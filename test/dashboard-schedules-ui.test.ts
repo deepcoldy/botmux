@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { filterSchedules, fmtScheduleDate } from '../src/dashboard/web/schedules-page.js';
+import {
+  filterSchedules,
+  fmtScheduleDate,
+  scheduleExecutionPlacement,
+} from '../src/dashboard/web/schedules-page.js';
 
 describe('dashboard schedules React page helpers', () => {
   it('reads enabled filter checkbox state before entering React state updaters', () => {
@@ -37,22 +41,39 @@ describe('dashboard schedules React page helpers', () => {
     expect(fmtScheduleDate()).toBe('—');
   });
 
-  it('renders a silent chip and hides the delivery toggle for silent schedules', () => {
+  it('renders a silent chip and keeps position editing inside the form (not the crowded row actions)', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
     // chip in the meta strip
     expect(page).toContain("s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null");
-    // delivery switch hidden for silent tasks (like 'local') — silent can't go new-topic
-    expect(page).toContain("s.deliver === 'local' || s.silent ? null : (");
+    expect(page).not.toContain('op="delivery"');
+    expect(page).not.toContain('setDeliver(');
   });
 
-  it('marks deliverTouched when silent auto-switches new-topic to origin (regression for silent_new_topic_exclusive)', () => {
+  it('offers three execution positions and allows lazy silent fresh topics', () => {
     const page = readFileSync(new URL('../src/dashboard/web/schedules-page.tsx', import.meta.url), 'utf8');
-    // When checking Silent on a new-topic task, the UI auto-switches deliver to
-    // origin. deliverTouched must be set true so the PATCH carries deliver:'origin'
-    // — otherwise the backend still sees new-topic + silent:true and rejects.
-    expect(page).toContain('setDeliverTouched(true)');
-    // The silent onChange handler must flip deliver to origin AND mark touched.
-    expect(page).toMatch(/setSilent\(e\.target\.checked\)[\s\S]*?setDeliver\('origin'\)[\s\S]*?setDeliverTouched\(true\)/);
+    expect(page).toContain('onChange={e => setSilent(e.target.checked)}');
+    expect(page).toContain('silentNewTopicConflict');
+    expect(page).toContain("value=\"top-level\"");
+    expect(page).toContain("value=\"topic\"");
+    expect(page).toContain("value=\"new-topic\"");
+    expect(page).toContain("setExecutionPosition('new-topic')");
+    expect(page).toContain("tr('schedules.form.topicTitle')");
+    expect(page).toContain('maxLength={200}');
+    expect(page).not.toContain("disabled={executionPosition === 'new-topic'}");
+    expect(page).toContain("executionPosition === 'new-topic' && silent");
+    expect(page).toContain("tr('schedules.form.topicRoot')");
+    expect(page).toContain("executionPosition === 'topic' && !rootMessageId.trim()");
+    expect(page).toContain("const localDelivery = editing?.deliver === 'local';");
+    expect(page).toContain('updateExecutionPosition: !localDelivery');
+    expect(page).toContain('...(data.updateExecutionPosition ? {');
+  });
+
+  it('maps stored state to top-level, retained-topic, fresh-topic, or local execution', () => {
+    expect(scheduleExecutionPlacement({ id: 'chat', scope: 'chat', rootMessageId: 'om_old' })).toBe('chat');
+    expect(scheduleExecutionPlacement({ id: 'thread', scope: 'thread', rootMessageId: 'om_root' })).toBe('thread');
+    expect(scheduleExecutionPlacement({ id: 'fresh', executionPosition: 'new-topic', rootMessageId: 'om_root' })).toBe('new-topic');
+    expect(scheduleExecutionPlacement({ id: 'legacy-fresh', deliver: 'new-topic' })).toBe('new-topic');
+    expect(scheduleExecutionPlacement({ id: 'local', deliver: 'local' })).toBe('local');
   });
 
   it('formats in the given schedule timezone, not the browser zone', () => {
@@ -83,5 +104,7 @@ describe('dashboard schedules React page helpers', () => {
     expect(css).toMatch(
       /\.schedule-chip-strip span\.schedule-error-chip \{[\s\S]*?\}\s*\.schedule-row-head \.schedule-state \{/,
     );
+    expect(css).toMatch(/\.schedules-list \{[\s\S]*?grid-auto-rows:\s*max-content/);
+    expect(css).toMatch(/\.schedule-list-row \.schedule-actions \{[\s\S]*?flex-wrap:\s*nowrap/);
   });
 });

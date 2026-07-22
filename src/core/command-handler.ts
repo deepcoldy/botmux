@@ -791,14 +791,12 @@ async function handleScheduleCommand(
   if (parsed) {
     const ds = larkAppId ? activeSessions.get(sessionKey(rootId, larkAppId)) : undefined;
     const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
-    const taskScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
-    // "新话题" keyword → every fire opens a brand-new topic in a fresh session.
-    // "静默" keyword → fires post no banner; the model decides whether to send.
-    const { deliver, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
-    if (silent && deliver === 'new-topic') {
-      await sessionReply(rootId, t('schedule.silent_new_topic_conflict', undefined, loc));
-      return;
-    }
+    const capturedScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
+    const capturedRootMessageId = capturedScope === 'thread' ? rootId : undefined;
+    const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
+    const executionPosition = requestedPosition
+      ?? (capturedScope === 'thread' ? 'topic' : 'top-level');
+    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
@@ -809,11 +807,14 @@ async function handleScheduleCommand(
       prompt: schedPrompt,
       workingDir,
       chatId,
-      rootMessageId: taskScope === 'thread' ? rootId : undefined,
+      // Retain the captured root even when top-level is selected so the task
+      // can later switch back to topic execution without losing its anchor.
+      rootMessageId: capturedRootMessageId,
       scope: taskScope,
+      executionPosition,
       chatType: ds?.chatType === 'p2p' ? 'p2p' : 'topic_group',
       larkAppId,
-      deliver,
+      deliver: 'origin',
       silent,
     });
     const next = scheduler.getNextRun(task.id);
@@ -826,9 +827,17 @@ async function handleScheduleCommand(
       dir: expandHome(workingDir),
       next: nextStr,
     }, loc);
-    const deliverNote = deliver === 'new-topic' ? '\n' + t('schedule.deliver_new_topic', undefined, loc) : '';
+    const positionNote = '\n' + t(
+      executionPosition === 'new-topic'
+        ? 'schedule.deliver_new_topic'
+        : executionPosition === 'top-level'
+          ? 'schedule.position_top_level'
+          : 'schedule.position_topic',
+      undefined,
+      loc,
+    );
     const silentNote = silent ? '\n' + t('schedule.silent_note', undefined, loc) : '';
-    await sessionReply(rootId, createdMsg + deliverNote + silentNote);
+    await sessionReply(rootId, createdMsg + positionNote + silentNote);
     return;
   }
 

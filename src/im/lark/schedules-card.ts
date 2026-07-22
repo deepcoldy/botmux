@@ -2,7 +2,7 @@
  * Schedules dashboard card.
  *
  * The list view is compact, paginated, refreshable, and read-only except for
- * per-row detail entry. The detail view exposes pause/resume, delivery-mode
+ * per-row detail entry. The detail view exposes pause/resume, execution-position
  * switching, and back actions. Run-now remains outside this card because it is
  * a one-shot side effect rather than a reversible state change.
  *
@@ -23,14 +23,14 @@ import { isDashboardAdmin } from '../../dashboard/dashboard-admins.js';
 import type {
   ScheduleCardTaskInput,
   ScheduleDetailDto,
-  ScheduleDelivery,
   ScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
 import {
   computeDeliveryButtonAvailability,
   computeButtonAvailability,
-  normalizeScheduleDelivery,
   paginateSchedules,
+  nextScheduleExecutionPosition,
+  resolveScheduleExecutionPlacement,
   toScheduleDetailDto,
   toScheduleRowDto,
 } from '../../dashboard/schedule-card-model.js';
@@ -357,20 +357,18 @@ function botLabelFromDetail(detail: ScheduleDetailDto): string {
   return '—';
 }
 
-function deliveryLabel(deliver: ScheduleDelivery, locale: Locale): string {
-  switch (deliver) {
-    case 'new-topic':
-      return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+function deliveryLabel(detail: ScheduleDetailDto, locale: Locale): string {
+  switch (resolveScheduleExecutionPlacement(detail.raw)) {
+    case 'thread':
+      return t('card.dashboard.schedules.delivery.thread', undefined, locale);
     case 'local':
       return t('card.dashboard.schedules.delivery.local', undefined, locale);
-    case 'origin':
+    case 'new-topic':
+      return t('card.dashboard.schedules.delivery.new_topic', undefined, locale);
+    case 'chat':
     default:
-      return t('card.dashboard.schedules.delivery.origin', undefined, locale);
+      return t('card.dashboard.schedules.delivery.top_level', undefined, locale);
   }
-}
-
-function nextDeliveryTarget(deliver: ScheduleDelivery): Exclude<ScheduleDelivery, 'local'> {
-  return deliver === 'new-topic' ? 'origin' : 'new-topic';
 }
 
 /** Options for the detail card. `invokerOpenId` plumbs the lock onto every callback button. */
@@ -391,7 +389,7 @@ export interface BuildSchedulesDetailCardOpts {
 
 /**
  * Build the schedule detail card: task metadata, next-run preview, reversible
- * state controls, delivery-mode switch, and back action.
+ * state controls, execution-position switching, and back action.
  *
  * Pause and resume are mutually exclusive per the model matrix:
  *   enabled === true → pause clickable, resume disabled (alreadyEnabled)
@@ -430,6 +428,15 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t('card.dashboard.schedules.detail.name_label', { name: escapeLarkMd(detail.name) }, opts.locale),
   );
+  if (detail.executionPlacement === 'new-topic' && detail.raw.topicTitle) {
+    infoLines.push(
+      t(
+        'card.dashboard.schedules.detail.topic_title_label',
+        { title: escapeLarkMd(detail.raw.topicTitle) },
+        opts.locale,
+      ),
+    );
+  }
   infoLines.push(
     t('card.dashboard.schedules.detail.enabled_label', { status: enabledLabel }, opts.locale),
   );
@@ -446,7 +453,7 @@ export function buildSchedulesDetailCard(
   infoLines.push(
     t(
       'card.dashboard.schedules.detail.delivery_label',
-      { delivery: escapeLarkMd(deliveryLabel(detail.deliver, opts.locale)) },
+      { delivery: escapeLarkMd(deliveryLabel(detail, opts.locale)) },
       opts.locale,
     ),
   );
@@ -547,11 +554,12 @@ export function buildSchedulesDetailCard(
   }
   if (opts.scope === 'global') navFields.dashboard_scope = 'global';
 
-  // ─── Action row — pause / resume + delivery (mutually exclusive) + back ─
+  // ─── Action row — pause / resume + execution position + back ──────────
   const pauseEnabled = detail.actions.pause.enabled === true;
   const resumeEnabled = detail.actions.resume.enabled === true;
-  const currentDelivery = normalizeScheduleDelivery(detail.raw.deliver);
-  const deliveryTarget = nextDeliveryTarget(currentDelivery);
+  const currentPlacement = resolveScheduleExecutionPlacement(detail.raw);
+  const showDeliveryButton = currentPlacement !== 'local';
+  const deliveryTarget = nextScheduleExecutionPosition(detail.raw);
   const deliveryButtonState = computeDeliveryButtonAvailability(detail.raw, deliveryTarget);
   const deliveryEnabled = deliveryButtonState.enabled === true;
   const pauseButton: Record<string, unknown> = {
@@ -584,8 +592,10 @@ export function buildSchedulesDetailCard(
       tag: 'plain_text',
       content: t(
         deliveryTarget === 'new-topic'
-          ? 'card.dashboard.schedules.btn.use_new_topic'
-          : 'card.dashboard.schedules.btn.use_origin',
+          ? 'card.dashboard.schedules.btn.use_fresh_topic'
+          : deliveryTarget === 'topic'
+            ? 'card.dashboard.schedules.btn.use_origin'
+            : 'card.dashboard.schedules.btn.use_new_topic',
         undefined,
         opts.locale,
       ),
@@ -595,7 +605,7 @@ export function buildSchedulesDetailCard(
       action: SCHEDULES_ACTION_DELIVERY,
       invoker_open_id: opts.invokerOpenId,
       schedule_id: detail.id,
-      target_delivery: deliveryTarget,
+      target_position: deliveryTarget,
       ...navFields,
     },
   };
@@ -605,7 +615,7 @@ export function buildSchedulesDetailCard(
     actions: [
       pauseButton,
       resumeButton,
-      deliveryButton,
+      ...(showDeliveryButton ? [deliveryButton] : []),
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.dashboard.schedules.btn.back', undefined, opts.locale) },
@@ -644,7 +654,7 @@ export function buildSchedulesDetailCard(
       });
     }
   }
-  if (!deliveryEnabled) {
+  if (showDeliveryButton && !deliveryEnabled) {
     const reasonKey = mapDeliveryDisabledReason(deliveryButtonState.reasonKey);
     if (reasonKey) {
       elements.push({
@@ -655,7 +665,6 @@ export function buildSchedulesDetailCard(
       });
     }
   }
-
   // Footer security note (mirrors list card).
   elements.push({
     tag: 'note',
@@ -698,10 +707,12 @@ function mapDeliveryDisabledReason(reasonKey: string | undefined): string | unde
   switch (reasonKey) {
     case 'schedules.action.delivery.local':
       return 'card.dashboard.schedules.delivery.disabled.local';
-    case 'schedules.action.delivery.silentOriginOnly':
-      return 'card.dashboard.schedules.delivery.disabled.silent';
+    case 'schedules.action.delivery.topicRootRequired':
+      return 'card.dashboard.schedules.delivery.disabled.topicRootRequired';
     case 'schedules.action.delivery.alreadyOrigin':
       return 'card.dashboard.schedules.delivery.disabled.alreadyOrigin';
+    case 'schedules.action.delivery.alreadyTopLevel':
+      return 'card.dashboard.schedules.delivery.disabled.alreadyTopLevel';
     case 'schedules.action.delivery.alreadyNewTopic':
       return 'card.dashboard.schedules.delivery.disabled.alreadyNewTopic';
     default:
@@ -939,11 +950,14 @@ export async function handleSchedulesCardAction(
     if (typeof scheduleId !== 'string' || !scheduleId) {
       return errorToast('card.dashboard.schedules.schedule_not_found', undefined, locale);
     }
-    const targetDelivery =
-      value.target_delivery === 'origin' || value.target_delivery === 'new-topic'
-        ? value.target_delivery
-        : undefined;
-    if (!targetDelivery) {
+    const legacyTarget = value.target_delivery === 'origin'
+      ? 'topic'
+      : value.target_delivery === 'new-topic' ? 'top-level' : undefined;
+    const targetPosition =
+      value.target_position === 'top-level' || value.target_position === 'topic' || value.target_position === 'new-topic'
+        ? value.target_position
+        : legacyTarget;
+    if (!targetPosition) {
       return ackToast('card.dashboard.settings.invalid_action', locale);
     }
     const failedKey = 'card.dashboard.schedules.delivery_failed';
@@ -958,7 +972,7 @@ export async function handleSchedulesCardAction(
     // Server-side action matrix for delivery mirrors pause/resume: the card
     // paint is UX only. Re-read the latest row and verify this exact target
     // is still a legal transition before calling the owner daemon.
-    const deliveryState = computeDeliveryButtonAvailability(before, targetDelivery);
+    const deliveryState = computeDeliveryButtonAvailability(before, targetPosition);
     if (deliveryState.enabled !== true) {
       const mappedKey = mapDeliveryDisabledReason(deliveryState.reasonKey) ?? failedKey;
       return errorToast(mappedKey, undefined, locale);
@@ -969,6 +983,7 @@ export async function handleSchedulesCardAction(
       resp = await client.request({
         method: 'POST',
         path: `/__daemon/schedules/${encodeURIComponent(scheduleId)}/delivery${writePathSuffix}`,
+        body: { executionPosition: targetPosition },
       });
     } catch (e) {
       return errorToast(failedKey, { reason: (e as Error).message }, locale);
@@ -978,11 +993,12 @@ export async function handleSchedulesCardAction(
       return errorToast(failedKey, { reason: failureReason }, locale);
     }
 
-    const responseDeliver =
-      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'origin' ||
-      (resp.body as { deliver?: unknown } | undefined)?.deliver === 'new-topic'
-        ? (resp.body as { deliver: 'origin' | 'new-topic' }).deliver
-        : targetDelivery;
+    const responsePosition =
+      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'topic' ||
+      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'top-level' ||
+      (resp.body as { executionPosition?: unknown } | undefined)?.executionPosition === 'new-topic'
+        ? (resp.body as { executionPosition: 'topic' | 'top-level' | 'new-topic' }).executionPosition
+        : targetPosition;
     const postRefetch = await safeGetSchedulesList(client, locale, listPathSuffix);
     let after: ScheduleCardTaskInput | undefined;
     if (!('errorResult' in postRefetch)) {
@@ -991,8 +1007,12 @@ export async function handleSchedulesCardAction(
     if (!after) {
       // Delivery toggle succeeded upstream but the refetch was stale/missing.
       // Keep the card interactive by rendering a synth row with the known
-      // target mode; the next refresh converges to the owner daemon snapshot.
-      after = { ...before, deliver: responseDeliver };
+      // target position; the next refresh converges to the owner snapshot.
+      after = {
+        ...before,
+        scope: responsePosition === 'topic' ? 'thread' : 'chat',
+        executionPosition: responsePosition,
+      };
     }
     const detail = toScheduleDetailDto(after, { nowMs: now() });
     const cardJson = buildSchedulesDetailCard(detail, {

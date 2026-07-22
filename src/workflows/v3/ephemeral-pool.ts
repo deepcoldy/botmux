@@ -212,11 +212,19 @@ async function runNodeImpl(
 
   drainWorkerDiagnostics(worker, req);
 
+  // Real chat binding (when the run was born in chat) over synthetic ids: the
+  // worker forwards chatId/chatType/rootMessageId/ownerOpenId into the CLI
+  // child's BOTMUX_* env, which custom CLI wrappers consume for per-user
+  // permission isolation (BOTMUX_OWNER_OPEN_ID is daemon-authenticated at run
+  // birth — a CLI child cannot forge it).  Standalone/dev runs keep synthetic
+  // values and get no owner env at all.
   const init = {
     type: 'init' as const,
     sessionId,
-    chatId: `v3-chat-${req.runId}`,
-    rootMessageId: `v3-root-${req.attemptId}`,
+    chatId: req.chatBinding?.chatId ?? `v3-chat-${req.runId}`,
+    ...(req.chatBinding?.chatType ? { chatType: req.chatBinding.chatType } : {}),
+    rootMessageId: req.chatBinding?.rootMessageId ?? `v3-root-${req.attemptId}`,
+    ...(req.chatBinding?.ownerOpenId ? { ownerOpenId: req.chatBinding.ownerOpenId } : {}),
     workingDir: cwd,
     cliId: req.botSnapshot.cliId,
     cliPathOverride: req.botSnapshot.cliPathOverride,

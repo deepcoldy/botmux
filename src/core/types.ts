@@ -345,7 +345,19 @@ export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | 
  *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
+  const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
+  if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+/** Resolve a persisted session's daemon routing anchor without first building
+ * a DaemonSession. Deferred schedule runs are isolated even though their
+ * visible delivery surface is a chat. */
+export function storedSessionAnchorId(
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun'>,
+): string {
+  return session.deferredScheduleRun?.routingAnchor
+    ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
 /** Storage key for the daemon-owned activeSessions map. A VC receiver is a

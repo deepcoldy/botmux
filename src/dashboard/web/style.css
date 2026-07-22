@@ -12450,6 +12450,7 @@ tbody tr[data-chat]:hover {
 }
 
 .schedules-list {
+  grid-auto-rows: max-content;
   align-content: start;
 }
 
@@ -12458,6 +12459,8 @@ tbody tr[data-chat]:hover {
   grid-template-columns: minmax(0, 1fr) auto;
   column-gap: 16px;
   align-items: flex-start;
+  align-self: start;
+  height: auto;
   min-height: 84px;
   padding: 11px 12px;
 }
@@ -12563,16 +12566,16 @@ tbody tr[data-chat]:hover {
 }
 
 .schedule-list-row .overview-list-tail {
-  align-self: end;
+  align-self: center;
   justify-self: end;
   justify-content: flex-end;
-  max-width: 460px;
+  max-width: none;
 }
 
 .schedule-list-row .schedule-actions {
   display: inline-flex;
   align-items: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 12px;
   justify-content: flex-end;
 }
@@ -12703,7 +12706,7 @@ tbody tr[data-chat]:hover {
   transform: none;
 }
 
-@media (max-width: 760px) {
+@media (max-width: 1240px) {
   .schedule-list-row {
     grid-template-columns: 1fr;
     row-gap: 10px;
@@ -12717,6 +12720,7 @@ tbody tr[data-chat]:hover {
 
   .schedule-list-row .schedule-actions {
     width: 100%;
+    flex-wrap: wrap;
   }
 }
 
@@ -23654,6 +23658,16 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   color: var(--text-dim);
 }
 
+.schedule-form-help-with-count {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.schedule-form-help-with-count span {
+  flex: none;
+}
+
 .schedule-form-radio-group {
   display: flex;
   gap: 16px;
@@ -23666,6 +23680,22 @@ button.ui-refresh-button.is-loading .ui-action-icon {
   gap: 6px;
   font-size: 13px;
   cursor: pointer;
+}
+
+.schedule-form-placement {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface-muted) 46%, transparent);
+}
+
+.schedule-form-placement strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .schedule-form-toggle {

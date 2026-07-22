@@ -44,6 +44,10 @@ export interface ScheduleCardTaskInput {
    *  when missing. */
   botName?: string;
   chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  executionPosition?: 'top-level' | 'topic' | 'new-topic';
+  topicTitle?: string;
   /** ISO of the next scheduled run (precomputed by caller). */
   nextRunAt?: string;
   /** ISO of the last completed run. */
@@ -53,13 +57,14 @@ export interface ScheduleCardTaskInput {
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
   repeat?: { times: number | null; completed: number };
-  /** Silent fires (no start banner, model decides whether to send). Silent
-   *  tasks cannot switch to new-topic delivery. */
+  /** Silent fires (no start banner, model decides whether to send). A fresh
+   *  topic is materialized lazily by the first botmux send. */
   silent?: boolean;
 }
 
 export type ScheduleKind = ParsedSchedule['kind'];
 export type ScheduleDelivery = 'origin' | 'local' | 'new-topic';
+export type ScheduleExecutionPlacement = 'chat' | 'thread' | 'new-topic' | 'local';
 export type ScheduleKindChip = ScheduleKind | 'all';
 
 export interface ScheduleFilterQuery extends PaginationParams {
@@ -115,6 +120,7 @@ export interface ScheduleDetailDto {
   kind: ScheduleKind;
   displayExpr: string;
   deliver: ScheduleDelivery;
+  executionPlacement: ScheduleExecutionPlacement;
   prompt?: string;
   /** True when prompt was longer than promptTruncateAt and got cut. */
   promptTruncated: boolean;
@@ -203,28 +209,48 @@ export function normalizeScheduleDelivery(deliver: ScheduleCardTaskInput['delive
   return deliver === 'new-topic' || deliver === 'local' ? deliver : 'origin';
 }
 
+/** Resolve the user-facing execution position from the captured session anchor. */
+export function resolveScheduleExecutionPlacement(
+  task: Pick<ScheduleCardTaskInput, 'deliver' | 'scope' | 'rootMessageId' | 'executionPosition'>,
+): ScheduleExecutionPlacement {
+  if (task.deliver === 'local') return 'local';
+  if (task.executionPosition === 'new-topic' || (!task.executionPosition && task.deliver === 'new-topic')) return 'new-topic';
+  if (task.executionPosition === 'topic') return task.rootMessageId ? 'thread' : 'chat';
+  if (task.executionPosition === 'top-level') return 'chat';
+  if (task.scope === 'chat') return 'chat';
+  return task.rootMessageId ? 'thread' : 'chat';
+}
+
 export function computeDeliveryButtonAvailability(
   task: ScheduleCardTaskInput,
-  target: Exclude<ScheduleDelivery, 'local'>,
+  target: 'top-level' | 'topic' | 'new-topic',
 ): ButtonState {
-  const current = normalizeScheduleDelivery(task.deliver);
-  if (current === 'local') {
+  if (task.deliver === 'local') {
     return { enabled: false, reasonKey: 'schedules.action.delivery.local' };
   }
-  // Silent tasks fire without any message; new-topic needs a first message to
-  // open the topic, so the switch is disabled (mirrors scheduler.toggleDelivery).
-  if (task.silent && target === 'new-topic') {
-    return { enabled: false, reasonKey: 'schedules.action.delivery.silentOriginOnly' };
+  const placement = resolveScheduleExecutionPlacement(task);
+  const current = placement === 'thread' ? 'topic' : placement === 'new-topic' ? 'new-topic' : 'top-level';
+  if (target === 'topic' && !task.rootMessageId) {
+    return { enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' };
   }
   if (current === target) {
     return {
       enabled: false,
-      reasonKey: target === 'origin'
+      reasonKey: target === 'topic'
         ? 'schedules.action.delivery.alreadyOrigin'
-        : 'schedules.action.delivery.alreadyNewTopic',
+        : target === 'top-level'
+          ? 'schedules.action.delivery.alreadyTopLevel'
+          : 'schedules.action.delivery.alreadyNewTopic',
     };
   }
   return { enabled: true };
+}
+
+export function nextScheduleExecutionPosition(task: ScheduleCardTaskInput): 'top-level' | 'topic' | 'new-topic' {
+  const placement = resolveScheduleExecutionPlacement(task);
+  if (placement === 'thread') return 'top-level';
+  if (placement === 'new-topic') return task.rootMessageId ? 'topic' : 'top-level';
+  return 'new-topic';
 }
 
 /** Build a single ScheduleRowDto for list rendering. */
@@ -260,6 +286,7 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
     kind: task.parsed.kind,
     displayExpr: task.parsed.display,
     deliver: normalizeScheduleDelivery(task.deliver),
+    executionPlacement: resolveScheduleExecutionPlacement(task),
     prompt: promptRaw.length === 0 ? undefined : prompt,
     promptTruncated,
     chatId: task.chatId,

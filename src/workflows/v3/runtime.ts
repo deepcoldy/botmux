@@ -66,6 +66,7 @@ import {
   type V3ArmedAttemptWorkerFence,
 } from './worker-fence.js';
 import { normalizeGateWaitInput, v3GateWaitId, writePendingWait } from './human-gate.js';
+import type { RunChatBinding } from './grill-state.js';
 import {
   ASK_HUMAN_ERROR_CODE,
   GOAL_ASK_FILE,
@@ -589,6 +590,10 @@ export interface V3RuntimeOptions {
   /** How long the scheduler waits for the original host SDK promise before
    *  detaching and reconciling the still-open durable intent with the same key. */
   hostResponseWaitMs?: number;
+  /** The run's authenticated chat binding — threaded verbatim into every
+   *  RunNodeRequest so worker CLI children get real BOTMUX_* identity env.
+   *  See RunNodeRequest.chatBinding. */
+  chatBinding?: RunChatBinding;
 }
 
 export interface V3PendingGate {
@@ -2714,6 +2719,7 @@ export async function runWorkflow(
       inputsPath,
       outputDir,
       env,
+      ...(opts.chatBinding ? { chatBinding: opts.chatBinding } : {}),
       workerFence,
       timeoutMs: (node.timeoutSec ?? DEFAULT_NODE_TIMEOUT_SEC) * 1000,
       cancelSignal: controller.signal,
