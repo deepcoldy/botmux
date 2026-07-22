@@ -13,6 +13,12 @@ const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;
 const HANG_TURN = process.env.FAKE_HANG_TURN === '1';
 const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
+const TITLE_DELAY_READS = Number(process.env.FAKE_TITLE_DELAY_READS ?? '0');
+const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
+const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
+const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
+let threadReadAttempt = 0;
+let currentThreadName;
 
 const httpServer = createServer((req, res) => {
   if (req.url === '/readyz') { res.writeHead(200); res.end('ok'); return; }
@@ -28,6 +34,14 @@ wss.on('connection', (ws) => {
       case 'initialize': return reply({ ok: true });
       case 'thread/start': return reply({ thread: { id: 'thread-fake-1' } });
       case 'thread/resume': return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      case 'thread/read':
+        threadReadAttempt += 1;
+        return reply({ thread: {
+          id: msg.params?.threadId ?? 'thread-fake-1',
+          name: currentThreadName ?? (threadReadAttempt > TITLE_DELAY_READS ? '<botmux_routing> automatic title' : null),
+          updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
+        } });
+      case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
       case 'turn/start': if (HANG_TURN) return; return reply({ accepted: true });
       default: return reply({});
     }

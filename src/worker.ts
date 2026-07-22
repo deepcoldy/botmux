@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname } from 'node:path';
+import { join, basename, dirname, delimiter } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
@@ -104,6 +104,7 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
+import { readCodexAppThreadMetadata, setCodexAppThreadName } from './services/codex-app-threads.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -334,6 +335,135 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
   return false;
 }
 
+/** 首条 UserMessage 落盘后再设置标题，避免被 Codex 的自动标题反向覆盖。 */
+async function syncFreshCodexNativeSessionTitle(
+  threadId: string,
+  engine?: CodexRpcEngine,
+): Promise<void> {
+  const cfg = lastInitConfig;
+  const title = cfg?.nativeSessionTitle?.trim();
+  if (!cfg || cfg.cliId !== 'codex' || cfg.adoptMode || !title || !threadId) return;
+  if (nativeSessionTitleAppliedThreadId === threadId || nativeSessionTitleSyncInFlight === threadId) return;
+
+  const revision = nativeSessionTitleRevision;
+  const resumeGeneration = nativeSessionTitleCurrentGenerationResume;
+  let syncLatestTitle = false;
+  nativeSessionTitleSyncInFlight = threadId;
+  try {
+    if (engine?.activeThreadId === threadId) {
+      if (resumeGeneration) {
+        await engine.waitForThreadUpdatedAfter(
+          nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
+          10_000,
+        );
+      } else {
+        await engine.waitForThreadName(10_000);
+      }
+      if (revision !== nativeSessionTitleRevision) {
+        syncLatestTitle = true;
+        return;
+      }
+      await engine.setThreadName(title);
+    } else {
+      const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+      const env: NodeJS.ProcessEnv = {
+        ...redactChildEnv(process.env),
+        ...sanitizePerBotEnv(cfg.env),
+      };
+      env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
+      const abortController = new AbortController();
+      nativeSessionTitleSyncAbortController = abortController;
+      await setCodexAppThreadName({
+        threadId,
+        name: title,
+        codexBin: adapter.resolvedBin,
+        cwd: cfg.workingDir,
+        env,
+        timeoutMs: 10_000,
+        signal: abortController.signal,
+        detached: true,
+        waitForExistingName: !resumeGeneration,
+        ...(resumeGeneration ? {
+          waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
+        } : {}),
+        registerForceClose: forceClose => {
+          nativeSessionTitleSyncForceClosers.add(forceClose);
+          return () => nativeSessionTitleSyncForceClosers.delete(forceClose);
+        },
+      });
+    }
+    if (revision !== nativeSessionTitleRevision) {
+      syncLatestTitle = true;
+      return;
+    }
+    nativeSessionTitleAppliedThreadId = threadId;
+    log(`Applied native Codex session title: ${title}`);
+  } catch (err: any) {
+    if (revision !== nativeSessionTitleRevision) syncLatestTitle = true;
+    else log(`Native Codex session title sync failed: ${err?.message ?? err}`);
+  } finally {
+    nativeSessionTitleSyncAbortController = undefined;
+    if (nativeSessionTitleSyncInFlight === threadId) nativeSessionTitleSyncInFlight = undefined;
+    if (syncLatestTitle) {
+      void syncFreshCodexNativeSessionTitle(threadId, engine);
+    }
+  }
+}
+
+/** 在 resume 首条输入前记录 updatedAt，后续用其确认历史派生标题已完成回写。 */
+async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexRpcEngine): Promise<void> {
+  const cfg = lastInitConfig;
+  if (!cfg || cfg.cliId !== 'codex' || cfg.adoptMode || !cfg.nativeSessionTitle) return;
+  nativeSessionTitleResumeUpdatedAt = Math.floor(Date.now() / 1000);
+  try {
+    if (engine?.activeThreadId === threadId) {
+      const metadata = await engine.readThreadMetadata(7000);
+      if (metadata.updatedAt !== undefined) nativeSessionTitleResumeUpdatedAt = metadata.updatedAt;
+      return;
+    }
+    const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+    const env: NodeJS.ProcessEnv = {
+      ...redactChildEnv(process.env),
+      ...sanitizePerBotEnv(cfg.env),
+    };
+    env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
+    const abortController = new AbortController();
+    nativeSessionTitleSyncAbortController = abortController;
+    const metadata = await readCodexAppThreadMetadata({
+      threadId,
+      codexBin: adapter.resolvedBin,
+      cwd: cfg.workingDir,
+      env,
+      timeoutMs: 7000,
+      signal: abortController.signal,
+      detached: true,
+      registerForceClose: forceClose => {
+        nativeSessionTitleSyncForceClosers.add(forceClose);
+        return () => nativeSessionTitleSyncForceClosers.delete(forceClose);
+      },
+    });
+    if (metadata.updatedAt !== undefined) nativeSessionTitleResumeUpdatedAt = metadata.updatedAt;
+  } catch (err: any) {
+    log(`Could not capture Codex resume title baseline: ${err?.message ?? err}`);
+  } finally {
+    nativeSessionTitleSyncAbortController = undefined;
+  }
+}
+
+/** 每次 CLI spawn 后重建当前 generation 的标题同步状态。 */
+async function prepareCodexNativeTitleGeneration(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  engine?: CodexRpcEngine,
+): Promise<void> {
+  if (cfg.cliId !== 'codex' || cfg.adoptMode || !cfg.nativeSessionTitle) return;
+  nativeSessionTitleAppliedThreadId = undefined;
+  nativeSessionTitleResumeUpdatedAt = undefined;
+  nativeSessionTitleCurrentGenerationResume = lastSpawnEffectiveResume;
+  if (!lastSpawnEffectiveResume) return;
+  const threadId = engine?.activeThreadId ?? lastSpawnEffectiveCliSessionId ?? cfg.cliSessionId;
+  if (threadId) await captureCodexResumeTitleBaseline(threadId, engine);
+}
+
 /** Stand up (or re-establish) the per-session codex app-server + botmux-owned
  *  thread and point remote{WsUrl,ThreadId} at it, so the next spawnCli launches
  *  `codex --remote <ws> resume <thread>` and input flows over JSON-RPC. Fully
@@ -426,10 +556,13 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       if (shouldPreMarkFirstTurn(first)) codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
       outcome = first; // 'accepted' | 'ambiguous' — both stay engaged, prompt never re-queued
     }
-    persistCliSessionId(threadId);
     codexRpcEngine = engine;
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
+    persistCliSessionId(threadId);
+    if (!wantResume && cfg.prompt && outcome === 'accepted') {
+      void syncFreshCodexNativeSessionTitle(threadId, engine);
+    }
     log(`Codex RPC input engaged (${outcome}${wantResume ? '/resume' : '/fresh'}): app-server ${engine.wsUrl} thread ${threadId}`);
     return outcome;
   } catch (err: any) {
@@ -1102,6 +1235,18 @@ const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = 
  * administrative TUI command: never type-ahead while the agent is busy, never
  * open a model turn, and latest-wins if several renames arrive before idle. */
 let pendingSessionRename: string | null = null;
+let nativeSessionTitleSyncInFlight: string | undefined;
+let nativeSessionTitleAppliedThreadId: string | undefined;
+let nativeSessionTitleRevision = 0;
+let nativeSessionTitleSyncAbortController: AbortController | undefined;
+let nativeSessionTitleResumeUpdatedAt: number | undefined;
+let nativeSessionTitleCurrentGenerationResume = false;
+const nativeSessionTitleSyncForceClosers = new Set<() => void>();
+
+function stopNativeSessionTitleSync(): void {
+  nativeSessionTitleSyncAbortController?.abort();
+  for (const forceClose of nativeSessionTitleSyncForceClosers) forceClose();
+}
 /** True after the rename command's Enter lands and until the TUI returns to its
  * prompt. Blocks type-ahead user messages from racing into the command UI. */
 let sessionRenameInFlight = false;
@@ -4736,6 +4881,7 @@ function scheduleSubmitFailureNotify(
         if (cliSessionId) {
           persistCliSessionId(cliSessionId);
           if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+          void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
         }
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         return;
@@ -5114,6 +5260,12 @@ async function flushPending(): Promise<void> {
         // Late-attach now so subsequent assistant_final events get
         // attributed to this turn.
         if (codexBridgeActive) codexBridgeNotifyCliSessionId(result.cliSessionId);
+      }
+      if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
+        const threadId = result?.cliSessionId
+          ?? codexRpcEngine?.activeThreadId
+          ?? lastInitConfig.cliSessionId;
+        if (threadId) void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine);
       }
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
@@ -7554,6 +7706,7 @@ async function spawnCli(
 
 function killCli(opts: { preservePending?: boolean } = {}): void {
   currentCliCredentialIsolated = false;
+  stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();
   stopCodexRpcEngine();
   destroyCrashDiagnosticTerminal('killCli');
@@ -7692,6 +7845,7 @@ async function restartCliProcess(
               await engageCodexRpc(restartCfg);
             }
             await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+            await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
             if (codexRpcEngine) armRpcStartupDialogDismiss();
           } catch (err) {
             cliRestartInProgress = false;
@@ -9001,6 +9155,7 @@ process.on('message', async (raw: unknown) => {
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
 
         // Queue the initial prompt — flushed when CLI shows idle.
@@ -9115,7 +9270,9 @@ process.on('message', async (raw: unknown) => {
         startScreenUpdates();
         startScreenAnalyzer();
         try {
-          await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
+          const restartCfg = { ...lastInitConfig, resume: true, prompt: '' };
+          await spawnCli(restartCfg);
+          await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
         } catch (err) {
           // Pass the message's own attempt (not the stale currentBotmux* from a
           // prior IM turn) so a durable delivery relaunch failure carries the
@@ -9245,6 +9402,10 @@ process.on('message', async (raw: unknown) => {
       // IPC handlers are concurrent with async init, so queue first even when
       // the adapter/backend has not finished initializing. flushPending will
       // capability-check and deliver the latest title once a real prompt is idle.
+      nativeSessionTitleRevision += 1;
+      nativeSessionTitleAppliedThreadId = undefined;
+      if (lastInitConfig) lastInitConfig.nativeSessionTitle = msg.title;
+      stopNativeSessionTitleSync();
       pendingSessionRename = msg.title;
       log(`Queued native session rename: ${msg.title}`);
       void flushPending();
@@ -9502,6 +9663,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();
   if (tmuxRestartTimer) {
     clearTimeout(tmuxRestartTimer);
@@ -9576,7 +9738,11 @@ function teardownSandboxBestEffort(): void {
 // and process.exit(1), killing a live session over a dropped log write. Install
 // the guard before any further stdout writes (log() writes to process.stdout).
 installStdioEpipeGuard();
-process.on('exit', () => { teardownSandboxBestEffort(); stopCodexRpcEngine(); });
+process.on('exit', () => {
+  stopNativeSessionTitleSync();
+  teardownSandboxBestEffort();
+  stopCodexRpcEngine();
+});
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.

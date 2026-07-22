@@ -538,6 +538,76 @@ describe('session.start lifecycle integration', () => {
       skillPolicy: { include: ['skill:deploy'] },
     }));
   });
+
+  it('passes the persisted Lark topic title to a fresh Codex worker before its first prompt', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '@TestBot 排查这个 TTP logid',
+        nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+      },
+    });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
+      prompt: 'hello',
+    }));
+  });
+
+  it('keeps a persisted user-defined title when a fresh Codex worker starts', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '我的手动标题',
+        nativeSessionTitle: '我的手动标题',
+        nativeSessionTitleUserDefined: true,
+      },
+    });
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      nativeSessionTitle: '我的手动标题',
+    }));
+  });
+
+  it('does not invent a title while resuming a legacy Codex session', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-1',
+      },
+    });
+    forkWorker(ds, 'hello', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).not.toHaveProperty('nativeSessionTitle');
+  });
+
+  it('reapplies a managed Lark title after its Codex session resumes', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-manual',
+        nativeSessionTitle: '[BotMux·Lark] 我的持久化标题',
+      },
+    });
+    forkWorker(ds, '继续处理', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      cliSessionId: 'codex-native-manual',
+      nativeSessionTitle: '[BotMux·Lark] 我的持久化标题',
+    }));
+  });
 });
 
 describe('managed turn authority worker generations', () => {

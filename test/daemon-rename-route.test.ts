@@ -305,6 +305,8 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_new' });
+    const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
+    expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
   });
 
   it('thread safety-net: passes the accepted reply id into the first worker', async () => {

@@ -94,6 +94,7 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import { buildBotmuxLarkNativeSessionTitle } from './session-title.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -2017,6 +2018,22 @@ export function forkWorker(
 
   const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
+  let nativeSessionTitle: string | undefined;
+  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+    const isFreshNativeSession = !resume && !ds.session.cliSessionId;
+    if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
+      ds.session.nativeSessionTitle = ds.session.nativeSessionTitleUserDefined
+        ? ds.session.title
+        : buildBotmuxLarkNativeSessionTitle(ds.session.title);
+      sessionStore.updateSession(ds.session);
+    }
+    if (
+      isFreshNativeSession
+      || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+    ) {
+      nativeSessionTitle = ds.session.nativeSessionTitle;
+    }
+  }
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
@@ -2160,6 +2177,7 @@ export function forkWorker(
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,

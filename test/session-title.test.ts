@@ -7,7 +7,7 @@ vi.mock('../src/services/session-store.js', () => ({
 
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
-import { updateSessionTitle } from '../src/core/session-title.js';
+import { buildBotmuxLarkNativeSessionTitle, updateSessionTitle } from '../src/core/session-title.js';
 
 function makeSession(): Session {
   return {
@@ -19,6 +19,38 @@ function makeSession(): Session {
     createdAt: '2026-07-13T00:00:00.000Z',
   };
 }
+
+describe('buildBotmuxLarkNativeSessionTitle', () => {
+  it('brands the title and strips consecutive leading mentions', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux Oncall @CoCo  排查这个 logid', [
+      { name: 'Botmux' },
+      { name: 'Botmux Oncall' },
+      { name: 'CoCo' },
+    ])).toBe('[BotMux·Lark] 排查这个 logid');
+  });
+
+  it('keeps ambiguous unstructured text intact instead of splitting a multi-word mention', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux Oncall 看下这个问题'))
+      .toBe('[BotMux·Lark] @Botmux Oncall 看下这个问题');
+  });
+
+  it('flattens whitespace and control characters', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('  第一行\n\t第二行\u0000  结论')).toBe('[BotMux·Lark] 第一行 第二行 结论');
+  });
+
+  it('falls back for empty topic content', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux', [{ name: 'Botmux' }])).toBe('[BotMux·Lark] 新话题');
+    expect(buildBotmuxLarkNativeSessionTitle(undefined)).toBe('[BotMux·Lark] 新话题');
+  });
+
+  it('limits the complete title to 100 characters with an ellipsis', () => {
+    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(200));
+
+    expect(Array.from(title)).toHaveLength(100);
+    expect(title.startsWith('[BotMux·Lark] ')).toBe(true);
+    expect(title.endsWith('…')).toBe(true);
+  });
+});
 
 describe('updateSessionTitle', () => {
   beforeEach(() => vi.clearAllMocks());
@@ -38,6 +70,8 @@ describe('updateSessionTitle', () => {
     }
 
     expect(session.title).toBe('First line Second line');
+    expect(session.nativeSessionTitle).toBe('First line Second line');
+    expect(session.nativeSessionTitleUserDefined).toBe(true);
     expect(sessionStore.updateSession).toHaveBeenCalledWith(session);
     expect(events).toEqual([{
       type: 'session.update',

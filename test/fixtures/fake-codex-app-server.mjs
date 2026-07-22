@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 const version = process.env.FAKE_CODEX_VERSION ?? '0.136.0';
@@ -16,9 +16,17 @@ if (args[0] !== 'app-server') {
 }
 
 const logPath = process.env.FAKE_CODEX_LOG;
+const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
+const titleDelayReads = Number(process.env.FAKE_CODEX_TITLE_DELAY_READS ?? '0');
+const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
+const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
+const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
+if (pidPath) writeFileSync(pidPath, String(process.pid));
 let inputBuffer = '';
 let turnAttempt = 0;
+let threadReadAttempt = 0;
+let currentThreadName;
 
 function write(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
@@ -93,7 +101,20 @@ function handle(request) {
     respond(request.id, { thread: { id: request.params.threadId } });
     return;
   }
+  if (request.method === 'thread/read') {
+    threadReadAttempt += 1;
+    respond(request.id, {
+      thread: {
+        id: request.params.threadId,
+        name: currentThreadName ?? (threadReadAttempt > titleDelayReads ? '<botmux_routing> 自动标题' : null),
+        updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
+      },
+    });
+    return;
+  }
   if (request.method === 'thread/name/set') {
+    if (behavior === 'hang-name') return;
+    currentThreadName = request.params.name;
     respond(request.id, {});
     return;
   }

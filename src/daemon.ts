@@ -145,6 +145,7 @@ import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './co
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -14634,6 +14635,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(cmdContent);
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -15597,6 +15599,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(parsed.content, parsed.mentions);
     sessionStore.updateSession(session);
 
     // chat-scope only — see the handleNewTopic twin above (topic substitute

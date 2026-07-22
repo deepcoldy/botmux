@@ -29,6 +29,38 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
     await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await engine.waitForThreadName();
+    await engine.setThreadName('[BotMux·Lark] hello world');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for a delayed automatic title before allowing the final title write', async () => {
+    const engine = makeEngine({
+      sessionId: 'delayed-title',
+      env: { ...process.env, FAKE_TITLE_DELAY_READS: '2' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadName()).toBe('<botmux_routing> automatic title');
+    await engine.setThreadName('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for resumed-thread metadata to advance before restoring its title', async () => {
+    const engine = makeEngine({
+      sessionId: 'resume-title',
+      env: {
+        ...process.env,
+        FAKE_UPDATED_DELAY_READS: '2',
+        FAKE_UPDATED_BEFORE: '100',
+        FAKE_UPDATED_AFTER: '101',
+      },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-resumed-title');
+    expect((await engine.readThreadMetadata()).updatedAt).toBe(100);
+    await engine.waitForThreadUpdatedAfter(100);
+    await engine.setThreadName('[BotMux·Lark] resumed title');
     engine.stop();
   }, 20_000);
 

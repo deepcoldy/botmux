@@ -211,6 +211,58 @@ export class CodexRpcEngine {
     await this.request('turn/start', params, opts);
   }
 
+  /** 首条用户消息落盘后设置线程名；失败不得拖垮仍在执行的模型 turn。 */
+  async setThreadName(name: string): Promise<void> {
+    if (!this.threadId) throw new Error('setThreadName before startThread/resumeThread');
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await this.request('thread/name/set', {
+        threadId: this.threadId,
+        name,
+      }, { timeoutMs: 7000, fatalOnTimeout: false });
+      if ((await this.readThreadMetadata(7000)).name === name) return;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+    throw new Error('Codex thread name did not persist after 3 attempts');
+  }
+
+  /** 等待 Codex 的首条消息派生标题可读，作为自动标题已落库的时序屏障。 */
+  async waitForThreadName(timeoutMs = 10_000): Promise<string> {
+    if (!this.threadId) throw new Error('waitForThreadName before startThread/resumeThread');
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw new Error(`Codex thread name was not ready after ${timeoutMs}ms`);
+      const { name } = await this.readThreadMetadata(Math.min(remaining, 2000));
+      if (name) return name;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+  }
+
+  /** 等待 resume 后首次 append 的元数据补丁落库；超时后由调用方继续做最终覆盖。 */
+  async waitForThreadUpdatedAfter(baseline: number, timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const { updatedAt } = await this.readThreadMetadata(Math.min(remaining, 2000));
+      if (updatedAt !== undefined && updatedAt > baseline) return;
+      await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
+    }
+  }
+
+  async readThreadMetadata(timeoutMs = 7000): Promise<{ name?: string; updatedAt?: number }> {
+    if (!this.threadId) throw new Error('readThreadMetadata before startThread/resumeThread');
+    const result = await this.request('thread/read', {
+      threadId: this.threadId,
+      includeTurns: false,
+    }, { timeoutMs, fatalOnTimeout: false });
+    const name = typeof result?.thread?.name === 'string' ? result.thread.name.trim() : '';
+    const updatedAt = typeof result?.thread?.updatedAt === 'number' ? result.thread.updatedAt : undefined;
+    return {
+      ...(name ? { name } : {}),
+      ...(updatedAt !== undefined ? { updatedAt } : {}),
+    };
+  }
+
   /** Deliver the FRESH first turn and resolve its outcome as one of THREE states,
    *  prioritising exactly-once over never-lost (P1-1). An empty thread can't be
    *  resumed by the TUI, so the first turn must persist the rollout before the
