@@ -64,6 +64,13 @@ function writeSessions(dataDir: string, sessions: StoredSession[]): string {
   return path;
 }
 
+function writeLegacySessions(dataDir: string, sessions: StoredSession[]): string {
+  mkdirSync(dataDir, { recursive: true });
+  const path = join(dataDir, 'sessions.json');
+  writeFileSync(path, JSON.stringify(Object.fromEntries(sessions.map(s => [s.sessionId, s]))));
+  return path;
+}
+
 function writeDaemonDescriptor(dataDir: string, port: number): void {
   const dir = join(dataDir, 'dashboard-daemons');
   mkdirSync(dir, { recursive: true });
@@ -266,6 +273,49 @@ describe('botmux delete — daemon-first close', () => {
         `/api/sessions/${other.sessionId}/close`,
         `/api/sessions/${self.sessionId}/close`,
       ]);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('closes a legacy session (no larkAppId) locally even when a daemon is online', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-legacy-data-'));
+    tempDirs.push(dataDir);
+    // Legacy session has no larkAppId and lives in sessions.json, not the
+    // per-bot file. A per-bot daemon cannot persist its close.
+    const session = makeSession('sess-delete-legacy', { larkAppId: undefined });
+    const sessionsPath = writeLegacySessions(dataDir, [session]);
+
+    const seen: string[] = [];
+    const server = createServer(async (req, res) => {
+      seen.push(req.url ?? '');
+      await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"alreadyClosed":false}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: undefined,
+        BOTMUX_LARK_APP_ID: undefined,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_DAEMON_IPC_PORT: undefined,
+      });
+
+      // CLI must not route the legacy session to the daemon: the daemon writes
+      // only its own sessions-<appId>.json and would return "200 OK" without
+      // actually closing the legacy row.
+      expect(seen).toEqual([]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('daemon 离线，本地收口');
+      const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
+      expect(stored[session.sessionId].status).toBe('closed');
+      expect(stored[session.sessionId].closedAt).toBeTruthy();
     } finally {
       await new Promise<void>((resolve, reject) => {
         server.close(err => err ? reject(err) : resolve());

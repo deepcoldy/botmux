@@ -3269,18 +3269,20 @@ async function closeSessionForDelete(
   s: SessionData,
   online = listOnlineDaemons(),
 ): Promise<SessionDeleteCloseResult> {
+  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
+  // writes only its own sessions-<appId>.json and silently no-ops on close
+  // (sessionStore.closeSession only touches the current file), so routing a
+  // legacy session to it yields "200 OK" with no actual state change. Keep
+  // these on the offline fallback, whose saveSession() persists to the legacy
+  // file correctly.
   const daemon = s.larkAppId
     ? online.find(d => d.larkAppId === s.larkAppId)
-    : online.length === 1 ? online[0] : undefined;
+    : undefined;
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
   const injectedPort = isCurrentSession
     ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
     : undefined;
   const ipcPort = daemon?.ipcPort ?? injectedPort;
-
-  if (!s.larkAppId && online.length > 1 && !ipcPort) {
-    return { ok: false, error: '会话缺少 larkAppId，多 daemon 下无法判定归属' };
-  }
 
   if (ipcPort) {
     try {
