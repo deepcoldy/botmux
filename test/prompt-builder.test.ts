@@ -308,7 +308,7 @@ describe('buildFollowUpContent', () => {
     expect(content.indexOf('<mentions>')).toBeGreaterThan(content.indexOf('</user_message>'));
     // Complex send guidance is discoverable once in the opening catalog; keep
     // every follow-up reminder intentionally tiny.
-    expect(content).toContain('<botmux_reminder>回复必须 botmux send，终端输出用户看不到</botmux_reminder>');
+    expect(content).toContain('<botmux_reminder>需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY</botmux_reminder>');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
   });

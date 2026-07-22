@@ -586,7 +586,7 @@ export const messages: Record<string, string> = {
   'ai.routing.intro': '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
   'ai.routing.must_use_botmux': '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
   'ai.routing.usage_heading': '使用指南：',
-  'ai.routing.usage_send_when': '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
+  'ai.routing.usage_send_when': '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
   'ai.routing.usage_send_text': '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
   'ai.routing.usage_heredoc': '- 多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.routing.heredoc_example': "  正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
@@ -617,7 +617,7 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': '多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
-  'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
+  'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -626,7 +626,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
-  'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到',
+  'ai.followup.reminder': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',

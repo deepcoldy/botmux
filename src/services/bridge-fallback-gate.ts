@@ -8,6 +8,10 @@
  * disk and threads them through here.
  *
  * Rules:
+ *   - Non-adopt + exact no-reply sentinel: suppress. Botmux-aware models use
+ *     this explicit protocol when a turn genuinely needs no chat response.
+ *     Exact matching is intentional: prose such as "I should stay silent"
+ *     is still a normal final answer and must not be guessed away.
  *   - Adopt mode never suppresses: in /adopt the model in the adopted
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
@@ -34,6 +38,12 @@ import { normaliseForFingerprint } from './bridge-turn-queue.js';
 
 const MATERIAL_FINAL_LENGTH_RATIO = 2;
 const MATERIAL_FINAL_MIN_EXTRA_CHARS = 120;
+
+export const BRIDGE_NO_REPLY_SENTINEL = 'BOTMUX_NO_REPLY';
+
+export function isBridgeNoReplyFinal(finalText: string | undefined): boolean {
+  return finalText?.trim() === BRIDGE_NO_REPLY_SENTINEL;
+}
 
 export interface BridgeSendMarker {
   sentAtMs: number;
@@ -95,6 +105,7 @@ export function shouldSuppressBridgeEmit(
   adoptMode: boolean,
 ): boolean {
   if (adoptMode) return false;
+  if (isBridgeNoReplyFinal(turn.finalText)) return true;
   if (turn.isLocal) return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;

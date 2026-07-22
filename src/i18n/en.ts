@@ -583,7 +583,7 @@ export const messages: Record<string, string> = {
   'ai.routing.intro': 'You are connected to a Lark (Feishu) topic group. The user is reading on Lark and CANNOT see your terminal output.',
   'ai.routing.must_use_botmux': 'To make the user see something, you MUST send it via the `botmux send` command. Terminal output does NOT reach the chat.',
   'ai.routing.usage_heading': 'How to use it:',
-  'ai.routing.usage_send_when': '- Use `botmux send` for: key conclusions, plans (wait for user approval before acting), final results, progress updates.',
+  'ai.routing.usage_send_when': '- Use `botmux send` for: key conclusions, plans (wait for user approval before acting), final results, progress updates. If no reply is needed, do not explain the silence and do not call `botmux send`; the final assistant message must be exactly `BOTMUX_NO_REPLY`.',
   'ai.routing.usage_send_text': '- Plain text is fine: `botmux send "your message"`. Formatting is auto-handled.',
   'ai.routing.usage_heredoc': '- Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.routing.heredoc_example': "  Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
@@ -614,7 +614,7 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': 'Multi-line body text MUST use a quoted heredoc / stdin (or a UTF-8 `--content-file`). Never write `botmux send "line1\\nline2"` or pass `JSON.stringify` / JSON-escaped text as a positional argument; shell / botmux do not turn literal `\\n` back into newlines.',
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
-  'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
+  'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply. If no reply is needed, do not explain the silence and do not call `botmux send`; the final assistant message must be exactly `BOTMUX_NO_REPLY`.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by VALUE: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Do not default to --no-mention, and do not @ people for nothing.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -623,7 +623,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
-  'ai.followup.reminder': 'Replies must go via `botmux send` — terminal output does not reach the user.',
+  'ai.followup.reminder': 'When a reply is needed, use `botmux send`; when none is needed, do not explain the silence and make the final exactly BOTMUX_NO_REPLY.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',
