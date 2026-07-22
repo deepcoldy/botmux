@@ -6,7 +6,7 @@ import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
-import { getSessionPersistentBackendType, persistentSessionName } from '../core/persistent-backend.js';
+import { getSessionPersistentBackendType, persistentBackendTargetForSession } from '../core/persistent-backend.js';
 import { readGlobalConfig, type LocalCliOpenMode } from '../global-config.js';
 
 export const LOCAL_CLI_IDS = [
@@ -203,13 +203,18 @@ function safeAttachAtom(value: string | undefined): string | undefined {
 
 function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
   const backendType = getSessionPersistentBackendType(ds);
+  const target = persistentBackendTargetForSession(ds);
   if (backendType === 'tmux') {
-    const name = persistentSessionName('tmux', ds.session.sessionId);
-    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${name}`)}` };
+    return { ok: true, command: `tmux attach-session -t ${shellQuote(`=${target!.sessionName}`)}` };
   }
   if (backendType === 'herdr') {
-    const name = persistentSessionName('herdr', ds.session.sessionId);
-    return { ok: true, command: `herdr session attach ${shellQuote(name)}` };
+    if (target!.backendType === 'herdr' && target!.agentName) {
+      return {
+        ok: true,
+        command: `herdr --session ${shellQuote(target!.sessionName)} agent attach ${shellQuote(target!.agentName)}`,
+      };
+    }
+    return { ok: true, command: `herdr session attach ${shellQuote(target!.sessionName)}` };
   }
   return fail('unsupported_backend', 'This session backend does not provide a safe local attach command.');
 }

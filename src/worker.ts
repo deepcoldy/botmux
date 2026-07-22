@@ -6824,6 +6824,16 @@ async function spawnCli(
     launchShell: lastInitConfig?.launchShell,
   });
 
+  // Publish the exact resource selected by this spawn immediately. In shared
+  // Herdr mode the daemon cannot derive the user's host session from the
+  // Botmux session id; persisting it lets worker-less restore/close/wake paths
+  // act on the managed agent instead of a nonexistent bmx-* session. Send on
+  // every in-worker respawn too, because selection may move to another host.
+  send({
+    type: 'persistent_backend_target',
+    target: selectedBackend.persistentBackendTarget,
+  });
+
   if (selectedBackend.createdHerdrSessionName) {
     send({
       type: 'user_notify',

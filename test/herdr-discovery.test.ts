@@ -62,6 +62,44 @@ describe('validateHerdrAdoptTarget', () => {
     expect(validateHerdrAdoptTarget('sess', 'pane-1')).toBe('alive');
   });
 
+  it('does not accept a reused listed pane when the expected CLI no longer runs there', () => {
+    mockExecFileSync
+      .mockReturnValueOnce(
+        JSON.stringify({ result: { agents: [{ pane_id: 'pane-1', agent: '/usr/bin/claude' }] } }) as any,
+      )
+      .mockReturnValueOnce(JSON.stringify({
+        result: {
+          process_info: {
+            foreground_processes: [{ pid: 4242, name: 'codex', argv: ['codex'] }],
+          },
+        },
+      }) as any);
+
+    expect(validateHerdrAdoptTarget('sess', 'pane-1', undefined, 'claude-code')).toBe('missing');
+  });
+
+  it('checks the exact expected PID even when another matching CLI appears first', () => {
+    const listed = JSON.stringify({ result: { agents: [{ pane_id: 'pane-1', agent: '/usr/bin/claude' }] } });
+    const processInfo = JSON.stringify({
+      result: {
+        process_info: {
+          foreground_processes: [
+            { pid: 1111, name: 'claude', argv: ['claude'] },
+            { pid: 2222, name: 'claude', argv: ['claude'] },
+          ],
+        },
+      },
+    });
+    mockExecFileSync
+      .mockReturnValueOnce(listed as any)
+      .mockReturnValueOnce(processInfo as any)
+      .mockReturnValueOnce(listed as any)
+      .mockReturnValueOnce(processInfo as any);
+
+    expect(validateHerdrAdoptTarget('sess', 'pane-1', 2222, 'claude-code')).toBe('alive');
+    expect(validateHerdrAdoptTarget('sess', 'pane-1', 3333, 'claude-code')).toBe('missing');
+  });
+
   it('returns "missing" when herdr returns ok but pane is not in list', () => {
     mockExecFileSync
       .mockReturnValueOnce(JSON.stringify({ result: { agents: [{ pane_id: 'pane-other' }] } }) as any)

@@ -60,6 +60,10 @@ describe('selectSessionBackend', () => {
     expect(selected.backend.constructor.name).toBe('MockTmuxPipeBackend');
     expect((selected.backend as any).paneTarget).toBe('bmx-9cfa0024');
     expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'tmux',
+      sessionName: 'bmx-9cfa0024',
+    });
   });
 
   it('uses managed pipe backend for a new tmux session', () => {
@@ -95,6 +99,11 @@ describe('selectSessionBackend', () => {
       ownsSession: false,
       ownsAgent: true,
     });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'work',
+      agentName: 'botmux-9cfa0024',
+    });
     expect(selected.createdHerdrSessionName).toBeUndefined();
   });
 
@@ -102,6 +111,10 @@ describe('selectSessionBackend', () => {
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'herdr' });
 
     expect((selected.backend as any).sessionName).toBe('bmx-9cfa0024');
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'bmx-9cfa0024',
+    });
     expect(selected.createdHerdrSessionName).toBe('bmx-9cfa0024');
   });
 

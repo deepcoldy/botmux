@@ -35,7 +35,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -1359,7 +1359,7 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
-    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    killPersistentBackendTarget(persistentBackendTargetForSession(ds)!);
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
@@ -2342,6 +2342,11 @@ function setupWorkerHandlers(
   worker.on('message', async (msg: WorkerToDaemon) => {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'persistent_backend_target': {
+        ds.session.persistentBackendTarget = msg.target;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
       case 'ready': {
         startupState.ready = true;
         ds.workerPort = msg.port;

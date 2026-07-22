@@ -4,7 +4,7 @@ import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
-import type { BackendType, SessionBackend } from './types.js';
+import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
 
 export type BackendGateDecision =
   | { action: 'spawn' }
@@ -64,6 +64,8 @@ export interface SelectedSessionBackend {
    *  terminal via relay — but it owns a persistent zellij session internally. */
   isZellijMode: boolean;
   persistentSessionName?: string;
+  /** Exact resource owned by this Botmux session; persisted by the daemon. */
+  persistentBackendTarget?: PersistentBackendTarget;
   isReattach?: boolean;
   /** Set only when this spawn must create a herdr session because none exists. */
   createdHerdrSessionName?: string;
@@ -91,6 +93,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isPipeMode: false,
       isZellijMode: true,
       persistentSessionName: sessionName,
+      persistentBackendTarget: { backendType: 'zellij', sessionName },
       isReattach: reattach,
     };
   }
@@ -113,6 +116,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
         isPipeMode: true,
         isZellijMode: false,
         persistentSessionName: ownedSessionName,
+        persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
         isReattach: true,
       };
     }
@@ -138,6 +142,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
         isPipeMode: true,
         isZellijMode: false,
         persistentSessionName: hostSessionName,
+        persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
         isReattach: reattach,
       };
     }
@@ -148,6 +153,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: ownedSessionName,
+      persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
       isReattach: false,
       createdHerdrSessionName: ownedSessionName,
     };
@@ -161,6 +167,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: sessionName,
+      persistentBackendTarget: { backendType: 'tmux', sessionName },
       isReattach: true,
     };
   }
@@ -171,6 +178,7 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
     isPipeMode: true,
     isZellijMode: false,
     persistentSessionName: sessionName,
+    persistentBackendTarget: { backendType: 'tmux', sessionName },
     isReattach: false,
   };
 }

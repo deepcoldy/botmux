@@ -152,12 +152,15 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { sweepIdleWorkers, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import {
   getSessionPersistentBackendType,
+  killPersistentBackendTarget,
   killPersistentSession,
-  persistentSessionName,
+  probePersistentBackendTarget,
   probePersistentSession,
+  resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -537,7 +540,8 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     }
   }
   const liveBackend = ds ? getSessionPersistentBackendType(ds) : undefined;
-  const persistedBackend = liveBackend ?? sessionStore.getSession(sessionId)?.backendType;
+  const persistedSession = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedBackend = liveBackend ?? persistedSession?.backendType;
   if (persistedBackend === 'pty') return true;
   const backendTypes: readonly PersistentBackendType[] =
     persistedBackend === 'tmux' || persistedBackend === 'herdr' || persistedBackend === 'zellij'
@@ -545,9 +549,14 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
       : VC_MEETING_PERSISTENT_BACKENDS.filter(vcMeetingPersistentBackendAvailable);
   let allMissing = true;
   for (const backendType of backendTypes) {
-    const name = persistentSessionName(backendType, sessionId);
+    const target = resolvePersistentBackendTarget(
+      backendType,
+      sessionId,
+      persistedSession?.persistentBackendTarget,
+    );
+    const name = target.sessionName;
     if (destroy) {
-      try { killPersistentSession(backendType, name); }
+      try { killPersistentBackendTarget(target); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -556,7 +565,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
       }
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-    try { probe = probePersistentSession(backendType, name); }
+    try { probe = probePersistentBackendTarget(target); }
     catch { probe = 'unknown'; }
     if (probe !== 'missing') {
       allMissing = false;
@@ -706,9 +715,10 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   killWorker: (ds: DaemonSession) => void;
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
+  resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string) => void;
-  probePersistent: (backendType: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
+  killPersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => void;
+  probePersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
 };
@@ -783,9 +793,15 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         ? VC_MEETING_PERSISTENT_BACKENDS.filter(deps.backendAvailable)
         : [persistentScope];
     let allMissing = true;
+    const persistedTarget = deps.resolvePersistentTarget?.(fence.receiverSessionId, ds);
     for (const backendType of backendTypes) {
-      const name = persistentSessionName(backendType, fence.receiverSessionId);
-      try { deps.killPersistent(backendType, name); }
+      const target = resolvePersistentBackendTarget(
+        backendType,
+        fence.receiverSessionId,
+        persistedTarget,
+      );
+      const name = target.sessionName;
+      try { deps.killPersistent(backendType, name, target); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -793,7 +809,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         );
       }
       let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
-      try { probe = deps.probePersistent(backendType, name); }
+      try { probe = deps.probePersistent(backendType, name, target); }
       catch { probe = 'unknown'; }
       if (probe !== 'missing') {
         allMissing = false;
@@ -980,10 +996,16 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
       return false;
     }
     let probe: 'exists' | 'missing' | 'unknown' = 'unknown';
+    const target = resolvePersistentBackendTarget(
+      persistentScope,
+      fence.receiverSessionId,
+      ds.session.persistentBackendTarget,
+    );
     try {
       probe = deps.probePersistent(
         persistentScope,
-        persistentSessionName(persistentScope, fence.receiverSessionId),
+        target.sessionName,
+        target,
       );
     } catch { probe = 'unknown'; }
     if (probe === 'missing') {
@@ -1052,9 +1074,17 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
     }
     return backendType === 'pty' ? 'none' : 'unknown';
   },
+  resolvePersistentTarget(sessionId, ds) {
+    return ds?.session.persistentBackendTarget
+      ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;
+  },
   backendAvailable: vcMeetingPersistentBackendAvailable,
-  killPersistent: killPersistentSession,
-  probePersistent: probePersistentSession,
+  killPersistent: (backendType, sessionName, target) => target
+    ? killPersistentBackendTarget(target)
+    : killPersistentSession(backendType, sessionName),
+  probePersistent: (backendType, sessionName, target) => target
+    ? probePersistentBackendTarget(target)
+    : probePersistentSession(backendType, sessionName),
   warn: message => logger.warn(message),
   error: message => logger.error(message),
 });

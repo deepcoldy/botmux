@@ -235,8 +235,35 @@ export class HerdrBackend implements SessionBackend {
   }
 
   static hasAgent(sessionName: string, agentName: string): boolean {
-    const raw = jsonCommand(herdrSessionArgs(sessionName, ['agent', 'get', agentName]), { timeout: 5000 });
-    return !!extractAgent(raw);
+    return HerdrBackend.probeAgent(sessionName, agentName) === 'exists';
+  }
+
+  /** Tri-state probe for a Botmux-managed agent inside a shared session. */
+  static probeAgent(sessionName: string, agentName: string): SessionProbe {
+    const result = tryJsonCommand(
+      herdrSessionArgs(sessionName, ['agent', 'list']),
+      { timeout: 5000 },
+    );
+    if (!result.ok) {
+      // `agent list` can fail because this specific host session disappeared,
+      // not only because the Herdr server is unavailable. Preserve the same
+      // missing-vs-unknown distinction as whole-session lifecycle probes.
+      return HerdrBackend.probeSession(sessionName) === 'missing' ? 'missing' : 'unknown';
+    }
+    const agent = extractAgents(result.value).find((row: any) => row?.name === agentName);
+    return agent && !agentRowExited(agent) ? 'exists' : 'missing';
+  }
+
+  /** Close only the managed pane, never the surrounding user-owned session. */
+  static killAgent(sessionName: string, agentName: string): void {
+    const raw = jsonCommand(
+      herdrSessionArgs(sessionName, ['agent', 'list']),
+      { timeout: 5000 },
+    );
+    const paneId = extractAgents(raw).find((row: any) => row?.name === agentName)?.pane_id;
+    if (typeof paneId === 'string' && paneId) {
+      runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', paneId]), { timeout: 5000 });
+    }
   }
 
   get isReattach(): boolean {
@@ -421,8 +448,12 @@ export class HerdrBackend implements SessionBackend {
     // existing session owns its pane but never the surrounding herdr session.
     if (this.opts.ownsSession ?? !this.opts.externalTarget) {
       HerdrBackend.killSession(this.sessionName);
-    } else if (this.opts.ownsAgent && this.paneId) {
-      runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
+    } else if (this.opts.ownsAgent) {
+      if (this.paneId) {
+        runHerdr(herdrSessionArgs(this.sessionName, ['pane', 'close', this.paneId]), { timeout: 5000 });
+      } else {
+        HerdrBackend.killAgent(this.sessionName, this.agentName);
+      }
     }
   }
 

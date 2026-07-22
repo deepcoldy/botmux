@@ -195,6 +195,38 @@ describe('HerdrBackend connection surface', () => {
     expect(HerdrBackend.hasSession(SESSION)).toBe(false);
   });
 
+  it('probeAgent() distinguishes a live managed agent, a missing agent, and a failed probe', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-live', pane_id: '1-1' },
+        { name: 'botmux-exited', pane_id: '1-2', running: false },
+      ] } }),
+    }]);
+
+    expect(HerdrBackend.probeAgent('work', 'botmux-live')).toBe('exists');
+    expect(HerdrBackend.probeAgent('work', 'botmux-exited')).toBe('missing');
+    expect(HerdrBackend.probeAgent('work', 'botmux-absent')).toBe('missing');
+
+    mockedExecFileSync.mockImplementation((() => { throw new Error('ETIMEDOUT'); }) as any);
+    expect(HerdrBackend.probeAgent('work', 'botmux-live')).toBe('unknown');
+  });
+
+  it('killAgent() closes only the managed pane in a shared session', () => {
+    setHerdrResponses([{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: 'botmux-deadbeef', pane_id: '4-2' },
+      ] } }),
+    }]);
+
+    HerdrBackend.killAgent('work', 'botmux-deadbeef');
+
+    expect(herdrCall('--session', 'work', 'pane', 'close', '4-2')).toBeDefined();
+    expect(herdrCall('session', 'stop', 'work')).toBeUndefined();
+    expect(herdrCall('session', 'delete', 'work')).toBeUndefined();
+  });
+
   it('ensureServer skips boot poll when session already exists (no spawn, no sleep)', () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },

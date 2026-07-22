@@ -614,14 +614,18 @@ function extractHerdrPanes(raw: any): any[] {
   return Array.isArray(panes) ? panes : [];
 }
 
-function herdrPaneCliProcess(raw: any, filterCliId?: CliId): { pid: number; cliId: CliId; cwd?: string } | undefined {
+function herdrPaneCliProcess(
+  raw: any,
+  filterCliId?: CliId,
+  expectedPid?: number,
+): { pid: number; cliId: CliId; cwd?: string } | undefined {
   const info = raw?.result?.process_info;
   const processes = Array.isArray(info?.foreground_processes) ? info.foreground_processes : [];
   for (const proc of processes) {
     const argv = Array.isArray(proc?.argv) ? proc.argv.filter((v: unknown): v is string => typeof v === 'string') : [];
     const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, argv, filterCliId);
     const pid = Number(proc?.pid);
-    if (cliId && Number.isInteger(pid) && pid > 0) {
+    if (cliId && Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid)) {
       return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
     }
   }
@@ -899,14 +903,17 @@ export function validateHerdrAdoptTarget(
   if (!sessionName || !paneId) return 'missing';
   const rawAgents = tryHerdrJson(['--session', sessionName, 'agent', 'list']);
   if (!rawAgents.ok) return 'unknown';
-  if (extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId)) return 'alive';
+  const listed = extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId);
+  // A matching pane id proves only that the pane still exists. Herdr can reuse
+  // that pane for another process after the originally discovered CLI exits,
+  // so PID/CLI-constrained adoption must re-check the foreground process too.
+  if (listed && !expectedPid && !expectedCliId) return 'alive';
 
-  // Hook-less/unknown panes (notably TraeX before its first lifecycle hook)
-  // are absent from agent list. Validate those against the live foreground
-  // process instead of rejecting a target discovery just found by process-info.
+  // Validate constrained listed panes, plus hook-less/unknown panes (notably
+  // TraeX before its first lifecycle hook), against the live foreground process.
   const rawInfo = tryHerdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
   if (!rawInfo.ok) return 'unknown';
-  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId);
+  const process = herdrPaneCliProcess(rawInfo.value, expectedCliId, expectedPid);
   if (!process) return 'missing';
   if (expectedPid && process.pid !== expectedPid) return 'missing';
   return 'alive';

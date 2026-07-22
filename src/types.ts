@@ -1,4 +1,4 @@
-import type { BackendType } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -323,6 +323,13 @@ export interface Session {
    */
   backendType?: BackendType;
   /**
+   * Exact persistent resource selected by the worker. Normally this is the
+   * deterministic `bmx-<sid8>` mux session. For shared Herdr it records the
+   * user's host session plus Botmux's managed agent name, so daemon-only
+   * lifecycle paths can probe/close the pane without killing the host session.
+   */
+  persistentBackendTarget?: PersistentBackendTarget;
+  /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
    * sandbox status is frozen here at creation so a restore/restart never
@@ -594,6 +601,7 @@ export type DaemonToWorker =
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
