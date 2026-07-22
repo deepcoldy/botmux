@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import {
+  shouldEmitEmptyCompletedBridgeFallback,
+  shouldSuppressBridgeEmit,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -142,5 +146,67 @@ describe('shouldSuppressBridgeEmit', () => {
   it('non-adopt: multiple markers — any one inside window triggers suppress', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 50 }, { sentAtMs: 175 }, { sentAtMs: 500 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, false)).toBe(true);
+  });
+});
+
+describe('shouldEmitEmptyCompletedBridgeFallback', () => {
+  it('emits a visible diagnostic when a completed turn has empty final text and no send marker', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('does not emit when the completed empty turn already has a botmux send marker', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      200,
+      [markerForContent(150, 'already sent visible result')],
+      false,
+    )).toBe(false);
+  });
+
+  it('does not emit for failed, ambiguous, local, adopt, or non-empty turns', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'ambiguous' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100, true), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: 'real answer', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('treats legacy empty assistant_final as completed for fallback purposes', () => {
+    expect(shouldEmitEmptyCompletedBridgeFallback(
+      { ...turn(100), finalText: '' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
   });
 });

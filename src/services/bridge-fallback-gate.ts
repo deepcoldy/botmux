@@ -52,6 +52,9 @@ export interface BridgeGateInput {
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
+  /** Explicit transcript terminal semantics. Undefined preserves the
+   * historical "assistant_final means completed" behavior. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
 export function buildBridgeSendMarkerContent(content: string): Pick<BridgeSendMarker, 'contentLength'> | undefined {
@@ -101,4 +104,21 @@ export function shouldSuppressBridgeEmit(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
   return markerSetCoversFinal(markersInWindow, turn.finalText);
+}
+
+/** Some structured CLIs can report a durable completed turn while their
+ * terminal event carries no final text. If there was no explicit `botmux send`
+ * in that turn window, silently completing leaves the Lark thread with no
+ * visible outcome. Emit a diagnostic fallback only for that narrow case. */
+export function shouldEmitEmptyCompletedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
+  if ((turn.finalText ?? '').trim().length > 0) return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }
