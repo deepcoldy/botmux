@@ -9130,6 +9130,10 @@ process.on('message', async (raw: unknown) => {
 
     case 'tui_keys': {
       handleTuiKeys(msg.keys, msg.isFinal);
+      // Re-arm the stuck detector: a key press may advance the CLI to another
+      // blocking screen (e.g. Enter moves from the hook list to a per-hook
+      // review). Without re-arming, the next stall would not warn the user.
+      stuckDetector?.arm();
       break;
     }
 

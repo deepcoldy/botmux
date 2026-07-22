@@ -2,36 +2,34 @@
  * Lightweight, AI-free "stuck" detector — fires a callback when a written input
  * has not produced a completed turn within a timeout window.
  *
- * Why this exists: the AI-powered ScreenAnalyzer catches rendered TUI selectors
- * (option lists, confirm dialogs) but is opt-in and requires an LLM endpoint.
- * Some blocking states — Codex PreToolUse hook review, a bare `[Y/n]` prompt,
- * a "Press any key" pause — do not always render as a clean option list, or the
- * analyzer is simply not configured. Without a fallback, botmux silently waits
- * forever while the user assumes the message was never delivered.
+ * Scope (intentionally narrow): this PR targets the specific Codex PreToolUse
+ * hook-review blocking state, where the CLI renders a review screen and waits
+ * for t/Enter/Esc. Generic [Y/n]/permission/Press-to-continue prompts are NOT
+ * handled here — they require semantic parsing that cannot be safely inferred
+ * from a regex, and belong in a follow-up PR.
  *
  * The detector does NOT itself decide the CLI is stuck. It only tracks elapsed
  * time since the last write and asks the owner (worker) to confirm via the
  * `isActuallyStuck` callback — the worker knows whether inflight inputs exist,
- * whether a TUI prompt card is already posted, and whether the CLI is at its
- * idle prompt. This avoids false positives from legitimately long turns.
+ * whether a TUI prompt card is already posted, and whether the PTY has been
+ * quiet. This avoids false positives from legitimately long turns.
  */
 
-/** Patterns that strongly suggest the CLI is blocked on user input rather than
- *  genuinely working. Matched against a recent terminal snapshot (ANSI-stripped). */
-const STUCK_PATTERNS: Array<{ re: RegExp; label: string }> = [
+/** Patterns identifying the Codex PreToolUse hook-review screen. Matched
+ *  against a recent terminal snapshot (ANSI-stripped). The label doubles as the
+ *  card's human-readable description. */
+const HOOK_REVIEW_PATTERNS: Array<{ re: RegExp; label: string }> = [
   { re: /hook needs review|needs review before it can run|PreToolUse hooks/i, label: 'hook review prompt' },
-  { re: /Press .+ to/i, label: 'key-press prompt' },
-  { re: /\[(Y|y)\/(N|n)\]|\[Y\/n\]|\[y\/N\]/, label: 'yes/no confirmation' },
-  { re: /trust all|review hooks/i, label: 'trust/review prompt' },
-  { re: /Do you want to|Would you like to|Proceed\?|Continue\?/i, label: 'confirmation question' },
-  { re: /permission|allow|deny/i, label: 'permission prompt' },
+  { re: /Press t to trust all/i, label: 'hook review prompt' },
 ];
 
 export interface StuckDetectorCallbacks {
   /** Called when the timeout elapses. Return true to fire the warning; false
    *  to silently re-arm (e.g. the CLI just finished a long turn). */
   isActuallyStuck: () => boolean;
-  /** Called once per armed window when isActuallyStuck returns true. */
+  /** Called once per armed window when isActuallyStuck returns true.
+   *  `matchedLabel` is set when the snapshot matches a known hook-review
+   *  pattern; undefined means the turn is stalled but the cause is unknown. */
   onStuck: (elapsedMs: number, matchedLabel?: string) => void;
   /** Optional: return the current terminal snapshot for pattern matching. */
   getSnapshot?: () => string;
@@ -91,7 +89,7 @@ export class StuckDetector {
   private matchSnapshot(): string | undefined {
     const snap = this.callbacks.getSnapshot?.();
     if (!snap) return undefined;
-    for (const { re, label } of STUCK_PATTERNS) {
+    for (const { re, label } of HOOK_REVIEW_PATTERNS) {
       if (re.test(snap)) return label;
     }
     return undefined;
