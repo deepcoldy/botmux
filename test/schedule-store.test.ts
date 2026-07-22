@@ -116,6 +116,24 @@ describe('schedule-store', () => {
       expect(data[ids[0]].name).toBe(TASK_PARAMS.name);
     });
 
+    it('persists fresh-topic execution and its custom title across reloads', async () => {
+      const { createTask } = await freshImport();
+      const task = createTask({
+        ...TASK_PARAMS,
+        executionPosition: 'new-topic',
+        topicTitle: '每日发布巡检',
+        scope: 'chat',
+      });
+
+      const { getTask } = await freshImport();
+      expect(getTask(task.id)).toMatchObject({
+        executionPosition: 'new-topic',
+        topicTitle: '每日发布巡检',
+        scope: 'chat',
+        deliver: 'origin',
+      });
+    });
+
     it('should assign unique IDs to different tasks', async () => {
       const { createTask } = await freshImport();
       const t1 = createTask({ ...TASK_PARAMS, name: 'Task A' });
@@ -229,26 +247,45 @@ describe('schedule-store', () => {
       expect(listTasks()).toHaveLength(0);
     });
 
-    it('should update the deliver mode (origin ↔ new-topic)', async () => {
+    it('normalizes a legacy new-topic update to origin', async () => {
       const { createTask, updateTask, getTask } = await freshImport();
       const task = createTask({ ...TASK_PARAMS, deliver: 'origin' });
       expect(task.deliver).toBe('origin');
 
       updateTask(task.id, { deliver: 'new-topic' });
-      expect(getTask(task.id)!.deliver).toBe('new-topic');
+      expect(getTask(task.id)!.deliver).toBe('origin');
 
       updateTask(task.id, { deliver: 'origin' });
       expect(getTask(task.id)!.deliver).toBe('origin');
     });
 
-    it('should persist a new-topic task created with deliver', async () => {
+    it('normalizes a legacy new-topic create to origin across reloads', async () => {
       const { createTask, getTask } = await freshImport();
       const task = createTask({ ...TASK_PARAMS, deliver: 'new-topic' });
       // Re-read from a fresh module instance to confirm it survives disk round-trip.
       const { getTask: getTask2 } = await freshImport();
-      expect(getTask2(task.id)!.deliver).toBe('new-topic');
+      expect(getTask2(task.id)!.deliver).toBe('origin');
       // (within same instance too)
-      expect(getTask(task.id)!.deliver).toBe('new-topic');
+      expect(getTask(task.id)!.deliver).toBe('origin');
+    });
+
+    it('migrates a legacy new-topic row to explicit fresh-topic execution', async () => {
+      const fp = join(tempDir, 'schedules.json');
+      writeFileSync(fp, JSON.stringify({
+        legacy: {
+          ...TASK_PARAMS,
+          id: 'legacy',
+          enabled: true,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          deliver: 'new-topic',
+        },
+      }), 'utf-8');
+
+      const { getTask } = await freshImport();
+      expect(getTask('legacy')).toMatchObject({
+        executionPosition: 'new-topic',
+        deliver: 'origin',
+      });
     });
 
     it('should persist updates to disk', async () => {

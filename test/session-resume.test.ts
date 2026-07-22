@@ -142,6 +142,7 @@ import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '..
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { writeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 beforeEach(() => {
@@ -240,6 +241,27 @@ describe('resumeSession', () => {
       expect(map.size).toBe(1);
       expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
       expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('keeps an unmaterialized auto-closed schedule run audit-only', async () => {
+      const hidden = makeClosedSession({
+        rootMessageId: 'schedule-run:task-1:run-1',
+        scope: 'chat',
+      });
+      hidden.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-1',
+        routingAnchor: 'schedule-run:task-1:run-1',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(hidden);
+      sessionStore.closeSession(hidden.sessionId);
+
+      expect(await resumeSession(hidden.sessionId, new Map())).toEqual({
+        ok: false,
+        error: 'deferred_unmaterialized',
+      });
+      expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('closed');
     });
 
     it('returns anchor_occupied when a REAL in-memory session owns the anchor', async () => {
@@ -363,6 +385,67 @@ describe('resumeSession', () => {
   });
 
   describe('success path', () => {
+    it('closes an unmaterialized hidden schedule run during daemon restore', async () => {
+      const hidden = sessionStore.createSession(
+        'oc_target',
+        'schedule-run:task-1:run-1',
+        'hidden schedule',
+        'group',
+      );
+      hidden.larkAppId = 'app_test';
+      hidden.scope = 'chat';
+      hidden.cliId = 'claude-code';
+      hidden.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-1',
+        routingAnchor: 'schedule-run:task-1:run-1',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(hidden);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      expect(map.size).toBe(0);
+      expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('closed');
+    });
+
+    it('restores a materialized lazy topic at its isolated virtual anchor', async () => {
+      const materialized = sessionStore.createSession(
+        'oc_target',
+        'schedule-run:task-1:run-2',
+        'published schedule',
+        'group',
+      );
+      materialized.larkAppId = 'app_test';
+      materialized.scope = 'chat';
+      materialized.cliId = 'claude-code';
+      materialized.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-2',
+        routingAnchor: 'schedule-run:task-1:run-2',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(materialized);
+      writeDeferredTopicBinding(tempDir, {
+        sessionId: materialized.sessionId,
+        turnId: materialized.deferredScheduleRun.turnId,
+        chatId: 'oc_target',
+        larkAppId: 'app_test',
+        routingAnchor: materialized.deferredScheduleRun.routingAnchor,
+        rootMessageId: 'om_materialized_root',
+        createdAt: '2026-07-21T00:01:00.000Z',
+      });
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('schedule-run:task-1:run-2', 'app_test'));
+      expect(restored?.session.sessionId).toBe(materialized.sessionId);
+      expect(restored?.session.rootMessageId).toBe('om_materialized_root');
+      expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
+    });
+
     it('restores dedicated VC receivers without collapsing them into the ordinary chat slot', async () => {
       const make = (title: string, receiver?: { meetingId: string; memberId: string }) => {
         const s = sessionStore.createSession('oc_listener', 'oc_listener', title, 'group');

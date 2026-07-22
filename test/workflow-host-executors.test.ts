@@ -526,6 +526,31 @@ describe('botmuxScheduleExecutor invoke()', () => {
       ok: false,
       errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
     });
+
+    const freshTopic = parseScheduleInput({
+      ...base,
+      schedule: 'every 30m',
+      executionPosition: 'new-topic',
+      topicTitle: '  每日发布巡检  ',
+    });
+    expect(freshTopic).toMatchObject({
+      executionPosition: 'new-topic',
+      scope: undefined,
+      topicTitle: '每日发布巡检',
+      deliver: 'origin',
+    });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(freshTopic, Date.now())).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      { ...freshTopic, silent: true },
+      Date.now(),
+    )).toEqual({ ok: true });
+    expect(botmuxScheduleExecutor.validateBeforeIntent!(
+      parseScheduleInput({ ...base, schedule: 'every 30m', executionPosition: 'topic' }),
+      Date.now(),
+    )).toMatchObject({
+      ok: false,
+      errorCode: 'HOST_SCHEDULE_TOPIC_ROOT_REQUIRED',
+    });
   });
 });
 

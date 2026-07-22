@@ -12,6 +12,7 @@ import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import * as scheduler from '../src/core/scheduler.js';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
@@ -836,6 +837,86 @@ describe('GET /api/schedules', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(Array.isArray(body.schedules)).toBe(true);
+  });
+});
+
+describe('POST /api/schedules execution position', () => {
+  it('accepts fresh-topic execution with a custom title and no retained root', async () => {
+    setLarkAppId('cli_schedule_test');
+    const addSpy = vi.spyOn(scheduler, 'addTask').mockImplementation((params: any) => ({
+      ...params,
+      id: 'fresh-1',
+      parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+      enabled: true,
+      createdAt: '2026-07-21T00:00:00.000Z',
+      deliver: 'origin',
+    }));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: '每日巡检',
+        schedule: 'every 30m',
+        prompt: '检查发布状态',
+        chatId: 'oc_target',
+        executionPosition: 'new-topic',
+        topicTitle: '每日发布巡检',
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(addSpy).toHaveBeenCalledWith(expect.objectContaining({
+      scope: 'chat',
+      executionPosition: 'new-topic',
+      topicTitle: '每日发布巡检',
+      rootMessageId: undefined,
+    }));
+    expect((await res.json()).task).toMatchObject({
+      executionPosition: 'new-topic',
+      topicTitle: '每日发布巡检',
+    });
+    addSpy.mockRestore();
+  });
+
+  it('accepts fresh-topic + silent as a lazily materialized topic', async () => {
+    setLarkAppId('cli_schedule_test');
+    const addSpy = vi.spyOn(scheduler, 'addTask').mockImplementation((params: any) => ({
+      ...params,
+      id: 'silent-fresh-1',
+      parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+      enabled: true,
+      createdAt: '2026-07-21T00:00:00.000Z',
+      deliver: 'origin',
+    }));
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/schedules`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: '静默巡检',
+        schedule: 'every 30m',
+        prompt: '检查发布状态',
+        chatId: 'oc_target',
+        executionPosition: 'new-topic',
+        silent: true,
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect((await res.json()).task).toMatchObject({
+      name: '静默巡检',
+      executionPosition: 'new-topic',
+      scope: 'chat',
+      silent: true,
+    });
+    expect(addSpy).toHaveBeenCalledWith(expect.objectContaining({
+      executionPosition: 'new-topic',
+      scope: 'chat',
+      silent: true,
+    }));
+    addSpy.mockRestore();
   });
 });
 

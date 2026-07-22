@@ -883,6 +883,8 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
     ...(context.resolvedWorkflowData ? { resolvedWorkflowData: context.resolvedWorkflowData } : {}),
     ...(deps.maxParallel ? { globalConcurrency: deps.maxParallel } : {}),
     ...(deps.cancelSignal ? { cancelSignal: deps.cancelSignal } : {}),
+    // Real BOTMUX_* identity env for worker CLI children (see RunNodeRequest.chatBinding).
+    ...(binding ? { chatBinding: binding } : {}),
   };
 
   const outcome = await runWorkflow(dag, runtimeDeps, opts);

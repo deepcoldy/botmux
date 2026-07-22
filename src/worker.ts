@@ -822,6 +822,8 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let deferredTopicOutputTail = '';
+const reportedDeferredTopicRoots = new Set<string>();
 const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff' };
 function cliName(): string { return CLI_DISPLAY_NAMES[lastInitConfig?.cliId ?? ''] ?? 'CLI'; }
 let isPromptReady = false;
@@ -4367,12 +4369,56 @@ function splitCodexAppControl(data: string): string {
   );
 }
 
+/** Riff runs `botmux send` in a remote filesystem, so its local binding
+ * sidecar is invisible to the host daemon. The CLI includes the claimed root
+ * in its success JSON; harvest that trusted-session/turn tuple from terminal
+ * output and forward it over worker IPC. The daemon accepts this relay only
+ * for Riff and verifies the claimed root belongs to the target chat; local
+ * backends use the host-visible sidecar directly. */
+function maybeReportDeferredTopicMaterialization(data: string): void {
+  const run = lastInitConfig?.deferredScheduleRun;
+  if (!run) return;
+  deferredTopicOutputTail = tailChars(deferredTopicOutputTail + stripAnsiForLog(data), 16_000);
+  const lines = deferredTopicOutputTail.split(/\r?\n/);
+  deferredTopicOutputTail = lines.pop() ?? '';
+  for (const line of lines) {
+    const start = line.indexOf('{"success":true');
+    const end = line.lastIndexOf('}');
+    if (start < 0 || end < start) continue;
+    try {
+      const parsed = JSON.parse(line.slice(start, end + 1)) as {
+        success?: boolean;
+        sessionId?: string;
+        turnId?: string;
+        deferredTopicRootMessageId?: string;
+      };
+      const root = parsed.deferredTopicRootMessageId;
+      if (
+        parsed.success !== true
+        || parsed.sessionId !== sessionId
+        || parsed.turnId !== run.turnId
+        || typeof root !== 'string'
+        || !root.startsWith('om_')
+        || reportedDeferredTopicRoots.has(root)
+      ) continue;
+      reportedDeferredTopicRoots.add(root);
+      send({
+        type: 'deferred_topic_materialized',
+        sessionId,
+        turnId: run.turnId,
+        rootMessageId: root,
+      });
+    } catch { /* not a botmux send JSON line */ }
+  }
+}
+
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
 function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
   lastPtyActivityAtMs = Date.now();
+  maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
   captureWorkflowTranscript(data);
   renderer?.write(data);
@@ -5733,6 +5779,15 @@ async function spawnCli(
     sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage ? 'thread' : 'chat';
     if (rootIsMessage) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
+    if (cfg.deferredScheduleRun) {
+      sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TASK_ID = cfg.deferredScheduleRun.taskId;
+      sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TURN_ID = cfg.deferredScheduleRun.turnId;
+      sessionEnv.BOTMUX_DEFERRED_SCHEDULE_ROUTING_ANCHOR = cfg.deferredScheduleRun.routingAnchor;
+      sessionEnv.BOTMUX_DEFERRED_SCHEDULE_CREATED_AT = cfg.deferredScheduleRun.createdAt;
+      if (cfg.deferredScheduleRun.topicTitle) {
+        sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TOPIC_TITLE = cfg.deferredScheduleRun.topicTitle;
+      }
+    }
     // Turn sender so `--mention-back` can resolve an @ target in the sandbox.
     if (cfg.ownerOpenId) sessionEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
     // Lark credentials so `botmux send` works inside the riff sandbox without a
@@ -6341,6 +6396,13 @@ async function spawnCli(
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  // Session owner under the standard BOTMUX_* name (the riff backend already
+  // exposes it; `__OWNER_OPEN_ID` stays for back-compat). Custom CLI wrappers
+  // use it for per-user permission isolation. Advisory identity only — botmux's
+  // own authz paths (v3 command authority, host.ts) ignore env owner values and
+  // resolve the current-turn caller from turn provenance instead.
+  if (cfg.ownerOpenId) childEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
+  else delete childEnv.BOTMUX_OWNER_OPEN_ID;
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-
   // written cred FILE in its BOT_HOME (send-cred.json, see sendCredFilePath) located
   // via the BOTMUX_LARK_APP_ID above — NOT from the env. The secret is deliberately kept OUT

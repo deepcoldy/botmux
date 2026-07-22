@@ -1488,7 +1488,7 @@ export interface EventHandlers {
    *  (rootMessageId for thread-scope, chatId for chat-scope). */
   isSessionOwner?: (anchor: string, larkAppId: string) => boolean;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
-  resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string } | null;
+  resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
   /** Fired when the dispatcher detects that a chat with a live chat-scope
    *  session has been converted to topic mode (chat_mode 'group' → 'topic'
    *  via Lark group settings). Daemon should evict the stale chat-scope
@@ -2469,7 +2469,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
           if (freshMode === 'group') {
             routing.scope = 'chat';
-            routing.anchor = alias.chatId;
+            routing.anchor = alias.anchor ?? alias.chatId;
             replyRootId = message.root_id;
             logger.info(`[reply-mode] alias root=${message.root_id.substring(0, 12)} → chat=${alias.chatId.substring(0, 12)} session=${alias.sessionId.substring(0, 8)}`);
           }

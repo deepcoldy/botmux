@@ -73,7 +73,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
 export type { DaemonSession } from './core/types.js';
 import type { DaemonSession } from './core/types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId } from './core/types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId } from './core/types.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -143,6 +143,8 @@ import { triggerSessionTurn } from './core/trigger-session.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -2209,19 +2211,99 @@ function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAlias
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
 }
 
-function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string } | null {
+function reconcileDeferredTopicBinding(ds: DaemonSession): string | undefined {
+  const run = ds.session.deferredScheduleRun;
+  if (!run) return undefined;
+  const binding = readDeferredTopicBinding(config.session.dataDir, ds.session.sessionId);
+  if (!binding
+    || binding.turnId !== run.turnId
+    || binding.chatId !== ds.chatId
+    || binding.larkAppId !== ds.larkAppId
+    || binding.routingAnchor !== run.routingAnchor) return undefined;
+  const nowIso = new Date().toISOString();
+  const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
+  const previous = aliases[binding.rootMessageId];
+  aliases[binding.rootMessageId] = {
+    createdAt: previous?.createdAt ?? binding.createdAt,
+    lastUsedAt: previous?.lastUsedAt ?? nowIso,
+  };
+  const changed = ds.session.rootMessageId !== binding.rootMessageId
+    || !ds.session.replyThreadAliases?.[binding.rootMessageId];
+  ds.session.rootMessageId = binding.rootMessageId;
+  ds.session.replyThreadAliases = aliases;
+  ds.replyThreadAliases = aliases;
+  if (changed) sessionStore.updateSession(ds.session);
+  return binding.rootMessageId;
+}
+
+const deferredScheduleSettleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleDeferredScheduleSettlement(
+  ds: DaemonSession,
+  context: { turnId: string; source: 'terminal' | 'idle' },
+): void {
+  const run = ds.session.deferredScheduleRun;
+  if (!run || run.turnId !== context.turnId) return;
+  const sessionId = ds.session.sessionId;
+  const prior = deferredScheduleSettleTimers.get(sessionId);
+  if (prior) clearTimeout(prior);
+  // Exact transcript terminal needs only a short filesystem visibility grace.
+  // Screen-only adapters use a longer confirmation and re-check that the same
+  // turn is still idle before reclaiming the hidden session.
+  const delayMs = context.source === 'terminal'
+    ? (ds.session.backendType === 'riff' ? 1_500 : 300)
+    : 1_500;
+  const timer = setTimeout(() => {
+    deferredScheduleSettleTimers.delete(sessionId);
+    void settleDeferredScheduleRun(ds, context, {
+      reconcile: reconcileDeferredTopicBinding,
+      closeSession: closeSessionHelper,
+    }).then((result) => {
+      if (result.action === 'materialized') {
+        logger.info(
+          `[scheduler] Deferred topic materialized session=${sessionId.slice(0, 8)} root=${result.rootMessageId.slice(0, 12)}`,
+        );
+        return;
+      }
+      if (result.action === 'closed') {
+        logger.info(
+          `[scheduler] Auto-closed silent deferred run with no botmux send `
+          + `session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
+        );
+      }
+    }).catch((err) => {
+      logger.warn(`[scheduler] Deferred run settlement failed session=${sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }, delayMs);
+  deferredScheduleSettleTimers.set(sessionId, timer);
+}
+
+function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
-    if (sessionHasReplyThreadAlias(ds.session, rootId)) return { chatId: ds.chatId, sessionId: ds.session.sessionId };
+    const deferredRoot = reconcileDeferredTopicBinding(ds);
+    if (sessionHasReplyThreadAlias(ds.session, rootId) || deferredRoot === rootId) {
+      return { chatId: ds.chatId, sessionId: ds.session.sessionId, anchor: sessionAnchorId(ds) };
+    }
   }
   const diskSessions = sessionStore.listSessions();
   if (diskSessions.some(s => s.status === 'active' && s.larkAppId === larkAppId && s.scope !== 'chat' && s.rootMessageId === rootId)) {
     return null;
   }
-  const hit = diskSessions.find(s => s.status === 'active' && s.larkAppId === larkAppId && s.chatId === chatId && sessionHasReplyThreadAlias(s, rootId));
-  return hit ? { chatId: hit.chatId, sessionId: hit.sessionId } : null;
+  const hit = diskSessions.find(s => {
+    if (s.status !== 'active' || s.larkAppId !== larkAppId || s.chatId !== chatId || s.scope !== 'chat') return false;
+    if (sessionHasReplyThreadAlias(s, rootId)) return true;
+    if (!s.deferredScheduleRun) return false;
+    const binding = readDeferredTopicBinding(config.session.dataDir, s.sessionId);
+    return binding?.rootMessageId === rootId
+      && binding.turnId === s.deferredScheduleRun.turnId
+      && binding.routingAnchor === s.deferredScheduleRun.routingAnchor;
+  });
+  return hit
+    ? { chatId: hit.chatId, sessionId: hit.sessionId, anchor: storedSessionAnchorId(hit) }
+    : null;
 }
 
 function setDirectChatDisplayNameFromSender(
@@ -16426,6 +16508,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
+    onDeferredScheduleTurnSettled(ds, context) {
+      scheduleDeferredScheduleSettlement(ds, context);
+    },
     onCliExit(_ds, context) {
       const result = handleVcMeetingWorkerGenerationExit(context, {
         dataDir: config.session.dataDir,
@@ -16937,6 +17022,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     vcMeetingReceiverRecoveryEscalating.clear();
     vcMeetingReceiverRecoveryScopes.clear();
     vcMeetingRuntimeLeaseRecovery.reset();
+    for (const timer of deferredScheduleSettleTimers.values()) clearTimeout(timer);
+    deferredScheduleSettleTimers.clear();
     vcMeetingReceiverRecoveryReady = false;
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();

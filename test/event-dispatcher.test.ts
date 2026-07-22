@@ -3367,6 +3367,36 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  it('routes a lazy schedule topic reply through its isolated virtual anchor', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.resolveReplyThreadAlias.mockReturnValue({
+      chatId: 'chat-reply-mode',
+      sessionId: 'sess-deferred',
+      anchor: 'schedule-run:task-1:run-1',
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'schedule-run:task-1:run-1');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up on the alert' }),
+      rootId: 'om_deferred_root',
+      messageId: 'om_deferred_reply',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'schedule-run:task-1:run-1',
+      replyRootId: 'om_deferred_root',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('shared follow-up with mention mode topic yields when the reply @mentions ANOTHER bot', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'topic' });
     mockGetChatMode.mockResolvedValue('group');

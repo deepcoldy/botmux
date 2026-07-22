@@ -102,6 +102,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
   'BOTMUX_ROOT_MESSAGE_ID',
+  // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
+  // channel). Custom CLI wrappers read it for per-user permission isolation.
+  'BOTMUX_OWNER_OPEN_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs

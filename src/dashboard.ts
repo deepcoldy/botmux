@@ -3376,7 +3376,17 @@ const server = createServer(async (req, res) => {
       const id = decodeURIComponent(m[1]); const op = m[2];
       const owner = resolveScheduleOwner(id);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
-      const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, { method: 'POST' });
+      let init: RequestInit = { method: 'POST' };
+      if (op === 'delivery') {
+        let body: unknown;
+        try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+        init = {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        };
+      }
+      const upstream = await proxyToDaemon(owner, `/api/schedules/${id}/${op}`, init);
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;
