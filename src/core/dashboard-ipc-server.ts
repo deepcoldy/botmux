@@ -67,7 +67,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -1375,11 +1375,13 @@ ipcRoute('GET', '/api/owner-profile', async (_req, res) => {
 // Codex/Claude Code 再收到一条 best-effort 原生 /rename，同步其 resume picker。
 // 飞书话题标题不受影响。全视图（看板/状态板/表格/抽屉）读同一字段。
 ipcRoute('POST', '/api/sessions/:sessionId/rename', async (req, res, params) => {
-  let body: { title?: unknown; source?: unknown };
+  let body: { title?: unknown; source?: unknown } & Record<string, unknown>;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const active = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, active, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   const title = normalizeSessionTitle(body.title);
   if (!title) return jsonRes(res, 400, { ok: false, error: 'bad_title' });
-  const active = findActiveBySessionId(params.sessionId);
   const session = active?.session ?? sessionStore.getOwnedSession(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   const source = normalizeSessionTitleSource(body.source, 'dashboard');
@@ -1434,6 +1436,9 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
   if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (!sessionSupportsWebTerminal(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'terminal_unsupported' });
+  }
   // Riff backend: the sandbox URL is the writable link — no local worker needed.
   if (ds.riffAccessUrl) {
     jsonRes(res, 200, { ok: true, url: ds.riffAccessUrl });
@@ -1481,7 +1486,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/write-link-card', async (req, res, pa
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   const r = await deliverWriteLinkCardToOwners(ds);
   const status = r.ok ? 200
-    : r.error === 'terminal_unavailable' ? 409
+    : r.error === 'terminal_unavailable' || r.error === 'terminal_unsupported' ? 409
     : r.error === 'no_owner' ? 422
     : 502;
   jsonRes(res, status, r);

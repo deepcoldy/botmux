@@ -129,6 +129,9 @@ import {
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
+  workerHasInitialized,
+  sessionSupportsWebTerminal,
+  readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
   type WorkerSessionReplyOptions,
@@ -642,7 +645,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
     );
     const name = target.sessionName;
     if (destroy) {
-      try { killPersistentBackendTarget(target); }
+      try { killPersistentBackendTarget(target, sessionId); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -803,7 +806,14 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
   resolvePersistentTarget?: (sessionId: string, ds?: DaemonSession) => PersistentBackendTarget | undefined;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => void;
+  /** `sessionId` is mandatory: ZMX destruction is identity-verified and refuses
+   *  a name-only kill. `target` carries Herdr's agent-scoped addressing. */
+  killPersistent: (
+    backendType: PersistentBackendType,
+    sessionName: string,
+    sessionId: string,
+    target?: PersistentBackendTarget,
+  ) => void;
   probePersistent: (backendType: PersistentBackendType, sessionName: string, target?: PersistentBackendTarget) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
@@ -887,7 +897,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
         persistedTarget,
       );
       const name = target.sessionName;
-      try { deps.killPersistent(backendType, name, target); }
+      try { deps.killPersistent(backendType, name, fence.receiverSessionId, target); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -1166,9 +1176,9 @@ const vcMeetingRuntimeLeaseRecovery = createVcMeetingRuntimeLeaseRecovery({
       ?? sessionStore.getSession(sessionId)?.persistentBackendTarget;
   },
   backendAvailable: vcMeetingPersistentBackendAvailable,
-  killPersistent: (backendType, sessionName, target) => target
-    ? killPersistentBackendTarget(target)
-    : killPersistentSession(backendType, sessionName),
+  killPersistent: (backendType, sessionName, sessionId, target) => target
+    ? killPersistentBackendTarget(target, sessionId)
+    : killPersistentSession(backendType, sessionName, sessionId),
   probePersistent: (backendType, sessionName, target) => target
     ? probePersistentBackendTarget(target)
     : probePersistentSession(backendType, sessionName),
@@ -3928,8 +3938,8 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
-    const readUrl = buildTerminalUrl(ds);
+  if (ds.streamCardId && workerHasInitialized(ds)) {
+    const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
     const prevMode = ds.displayMode ?? 'hidden';
@@ -18310,7 +18320,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       host: terminalProxyHost,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
-          if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+          if (ds.session.sessionId === sessionId && sessionSupportsWebTerminal(ds) && ds.workerPort) {
+            return ds.workerPort;
+          }
         }
         return undefined;
       },

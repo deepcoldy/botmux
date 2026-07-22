@@ -802,10 +802,15 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       } as any;
       findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
 
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const renamePath = `/api/sessions/${session.sessionId}/rename`;
+      const res = await fetch(`http://127.0.0.1:${handle.port}${renamePath}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', renamePath, handle.port),
+        },
         body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
       });
 
@@ -1330,6 +1335,23 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s1/write-link`, { headers: tokenAuthHeaders() });
     expect(res.status).toBe(409);
     expect((await res.json()).error).toBe('terminal_unavailable');
+    spy.mockRestore();
+  });
+
+  it('reports Web Terminal as unsupported for the zmx backend', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-zmx', backendType: 'zmx', webPort: 4321 },
+      workerPort: 4321,
+      workerToken: 'stale-secret',
+      riffAccessUrl: 'https://stale-riff.example',
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-zmx/write-link`, {
+      headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('terminal_unsupported');
     spy.mockRestore();
   });
 

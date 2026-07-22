@@ -135,36 +135,139 @@ describe('device-isolation daemon transaction', () => {
     expect(currentDeviceIsolationFreezeLease(NOW)).toBeNull();
   });
 
-  it('blocks adopted and unattested detached sessions before exposing a lease', () => {
+  it('blocks adopted and unattested detached ZMX sessions before exposing a lease', () => {
     const sessions: DeviceIsolationRuntimeSession[] = [{
       sessionId: 'adopted',
       adopted: true,
       frozenBackend: 'tmux',
       workerPresent: false,
     }, {
-      sessionId: 'detached',
+      sessionId: 'abcdefgh-detached',
       adopted: false,
-      frozenBackend: 'tmux',
+      frozenBackend: 'zmx',
       workerPresent: false,
     }];
+    const probes: Array<{ backendType: string; name: string }> = [];
     setDeviceIsolationDaemonDependenciesForTest({
       dataDir: () => '/tmp/data',
       listSessions: () => sessions,
       processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
-      probePersistent: () => 'exists',
+      probePersistent: (backendType, name) => {
+        probes.push({ backendType, name });
+        return 'exists';
+      },
     });
 
     const inventory = buildDeviceIsolationInventory();
     expect(inventory.blockers).toEqual([
+      { sessionId: 'abcdefgh-detached', blocker: 'unattested_worker' },
       { sessionId: 'adopted', blocker: 'adopted_session' },
-      { sessionId: 'detached', blocker: 'unattested_worker' },
     ]);
+    expect(inventory.entries[0]).toMatchObject({
+      sessionId: 'abcdefgh-detached',
+      backendType: 'zmx',
+      disposition: 'blocked',
+      persistent: {
+        backendType: 'zmx',
+        name: 'bmx-abcdefgh',
+        probe: 'exists',
+      },
+    });
+    expect(probes).toEqual([{ backendType: 'zmx', name: 'bmx-abcdefgh' }]);
     const result = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
     expect(result).toMatchObject({
       status: 409,
       body: { ok: false, error: 'activation_blocked' },
     });
     expect(currentDeviceIsolationFreezeLease(NOW)).toBeNull();
+  });
+
+  it('terminates an attested live ZMX session before committing activation', async () => {
+    let marker = pendingMarker();
+    let backingExists = true;
+    let sessions: DeviceIsolationRuntimeSession[] = [{
+      sessionId: 'abcdefgh-owned',
+      adopted: false,
+      frozenBackend: 'zmx',
+      workerPresent: true,
+      workerGeneration: 9,
+      worker: { pid: 3001, procStart: 'zmx-worker-start' },
+      attestation: {
+        backendType: 'zmx',
+        credentialIsolated: false,
+        cli: { pid: 3002, procStart: 'zmx-cli-start' },
+        workerGeneration: 9,
+      },
+    }];
+    const live = new Map<number, string>([
+      [process.pid, 'daemon-start'],
+      [3001, 'zmx-worker-start'],
+      [3002, 'zmx-cli-start'],
+    ]);
+    const killed: Array<{ backendType: string; name: string; sessionId: string }> = [];
+    let closeCalls = 0;
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      dataDir: () => '/tmp/data',
+      listSessions: () => sessions,
+      processStart: pid => live.get(pid),
+      processExists: pid => live.has(pid),
+      readMarker: () => marker,
+      probePersistent: (backendType, name) => {
+        expect({ backendType, name }).toEqual({
+          backendType: 'zmx',
+          name: 'bmx-abcdefgh',
+        });
+        return backingExists ? 'exists' : 'missing';
+      },
+      killPersistent: (backendType, name, sessionId) => {
+        killed.push({ backendType, name, sessionId });
+        backingExists = false;
+      },
+      closeWorker: () => {
+        closeCalls += 1;
+        live.delete(3001);
+        live.delete(3002);
+        sessions = [{
+          sessionId: 'abcdefgh-owned',
+          adopted: false,
+          frozenBackend: 'zmx',
+          workerPresent: false,
+        }];
+      },
+      sleep: async () => {},
+    });
+
+    const prepared = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
+    expect(prepared.status).toBe(200);
+    expect(prepared.body.inventory).toEqual([
+      expect.objectContaining({
+        sessionId: 'abcdefgh-owned',
+        backendType: 'zmx',
+        disposition: 'owned_local',
+        persistent: {
+          backendType: 'zmx',
+          name: 'bmx-abcdefgh',
+          probe: 'exists',
+        },
+      }),
+    ]);
+
+    const committed = await commitDeviceIsolationActivation({
+      activationVersion: 1,
+      nonce: NONCE,
+      leaseId: prepared.body.leaseId,
+      markerSha256: digest(marker),
+    });
+
+    expect(committed).toMatchObject({ status: 200, body: { phase: 'committed' } });
+    expect(closeCalls).toBe(1);
+    expect(killed).toEqual([{
+      backendType: 'zmx',
+      name: 'bmx-abcdefgh',
+      sessionId: 'abcdefgh-owned',
+    }]);
+    expect(backingExists).toBe(false);
   });
 
   it('allows abort only before commit and retains the committed freeze', async () => {

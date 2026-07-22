@@ -1421,7 +1421,7 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('会话后端 backendType', [
-    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr/zmx 支持托管持久会话；zellij 为实验后端（需 zellij >= 0.44）。',
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.1 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
     '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx。',
   ]);
@@ -5148,14 +5148,22 @@ async function cmdTitle(rest: string[]): Promise<void> {
   const source = process.env.BOTMUX_SESSION_ID === session.sessionId ? 'agent' : 'cli';
   let res: Response;
   try {
-    res = await fetch(
-      `http://127.0.0.1:${daemon.ipcPort}/api/sessions/${encodeURIComponent(session.sessionId)}/rename`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ title, source }),
-      },
-    );
+    res = source === 'agent'
+      ? await postSessionCliIpc(
+          daemon.ipcPort,
+          session.sessionId,
+          'rename',
+          { title, source },
+        )
+      : await fetchDaemonIpc(
+          daemon.ipcPort,
+          `/api/sessions/${encodeURIComponent(session.sessionId)}/rename`,
+          {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ title, source }),
+          },
+        );
   } catch (err: any) {
     console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
     process.exit(1);
@@ -5276,6 +5284,8 @@ async function cmdTermLink(rest: string[]): Promise<void> {
     console.error('❌ daemon 中该会话非活跃，无法获取可操作终端。');
   } else if (errCode === 'terminal_unavailable') {
     console.error('❌ 该会话终端尚未就绪（worker 未起或缺 token）。等会话起来再试。');
+  } else if (errCode === 'terminal_unsupported') {
+    console.error('❌ 该会话后端不提供 Web 终端；ZMX 会话请在本机运行 botmux list 或 zmx attach。');
   } else if (errCode === 'no_owner') {
     console.error('❌ 该 bot 未配置 owner（allowedUsers 为空 / 全开放模式），没有可私密投递的对象。');
   } else if (errCode === 'delivery_failed') {

@@ -89,7 +89,7 @@ describe('P1 requestSessionRestart wiring', () => {
     const body = workerPoolSource.slice(fn, fn + 2800);
     expect(body).toContain('shouldDestroyPaneBeforeRestart(ds)');
     expect(body).toContain('persistentBackendTargetForSession(ds)');
-    expect(body).toContain('killPersistentBackendTarget(target)');
+    expect(body).toContain('killPersistentBackendTarget(target, ds.session.sessionId)');
     // No target (e.g. PTY/riff/legacy-unstamped) → no-op, never throws.
     expect(body).toContain('if (!target) return;');
 

@@ -188,12 +188,21 @@ export function probePersistentBackendTarget(target: PersistentBackendTarget): S
   return probePersistentSession(target.backendType, target.sessionName);
 }
 
-export function killPersistentBackendTarget(target: PersistentBackendTarget): void {
+/**
+ * `sessionId` is REQUIRED for ZMX: its destruction is identity-verified against
+ * the botmux labels stamped on the session, and `killPersistentSession` refuses
+ * a name-only ZMX kill rather than risk destroying a same-named user session.
+ * Callers that hold the owning session must always pass it through.
+ */
+export function killPersistentBackendTarget(
+  target: PersistentBackendTarget,
+  sessionId?: string,
+): void {
   if (target.backendType === 'herdr' && target.agentName) {
     HerdrBackend.killAgent(target.sessionName, target.agentName);
     return;
   }
-  killPersistentSession(target.backendType, target.sessionName);
+  killPersistentSession(target.backendType, target.sessionName, sessionId);
 }
 
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {
@@ -269,10 +278,21 @@ export function probePersistentBackendServer(
   return 'unknown';
 }
 
-/** Kill a backing session (each backend's killSession is a no-op when absent). */
-export function killPersistentSession(backendType: PersistentBackendType, name: string): void {
+/**
+ * Kill a backing session. ZMX additionally requires the complete botmux UUID:
+ * its public name contains only eight UUID characters, so name-only deletion
+ * could destroy a different session after a prefix collision.
+ */
+export function killPersistentSession(
+  backendType: PersistentBackendType,
+  name: string,
+  sessionId?: string,
+): void {
   if (backendType === 'tmux') TmuxBackend.killSession(name);
   else if (backendType === 'zellij') ZellijBackend.killSession(name);
-  else if (backendType === 'zmx') ZmxBackend.killSession(name);
+  else if (backendType === 'zmx') {
+    if (!sessionId) throw new Error(`refusing name-only ZMX kill for ${name}`);
+    ZmxBackend.killManagedSession(name, sessionId);
+  }
   else HerdrBackend.killSession(name);
 }

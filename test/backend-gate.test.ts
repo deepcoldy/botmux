@@ -39,10 +39,22 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
     expect(decideBackendGate({ requested: 'zmx', available: false, hasExistingSession: false }).action).toBe('gate');
   });
 
-  it('reattaches a live zmx session despite a transient probe failure', () => {
+  it('keeps the generic existing-session exemption available for transient probes', () => {
     expect(
       decideBackendGate({ requested: 'zmx', available: false, hasExistingSession: true }),
     ).toEqual({ action: 'spawn' });
+  });
+
+  it('requires the ZMX protocol version before considering a managed live session', () => {
+    const start = workerSource.indexOf("} else if (effectiveBackend === 'zmx') {");
+    const end = workerSource.indexOf("} else if (effectiveBackend === 'herdr')", start);
+    const gate = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(gate.indexOf('probeZmxVersion()')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
+    expect(gate).toContain("resolvedZmxSessionProbe = 'unknown'");
+    expect(gate).toContain('hasExistingSession = false');
   });
 });
 
@@ -55,10 +67,11 @@ describe('backendGateUserMessage', () => {
     expect(msg).toContain('BACKEND_TYPE=pty');
   });
 
-  it('includes the supported ZMX version and install path', () => {
+  it('includes the supported ZMX version and unreleased upstream prerequisite', () => {
     const msg = backendGateUserMessage('zmx', 'zmx 二进制不在 PATH 上');
-    expect(msg).toContain('zmx >= 0.6.0');
-    expect(msg).toContain('neurosnap/tap/zmx');
+    expect(msg).toContain('zmx >= 0.7.1');
+    expect(msg).toContain('PR #202');
+    expect(msg).toContain('官方 0.6.0 尚不满足');
   });
 });
 
@@ -121,5 +134,52 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain("postKillProbe !== 'missing'");
     expect(gate).toContain("effectiveBackendType === 'zmx'");
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
+  });
+});
+
+describe('ZMX observer crash cleanup', () => {
+  it('detaches zmx tail from the synchronous worker exit hook without destroying the session', () => {
+    const start = workerSource.indexOf("process.on('exit'");
+    const end = workerSource.indexOf("process.on('uncaughtException'", start);
+    const exitHook = workerSource.slice(start, end);
+
+    expect(start).toBeGreaterThan(-1);
+    expect(exitHook).toContain('backend instanceof ZmxBackend');
+    expect(exitHook).toContain('backend.kill()');
+    expect(exitHook).not.toContain('destroySession');
+  });
+});
+
+describe('live-only observer screen rebase', () => {
+  it('registers the authoritative snapshot callback and refreshes idle/card state', () => {
+    const handlerStart = workerSource.indexOf('function onBackendScreenResync(');
+    const handlerEnd = workerSource.indexOf('function releaseRawInputRestartGate', handlerStart);
+    const handler = workerSource.slice(handlerStart, handlerEnd);
+    const registration = workerSource.indexOf('backend.onScreenResync?.(');
+
+    expect(handlerStart).toBeGreaterThan(-1);
+    expect(registration).toBeGreaterThan(handlerStart);
+    expect(handler).toContain('lastPtyActivityAtMs = now');
+    expect(handler).toContain('lastAnalyzerSnapshot = snapshot');
+    expect(handler).toContain('idleDetector.reset()');
+    expect(handler).toContain('idleDetector.feed(idleTail)');
+    expect(handler).toContain('workflowTranscript = snapshot.slice');
+    expect(handler).toContain('handleVisibleStartupInteraction(snapshot)');
+  });
+
+  it('shares update and trust dialog handling with incremental PTY output', () => {
+    const helperStart = workerSource.indexOf('function handleVisibleStartupInteraction(');
+    const helperEnd = workerSource.indexOf('// Codex App runner sends', helperStart);
+    const helper = workerSource.slice(helperStart, helperEnd);
+    const ptyStart = workerSource.indexOf('function onPtyData(');
+    const ptyEnd = workerSource.indexOf('function onBackendScreenResync(', ptyStart);
+    const ptyHandler = workerSource.slice(ptyStart, ptyEnd);
+
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helperEnd).toBeGreaterThan(helperStart);
+    expect(helper).toContain('dismissAidenCodexUpdateDialog(data)');
+    expect(helper).toContain('TRUST_DIALOG_PATTERN.test(stripped)');
+    expect(helper).toContain("sendSpecialKeys('Enter')");
+    expect(ptyHandler).toContain('handleVisibleStartupInteraction(data)');
   });
 });

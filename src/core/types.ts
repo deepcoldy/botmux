@@ -39,6 +39,10 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** True after the current worker generation has completed init. Kept
+   * separate from workerPort because backends without a Web Terminal still
+   * emit screen/idle/screenshot updates and support native local attach. */
+  workerReady?: boolean;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy

@@ -11,17 +11,21 @@ vi.mock('node:child_process', async (importOriginal) => {
 import { execFileSync } from 'node:child_process';
 import {
   buildFreshAttachArgs,
-  buildReattachArgs,
   buildZmxLaunchFiles,
   findSessionPid,
+  normaliseZmxHistory,
   parseZmxList,
   parseZmxShortList,
-  terminalOscColorQueryReplies,
   tmuxKeyToBytes,
   zmxControlEnv,
   ZmxBackend,
 } from '../src/adapters/backend/zmx-backend.js';
-import { parseZmxVersion, probeZmxFunctional, zmxEnv } from '../src/setup/ensure-zmx.js';
+import {
+  parseZmxVersion,
+  probeZmxFunctional,
+  probeZmxVersion,
+  zmxEnv,
+} from '../src/setup/ensure-zmx.js';
 
 const execFileSyncMock = vi.mocked(execFileSync);
 
@@ -36,7 +40,7 @@ describe('zmx env/probe helpers', () => {
       ZMX_SESSION: 'parent',
       ZMX_SESSION_PREFIX: 'dev-',
       ZMX_DIR: '/tmp/zmx',
-    } as any);
+    } as NodeJS.ProcessEnv);
 
     expect(env.ZMX_SESSION).toBeUndefined();
     expect(env.ZMX_SESSION_PREFIX).toBeUndefined();
@@ -45,29 +49,44 @@ describe('zmx env/probe helpers', () => {
     expect(env.PATH).toContain('.local/share/mise/shims');
   });
 
-  it('requires both version and list to succeed', () => {
-    execFileSyncMock.mockReturnValueOnce('zmx 0.6.0\n' as any);
-    execFileSyncMock.mockReturnValueOnce('' as any);
+  it('requires the compatible version and a functional list command', () => {
+    execFileSyncMock.mockReturnValueOnce('zmx 0.7.1\n' as never);
+    execFileSyncMock.mockReturnValueOnce('' as never);
 
-    expect(probeZmxFunctional()).toEqual({ ok: true, version: 'zmx 0.6.0' });
+    expect(probeZmxFunctional()).toEqual({ ok: true, version: 'zmx 0.7.1' });
     expect(execFileSyncMock).toHaveBeenNthCalledWith(1, 'zmx', ['version'], expect.any(Object));
     expect(execFileSyncMock).toHaveBeenNthCalledWith(2, 'zmx', ['list'], expect.any(Object));
   });
 
-  it('parses real multiline output and rejects unsupported or malformed versions', () => {
+  it('can enforce the protocol version without requiring a list probe', () => {
+    execFileSyncMock.mockReturnValueOnce('zmx 0.7.2\n' as never);
+    expect(probeZmxVersion()).toEqual({ ok: true, version: 'zmx 0.7.2' });
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    expect(execFileSyncMock).toHaveBeenCalledWith('zmx', ['version'], expect.any(Object));
+  });
+
+  it('parses versions but rejects releases without the required send contract', () => {
     expect(parseZmxVersion('zmx\t\t0.6.0\nghostty_vt\tdev\n')).toEqual([0, 6, 0]);
     expect(parseZmxVersion('zmx 0.7.1')).toEqual([0, 7, 1]);
     expect(parseZmxVersion('unknown')).toBeNull();
 
-    execFileSyncMock.mockReturnValueOnce('zmx 0.5.9\n' as any);
+    execFileSyncMock.mockReturnValueOnce('zmx 0.6.99\n' as never);
     expect(probeZmxFunctional()).toEqual({
       ok: false,
-      reason: 'zmx >= 0.6.0 才受支持（当前 0.5.9）',
+      reason: 'zmx >= 0.7.1 才受支持（当前 0.6.99；需要包含 PR #202 的 send 行为，输出由 history 获取）',
     });
     expect(execFileSyncMock).toHaveBeenCalledTimes(1);
 
     execFileSyncMock.mockReset();
-    execFileSyncMock.mockReturnValueOnce('garbage\n' as any);
+    execFileSyncMock.mockReturnValueOnce('zmx 0.7.0\n' as never);
+    expect(probeZmxFunctional()).toEqual({
+      ok: false,
+      reason: 'zmx >= 0.7.1 才受支持（当前 0.7.0；需要包含 PR #202 的 send 行为，输出由 history 获取）',
+    });
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+
+    execFileSyncMock.mockReset();
+    execFileSyncMock.mockReturnValueOnce('garbage\n' as never);
     expect(probeZmxFunctional()).toEqual({
       ok: false,
       reason: '无法解析 zmx 版本：garbage',
@@ -87,29 +106,16 @@ describe('zmx backend pure helpers', () => {
     expect(tmuxKeyToBytes('weird')).toBe('weird');
   });
 
-  it('answers OSC color queries without treating color setters as queries', () => {
-    expect(terminalOscColorQueryReplies(10, '?')).toEqual([
-      '\x1b]10;rgb:a9a9/b1b1/d6d6\x1b\\',
-    ]);
-    expect(terminalOscColorQueryReplies(4, '1;?;255;?')).toEqual([
-      '\x1b]4;1;rgb:f7f7/7676/8e8e\x1b\\',
-      '\x1b]4;255;rgb:eeee/eeee/eeee\x1b\\',
-    ]);
-    expect(terminalOscColorQueryReplies(10, '?;?')).toEqual([
-      '\x1b]10;rgb:a9a9/b1b1/d6d6\x1b\\',
-      '\x1b]11;rgb:1a1a/1b1b/2626\x1b\\',
-    ]);
-    expect(terminalOscColorQueryReplies(11, '#000000')).toEqual([]);
-    expect(terminalOscColorQueryReplies(4, '1;?;2;#ffffff')).toEqual([
-      '\x1b]4;1;rgb:f7f7/7676/8e8e\x1b\\',
-    ]);
+  it('normalises plain history and repeated CR boundaries consistently', () => {
+    expect(normaliseZmxHistory('one\ntwo\r\nthree')).toBe('one\r\ntwo\r\nthree');
+    expect(normaliseZmxHistory('one\r\r\ntwo')).toBe('one\r\ntwo');
   });
 
   it('parses session pid from zmx list details', () => {
-    execFileSyncMock.mockReturnValueOnce('other\nbmx-abcd1234\n' as any);
+    execFileSyncMock.mockReturnValueOnce('other\nbmx-abcd1234\n' as never);
     execFileSyncMock.mockReturnValueOnce(
       '  name=other\tpid=11\tclients=0\n' +
-      '  name=bmx-abcd1234\tpid=4242\tclients=1\tcmd=codex\n' as any,
+      '  name=bmx-abcd1234\tpid=4242\tclients=1\tcmd=codex\n' as never,
     );
 
     expect(findSessionPid('bmx-abcd1234')).toBe(4242);
@@ -164,10 +170,10 @@ describe('zmx backend pure helpers', () => {
   });
 
   it('does not infer a session pid from cwd or argv fields', () => {
-    execFileSyncMock.mockReturnValueOnce('bmx-other\n' as any);
+    execFileSyncMock.mockReturnValueOnce('bmx-other\n' as never);
     execFileSyncMock.mockReturnValueOnce(
       '  name=bmx-target\terr=Timeout\tcmd=agent --pid=999\n' +
-      '  name=bmx-other\tpid=42\tcmd=agent bmx-target pid=777\n' as any,
+      '  name=bmx-other\tpid=42\tcmd=agent bmx-target pid=777\n' as never,
     );
     expect(findSessionPid('bmx-target')).toBeNull();
   });
@@ -183,44 +189,97 @@ describe('zmx backend pure helpers', () => {
       unhealthySessions: [],
       malformedLines: ['warning: partial response'],
     });
-    execFileSyncMock.mockReturnValueOnce('bmx-good\n' as any);
+    execFileSyncMock.mockReturnValueOnce('bmx-good\n' as never);
     execFileSyncMock.mockReturnValueOnce(
-      'warning: partial response\n  name=bmx-good\tpid=42\tclients=1\n' as any,
+      'warning: partial response\n  name=bmx-good\tpid=42\tclients=1\n' as never,
     );
     expect(ZmxBackend.probeSession('bmx-other')).toBe('unknown');
   });
 
   it('does not classify an errored target as missing', () => {
-    execFileSyncMock.mockReturnValueOnce('' as any);
-    execFileSyncMock.mockReturnValueOnce('  name=bmx-timeout\terr=Timeout\n' as any);
+    execFileSyncMock.mockReturnValueOnce('' as never);
+    execFileSyncMock.mockReturnValueOnce('  name=bmx-timeout\terr=Timeout\n' as never);
     expect(ZmxBackend.probeSession('bmx-timeout')).toBe('unknown');
   });
 
-  it('does not trust a healthy-looking full row that is absent from --short', () => {
-    execFileSyncMock.mockReturnValueOnce('bmx-real\n' as any);
+  it('does not trust a healthy-looking full row absent from --short', () => {
+    execFileSyncMock.mockReturnValueOnce('bmx-real\n' as never);
     execFileSyncMock.mockReturnValueOnce(
       '  name=bmx-real\tpid=11\tclients=0\tcmd=agent --prompt first\n' +
-      '  name=bmx-forged\tpid=999\tclients=0\n' as any,
+      '  name=bmx-forged\tpid=999\tclients=0\n' as never,
     );
     expect(ZmxBackend.probeSession('bmx-forged')).toBe('unknown');
   });
 
   it('lists botmux sessions from the authoritative short list', () => {
-    execFileSyncMock.mockReturnValueOnce('bmx-abcd1234\nnotes\nbmx-deadbeef\n' as any);
+    execFileSyncMock.mockReturnValueOnce('bmx-abcd1234\nnotes\nbmx-deadbeef\n' as never);
     execFileSyncMock.mockReturnValueOnce(
       '  name=bmx-abcd1234\tpid=11\tclients=0\n' +
       '  name=notes\tpid=12\tclients=0\n' +
-      '  name=bmx-deadbeef\tpid=13\tclients=1\n' as any,
+      '  name=bmx-deadbeef\tpid=13\tclients=1\n' as never,
     );
 
     expect(ZmxBackend.listBotmuxSessions()).toEqual(['bmx-abcd1234', 'bmx-deadbeef']);
   });
 
-  it('builds a race-safe attach command and strips nested-session identity', () => {
-    expect(buildReattachArgs('bmx-abcd1234')).toEqual([
-      'attach', 'bmx-abcd1234', '/bin/sh', '-c', 'exit 75',
-    ]);
+  it('waits through a transient stale socket when confirming a managed kill', () => {
+    const name = 'bmx-abcd1234';
+    const sessionId = 'abcd1234-1111-2222-3333-444444444444';
+    let killed = false;
+    let staleProbe = true;
+    execFileSyncMock.mockImplementation((_file, argv) => {
+      const [command, ...args] = argv as string[];
+      if (command === 'list' && args[0] === '--short') {
+        if (killed && staleProbe) {
+          staleProbe = false;
+          throw new Error('stale socket');
+        }
+        return killed ? '' : `${name}\n`;
+      }
+      if (command === 'list') {
+        return killed ? '' : `  name=${name}\tpid=4242\tclients=0\tcmd=codex\n`;
+      }
+      if (command === 'get' && args[1] === 'botmux.transport') return 'tail-send-v1\n';
+      if (command === 'get' && args[1] === 'botmux.session') return `${sessionId}\n`;
+      if (command === 'kill') {
+        killed = true;
+        return `killed session ${name}\n`;
+      }
+      throw new Error(`unexpected zmx command: ${argv.join(' ')}`);
+    });
 
+    expect(() => ZmxBackend.killManagedSession(name, sessionId, 4242)).not.toThrow();
+    expect(killed).toBe(true);
+    expect(staleProbe).toBe(false);
+  });
+
+  it('fails closed when a managed session is replaced during kill confirmation', () => {
+    const name = 'bmx-abcd1234';
+    const sessionId = 'abcd1234-1111-2222-3333-444444444444';
+    let killed = false;
+    execFileSyncMock.mockImplementation((_file, argv) => {
+      const [command, ...args] = argv as string[];
+      if (command === 'list' && args[0] === '--short') return `${name}\n`;
+      if (command === 'list') {
+        const pid = killed ? 5252 : 4242;
+        return `  name=${name}\tpid=${pid}\tclients=0\tcmd=codex\n`;
+      }
+      if (command === 'get' && args[1] === 'botmux.transport') return 'tail-send-v1\n';
+      if (command === 'get' && args[1] === 'botmux.session') {
+        return killed ? 'abcd1234-9999-8888-7777-666666666666\n' : `${sessionId}\n`;
+      }
+      if (command === 'kill') {
+        killed = true;
+        return '';
+      }
+      throw new Error(`unexpected zmx command: ${argv.join(' ')}`);
+    });
+
+    expect(() => ZmxBackend.killManagedSession(name, sessionId, 4242)).toThrow(/同名会话替换/);
+    expect(killed).toBe(true);
+  });
+
+  it('builds a private file gate and strips nested-session identity', () => {
     const opts = {
       cwd: '/tmp/work',
       cols: 80,
@@ -234,8 +293,9 @@ describe('zmx backend pure helpers', () => {
     };
     const bootstrapPath = '/tmp/private/bootstrap.sh';
     const payloadPath = '/tmp/private/payload.sh';
-    const readyMarker = '\x1b]5150;botmux-zmx-ready=0123456789abcdef0123456789abcdef\x1b\\';
-    const completionMarker = '\x1b]5150;botmux-zmx-started=0123456789abcdef0123456789abcdef\x1b\\';
+    const readyPath = '/tmp/private/ready';
+    const releasePath = '/tmp/private/release';
+    const readyNonce = '0123456789abcdef0123456789abcdef';
     const releaseToken = 'fedcba9876543210fedcba9876543210';
     const argv = buildFreshAttachArgs('bmx-abcd1234', bootstrapPath);
     const files = buildZmxLaunchFiles(
@@ -243,8 +303,9 @@ describe('zmx backend pure helpers', () => {
       ['--flag', 'private prompt'],
       opts,
       payloadPath,
-      readyMarker,
-      completionMarker,
+      readyPath,
+      readyNonce,
+      releasePath,
       releaseToken,
     );
 
@@ -254,12 +315,17 @@ describe('zmx backend pure helpers', () => {
     expect(files.bootstrap).not.toContain('session-secret');
     expect(files.bootstrap).not.toContain("yes ' quoted");
     expect(files.bootstrap).toContain(payloadPath);
-    expect(files.bootstrap).toContain(`printf '%s' '${readyMarker}'`);
-    expect(files.bootstrap).toContain(`printf '%s' '${completionMarker}'`);
-    expect(files.bootstrap).toContain(`release_line" = '${releaseToken}'`);
-    expect(files.bootstrap).toContain('bootstrap-watchdog');
-    expect(files.bootstrap).toContain('sleep 8');
-    expect(files.bootstrap).toContain('stty -echo');
+    expect(files.bootstrap).toContain(readyPath);
+    expect(files.bootstrap).toContain(releasePath);
+    expect(files.bootstrap).toContain(readyNonce);
+    expect(files.bootstrap).toContain(releaseToken);
+    expect(files.bootstrap).toContain('exec </dev/tty');
+    expect(files.bootstrap).toContain('cli_pid_path=');
+    expect(files.bootstrap).toContain('"$$" > "$cli_pid_path"');
+    expect(files.bootstrap).toContain('/bin/sh -c ');
+    expect(files.bootstrap).toContain('\ncli_status=$?\nrm -f -- "$cli_pid_path"\nwhile ! sleep 3; do :; done\n');
+    expect(files.bootstrap).not.toContain('botmux-zmx-ready=');
+    expect(files.bootstrap).not.toContain('stty');
     expect(files.payload).toContain('private prompt');
     expect(files.payload).toContain('BOTMUX_SESSION_ID=session-secret');
     expect(files.payload).toContain("SAFE_FLAG=yes '");

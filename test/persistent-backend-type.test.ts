@@ -24,6 +24,7 @@ import {
   killPersistentBackendTarget,
   managedTargetsForCliChange,
   probePersistentBackendTarget,
+  killPersistentSession,
   probePersistentSessions,
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
@@ -202,5 +203,19 @@ describe('probePersistentSessions', () => {
     ]);
     expect(probe).toHaveBeenCalledTimes(1);
     probe.mockRestore();
+  });
+});
+
+describe('killPersistentSession ZMX ownership fence', () => {
+  it('refuses name-only deletion and delegates the complete UUID to the managed kill', () => {
+    expect(() => killPersistentSession('zmx', 'bmx-abcdef12')).toThrow(/name-only ZMX kill/);
+
+    const kill = vi.spyOn(ZmxBackend, 'killManagedSession').mockImplementation(() => {});
+    killPersistentSession('zmx', 'bmx-abcdef12', 'abcdef12-1111-2222-3333-444444444444');
+    expect(kill).toHaveBeenCalledWith(
+      'bmx-abcdef12',
+      'abcdef12-1111-2222-3333-444444444444',
+    );
+    kill.mockRestore();
   });
 });

@@ -91,6 +91,7 @@ function harness(input: {
   const sent: Array<{ sessionId: string; turnId: string; dispatchAttempt: number }> = [];
   const killed: string[] = [];
   const backingKills: string[] = [];
+  const backingKillCalls: Array<{ backend: string; sessionName: string; sessionId: string }> = [];
   const probes: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
@@ -110,8 +111,9 @@ function harness(input: {
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
     backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => input.backendAvailable?.(backend) ?? true,
-    killPersistent: (backend: string, sessionName: string) => {
+    killPersistent: (backend: string, sessionName: string, sessionId: string) => {
       backingKills.push(`${backend}:${sessionName}`);
+      backingKillCalls.push({ backend, sessionName, sessionId });
     },
     probePersistent: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => {
       probes.push(`${backend}:${sessionName}`);
@@ -120,7 +122,7 @@ function harness(input: {
     warn: (message: string) => warnings.push(message),
     error: (message: string) => errors.push(message),
   } as any);
-  return { recovery, sessions, sent, killed, backingKills, probes, warnings, errors };
+  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, probes, warnings, errors };
 }
 
 describe('VC meeting runtime lease recovery', () => {
@@ -196,6 +198,21 @@ describe('VC meeting runtime lease recovery', () => {
     expect(h.killed).toEqual(['session_a']);
     expect(h.backingKills).toEqual(['tmux:bmx-session_']);
     expect(h.probes).toEqual(['tmux:bmx-session_']);
+    expect(h.recovery.snapshot()).toEqual([]);
+  });
+
+  it('passes the full receiver session id to ZMX teardown', () => {
+    const h = harness({
+      sessions: [fakeSession({ worker: false, persistentScope: 'zmx' })],
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.backingKillCalls).toEqual([{
+      backend: 'zmx',
+      sessionName: 'bmx-session_',
+      sessionId: 'session_a',
+    }]);
+    expect(h.probes).toEqual(['zmx:bmx-session_']);
     expect(h.recovery.snapshot()).toEqual([]);
   });
 

@@ -134,7 +134,7 @@
 | `sandboxReadonlyPaths` | 在沙盒内额外只读挂载的已存在路径，适合共享源码快照、参考仓库或生成文档等只允许查看、不允许修改的输入 |
 | `sandboxNetwork` | 沙盒会话的网络策略。缺省 / `true` 保留当前网络和代理访问；`false` 添加 `--unshare-net`，阻断普通网络出口 |
 
-> ZMX 后端当前无法执行文件沙盒或读隔离。`backendType: "zmx"` 与 per-bot / 全局沙盒，或 macOS 上独立生效的 `readIsolation` 同时启用时会 fail closed，并向会话返回操作提示。Linux 上单独设置旧 `readIsolation` 标志按 worker 统一语义是 no-op，不会误拦 ZMX；需要真实隔离时请启用 sandbox 并改用 tmux / PTY。见 [ZMX 后端边界](/zmx#不支持的组合)。
+> ZMX 无法执行文件沙盒或实际生效的读隔离，开启这些边界的配置组合会 fail closed，详见 [ZMX 后端边界](/zmx#不支持的组合)。
 
 ## 卡片与终端
 

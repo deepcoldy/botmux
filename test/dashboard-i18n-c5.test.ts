@@ -67,6 +67,7 @@ const REQUIRED_KEYS: string[] = [
   'card.dashboard.sessions.confirm.resume.title',
   'card.dashboard.sessions.confirm.resume.text',
   'card.dashboard.sessions.terminal.disabled.noPort',
+  'card.dashboard.sessions.terminal.disabled.unsupported',
   'card.dashboard.sessions.resume.disabled.onlyClosed',
 
   // ─── schedules card (PR3 slice 1) ───────────────────────────────────
