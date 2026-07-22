@@ -121,6 +121,16 @@ export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonEle
   );
 }
 
+/**
+ * Native modal dialogs live in the browser's top layer. A floating element
+ * portaled to document.body therefore stays behind an open dialog regardless
+ * of its z-index. Keep floating UI in the nearest open dialog when there is
+ * one, while retaining document.body as the normal page-level host.
+ */
+export function floatingPortalHost(anchor: Element | null, fallback: HTMLElement): Element {
+  return anchor?.closest('dialog[open]') ?? fallback;
+}
+
 export function InfoTip(props: {
   children: ReactNode;
   label?: string;
@@ -189,7 +199,7 @@ export function InfoTip(props: {
       >
         {props.children}
       </span>,
-      document.body,
+      floatingPortalHost(tipRef.current, document.body),
     )
     : null;
 
@@ -306,7 +316,7 @@ export function OverflowText(props: {
       >
         {props.text}
       </span>,
-      document.body,
+      floatingPortalHost(anchorRef.current, document.body),
     )
     : null;
 
