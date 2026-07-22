@@ -396,6 +396,45 @@ describe('desktop device enrollment protocol client', () => {
     expect(readDeviceCredentials({ homeDir })).toMatchObject({ refreshRecoveryRequired: true });
   });
 
+  it('caps foreign-journal recursion instead of ping-ponging forever', async () => {
+    const homeDir = tempHome();
+    const now = 1_800_000_000_000;
+    writeDeviceCredentials({
+      issuer: 'https://platform.example.test', accessToken: 'a1',
+      accessExpiresAt: now + 600_000, refreshToken: 'r1', deviceExp: 1_900_000_000_000,
+    }, { homeDir, now: () => new Date(now) });
+    let requestSeq = 0;
+    const refresh = vi.fn(async () => {
+      // After each 409, a "foreign" process journals a different key so the
+      // reread path keeps following foreign journals rather than blocking.
+      const foreignId = `00000000-0000-4000-8000-0000000000f${requestSeq}`;
+      requestSeq += 1;
+      const current = readDeviceCredentials({ homeDir });
+      if (current) {
+        writeDeviceCredentials({
+          issuer: current.issuer,
+          accessToken: current.accessToken,
+          accessExpiresAt: current.accessExpiresAt,
+          refreshToken: current.refreshToken,
+          deviceExp: current.deviceExp,
+          pendingRefreshRequestId: foreignId,
+          pendingRefreshStartedAt: now,
+        }, { homeDir, now: () => new Date(now) });
+      }
+      throw new DeviceProtocolError('conflict', 'request_rejected', 409, 'refresh_in_progress');
+    });
+    await expect(refreshStoredDeviceCredentials({
+      homeDir,
+      now: () => new Date(now),
+      requestIdFactory: () => `00000000-0000-4000-8000-0000000000a${requestSeq}`,
+      sleep: async () => {},
+      createClient: issuer => ({ issuer, refresh }),
+    })).rejects.toThrow(/journal 切换超过/);
+    // Initial attempt + 2 foreign-journal hops (depth 0,1,2) then stop.
+    expect(refresh.mock.calls.length).toBeLessThanOrEqual(3);
+    expect(readDeviceCredentials({ homeDir })).toMatchObject({ refreshRecoveryRequired: true });
+  });
+
   it('does not send a pending refresh after the safe replay window', async () => {
     const homeDir = tempHome();
     const now = 1_800_000_100_000;

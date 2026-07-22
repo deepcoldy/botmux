@@ -18,10 +18,21 @@ const textExtensions = new Set([
   '.html', '.css', '.sh', '.kdl',
 ]);
 const allowedHosts = new Set([
+  // Documented public integrations (keep intentional).
   'riff.bytedance.net',
   'riff-infra-boe.bytedance.net',
+  'code.byted.org',
+  'tosv.byted.org',
+  // Public docs / install scripts reference these hosts.
+  'bnpm.byted.org',
 ]);
-const hostnamePattern = /\b(?:[a-z0-9-]+\.)*bytedance\.net\b/gi;
+// Require at least one label so bare corporate TLD mentions in assertions/comments
+// do not trip the gate; catch accidental private subdomains under either suffix.
+const hostnamePattern = /\b(?:[a-z0-9-]+\.)+(?:bytedance\.net|byted\.org)\b/gi;
+const allowedHostSuffixes = [
+  '.ai-sandbox-boe.byted.org',
+];
+const selfPath = fileURLToPath(import.meta.url);
 
 function* walk(path) {
   const stats = statSync(path);
@@ -40,13 +51,14 @@ function* walk(path) {
 const files = [
   ...rootFiles.map(file => join(repoRoot, file)),
   ...roots.flatMap(root => [...walk(join(repoRoot, root))]),
-];
+].filter(file => resolve(file) !== selfPath);
 const violations = [];
 for (const file of files) {
   const source = readFileSync(file, 'utf8');
   for (const match of source.matchAll(hostnamePattern)) {
     const hostname = match[0].toLowerCase();
     if (allowedHosts.has(hostname)) continue;
+    if (allowedHostSuffixes.some(suffix => hostname.endsWith(suffix))) continue;
     const line = source.slice(0, match.index).split('\n').length;
     violations.push(`${relative(repoRoot, file)}:${line}: ${hostname}`);
   }

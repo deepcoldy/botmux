@@ -935,8 +935,13 @@ export async function clearStoredDeviceCredentials(
  * same server operation. A waiter that observed the old token returns the
  * winner's new credential instead of performing a second rotation.
  */
+/** Max foreign-journal follow hops. Multi-process journal handoff should
+ * converge in one hop; a small bound blocks theoretical refresh ping-pong. */
+const MAX_FOREIGN_JOURNAL_DEPTH = 2;
+
 export async function refreshStoredDeviceCredentials(
   options: StoredDeviceRefreshOptions = {},
+  foreignJournalDepth = 0,
 ): Promise<DeviceCredentials> {
   const pathOptions: DeviceCredentialPathOptions = {
     ...(options.homeDir !== undefined ? { homeDir: options.homeDir } : {}),
@@ -1068,7 +1073,16 @@ export async function refreshStoredDeviceCredentials(
   }, { maxWaitMs: 15_000 });
   if (reread.kind === 'credentials') return reread.value;
   if (reread.kind === 'foreign_journal') {
-    return await refreshStoredDeviceCredentials(options);
+    if (foreignJournalDepth >= MAX_FOREIGN_JOURNAL_DEPTH) {
+      // Prevent endless multi-process journal thrash from replaying forever.
+      const latest = readDeviceCredentials(pathOptions);
+      if (latest) writeRefreshRecoveryRequired(latest, pathOptions, options.now);
+      throw new DeviceProtocolError(
+        `设备续期 journal 切换超过 ${MAX_FOREIGN_JOURNAL_DEPTH} 次仍未收敛；已停止自动续期，请重新注册`,
+        'invalid_response',
+      );
+    }
+    return await refreshStoredDeviceCredentials(options, foreignJournalDepth + 1);
   }
   throw new DeviceProtocolError(
     '检测到不同续期密钥且本地没有可恢复的赢家日志；设备凭证可能泄露。已停止自动续期，请立即在设备管理页吊销并重新注册',

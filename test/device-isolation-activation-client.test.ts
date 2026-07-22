@@ -212,4 +212,43 @@ describe('activateDeviceCredentialIsolation', () => {
     expect(prepareCalls).toBe(2);
     expect(readDeviceCredentialIsolationMarker({ homeDir })?.state).toBe('active');
   });
+
+  it('automatically retries once when commit reports inventory_changed', async () => {
+    const homeDir = tempRoot();
+    const dataDir = join(homeDir, '.botmux', 'data');
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    const descriptor = daemonDescriptor();
+    let prepareCalls = 0;
+    let commitCalls = 0;
+    const fakeFetch = async (_port: number, path: string, init: RequestInit): Promise<Response> => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      if (path.endsWith('/prepare')) prepareCalls += 1;
+      if (path.endsWith('/commit')) {
+        commitCalls += 1;
+        if (commitCalls === 1) {
+          return new Response(JSON.stringify({ error: 'inventory_changed' }), { status: 409 });
+        }
+      }
+      return new Response(JSON.stringify({
+        ok: true, activationVersion: 1, nonce: body.nonce, leaseId: `lease-${prepareCalls}`,
+        expiresAt: Date.now() + 30_000, inventoryGeneration: `g${prepareCalls}`,
+        daemon: {
+          larkAppId: descriptor.larkAppId, bootInstanceId: descriptor.bootInstanceId,
+          pid: descriptor.pid, procStart: 'proc-321', dataDir,
+        },
+      }));
+    };
+
+    await expect(activateDeviceCredentialIsolation({
+      homeDir,
+      dependencies: {
+        listDaemons: () => [descriptor], fetchDaemon: fakeFetch,
+        processStart: () => 'proc-321', nonceFactory: () => 'n'.repeat(43),
+        expectedDataDir: dataDir,
+      },
+    })).resolves.toMatchObject({ activated: true, daemonCount: 1 });
+    expect(prepareCalls).toBe(2);
+    expect(commitCalls).toBe(2);
+    expect(readDeviceCredentialIsolationMarker({ homeDir })?.state).toBe('active');
+  });
 });

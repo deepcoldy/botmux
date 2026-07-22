@@ -6979,8 +6979,11 @@ async function spawnCli(
     ));
     seatbeltProfilePath = profilePath;
     spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
-    spawnBin = 'sandbox-exec';
-    log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt`);
+    // Absolute path only: a pre-activation unconfined CLI could plant a fake
+    // sandbox-exec earlier on PATH. Prefer the probe result; fall back to the
+    // well-known system location used by full Seatbelt wrapping above.
+    spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
+    log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt: ${spawnBin} -f ${profilePath}`);
   }
   if (!willReattachPersistent && credentialOnlyBwrap) {
     const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');

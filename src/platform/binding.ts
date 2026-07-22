@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import {
   readSecureHostFileSync,
   unlinkSecureHostFileSync,
+  UnsafeHostAuthorityFileError,
   writeSecureHostFileSync,
 } from './secure-host-file.js';
 
@@ -39,8 +40,17 @@ export function readPlatformBinding(): PlatformBinding | null {
     if (obj && typeof obj.platformUrl === 'string' && typeof obj.machineToken === 'string' && typeof obj.machineId === 'string') {
       return obj as PlatformBinding;
     }
-  } catch {
-    /* ignore */
+  } catch (error) {
+    // File-missing / parse failures still mean "unbound". Permission/symlink
+    // failures are different: treat as unbound for callers, but log a clear
+    // recovery hint so a hand-copied platform.json does not look like a silent
+    // drop-binding mystery.
+    if (error instanceof UnsafeHostAuthorityFileError) {
+      console.error(
+        `[platform-binding] 拒绝读取 ${PLATFORM_BINDING_PATH}: ${error.message}`
+        + '（请确保文件权限为 0600、路径不是符号链接，且 ~/.botmux 不可被组/其他用户写入；例: chmod 600 ~/.botmux/platform.json）',
+      );
+    }
   }
   return null;
 }

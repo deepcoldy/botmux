@@ -865,6 +865,8 @@ export function buildSeatbeltProfile(
 // process. A credential-only pane is safe to reattach while the bot remains in
 // credential-only mode, but must cold-spawn if full read/write isolation is
 // enabled later. A version alone cannot express that strengthening transition.
+// Version 6 was intentionally skipped to avoid colliding with an experimental
+// marker layout that briefly shipped in intermediate device-isolation branches.
 export const ISOLATION_PANE_MARKER_VERSION = 7;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';

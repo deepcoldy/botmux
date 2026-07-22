@@ -226,6 +226,16 @@ async function bestEffortRelease(
   )));
 }
 
+/** Benign worker churn between prepare and commit changes inventory generation
+ * and surfaces as inventory_changed. One automatic full retry absorbs that
+ * without forcing the operator to re-run enroll. */
+const MAX_ACTIVATION_INVENTORY_RETRIES = 1;
+
+function isInventoryChangedActivationError(error: unknown): boolean {
+  return error instanceof DeviceIsolationDaemonActivationError
+    && /inventory_changed/.test(error.message);
+}
+
 /**
  * Establish the one-way marker without leaving a legacy local CLI capable of
  * reading the first grant journal/device token. Existing valid markers are a
@@ -247,6 +257,27 @@ export async function activateDeviceCredentialIsolation(
     // old process was quiesced. Continue the full daemon transaction.
   }
 
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_ACTIVATION_INVENTORY_RETRIES; attempt += 1) {
+    try {
+      return await runDeviceCredentialIsolationActivationAttempt(options, homeDir, markerPath);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= MAX_ACTIVATION_INVENTORY_RETRIES || !isInventoryChangedActivationError(error)) {
+        throw error;
+      }
+      // Marker may remain PENDING after the failed attempt; that is intentional
+      // and the next attempt continues the one-way transition from there.
+    }
+  }
+  throw lastError;
+}
+
+async function runDeviceCredentialIsolationActivationAttempt(
+  options: ActivateDeviceIsolationOptions,
+  homeDir: string,
+  markerPath: string,
+): Promise<{ activated: boolean; daemonCount: number; markerSha256: string }> {
   const deps = options.dependencies ?? {};
   const daemons = (deps.listDaemons ?? listOnlineDaemons)();
   if (daemons.length === 0) {

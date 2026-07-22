@@ -76,6 +76,11 @@ function hasExactKeys(record: Record<string, unknown>, expected: string[]): bool
   return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
+/**
+ * Keep this boolean predicate in lockstep with platform `normalizeDeviceIssuer`
+ * (throwing validator). Desktop only sanitizes a public status DTO and must not
+ * import the host credential module into the Electron main process.
+ */
 function isSafeIssuer(raw: string): boolean {
   if (raw.length === 0 || raw.length > 2048) return false;
   try {
