@@ -6,7 +6,7 @@
 - **AI 编程 CLI / 本地 Agent 应用**：至少一种已安装并完成认证，可执行文件在 `PATH` 中：
   - `claude`（Claude Code）、`codex`、`cursor-agent`（Cursor）、`gemini`、`opencode`、`coco`（Trae / CoCo）、`agy`（Antigravity）、`hermes` 等
 - **tmux ≥ 3.x**（可选）：安装后自动启用会话常驻——daemon 重启不中断 CLI。
-- **zmx ≥ 0.6.0**（可选，macOS / Linux）：轻量持久会话后端，需显式配置 `backendType: "zmx"` 或 `BACKEND_TYPE=zmx`。botmux 不会自动安装/选择；Homebrew 可用 `brew install neurosnap/tap/zmx`，其它安装方式见 [ZMX 后端](/zmx)。
+- **zmx ≥ 0.7.1**（可选，macOS / Linux）：仅显式配置 `backendType: "zmx"` 或 `BACKEND_TYPE=zmx` 时启用；将 0.7.1 视为假定包含 [PR #202](https://github.com/neurosnap/zmx/pull/202) `send` 行为的首个发布版，安装与完整前置见 [ZMX 后端](/zmx)。
 
 ## 推荐部署形态
 

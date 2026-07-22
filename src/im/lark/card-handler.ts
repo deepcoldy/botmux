@@ -59,7 +59,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, killWorker, closeSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
@@ -544,6 +544,22 @@ export async function commitRepoSelection(
     return;
   } else {
     // Mid-session repo switch — close old session, start fresh.
+    // ZMX close is identity/generation verified and may refuse. Prove teardown
+    // before claiming the card or mutating any old-session state; on refusal
+    // the current session and card remain fully retryable.
+    try {
+      teardownAuthoritativePersistentBackingBeforeClose(ds);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.warn(`[${tag(ds)}] Repo switch refused because backing teardown was not proven: ${reason}`);
+      try {
+        await sessionReply(rootId, t('cmd.repo.switch_close_failed', { error: reason }, locTarget));
+      } catch (replyErr) {
+        logger.warn(`[${tag(ds)}] Repo-switch teardown failure reply failed: ${replyErr instanceof Error ? replyErr.message : replyErr}`);
+      }
+      return;
+    }
+
     // Claim the current card BEFORE killWorker / any await. A concurrent click
     // on the same Feishu card must not pass a second kill+fork while the first
     // switch is still awaiting confirm replies. Correctness does not depend on
@@ -1649,8 +1665,17 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Build the closed card BEFORE killWorker/closeSession — it reads the
       // live session's identity off `ds`.
       const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
-      killWorker(ds);
-      sessionStore.closeSession(ds.session.sessionId);
+      try {
+        await closeSession(ds.session.sessionId);
+      } catch (err) {
+        logger.error(`[${tag(ds)}] Refused close because backing teardown was not verified: ${err}`);
+        return {
+          toast: {
+            type: 'warning',
+            content: `会话关闭失败：${err instanceof Error ? err.message : String(err)}`,
+          },
+        };
+      }
       activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
@@ -1740,8 +1765,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       persistStreamCardState(ds);
 
       let cardJson: string | undefined;
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
-        const readUrl = buildTerminalUrl(ds);
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
+        const readUrl = readableTerminalUrlFor(ds);
         cardJson = buildStreamingCard(
           ds.session.sessionId,
           sessionAnchorId(ds),
@@ -1900,10 +1925,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'get_write_link' && ds && operatorOpenId) {
-      const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.riffAccessUrl || (ds.workerPort && ds.workerToken)) {
+      if (!sessionSupportsWebTerminal(ds)) {
+        // Old cards can retain a get_write_link callback and stale port/token
+        // fields after the session is restored onto ZMX. This is a permanent
+        // backend capability boundary, not a transient startup delay.
+        const unsupportedCard = JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{ tag: 'markdown', content: t('card.action.terminal_unsupported', undefined, locDs) }],
+        });
+        await deliverEphemeralOrReply(ds, operatorOpenId, unsupportedCard, 'interactive', () => sessionReply(rootId, unsupportedCard, 'interactive'));
+        return;
+      }
+      if (sessionSupportsWebTerminal(ds) && (ds.riffAccessUrl || (ds.workerPort && ds.workerToken))) {
         const writeUrl = buildTerminalUrl(ds, { write: true });
         const cardJson = buildSessionCard(
           ds.session.sessionId,
@@ -1963,8 +1998,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           if (ds.worker) {
             ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
           }
-          if (cardMessageId && ds.workerPort) {
-            const readUrl = buildTerminalUrl(ds);
+          if (cardMessageId && workerHasInitialized(ds)) {
+            const readUrl = readableTerminalUrlFor(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const cardJson = buildStreamingCard(
               ds.session.sessionId,
@@ -2007,7 +2042,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
         }
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = ds.workerPort ? buildTerminalUrl(ds) : '';
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2047,8 +2082,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.worker) {
         ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
       }
-      if (ds.streamCardId && ds.workerPort) {
-        const readUrl = buildTerminalUrl(ds);
+      if (ds.streamCardId && workerHasInitialized(ds)) {
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2111,10 +2146,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       // Return the current card JSON so Feishu doesn't revert the displayed
       // image to the originally-POSTed initial frame while waiting for the
       // fresh screenshot PATCH (~1s).
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = buildTerminalUrl(ds);
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -2152,10 +2187,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
-      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && ds.workerPort) {
+      if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
         const botCfg = getBot(ds.larkAppId).config;
         const effectiveCliId = sessionCliId(ds);
-        const readUrl = buildTerminalUrl(ds);
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,

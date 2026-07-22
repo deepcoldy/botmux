@@ -20,7 +20,7 @@
 
 [中文](README.md) | English
 
-**Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards, a web terminal, and zero glue code.**
+**Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards and, except on the plain-text ZMX backend, a web terminal.**
 
 > 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>** — this README only covers why and how to get started fast.
 
@@ -53,10 +53,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
 | Multi-CLI Support | Many CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build / Kiro, …) | Tied to a single SDK, cannot switch CLIs |
-| Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
+| Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync (except on ZMX) | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
-| Terminal Access | tmux / ZMX attach directly into the CLI process, same as local dev experience | No direct terminal access |
+| Terminal Access | Local tmux / ZMX attach directly into the CLI process, same as local dev experience | No direct terminal access |
 | Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
 ---
@@ -67,7 +67,6 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 - **AI coding CLI / local agent app** installed and authenticated (`claude`, `codex`, `coco`, `cursor-agent`, `gemini`, `genius`, `opencode`, `hermes`, `seed` (Seed CLI, a Claude Code fork), `relay` (Relay CLI, the new release of Seed), `pi`, `omp` (oh-my-pi, a Pi fork), `copilot` (GitHub Copilot CLI), `traex` (TRAE CLI), `mircli` (Mir CLI), `agy` (Antigravity), `kimi` (Kimi Code), `grok` (Grok Build), or `kiro-cli` (Kiro) in PATH)
   - **CoCo requires `0.120.32+`**: type-ahead (sending a new message while a turn is still running, parked in CoCo's own message queue) relies on 0.120.32+ behavior; earlier versions may drop or serialize input while busy — upgrade before use
 - **tmux** >= 3.x (optional — auto-enabled when installed for persistent CLI sessions)
-- **zmx** >= 0.6.0 (optional, macOS / Linux; explicitly opt in with `backendType: "zmx"` or `BACKEND_TYPE=zmx`; botmux never installs or selects it automatically)
 - **CJK fonts** (only needed for screenshot rendering of Chinese text / emoji):
   - macOS: ships with PingFang / Hiragino, no action needed
   - Debian/Ubuntu: daemon will background-install `fonts-noto-cjk fonts-noto-color-emoji` on first boot if missing (requires passwordless sudo or running as root; restart the daemon after install)
@@ -218,16 +217,16 @@ Then restart the daemon: `botmux restart`.
 
 Each conversation turn gets a live-updating Feishu card — your main window for sensing and driving the CLI from phone/Lark:
 
-- **Live terminal screenshot streamed to the card** (rendered headlessly via xterm into a PNG, faithfully reproducing the CLI's TUI); one-tap "show/hide output", "export text", "page up/down"
+- **Live terminal screenshot streamed to the card** (raw terminal streams are rendered headlessly through xterm to reproduce the CLI's TUI; ZMX instead refreshes from its eventually consistent plain-text `history` screen); one-tap "show/hide output", "export text", "page up/down"
 - **Live status**: Starting → Analyzing → Working / Executing → Idle; marks "limit reached · retryable" when quota runs out
-- **Act right from the card**: open (writable) terminal, 🔑 get write link, restart / close / take over the session, re-send last task
+- **Act right from the card**: backends with a Web Terminal can open it and issue a 🔑 write link; all backends retain their applicable restart / close / takeover / re-send controls
 - **One new card per turn**, the previous one frozen as an archive; after `/relay` moves a session to another group, the old card auto-freezes as an archive
 - **Closing leaves a resumable card** (with the CLI's native resume command) — click back in anytime
 
 
 ### Web Terminal (Interactive)
 
-Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
+Every session except a ZMX-backed one exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`. ZMX does not provide a Web TUI; run `botmux list` or `zmx attach` locally to enter the same CLI.
 
 - When `WEB_EXTERNAL_HOST` is unset or blank, start/restart auto-detects the current non-loopback IPv4 address. To pin a proxy, NAT address, or hostname, set it explicitly in `~/.botmux/.env`. Restarts launched from a botmux session, the Dashboard, or auto-update treat that file as authoritative so the old daemon address cannot leak into the new processes.
 - **Read-only link** — shown on the streaming card in the group thread
@@ -295,15 +294,9 @@ BACKEND_TYPE=pty botmux start
 
 ### ZMX Session Backend (Explicit Opt-In)
 
-[ZMX](https://github.com/neurosnap/zmx) is a lightweight persistent-session alternative to tmux. botmux drives it through one real `zmx attach` PTY (not a `tail` / `send` side channel). The deterministic session name is `bmx-<first 8 chars of sessionId>`, so raw ANSI, terminal sizing, input, and the re-attach snapshot all travel over the same I/O path.
+[ZMX](https://github.com/neurosnap/zmx) is a lightweight persistent-session alternative to tmux. botmux uses `tail` as a change signal, `history` as the authoritative plain-text screen, and the corrected `send` for input, while `zmx attach` still opens the same CLI locally. It supports macOS and Linux and is enabled only with an explicit `backendType: "zmx"` or `BACKEND_TYPE=zmx`; botmux never installs or selects it automatically.
 
-- macOS and Linux are supported, with **zmx >= 0.6.0** required. Install with Homebrew using `brew install neurosnap/tap/zmx`; on other hosts, download the matching prebuilt binary from the [official ZMX project](https://github.com/neurosnap/zmx#install) and put it on `PATH`. botmux **does not install ZMX or select it automatically**.
-- Prefer `"backendType": "zmx"` in one bot's `bots.json` entry; use `BACKEND_TYPE=zmx botmux start` to select it deployment-wide. A missing binary, unsupported version, or failed `zmx list` probe **fails closed** and never silently falls back to PTY.
-- Across a daemon restart, the ZMX session and CLI stay alive and botmux re-attaches. If the backing session is gone, botmux retains the recoverable record and lazily resumes it on the next message. `/close` explicitly destroys the ZMX session and terminates the CLI.
-- `botmux list` shows these sessions and Enter attaches in place. On a macOS daemon, you can also explicitly enable **Native CLI opening** in Dashboard settings and use the card button to attach to the same ZMX session.
-- The ZMX backend does not support `/adopt` and cannot enforce botmux's file sandbox or read isolation. A per-bot/global sandbox, or the standalone effective `readIsolation` mode on macOS, is rejected with an actionable notification. On Linux, the bare legacy `readIsolation` flag is a no-op under the worker's unified semantics and does not incorrectly gate ZMX; enable the sandbox and use tmux / PTY when isolation is required.
-
-See the [ZMX backend documentation](https://deepcoldy.github.io/botmux/en/zmx) for the complete operating and troubleshooting notes.
+This integration treats **zmx 0.7.1** as the first release assumed to contain the `send` behavior from [ZMX PR #202](https://github.com/neurosnap/zmx/pull/202), and requires **zmx >= 0.7.1**. See the [ZMX backend documentation](https://deepcoldy.github.io/botmux/en/zmx) for installation, upgrades, eventually consistent plain-text output, and sandbox / adopt boundaries.
 
 ### Session Adopt
 

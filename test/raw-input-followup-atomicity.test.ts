@@ -110,7 +110,7 @@ describe('worker command-line write mutex', () => {
 });
 
 describe('worker sendRawCommandLine helper', () => {
-  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 2200);
+  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 3000);
 
   it('generic CLIs: literal text → 200ms beat → Enter in order (slash-picker safe)', () => {
     const textIdx = helper.indexOf('sendText(content)');
@@ -144,6 +144,33 @@ describe('worker sendRawCommandLine helper', () => {
     expect(cocoEnterIdx).toBeLessThan(genericTextIdx);
     expect(returnIdx).toBeGreaterThan(cocoEnterIdx);
     expect(returnIdx).toBeLessThan(genericTextIdx);
+  });
+
+  it('fails before Enter when a backend explicitly rejects the generic text write', () => {
+    const textIdx = helper.indexOf('sendText(content)');
+    const rejectionIdx = helper.indexOf("throw new Error('backend rejected command text input')", textIdx);
+    const beatIdx = helper.indexOf('setTimeout(r, 200)', textIdx);
+    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", textIdx);
+
+    expect(helper.slice(textIdx - 30, rejectionIdx)).toContain('=== false');
+    expect(rejectionIdx).toBeGreaterThan(textIdx);
+    expect(rejectionIdx).toBeLessThan(beatIdx);
+    expect(rejectionIdx).toBeLessThan(enterIdx);
+  });
+
+  it('stops CoCo typing immediately on rejection and also checks the submit key', () => {
+    const cocoIdx = helper.indexOf("cliId === 'coco'");
+    const charIdx = helper.indexOf('sendText(ch)', cocoIdx);
+    const charRejectionIdx = helper.indexOf("throw new Error('backend rejected command text input')", charIdx);
+    const throttleIdx = helper.indexOf('COCO_SLASH_TYPE_THROTTLE_MS', charIdx);
+    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", throttleIdx);
+    const enterRejectionIdx = helper.indexOf("throw new Error('backend rejected command submit key')", enterIdx);
+
+    expect(helper.slice(charIdx - 30, charRejectionIdx)).toContain('=== false');
+    expect(charRejectionIdx).toBeGreaterThan(charIdx);
+    expect(charRejectionIdx).toBeLessThan(throttleIdx);
+    expect(helper.slice(enterIdx - 30, enterRejectionIdx)).toContain('=== false');
+    expect(enterRejectionIdx).toBeGreaterThan(enterIdx);
   });
 });
 

@@ -45,6 +45,7 @@ import {
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
@@ -105,9 +106,11 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   return null;
 }
 
-async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boolean> {
+type CliMismatchCloseResult = 'not_mismatched' | 'closed' | 'teardown_failed';
+
+async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
   const mismatch = sessionBotCliMismatch(ds);
-  if (!mismatch) return false;
+  if (!mismatch) return 'not_mismatched';
 
   const tag = ds.session.sessionId.substring(0, 8);
   const backendType = getSessionPersistentBackendType(ds);
@@ -118,12 +121,25 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boole
   if (backendType && (!ds.worker || ds.worker.killed)) {
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${backendName}`);
-    killPersistentSession(backendType, backendName);
+    try {
+      killPersistentSession(backendType, backendName, ds.session.sessionId);
+    } catch (err) {
+      // ZMX destruction is deliberately identity-verified and can fail on an
+      // inconclusive probe or a generation change. Never close the persisted
+      // row in that state: doing so would orphan a possibly-live CLI with no
+      // retryable ownership record. The caller skips this row and continues
+      // restoring/sweeping unrelated sessions.
+      logger.error(
+        `[${tag}] CLI mismatch backing teardown failed; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 'teardown_failed';
+    }
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
   await closeSession(ds.session.sessionId);
-  return true;
+  return 'closed';
 }
 
 /**
@@ -145,7 +161,14 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
-    if (await closeActiveSessionIfCliMismatch(ds)) closed++;
+    try {
+      if (await closeActiveSessionIfCliMismatch(ds) === 'closed') closed++;
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return closed;
 }
@@ -1421,7 +1444,23 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         // instead of resurrecting an invisible worker.
         const backendType = getSessionPersistentBackendType(ds);
         if (backendType) {
-          killPersistentSession(backendType, persistentSessionName(backendType, session.sessionId));
+          try {
+            killPersistentSession(
+              backendType,
+              persistentSessionName(backendType, session.sessionId),
+              session.sessionId,
+            );
+          } catch (err) {
+            // Keep the row active when destruction cannot be proved. Closing it
+            // would strand a possibly-live hidden run with no ownership record;
+            // skipping registration also prevents this restore pass from
+            // accidentally reattaching it. Continue with the remaining rows.
+            logger.error(
+              `[${session.sessionId.substring(0, 8)}] Could not tear down unmaterialized deferred run; keeping active row: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
         }
         sessionStore.closeSession(session.sessionId);
         removeDeferredTopicBinding(config.session.dataDir, session.sessionId);
@@ -1439,7 +1478,16 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       ds.replyThreadAliases = aliases;
       sessionStore.updateSession(session);
     }
-    if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    try {
+      const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
+      if (mismatchClose !== 'not_mismatched') continue;
+    } catch (err) {
+      logger.error(
+        `[${session.sessionId.substring(0, 8)}] CLI mismatch close failed during restore; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
@@ -1453,7 +1501,17 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
     if (!restored || session.status !== 'active' || restoreCurrent !== ds) {
       logger.warn(`[${session.sessionId.substring(0, 8)}] Restore was cancelled while resolving a routing collision`);
-      await closeSession(session.sessionId);
+      try {
+        await closeSession(session.sessionId);
+      } catch (err) {
+        // A rejected ZMX ownership/generation probe means teardown was not
+        // proven. Keep the persisted row active for a later retry and continue
+        // restoring unrelated sessions instead of crash-looping daemon boot.
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Could not close restore collision loser; keeping active row: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       continue;
     }
     restoredByThisInvocation.push(ds);
@@ -1574,7 +1632,16 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // check on the reattach path too — persistent-backend reattach ignores the
     // bin/args handed to backend.spawn(), so anything that slips through here
     // would silently resurrect the old frozen CLI.
-    if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    try {
+      const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
+      if (mismatchClose !== 'not_mismatched') continue;
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed during reattach; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
 
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
@@ -1610,6 +1677,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
  * only the first forks; the rest just await the same `ds.workerPort`.
  */
 export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<number | undefined> {
+  const frozenBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (frozenBackendType !== undefined && !backendSupportsWebTerminal(frozenBackendType)) {
+    return undefined;
+  }
   if (ds.workerPort) return ds.workerPort;
   if (ds.session.status !== 'active') return undefined;
 

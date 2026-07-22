@@ -568,6 +568,8 @@ function mapTerminalDisabledReason(reasonKey: string | undefined): string | unde
   switch (reasonKey) {
     case 'sessions.action.terminal.noPort':
       return 'card.dashboard.sessions.terminal.disabled.noPort';
+    case 'sessions.action.terminal.unsupported':
+      return 'card.dashboard.sessions.terminal.disabled.unsupported';
     default:
       return undefined;
   }

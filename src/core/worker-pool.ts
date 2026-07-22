@@ -35,6 +35,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
@@ -324,11 +325,36 @@ function doneReactionEmojiFor(ds: DaemonSession): string {
   } catch { return DONE_REACTION_EMOJI_TYPE; }
 }
 
+/** Worker lifecycle readiness is independent from Web Terminal availability.
+ * Legacy/test sessions predate workerReady, so retain the old port inference
+ * only while the explicit flag is absent. */
+export function workerHasInitialized(ds: DaemonSession): boolean {
+  return ds.workerReady === true
+    || (ds.workerReady === undefined
+      && sessionSupportsWebTerminal(ds)
+      && !!(ds.workerPort ?? ds.session.webPort));
+}
+
+/** Capability of the backend frozen onto this worker/session generation. */
+export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  // Pre-backend-stamp sessions are legacy tmux sessions and retain Web TUI.
+  return backendType === undefined || backendSupportsWebTerminal(backendType);
+}
+
+/** Empty means this session intentionally has no Web Terminal surface. */
+export function readableTerminalUrlFor(ds: DaemonSession): string {
+  return sessionSupportsWebTerminal(ds) && (ds.workerPort ?? ds.session.webPort)
+    ? buildTerminalUrl(ds)
+    : '';
+}
+
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
 // card body (token included). Returns undefined unless the bot enabled it AND
 // the worker port/token are known. Exported for card-handler's re-renders so the
 // link stays put across button-driven card updates.
 export function writableTerminalLinkFor(ds: DaemonSession): string | undefined {
+  if (!sessionSupportsWebTerminal(ds)) return undefined;
   try {
     if (getBot(ds.larkAppId).config.writableTerminalLinkInCard !== true) return undefined;
   } catch { return undefined; }
@@ -347,7 +373,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     ds.pendingLocalCliButtonRefresh = true;
     return;
   }
-  if (!ds.streamCardId || !ds.workerPort) return;
+  if (!ds.streamCardId || !workerHasInitialized(ds)) return;
   ds.pendingLocalCliButtonRefresh = undefined;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
@@ -355,7 +381,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    buildTerminalUrl(ds),
+    readableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
     ds.lastScreenContent ?? '',
     status,
@@ -551,12 +577,11 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   // screen_update path has already suppressed auxiliary UI.
   if (ds.session.vcMeetingReceiver) return;
   if (ds.lastScreenStatus !== 'limited') return;
-  const port = ds.workerPort ?? ds.session.webPort;
-  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !port) return;
+  if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) return;
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = buildTerminalUrl(ds);
+  const readUrl = readableTerminalUrlFor(ds);
   const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -716,8 +741,8 @@ export function recallFrozenCards(ds: DaemonSession): void {
  * manually summon a live card in an otherwise-quiet session. Parks the current
  * card (if any) first so `recallFrozenCards` withdraws it once the fresh one
  * lands — the thread ends up with a single live card. Returns false when the
- * worker terminal isn't ready yet (no port), so the caller can surface a
- * friendly "not ready" message.
+ * worker isn't initialized yet, so the caller can surface a friendly "not
+ * ready" message. A ready backend without Web Terminal still gets the card.
  *
  * Note: this does NOT itself flip `ds.streamingCardForced` — the caller sets
  * that so the card keeps live-patching afterwards even when the bot opted out.
@@ -730,11 +755,10 @@ export async function postFreshStreamingCard(
   // publish one into the listener chat as a streaming-card side channel.
   if (ds.session.vcMeetingReceiver) return false;
   if (isDocNativeSession(ds)) return false;
-  const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return false;
+  if (!workerHasInitialized(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = buildTerminalUrl(ds);
+  const readUrl = readableTerminalUrlFor(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
 
@@ -819,12 +843,11 @@ export async function postPrivateSnapshotCard(
   ds: DaemonSession,
   audience: string[],
 ): Promise<{ sent: number; total: number; notReady: boolean }> {
-  const port = ds.workerPort ?? ds.session.webPort;
-  if (!port) return { sent: 0, total: audience.length, notReady: true };
+  if (!workerHasInitialized(ds)) return { sent: 0, total: audience.length, notReady: true };
 
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = buildTerminalUrl(ds);
+  const readUrl = readableTerminalUrlFor(ds);
   const title = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
   const status = ds.lastScreenStatus ?? 'idle';
   const cardJson = buildPrivateSnapshotCard(
@@ -896,7 +919,7 @@ export async function deliverWriteLinkCard(
 
 export interface WriteLinkOwnerDelivery {
   ok: boolean;
-  error?: 'terminal_unavailable' | 'no_owner' | 'delivery_failed';
+  error?: 'terminal_unavailable' | 'terminal_unsupported' | 'no_owner' | 'delivery_failed';
   delivered: number;
   total: number;
   channels: Array<'ephemeral' | 'dm' | 'failed'>;
@@ -910,6 +933,7 @@ export interface WriteLinkOwnerDelivery {
  * ({@link deliverWritableTerminalCardTo}, behind the `/term` slash command).
  */
 export function buildWritableTerminalCard(ds: DaemonSession): string | null {
+  if (!sessionSupportsWebTerminal(ds)) return null;
   // Riff backend: the sandbox URL is the writable link — no local worker/token needed.
   if (ds.riffAccessUrl) {
     const botCfg = getBot(ds.larkAppId).config;
@@ -955,6 +979,9 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
  * these private channels — it is never returned to the CLI caller / stdout.
  */
 export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<WriteLinkOwnerDelivery> {
+  if (!sessionSupportsWebTerminal(ds)) {
+    return { ok: false, error: 'terminal_unsupported', delivered: 0, total: 0, channels: [] };
+  }
   const cardJson = buildWritableTerminalCard(ds);
   if (!cardJson) return { ok: false, error: 'terminal_unavailable', delivered: 0, total: 0, channels: [] };
 
@@ -987,7 +1014,8 @@ export async function deliverWriteLinkCardToOwners(ds: DaemonSession): Promise<W
 export async function deliverWritableTerminalCardTo(
   ds: DaemonSession,
   operatorOpenId: string,
-): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready'> {
+): Promise<'ephemeral' | 'dm' | 'failed' | 'not_ready' | 'unsupported'> {
+  if (!sessionSupportsWebTerminal(ds)) return 'unsupported';
   const cardJson = buildWritableTerminalCard(ds);
   if (!cardJson) return 'not_ready';
   return deliverWriteLinkCard(ds, operatorOpenId, cardJson);
@@ -999,12 +1027,41 @@ export interface SubstituteControlCardDelivery {
 }
 
 /**
- * DM a writable-terminal control card to the bot's owner(s) for a substitute-mode session.
+ * Build the private owner control card used by substitute-mode sessions.
+ * Web-capable backends keep the writable-terminal card; backends without a
+ * Web Terminal (currently ZMX) still need restart / close controls.
+ */
+function buildSubstituteControlCard(ds: DaemonSession): string | null {
+  const writableCard = buildWritableTerminalCard(ds);
+  if (writableCard) return writableCard;
+
+  // A Web-capable backend returning null simply is not ready yet. Preserve the
+  // existing retry-on-next-ready behavior instead of sending a partial card.
+  if (sessionSupportsWebTerminal(ds)) return null;
+
+  const botCfg = getBot(ds.larkAppId).config;
+  const effectiveCliId = sessionCliId(ds, botCfg);
+  return buildSessionCard(
+    ds.session.sessionId,
+    sessionAnchorId(ds),
+    '', // Manage-only: this backend intentionally has no Web Terminal URL.
+    ds.session.title || getCliDisplayName(effectiveCliId),
+    effectiveCliId,
+    true,
+    !!ds.adoptedFrom,
+    localeForBot(ds.larkAppId),
+    isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+  );
+}
+
+/**
+ * DM a control card to the bot's owner(s) for a substitute-mode session.
+ * ZMX receives a manage-only card because it has no Web Terminal surface.
  * Guards against duplicate sends via `session.substituteControlCardSent`.
  */
 export async function deliverSubstituteControlCard(ds: DaemonSession): Promise<SubstituteControlCardDelivery> {
   if (ds.session.substituteControlCardSent) return { sent: 0, total: 0 };
-  const cardJson = buildWritableTerminalCard(ds);
+  const cardJson = buildSubstituteControlCard(ds);
   if (!cardJson) {
     logger.warn(`[${tag(ds)}] substitute control card skipped: terminal not ready`);
     return { sent: 0, total: 0 };
@@ -1308,6 +1365,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
+  ds.workerReady = false;
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
@@ -1375,7 +1433,11 @@ function destroyOrphanedBackingSession(ds: DaemonSession): void {
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
   try {
-    killPersistentSession(backendType, persistentSessionName(backendType, ds.session.sessionId));
+    killPersistentSession(
+      backendType,
+      persistentSessionName(backendType, ds.session.sessionId),
+      ds.session.sessionId,
+    );
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
@@ -1398,6 +1460,7 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
   if (!ds.worker || ds.worker.killed) {
+    ds.workerReady = false;
     // There is no live generation that can still own this capability.
     ds.managedTurnOrigin = undefined;
     return false;
@@ -1413,6 +1476,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   armWorkerKillBackstop(w, tag(ds));
 
   ds.worker = null;
+  ds.workerReady = false;
   ds.localProcessAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -1563,6 +1627,42 @@ function isLegacyApiDocSubscription(managedBy: 'subscribe-lark-doc' | 'watch-com
 }
 
 /**
+ * Perform the close-time teardown that must be proven before callers mutate
+ * the active registry or persisted Session row.
+ *
+ * ZMX is deliberately fail-closed: killManagedSession verifies the managed
+ * UUID/generation and throws when ownership is ambiguous. Most close paths go
+ * through closeSession(), but repo replacement reuses the live DaemonSession
+ * object and therefore cannot call closeSession() without deleting the routing
+ * generation it is about to repopulate. Those paths call this synchronous seam
+ * first, while every bit of old-session state is still intact.
+ *
+ * Other backends retain their existing worker-side graceful teardown. Adopted,
+ * queued, and already-closed rows never own a ZMX process to destroy.
+ */
+export function teardownAuthoritativePersistentBackingBeforeClose(
+  target: DaemonSession | Session,
+): void {
+  const ds = 'session' in target ? (target as DaemonSession) : undefined;
+  const session = ds?.session ?? (target as Session);
+  const backendType = ds ? getSessionPersistentBackendType(ds) : session.backendType;
+  if (
+    backendType !== 'zmx'
+    || ds?.initConfig?.adoptMode
+    || ds?.adoptedFrom
+    || session.adoptedFrom
+    || session.queued
+    || session.status === 'closed'
+  ) return;
+
+  killPersistentSession(
+    'zmx',
+    persistentSessionName('zmx', session.sessionId),
+    session.sessionId,
+  );
+}
+
+/**
  * Idempotent close: kill worker if alive, mark Session status='closed' + closedAt,
  * publish session.exited (if a live worker was killed) and session.update
  * (if the persistence row transitioned to closed).
@@ -1574,13 +1674,17 @@ export async function closeSession(
   sessionId: string,
 ): Promise<{ ok: true; alreadyClosed: boolean; known: boolean }> {
   const ds = findActiveBySessionId(sessionId);
+  const stored = sessionStore.getOwnedSession(sessionId);
+  // Prove fail-closed ZMX teardown before any registry/store mutation. Repo
+  // replacement paths reuse the same helper before their own state transition.
+  const teardownTarget = ds ?? stored;
+  if (teardownTarget) teardownAuthoritativePersistentBackingBeforeClose(teardownTarget);
   let killedLive = false;
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
   // Snapshot ownership + transition state before mutating the live object:
   // sessionStore commonly holds the very same Session reference as `ds`.
-  const stored = sessionStore.getOwnedSession(sessionId);
   const known = !!ds || !!stored;
   const wasOpen = !!stored && stored.status !== 'closed';
   const storedHadDocCommentTargets = Object.keys(stored?.docCommentTargets ?? {}).length > 0;
@@ -1721,7 +1825,7 @@ export function destroyUnregisteredPersistentBacking(
   if (!isSuspendableBackendType(backendType)) return false;
   const backendName = persistentSessionName(backendType, session.sessionId);
   try {
-    kill(backendType, backendName);
+    kill(backendType, backendName, session.sessionId);
     logger.info(`[${session.sessionId.substring(0, 8)}] Closed unregistered ${backendType} backing ${backendName}`);
     return true;
   } catch (err) {
@@ -2207,6 +2311,7 @@ export function forkWorker(
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
+  ds.workerReady = false;
 
   let resume = false;
   let initTurnId: string | undefined;
@@ -2290,6 +2395,7 @@ export function forkWorker(
     try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
     try { ds.worker.kill(); } catch { /* ignore */ }
     ds.worker = null;
+    ds.workerReady = false;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
@@ -2476,6 +2582,16 @@ export function forkWorker(
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
   };
+  // A persisted port from an older ZMX implementation must never revive the
+  // removed Web TUI or get forwarded as a preferred listen port. The worker
+  // will signal lifecycle readiness with port=0 instead.
+  if (!backendSupportsWebTerminal(initMsg.backendType)) {
+    initMsg.webPort = undefined;
+    if (ds.session.webPort !== undefined) {
+      ds.session.webPort = undefined;
+      sessionStore.updateSession(ds.session);
+    }
+  }
   worker.send(initMsg);
   ds.initConfig = initMsg;
 
@@ -2652,6 +2768,14 @@ function setupWorkerHandlers(
   const showTakeover = false;
 
   worker.on('message', async (msg: WorkerToDaemon) => {
+    // Every IPC message is scoped to the child generation that emitted it.
+    // A replaced worker can drain queued messages after the new child has been
+    // installed; never let those stale events mutate the replacement's cards,
+    // tokens, readiness, transcript metadata, or durable turn state.
+    if (ds.worker !== worker) {
+      logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
+      return;
+    }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
       case 'local_process_attestation': {
@@ -2659,7 +2783,6 @@ function setupWorkerHandlers(
         // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
         // Bind it to the daemon's current worker generation so a late message
         // from a replaced worker never attests the replacement process.
-        if (ds.worker !== worker) break;
         ds.localProcessAttestation = {
           backendType: msg.backendType,
           credentialIsolated: msg.credentialIsolated,
@@ -2673,29 +2796,37 @@ function setupWorkerHandlers(
       }
       case 'ready': {
         startupState.ready = true;
-        ds.workerPort = msg.port;
-        ds.workerToken = msg.token;
-        ds.workerViewToken = msg.viewToken ?? null;
-        // Persist port so it can be reused after daemon restart
-        ds.session.webPort = msg.port;
+        ds.workerReady = true;
+        const webPort = Number.isInteger(msg.port) && msg.port > 0 ? msg.port : null;
+        ds.workerPort = webPort;
+        ds.workerToken = webPort ? msg.token : null;
+        ds.workerViewToken = webPort ? (msg.viewToken ?? null) : null;
+        // Persist a real port only. port=0 is the explicit ready-without-Web-
+        // Terminal sentinel used by backends whose output is not raw ANSI.
+        ds.session.webPort = webPort ?? undefined;
         sessionStore.updateSession(ds.session);
-        const readOnlyUrl = buildTerminalUrl(ds);
-        const writeUrl = buildTerminalUrl(ds, { write: true });
-        logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl.replace(/\?.*$/, '?viewToken=[redacted]')}`);
+        const readOnlyUrl = readableTerminalUrlFor(ds);
+        if (readOnlyUrl) {
+          logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl.replace(/\?.*$/, '?viewToken=[redacted]')}`);
+        } else {
+          logger.info(`[${t}] Worker ready (Web Terminal unavailable for this backend)`);
+        }
         if (ds.usageLimit) {
           ds.lastScreenStatus = 'limited';
           armUsageLimitRetryTimer(ds);
         }
-        // Dashboard: surface the new xterm port so the live terminal link works.
+        // Dashboard: surface the xterm port, or explicitly clear it for a
+        // ready backend with no Web Terminal capability.
         dashboardEventBus.publish({
           type: 'session.update',
           body: {
             sessionId: ds.session.sessionId,
-            patch: { webPort: msg.port },
+            patch: { webPort },
           },
         });
 
-        // Substitute-mode control card: DM owner(s) a writable terminal + manage buttons.
+        // Substitute-mode control card: DM owner(s) writable-terminal controls
+        // when supported, or manage-only controls for no-Web backends.
         // Consumed before any early break below so avatar-style (card-off) sessions
         // still deliver the owner control card.
         if (ds.pendingSubstituteControlCard) {
@@ -2978,13 +3109,10 @@ function setupWorkerHandlers(
       }
 
       case 'screen_update': {
-        // Wait for `ready` (workerPort) before any card work — the read link
-        // is the LOCAL log terminal for every backend including riff
-        // (Web终端=日志页), so a port-less POST would render
-        // `http://host:undefined`. riff's early markPromptReady screen_update
-        // simply drops here; the `ready` handler posts the initial card with
-        // the real port, and riffAccessUrl rides the pending-patch flow.
-        if (!ds.workerPort) break;
+        // Wait for worker init, independently of Web Terminal availability.
+        // ZMX intentionally reports ready with port=0, but its plain-history
+        // screenshots and idle/status transitions must keep flowing.
+        if (!startupState.ready && !workerHasInitialized(ds)) break;
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
@@ -3048,7 +3176,7 @@ function setupWorkerHandlers(
         // user turn clears the flag. Dashboard SSE above still reflects status.
         if (ds.suppressRecoveryCard) break;
 
-        const readUrl = buildTerminalUrl(ds);
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
@@ -3154,8 +3282,8 @@ function setupWorkerHandlers(
         persistStreamCardState(ds);
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
-        if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !ds.workerPort) break;
-        const readUrl = buildTerminalUrl(ds);
+        if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
+        const readUrl = readableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -3283,8 +3411,8 @@ function setupWorkerHandlers(
         if (ds.adoptedFrom) {
           logger.info(`[${t}] Adopted session ended`);
           // Freeze the streaming card
-          if (!suppressExitUi && ds.streamCardId && (ds.workerPort || ds.riffAccessUrl)) {
-            const readUrl = buildTerminalUrl(ds);
+          if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
+            const readUrl = readableTerminalUrlFor(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -3321,11 +3449,11 @@ function setupWorkerHandlers(
         if (rc.count > 3) {
           logger.warn(`[${t}] ${getCliDisplayName(effectiveCliId)} crashed ${rc.count} times in 1 min, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
-          // Freeze the last streaming card so it doesn't stay at "working" forever.
-          // 读链接严格要求 workerPort（riffAccessUrl 是写能力且 worker 退出后不清，
-          // 用它放行会构造 host:undefined 的坏读链接）。
-          if (!suppressExitUi && ds.streamCardId && ds.workerPort) {
-            const readUrl = buildTerminalUrl(ds);
+          // Freeze the last streaming card so it doesn't stay at "working"
+          // forever. Backends without a Web Terminal pass an empty read URL;
+          // the card keeps snapshot/manage controls and omits terminal links.
+          if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
+            const readUrl = readableTerminalUrlFor(ds);
             const turnTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -3693,6 +3821,7 @@ function setupWorkerHandlers(
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
       ds.worker = null;
+      ds.workerReady = false;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
     }
@@ -4136,6 +4265,7 @@ export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
   if (!canForkRegisteredSession(ds)) return;
+  ds.workerReady = false;
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -4160,6 +4290,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch {}
     try { ds.worker.kill(); } catch {}
     ds.worker = null;
+    ds.workerReady = false;
     ds.workerPort = null;
     ds.workerToken = null;
     ds.workerViewToken = null;
@@ -4523,10 +4654,39 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr' | 'zmx',
   const activeNames = new Set(
     activeSessions_.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
   );
-  const ownedNames = new Set([
-    ...storedSessions.filter(belongsToBackend).map(s => backend.sessionName(s.sessionId)),
-    ...activeNames,
-  ]);
+  const ownedSessions = [
+    ...storedSessions.filter(belongsToBackend),
+    ...activeSessions_.filter(belongsToBackend),
+  ];
+  const ownedIdsByName = new Map<string, Set<string>>();
+  for (const session of ownedSessions) {
+    const name = backend.sessionName(session.sessionId);
+    const ids = ownedIdsByName.get(name) ?? new Set<string>();
+    ids.add(session.sessionId);
+    ownedIdsByName.set(name, ids);
+  }
+  const ownedNames = new Set(ownedIdsByName.keys());
+  const killOwnedBackendSession = (name: string, exactSessionId?: string): void => {
+    if (backendType !== 'zmx') {
+      backend.killSession(name);
+      return;
+    }
+    const candidates = exactSessionId
+      ? new Set([exactSessionId])
+      : ownedIdsByName.get(name);
+    if (!candidates || candidates.size !== 1) {
+      logger.warn(
+        `Refusing ambiguous name-only ZMX cleanup for ${name}; ` +
+        `matching stored session ids=${candidates?.size ?? 0}`,
+      );
+      return;
+    }
+    try {
+      ZmxBackend.killManagedSession(name, [...candidates][0]!);
+    } catch (err) {
+      logger.warn(`Refusing unsafe ZMX cleanup for ${name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
@@ -4535,13 +4695,13 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr' | 'zmx',
       // ownership credential. Another checkout/data root can legitimately own
       // a bmx-* daemon, so never kill a name absent from this bot's store/map.
       if (backendType === 'zmx' && !ownedNames.has(name)) continue;
-      backend.killSession(name);
+      killOwnedBackendSession(name);
     }
   } else {
     for (const name of backend.listBotmuxSessions()) {
       if (ownedNames.has(name) && !activeNames.has(name)) {
         logger.info(`Killing orphaned ${backendType} session: ${name}`);
-        backend.killSession(name);
+        killOwnedBackendSession(name);
       }
     }
     for (const session of activeSessions_) {
@@ -4553,7 +4713,7 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr' | 'zmx',
       if (botCliId && sessionCliId !== botCliId) {
         const name = backend.sessionName(session.sessionId);
         logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${name}`);
-        backend.killSession(name);
+        killOwnedBackendSession(name, session.sessionId);
       }
     }
   }

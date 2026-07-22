@@ -1,237 +1,554 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync, writeFileSync, writeSync } from 'node:fs';
 
-const fakePtys = vi.hoisted(() => [] as FakePty[]);
+const childMocks = vi.hoisted(() => {
+  class FakeStream {
+    private readonly listeners = new Map<string, Array<(value: any) => void>>();
 
-class FakePty {
-  readonly writes: string[] = [];
-  spawnArgs: string[] = [];
-  killed = false;
-  private dataCb: ((data: string) => void) | undefined;
-  private exitCb: ((event: { exitCode: number; signal?: number }) => void) | undefined;
+    on(event: string, cb: (value: any) => void): this {
+      const callbacks = this.listeners.get(event) ?? [];
+      callbacks.push(cb);
+      this.listeners.set(event, callbacks);
+      return this;
+    }
 
-  write(data: string): void { this.writes.push(data); }
-  resize(): void {}
-  kill(): void { this.killed = true; }
-  onData(cb: (data: string) => void): void { this.dataCb = cb; }
-  onExit(cb: (event: { exitCode: number; signal?: number }) => void): void { this.exitCb = cb; }
-  emitData(data: string): void { this.dataCb?.(data); }
-  emitExit(exitCode: number, signal?: number): void { this.exitCb?.({ exitCode, signal }); }
-}
+    emit(event: string, value: any): void {
+      for (const cb of this.listeners.get(event) ?? []) cb(value);
+    }
+  }
 
-vi.mock('node-pty', () => ({
-  spawn: vi.fn((_file: string, args: string[]) => {
-    const child = new FakePty();
-    child.spawnArgs = args;
-    fakePtys.push(child);
-    return child;
-  }),
+  class FakeChild {
+    readonly stdout = new FakeStream();
+    readonly stderr = new FakeStream();
+    killed = false;
+    onDisconnect: (() => void) | null = null;
+    private disconnected = false;
+    private readonly onceListeners = new Map<string, (a: any, b?: any) => void>();
+
+    constructor(readonly kind: 'tail' | 'history') {}
+
+    once(event: string, cb: (a: any, b?: any) => void): this {
+      this.onceListeners.set(event, cb);
+      return this;
+    }
+
+    kill(): boolean {
+      this.killed = true;
+      this.disconnect();
+      return true;
+    }
+
+    emitData(value: Buffer | string): void {
+      this.stdout.emit('data', value);
+    }
+
+    emitClose(code: number | null = 0, signal: NodeJS.Signals | null = null): void {
+      this.disconnect();
+      this.onceListeners.get('close')?.(code, signal);
+    }
+
+    private disconnect(): void {
+      if (this.disconnected) return;
+      this.disconnected = true;
+      this.onDisconnect?.();
+    }
+  }
+
+  return {
+    FakeChild,
+    execFile: vi.fn(),
+    execFileSync: vi.fn(),
+    spawn: vi.fn(),
+    spawnSync: vi.fn(),
+    children: [] as FakeChild[],
+  };
+});
+
+const fsMocks = vi.hoisted(() => ({
+  readFileSync: vi.fn(),
+  actualReadFileSync: null as null | ((...args: any[]) => any),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, execFileSync: vi.fn() };
+  return {
+    ...actual,
+    execFile: childMocks.execFile,
+    execFileSync: childMocks.execFileSync,
+    spawn: childMocks.spawn,
+    spawnSync: childMocks.spawnSync,
+  };
 });
 
-import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  fsMocks.actualReadFileSync = actual.readFileSync as (...args: any[]) => any;
+  return {
+    ...actual,
+    readFileSync: fsMocks.readFileSync,
+  };
+});
+
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 
-const execFileSyncMock = vi.mocked(execFileSync);
+const SESSION = 'bmx-test0001';
+const SESSION_ID = 'test0001-1111-2222-3333-444444444444';
+const PRIVATE_VALUE = 'provider-secret';
 
-function spawnBackend(): { backend: ZmxBackend; child: FakePty } {
-  execFileSyncMock.mockReturnValueOnce('' as never); // --short: no pre-existing session
-  execFileSyncMock.mockReturnValueOnce('' as never); // full list
-  const backend = new ZmxBackend('bmx-test0001');
+interface FakeZmxState {
+  exists: boolean;
+  pid: number;
+  clients: number;
+  command: string;
+  transport: string;
+  sessionId: string;
+  launchPid: number;
+  history: string;
+  historyStderr: string;
+  sendInputs: Buffer[];
+  failSendAt: number | null;
+  deferHistory: boolean;
+  readyPath: string | null;
+}
+
+let state: FakeZmxState;
+const backends: ZmxBackend[] = [];
+
+function zmxList(): string {
+  if (!state.exists) return '';
+  return `  name=${SESSION}\tpid=${state.pid}\tclients=${state.clients}\tcmd=${state.command}\n`;
+}
+
+function extractShellAssignment(script: string, name: string): string {
+  const match = script.match(new RegExp(`^${name}='([^']*)'$`, 'm'));
+  if (!match) throw new Error(`missing ${name} in bootstrap`);
+  return match[1]!;
+}
+
+function makeBackend(opts: { reattach?: boolean } = {}): ZmxBackend {
+  const backend = new ZmxBackend(SESSION, {
+    ownsSession: true,
+    isReattach: opts.reattach ?? false,
+    sessionId: SESSION_ID,
+  });
+  backends.push(backend);
+  return backend;
+}
+
+function spawnBackend(backend = makeBackend()): ZmxBackend {
   backend.spawn('/bin/sh', ['-c', 'echo ready'], {
     cwd: '/tmp',
     cols: 80,
     rows: 24,
-    env: { PATH: '/bin' },
+    env: { PATH: '/bin', BOTMUX_SESSION_ID: SESSION_ID },
+    injectEnv: { PROVIDER_TEST_TOKEN: PRIVATE_VALUE },
   });
-  return { backend, child: fakePtys.at(-1)! };
+  return backend;
 }
 
-function launchMarkers(child: FakePty): { ready: string; completion: string; release: string } {
-  const bootstrapPath = child.spawnArgs.at(-1);
-  if (!bootstrapPath) throw new Error('missing ZMX bootstrap path');
-  const bootstrap = readFileSync(bootstrapPath, 'utf8');
-  const nonce = bootstrap.match(/botmux-zmx-ready=([0-9a-f]{32})/)?.[1];
-  const release = bootstrap.match(/release_line" = '([0-9a-f]{32})'/)?.[1];
-  if (!nonce || !bootstrap.includes(`botmux-zmx-started=${nonce}`)) {
-    throw new Error('missing ZMX launch markers');
-  }
-  if (!release) throw new Error('missing ZMX private release token');
-  const ready = `\x1b]5150;botmux-zmx-ready=${nonce}\x1b\\`;
-  const completion = `\x1b]5150;botmux-zmx-started=${nonce}\x1b\\`;
-  return { ready, completion, release };
+function tailChildren(): InstanceType<typeof childMocks.FakeChild>[] {
+  return childMocks.children.filter(child => child.kind === 'tail');
 }
 
-describe('ZmxBackend recovery transport', () => {
+function historyChildren(): InstanceType<typeof childMocks.FakeChild>[] {
+  return childMocks.children.filter(child => child.kind === 'history');
+}
+
+async function settleAtCurrentTime(): Promise<void> {
+  // Labels are read through async execFile, then history through a child
+  // process. Drain both promise/microtask boundaries before advancing timers
+  // that their completion may have scheduled at the current fake time.
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  await vi.advanceTimersByTimeAsync(0);
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+}
+
+async function advanceAndSettle(ms: number): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+  await settleAtCurrentTime();
+}
+
+describe('ZmxBackend history-authoritative transport', () => {
   beforeEach(() => {
-    vi.useFakeTimers();
-    fakePtys.length = 0;
-    execFileSyncMock.mockReset();
+    // Keep Date.now real: fresh-ready/tail handshakes use synchronous
+    // Atomics.wait polling. Freezing Date would turn a regression into a hung
+    // test instead of letting its real deadline expire.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    state = {
+      exists: false,
+      pid: process.ppid,
+      clients: 0,
+      command: '',
+      transport: '',
+      sessionId: '',
+      launchPid: process.pid,
+      history: '',
+      historyStderr: '',
+      sendInputs: [],
+      failSendAt: null,
+      deferHistory: false,
+      readyPath: null,
+    };
+    backends.length = 0;
+    childMocks.children.length = 0;
+    childMocks.execFile.mockReset();
+    childMocks.execFileSync.mockReset();
+    childMocks.spawn.mockReset();
+    childMocks.spawnSync.mockReset();
+    fsMocks.readFileSync.mockReset();
+    fsMocks.readFileSync.mockImplementation((...args: any[]) => fsMocks.actualReadFileSync!(...args));
+
+    childMocks.execFileSync.mockImplementation((_file: string, argv: string[], options?: any) => {
+      if (_file === '/usr/bin/ps') {
+        const pid = Number(argv.at(-1));
+        return pid === state.launchPid ? `${state.pid}\n` : '';
+      }
+      const [command, ...args] = argv;
+      if (command === 'list' && args[0] === '--short') return state.exists ? `${SESSION}\n` : '';
+      if (command === 'list') return zmxList();
+      if (command === 'get') {
+        if (args[1] === 'botmux.transport') return state.transport;
+        if (args[1] === 'botmux.session') return state.sessionId;
+        if (args[1] === 'botmux.launch_pid') return `${state.launchPid}\n`;
+        return `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\n`;
+      }
+      if (command === 'set') {
+        for (const assignment of args.slice(1)) {
+          const [key, value = ''] = assignment.split('=', 2);
+          if (key === 'botmux.transport') state.transport = value;
+          if (key === 'botmux.session') state.sessionId = value;
+          if (key === 'botmux.launch_pid') state.launchPid = Number(value);
+        }
+        return '';
+      }
+      if (command === 'send') {
+        state.sendInputs.push(Buffer.from(options?.input ?? ''));
+        return state.failSendAt === state.sendInputs.length
+          ? `session ${SESSION} is unresponsive\n`
+          : '';
+      }
+      if (command === 'kill') {
+        state.exists = false;
+        state.clients = 0;
+        return '';
+      }
+      throw new Error(`unexpected zmx command: ${argv.join(' ')}`);
+    });
+
+    childMocks.execFile.mockImplementation((_file: string, argv: string[], _options: unknown, callback: Function) => {
+      const child = { kill: vi.fn() };
+      const [command] = argv;
+      queueMicrotask(() => {
+        if (command !== 'get') {
+          callback(new Error(`unexpected async zmx command: ${argv.join(' ')}`), '', '');
+          return;
+        }
+        callback(
+          null,
+          `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\n`,
+          '',
+        );
+      });
+      return child;
+    });
+
+    childMocks.spawnSync.mockImplementation((_file: string, argv: string[]) => {
+      const bootstrapPath = argv.at(-1)!;
+      const bootstrap = readFileSync(bootstrapPath, 'utf8');
+      const readyPath = extractShellAssignment(bootstrap, 'ready_path');
+      const cliPidPath = extractShellAssignment(bootstrap, 'cli_pid_path');
+      const readyNonce = extractShellAssignment(bootstrap, 'ready_nonce');
+      state.readyPath = readyPath;
+      state.exists = true;
+      state.command = `/bin/sh ${bootstrapPath}`;
+      writeFileSync(cliPidPath, `${state.launchPid}\n`, { mode: 0o600 });
+      writeFileSync(readyPath, `${readyNonce}\n`, { mode: 0o600 });
+      return {
+        pid: 99,
+        status: 0,
+        signal: null,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.alloc(0),
+      } as any;
+    });
+
+    childMocks.spawn.mockImplementation((_file: string, argv: string[], options?: any) => {
+      const kind = argv[0] === 'tail' ? 'tail' : 'history';
+      const child = new childMocks.FakeChild(kind);
+      childMocks.children.push(child);
+      if (kind === 'tail') {
+        state.clients += 1;
+        child.onDisconnect = () => { state.clients = Math.max(0, state.clients - 1); };
+      } else {
+        const fd = options?.stdio?.[1];
+        if (typeof fd !== 'number') throw new Error('history stdout must be a private file descriptor');
+        writeSync(fd, Buffer.from(state.history, 'utf8'));
+        if (state.historyStderr) child.stderr.emit('data', state.historyStderr);
+        if (!state.deferHistory) queueMicrotask(() => child.emitClose(0, null));
+      }
+      return child as any;
+    });
   });
 
   afterEach(() => {
+    for (const backend of backends) backend.kill();
     vi.useRealTimers();
   });
 
-  it('keeps queued input FIFO and retries an inconclusive flush probe on a quiet attach', () => {
-    const { backend, child } = spawnBackend();
-    const markers = launchMarkers(child);
-    backend.write('A');
-    child.emitData(`ready:${markers.ready.slice(0, 19)}`);
-    expect(child.writes).toEqual([]);
-    child.emitData(`${markers.ready.slice(19)}${markers.completion}\n`);
-    backend.write('B');
+  it('waits through transient empty and mismatched fresh-ready reads', () => {
+    let readyReads = 0;
+    fsMocks.readFileSync.mockImplementation((path: unknown, ...args: any[]) => {
+      if (state.readyPath && String(path) === state.readyPath) {
+        readyReads += 1;
+        if (readyReads === 1) return '';
+        if (readyReads === 2) return 'stale-ready-nonce\n';
+      }
+      return fsMocks.actualReadFileSync!(path, ...args);
+    });
 
-    // First post-attach probe is inconclusive, then the same silent attach is
-    // confirmed live. No second data frame should be required to release input.
-    execFileSyncMock.mockReturnValueOnce('' as never);
-    execFileSyncMock.mockReturnValueOnce('  name=bmx-test0001\terr=Timeout\n' as never);
-    execFileSyncMock.mockReturnValueOnce('bmx-test0001\n' as never);
-    execFileSyncMock.mockReturnValueOnce('  name=bmx-test0001\tpid=42\tclients=1\n' as never);
-    vi.advanceTimersByTime(150);
-    expect(child.writes).toEqual([`${markers.release}\r`]);
-    vi.advanceTimersByTime(300);
-    expect(child.writes).toEqual([`${markers.release}\r`, 'AB']);
-    backend.kill();
-    vi.advanceTimersByTime(5 * 60_000);
+    expect(() => spawnBackend()).not.toThrow();
+    expect(readyReads).toBe(3);
   });
 
-  it('strips the split fresh-ready marker before output and releases the bootstrap once', () => {
-    const { backend, child } = spawnBackend();
-    const markers = launchMarkers(child);
+  it('uses tail only as a change signal and publishes Unicode from history', async () => {
+    state.history = '你好😀曛\n';
+    const backend = spawnBackend();
+    const output: string[] = [];
+    const resyncs: string[] = [];
+    backend.onData(data => output.push(data));
+    backend.onScreenResync(snapshot => resyncs.push(snapshot));
+
+    const tail = tailChildren()[0]!;
+    tail.emitData('tail-bytes-that-must-never-reach-worker\n');
+    expect(output).toEqual([]);
+    expect(resyncs).toEqual([]);
+
+    await settleAtCurrentTime();
+    expect(output).toEqual([]);
+    expect(resyncs).toEqual(['你好😀曛\r\n']);
+    expect(resyncs.join('')).not.toContain('tail-bytes');
+    expect(backend.captureCurrentScreen()).toBe('你好😀曛\r\n');
+  });
+
+  it('safety-polls pure Chinese output even when tail emits no data', async () => {
+    const backend = spawnBackend();
     const output: string[] = [];
     backend.onData(data => output.push(data));
+    await settleAtCurrentTime();
 
-    child.emitData(`zmx-prefix${markers.ready.slice(0, 11)}`);
-    expect(output).toEqual([]);
-    expect(child.writes).toEqual([]);
+    state.history = '纯中文没有 tail 事件：你好曛😀\n';
+    await advanceAndSettle(250);
 
-    child.emitData(`${markers.ready.slice(11)}${markers.completion.slice(0, 13)}`);
-    expect(child.writes).toEqual([`${markers.release}\r`]);
-    expect(output).toEqual([]);
-
-    child.emitData(`${markers.completion.slice(13)}cli-suffix`);
-    expect(output.join('')).toBe('zmx-prefixcli-suffix');
-    expect(output.join('')).not.toContain(markers.ready);
-    expect(output.join('')).not.toContain(markers.completion);
-
-    child.emitData('later');
-    expect(child.writes).toEqual([`${markers.release}\r`]);
-    expect(output.join('')).toBe('zmx-prefixcli-suffixlater');
-    backend.kill();
-    vi.advanceTimersByTime(5 * 60_000);
+    expect(output).toEqual(['纯中文没有 tail 事件：你好曛😀\r\n']);
   });
 
-  it('quarantines until the unverified fresh session disappears, then exits once', () => {
-    const { backend, child } = spawnBackend();
+  it('re-syncs an unchanged history snapshot when tail reports activity', async () => {
+    state.history = 'same screen\n';
+    const backend = spawnBackend();
+    const resyncs: string[] = [];
+    backend.onScreenResync(snapshot => resyncs.push(snapshot));
+    await settleAtCurrentTime();
+
+    tailChildren()[0]!.emitData(Buffer.from([0xe6, 0x9b, 0x9b]));
+    await advanceAndSettle(50);
+
+    expect(resyncs).toEqual(['same screen\r\n', 'same screen\r\n']);
+  });
+
+  it('emits only an authoritative prefix delta and re-syncs a rewritten history', async () => {
+    state.history = 'first\n';
+    const backend = spawnBackend();
     const output: string[] = [];
-    const exits: Array<[number | null, string | null]> = [];
+    const resyncs: string[] = [];
     backend.onData(data => output.push(data));
-    backend.onExit((code, signal) => exits.push([code, signal]));
+    backend.onScreenResync(snapshot => resyncs.push(snapshot));
+    await settleAtCurrentTime();
 
-    child.emitData('foreign session output');
-    expect(child.writes).toEqual([]);
-    expect(output).toEqual([]);
+    state.history = 'first\nsecond\n';
+    tailChildren()[0]!.emitData('hint');
+    await advanceAndSettle(50);
+    expect(output).toEqual(['second\r\n']);
+    expect(resyncs).toEqual(['first\r\n']);
 
-    execFileSyncMock.mockReturnValueOnce('' as never);
-    execFileSyncMock.mockReturnValueOnce('' as never);
-    vi.advanceTimersByTime(5_000);
-    expect(exits).toEqual([]);
-    expect(child.killed).toBe(true);
-    expect(fakePtys).toHaveLength(1);
-
-    vi.advanceTimersByTime(100);
-    expect(exits).toEqual([[75, null]]);
-
-    child.emitExit(0, 0);
-    vi.advanceTimersByTime(10_000);
-    expect(fakePtys).toHaveLength(1);
+    state.history = 'rewritten\n';
+    tailChildren()[0]!.emitData('hint');
+    await advanceAndSettle(50);
+    expect(resyncs).toEqual(['first\r\n', 'rewritten\r\n']);
   });
 
-  it('quarantines a crash-left bootstrap on reattach without forwarding output or input', () => {
-    const original = spawnBackend();
-    const markers = launchMarkers(original.child);
-    original.backend.kill();
-
-    execFileSyncMock.mockReturnValueOnce('bmx-test0001\n' as never);
-    execFileSyncMock.mockReturnValueOnce(
-      '  name=bmx-test0001\tpid=42\tclients=0\tcmd=/bin/sh /tmp/botmux-zmx-launch-x/bootstrap.sh\n' as never,
-    );
-    const reattached = new ZmxBackend('bmx-test0001', { isReattach: true });
+  it('coalesces tail triggers behind one in-flight history capture', async () => {
+    state.history = 'one\n';
+    state.deferHistory = true;
+    const backend = spawnBackend();
     const output: string[] = [];
-    const exits: Array<[number | null, string | null]> = [];
-    reattached.onData(data => output.push(data));
-    reattached.onExit((code, signal) => exits.push([code, signal]));
-    reattached.spawn('/bin/sh', ['-c', 'echo resumed'], {
-      cwd: '/tmp',
-      cols: 80,
-      rows: 24,
-      env: { PATH: '/bin' },
-    });
-    const child = fakePtys.at(-1)!;
+    backend.onData(data => output.push(data));
+    await settleAtCurrentTime();
+    expect(historyChildren()).toHaveLength(1);
 
-    reattached.write('hello\r');
-    child.emitData(`\x1b[2J${markers.ready.slice(0, 17)}`);
-    child.emitData(markers.ready.slice(17));
-    expect(child.killed).toBe(true);
-    expect(child.writes).toEqual([]);
-    expect(output).toEqual([]);
-    expect(exits).toEqual([]);
+    for (let i = 0; i < 10; i += 1) tailChildren()[0]!.emitData('hint');
+    expect(historyChildren()).toHaveLength(1);
 
-    execFileSyncMock.mockReturnValueOnce('' as never);
-    execFileSyncMock.mockReturnValueOnce('' as never);
-    vi.advanceTimersByTime(100);
-    expect(exits).toEqual([[75, null]]);
-    expect(fakePtys).toHaveLength(2);
-    vi.advanceTimersByTime(5 * 60_000);
+    state.history = 'one\ntwo\n';
+    state.deferHistory = false;
+    historyChildren()[0]!.emitClose(0, null);
+    await settleAtCurrentTime();
+    // The ten triggers merge into exactly one follow-up capture, rather than
+    // spawning one `zmx history` process per tail chunk. The follow-up retains
+    // a short debounce so a large transcript cannot starve concurrent send.
+    expect(historyChildren()).toHaveLength(1);
+    await advanceAndSettle(50);
+    expect(historyChildren()).toHaveLength(2);
+    await settleAtCurrentTime();
+    expect(output).toEqual(['two\r\n']);
   });
 
-  it('never kills an unverified same-name session when quarantine is destroyed', () => {
-    const original = spawnBackend();
-    const markers = launchMarkers(original.child);
-    original.backend.kill();
+  it('settleCurrentScreen waits for a capture that starts after the in-flight sample', async () => {
+    state.history = 'before\n';
+    state.deferHistory = true;
+    const backend = spawnBackend();
+    const output: string[] = [];
+    backend.onData(data => output.push(data));
+    await settleAtCurrentTime();
+    expect(historyChildren()).toHaveLength(1);
 
-    execFileSyncMock.mockReturnValueOnce('bmx-test0001\n' as never);
-    execFileSyncMock.mockReturnValueOnce(
-      '  name=bmx-test0001\tpid=42\tclients=0\tcmd=/bin/sh /tmp/botmux-zmx-launch-x/bootstrap.sh\n' as never,
-    );
-    const reattached = new ZmxBackend('bmx-test0001', { isReattach: true });
-    reattached.spawn('/bin/sh', ['-c', 'echo resumed'], {
-      cwd: '/tmp',
-      cols: 80,
-      rows: 24,
-      env: { PATH: '/bin' },
-    });
-    const child = fakePtys.at(-1)!;
-    execFileSyncMock.mockClear();
+    const settled = backend.settleCurrentScreen();
+    state.history = 'before\nfinal pure 中文曛😀\n';
+    state.deferHistory = false;
+    historyChildren()[0]!.emitClose(0, null);
+    await settleAtCurrentTime();
 
-    child.emitData(markers.ready);
-    expect(child.killed).toBe(true);
-    reattached.destroySession();
-
-    expect(execFileSyncMock.mock.calls.some(([, args]) =>
-      Array.isArray(args) && args[0] === 'kill',
-    )).toBe(false);
-    vi.advanceTimersByTime(5 * 60_000);
+    expect(historyChildren()).toHaveLength(1);
+    await advanceAndSettle(50);
+    expect(historyChildren()).toHaveLength(2);
+    await expect(settled).resolves.toBe(true);
+    expect(output).toEqual(['final pure 中文曛😀\r\n']);
   });
 
-  it('normalizes node-pty signal 0 to a normal null exit signal', () => {
-    const { backend, child } = spawnBackend();
-    const markers = launchMarkers(child);
-    child.emitData(markers.ready);
-    child.emitData(markers.completion);
-    const exits: Array<[number | null, string | null]> = [];
-    backend.onExit((code, signal) => exits.push([code, signal]));
-    execFileSyncMock.mockReturnValueOnce('' as never); // --short: target is truly gone
-    execFileSyncMock.mockReturnValueOnce('' as never); // full list
+  it('keeps settle pending when its own capture is dirtied and waits for the follow-up', async () => {
+    state.history = 'before\n';
+    const backend = spawnBackend();
+    const output: string[] = [];
+    backend.onData(data => output.push(data));
+    await settleAtCurrentTime();
+    expect(historyChildren()).toHaveLength(1);
 
-    child.emitExit(0, 0);
-    vi.advanceTimersByTime(50);
-    expect(exits).toEqual([[0, null]]);
-    vi.advanceTimersByTime(5 * 60_000);
+    state.deferHistory = true;
+    const settled = backend.settleCurrentScreen();
+    let didSettle = false;
+    void settled.then(() => { didSettle = true; });
+    await settleAtCurrentTime();
+    expect(historyChildren()).toHaveLength(2);
+
+    // Output arrives after capture A started. The tail payload is only a wake
+    // signal, but it must latch a mandatory capture B before settle resolves.
+    state.history = 'before\nafter capture start 中文曛😀\n';
+    tailChildren()[0]!.emitData('dirty');
+    state.deferHistory = false;
+    historyChildren()[1]!.emitClose(0, null);
+    await settleAtCurrentTime();
+    expect(didSettle).toBe(false);
+
+    await advanceAndSettle(50);
+    expect(historyChildren()).toHaveLength(3);
+    await expect(settled).resolves.toBe(true);
+    expect(output).toEqual(['after capture start 中文曛😀\r\n']);
+  });
+
+  it('rejects an ambiguous empty history without clearing cache or consuming resync obligations', async () => {
+    state.history = 'authoritative nonempty\n';
+    const backend = spawnBackend();
+    const resyncs: string[] = [];
+    backend.onScreenResync(snapshot => resyncs.push(snapshot));
+    await settleAtCurrentTime();
+    expect(backend.captureCurrentScreen()).toBe('authoritative nonempty\r\n');
+    expect(resyncs).toEqual(['authoritative nonempty\r\n']);
+
+    state.history = '';
+    const rejected = backend.settleCurrentScreen();
+    (backend as any).requestHistoryCapture(0, true, true);
+    await settleAtCurrentTime();
+
+    await expect(rejected).resolves.toBe(false);
+    expect(backend.captureCurrentScreen()).toBe('authoritative nonempty\r\n');
+    expect((backend as any).tailActivitySinceCapture).toBe(true);
+    expect((backend as any).forceResyncOnNextSnapshot).toBe(true);
+
+    state.history = 'authoritative nonempty\n';
+    const recovered = backend.settleCurrentScreen();
+    await settleAtCurrentTime();
+
+    await expect(recovered).resolves.toBe(true);
+    expect(resyncs).toEqual([
+      'authoritative nonempty\r\n',
+      'authoritative nonempty\r\n',
+    ]);
+    expect((backend as any).tailActivitySinceCapture).toBe(false);
+    expect((backend as any).forceResyncOnNextSnapshot).toBe(false);
+  });
+
+  it('returns false on a rejected single-frame send without emitting a generic compensation frame', () => {
+    const backend = spawnBackend();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('short input')).toBe(false);
+    expect(state.sendInputs).toHaveLength(1);
+    expect(state.sendInputs[0]!.subarray(0, -1).toString()).toBe('short input');
+
+    state.sendInputs.length = 0;
+    state.failSendAt = 1;
+    expect(backend.sendSpecialKeys('Enter')).toBe(false);
+    expect(state.sendInputs).toHaveLength(1);
+    expect(state.sendInputs[0]!.subarray(0, -1).toString()).toBe('\r');
+  });
+
+  it('rejects input above 64 KiB before sending any prefix', () => {
+    const backend = spawnBackend();
+
+    expect(() => backend.sendText('x'.repeat((64 * 1024) + 1))).toThrow(/超过 65536 字节安全上限/);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('closes bracketed paste and cancels even when its first frame is rejected ambiguously', () => {
+    const backend = spawnBackend();
+    state.failSendAt = 1;
+
+    expect(() => backend.pasteText('short paste')).toThrow(/粘贴发送失败/);
+    expect(state.sendInputs).toHaveLength(2);
+    expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+    expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+  });
+
+  it('closes bracketed paste and cancels a partial multi-frame send', () => {
+    const backend = spawnBackend();
+    state.failSendAt = 2;
+
+    expect(() => backend.pasteText('x'.repeat(2_000))).toThrow(/粘贴发送失败/);
+    expect(state.sendInputs).toHaveLength(3);
+    expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+    expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
+  });
+
+  it('serves captureCurrentScreen from the cache without spawning history', async () => {
+    state.history = 'cached 你好😀\n';
+    const backend = spawnBackend();
+    await settleAtCurrentTime();
+    const capturesBefore = historyChildren().length;
+
+    expect(backend.captureCurrentScreen()).toBe('cached 你好😀\r\n');
+    expect(backend.captureViewport()).toBe('cached 你好😀\r\n');
+    expect(historyChildren()).toHaveLength(capturesBefore);
+  });
+
+  it('preserves a same-name session whose complete UUID label belongs elsewhere', () => {
+    state.exists = true;
+    state.command = '/usr/bin/vim';
+    state.transport = 'tail-send-v1';
+    state.sessionId = 'test0001-9999-8888-7777-666666666666';
+    const backend = makeBackend({ reattach: true });
+
+    expect(() => spawnBackend(backend)).toThrow(/另一个完整 botmux session/);
+    backend.destroySession();
+    expect(state.exists).toBe(true);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) => argv[0] === 'kill')).toBe(false);
   });
 });

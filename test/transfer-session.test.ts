@@ -872,7 +872,7 @@ describe('closeSession concurrency', () => {
     const base = makeDs().session;
     const zmx = { ...base, backendType: 'zmx' as const };
     expect(destroyUnregisteredPersistentBacking(zmx, kill)).toBe(true);
-    expect(kill).toHaveBeenCalledWith('zmx', 'bmx-sess-abc');
+    expect(kill).toHaveBeenCalledWith('zmx', 'bmx-sess-abc', 'sess-abc-123');
 
     kill.mockClear();
     expect(destroyUnregisteredPersistentBacking({ ...zmx, adoptedFrom: {

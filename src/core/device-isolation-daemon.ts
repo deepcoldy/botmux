@@ -34,7 +34,7 @@ export const DEVICE_ISOLATION_PREPARE_PATH = '/api/device-isolation/activation/p
 export const DEVICE_ISOLATION_COMMIT_PATH = '/api/device-isolation/activation/commit';
 export const DEVICE_ISOLATION_RELEASE_PATH = '/api/device-isolation/activation/release';
 
-type LocalPersistentBackend = 'tmux' | 'herdr' | 'zellij';
+type LocalPersistentBackend = 'tmux' | 'herdr' | 'zellij' | 'zmx';
 type InventoryBackend = BackendType | 'unknown';
 type ProcessIdentity = { pid: number; procStart: string };
 
@@ -99,7 +99,13 @@ export interface DeviceIsolationDaemonDependencies {
   processExists: (pid: number) => boolean;
   signalProcess: (pid: number, signal: NodeJS.Signals) => void;
   probePersistent: (backendType: LocalPersistentBackend, name: string) => SessionProbe;
-  killPersistent: (backendType: LocalPersistentBackend, name: string) => void;
+  /** Full sessionId is mandatory so prefix-addressed backends such as ZMX can
+   * re-verify ownership before destructive teardown. */
+  killPersistent: (
+    backendType: LocalPersistentBackend,
+    name: string,
+    sessionId: string,
+  ) => void;
   closeWorker: (session: DeviceIsolationRuntimeSession) => void;
   readMarker: () => string | null;
   sleep: (ms: number) => Promise<void>;
@@ -122,7 +128,7 @@ let daemonIdentity: DeviceIsolationDaemonIdentity | null = null;
 let transaction: ActivationTransaction | null = null;
 
 function isPersistentBackend(value: InventoryBackend): value is LocalPersistentBackend {
-  return value === 'tmux' || value === 'herdr' || value === 'zellij';
+  return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
 }
 
 function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff'> {
@@ -454,7 +460,11 @@ async function quiesceOwnedSessions(
       if (!session) return 'teardown_failed';
       dependencies.closeWorker(session);
       if (target.persistent) {
-        dependencies.killPersistent(target.persistent.backendType, target.persistent.name);
+        dependencies.killPersistent(
+          target.persistent.backendType,
+          target.persistent.name,
+          target.sessionId,
+        );
       }
     }
   } catch {
@@ -486,7 +496,11 @@ async function quiesceOwnedSessions(
         if (probe === 'exists') {
           clean = false;
           try {
-            dependencies.killPersistent(target.persistent.backendType, target.persistent.name);
+            dependencies.killPersistent(
+              target.persistent.backendType,
+              target.persistent.name,
+              target.sessionId,
+            );
           } catch { /* verified by the next probe */ }
         }
       }

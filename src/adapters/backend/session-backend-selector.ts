@@ -46,7 +46,7 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
     backend === 'tmux'
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
       : backend === 'zmx'
-        ? '需要 zmx >= 0.6.0；macOS: brew install neurosnap/tap/zmx ｜ Linux: 安装官方 release binary'
+        ? '需要包含 PR #202 send 行为的 zmx >= 0.7.1；当前官方 0.6.0 尚不满足，请等待对应正式版'
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,
@@ -121,9 +121,16 @@ export function selectSessionBackend(opts: {
     const sessionName = ZmxBackend.sessionName(opts.sessionId);
     const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName);
     return {
-      backend: new ZmxBackend(sessionName, { ownsSession: true, isReattach: reattach }),
+      backend: new ZmxBackend(sessionName, {
+        ownsSession: true,
+        isReattach: reattach,
+        sessionId: opts.sessionId,
+      }),
       isTmuxMode: false,
-      isPipeMode: false,
+      // ZMX is observed out-of-band (`zmx tail`) and driven independently
+      // (`zmx send`), matching the worker's pipe-backend data path rather than
+      // a bidirectional PTY attach client.
+      isPipeMode: true,
       isZellijMode: false,
     };
   }

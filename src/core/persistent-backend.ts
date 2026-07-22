@@ -209,10 +209,21 @@ export function probePersistentBackendServer(
   return 'unknown';
 }
 
-/** Kill a backing session (each backend's killSession is a no-op when absent). */
-export function killPersistentSession(backendType: PersistentBackendType, name: string): void {
+/**
+ * Kill a backing session. ZMX additionally requires the complete botmux UUID:
+ * its public name contains only eight UUID characters, so name-only deletion
+ * could destroy a different session after a prefix collision.
+ */
+export function killPersistentSession(
+  backendType: PersistentBackendType,
+  name: string,
+  sessionId?: string,
+): void {
   if (backendType === 'tmux') TmuxBackend.killSession(name);
   else if (backendType === 'zellij') ZellijBackend.killSession(name);
-  else if (backendType === 'zmx') ZmxBackend.killSession(name);
+  else if (backendType === 'zmx') {
+    if (!sessionId) throw new Error(`refusing name-only ZMX kill for ${name}`);
+    ZmxBackend.killManagedSession(name, sessionId);
+  }
   else HerdrBackend.killSession(name);
 }

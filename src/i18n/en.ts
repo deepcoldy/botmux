@@ -55,6 +55,7 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
   'card.usage_limit.retry_ready': '✅ {cliName} usage limit should have reset. Retry the last task, or send a new message.',
   'card.private.snapshot_note': '🔒 Private static snapshot (visible only to you, not live-updating). Tap Open Web Terminal for the live view.',
+  'card.private.snapshot_note_no_terminal': '🔒 Private static snapshot (visible only to you, not live-updating). This backend does not provide a Web Terminal.',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 Project Repository',
@@ -214,6 +215,7 @@ export const messages: Record<string, string> = {
   'cmd.card.operator_only': '⚠️ Only authorized users (allowedUsers) can use /card.',
   'cmd.term.operator_only': '⚠️ Only authorized users (allowedUsers) can use /term to get the operable terminal link.',
   'cmd.term.no_session': 'No active session in this topic — /term needs a running session.',
+  'cmd.term.unsupported': 'This session backend does not provide a Web Terminal. For ZMX, run botmux list or zmx attach locally.',
   'cmd.term.not_ready': '🔒 Terminal isn’t ready yet; send /term again once the session is up.',
   'cmd.term.failed': '⚠️ Failed to send the operable link (both the private card and DM failed); check the daemon logs.',
   'cmd.term.sent_dm': '🔑 Sent the operable terminal link to your DM (kept out of the group).',
@@ -277,6 +279,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.card_already_consumed': '✅ Repo already selected — please ignore the old card',
   'cmd.repo.worktree_created_not_switched': '🌿 Worktree created: `{path}` (branch `{branch}`), but the session changed meanwhile — not switched automatically. Use `/repo {path}` to open it.',
   'cmd.repo.worktree_switch_failed': '⚠️ Worktree created at `{path}`, but switching to it failed: {error}\nUse `/repo {path}` to open it manually.',
+  'cmd.repo.switch_close_failed': '⚠️ Could not safely close the current session; repository was not switched: {error}',
   // Used when 「default-directory-only」mode has「auto-create worktree」on, at new
   // session start (shared by interactive new topic / dashboard create / webhook).
   'worktree.auto_creating': '🌿 Creating an isolated worktree for this session (includes a git fetch, may take a few seconds)…',
@@ -702,8 +705,9 @@ export const messages: Record<string, string> = {
   'card.voice.user_message': 'Generate a voice summary',
   'card.action.takeover_retired': '⚠️ The old "Take Over" button is retired. In bridge mode, botmux bridges the original CLI so replies still come back to Lark — no takeover needed. Full takeover (`/adopt --takeover`) is on the roadmap.',
   'card.action.terminal_not_ready': '⚠️ Terminal is not ready yet, please try again shortly.',
+  'card.action.terminal_unsupported': '⚠️ This session backend does not provide a Web Terminal. For ZMX, run `botmux list` or `zmx attach` locally.',
   'card.action.local_terminal_opened': '💻 Requested opening local {cliName}.',
-  'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use Web Terminal instead.',
+  'card.action.local_terminal_unsupported': '⚠️ This {cliName} session cannot be opened locally yet. Use a terminal access method supported by this backend.',
   'card.action.local_cli_missing': '⚠️ Could not find the local {cliName} executable ({executable}). Install it or configure PATH / cliPathOverride.',
   'card.action.local_terminal_failed': '⚠️ Failed to open local CLI: {reason}',
   'card.action.local_terminal_no_permission': '🔒 You do not have operate permission, so you cannot open the local CLI.',
@@ -852,6 +856,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.resume.title': 'Resume this session?',
   'card.dashboard.sessions.confirm.resume.text': 'Resume will recreate the worker and continue the session. Session: {title}',
   'card.dashboard.sessions.terminal.disabled.noPort': 'Web Terminal port is not available (not started or already closed)',
+  'card.dashboard.sessions.terminal.disabled.unsupported': 'This backend does not provide a Web Terminal',
   'card.dashboard.sessions.resume.disabled.onlyClosed': 'Only closed sessions can be resumed',
 
   // schedules card (PR3 slice 1)
@@ -1035,9 +1040,9 @@ export const messages: Record<string, string> = {
   'settings.openTerminalInFeishu': 'Open Web Terminal in Feishu',
   'settings.openTerminalInFeishuHelp': 'Terminal links open in the Feishu in-app webview by default.',
   'settings.enableLocalCliOpen': 'Enable native CLI opening',
-  'settings.enableLocalCliOpenHelp': 'Off by default and available only when the daemon runs on macOS. Attach mode supports current tmux / Herdr / ZMX sessions and keeps the same I/O/history when possible; resume mode starts a separate CLI resume process and may stop Feishu from following the session.',
+  'settings.enableLocalCliOpenHelp': 'Off by default and available only when the daemon runs on macOS. Attach mode enters the same CLI in current tmux / Herdr / ZMX sessions; a ZMX local attach uses the native terminal while Lark remains a plain-text stream. Resume mode starts a separate CLI resume process and may stop Feishu from following the session.',
   'settings.localCliOpenMode': 'Native CLI open mode',
-  'settings.localCliOpenModeHelp': 'Defaults to attaching the current session: managed tmux / Herdr / ZMX use exact attach, adopted sessions attach only when a reliable existing target is known. Direct resume is for local debugging when you accept the Feishu continuity risk.',
+  'settings.localCliOpenModeHelp': 'Defaults to attaching the current session: managed tmux / Herdr / ZMX use exact attach, and adopted sessions attach only when a reliable existing target is known. A native ZMX attach does not mean botmux provides a Web TUI. Direct resume is for local debugging when you accept the Feishu continuity risk.',
   'settings.localCliOpenModeAttach': 'Attach current session (recommended)',
   'settings.localCliOpenModeResume': 'Start CLI resume',
   'settings.autoUpdate': 'Daily auto-update',
@@ -1103,6 +1108,10 @@ export const messages: Record<string, string> = {
   // Worker-side submit / notify messages
   'worker.submit_impossible': '⚠️ Your last message was NOT delivered to {cliName}: the current keybinding config can’t auto-submit from the terminal.\nReason: {reason}\nAdjust the Claude Code Chat keybinding, then resend.\nStart: {preview}',
   'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. ZMX has no Web Terminal; resend it, or run botmux list locally and inspect the session.\nStart: {preview}',
+  'worker.interrupt_unconfirmed': '⚠️ Interrupt key {key} could not be delivered to {cliName} after two attempts. The CLI may still be running, and the card will not claim it stopped. {recovery}',
+  'worker.interrupt_recovery_zmx': 'Retry, or run botmux list locally, enter the ZMX session, and interrupt it there.',
+  'worker.interrupt_recovery_web': 'Retry, or open the Web Terminal and interrupt it manually.',
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',
 

@@ -10,4 +10,6 @@ Every conversation turn produces a live-updating Lark card, your primary window 
 - **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive.
 - **An "recoverable" card on close**: it includes the CLI's native resume command, so you can click back in to continue anytime.
 
+> **ZMX exception**: ZMX cards refresh from the eventually consistent plain-text `history` screen, without color, cursor state, or the alternate screen. ZMX also has no Web TUI, so its cards omit Web Terminal and operation-link buttons. Use `botmux list` or `zmx attach` locally for the full TUI. See [ZMX backend](/en/zmx) for the other boundaries.
+
 > The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display cards, `--card-file` / `--card-json` can send raw interactive card JSON (display + open_url only — any callback-firing control, such as callback buttons, dropdowns, inputs, or form submits, is rejected).

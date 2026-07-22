@@ -162,6 +162,7 @@ import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionId
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -169,6 +170,14 @@ import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import {
+  isCriticalInterruptKey,
+  sendCriticalControlKey,
+} from './adapters/backend/critical-control-key.js';
+import {
+  backendCliCompatibilityError,
+  backendSupportsWebTerminal,
+} from './adapters/backend/capabilities.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import {
@@ -201,7 +210,7 @@ import {
 } from './platform/device-paths.js';
 import type { BackendType, SessionBackend, SessionProbe } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
-import { probeZmxFunctional } from './setup/ensure-zmx.js';
+import { probeZmxVersion } from './setup/ensure-zmx.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
@@ -262,6 +271,12 @@ scrubSessionCliHomeEnv(process.env);
 
 let cliAdapter: CliAdapter | null = null;
 let backend: SessionBackend | null = null;
+let backendScreenRevision = 0;
+let idleScreenSettleTask: {
+  backend: SessionBackend;
+  revision: number;
+  promise: Promise<{ proceed: boolean; degraded: boolean }>;
+} | null = null;
 let intentionalRestartBackend: SessionBackend | null = null;
 // Hybrid codex RPC input mode (opt-in per bot, cfg.codexRpcInput). When active,
 // user input is delivered to codex via the app-server JSON-RPC channel
@@ -292,9 +307,11 @@ function persistentPaneInfo(backendType: string, sessionId: string): { name: str
   if (backendType === 'tmux') name = TmuxBackend.sessionName(sessionId);
   else if (backendType === 'herdr') name = HerdrBackend.sessionName(sessionId);
   else if (backendType === 'zellij') name = ZellijBackend.sessionName(sessionId);
+  else if (backendType === 'zmx') name = ZmxBackend.sessionName(sessionId);
   if (!name) return null;
   const live = backendType === 'tmux' ? TmuxBackend.hasSession(name)
     : backendType === 'zellij' ? ZellijBackend.hasSession(name)
+      : backendType === 'zmx' ? ZmxBackend.probeManagedSession(name, sessionId).state === 'compatible'
       : HerdrBackend.hasSession(name);
   return { name, live };
 }
@@ -303,7 +320,29 @@ function persistentPaneLive(backendType: PersistentBackendType, name: string): b
   if (backendType === 'tmux') return TmuxBackend.hasSession(name);
   if (backendType === 'zellij') return ZellijBackend.hasSession(name);
   if (backendType === 'herdr') return HerdrBackend.hasSession(name);
-  return false;
+  return ZmxBackend.hasSession(name);
+}
+
+function probeOwnedZmxSession(
+  name: string,
+  sessionId: string,
+  expectedPid?: number,
+): { probe: SessionProbe; pid?: number; reason?: string } {
+  const managed = ZmxBackend.probeManagedSession(name, sessionId);
+  if (managed.state === 'missing') return { probe: 'missing' };
+  if (managed.state === 'unknown') return { probe: 'unknown', reason: managed.reason };
+  if (managed.state === 'incompatible') {
+    return {
+      probe: 'unknown',
+      reason: managed.reason === 'transport-label'
+        ? `ZMX 会话 ${name} 缺少 botmux 传输标签（tail 信号 + history 屏幕 + send 输入）；请手动关闭旧会话后重试`
+        : `ZMX 会话 ${name} 属于另一个完整 botmux session`,
+    };
+  }
+  if (expectedPid !== undefined && managed.pid !== expectedPid) {
+    return { probe: 'unknown', reason: `ZMX 会话 ${name} 的 PTY root PID 已变化` };
+  }
+  return { probe: 'exists', pid: managed.pid };
 }
 
 /** Kill a persistent session and VERIFY it is gone (bounded retry). killSession
@@ -312,9 +351,13 @@ function persistentPaneLive(backendType: PersistentBackendType, name: string): b
  *  pane would then be reattached against the NEW app-server's fresh port,
  *  re-triggering the exact P0 freeze. Returns true only when the session is
  *  confirmed absent (Codex delta point 1). */
-async function killPersistentSessionVerified(backendType: PersistentBackendType, name: string): Promise<boolean> {
+async function killPersistentSessionVerified(
+  backendType: PersistentBackendType,
+  name: string,
+  sessionId?: string,
+): Promise<boolean> {
   return killAndVerifyPersistentPane(name, {
-    kill: (resolvedName) => killPersistentSession(backendType, resolvedName),
+    kill: (resolvedName) => killPersistentSession(backendType, resolvedName, sessionId),
     isLive: (resolvedName) => persistentPaneLive(backendType, resolvedName),
     wait: delay,
   });
@@ -1008,16 +1051,24 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
       const cmd = content.trim();
       const typed = cmd.includes(' ') ? cmd : `${cmd} `;
       for (const ch of typed) {
-        (be as any).sendText(ch);
+        if ((be as any).sendText(ch) === false) {
+          throw new Error('backend rejected command text input');
+        }
         await new Promise(r => setTimeout(r, COCO_SLASH_TYPE_THROTTLE_MS));
       }
       await new Promise(r => setTimeout(r, 200));
-      (be as any).sendSpecialKeys('Enter');
+      if ((be as any).sendSpecialKeys('Enter') === false) {
+        throw new Error('backend rejected command submit key');
+      }
       return;
     }
-    (be as any).sendText(content);
+    if ((be as any).sendText(content) === false) {
+      throw new Error('backend rejected command text input');
+    }
     await new Promise(r => setTimeout(r, 200));
-    (be as any).sendSpecialKeys('Enter');
+    if ((be as any).sendSpecialKeys('Enter') === false) {
+      throw new Error('backend rejected command submit key');
+    }
   } else {
     // PtyBackend has no sendText/sendSpecialKeys, so write the keystrokes
     // directly — but still beat between the text and the Enter. Writing
@@ -3971,7 +4022,18 @@ function exitTmuxScrollMode(): void {
   tmuxScrolledHalfPages = 0;
 }
 
-function handleTermAction(key: TermActionKey): void {
+function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | boolean {
+  if ('sendSpecialKeys' in target && TMUX_KEY_MAP[key]) {
+    return (target as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
+  }
+  if (PTY_SEQ_MAP[key]) {
+    target.write(PTY_SEQ_MAP[key]);
+    return true;
+  }
+  return false;
+}
+
+async function handleTermAction(key: TermActionKey): Promise<void> {
   // riff：没有远端终端可驱动——把控制字符 write 进 RiffBackend 会变成一个内容为
   // ANSI 序列的 follow-up 任务（^C 也不会 cancel 任务），必须整体拒绝。
   if (effectiveBackendType === 'riff') {
@@ -3979,11 +4041,12 @@ function handleTermAction(key: TermActionKey): void {
     return;
   }
   if (!backend) return;
+  const targetBackend = backend;
   const isHalfPage = key === 'half_page_up' || key === 'half_page_down';
 
   // Tmux copy-mode scroll (works around alternate-buffer scrollback limitation)
-  if (isHalfPage && 'sendCopyModeCommand' in backend) {
-    const tb = backend as any;
+  if (isHalfPage && 'sendCopyModeCommand' in targetBackend) {
+    const tb = targetBackend as any;
     try {
       if (tmuxScrolledHalfPages === 0 && key === 'half_page_up') {
         tb.enterCopyMode();
@@ -4008,10 +4071,45 @@ function handleTermAction(key: TermActionKey): void {
   // Any non-scroll key cancels active scroll first so the live view returns.
   if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
 
-  if ('sendSpecialKeys' in backend && TMUX_KEY_MAP[key]) {
-    (backend as any).sendSpecialKeys(TMUX_KEY_MAP[key]);
-  } else if (PTY_SEQ_MAP[key]) {
-    backend.write(PTY_SEQ_MAP[key]);
+  const criticalInterrupt = isCriticalInterruptKey(key);
+  let delivered = false;
+  if (criticalInterrupt) {
+    delivered = await sendCriticalControlKey(() => {
+      // Never retry an old interrupt into a replacement CLI generation.
+      if (backend !== targetBackend) return true;
+      return sendTermActionOnce(targetBackend, key);
+    });
+  } else {
+    try {
+      delivered = sendTermActionOnce(targetBackend, key) !== false;
+    } catch (err) {
+      log(`Term action ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (backend !== targetBackend) return;
+  if (!delivered) {
+    log(`Term action ${key} was not delivered${criticalInterrupt ? ' after retry' : ''}`);
+    if (criticalInterrupt) {
+      const recovery = t(
+        effectiveBackendType === 'zmx'
+          ? 'worker.interrupt_recovery_zmx'
+          : 'worker.interrupt_recovery_web',
+      );
+      send({
+        type: 'user_notify',
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+        message: t('worker.interrupt_unconfirmed', {
+          key: TMUX_KEY_MAP[key] ?? key,
+          cliName: cliName(),
+          recovery,
+        }),
+      });
+    }
+    // Refresh the card from real output, but do not clear prompt blocking or
+    // claim that the CLI stopped when the key never reached it.
+    scheduleOneShotAfterAction();
+    return;
   }
   // ESC/Ctrl-C/Enter likely ends an active TUI prompt. The analyzer
   // won't re-analyze while promptActive=true, so un-wedge both flags here.
@@ -4178,7 +4276,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
   // Step 3: write text via cliAdapter (auto-switches to text mode + submits with Enter)
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeys.length} nav keys)`);
   try {
-    await cliAdapter.writeInput(backend, text);
+    await cliAdapter.writeInput(adapterInputHandle(backend), text);
   } catch (err: any) {
     log(`TUI text input write failed: ${err.message}`);
   }
@@ -4293,6 +4391,32 @@ function dismissAidenCodexUpdateDialog(data: string): boolean {
     (backend as any).sendSpecialKeys('Down', 'Enter');
   } else {
     backend?.write('\x1b[B\r');
+  }
+  return true;
+}
+
+/**
+ * Handle startup-only interactions discovered in visible terminal text.
+ * Both incremental PTY chunks and authoritative observer snapshots pass
+ * through here so reconnecting a live-only backend cannot strand the CLI on a
+ * dialog that appeared while its observer was offline.
+ */
+function handleVisibleStartupInteraction(data: string): boolean {
+  // Aiden strips the Codex config override because the launcher rejects it.
+  // Consume only the known startup update picker and choose its non-upgrade
+  // row; never let its selection marker reach the first-prompt idle detector.
+  if (dismissAidenCodexUpdateDialog(data)) return true;
+
+  if (trustHandled) return false;
+  const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  if (!TRUST_DIALOG_PATTERN.test(stripped)) return false;
+
+  trustHandled = true;
+  log('Trust dialog detected, auto-accepting...');
+  if (backend && 'sendSpecialKeys' in backend) {
+    (backend as any).sendSpecialKeys('Enter');
+  } else {
+    backend?.write('\r');
   }
   return true;
 }
@@ -4446,9 +4570,57 @@ function maybeReportDeferredTopicMaterialization(data: string): void {
 
 // ─── Prompt Detection ────────────────────────────────────────────────────────
 
+function settleBackendScreenBeforeIdle(
+  target: SessionBackend,
+  requestedRevision: number,
+): Promise<{ proceed: boolean; degraded: boolean }> {
+  if (!target.settleCurrentScreen) return Promise.resolve({ proceed: true, degraded: false });
+  const existing = idleScreenSettleTask?.backend === target ? idleScreenSettleTask : null;
+  // A settle round is reusable only for the same (or a newer) authoritative
+  // screen revision. If another idle edge arrives after more output while the
+  // old barrier is still running, chain one fresh round behind it; otherwise
+  // the later edge could finalize from a sample that began before its output.
+  if (existing && existing.revision >= requestedRevision) return existing.promise;
+
+  const runFreshSettle = async (): Promise<{ proceed: boolean; degraded: boolean }> => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (backend !== target) return { proceed: false, degraded: false };
+      try {
+        if (await target.settleCurrentScreen!()) return { proceed: true, degraded: false };
+      } catch (err) {
+        log(`Screen settle attempt ${attempt + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+    }
+    // History is an availability enhancement around an already-successful
+    // screen cache. Never leave a completed turn stuck forever when the ZMX
+    // daemon is busy; use the last authoritative snapshot after bounded retry.
+    return { proceed: true, degraded: true };
+  };
+  const promise = (async (): Promise<{ proceed: boolean; degraded: boolean }> => {
+    if (existing) await existing.promise;
+    if (backend !== target) return { proceed: false, degraded: false };
+    return runFreshSettle();
+  })();
+  idleScreenSettleTask = { backend: target, revision: requestedRevision, promise };
+  void promise.finally(() => {
+    if (idleScreenSettleTask?.promise === promise) idleScreenSettleTask = null;
+  });
+  return promise;
+}
+
+/** Submission writes must surface ZMX's explicit false result, while its
+ * best-effort navigation/startup keystrokes keep their non-throwing contract. */
+function adapterInputHandle(target: SessionBackend): PtyHandle {
+  return target instanceof ZmxBackend
+    ? strictInputHandle(target)
+    : target;
+}
+
 function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
+  backendScreenRevision += 1;
   lastPtyActivityAtMs = Date.now();
   maybeReportDeferredTopicMaterialization(data);
   maybeCaptureKiroSessionId(data);
@@ -4490,30 +4662,53 @@ function onPtyData(data: string): void {
     }
   }
 
-  // Aiden strips the Codex config override because the launcher rejects it.
-  // Consume only the known startup update picker and choose its non-upgrade
-  // row; never let its selection marker reach the first-prompt idle detector.
-  if (dismissAidenCodexUpdateDialog(data)) return;
-
-  // Trust dialog auto-accept
-  if (!trustHandled) {
-    const stripped = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
-    if (TRUST_DIALOG_PATTERN.test(stripped)) {
-      trustHandled = true;
-      log('Trust dialog detected, auto-accepting...');
-      if (backend && 'sendSpecialKeys' in backend) {
-        (backend as any).sendSpecialKeys('Enter');
-      } else {
-        backend?.write('\r');
-      }
-      return;
-    }
-  }
+  if (handleVisibleStartupInteraction(data)) return;
 
   // Track last PTY output time for the ready-gate quiescence settle (see
   // settleThenFlush) and delegate idle detection to IdleDetector.
   lastPtyOutputAtMs = Date.now();
   idleDetector?.feed(data);
+}
+
+/**
+ * Rebase state derived from a live-only observer after it reconnects. This is
+ * deliberately separate from onPtyData: `snapshot` is authoritative full
+ * state, not an incremental chunk, so appending it would duplicate renderer
+ * and workflow history while still failing to express a reset.
+ */
+function onBackendScreenResync(snapshot: string): void {
+  backendScreenRevision += 1;
+  const now = Date.now();
+  lastPtyActivityAtMs = now;
+  lastPtyOutputAtMs = now;
+  lastAnalyzerSnapshot = snapshot;
+  maybeReportDeferredTopicMaterialization(snapshot);
+  maybeCaptureKiroSessionId(snapshot);
+
+  if (renderer) {
+    renderer.dispose();
+    renderer = new TerminalRenderer(renderCols, renderRows);
+    renderer.write(snapshot);
+  }
+
+  if (isWorkflowWorker() && !workflowFinalOutputSent) {
+    // The append-only PTY replay log has no reset opcode. Appending a full
+    // history snapshot would duplicate everything already recorded; keep its
+    // live-byte semantics and rebase only the bounded final-output transcript.
+    workflowTranscript = snapshot.slice(-WORKFLOW_TRANSCRIPT_MAX);
+    maybeEmitWorkflowTranscriptOutput();
+  }
+
+  if (handleVisibleStartupInteraction(snapshot)) return;
+
+  // A prompt/final marker may have been emitted while tail was offline. Feed
+  // only the recent screen tail into a reset detector: ZMX history is scrollback,
+  // so old completion markers must not make a currently-busy CLI look idle.
+  if (idleDetector) {
+    idleDetector.reset();
+    const idleTail = snapshot.split(/\r?\n/).slice(-20).join('\n').slice(-4000);
+    if (idleTail) idleDetector.feed(idleTail);
+  }
 }
 
 function releaseRawInputRestartGate(): void {
@@ -4783,7 +4978,17 @@ function scheduleSubmitFailureNotify(
       send({
         type: 'user_notify',
         turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
-        message: t('worker.submit_unconfirmed', { cliName: cliName(), secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000), transcriptLabel, preview }),
+        message: t(
+          effectiveBackendType === 'zmx'
+            ? 'worker.submit_unconfirmed_zmx'
+            : 'worker.submit_unconfirmed',
+          {
+            cliName: cliName(),
+            secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
+            transcriptLabel,
+            preview,
+          },
+        ),
       });
     }
   }, SUBMIT_DEFERRED_RECHECK_MS);
@@ -5084,9 +5289,13 @@ async function flushPending(): Promise<void> {
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
-          result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);
+          result = await cliAdapter.writeStructuredInput(
+            adapterInputHandle(backend),
+            msg,
+            item.codexAppInput,
+          );
         } else {
-          result = await cliAdapter.writeInput(backend, msg);
+          result = await cliAdapter.writeInput(adapterInputHandle(backend), msg);
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
@@ -5494,7 +5703,11 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
   try {
     const initial = be.captureCurrentScreen?.() ?? '';
     if (initial.length > 0) {
-      onPtyData(initial);
+      if (be instanceof ZmxBackend) {
+        onBackendScreenResync(initial);
+      } else {
+        onPtyData(initial);
+      }
       if (be instanceof HerdrBackend) {
         relayHerdrWebSnapshot(initial);
       }
@@ -5771,7 +5984,16 @@ async function spawnCli(
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
+  const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
+  if (backendCliError) {
+    throw new Error(
+      `⚠️ ${cfg.cliId} 当前不能使用 ZMX 后端：其完成事件依赖不可见 OSC 控制消息，` +
+      `而 ZMX 的纯文本 history 不保留该通道。请将 backendType 改为 tmux / pty。\n` +
+      `原因：${backendCliError}`,
+    );
+  }
   let resolvedZmxSessionProbe: SessionProbe | undefined;
+  let resolvedZmxSessionPid: number | undefined;
   {
     let available = true;
     let reason = '';
@@ -5793,17 +6015,29 @@ async function spawnCli(
         reason = 'zellij 功能性探针失败（需 zellij >= 0.44）';
       }
     } else if (effectiveBackend === 'zmx') {
-      // The full list is tri-state: per-session `err=` rows and malformed
-      // output are inconclusive, never permission to create a duplicate CLI.
-      resolvedZmxSessionProbe = ZmxBackend.probeSession(ZmxBackend.sessionName(cfg.sessionId));
-      hasExistingSession = resolvedZmxSessionProbe === 'exists';
-      if (resolvedZmxSessionProbe === 'unknown') {
+      // The local controller version is a protocol requirement even when the
+      // backing session already exists: 0.6 has the old send semantics. Only a
+      // transient functional probe may be exempted for a verified live session.
+      const version = probeZmxVersion();
+      if (!version.ok) {
         available = false;
-        reason = 'zmx 会话列表探针结果不确定';
-      } else if (!hasExistingSession) {
-        const probe = probeZmxFunctional();
-        available = probe.ok;
-        if (!probe.ok) reason = probe.reason;
+        reason = version.reason;
+        resolvedZmxSessionProbe = 'unknown';
+      } else {
+        const resolved = probeOwnedZmxSession(
+          ZmxBackend.sessionName(cfg.sessionId),
+          cfg.sessionId,
+        );
+        resolvedZmxSessionProbe = resolved.probe;
+        resolvedZmxSessionPid = resolved.pid;
+        hasExistingSession = resolved.probe === 'exists';
+        if (resolved.probe === 'unknown') {
+          available = false;
+          reason = resolved.reason ?? 'zmx 会话所有权探针结果不确定';
+          // Do not let decideBackendGate's live-session exemption override an
+          // incompatible/unknown ownership result.
+          hasExistingSession = false;
+        }
       }
     } else if (effectiveBackend === 'herdr') {
       // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
@@ -6139,10 +6373,23 @@ async function spawnCli(
   // policy pane survives daemon restarts and suspend→resume safely because the
   // confinement remains attached to the live process.
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneProbe = probePersistentSession(
+    const zmxOwnedProbe = effectiveBackendType === 'zmx'
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
+      : undefined;
+    const paneProbe = zmxOwnedProbe?.probe ?? probePersistentSession(
       effectiveBackendType as PersistentBackendType,
       persistentSessionName,
     );
+    if (
+      effectiveBackendType === 'zmx'
+      && resolvedZmxSessionProbe !== 'exists'
+      && paneProbe === 'exists'
+    ) {
+      throw new Error(
+        `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
+        'ZMX session appeared after the frozen launch probe',
+      );
+    }
     if (paneProbe === 'unknown') {
       throw new Error(
         `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
@@ -6165,9 +6412,37 @@ async function spawnCli(
         // obsolete permissions. Kill it before publishing any new capability.
         log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
         try {
-          killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+          if (effectiveBackendType === 'zmx') {
+            ZmxBackend.killManagedSession(
+              persistentSessionName,
+              cfg.sessionId,
+              resolvedZmxSessionPid,
+            );
+          } else {
+            killPersistentSession(
+              effectiveBackendType as PersistentBackendType,
+              persistentSessionName,
+              cfg.sessionId,
+            );
+          }
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
+        }
+        const postKillProbe = effectiveBackendType === 'zmx'
+          ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+          : probePersistentSession(
+              effectiveBackendType as PersistentBackendType,
+              persistentSessionName,
+            );
+        if (postKillProbe !== 'missing') {
+          throw new Error(
+            `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
+            `could not confirm stale ${effectiveBackendType} pane termination`,
+          );
+        }
+        if (effectiveBackendType === 'zmx') {
+          resolvedZmxSessionProbe = postKillProbe;
+          resolvedZmxSessionPid = undefined;
         }
       }
     }
@@ -6178,7 +6453,19 @@ async function spawnCli(
   );
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
     const persistentBackendType = effectiveBackendType as PersistentBackendType;
-    const paneProbe = probePersistentSession(persistentBackendType, persistentSessionName);
+    const paneProbe = effectiveBackendType === 'zmx'
+      ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid).probe
+      : probePersistentSession(persistentBackendType, persistentSessionName);
+    if (
+      effectiveBackendType === 'zmx'
+      && resolvedZmxSessionProbe !== 'exists'
+      && paneProbe === 'exists'
+    ) {
+      throw new Error(
+        `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
+        'ZMX session appeared after the frozen launch probe',
+      );
+    }
     if (paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
@@ -6193,8 +6480,18 @@ async function spawnCli(
       // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
       // fresh relay socket instead of reattaching to a dead connection.
       log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
-      killPersistentSession(persistentBackendType, persistentSessionName);
-      const postKillProbe = probePersistentSession(persistentBackendType, persistentSessionName);
+      if (effectiveBackendType === 'zmx') {
+        ZmxBackend.killManagedSession(
+          persistentSessionName,
+          cfg.sessionId,
+          resolvedZmxSessionPid,
+        );
+      } else {
+        killPersistentSession(persistentBackendType, persistentSessionName, cfg.sessionId);
+      }
+      const postKillProbe = effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe
+        : probePersistentSession(persistentBackendType, persistentSessionName);
       if (postKillProbe !== 'missing') {
         throw new Error(
           `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
@@ -6203,6 +6500,7 @@ async function spawnCli(
       }
       if (effectiveBackendType === 'zmx') {
         resolvedZmxSessionProbe = postKillProbe;
+        resolvedZmxSessionPid = undefined;
       }
     }
   }
@@ -7442,6 +7740,19 @@ async function spawnCli(
     idleDetector = new IdleDetector(cliAdapter);
     idleDetector.onIdle(async () => {
       log('Prompt detected (idle)');
+      const idleBackend = backend;
+      const revisionBeforeSettle = backendScreenRevision;
+      if (idleBackend?.settleCurrentScreen) {
+        const settle = await settleBackendScreenBeforeIdle(idleBackend, revisionBeforeSettle);
+        if (!settle.proceed || backend !== idleBackend) return;
+        if (backendScreenRevision !== revisionBeforeSettle) {
+          log('Authoritative screen changed during idle settle; deferring completion to the re-armed detector');
+          return;
+        }
+        if (settle.degraded) {
+          log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
+        }
+      }
       // Bridge drain MUST run before markPromptReady() — the latter calls
       // flushPending() which can immediately fire the next queued message
       // (type-ahead adapters), shifting bridgeQueue's notion of "current
@@ -7458,6 +7769,11 @@ async function spawnCli(
 
   backend.onData(onPtyData);
   const observedBackend = backend;
+  backend.onScreenResync?.((snapshot) => {
+    if (observedBackend !== backend) return;
+    log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    onBackendScreenResync(snapshot);
+  });
   backend.onAccessUrl?.((url) => {
     send({
       type: 'riff_access_url',
@@ -8259,38 +8575,6 @@ var term=new Terminal({
   fontSize:14,fontFamily:"'JetBrains Mono','Fira Code',monospace",
   cursorBlink:!isTouch,scrollback:50000,allowProposedApi:true
 });
-// ZMX's attach transport has one headless terminal in the worker that answers
-// DA/DSR/CPR/mode/status queries even when no browser exists. A normal xterm.js
-// tab would answer the same queries again (N tabs => N extra replies), so for
-// this backend only, consume reply-producing query families in every browser.
-// They are zero-width control requests; returning true suppresses xterm's
-// built-in response without changing rendered output. Other backends keep the
-// default browser responder because they do not own one server-side.
-var _serverTerminalResponder=${effectiveBackendType === 'zmx'};
-if(_serverTerminalResponder&&term.parser){
-  var _queryParam0=function(p){
-    var v=p&&p.length?p[0]:0;
-    return Array.isArray(v)?(v[0]||0):(v||0);
-  };
-  term.parser.registerCsiHandler({final:'c'},function(p){return _queryParam0(p)<=0});
-  term.parser.registerCsiHandler({prefix:'>',final:'c'},function(p){return _queryParam0(p)<=0});
-  term.parser.registerCsiHandler({final:'n'},function(p){var v=_queryParam0(p);return v===5||v===6});
-  term.parser.registerCsiHandler({prefix:'?',final:'n'},function(p){return _queryParam0(p)===6});
-  term.parser.registerCsiHandler({intermediates:'$',final:'p'},function(){return true});
-  term.parser.registerCsiHandler({prefix:'?',intermediates:'$',final:'p'},function(){return true});
-  term.parser.registerCsiHandler({final:'t'},function(p){return _queryParam0(p)===18});
-  term.parser.registerDcsHandler({intermediates:'$',final:'q'},function(){return true});
-  var _oscColorQuery=function(ident,data){
-    if(ident!==4)return data.split(';').indexOf('?')!==-1;
-    var parts=data.split(';');
-    if(parts.length<2||parts.length%2!==0)return false;
-    for(var i=0;i<parts.length;i+=2){if(/^\d+$/.test(parts[i])&&parts[i+1]==='?')return true;}
-    return false;
-  };
-  [4,10,11,12].forEach(function(ident){
-    term.parser.registerOscHandler(ident,function(data){return _oscColorQuery(ident,data)});
-  });
-}
 var fit=new FitAddon.FitAddon();
 term.loadAddon(fit);
 term.loadAddon(new WebLinksAddon.WebLinksAddon());
@@ -9064,17 +9348,26 @@ process.on('message', async (raw: unknown) => {
           publishSandboxRelayCapability();
         }
         let port = 0;
+        const requestedBackendType = msg.backendType ?? config.daemon.backendType;
+        const webTerminalEnabled = backendSupportsWebTerminal(requestedBackendType);
         if (!isWorkflowWorker()) {
-          port = await startWebServer(config.web.workerHost, msg.webPort);
+          if (webTerminalEnabled) {
+            port = await startWebServer(config.web.workerHost, msg.webPort);
+          } else {
+            log(`Web terminal disabled for ${requestedBackendType} backend (no raw ANSI transport)`);
+          }
           startScreenUpdates();
           startScreenAnalyzer();
         } else {
-          // Workflow attempts still expose a read-only web terminal so the
-          // workflow dashboard can observe in-flight subagents.  Keep the
-          // chat-side features disabled: no screen cards, no analyzer, no
-          // sessionStore writes.
-          port = await startWebServer(config.web.workerHost, msg.webPort);
-          log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
+          // Workflow attempts expose a read-only web terminal only when the
+          // backend has a raw terminal stream. Keep chat-side features
+          // disabled: no screen cards, no analyzer, no sessionStore writes.
+          if (webTerminalEnabled) {
+            port = await startWebServer(config.web.workerHost, msg.webPort);
+            log('Workflow worker mode: web terminal enabled; skipping screen updates and screen analyzer');
+          } else {
+            log(`Workflow worker mode: web terminal disabled for ${requestedBackendType} backend`);
+          }
         }
         // Hybrid codex RPC input (opt-in): bind the pane to a botmux-owned
         // app-server thread; input flows via JSON-RPC instead of a drop-prone
@@ -9097,7 +9390,11 @@ process.on('message', async (raw: unknown) => {
             rpcPluginGenerationPrepared = true;
           },
           engage: () => engageCodexRpc(msg),
-          killVerify: (name) => killPersistentSessionVerified(rpcBackendType as PersistentBackendType, name),
+          killVerify: (name) => killPersistentSessionVerified(
+            rpcBackendType as PersistentBackendType,
+            name,
+            msg.sessionId,
+          ),
           teardownEngine: () => stopCodexRpcEngine(),
           log: (m) => log(m),
           notify: (m) => send({ type: 'user_notify', message: m, turnId: msg.turnId }),
@@ -9285,7 +9582,7 @@ process.on('message', async (raw: unknown) => {
             // ingest path is unaffected because mark already happened
             // above (codexBridgeMarkPendingTurn / bridgeMarkPendingTurn).
             try {
-              const result = await cliAdapter.writeInput(backend as unknown as PtyHandle, content);
+              const result = await cliAdapter.writeInput(adapterInputHandle(backend), content);
               if (result?.cliSessionId) {
                 persistCliSessionId(result.cliSessionId);
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
@@ -9526,7 +9823,7 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'term_action': {
-      handleTermAction(msg.key);
+      await handleTermAction(msg.key);
       break;
     }
 
@@ -9684,7 +9981,16 @@ function teardownSandboxBestEffort(): void {
 // and process.exit(1), killing a live session over a dropped log write. Install
 // the guard before any further stdout writes (log() writes to process.stdout).
 installStdioEpipeGuard();
-process.on('exit', () => { teardownSandboxBestEffort(); stopCodexRpcEngine(); });
+process.on('exit', () => {
+  // `zmx tail` can remain blocked with PPID=1 after an abrupt Node exit because
+  // it notices a broken stdout pipe only when new session output arrives.
+  // Detach the observer synchronously; never destroy the persistent CLI here.
+  if (backend instanceof ZmxBackend) {
+    try { backend.kill(); } catch { /* best-effort crash teardown */ }
+  }
+  teardownSandboxBestEffort();
+  stopCodexRpcEngine();
+});
 process.on('uncaughtException', (err: NodeJS.ErrnoException) => {
   // A broken pipe on stdout/stderr (or any socket) must not tear down a live
   // session — the stdio guard handles those it can; this is the backstop.

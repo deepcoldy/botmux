@@ -10,6 +10,7 @@
  */
 
 import type { SessionRow } from '../core/dashboard-rows.js';
+import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import type {
   ButtonState,
   PaginationMeta,
@@ -237,13 +238,15 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
   const isClosed = row.status === 'closed';
   const isStarting = row.status === 'starting';
   const canCloseNow = !isClosed && !isStarting;
+  const supportsWebTerminal = row.backendType === undefined
+    || backendSupportsWebTerminal(row.backendType);
   // Closed sessions can still carry a stale
   // webPort (closeSession / dashboard close don't null the field), so a
   // simple `webPort != null` check would surface a dead terminal link on
   // the closed detail card. Gate openTerminal on status too — terminals
   // are only meaningful on a live worker.
   const canOpenTerminal =
-    !isClosed && row.webPort !== null && row.webPort !== undefined;
+    supportsWebTerminal && !isClosed && row.webPort !== null && row.webPort !== undefined;
   const locateMode: LocateMode = row.scope === 'chat' ? 'openChat' : 'openTopic';
 
   const actions: SessionActionMatrix = {
@@ -252,7 +255,12 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
       enabled: false,
       reasonKey: isStarting ? 'sessions.action.close.starting' : 'sessions.action.close.alreadyClosed',
     },
-    openTerminal: canOpenTerminal ? { enabled: true } : { enabled: false, reasonKey: 'sessions.action.terminal.noPort' },
+    openTerminal: canOpenTerminal ? { enabled: true } : {
+      enabled: false,
+      reasonKey: supportsWebTerminal
+        ? 'sessions.action.terminal.noPort'
+        : 'sessions.action.terminal.unsupported',
+    },
     locate: { enabled: true },
     locateMode,
   };

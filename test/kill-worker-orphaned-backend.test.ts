@@ -38,7 +38,7 @@ vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
 vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
   ZmxBackend: {
     sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
-    killSession: zmxKill,
+    killManagedSession: zmxKill,
     listBotmuxSessions: vi.fn(() => []),
   },
 }));
@@ -67,7 +67,7 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { killWorker } from '../src/core/worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose } from '../src/core/worker-pool.js';
 
 const SID = 'abcd1234-0000-0000-0000-000000000000';
 const EXPECTED_NAME = 'bmx-abcd1234';
@@ -114,7 +114,7 @@ describe('killWorker — orphaned backing session teardown (no live worker)', ()
 
   it('destroys the zmx backing session', () => {
     killWorker(ds({}, { backendType: 'zmx' }));
-    expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME);
+    expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
     expect(tmuxKill).not.toHaveBeenCalled();
   });
 
@@ -158,5 +158,36 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(tmuxKill).not.toHaveBeenCalled();
     expect(d.worker).toBeNull();
     expect(d.managedTurnOrigin).toBeUndefined();
+  });
+});
+
+describe('teardownAuthoritativePersistentBackingBeforeClose', () => {
+  it('synchronously proves ZMX teardown before callers mutate close state', () => {
+    const d = ds({ worker: { killed: false } as any }, { backendType: 'zmx' });
+
+    teardownAuthoritativePersistentBackingBeforeClose(d);
+
+    expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
+    expect(d.worker).not.toBeNull();
+    expect(d.session.status).toBeUndefined();
+  });
+
+  it('propagates ZMX ownership refusal without mutating the session', () => {
+    const refusal = new Error('ownership probe unavailable');
+    zmxKill.mockImplementationOnce(() => { throw refusal; });
+    const d = ds({ worker: { killed: false } as any }, { backendType: 'zmx' });
+
+    expect(() => teardownAuthoritativePersistentBackingBeforeClose(d)).toThrow(refusal);
+    expect(d.worker).not.toBeNull();
+    expect(d.session.status).toBeUndefined();
+  });
+
+  it('is a no-op for non-ZMX, queued, and adopted sessions', () => {
+    teardownAuthoritativePersistentBackingBeforeClose(ds({}, { backendType: 'tmux' }));
+    teardownAuthoritativePersistentBackingBeforeClose(ds({ session: { sessionId: SID, queued: true } as any }, { backendType: 'zmx' }));
+    teardownAuthoritativePersistentBackingBeforeClose(ds({ adoptedFrom: { source: 'tmux' } as any }, { backendType: 'zmx' }));
+
+    expect(zmxKill).not.toHaveBeenCalled();
+    expect(tmuxKill).not.toHaveBeenCalled();
   });
 });

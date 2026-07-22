@@ -102,6 +102,9 @@ import {
   ensureCliEnv,
   sweepGlobalBotmuxSkills,
   writableTerminalLinkFor,
+  workerHasInitialized,
+  sessionSupportsWebTerminal,
+  readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
   type WorkerSessionReplyOptions,
@@ -553,7 +556,7 @@ function vcMeetingBootBackingMissing(sessionId: string, destroy: boolean): boole
   for (const backendType of backendTypes) {
     const name = persistentSessionName(backendType, sessionId);
     if (destroy) {
-      try { killPersistentSession(backendType, name); }
+      try { killPersistentSession(backendType, name, sessionId); }
       catch (err) {
         logger.warn(
           `[vc-delivery] boot recovery backing kill failed backend=${backendType} `
@@ -713,7 +716,11 @@ type VcMeetingRuntimeLeaseRecoveryDeps = {
   resolvePersistentScope: (ds: DaemonSession) => VcMeetingRuntimePersistentScope;
   resolveMissingPersistentScope: (sessionId: string) => VcMeetingRuntimePersistentScope;
   backendAvailable: (backendType: PersistentBackendType) => boolean;
-  killPersistent: (backendType: PersistentBackendType, sessionName: string) => void;
+  killPersistent: (
+    backendType: PersistentBackendType,
+    sessionName: string,
+    sessionId: string,
+  ) => void;
   probePersistent: (backendType: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
   warn: (message: string) => void;
   error: (message: string) => void;
@@ -791,7 +798,7 @@ function createVcMeetingRuntimeLeaseRecovery(deps: VcMeetingRuntimeLeaseRecovery
     let allMissing = true;
     for (const backendType of backendTypes) {
       const name = persistentSessionName(backendType, fence.receiverSessionId);
-      try { deps.killPersistent(backendType, name); }
+      try { deps.killPersistent(backendType, name, fence.receiverSessionId); }
       catch (err) {
         deps.warn(
           `[vc-delivery] runtime lease backing kill failed backend=${backendType} `
@@ -3526,8 +3533,8 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   ds.streamingCardForced = undefined;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
-    const readUrl = buildTerminalUrl(ds);
+  if (ds.streamCardId && workerHasInitialized(ds)) {
+    const readUrl = readableTerminalUrlFor(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
     const prevMode = ds.displayMode ?? 'hidden';
@@ -17075,7 +17082,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       host: config.web.host,
       resolvePort: (sessionId) => {
         for (const ds of activeSessions.values()) {
-          if (ds.session.sessionId === sessionId && ds.workerPort) return ds.workerPort;
+          if (ds.session.sessionId === sessionId && sessionSupportsWebTerminal(ds) && ds.workerPort) {
+            return ds.workerPort;
+          }
         }
         return undefined;
       },

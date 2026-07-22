@@ -101,16 +101,20 @@ describe('selectSessionBackend', () => {
     expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false });
   });
 
-  it('uses zmx attach as a direct PTY backend', () => {
+  it('uses zmx tail signals, history snapshots, and send as a managed pipe backend', () => {
     vi.mocked(ZmxBackend.hasSession).mockReturnValue(true);
 
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zmx' });
 
     expect(selected.isZellijMode).toBe(false);
     expect(selected.isTmuxMode).toBe(false);
-    expect(selected.isPipeMode).toBe(false);
+    expect(selected.isPipeMode).toBe(true);
     expect(selected.backend.constructor.name).toBe('MockZmxBackend');
-    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect((selected.backend as any).opts).toEqual({
+      ownsSession: true,
+      isReattach: true,
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+    });
   });
 });
 

@@ -6,7 +6,7 @@ function deps(overrides: Partial<BackendAvailabilityDeps> = {}): BackendAvailabi
     ensureTmux: vi.fn(async () => ({ installed: true, version: 'tmux 3.5', freshInstall: false, binaryPresent: true })),
     ensureHerdr: vi.fn(async () => ({ installed: true, version: 'herdr 0.7.3', freshInstall: false })),
     probeZellijFunctional: vi.fn(() => ({ ok: true, version: 'zellij 0.44.1' })),
-    probeZmxFunctional: vi.fn(() => ({ ok: true, version: 'zmx 0.6.0' })),
+    probeZmxFunctional: vi.fn(() => ({ ok: true, version: 'zmx 0.7.1' })),
     ...overrides,
   };
 }
@@ -66,7 +66,7 @@ describe('ensureBackendAvailable', () => {
       ok: false,
       backendType: 'zmx',
       reason: 'zmx 0.5.9 过旧',
-      manualCommand: 'macOS: brew install neurosnap/tap/zmx；Linux: 安装 ZMX 官方 release binary（>= 0.6.0）',
+      manualCommand: '等待包含 PR #202 send 行为的 ZMX >= 0.7.1 正式版；发布后 macOS 可用 Homebrew、Linux 可用官方 release binary 安装',
     });
     expect(d.probeZmxFunctional).toHaveBeenCalledTimes(1);
     expect(d.probeZellijFunctional).not.toHaveBeenCalled();

@@ -82,7 +82,7 @@ vi.mock('../src/core/dashboard-events.js', () => ({
 }));
 
 vi.mock('../src/core/dashboard-rows.js', () => ({
-  composeRowFromActive: vi.fn(),
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: undefined })),
 }));
 
 vi.mock('../src/skills/installer.js', () => ({
@@ -218,6 +218,73 @@ describe('Worker ready: set_display_mode re-sync', () => {
     const logs = loggerInfoMock.mock.calls.flat().join('\n');
     expect(logs).toContain('viewToken=[redacted]');
     expect(logs).not.toContain('view_cap');
+  });
+
+  it('treats port=0 as ready without Web Terminal and keeps screen/screenshot state flowing', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      session: { ...makeDs().session, backendType: 'zmx' },
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+      displayMode: 'screenshot',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 0, token: 'unused', viewToken: 'unused-view' });
+    await flush();
+
+    expect(ds.workerReady).toBe(true);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.workerViewToken).toBeNull();
+    expect(ds.session.webPort).toBeUndefined();
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(sessionReplyMock.mock.calls[0][1]).readUrl).toBe('');
+
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'plain zmx history',
+      status: 'idle',
+    });
+    fakeWorker.emit('message', {
+      type: 'screenshot_uploaded',
+      imageKey: 'img_zmx_history',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.lastScreenContent).toBe('plain zmx history');
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.currentImageKey).toBe('img_zmx_history');
+  });
+
+  it('ignores every message from a replaced worker generation', async () => {
+    const staleWorker = makeFakeWorker();
+    const currentWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: currentWorker,
+      workerReady: false,
+      workerPort: null,
+      lastScreenContent: 'current generation',
+      lastScreenStatus: 'working',
+    });
+
+    __testOnly_setupWorkerHandlers(ds, staleWorker);
+    staleWorker.emit('message', { type: 'ready', port: 9999, token: 'stale-token' });
+    staleWorker.emit('message', {
+      type: 'screen_update',
+      content: 'stale generation',
+      status: 'idle',
+    });
+    await flush();
+
+    expect(ds.workerReady).toBe(false);
+    expect(ds.workerPort).toBeNull();
+    expect(ds.workerToken).toBeNull();
+    expect(ds.lastScreenContent).toBe('current generation');
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('doc-native session never posts a streaming card to the virtual doc: chat id', async () => {

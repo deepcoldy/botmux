@@ -145,8 +145,9 @@ export interface DashboardGlobalConfig {
   openTerminalInFeishu?: boolean;
   /** Opt in to native "Open <CLI>" buttons on supported desktop hosts.
    *  Default false. When enabled, localCliOpenMode defaults to 'attach' so a
-   *  botmux-managed persistent backend attaches to the same I/O/history and
-   *  preserves Feishu continuity; 'resume' starts a separate CLI resume process
+   *  botmux-managed persistent backend enters the same underlying CLI and
+   *  preserves Feishu continuity. ZMX uses its native local terminal while
+   *  Feishu remains plain text; 'resume' starts a separate CLI resume process
    *  and may break that continuity. */
   enableLocalCliOpen?: boolean;
   /** How native "Open <CLI>" buttons launch on macOS. Missing defaults to

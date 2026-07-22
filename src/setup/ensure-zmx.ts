@@ -47,7 +47,7 @@ export function zmxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv 
   };
 }
 
-export function probeZmxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {
+export function probeZmxVersion(): { ok: true; version: string } | { ok: false; reason: string } {
   let version: string;
   try {
     version = execFileSync('zmx', ['version'], {
@@ -64,12 +64,19 @@ export function probeZmxFunctional(): { ok: true; version: string } | { ok: fals
   if (!parsedVersion) {
     return { ok: false, reason: `无法解析 zmx 版本：${version.split('\n')[0] || '(empty)'}` };
   }
-  if (compareVersion(parsedVersion, [0, 6, 0]) < 0) {
+  if (compareVersion(parsedVersion, [0, 7, 1]) < 0) {
     return {
       ok: false,
-      reason: `zmx >= 0.6.0 才受支持（当前 ${parsedVersion.join('.')}）`,
+      reason: `zmx >= 0.7.1 才受支持（当前 ${parsedVersion.join('.')}；需要包含 PR #202 的 send 行为，输出由 history 获取）`,
     };
   }
+
+  return { ok: true, version };
+}
+
+export function probeZmxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {
+  const versionProbe = probeZmxVersion();
+  if (!versionProbe.ok) return versionProbe;
 
   try {
     execFileSync('zmx', ['list'], {
@@ -83,7 +90,7 @@ export function probeZmxFunctional(): { ok: true; version: string } | { ok: fals
     return { ok: false, reason: stderr || 'zmx list 失败' };
   }
 
-  return { ok: true, version };
+  return versionProbe;
 }
 
 export function parseZmxVersion(output: string): [number, number, number] | null {

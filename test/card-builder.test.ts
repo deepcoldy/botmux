@@ -271,6 +271,17 @@ describe('buildSessionCard', () => {
       expect(linkBtn.value.session_id).toBe(SID);
     });
 
+    it('keeps native attach and close but hides Web Terminal controls without a URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildSessionCard(SID, ROOT, '', TITLE, 'codex', false, false, 'en', true));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
+    });
+
     it('includes Open Codex beside Web Terminal for codex sessions only', () => {
       enableLocalCliOpen();
       const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'codex', false, false, 'en', true));
@@ -688,6 +699,22 @@ describe('buildStreamingCard', () => {
       expect(linkBtn).toBeDefined();
       expect(linkBtn.value.root_id).toBe(ROOT);
       expect(linkBtn.value.session_id).toBe(SID);
+    });
+
+    it('hides Web Terminal controls when the backend has no terminal URL', () => {
+      enableLocalCliOpen();
+      const card = parse(buildStreamingCard(
+        SID, ROOT, '', TITLE, '', 'idle', 'codex', 'hidden',
+        undefined, undefined, false, false, 'en', undefined, undefined, true,
+      ));
+      const actions = findActions(card);
+
+      expect(actions.some((a: any) => a.multi_url)).toBe(false);
+      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      // Native local opening (for example `zmx attach`) stays available.
+      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
+      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('should include close button with danger type', () => {
@@ -1425,6 +1452,19 @@ describe('buildPrivateSnapshotCard', () => {
     const btns = allButtons(card);
     expect(btns.some((b: any) => b.value?.action === 'open_local_cli')).toBe(false);
     expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['url', 'get_write_link', 'close']);
+  });
+
+  it('keeps the snapshot and close control but hides terminal links when unavailable', () => {
+    const card = parse(buildPrivateSnapshotCard(
+      '', 'my session', 'idle', 'codex', undefined, 'plain zmx history',
+      'sess-9', 'om_anchor', 'en',
+    ));
+    const btns = allButtons(card);
+
+    expect(btns.map((b: any) => b.value?.action ?? 'url')).toEqual(['close']);
+    expect(JSON.stringify(card)).toContain('plain zmx history');
+    expect(JSON.stringify(card)).toContain('static snapshot');
+    expect(JSON.stringify(card)).not.toContain('Open Web Terminal');
   });
 
   it('callback buttons carry root_id/session_id/cli_id for handler resolution', () => {
