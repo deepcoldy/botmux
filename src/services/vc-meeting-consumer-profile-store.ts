@@ -157,6 +157,7 @@ function rawProfile(profile: VcMeetingConsumerProfileConfig): Record<string, unk
     ...(profile.instructions ? { instructions: profile.instructions } : {}),
     ...(profile.filter ? { filter: profile.filter } : {}),
     responseMode: profile.responseMode,
+    ...(profile.listenerDelivery ? { listenerDelivery: profile.listenerDelivery } : {}),
     capabilities: [...profile.capabilities],
     ...(profile.ownedSinks?.length ? { ownedSinks: [...profile.ownedSinks] } : {}),
   };

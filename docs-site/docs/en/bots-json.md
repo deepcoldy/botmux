@@ -186,6 +186,38 @@ Example:
 |------|------|
 | `voice` | The bot's voice-engine override, merged field-by-field on top of the global `voice` block in `~/.botmux/config.json` (per-bot takes precedence). When valid voice credentials are present, a "🔊 Voice summary" button appears on reply cards. See [Voice summary](/en/voice) |
 
+## Meeting listener roles and group placement
+
+`vcMeetingAgent.meetingConsumer.consumerProfiles` defines reusable meeting-listener roles. `responseMode` controls whether automatic model output is authorized; `listenerDelivery.placement` independently controls where authorized output appears:
+
+The Dashboard meeting-role editor includes a local built-in template library: Important information sync, Structured meeting minutes, Decision and action tracker, and Risk and assumption watch. “Use template” copies the selected template into a normal, fully editable profile; later template changes never overwrite user configuration. The catalog has stable template IDs, versions, and source metadata so a community source can use the same model later. This release makes no network request and uploads no usage data, so popularity rankings are intentionally unavailable.
+
+- `silent`: automatic model output stays hidden.
+- `listener_thread`: automatic output may be sent to the listener group and requires `listener.output.request`.
+- placement `auto` (also the default when omitted): preserve legacy session routing.
+- placement `chat`: send every update as a top-level group message.
+- placement `topic`: use the first useful update as a stable topic root and thread later updates under it. Removing and re-enabling the profile starts a new topic.
+
+Automatic `listener_thread` output uses an internal `skip | publish` control protocol. The agent decides whether the current meeting state warrants publication; botmux sends only the `publish` message body and never renders the control JSON in Lark. There is no semantic-fingerprint deduplication or debounce/interval setting: novelty, observation time, and publication timing remain the agent's responsibility under the profile prompt and full meeting context. Malformed envelopes fail closed. Explicit human IM replies keep their existing quote/thread routing and do not use this protocol.
+
+Example generic “important meeting information sync” profile:
+
+```json
+{
+  "id": "important-sync",
+  "agentAppId": "cli_your_agent_app_id",
+  "label": "Important meeting information sync",
+  "role": "important-information-sync",
+  "instructions": "Continuously listen to the meeting. Publish only new information that materially matters to collaborators: confirmed decisions, status changes, explicit blockers or risks, and items people need to know or act on. When discussion has not formed a clear change, do not publish yet; decide whether to keep observing and when to publish from meeting semantics. Ignore discussion process, repetition, small talk, and unconfirmed speculation. Keep each update concise and include owner, deadline, scope, or impact when known. A correction to a previously stated time, owner, scope, status, or conclusion must be published as new information even when most surrounding details remain unchanged. Re-evaluate transcript revisions without repeating unchanged items.",
+  "filter": { "activityTypes": ["transcript_received", "chat_received"] },
+  "responseMode": "listener_thread",
+  "listenerDelivery": { "placement": "topic" },
+  "capabilities": ["listener.output.request", "meeting.read"]
+}
+```
+
+Set `agentAppId` to the bot that executes the role. Add the profile id to `defaultConsumerIds` with `defaultMode: "agents"` to enable it by default, or select it manually from the in-meeting consumer card.
+
 ## Runtime state (auto-maintained, do not edit)
 
 The following fields are written by botmux itself and persisted into `bots.json` alongside authorizations / switches. They are listed only for reference — **do not edit them by hand**:

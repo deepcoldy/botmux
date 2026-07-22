@@ -33,7 +33,11 @@ const imOrigin: VcMeetingImTurnOrigin = {
   larkMessageId: 'om_current',
 };
 
-function seed(responseMode: 'silent' | 'listener_thread'): void {
+function seed(
+  responseMode: 'silent' | 'listener_thread',
+  outputPlacement: 'auto' | 'chat' | 'topic' = 'auto',
+  listenerOutputProtocol: 'plain' | 'decision_v1' = 'plain',
+): void {
   applyVcMeetingMemberProjection(dir, {
     ...memberKey,
     ownerBootId: 'owner-boot',
@@ -49,6 +53,7 @@ function seed(responseMode: 'silent' | 'listener_thread'): void {
     joinedAtIngestSeq: 0,
     receiverSessionId: 'receiver-session',
     outputChatId: 'listener-chat',
+    outputPlacement,
   });
   acceptVcMeetingDelivery(dir, {
     ...memberKey,
@@ -60,6 +65,7 @@ function seed(responseMode: 'silent' | 'listener_thread'): void {
     fromSeq: 1,
     toSeq: 1,
     responseMode,
+    listenerOutputProtocol,
     receiverBootId: 'receiver-boot',
   });
   markVcMeetingDeliveryDispatched(dir, { ...memberKey, deliveryKey: 'delivery-key' }, {
@@ -95,7 +101,9 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
   });
 
@@ -185,7 +193,9 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'receiver-session', receiverSession: true,
@@ -260,6 +270,39 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toMatchObject({ ok: false, errorCode: 'silent_delivery' });
   });
 
+  it('keeps listener placement frozen on the accepted receipt', () => {
+    seed('listener_thread', 'topic');
+    applyVcMeetingMemberProjection(dir, {
+      ...memberKey,
+      ownerBootId: 'owner-boot', ownerEpoch: 1, agentAppId: 'agent', role: 'minutes',
+      membershipGeneration: 2, status: 'active', responseMode: 'listener_thread',
+      joinedAtIngestSeq: 0, receiverSessionId: 'receiver-session', outputChatId: 'listener-chat',
+      outputPlacement: 'chat',
+    });
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({
+      ok: true,
+      kind: 'listener_thread',
+      outputPlacement: 'topic',
+      meetingOwner: { memberId: 'member', memberEpoch: 1 },
+    });
+  });
+
+  it('freezes the controlled-output protocol on the delivery receipt', () => {
+    seed('listener_thread', 'topic', 'decision_v1');
+    expect(evaluateVcMeetingManagedSend(dir, {
+      receiverSessionId: 'receiver-session', receiverSession: true,
+      turnId: 'delivery-key', dispatchAttempt: 1,
+    })).toMatchObject({
+      ok: true,
+      kind: 'listener_thread',
+      outputPlacement: 'topic',
+      listenerOutputProtocol: 'decision_v1',
+    });
+  });
+
   it('keeps ordinary non-receiver sends unchanged', () => {
     expect(evaluateVcMeetingManagedSend(dir, {
       receiverSessionId: 'ordinary-session', receiverSession: false, turnId: 'im-message',
@@ -274,7 +317,9 @@ describe('evaluateVcMeetingManagedSend', () => {
     })).toEqual({
       ok: true,
       kind: 'listener_thread',
-      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting' },
+      outputPlacement: 'auto',
+      listenerOutputProtocol: 'plain',
+      meetingOwner: { listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member', memberEpoch: 1 },
     });
     expect(evaluateVcMeetingManagedOriginClaim(dir, {
       receiverSessionId: 'receiver-session', liveOrigin, claimedCapability: 'cap-old',

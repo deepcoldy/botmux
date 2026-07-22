@@ -319,6 +319,7 @@ describe('parseBotConfigsFromText — brand', () => {
                 instructions: '  维护决策和待办。\r\n\t标记负责人。  ',
                 filter: { activityTypes: ['transcript_received', 'chat_received'] },
                 responseMode: 'silent',
+                listenerDelivery: { placement: 'topic' },
                 capabilities: ['meeting.read'],
               },
               {
@@ -348,6 +349,7 @@ describe('parseBotConfigsFromText — brand', () => {
           instructions: '维护决策和待办。\n\t标记负责人。',
           filter: { activityTypes: ['transcript_received', 'chat_received'] },
           responseMode: 'silent',
+          listenerDelivery: { placement: 'topic' },
           capabilities: ['meeting.read'],
         },
         {
@@ -520,6 +522,10 @@ describe('parseBotConfigsFromText — brand', () => {
       .toThrow(/meeting_text requires capability meeting\.output\.request/);
     expect(() => parseProfile({ id: 'legacy-generalist', responseMode: 'listener_thread' }))
       .toThrow(/listener_thread requires listener\.output\.request/);
+    expect(() => parseProfile({ listenerDelivery: { placement: 'broadcast' } }))
+      .toThrow(/listenerDelivery\.placement: must be auto, chat, or topic/);
+    expect(() => parseProfile({ listenerDelivery: { placement: 'topic', extra: true } }))
+      .toThrow(/listenerDelivery: unknown field\(s\): extra/);
     expect(() => parseProfile({
       responseMode: 'listener_thread',
       capabilities: ['meeting.read', 'listener.output.request'],

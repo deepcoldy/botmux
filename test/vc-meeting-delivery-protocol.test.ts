@@ -131,7 +131,26 @@ describe('validateVcMeetingMemberProjectionRequest', () => {
   it('accepts a fenced projection without a caller-selected receiver session', () => {
     const result = validateVcMeetingMemberProjectionRequest(memberProjection());
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.request).not.toHaveProperty('receiverSessionId');
+    if (result.ok) {
+      expect(result.request).not.toHaveProperty('receiverSessionId');
+      expect(result.request.outputRoute).toEqual({ chatId: 'chat_1', placement: 'auto' });
+    }
+  });
+
+  it('accepts explicit listener placement and rejects unsupported placement', () => {
+    const topic = memberProjection() as any;
+    topic.outputRoute.placement = 'topic';
+    expect(validateVcMeetingMemberProjectionRequest(topic)).toMatchObject({
+      ok: true,
+      request: { outputRoute: { chatId: 'chat_1', placement: 'topic' } },
+    });
+
+    const invalid = memberProjection() as any;
+    invalid.outputRoute.placement = 'broadcast';
+    expect(validateVcMeetingMemberProjectionRequest(invalid)).toMatchObject({
+      ok: false,
+      path: 'outputRoute.placement',
+    });
   });
 
   it('canonicalizes optional trusted profile instructions on membership only', () => {

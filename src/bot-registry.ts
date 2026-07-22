@@ -251,6 +251,8 @@ const VC_MEETING_CONSUMER_MANAGED_SINKS = [
   'meeting_voice',
 ] as const satisfies readonly VcMeetingConsumerManagedSink[];
 
+const VC_MEETING_LISTENER_OUTPUT_PLACEMENTS = ['auto', 'chat', 'topic'] as const;
+
 const VC_MEETING_OUTPUT_CAPABILITY = 'meeting.output.request';
 const VC_MEETING_LISTENER_OUTPUT_CAPABILITY = 'listener.output.request';
 const VC_MEETING_CONSUMER_PROFILE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
@@ -340,6 +342,25 @@ function normalizeVcMeetingConsumerOwnedSinks(
   return sinks.length > 0 ? sinks as VcMeetingConsumerManagedSink[] : undefined;
 }
 
+function normalizeVcMeetingListenerDelivery(
+  raw: unknown,
+  path: string,
+): VcMeetingConsumerProfileConfig['listenerDelivery'] | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    strictConfigError(path, 'must be an object');
+  }
+  const entry = raw as Record<string, unknown>;
+  const unknownKeys = Object.keys(entry).filter(key => key !== 'placement');
+  if (unknownKeys.length > 0) {
+    strictConfigError(path, `unknown field(s): ${unknownKeys.join(', ')}`);
+  }
+  if (!(VC_MEETING_LISTENER_OUTPUT_PLACEMENTS as readonly unknown[]).includes(entry.placement)) {
+    strictConfigError(`${path}.placement`, 'must be auto, chat, or topic');
+  }
+  return { placement: entry.placement as 'auto' | 'chat' | 'topic' };
+}
+
 function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProfileConfig[] {
   const path = 'vcMeetingAgent.meetingConsumer.consumerProfiles';
   if (!Array.isArray(raw)) strictConfigError(path, 'must be an array');
@@ -357,6 +378,7 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
       'instructions',
       'filter',
       'responseMode',
+      'listenerDelivery',
       'capabilities',
       'ownedSinks',
     ]);
@@ -395,6 +417,10 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
       `${profilePath}.ownedSinks`,
       capabilities,
     );
+    const listenerDelivery = normalizeVcMeetingListenerDelivery(
+      entry.listenerDelivery,
+      `${profilePath}.listenerDelivery`,
+    );
     return {
       id,
       agentAppId,
@@ -405,6 +431,7 @@ function normalizeVcMeetingConsumerProfiles(raw: unknown): VcMeetingConsumerProf
         : {}),
       ...(filter ? { filter } : {}),
       responseMode: entry.responseMode,
+      ...(listenerDelivery ? { listenerDelivery } : {}),
       capabilities,
       ...(ownedSinks ? { ownedSinks } : {}),
     };

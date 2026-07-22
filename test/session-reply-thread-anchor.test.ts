@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   sendMessage: vi.fn(async () => 'om_top'),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+  topicRoots: new Map<string, string>(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -33,6 +34,19 @@ vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return { ...actual, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
 });
+
+vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
+  getVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>) => (
+    mocks.topicRoots.get(JSON.stringify(key))
+  )),
+  recordVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>, root: string) => {
+    const serialized = JSON.stringify(key);
+    const prior = mocks.topicRoots.get(serialized);
+    if (prior && prior !== root) return { ok: false as const, reason: 'conflict' as const };
+    mocks.topicRoots.set(serialized, root);
+    return { ok: true as const, rootMessageId: root, existing: !!prior };
+  }),
+}));
 
 import { registerBot } from '../src/bot-registry.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
@@ -98,6 +112,7 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
+    mocks.topicRoots.clear();
     activeSessions.clear();
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
   });
@@ -227,6 +242,64 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
       },
       { suppressHook: true },
     );
+  });
+
+  it('forces automatic chat placement to the group top level even when a shared anchor exists', async () => {
+    seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'important update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'chat',
+      suppressHook: true,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, 'important update', 'text', undefined, expect.anything(), { suppressHook: true },
+    );
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('uses the first automatic topic output as a durable root and threads later outputs into it', async () => {
+    const receiver = seedReceiverSession();
+    const meetingTopicKey = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+      targetChatId: CHAT,
+    };
+
+    await sessionReply(CHAT, 'first update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+    await sessionReply(CHAT, 'second update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, 'first update', 'text', undefined, expect.anything(), { suppressHook: true },
+    );
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_top', 'second update', 'text', true, undefined, expect.anything(), { suppressHook: true },
+    );
+  });
+
+  it('fails closed when topic placement lacks a matching stream key', async () => {
+    const receiver = seedReceiverSession();
+    await expect(sessionReply(CHAT, 'bad route', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      suppressHook: true,
+    })).rejects.toThrow(/durable topic key/i);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
 
   it('fails closed when a receiver source session is stale instead of using the ordinary chat slot', async () => {

@@ -9,12 +9,16 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
-import { useT } from './react-hooks.js';
+import { useDashboardLocale, useT } from './react-hooks.js';
 import type {
   VcMeetingAgentOptionDto,
   VcMeetingConsumerProfileDto,
   VcMeetingPermissionPreset,
 } from '../vc-consumer-profiles-api.js';
+import type {
+  VcMeetingConsumerProfileTemplate,
+  VcMeetingConsumerProfileTemplateCatalog,
+} from '../../services/vc-meeting-consumer-profile-templates.js';
 
 const ACTIVITY_TYPES = [
   'transcript_received',
@@ -52,6 +56,7 @@ interface CatalogState {
   defaultConsumerIds: string[];
   profiles: DraftProfile[];
   agentOptions: VcMeetingAgentOptionDto[];
+  templateCatalog: VcMeetingConsumerProfileTemplateCatalog;
   migrationOffer?: 'enable_seeded_minutes_default';
 }
 
@@ -62,7 +67,12 @@ function nextUiKey(): string {
 }
 
 function toDraft(profile: VcMeetingConsumerProfileDto): DraftProfile {
-  return { ...profile, uiKey: nextUiKey(), isNew: false };
+  return {
+    ...profile,
+    listenerPlacement: profile.listenerPlacement ?? 'auto',
+    uiKey: nextUiKey(),
+    isNew: false,
+  };
 }
 
 function toDto(draft: DraftProfile): VcMeetingConsumerProfileDto {
@@ -81,6 +91,39 @@ function FieldHead(props: { title: string; help: string }): JSX.Element {
         <span className="vc-profile-help">{props.help}</span>
       </InfoTip>
     </span>
+  );
+}
+
+function VcProfileDialog(props: {
+  title: string;
+  eyebrow?: string;
+  children: ReactNode;
+  onClose(): void;
+  className?: string;
+}): JSX.Element {
+  const tr = useT();
+  const ref = useRef<HTMLDialogElement | null>(null);
+  useEffect(() => {
+    const dialog = ref.current;
+    if (!dialog || dialog.open) return;
+    try { dialog.showModal(); } catch { dialog.setAttribute('open', ''); }
+  }, []);
+  return (
+    <dialog
+      ref={ref}
+      className={['vc-profile-dialog', props.className].filter(Boolean).join(' ')}
+      onClose={props.onClose}
+      onCancel={(event) => { event.preventDefault(); props.onClose(); }}
+    >
+      <header className="vc-profile-dialog-head">
+        <div>
+          {props.eyebrow ? <span>{props.eyebrow}</span> : null}
+          <h3>{props.title}</h3>
+        </div>
+        <button type="button" className="vc-profile-dialog-close" aria-label={tr('settings.vcProfiles.close')} onClick={props.onClose} />
+      </header>
+      <div className="vc-profile-dialog-body">{props.children}</div>
+    </dialog>
   );
 }
 
@@ -109,6 +152,7 @@ export function VcConsumerProfilesSection(props: {
   listenerBotOptions: Array<{ larkAppId: string; botName?: string | null }>;
 }) {
   const tr = useT();
+  const locale = useDashboardLocale();
   const mountedRef = useRef(false);
   const options = props.listenerBotOptions;
   const [targetBot, setTargetBot] = useState<string>(
@@ -122,6 +166,8 @@ export function VcConsumerProfilesSection(props: {
   const [conflict, setConflict] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<FieldErrorMap>({});
   const [savedTick, setSavedTick] = useState(false);
+  const [selectedProfileKey, setSelectedProfileKey] = useState<string | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -150,6 +196,8 @@ export function VcConsumerProfilesSection(props: {
     setDirty(false);
     setConflict(false);
     setFieldErrors({});
+    setSelectedProfileKey(null);
+    setSelectedTemplateId(null);
     if (!bot) {
       setLoadError(null);
       return;
@@ -175,6 +223,10 @@ export function VcConsumerProfilesSection(props: {
           defaultConsumerIds: Array.isArray(body.defaultConsumerIds) ? body.defaultConsumerIds : [],
           profiles: (Array.isArray(body.profiles) ? body.profiles : []).map(toDraft),
           agentOptions: Array.isArray(body.agentOptions) ? body.agentOptions : [],
+          templateCatalog: body.templateCatalog?.schemaVersion === 1
+            && Array.isArray(body.templateCatalog.templates)
+            ? body.templateCatalog
+            : { schemaVersion: 1, templates: [] },
           ...(body.migrationOffer === 'enable_seeded_minutes_default'
             ? { migrationOffer: body.migrationOffer }
             : {}),
@@ -276,6 +328,10 @@ export function VcConsumerProfilesSection(props: {
         defaultConsumerIds: Array.isArray(body.defaultConsumerIds) ? body.defaultConsumerIds : [],
         profiles: (Array.isArray(body.profiles) ? body.profiles : []).map(toDraft),
         agentOptions: Array.isArray(body.agentOptions) ? body.agentOptions : [],
+        templateCatalog: body.templateCatalog?.schemaVersion === 1
+          && Array.isArray(body.templateCatalog.templates)
+          ? body.templateCatalog
+          : { schemaVersion: 1, templates: [] },
         ...(body.migrationOffer === 'enable_seeded_minutes_default'
           ? { migrationOffer: body.migrationOffer }
           : {}),
@@ -346,18 +402,49 @@ export function VcConsumerProfilesSection(props: {
   }, [tr]);
 
   const addProfile = useCallback(() => {
+    const uiKey = nextUiKey();
     mutate(state => ({
       ...state,
       profiles: [...state.profiles, {
-        uiKey: nextUiKey(),
+        uiKey,
         isNew: true,
         id: '',
         agentAppId: state.agentOptions[0]?.appId ?? '',
         responseMode: 'silent',
+        listenerPlacement: 'auto',
         permissionPreset: 'observe_only',
       }],
     }));
+    setSelectedProfileKey(uiKey);
   }, [mutate]);
+
+  const addProfileFromTemplate = useCallback((template: VcMeetingConsumerProfileTemplate) => {
+    const uiKey = nextUiKey();
+    mutate(state => {
+      const usedIds = new Set(state.profiles.map(profile => profile.id));
+      let id = template.suggestedProfileId;
+      for (let suffix = 2; usedIds.has(id); suffix += 1) {
+        id = `${template.suggestedProfileId.slice(0, 60)}-${suffix}`;
+      }
+      return {
+        ...state,
+        profiles: [...state.profiles, {
+          uiKey,
+          isNew: true,
+          id,
+          label: template.profileLabel[locale],
+          agentAppId: state.agentOptions[0]?.appId ?? '',
+          instructions: template.instructions[locale],
+          activityTypes: [...template.activityTypes],
+          responseMode: template.responseMode,
+          listenerPlacement: template.listenerPlacement,
+          permissionPreset: template.permissionPreset,
+        }],
+      };
+    });
+    setSelectedTemplateId(null);
+    setSelectedProfileKey(uiKey);
+  }, [locale, mutate]);
 
   const removeProfile = useCallback((uiKey: string) => {
     mutate(state => ({
@@ -366,6 +453,7 @@ export function VcConsumerProfilesSection(props: {
       defaultConsumerIds: state.defaultConsumerIds.filter(id =>
         state.profiles.some(profile => profile.uiKey !== uiKey && profile.id === id)),
     }));
+    setSelectedProfileKey(current => current === uiKey ? null : current);
   }, [mutate]);
 
   if (options.length === 0) return null;
@@ -380,6 +468,23 @@ export function VcConsumerProfilesSection(props: {
       && agent.reliableTurnTerminal
       && agent.managedSideEffectIsolation,
   ) ?? false;
+  const selectedProfileIndex = catalog?.profiles.findIndex(profile => profile.uiKey === selectedProfileKey) ?? -1;
+  const selectedProfile = selectedProfileIndex >= 0 ? catalog?.profiles[selectedProfileIndex] ?? null : null;
+  const selectedTemplate = catalog?.templateCatalog.templates.find(template => template.templateId === selectedTemplateId) ?? null;
+
+  const setProfileDefault = (profile: DraftProfile, enabled: boolean): void => {
+    if (!profile.id) return;
+    mutate(state => {
+      const ids = enabled
+        ? [profile.id]
+        : state.defaultConsumerIds.filter(id => id !== profile.id);
+      return {
+        ...state,
+        defaultMode: ids.length > 0 ? 'agents' : 'listenOnly',
+        defaultConsumerIds: ids,
+      };
+    });
+  };
 
   return (
     <div className="vc-profiles-section">
@@ -462,146 +567,92 @@ export function VcConsumerProfilesSection(props: {
           {catalog.catalogState === 'legacy_or_partial' ? (
             <p className="hint">{tr('settings.vcProfiles.legacyCatalog')}</p>
           ) : null}
-          {catalog.profiles.map((profile, index) => (
-            <div key={profile.uiKey} className="vc-profile-card">
-              <div className="vc-profile-grid">
-                <label className="vc-profile-field">
-                  <span><FieldHead title={tr('settings.vcProfiles.fieldId')} help={tr('settings.vcProfiles.idHelp')} /></span>
-                  <input
-                    type="text"
-                    value={profile.id}
-                    disabled={frozen || !profile.isNew}
-                    placeholder="minutes"
-                    onChange={(e) => {
-                      const nextId = e.target.value;
-                      const oldId = profile.id;
-                      // 新 profile 已被勾为默认后再改 ID：默认列表同步替换旧值，
-                      // 否则提交时 defaultConsumerIds 残留旧 ID 必然 422。
-                      mutate(state => ({
-                        ...state,
-                        profiles: state.profiles.map(candidate =>
-                          candidate.uiKey === profile.uiKey ? { ...candidate, id: nextId } : candidate),
-                        defaultConsumerIds: state.defaultConsumerIds.map(id =>
-                          (id === oldId && oldId ? nextId : id)).filter(id => !!id),
-                      }));
-                    }}
-                  />
-                  {err(`profiles[${index}].id`) ? <em className="vc-profile-err">{err(`profiles[${index}].id`)}</em> : null}
-                </label>
-                <label className="vc-profile-field">
-                  <span><FieldHead title={tr('settings.vcProfiles.fieldLabel')} help={tr('settings.vcProfiles.labelHelp')} /></span>
-                  <input
-                    type="text"
-                    value={profile.label ?? ''}
-                    disabled={frozen}
-                    onChange={e => updateProfile(profile.uiKey, { label: e.target.value || undefined })}
-                  />
-                  {err(`profiles[${index}].label`) ? <em className="vc-profile-err">{err(`profiles[${index}].label`)}</em> : null}
-                </label>
-                <div className="vc-profile-field">
-                  <span><FieldHead title={tr('settings.vcProfiles.fieldAgent')} help={tr('settings.vcProfiles.agentHelp')} /></span>
-                  <DropdownMenu
-                    className="vc-profile-agent-menu"
-                    ariaLabel={tr('settings.vcProfiles.fieldAgent')}
-                    disabled={frozen}
-                    value={profile.agentAppId}
-                    label={agentTriggerLabel(profile.agentAppId)}
-                    options={agentOptionItems}
-                    onChange={value => updateProfile(profile.uiKey, { agentAppId: value })}
-                  />
-                  {err(`profiles[${index}].agentAppId`) ? <em className="vc-profile-err">{err(`profiles[${index}].agentAppId`)}</em> : null}
-                </div>
-                <div className="vc-profile-field">
-                  <span><FieldHead title={tr('settings.vcProfiles.fieldResponseMode')} help={tr('settings.vcProfiles.responseModeHelp')} /></span>
-                  <DropdownMenu
-                    ariaLabel={tr('settings.vcProfiles.fieldResponseMode')}
-                    disabled={frozen}
-                    value={profile.responseMode}
-                    label={profile.responseMode === 'listener_thread'
-                      ? tr('settings.vcProfiles.responseListener')
-                      : tr('settings.vcProfiles.responseSilent')}
-                    options={[
-                      { value: 'silent', label: tr('settings.vcProfiles.responseSilent') },
-                      { value: 'listener_thread', label: tr('settings.vcProfiles.responseListener') },
-                    ]}
-                    onChange={value => updateProfile(profile.uiKey, { responseMode: value as DraftProfile['responseMode'] })}
-                  />
-                  {err(`profiles[${index}].responseMode`) ? <em className="vc-profile-err">{err(`profiles[${index}].responseMode`)}</em> : null}
-                </div>
-                <div className="vc-profile-field">
-                  <span><FieldHead title={tr('settings.vcProfiles.fieldPreset')} help={tr('settings.vcProfiles.presetHelp')} /></span>
-                  <DropdownMenu
-                    ariaLabel={tr('settings.vcProfiles.fieldPreset')}
-                    disabled={frozen}
-                    value={profile.permissionPreset}
-                    label={dropdownLabel(presetOptions(profile), profile.permissionPreset)}
-                    options={presetOptions(profile)}
-                    onChange={value => updateProfile(profile.uiKey, { permissionPreset: value as VcMeetingPermissionPreset })}
-                  />
-                  {err(`profiles[${index}].permissionPreset`) ? <em className="vc-profile-err">{err(`profiles[${index}].permissionPreset`)}</em> : null}
-                </div>
-              </div>
-              <label className="vc-profile-field vc-profile-instructions">
-                <span>
-                  <FieldHead title={tr('settings.vcProfiles.fieldInstructions')} help={tr('settings.vcProfiles.instructionsHelp')} />
-                  <em className="vc-profile-count">{(profile.instructions ?? '').length}/{INSTRUCTIONS_MAX}</em>
-                </span>
-                <textarea
-                  rows={4}
-                  maxLength={INSTRUCTIONS_MAX}
-                  value={profile.instructions ?? ''}
-                  disabled={frozen}
-                  placeholder={tr('settings.vcProfiles.instructionsPlaceholder')}
-                  onChange={e => updateProfile(profile.uiKey, { instructions: e.target.value || undefined })}
-                />
-                {err(`profiles[${index}].instructions`) ? <em className="vc-profile-err">{err(`profiles[${index}].instructions`)}</em> : null}
-              </label>
-              <div className="vc-profile-field">
-                <span><FieldHead title={tr('settings.vcProfiles.fieldActivityTypes')} help={tr('settings.vcProfiles.activityHelp')} /></span>
-                <div className="vc-profile-activity">
-                  {ACTIVITY_TYPES.map(type => {
-                    const checked = profile.activityTypes?.includes(type) ?? false;
-                    return (
-                      <label key={type} className="vc-profile-check">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          disabled={frozen}
-                          onChange={(e) => {
-                            const current = new Set(profile.activityTypes ?? []);
-                            if (e.target.checked) current.add(type);
-                            else current.delete(type);
-                            updateProfile(profile.uiKey, {
-                              activityTypes: current.size > 0 ? [...current] : undefined,
-                            });
-                          }}
-                        />
-                        {tr(`settings.vcProfiles.activity.${type}`)}
-                      </label>
-                    );
-                  })}
-                </div>
-                <em className="vc-profile-hint">{tr('settings.vcProfiles.activityAllHint')}</em>
-                {err(`profiles[${index}].activityTypes`) ? <em className="vc-profile-err">{err(`profiles[${index}].activityTypes`)}</em> : null}
+          <section className="vc-profile-library-section">
+            <div className="vc-profile-list-heading">
+              <div>
+                <strong>{tr('settings.vcProfiles.list.title')}</strong>
+                <p>{tr('settings.vcProfiles.list.help')}</p>
               </div>
               {props.canWrite ? (
-                <button
-                  type="button"
-                  className="vc-profiles-link vc-profile-remove"
-                  disabled={saving || loading}
-                  onClick={() => removeProfile(profile.uiKey)}
-                >
-                  {tr('settings.vcProfiles.remove')}
+                <button type="button" className="vc-profiles-link vc-profile-add" disabled={saving || loading} onClick={addProfile}>
+                  {tr('settings.vcProfiles.add')}
                 </button>
               ) : null}
             </div>
-          ))}
-          {props.canWrite ? (
-            <button type="button" className="vc-profiles-link" disabled={saving || loading} onClick={addProfile}>
-              {tr('settings.vcProfiles.add')}
-            </button>
+            {catalog.profiles.length > 0 ? (
+              <div className="vc-profile-card-grid">
+                {catalog.profiles.map(profile => {
+                  const agent = catalog.agentOptions.find(item => item.appId === profile.agentAppId);
+                  const isDefault = catalog.defaultMode === 'agents' && catalog.defaultConsumerIds.includes(profile.id);
+                  return (
+                    <article
+                      key={profile.uiKey}
+                      className="vc-profile-summary-card"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setSelectedProfileKey(profile.uiKey)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          setSelectedProfileKey(profile.uiKey);
+                        }
+                      }}
+                    >
+                      <div className="vc-profile-summary-top">
+                        <span className="vc-profile-summary-icon" aria-hidden="true">{(profile.label || profile.id || '?').slice(0, 1)}</span>
+                        <div>
+                          <strong>{profile.label || profile.id || tr('settings.vcProfiles.untitled')}</strong>
+                          <code>{profile.id || tr('settings.vcProfiles.newBadge')}</code>
+                        </div>
+                        {profile.isNew ? <em>{tr('settings.vcProfiles.newBadge')}</em> : null}
+                      </div>
+                      <p>{(profile.instructions ?? '').trim() || tr('settings.vcProfiles.noInstructions')}</p>
+                      <div className="vc-profile-summary-meta">
+                        <span>{agent?.label ?? profile.agentAppId}</span>
+                        <span>{profile.responseMode === 'listener_thread' ? tr('settings.vcProfiles.responseListener') : tr('settings.vcProfiles.responseSilent')}</span>
+                      </div>
+                      <label className="vc-profile-default-toggle" onClick={event => event.stopPropagation()}>
+                        <input
+                          type="checkbox"
+                          checked={isDefault}
+                          disabled={frozen || !profile.id}
+                          onChange={event => setProfileDefault(profile, event.currentTarget.checked)}
+                        />
+                        <span>{tr('settings.vcProfiles.setDefault')}</span>
+                      </label>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : <p className="vc-profile-empty">{tr('settings.vcProfiles.list.empty')}</p>}
+          </section>
+          {catalog.templateCatalog.templates.length > 0 ? (
+            <section className="vc-profile-template-catalog">
+              <div className="vc-profile-template-heading">
+                <div>
+                  <strong>{tr('settings.vcProfiles.templates.title')}</strong>
+                  <p>{tr('settings.vcProfiles.templates.help')}</p>
+                </div>
+                <span>{tr('settings.vcProfiles.templates.builtinBadge')}</span>
+              </div>
+              <div className="vc-profile-template-grid">
+                {catalog.templateCatalog.templates.map(template => (
+                  <button
+                    type="button"
+                    key={`${template.templateId}@${template.version}`}
+                    className="vc-profile-template-card"
+                    onClick={() => setSelectedTemplateId(template.templateId)}
+                  >
+                    <span aria-hidden="true">✦</span>
+                    <strong>{template.title[locale]}</strong>
+                    <p>{template.description[locale]}</p>
+                    <em>{tr('settings.vcProfiles.viewDetails')} →</em>
+                  </button>
+                ))}
+              </div>
+            </section>
           ) : null}
-          <div className="settings-field-row">
+          <div className="settings-field-row vc-profile-default-mode-row">
             <FieldTitle help={tr('settings.vcProfiles.defaultModeHelp')}>{tr('settings.vcProfiles.defaultMode')}</FieldTitle>
             <DropdownMenu
               className="settings-field-menu"
@@ -621,36 +672,8 @@ export function VcConsumerProfilesSection(props: {
               }))}
             />
           </div>
-          {catalog.defaultMode === 'agents' ? (
-            <div className="vc-profile-field">
-              <span>{tr('settings.vcProfiles.defaultConsumers')}</span>
-              <div className="vc-profile-activity">
-                {catalog.profiles.filter(profile => profile.id).map((profile) => {
-                  const checked = catalog.defaultConsumerIds.includes(profile.id);
-                  return (
-                    <label key={profile.uiKey} className="vc-profile-check">
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        disabled={frozen}
-                        onChange={(e) => {
-                          mutate(state => ({
-                            ...state,
-                            defaultConsumerIds: e.target.checked
-                              ? [...state.defaultConsumerIds, profile.id]
-                              : state.defaultConsumerIds.filter(id => id !== profile.id),
-                          }));
-                        }}
-                      />
-                      {profile.label || profile.id}
-                    </label>
-                  );
-                })}
-              </div>
-              {err('defaultConsumerIds') ? <em className="vc-profile-err">{err('defaultConsumerIds')}</em> : null}
-              {err('defaultMode') ? <em className="vc-profile-err">{err('defaultMode')}</em> : null}
-            </div>
-          ) : null}
+          {err('defaultConsumerIds') ? <em className="vc-profile-err">{err('defaultConsumerIds')}</em> : null}
+          {err('defaultMode') ? <em className="vc-profile-err">{err('defaultMode')}</em> : null}
           {props.canWrite ? (
             <div className="vc-profiles-actions">
               <button
@@ -665,8 +688,234 @@ export function VcConsumerProfilesSection(props: {
               {dirty && !saving ? <span className="vc-profile-hint">{tr('settings.vcProfiles.unsaved')}</span> : null}
             </div>
           ) : null}
+          {selectedProfile ? (
+            <ProfileEditorDialog
+              profile={selectedProfile}
+              index={selectedProfileIndex}
+              frozen={frozen}
+              canWrite={props.canWrite}
+              agentOptions={agentOptionItems}
+              agentLabel={agentTriggerLabel(selectedProfile.agentAppId)}
+              presetOptions={presetOptions(selectedProfile)}
+              error={err}
+              onClose={() => setSelectedProfileKey(null)}
+              onUpdate={patch => updateProfile(selectedProfile.uiKey, patch)}
+              onIdChange={(nextId) => {
+                const oldId = selectedProfile.id;
+                mutate(state => ({
+                  ...state,
+                  profiles: state.profiles.map(candidate => candidate.uiKey === selectedProfile.uiKey
+                    ? { ...candidate, id: nextId }
+                    : candidate),
+                  defaultConsumerIds: state.defaultConsumerIds.map(id =>
+                    (id === oldId && oldId ? nextId : id)).filter(Boolean),
+                }));
+              }}
+              onRemove={() => removeProfile(selectedProfile.uiKey)}
+            />
+          ) : null}
+          {selectedTemplate ? (
+            <TemplateDetailsDialog
+              template={selectedTemplate}
+              locale={locale}
+              disabled={frozen || catalog.agentOptions.length === 0}
+              onClose={() => setSelectedTemplateId(null)}
+              onUse={() => addProfileFromTemplate(selectedTemplate)}
+            />
+          ) : null}
         </>
       ) : null}
     </div>
+  );
+}
+
+function ProfileEditorDialog(props: {
+  profile: DraftProfile;
+  index: number;
+  frozen: boolean;
+  canWrite: boolean;
+  agentOptions: Array<{ value: string; label: ReactNode }>;
+  agentLabel: ReactNode;
+  presetOptions: Array<{ value: VcMeetingPermissionPreset; label: string }>;
+  error(path: string): string | undefined;
+  onClose(): void;
+  onUpdate(patch: Partial<DraftProfile>): void;
+  onIdChange(value: string): void;
+  onRemove(): void;
+}): JSX.Element {
+  const tr = useT();
+  const { profile, index } = props;
+  return (
+    <VcProfileDialog
+      className="vc-profile-editor-dialog"
+      eyebrow={tr('settings.vcProfiles.list.title')}
+      title={profile.label || profile.id || tr('settings.vcProfiles.untitled')}
+      onClose={props.onClose}
+    >
+      <div className="vc-profile-grid">
+        <label className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldId')} help={tr('settings.vcProfiles.idHelp')} /></span>
+          <input
+            type="text"
+            value={profile.id}
+            disabled={props.frozen || !profile.isNew}
+            placeholder="minutes"
+            onChange={event => props.onIdChange(event.currentTarget.value)}
+          />
+          {props.error(`profiles[${index}].id`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].id`)}</em> : null}
+        </label>
+        <label className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldLabel')} help={tr('settings.vcProfiles.labelHelp')} /></span>
+          <input
+            type="text"
+            value={profile.label ?? ''}
+            disabled={props.frozen}
+            onChange={event => props.onUpdate({ label: event.currentTarget.value || undefined })}
+          />
+          {props.error(`profiles[${index}].label`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].label`)}</em> : null}
+        </label>
+        <div className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldAgent')} help={tr('settings.vcProfiles.agentHelp')} /></span>
+          <DropdownMenu
+            className="vc-profile-agent-menu"
+            ariaLabel={tr('settings.vcProfiles.fieldAgent')}
+            disabled={props.frozen}
+            value={profile.agentAppId}
+            label={props.agentLabel}
+            options={props.agentOptions}
+            onChange={value => props.onUpdate({ agentAppId: value })}
+          />
+          {props.error(`profiles[${index}].agentAppId`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].agentAppId`)}</em> : null}
+        </div>
+        <div className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldResponseMode')} help={tr('settings.vcProfiles.responseModeHelp')} /></span>
+          <DropdownMenu
+            ariaLabel={tr('settings.vcProfiles.fieldResponseMode')}
+            disabled={props.frozen}
+            value={profile.responseMode}
+            label={profile.responseMode === 'listener_thread' ? tr('settings.vcProfiles.responseListener') : tr('settings.vcProfiles.responseSilent')}
+            options={[
+              { value: 'silent', label: tr('settings.vcProfiles.responseSilent') },
+              { value: 'listener_thread', label: tr('settings.vcProfiles.responseListener') },
+            ]}
+            onChange={value => props.onUpdate({ responseMode: value as DraftProfile['responseMode'] })}
+          />
+          {props.error(`profiles[${index}].responseMode`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].responseMode`)}</em> : null}
+        </div>
+        <div className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldListenerPlacement')} help={tr('settings.vcProfiles.listenerPlacementHelp')} /></span>
+          <DropdownMenu
+            ariaLabel={tr('settings.vcProfiles.fieldListenerPlacement')}
+            disabled={props.frozen || profile.responseMode === 'silent'}
+            value={profile.listenerPlacement ?? 'auto'}
+            label={tr(`settings.vcProfiles.listenerPlacement.${profile.listenerPlacement ?? 'auto'}`)}
+            options={['auto', 'chat', 'topic'].map(value => ({ value, label: tr(`settings.vcProfiles.listenerPlacement.${value}`) }))}
+            onChange={value => props.onUpdate({ listenerPlacement: value as VcMeetingConsumerProfileDto['listenerPlacement'] })}
+          />
+          {props.error(`profiles[${index}].listenerPlacement`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].listenerPlacement`)}</em> : null}
+        </div>
+        <div className="vc-profile-field">
+          <span><FieldHead title={tr('settings.vcProfiles.fieldPreset')} help={tr('settings.vcProfiles.presetHelp')} /></span>
+          <DropdownMenu
+            ariaLabel={tr('settings.vcProfiles.fieldPreset')}
+            disabled={props.frozen}
+            value={profile.permissionPreset}
+            label={dropdownLabel(props.presetOptions, profile.permissionPreset)}
+            options={props.presetOptions}
+            onChange={value => props.onUpdate({ permissionPreset: value as VcMeetingPermissionPreset })}
+          />
+          {props.error(`profiles[${index}].permissionPreset`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].permissionPreset`)}</em> : null}
+        </div>
+      </div>
+      <label className="vc-profile-field vc-profile-instructions">
+        <span>
+          <FieldHead title={tr('settings.vcProfiles.fieldInstructions')} help={tr('settings.vcProfiles.instructionsHelp')} />
+          <em className="vc-profile-count">{(profile.instructions ?? '').length}/{INSTRUCTIONS_MAX}</em>
+        </span>
+        <textarea
+          rows={7}
+          maxLength={INSTRUCTIONS_MAX}
+          value={profile.instructions ?? ''}
+          disabled={props.frozen}
+          placeholder={tr('settings.vcProfiles.instructionsPlaceholder')}
+          onChange={event => props.onUpdate({ instructions: event.currentTarget.value || undefined })}
+        />
+        {props.error(`profiles[${index}].instructions`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].instructions`)}</em> : null}
+      </label>
+      <div className="vc-profile-field">
+        <span><FieldHead title={tr('settings.vcProfiles.fieldActivityTypes')} help={tr('settings.vcProfiles.activityHelp')} /></span>
+        <div className="vc-profile-activity">
+          {ACTIVITY_TYPES.map(type => {
+            const checked = profile.activityTypes?.includes(type) ?? false;
+            return (
+              <label key={type} className="vc-profile-check">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={props.frozen}
+                  onChange={(event) => {
+                    const current = new Set(profile.activityTypes ?? []);
+                    if (event.currentTarget.checked) current.add(type);
+                    else current.delete(type);
+                    props.onUpdate({ activityTypes: current.size > 0 ? [...current] : undefined });
+                  }}
+                />
+                {tr(`settings.vcProfiles.activity.${type}`)}
+              </label>
+            );
+          })}
+        </div>
+        <em className="vc-profile-hint">{tr('settings.vcProfiles.activityAllHint')}</em>
+        {props.error(`profiles[${index}].activityTypes`) ? <em className="vc-profile-err">{props.error(`profiles[${index}].activityTypes`)}</em> : null}
+      </div>
+      {props.canWrite ? (
+        <footer className="vc-profile-dialog-actions">
+          <button type="button" className="vc-profiles-link vc-profile-remove" disabled={props.frozen} onClick={props.onRemove}>
+            {tr('settings.vcProfiles.remove')}
+          </button>
+          <button type="button" className="vc-profile-dialog-done" onClick={props.onClose}>{tr('settings.vcProfiles.done')}</button>
+        </footer>
+      ) : null}
+    </VcProfileDialog>
+  );
+}
+
+function TemplateDetailsDialog(props: {
+  template: VcMeetingConsumerProfileTemplate;
+  locale: 'zh' | 'en';
+  disabled: boolean;
+  onClose(): void;
+  onUse(): void;
+}): JSX.Element {
+  const tr = useT();
+  const template = props.template;
+  return (
+    <VcProfileDialog
+      className="vc-profile-template-dialog"
+      eyebrow={tr('settings.vcProfiles.templates.title')}
+      title={template.title[props.locale]}
+      onClose={props.onClose}
+    >
+      <p className="vc-profile-template-description">{template.description[props.locale]}</p>
+      <div className="vc-profile-template-facts">
+        <div><span>{tr('settings.vcProfiles.fieldResponseMode')}</span><strong>{tr(template.responseMode === 'listener_thread' ? 'settings.vcProfiles.responseListener' : 'settings.vcProfiles.responseSilent')}</strong></div>
+        <div><span>{tr('settings.vcProfiles.fieldListenerPlacement')}</span><strong>{tr(`settings.vcProfiles.listenerPlacement.${template.listenerPlacement}`)}</strong></div>
+        <div><span>{tr('settings.vcProfiles.fieldPreset')}</span><strong>{tr(`settings.vcProfiles.preset.${template.permissionPreset}`)}</strong></div>
+      </div>
+      <section className="vc-profile-template-prompt">
+        <strong>{tr('settings.vcProfiles.fieldInstructions')}</strong>
+        <p>{template.instructions[props.locale]}</p>
+      </section>
+      <section className="vc-profile-template-events">
+        <strong>{tr('settings.vcProfiles.fieldActivityTypes')}</strong>
+        <div>{template.activityTypes.map(type => <span key={type}>{tr(`settings.vcProfiles.activity.${type}`)}</span>)}</div>
+      </section>
+      <footer className="vc-profile-dialog-actions">
+        <button type="button" className="vc-profile-dialog-secondary" onClick={props.onClose}>{tr('settings.vcProfiles.close')}</button>
+        <button type="button" className="vc-profile-template-use" disabled={props.disabled} onClick={props.onUse}>
+          {tr('settings.vcProfiles.templates.use')}
+        </button>
+      </footer>
+    </VcProfileDialog>
   );
 }

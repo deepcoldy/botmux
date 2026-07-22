@@ -26,6 +26,10 @@ import {
   type VcMeetingMemberKey,
 } from './vc-meeting-delivery-store.js';
 import { normalizeVcMeetingProfileInstructions } from './vc-meeting-profile-instructions.js';
+import {
+  VC_MEETING_LISTENER_OUTPUT_CONTRACT,
+  vcMeetingListenerOutputProtocolForInstructionVersion,
+} from './vc-meeting-listener-output-protocol.js';
 
 const MAX_AUTOMATIC_DISPATCH_ATTEMPTS = 3;
 
@@ -180,6 +184,7 @@ export async function registerVcMeetingMember(
     joinedAtIngestSeq: request.member.joinedAtIngestSeq,
     receiverSessionId,
     outputChatId: request.outputRoute.chatId,
+    outputPlacement: request.outputRoute.placement,
   });
 
   // Fencing a stream off must never depend on being able to start/restore its
@@ -281,6 +286,12 @@ export function buildVcMeetingDeliveryTriggerRequest(
   const trustedRoleSection = normalizedInstructions.instructions === undefined
     ? ''
     : `\n\n<botmux_role_instructions>\n${normalizedInstructions.instructions}\n</botmux_role_instructions>`;
+  const listenerOutputProtocol = vcMeetingListenerOutputProtocolForInstructionVersion(
+    request.instructionVersion,
+  );
+  const listenerOutputContract = silent || listenerOutputProtocol === 'plain'
+    ? ''
+    : `\n\n${VC_MEETING_LISTENER_OUTPUT_CONTRACT}`;
   return {
     source: {
       type: 'vc_meeting',
@@ -293,7 +304,7 @@ export function buildVcMeetingDeliveryTriggerRequest(
       chatId: request.target.chatId,
       sessionId: request.target.sessionId,
     },
-    instruction: fixedInstruction + trustedRoleSection,
+    instruction: fixedInstruction + trustedRoleSection + listenerOutputContract,
     envelope: {
       format: 'botmux.vc-meeting-delivery.v1',
       sourceName: 'VC meeting stream',
@@ -321,6 +332,7 @@ function validateDeliveryBinding(
 ): VcMeetingReceiverResult | {
   binding: VcMeetingReceiverSessionBinding;
   responseMode: 'silent' | 'listener_thread';
+  outputPlacement: 'auto' | 'chat' | 'topic';
   instructions?: string;
 } {
   if (request.member.agentAppId !== deps.selfAppId) {
@@ -363,6 +375,7 @@ function validateDeliveryBinding(
   return {
     binding,
     responseMode: projection.responseMode,
+    outputPlacement: projection.outputPlacement ?? 'auto',
     ...(projection.instructions !== undefined ? { instructions: projection.instructions } : {}),
   };
 }
@@ -459,6 +472,10 @@ export async function receiveVcMeetingDelivery(
     toSeq: request.stream.toSeq,
     final: request.stream.final,
     responseMode: binding.responseMode,
+    outputPlacement: binding.outputPlacement,
+    listenerOutputProtocol: vcMeetingListenerOutputProtocolForInstructionVersion(
+      request.instructionVersion,
+    ),
     receiverBootId: deps.receiverBootId,
   });
 

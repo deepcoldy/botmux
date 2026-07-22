@@ -90,6 +90,12 @@ import {
 } from '../services/vc-meeting-im-reply.js';
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
+import {
+  getVcMeetingListenerTopicRoot,
+  recordVcMeetingListenerTopicRoot,
+  type VcMeetingListenerTopicKey,
+} from '../services/vc-meeting-listener-topic-store.js';
+import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -134,6 +140,10 @@ export interface WorkerSessionReplyOptions {
    * share a visible chat anchor with ordinary sessions, so the anchor alone
    * cannot identify the transcript/lifecycle owner. */
   sourceSessionId?: string;
+  /** Automatic VC delivery presentation. Explicit human IM replies omit this
+   * and continue to follow their quote/thread context. */
+  placement?: 'auto' | 'chat' | 'topic';
+  meetingTopicKey?: VcMeetingListenerTopicKey;
 }
 
 export interface WorkerPoolCallbacks {
@@ -3655,12 +3665,52 @@ function deliverFinalOutput(
         && managedDecision.kind === 'listener_thread'
         ? managedDecision.meetingOwner
         : undefined;
+      const listenerOutputPlacement = managedDecision?.ok
+        && managedDecision.kind === 'listener_thread'
+        ? managedDecision.outputPlacement
+        : 'auto';
+      const listenerOutputProtocol = managedDecision?.ok
+        && managedDecision.kind === 'listener_thread'
+        ? managedDecision.listenerOutputProtocol
+        : 'plain';
+      const meetingTopicKey: VcMeetingListenerTopicKey | undefined = !imOrigin
+        && listenerOutputOwner
+        && listenerOutputPlacement === 'topic'
+        ? {
+            ...listenerOutputOwner,
+            targetChatId: ds.chatId,
+          }
+        : undefined;
+      let visibleAssistantText = msg.content;
+      if (!imOrigin
+        && listenerOutputOwner
+        && msg.dispatchAttempt !== undefined
+        && listenerOutputProtocol === 'decision_v1') {
+        const controlledOutput = parseVcMeetingListenerOutput(msg.content);
+        if (!controlledOutput.ok) {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.error(
+            `[${t}] VC listener output suppressed: invalid control envelope `
+            + `(${controlledOutput.reason}) turn=${msg.turnId.substring(0, 8)}`,
+          );
+          return;
+        }
+        if (controlledOutput.decision === 'skip') {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          logger.info(
+            `[${t}] VC listener output skipped by agent decision `
+            + `(turn ${msg.turnId.substring(0, 8)})`,
+          );
+          return;
+        }
+        visibleAssistantText = controlledOutput.content;
+      }
       // Meeting-derived text is untrusted card markdown. A model-authored
       // native <at> tag and the ordinary owner footer would both create a
       // second addressing side effect outside the action ledger.
       const safeAssistantText = managedReceiver
-        ? neutralizeLarkAtTags(msg.content)
-        : msg.content;
+        ? neutralizeLarkAtTags(visibleAssistantText)
+        : visibleAssistantText;
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
@@ -3695,6 +3745,9 @@ function deliverFinalOutput(
       const proposedOutput = {
         targetChatId: ds.chatId,
         ...(imOrigin ? { quoteTargetId: imOrigin.larkMessageId } : {}),
+        ...(!imOrigin && listenerOutputOwner
+          ? { placement: listenerOutputPlacement }
+          : {}),
         msgType: 'interactive',
         content: cardJson,
       };
@@ -3728,6 +3781,19 @@ function deliverFinalOutput(
       }
       const recordPrimaryOutput = (messageId: string): void => {
         if (!listenerOutputOwner) return;
+        if (meetingTopicKey
+          && !getVcMeetingListenerTopicRoot(config.session.dataDir, meetingTopicKey)) {
+          const topic = recordVcMeetingListenerTopicRoot(
+            config.session.dataDir,
+            meetingTopicKey,
+            messageId,
+          );
+          if (!topic.ok) {
+            logger.error(
+              `[${t}] VC listener topic anchor rejected message=${messageId} reason=${topic.reason}`,
+            );
+          }
+        }
         try {
           const recorded = recordVcMeetingListenerMessage(config.session.dataDir, {
             ...listenerOutputOwner,
@@ -3775,6 +3841,12 @@ function deliverFinalOutput(
               // provider call). Never fan meeting content out to user hooks,
               // including the first attempt and crash reconciliation replay.
               suppressHook: true,
+              ...(!imOrigin && listenerOutputOwner
+                ? {
+                    placement: canonicalOutput.placement ?? 'auto',
+                    ...(meetingTopicKey ? { meetingTopicKey } : {}),
+                  }
+                : {}),
             }
           : undefined,
       );

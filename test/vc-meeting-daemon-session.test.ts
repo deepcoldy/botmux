@@ -107,6 +107,17 @@ vi.mock('../src/services/vc-meeting-consumer-isolation.js', async (importOrigina
   };
 });
 
+vi.mock('../src/core/daemon-ipc-auth.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/daemon-ipc-auth.js')>();
+  return {
+    ...actual,
+    // Cross-daemon routing is exercised through a mocked loopback fetch. Keep
+    // the production HMAC envelope implementation, but provide the host-only
+    // secret explicitly so the test never depends on a developer's HOME.
+    loadDaemonIpcSecret: () => 'vc-meeting-daemon-test-secret',
+  };
+});
+
 vi.mock('@larksuiteoapi/node-sdk', () => {
   class FakeClient {
     opts: Record<string, unknown>;
@@ -2577,6 +2588,94 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(cardJson).toContain('agent：meeting-notes-bot');
     expect(cardJson).not.toContain('(claude-code)');
     expect(cardJson).not.toContain('Agent Claude');
+  });
+
+  it('freezes optional per-meeting context into newly activated profiles without changing the preset', async () => {
+    registerConsumerAgentBot(AGENT_APP_ID, { name: 'Facilitator Agent' });
+    const presetInstructions = '按既定职责推进会议，并在每个环节结束时总结。';
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      name: 'Meeting Bot',
+      cliId: 'claude-code',
+      workingDir: process.cwd(),
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          selectionTimeoutMs: 20_000,
+          consumerProfiles: [{
+            id: 'facilitator',
+            agentAppId: AGENT_APP_ID,
+            label: '会议主持',
+            role: 'facilitator',
+            instructions: presetInstructions,
+            responseMode: 'silent',
+            capabilities: ['meeting.read'],
+          }],
+        },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_activation_context',
+      meeting: { id: 'm_activation_context', meetingNo: '292929292', topic: 'Agenda review' },
+      raw: { event: { meeting: { id: 'm_activation_context', meeting_no: '292929292' } } },
+    });
+
+    const initialCard = JSON.parse(sentMessages.at(-1)!.content);
+    const staged = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: { value: interactiveCardActionValue(consumerProfileToggleButton(initialCard, 'facilitator')) },
+    }, APP_ID);
+    const confirm = interactiveCardActionValue(interactiveCardButton(staged, '确认'));
+    const tooLong = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: {
+        value: confirm,
+        form_value: { vc_meeting_activation_context: 'x'.repeat(2_001) },
+      },
+    }, APP_ID);
+    expect(tooLong.toast.content).toContain('不能超过 2000 个字符');
+    expect(addBotToChatCalls).toHaveLength(0);
+
+    const meetingContext = '议程：\n1. 背景与目标\n2. 方案讨论\n3. 明确负责人和截止时间';
+    const patchIndex = patchedMessages.length;
+    const processing = await __vcMeetingAgentTest.handleCardAction({
+      operator: { open_id: TARGET_OPEN_ID },
+      action: {
+        value: confirm,
+        form_value: { vc_meeting_activation_context: meetingContext },
+      },
+    }, APP_ID);
+    expect(processing.header.title.content).toBe('会议多 agent 设置中');
+    expect((await waitForPatchedCardTitle('会议 agents 已启用', patchIndex))?.header?.title?.content)
+      .toBe('会议 agents 已启用');
+
+    const expectedInstructions = [
+      presetInstructions,
+      '',
+      '本次会议补充说明（仅适用于本次会议，不修改角色预设）：',
+      meetingContext,
+    ].join('\n');
+    const runtime = runtimeStoreRecords.find(record => record.meeting.id === 'm_joined_292929292');
+    expect(runtime?.selectedAgents).toEqual([
+      expect.objectContaining({ profileId: 'facilitator', instructions: expectedInstructions }),
+    ]);
+    expect(getBot(APP_ID).config.vcMeetingAgent?.meetingConsumer?.consumerProfiles?.[0]?.instructions)
+      .toBe(presetInstructions);
+    expect(listVcMeetingHubMembers(config.session.dataDir, {
+      listenerAppId: APP_ID,
+      meetingId: 'm_joined_292929292',
+    })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ memberId: 'facilitator', instructions: expectedInstructions }),
+    ]));
   });
 
   it('activates multiple consumer profiles with independent durable memberships', async () => {
