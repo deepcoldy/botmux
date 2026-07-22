@@ -65,4 +65,12 @@ export class InflightInputTracker {
     this.unacked.length = 0;
     return this.carryOver.splice(0);
   }
+
+  /** True if no unacked inputs are currently in flight. Used by the
+   *  StuckDetector to decide whether a stalled turn has a real input waiting
+   *  for completion — covers both durable and non-durable (ordinary IM)
+   *  turns, since onWrite() tracks both. */
+  isEmpty(): boolean {
+    return this.unacked.length === 0;
+  }
 }

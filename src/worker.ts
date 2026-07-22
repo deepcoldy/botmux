@@ -3793,19 +3793,21 @@ function startStuckDetector(): void {
   stopStuckDetector();
   stuckDetector = new StuckDetector(sd.timeoutMs, {
     isActuallyStuck: () => {
-      // Only warn if there are genuinely unconsumed inputs AND the CLI is not
-      // at its idle prompt AND no TUI prompt card is already posted. A long
-      // legitimate turn (model thinking, tool calls) must not trigger this.
+      // Only warn if the CLI is not at its idle prompt AND no TUI prompt card
+      // is already posted. A long legitimate turn (model thinking, tool calls)
+      // must not trigger this.
       if (isPromptReady) return false;
       if (tuiPromptBlocking) return false;
-      // InflightInputTracker doesn't expose its queue length; peek via the
-      // durable-turn gate which is set when a tracked write is in flight.
-      if (!durableTurnInFlight && inflightInputsEmpty()) return false;
       // Anti-false-positive: if the PTY produced output recently the CLI is
       // still actively working (model streaming, tool output, spinner) — not
       // stuck. Require quiescence before firing.
       const sincePty = Date.now() - lastPtyActivityAtMs;
       if (sincePty < 15_000) return false;
+      // Do NOT gate on durableTurnInFlight: the original hook-review incident
+      // ran on a non-durable (ordinary IM) turn, and a durable turn's 20s
+      // submit-recheck failure clears durableTurnInFlight before the 45s
+      // detector fires. The PTY-quiescence + !isPromptReady combination is
+      // sufficient to detect a genuinely stalled turn.
       return true;
     },
     onStuck: (elapsedMs, matchedLabel) => {
@@ -3829,11 +3831,12 @@ function stopStuckDetector(): void {
   stuckDetector = null;
 }
 
-/** InflightInputTracker doesn't expose queue length; infer emptiness from the
- *  durable-turn gate. Non-durable writes are rare (adopt/raw input) and the
- *  detector is a best-effort fallback anyway. */
+/** True if no unacked inputs are currently in flight. Uses the tracker's
+ *  real queue length so both durable and non-durable (ordinary IM) turns
+ *  are covered — the original hook-review incident ran on a non-durable
+ *  turn, so gating on durableTurnInFlight alone would never fire. */
 function inflightInputsEmpty(): boolean {
-  return !durableTurnInFlight;
+  return inflightInputs.isEmpty();
 }
 
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
