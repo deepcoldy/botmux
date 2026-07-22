@@ -13,6 +13,7 @@ import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+import { readProcessStartIdentity } from './session-marker.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -580,6 +581,14 @@ function getPaneDimensions(tmuxTarget: string): { cols: number; rows: number } |
 
 type HerdrJsonResult = { ok: true; value: any | undefined } | { ok: false };
 
+// PID lookup is useful metadata, not a reason for `/adopt` discovery to wedge
+// the daemon. A broken Herdr server used to cost 5 seconds per matching pane.
+// Keep each probe short and cap the whole synchronous discovery pass; panes
+// beyond the budget remain adoptable in observation-only mode (without a PID
+// marker) instead of blocking every command handled by this daemon process.
+const HERDR_PROCESS_INFO_TIMEOUT_MS = 1_000;
+const HERDR_PROCESS_INFO_TOTAL_BUDGET_MS = 1_500;
+
 function tryHerdrJson(args: string[], opts?: { timeout?: number }): HerdrJsonResult {
   try {
     const out = execFileSync('herdr', args, {
@@ -630,11 +639,25 @@ function herdrProcessPid(process: any): number | undefined {
  * process group are reported (for example node → native codex). */
 function herdrCliPid(raw: any, cliId: CliId): number | undefined {
   const processes = herdrForegroundProcesses(raw).filter(p => herdrProcessPid(p) !== undefined);
+  // Prefer a process whose actual executable name is the CLI. Herdr can report
+  // a launcher before its native child; checking argv0 in that same first pass
+  // would incorrectly select `node argv0=codex` before a later `name=codex`.
   for (const process of processes) {
-    for (const value of [process?.argv0, process?.name]) {
-      if (typeof value === 'string' && cliIdForComm(basename(value), cliId) === cliId) {
-        return herdrProcessPid(process);
-      }
+    if (
+      typeof process?.name === 'string'
+      && cliIdForComm(basename(process.name), cliId) === cliId
+    ) {
+      return herdrProcessPid(process);
+    }
+  }
+  // Some Node CLIs deliberately set argv0 while the executable name remains
+  // `node` (live Herdr Pi has appeared in both forms across 0.7.x).
+  for (const process of processes) {
+    if (
+      typeof process?.argv0 === 'string'
+      && cliIdForComm(basename(process.argv0), cliId) === cliId
+    ) {
+      return herdrProcessPid(process);
     }
   }
   for (const process of processes) {
@@ -658,6 +681,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
     return name && s?.running === true && !name.startsWith('bmx-');
   });
   const results: AdoptableSession[] = [];
+  const processInfoDeadline = Date.now() + HERDR_PROCESS_INFO_TOTAL_BUDGET_MS;
   for (const session of sessions) {
     const sessionName = session.name as string;
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
@@ -670,10 +694,13 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const terminalId = typeof agent?.terminal_id === 'string' ? agent.terminal_id : undefined;
       const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
-      const processInfo = herdrJson([
-        '--session', sessionName,
-        'pane', 'process-info', '--pane', paneId,
-      ]);
+      const remainingProcessInfoBudget = processInfoDeadline - Date.now();
+      const processInfo = remainingProcessInfoBudget > 0
+        ? herdrJson([
+            '--session', sessionName,
+            'pane', 'process-info', '--pane', paneId,
+          ], { timeout: Math.max(1, Math.min(HERDR_PROCESS_INFO_TIMEOUT_MS, remainingProcessInfoBudget)) })
+        : undefined;
       const cliPid = herdrCliPid(processInfo, cliId);
       const claudeMeta = cliId === 'claude-code' ? findUniqueClaudeSessionByCwd(cwd) : undefined;
       results.push({
@@ -871,11 +898,39 @@ export function validateTmuxAdoptTarget(tmuxTarget: string, expectedPid: number,
 
 export type AdoptValidationResult = 'alive' | 'missing' | 'unknown';
 
-export function validateHerdrAdoptTarget(sessionName: string | undefined, paneId: string | undefined): AdoptValidationResult {
+export function validateHerdrAdoptTarget(
+  sessionName: string | undefined,
+  paneId: string | undefined,
+  expectedPid?: number,
+  cliId?: CliId,
+  expectedProcStart?: string,
+): AdoptValidationResult {
   if (!sessionName || !paneId) return 'missing';
   const rawAgents = tryHerdrJson(['--session', sessionName, 'agent', 'list']);
   if (!rawAgents.ok) return 'unknown';
-  return extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId) ? 'alive' : 'missing';
+  if (!extractHerdrAgents(rawAgents.value).some((agent: any) => agent?.pane_id === paneId)) return 'missing';
+  if (!expectedPid) return 'alive';
+
+  // An agent row only proves the pane exists. Re-check the foreground CLI so a
+  // daemon restore cannot bind a persisted PID that exited and was reused by
+  // an unrelated process while the Herdr pane remained alive.
+  const processInfo = tryHerdrJson([
+    '--session', sessionName,
+    'pane', 'process-info', '--pane', paneId,
+  ], { timeout: HERDR_PROCESS_INFO_TIMEOUT_MS });
+  if (!processInfo.ok) return 'unknown';
+  const livePid = cliId
+    ? herdrCliPid(processInfo.value, cliId)
+    : herdrForegroundProcesses(processInfo.value)
+      .map(herdrProcessPid)
+      .find(pid => pid === expectedPid);
+  if (livePid !== expectedPid) return 'missing';
+  if (expectedProcStart) {
+    const liveProcStart = readProcessStartIdentity(expectedPid);
+    if (!liveProcStart) return 'unknown';
+    if (liveProcStart !== expectedProcStart) return 'missing';
+  }
+  return 'alive';
 }
 
 export function validateAdoptTarget(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): boolean {
@@ -883,12 +938,30 @@ export function validateAdoptTarget(target: AdoptableSession | NonNullable<impor
 }
 
 export function validateAdoptTargetState(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): AdoptValidationResult {
-  if (target.source === 'herdr') return validateHerdrAdoptTarget(target.herdrSessionName, target.herdrPaneId ?? target.herdrTarget);
+  if (target.source === 'herdr') {
+    const pid = (target as { cliPid?: number }).cliPid
+      ?? (target as { originalCliPid?: number }).originalCliPid;
+    const procStart = 'originalCliProcStart' in target ? target.originalCliProcStart : undefined;
+    return validateHerdrAdoptTarget(
+      target.herdrSessionName,
+      target.herdrPaneId ?? target.herdrTarget,
+      pid,
+      target.cliId,
+      procStart,
+    );
+  }
   const pid = 'originalCliPid' in target
     ? target.originalCliPid
     : ('cliPid' in target ? target.cliPid : undefined);
   if (!target.tmuxTarget || !pid) return 'missing';
-  return validateTmuxAdoptTarget(target.tmuxTarget, pid, target.cliId) ? 'alive' : 'missing';
+  if (!validateTmuxAdoptTarget(target.tmuxTarget, pid, target.cliId)) return 'missing';
+  const procStart = 'originalCliProcStart' in target ? target.originalCliProcStart : undefined;
+  if (procStart) {
+    const liveProcStart = readProcessStartIdentity(pid);
+    if (!liveProcStart) return 'unknown';
+    if (liveProcStart !== procStart) return 'missing';
+  }
+  return 'alive';
 }
 
 // 仅供单测使用 —— 暴露内部 helper，方便覆盖跨平台 (Linux /proc vs macOS ps/lsof/pgrep)

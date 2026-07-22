@@ -150,6 +150,7 @@ vi.mock('../src/services/session-store.js', () => ({
   })),
   updateSession: vi.fn(),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
+  findActiveAdoptSessions: vi.fn(() => []),
 }));
 
 vi.mock('../src/services/schedule-store.js', () => ({
@@ -1029,6 +1030,7 @@ describe('handleCommand', () => {
     vi.mocked(resolveDocFile).mockResolvedValue({ fileToken: 'doc_token_12345678901234567890', fileType: 'docx' });
     vi.mocked(getDocSubscription).mockReturnValue(null);
     vi.mocked(putDocSubscription).mockReturnValue({});
+    vi.mocked(sessionStore.findActiveAdoptSessions).mockReturnValue([]);
     // NOTE: vi.clearAllMocks() only clears call history — it does NOT undo
     // mockReturnValue/mockImplementation overrides set inside individual
     // tests (verified on vitest 4; resetAllMocks is what restores factory
@@ -2915,6 +2917,89 @@ describe('handleCommand', () => {
       expect(ds.session.adoptedFrom).toEqual(ds.adoptedFrom);
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(forkAdoptWorker).toHaveBeenCalledWith(ds);
+    });
+
+    it('refuses to adopt a Herdr pane already owned by another active topic', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const other = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'other-session',
+          rootMessageId: 'om_other',
+          adoptedFrom: {
+            source: 'herdr',
+            herdrSessionName: 'work',
+            herdrPaneId: 'w3:p3',
+            originalCliPid: 16493,
+            cliId: 'pi',
+            cwd: '/home/testuser/project-pi',
+          },
+        }),
+        adoptedFrom: {
+          source: 'herdr',
+          herdrSessionName: 'work',
+          herdrPaneId: 'w3:p3',
+          originalCliPid: 16493,
+          cliId: 'pi',
+          cwd: '/home/testuser/project-pi',
+        },
+      });
+      deps.activeSessions.set(sessionKey('om_other', LARK_APP_ID), other);
+
+      await startAdoptSession({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrTarget: 'w3:p3',
+        herdrPaneId: 'w3:p3',
+        cliPid: 16493,
+        cliId: 'pi',
+        cwd: '/home/testuser/project-pi',
+        paneCols: 200,
+        paneRows: 50,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('另一个 Botmux 会话'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses a stale picker callback when this topic became adopted after the card rendered', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: {
+          source: 'tmux',
+          tmuxTarget: 'existing:0.0',
+          originalCliPid: 16000,
+          cliId: 'codex',
+          cwd: '/existing',
+        },
+      });
+      const deps = makeDeps(ds);
+
+      await startAdoptSession({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w3:p3',
+        cliPid: 16493,
+        cliId: 'pi',
+        cwd: '/new',
+        paneCols: 200,
+        paneRows: 50,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom?.tmuxTarget).toBe('existing:0.0');
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('断开'),
+        undefined,
+        LARK_APP_ID,
+      );
     });
 
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {

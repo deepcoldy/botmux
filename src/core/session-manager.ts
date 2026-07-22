@@ -23,6 +23,7 @@ import {
 } from '../skills/injection-mode.js';
 import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
+import { readProcessStartIdentity } from './session-marker.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
@@ -1202,9 +1203,20 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // user-editable via /rename and must not change restore semantics.
     if (session.adoptedFrom) {
       const adopted = session.adoptedFrom as NonNullable<DaemonSession['adoptedFrom']>;
-      const validation = adopted.zellijPaneId
+      let validation = adopted.zellijPaneId
         ? (typeof adopted.originalCliPid === 'number' && validateZellijAdoptTarget(adopted.zellijSession ?? '', adopted.zellijPaneId, adopted.originalCliPid, adopted.cliId) ? 'alive' : 'missing')
         : validateAdoptTargetState(adopted);
+      if (
+        validation === 'alive'
+        && adopted.zellijPaneId
+        && adopted.originalCliPid
+        && adopted.originalCliProcStart
+      ) {
+        const liveProcStart = readProcessStartIdentity(adopted.originalCliPid);
+        validation = !liveProcStart
+          ? 'unknown'
+          : liveProcStart === adopted.originalCliProcStart ? 'alive' : 'missing';
+      }
       if (validation === 'missing') {
         logger.info(`Closing adopt session ${session.sessionId} (adopted target exited: ${adoptTargetLabel(adopted)})`);
         sessionStore.closeSession(session.sessionId);

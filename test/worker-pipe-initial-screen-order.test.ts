@@ -205,7 +205,8 @@ describe('worker pipe initial screen ordering', () => {
     expect(herdrBlock).toContain('herdrBe.cliPid = cfg.adoptCliPid');
     expect(herdrBlock).toContain('cfg.adoptCwd ?? cfg.workingDir');
     expect(herdrBlock).toContain('herdrBe.cliCwd');
-    expect(herdrBlock).toContain("if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt')");
+    expect(herdrBlock).toContain("if (cfg.adoptCliPid && !claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt'))");
+    expect(herdrBlock.indexOf('!claimCliPidMarker(')).toBeLessThan(herdrBlock.indexOf('herdrBe.spawn('));
     expect(herdrBlock).toContain('releaseCliPidMarker();');
   });
 
@@ -214,7 +215,8 @@ describe('worker pipe initial screen ordering', () => {
     const pipeStart = source.indexOf("cfg.adoptMode && (cfg.adoptTmuxTarget || cfg.adoptZellijPaneId)");
     const pipeEnd = source.indexOf("cliAdapter = createCliAdapterSync", pipeStart);
     const pipeBlock = source.slice(pipeStart, pipeEnd);
-    expect(pipeBlock).toContain('if (cfg.adoptCliPid) claimCliPidMarker(');
+    expect(pipeBlock).toContain('if (cfg.adoptCliPid && !claimCliPidMarker(');
+    expect(pipeBlock.indexOf('!claimCliPidMarker(')).toBeLessThan(pipeBlock.indexOf('observeBe.spawn('));
     expect(pipeBlock).toContain('releaseCliPidMarker();');
 
     const messageStart = source.indexOf("case 'message':");

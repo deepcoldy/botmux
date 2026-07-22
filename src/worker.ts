@@ -1414,20 +1414,23 @@ function releaseCliPidMarkerPath(path: string): void {
   }
 }
 
-function claimCliPidMarker(pid: number, source: string): void {
-  if (!process.env.SESSION_DATA_DIR || !sessionId) return;
+function claimCliPidMarker(pid: number, source: string): boolean {
+  if (!process.env.SESSION_DATA_DIR || !sessionId) return false;
   const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
   try {
     mkdirSync(markersDir, { recursive: true });
     cliPidMarker = join(markersDir, String(pid));
     if (writeCliPidMarkerPath(cliPidMarker, true)) {
       log(`CLI PID marker written (${source}): ${pid}`);
+      return true;
     } else {
       cliPidMarker = null;
+      return false;
     }
   } catch (err: any) {
     cliPidMarker = null;
     log(`Failed to write CLI PID marker (${source}): ${err?.message ?? err}`);
+    return false;
   }
 }
 
@@ -5587,6 +5590,9 @@ async function spawnCli(
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
     const target = cfg.adoptHerdrTarget ?? cfg.adoptHerdrPaneId!;
+    if (cfg.adoptCliPid && !claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt')) {
+      throw new Error(t('worker.adopt_pid_marker_conflict', { pid: cfg.adoptCliPid }));
+    }
     const herdrBe = new HerdrBackend(cfg.adoptHerdrSessionName, {
       externalTarget: {
         sessionName: cfg.adoptHerdrSessionName,
@@ -5609,8 +5615,6 @@ async function spawnCli(
       rows,
       env: process.env as Record<string, string>,
     });
-    if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, 'herdr adopt');
-
     wireHerdrWebTerminalRelays(herdrBe);
     seedBackendScreen('herdr adopt', herdrBe);
 
@@ -5655,10 +5659,13 @@ async function spawnCli(
     isZellijMode = !!cfg.adoptZellijPaneId;
     const cols = cfg.adoptPaneCols ?? PTY_COLS;
     const rows = cfg.adoptPaneRows ?? PTY_ROWS;
+    effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
+    if (cfg.adoptCliPid && !claimCliPidMarker(cfg.adoptCliPid, `${effectiveBackendType} adopt`)) {
+      throw new Error(t('worker.adopt_pid_marker_conflict', { pid: cfg.adoptCliPid }));
+    }
     const observeBe: ObserveBackend = cfg.adoptZellijPaneId
       ? new ZellijObserveBackend(cfg.adoptZellijSession ?? '', cfg.adoptZellijPaneId, { cliPid: cfg.adoptCliPid })
       : new TmuxPipeBackend(cfg.adoptTmuxTarget!, { cliPid: cfg.adoptCliPid });
-    effectiveBackendType = cfg.adoptZellijPaneId ? 'zellij' : 'tmux';
     backend = observeBe;
     // writeInput (grok concurrent prompt_history binding, claude pid-state)
     // reads these fields off the PtyHandle — constructor only stores
@@ -5671,8 +5678,6 @@ async function spawnCli(
       rows,
       env: process.env as Record<string, string>,
     });
-    if (cfg.adoptCliPid) claimCliPidMarker(cfg.adoptCliPid, `${effectiveBackendType} adopt`);
-
     // Seed the shared scrollback with the pane's current screen so any
     // already-connected (or future) WS clients render meaningful content
     // immediately, instead of waiting for the next observe tick.
