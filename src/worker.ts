@@ -457,6 +457,16 @@ function stopCodexRpcEngine(): void {
   remoteWsUrl = undefined;
   remoteThreadId = undefined;
   clearRpcEnginePidMarker();
+  // Tear down the engine: release any RPC turn still holding the lifecycle gate
+  // open. Without this, a switch from RPC to paste mode leaves a never-started
+  // turn blocking idle forever (no transcript terminal event will arrive).
+  for (const turn of codexBridgeQueue.peek()) {
+    if (turn.rpcActive && turn.finalText === undefined) {
+      codexBridgeQueue.stopRpcActive(turn.turnId, turn.dispatchAttempt);
+    }
+  }
+  stopStructuredStartGraceRecheck();
+  structuredRejectedReadyEvidenceGeneration = undefined;
   try { engine?.stop(); } catch { /* best effort */ }
 }
 
@@ -5967,7 +5977,6 @@ let tuiPromptBlocking = false;
 function projectedRuntimeScreenStatus(): RuntimeScreenStatus {
   return codexAppLivenessStatus(projectRuntimeScreenStatus({
     promptReady: isPromptReady,
-    analyzing: screenAnalyzer?.isAnalyzing === true,
     structuredTurnBlocking: hasStructuredLifecycleBlock(),
   }));
 }
@@ -6093,6 +6102,7 @@ async function writeAdoptMessage(
           result.failureReason,
           turnSeq,
           { turnId, dispatchAttempt },
+          'failed',
           true,
         );
       }
@@ -8744,8 +8754,6 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
-  if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
-  if (sessionRenameInFlight) return;  // wait for /rename to finish before any user input
   if (pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -8896,7 +8904,7 @@ async function flushPending(): Promise<void> {
           // the preceding turn in that window must not release the rename gate.
           beginCliWriteCycle();
           sessionRenamePhase = 'writing';
-          await sendRawCommandLineSerially(renameBackend, buildRename(title));
+          await sendRawCommandLineWithRecoveryFence(renameBackend, buildRename(title));
           if (cliSpawnGeneration !== renameGeneration || backend !== renameBackend || cliRestartInProgress) {
             throw new Error('rename backend generation changed before Enter settlement');
           }
@@ -9081,7 +9089,6 @@ async function flushPending(): Promise<void> {
       // backend regression). flushPending is invoked fire-and-forget, so an
       // escaping rejection would become an unhandledRejection and crash the
       // worker — exactly the failure mode this change is closing. Contain it.
-      let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
       let submissionBackend: SessionBackend | null = null;
       let recoveryFailureReason: string | undefined;
       const writeGeneration = cliSpawnGeneration;
@@ -9120,6 +9127,10 @@ async function flushPending(): Promise<void> {
             await codexRpcEngine!.sendTurn(msg, item.turnId);
           });
           result = { submitted: true };
+          // RPC has no local transcript user event. The app-server ACK is the
+          // authoritative start edge, so keep the lifecycle gate active until
+          // the RPC terminal callback or engine teardown retires it.
+          if (bridgeTurnId) codexBridgeQueue.markRpcActive(bridgeTurnId, item.dispatchAttempt);
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
           const targetBackend = backend;
           const targetAdapter = cliAdapter;
@@ -9247,6 +9258,7 @@ async function flushPending(): Promise<void> {
           }
         }
         if (bridgeTurnId) {
+          codexBridgeQueue.stopRpcActive(bridgeTurnId, item.dispatchAttempt);
           codexBridgeQueue.finishSubmitVerification(
             bridgeTurnId,
             undefined,

@@ -95,6 +95,14 @@ export interface CodexPendingTurn {
    *  assistant reply so the Lark thread sees both sides of the exchange. */
   userText?: string;
   sourceSessionId?: string;
+  /** True when the turn was delivered via Codex RPC (turn/start) and the
+   *  app-server has acknowledged it. RPC turns have no local transcript to
+   *  ingest, so they can never reach the started state; this flag keeps the
+   *  lifecycle gate asserted for the full server-side execution instead of
+   *  letting the bounded 20s confirmation lease expire mid-turn (which would
+   *  falsely release idle and prune a still-running turn). Cleared by the
+   *  terminal edge or an explicit stop. */
+  rpcActive?: boolean;
 }
 
 export class CodexBridgeQueue {
@@ -203,6 +211,12 @@ export class CodexBridgeQueue {
       const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
       if (!head) break;
 
+      // An RPC turn is running server-side with no local transcript to ingest.
+      // It can never reach started, so the bounded lease must NOT be used to
+      // prune it — that would falsely release idle while the app-server is still
+      // executing. Keep it until the terminal edge or explicit stop.
+      if (head.rpcActive) break;
+
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
       // once it finishes, finishSubmitVerification refreshes attribution from
@@ -244,6 +258,34 @@ export class CodexBridgeQueue {
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
     turn.submitConfirmedAtMs = confirmedAtMs;
+    return true;
+  }
+
+  /** Mark a turn as actively running server-side via Codex RPC. The app-server
+   *  ack for turn/start is authoritative confirmation that execution has begun,
+   *  but no local transcript event will follow to flip started. This flag keeps
+   *  the lifecycle gate asserted and protects the turn from lease expiry pruning
+   *  until the terminal edge (or an explicit stop) clears it. */
+  markRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText === undefined);
+    if (!turn) return false;
+    turn.rpcActive = true;
+    turn.submitVerificationStartedAtMs = undefined;
+    turn.unconfirmedAttributionStartedAtMs = undefined;
+    turn.submitConfirmedAtMs = undefined;
+    return true;
+  }
+
+  /** Clear the server-side active flag when an RPC turn reaches a terminal edge
+   *  or is otherwise retired. Without this, a completed RPC turn would keep the
+   *  lifecycle gate asserted forever (permanent false-busy). */
+  stopRpcActive(turnId: string, dispatchAttempt?: number): boolean {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (!turn || !turn.rpcActive) return false;
+    turn.rpcActive = undefined;
     return true;
   }
 
@@ -295,6 +337,7 @@ export class CodexBridgeQueue {
     return this.queue.some(turn => {
       if (turn.finalText !== undefined) return false;
       if (turn.started) return true;
+      if (turn.rpcActive) return true;
       const confirmed = turn.submitConfirmedAtMs !== undefined
         && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
       const verifying = turn.submitVerificationStartedAtMs !== undefined
@@ -308,7 +351,7 @@ export class CodexBridgeQueue {
    *  lease expires. Started turns return undefined because their eventual
    *  assistant_final is the authoritative re-drive. */
   preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
-    if (this.queue.some(turn => turn.started && turn.finalText === undefined)) return undefined;
+    if (this.queue.some(turn => (turn.started || turn.rpcActive) && turn.finalText === undefined)) return undefined;
     const activeRemaining = this.queue.flatMap(candidate => {
       if (candidate.started || candidate.finalText !== undefined) return [];
       const leases: number[] = [];
@@ -356,6 +399,9 @@ export class CodexBridgeQueue {
     const nextPending = this.queue.find(turn => !turn.started
       && turn.finalText === undefined);
     if (!nextPending) return;
+    // RPC turns keep their own rpcActive flag for lifecycle gating; do not
+    // overwrite it with a bounded confirmation/attribution lease.
+    if (nextPending.rpcActive) return;
     const observedAtMs = this.now();
     if (nextPending.submitConfirmedAtMs !== undefined) {
       nextPending.submitConfirmedAtMs = observedAtMs;

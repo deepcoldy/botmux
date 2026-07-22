@@ -958,6 +958,90 @@ describe('CodexBridgeQueue', () => {
     expect(ready.sourceSessionId).toBe('h1');
   });
 
+
+  // ── RPC mode: server-side execution has no local transcript ──────────────
+  // An RPC turn is confirmed by the app-server ack but never reaches started
+  // because no local transcript is ingested. Without rpcActive, the bounded
+  // 20s confirmation lease would expire mid-turn (long-running or approval-
+  // pending turns) → pruneExpiredPreStartHeads drops it → false idle.
+
+  it('rpcActive keeps the lifecycle gate asserted past the confirmation lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-turn', 'run on server', 100);
+    q.confirmPendingTurn('rpc-turn', 200);
+    q.markRpcActive('rpc-turn');
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    // 25s later — well past the 20s confirmation lease — still blocking.
+    now = 26_000;
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.preStartLeaseRemainingMs(now)).toBeUndefined();
+  });
+
+  it('rpcActive turn is never pruned by expiry while active', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-prune', 'server turn', 100);
+    q.markRpcActive('rpc-prune');
+
+    now = 60_000;  // far past any lease
+    const dropped = q.pruneExpiredPreStartHeads(now);
+    expect(dropped).toEqual([]);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.peek().length).toBe(1);
+  });
+
+  it('stopRpcActive releases the lifecycle gate without a terminal edge', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-stop', 'server turn', 100);
+    q.markRpcActive('rpc-stop');
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    expect(q.stopRpcActive('rpc-stop')).toBe(true);
+    expect(q.hasBlockingTurn(now)).toBe(false);
+    // Stopping again is a no-op (returns false).
+    expect(q.stopRpcActive('rpc-stop')).toBe(false);
+  });
+
+  it('rpcActive does not block a normal started turn from draining', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('normal', 'local turn', 90);
+    q.mark('rpc', 'server turn', 100);
+    q.markRpcActive('rpc');
+
+    // Normal turn starts and finishes normally.
+    q.ingest([userEv('local turn', 'u-normal', 200)]);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    q.ingest([asstEv('done', 'a-normal', 300)]);
+
+    // Normal turn is emittable; rpc turn still blocks.
+    const ready = q.drainEmittable();
+    expect(ready.map(t => t.turnId)).toEqual(['normal']);
+    expect(q.hasBlockingTurn(now)).toBe(true);
+
+    // After the RPC turn is stopped, it no longer blocks the lifecycle gate.
+    // It remains in the queue as a normal pending turn until its attribution
+    // lease expires (separate from the rpcActive gate).
+    q.stopRpcActive('rpc');
+    expect(q.hasBlockingTurn(now)).toBe(false);
+  });
+
+  it('markRpcActive clears any pending verification/confirmation lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rpc-verify', 'server turn', 100);
+    q.beginSubmitVerification('rpc-verify', 200);
+    // Move past the verification lease so it would normally be prunable.
+    now = 40_000;
+    q.markRpcActive('rpc-verify');
+    // rpcActive takes over from the expired verification lease.
+    expect(q.hasBlockingTurn(now)).toBe(true);
+    expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+  });
+
   it('clearPending wipes queue state', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'one', 100);
