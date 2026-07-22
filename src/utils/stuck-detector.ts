@@ -15,18 +15,116 @@
  * quiet. This avoids false positives from legitimately long turns.
  */
 
-/** Identifies the complete Codex PreToolUse hook-review screen. A keyword by
- * itself is not enough: users and model output can legitimately quote the
- * incident text. We require all three contemporaneous UI signals:
- * - the PreToolUse hooks title,
- * - a pending review state, and
- * - the control hint documenting t / Enter / Esc.
- */
-function isHookReviewScreen(snapshot: string): boolean {
-  const hasTitle = /PreToolUse hooks/i.test(snapshot);
-  const hasPendingReview = /hook needs review|needs review before it can run/i.test(snapshot);
-  const hasControls = /Press t to trust all; enter to review hooks; esc to close/i.test(snapshot);
-  return hasTitle && hasPendingReview && hasControls;
+/** Codex hook-review screen whose documented controls are safe to expose. */
+export type HookReviewScreenType = 'hooks overview' | 'pretooluse hooks detail';
+
+export interface StuckWarningAction {
+  keys: string[];
+  text: string;
+  isFinal: true;
+  rearmStuckDetector: boolean;
+}
+
+const STUCK_WARNING_ACTIONS: Record<HookReviewScreenType, readonly StuckWarningAction[]> = {
+  'hooks overview': [
+    { keys: ['t'], text: '信任全部 (trust all)', isFinal: true, rearmStuckDetector: false },
+    { keys: ['Enter'], text: '逐项审核 (review hooks)', isFinal: true, rearmStuckDetector: true },
+    { keys: ['Escape'], text: '关闭 (close)', isFinal: true, rearmStuckDetector: false },
+  ],
+  'pretooluse hooks detail': [
+    { keys: ['t'], text: '信任此 hook (trust)', isFinal: true, rearmStuckDetector: false },
+    { keys: ['Escape'], text: '返回 (go back)', isFinal: true, rearmStuckDetector: false },
+  ],
+};
+
+/** Resolve a stuck-card button by server-owned screen type and option index. */
+export function resolveStuckWarningAction(
+  screen: HookReviewScreenType,
+  selectedIndex: number,
+): StuckWarningAction | undefined {
+  return STUCK_WARNING_ACTIONS[screen][selectedIndex];
+}
+
+/** Reclassify an authoritative fresh screen and write only a whitelisted action. */
+export async function writeStuckWarningAction(
+  expectedScreen: HookReviewScreenType,
+  keys: readonly string[],
+  capture: () => Promise<string | null>,
+  write: (key: string) => void | Promise<void>,
+  isCurrent: () => boolean = () => true,
+): Promise<boolean> {
+  if (keys.length !== 1 || !STUCK_WARNING_ACTIONS[expectedScreen].some(action => action.keys[0] === keys[0])) return false;
+  const snapshot = await capture();
+  if (!snapshot || classifyHookReviewScreen(snapshot) !== expectedScreen || !isCurrent()) return false;
+  try {
+    await write(keys[0]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Classify the active Codex hook-review screen. Terminal snapshots may
+ * contain retained scrollback or both an overview and a newly-opened detail
+ * modal, so the control footer must be at the bottom and the active region
+ * starts at the bottom-most matching title. Soft-wrapped rows within that
+ * semantic region are normalized before matching. */
+export function classifyHookReviewScreen(snapshot: string): HookReviewScreenType | undefined {
+  const lines = snapshot
+    .replace(/\x1b(?:\[[0-?]*[ -\/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g, '')
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(line => line.trimEnd());
+  while (lines.length > 0 && lines.at(-1)?.trim() === '') lines.pop();
+
+  const footerIndex = lines.length - 1;
+  if (footerIndex < 0) return undefined;
+  const footer = lines[footerIndex].trim();
+  const footerScreen: HookReviewScreenType | undefined = /^Press t to trust all; enter to review hooks; esc to close$/i.test(footer)
+    ? 'hooks overview'
+    : /^Press t to trust; esc to go back$/i.test(footer)
+      ? 'pretooluse hooks detail'
+      : undefined;
+  if (!footerScreen) return undefined;
+
+  let titleIndex = -1;
+  let screen: HookReviewScreenType | undefined;
+  for (let i = footerIndex - 1; i >= 0; i -= 1) {
+    if (/^\s*PreToolUse hooks\s*$/i.test(lines[i])) {
+      titleIndex = i;
+      screen = 'pretooluse hooks detail';
+      break;
+    }
+    if (/^\s*Hooks\s*$/i.test(lines[i])) {
+      titleIndex = i;
+      screen = 'hooks overview';
+      break;
+    }
+  }
+  if (titleIndex < 0 || !screen || screen !== footerScreen) return undefined;
+
+  const regionLines = lines.slice(titleIndex, footerIndex + 1);
+  const region = regionLines.join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const hasPendingReview = /hooks? (?:needs?|need) review before (?:it|they) can run/i.test(region);
+
+  if (screen === 'pretooluse hooks detail'
+    && hasPendingReview
+    && /\[!\]\s+Hook\s+\d+\s+·\s+new/i.test(region)
+    && /Event\s+PreToolUse/i.test(region)
+    && /Trust\s+New hook - review required/i.test(region)) {
+    return screen;
+  }
+
+  if (screen === 'hooks overview'
+    && hasPendingReview
+    && /Event\s+Installed\s+Active\s+Review/i.test(region)
+    && /PreToolUse\s+\d+\s+\d+\s+[1-9]\d*(?:\s+Before a tool\S*)?/i.test(region)) {
+    return screen;
+  }
+
+  return undefined;
 }
 
 export interface StuckDetectorCallbacks {
@@ -102,6 +200,6 @@ export class StuckDetector {
 
   private matchSnapshot(): string | undefined {
     const snap = this.callbacks.getSnapshot?.();
-    return snap && isHookReviewScreen(snap) ? 'hook review prompt' : undefined;
+    return snap ? classifyHookReviewScreen(snap) : undefined;
   }
 }

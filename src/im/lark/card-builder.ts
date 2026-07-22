@@ -1327,6 +1327,7 @@ export function buildTuiPromptCard(
   multiSelect?: boolean,
   toggledIndices?: number[],
   locale?: Locale,
+  stuckWarningAuthority?: { nonce: number; workerGeneration: number },
 ): string {
   const hasInputOption = options.some(o => o.type === 'input');
   const toggled = new Set(toggledIndices ?? []);
@@ -1370,6 +1371,10 @@ export function buildTuiPromptCard(
         selected_index: String(originalIndex),
         selected_text: opt.text,
         option_type: opt.type ?? 'select',
+        ...(stuckWarningAuthority ? {
+          stuck_warning_nonce: String(stuckWarningAuthority.nonce),
+          stuck_warning_generation: String(stuckWarningAuthority.workerGeneration),
+        } : {}),
       },
     });
   }

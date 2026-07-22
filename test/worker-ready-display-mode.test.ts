@@ -38,7 +38,12 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     localCliReady: args[15] === true,
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
-  buildTuiPromptCard: vi.fn(() => '{}'),
+  buildTuiPromptCard: vi.fn((...args: any[]) => JSON.stringify({
+    type: 'tui',
+    description: args[2],
+    options: args[3],
+    authority: args[7],
+  })),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
@@ -611,6 +616,168 @@ describe('Worker ready: set_display_mode re-sync', () => {
       content: '/goal ship',
       followUpContent: '<user_message>legacy</user_message>',
     });
+  });
+
+  it('builds distinct overview and detail stuck-warning cards', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 45_000, matchedPattern: 'hooks overview', cliLifetimeNonce: 'cli-1',
+    });
+    await flush();
+    const overview = JSON.parse(sessionReplyMock.mock.calls[0][1]);
+    expect(overview.description).toContain('Hooks 审核总览');
+    expect(overview.options.map((option: any) => option.label)).toEqual(['t', 'Enter', 'Esc']);
+    expect(overview.authority).toEqual({ nonce: 1, workerGeneration: 1 });
+
+    ds.stuckWarningCardId = undefined;
+    ds.stuckWarningTurnId = undefined;
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 45_000, matchedPattern: 'pretooluse hooks detail', cliLifetimeNonce: 'cli-1',
+    });
+    await flush();
+    const detail = JSON.parse(sessionReplyMock.mock.calls[1][1]);
+    expect(detail.description).toContain('PreToolUse hook 详情审核');
+    expect(detail.options.map((option: any) => option.label)).toEqual(['t', 'Esc']);
+  });
+
+  it('does not activate a stuck-warning POST that prompt_ready invalidated in flight', async () => {
+    const fakeWorker = makeFakeWorker();
+    let finishPost!: (id: string) => void;
+    sessionReplyMock.mockImplementationOnce(() => new Promise(resolve => { finishPost = resolve; }));
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 45_000, matchedPattern: 'hooks overview', cliLifetimeNonce: 'cli-1',
+    });
+    await flush();
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    finishPost('om_stale_warning');
+    await flush();
+
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBe(2);
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_stale_warning', '{}');
+  });
+
+  it('worker replacement revokes the prior generation stuck-warning card', async () => {
+    const oldWorker = makeFakeWorker();
+    const replacementWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: oldWorker,
+      stuckWarningCardId: 'om_old_warning',
+      stuckWarningTurnId: 'turn-old',
+      stuckWarningPattern: 'hooks overview',
+      stuckWarningWorkerGeneration: 1,
+      stuckWarningNonce: 9,
+    });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    ds.stuckWarningCardId = 'om_old_warning';
+    ds.stuckWarningTurnId = 'turn-old';
+    ds.stuckWarningPattern = 'hooks overview';
+    ds.stuckWarningWorkerGeneration = 1;
+    ds.worker = replacementWorker;
+
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_old_warning', '{}');
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningWorkerGeneration).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBe(11);
+  });
+
+  it('stale prompt_ready cannot clear a replacement generation card', async () => {
+    const oldWorker = makeFakeWorker();
+    const replacementWorker = makeFakeWorker();
+    const ds = makeDs({ worker: oldWorker });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    ds.worker = replacementWorker;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+    ds.stuckWarningCardId = 'om_new_warning';
+    ds.stuckWarningNonce = 8;
+    ds.stuckWarningPattern = 'hooks overview';
+    ds.stuckWarningWorkerGeneration = ds.workerGeneration;
+
+    oldWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(ds.stuckWarningCardId).toBe('om_new_warning');
+    expect(ds.stuckWarningNonce).toBe(8);
+    expect(updateMessageMock).not.toHaveBeenCalledWith('app_test', 'om_new_warning', '{}');
+  });
+
+  it('ignores stuck-warning messages from a replaced worker generation', async () => {
+    const oldWorker = makeFakeWorker();
+    const replacementWorker = makeFakeWorker();
+    const ds = makeDs({ worker: oldWorker });
+    __testOnly_setupWorkerHandlers(ds, oldWorker);
+    ds.worker = replacementWorker;
+    __testOnly_setupWorkerHandlers(ds, replacementWorker);
+
+    oldWorker.emit('message', {
+      type: 'stuck_warning', elapsedMs: 45_000, matchedPattern: 'hooks overview', cliLifetimeNonce: 'cli-1',
+    });
+    oldWorker.emit('message', { type: 'stuck_warning_action_result', cardNonce: 1, delivered: false, rearmStuckDetector: false });
+    await flush();
+
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.stuckWarningCardId).toBeUndefined();
+  });
+
+  it('in-worker CLI replacement invalidates the old stuck-warning card before a replacement prompt', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      stuckWarningCardId: 'om_warning',
+      stuckWarningTurnId: 'turn-1',
+      stuckWarningPattern: 'hooks overview',
+      stuckWarningWorkerGeneration: 1,
+      stuckWarningCliLifetimeNonce: 'cli-old',
+      stuckWarningNonce: 9,
+    });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', { type: 'stuck_warning_invalidated', cliLifetimeNonce: 'cli-old' });
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_warning', '{}');
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningCliLifetimeNonce).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBe(11);
+  });
+
+  it('resolves the active card when worker rejects stale keys', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      stuckWarningCardId: 'om_warning',
+      stuckWarningTurnId: 'turn-1',
+      stuckWarningPattern: 'hooks overview',
+      stuckWarningWorkerGeneration: 1,
+      stuckWarningNonce: 9,
+      stuckWarningProcessingNonce: 9,
+    });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'stuck_warning_action_result',
+      cardNonce: 9,
+      delivered: false,
+      rearmStuckDetector: false,
+      reason: 'screen changed',
+    });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith('app_test', 'om_warning', '{}');
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningPattern).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBe(10);
   });
 
   it('prompt_ready without pending raw input never emits the buffered follow-up alone', async () => {

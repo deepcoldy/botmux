@@ -57,6 +57,7 @@ import { createCliAdapterSync } from '../../adapters/cli/registry.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
+import { resolveStuckWarningAction } from '../../utils/stuck-detector.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
@@ -1772,26 +1773,93 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return;
     }
 
+    const isStuckWarningCallback = !!ds && (
+      (!!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId)
+      || value?.stuck_warning_nonce !== undefined
+      || value?.stuck_warning_generation !== undefined
+    );
+    if (isStuckWarningCallback && actionType !== 'tui_keys') {
+      logger.warn(`[${tag(ds!)}] Rejected non-tui_keys action tied to stuck-warning authority: ${actionType}`);
+      return;
+    }
+
     if (actionType === 'tui_keys' && ds) {
       // Fail-closed: only act on a currently-active card (either the
       // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
       // click from a resolved/replaced card must NOT send any IPC to the
       // worker — the CLI may have moved on or recovered. PATCH is UI only,
       // not an authorization check.
+      const callbackNonce = Number(value?.stuck_warning_nonce);
+      const callbackGeneration = Number(value?.stuck_warning_generation);
+      const presentsStuckAuthority = value?.stuck_warning_nonce !== undefined
+        || value?.stuck_warning_generation !== undefined;
       const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
       const isActiveStuckCard = !!ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId;
       if (!isActiveTuiCard && !isActiveStuckCard) {
         logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
+        if (presentsStuckAuthority && cardMessageId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(t('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
+            logger.debug(`[${tag(ds)}] Failed to expire stale stuck-warning card: ${err}`),
+          );
+        }
         return;
       }
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
-      const isFinal = value?.is_final === '1';
+      let isFinal = value?.is_final === '1';
       const optionType = value?.option_type ?? 'select';
-      const selectedIndex = Number(value?.selected_index ?? 0);
-      const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
+      const selectedIndex = Number(value?.selected_index);
+      let selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
+      let rearmStuckDetector = false;
+      if (isActiveStuckCard) {
+        if (ds.stuckWarningProcessingNonce === callbackNonce) {
+          logger.info(`[${tag(ds)}] Ignored duplicate stuck-warning click while delivery is pending (nonce=${callbackNonce})`);
+          const locDs = localeForBot(ds.larkAppId);
+          try { return JSON.parse(buildTuiPromptProcessingCard(selectedText, locDs)); } catch { return; }
+        }
+        const authorityMatches = Number.isSafeInteger(selectedIndex)
+          && selectedIndex >= 0
+          && Number.isSafeInteger(callbackNonce)
+          && Number.isSafeInteger(callbackGeneration)
+          && callbackNonce === ds.stuckWarningNonce
+          && callbackGeneration === ds.stuckWarningWorkerGeneration
+          && callbackGeneration === ds.workerGeneration;
+        const action = authorityMatches && ds.stuckWarningPattern
+          ? resolveStuckWarningAction(ds.stuckWarningPattern, selectedIndex)
+          : undefined;
+        if (!action) {
+          logger.warn(`[${tag(ds)}] Rejected invalid stuck-warning action (pattern=${ds.stuckWarningPattern ?? 'none'}, index=${selectedIndex}, nonce=${callbackNonce}, generation=${callbackGeneration})`);
+          return { toast: { type: 'warning', content: '操作无效，请使用当前卡片上的按钮重试' } };
+        }
+        if (!ds.worker || ds.worker.killed) {
+          const locDs = localeForBot(ds.larkAppId);
+          if (cardMessageId) {
+            const failedCard = buildTuiPromptResolvedCard('未发送：会话进程已退出，请稍后重试', locDs);
+            updateMessage(ds.larkAppId, cardMessageId, failedCard).catch(err =>
+              logger.debug(`[${tag(ds)}] Failed to expire stuck-warning card without worker: ${err}`),
+            );
+          }
+          if (cardMessageId === ds.stuckWarningCardId) {
+            ds.stuckWarningCardId = undefined;
+            ds.stuckWarningTurnId = undefined;
+            ds.stuckWarningPattern = undefined;
+            ds.stuckWarningWorkerGeneration = undefined;
+            ds.stuckWarningCliLifetimeNonce = undefined;
+            ds.stuckWarningProcessingNonce = undefined;
+            ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+            publishAttentionPatch(ds);
+          }
+          return;
+        }
+        keys = action.keys;
+        selectedText = action.text;
+        isFinal = action.isFinal;
+        rearmStuckDetector = action.rearmStuckDetector;
+      }
 
-      if (optionType === 'toggle') {
+      if (optionType === 'toggle' && !isActiveStuckCard) {
         // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
         // card must never read or mutate the other card's global selections.
         if (!isActiveTuiCard) {
@@ -1843,20 +1911,31 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          // Only the stuck-warning card's Enter action re-arms the detector
-          // (Enter advances from the hook list to a per-hook review). Match by
-          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
-          // in the card definition. t/Esc and all ScreenAnalyzer cards never
-          // set this flag. Also require the source card to be our own.
-          const isStuckWarningEnter = !!ds.stuckWarningCardId
-            && cardMessageId === ds.stuckWarningCardId
-            && keys.length === 1
-            && keys[0] === 'Enter';
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} — "${selectedText}"`);
+          if (isActiveStuckCard && ds.stuckWarningNonce !== undefined) {
+            ds.stuckWarningProcessingNonce = ds.stuckWarningNonce;
+          }
+          ds.worker.send({
+            type: 'tui_keys',
+            keys: allKeys,
+            isFinal,
+            rearmStuckDetector,
+            ...(isActiveStuckCard && ds.stuckWarningPattern
+              ? {
+                  expectedStuckPattern: ds.stuckWarningPattern,
+                  stuckCardNonce: ds.stuckWarningNonce,
+                  expectedCliLifetimeNonce: ds.stuckWarningCliLifetimeNonce,
+                }
+              : {}),
+          } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${rearmStuckDetector} — "${selectedText}"`);
         }
 
-        if (isFinal) {
+        if (isActiveStuckCard && cardMessageId) {
+          const locDs = localeForBot(ds.larkAppId);
+          try { return JSON.parse(buildTuiPromptProcessingCard(selectedText, locDs)); } catch { return; }
+        }
+
+        if (isFinal && !isActiveStuckCard) {
           const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
@@ -1885,6 +1964,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           if (ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId) {
             ds.stuckWarningCardId = undefined;
             ds.stuckWarningTurnId = undefined;
+            ds.stuckWarningPattern = undefined;
+            ds.stuckWarningWorkerGeneration = undefined;
+            ds.stuckWarningCliLifetimeNonce = undefined;
+            ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
           }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
