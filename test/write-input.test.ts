@@ -1306,6 +1306,24 @@ describe('codex writeInput submission confirmation', () => {
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
   });
+
+  it('does not crash and reports failure when history.jsonl is absent', async () => {
+    // Codex has no fresh-install short-wait branch like CoCo. When
+    // history.jsonl does not exist at submit time, currentFileSize returns 0
+    // and waitForHistoryAppend polls until the budget expires, then retries
+    // Enter and finally surfaces { submitted: false, recheck } — it must NOT
+    // throw or silently return undefined (which would let a missing submit
+    // look like a confirmed one).
+    const { rmSync } = await import('node:fs');
+    try { rmSync(codexHistoryPath()); } catch { /* may not exist */ }
+    const pty = makeTmuxPty({ confirmCodexSubmit: false });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
+    expect((result as any).recheck()).toBe(false);
+  });
 });
 
 describe('coco writeInput submission confirmation', () => {
@@ -1418,6 +1436,49 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
+  });
+
+  it('fresh install: returns { submitted: true } when history.jsonl appears with our marker during the short wait', async () => {
+    // Fresh-install branch 1: history.jsonl is absent at submit time, but CoCo
+    // creates it and appends our marker within the 1.2s short-wait window.
+    // Adapter must return authoritative { submitted: true }, not undefined.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    // The mock confirms on the first Enter by writing a coco-shaped history
+    // line — but the file does not exist yet when baseByte is sampled, so we
+    // exercise the fresh-install short-wait path rather than the normal loop.
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: true });
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('fresh install: falls through to retry loop when history.jsonl appears without our marker', async () => {
+    // Fresh-install branch 3: history.jsonl is absent at submit time, appears
+    // during the short wait, but does NOT contain our marker (e.g. another
+    // session's line landed first). Adapter must NOT silently return undefined;
+    // it must fall through to the normal retry/failure loop and surface
+    // { submitted: false, recheck } so the worker can warn rather than mask a
+    // real submit failure on a new install.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    let submittedOnce = false;
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        if (submittedOnce) return;
+        submittedOnce = true;
+        // File appears, but with an unrelated line — our marker is absent.
+        appendCocoHistory('some other session\'s submit, not ours');
+      }),
+      pasteText: vi.fn(),
+    };
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
   });
 
   it('confirms submit when baseByte lands mid-line (non-atomic history append)', async () => {

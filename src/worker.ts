@@ -406,6 +406,16 @@ function stopCodexRpcEngine(): void {
   remoteWsUrl = undefined;
   remoteThreadId = undefined;
   clearRpcEnginePidMarker();
+  // Tear down the engine: release any RPC turn still holding the lifecycle gate
+  // open. Without this, a switch from RPC to paste mode leaves a never-started
+  // turn blocking idle forever (no transcript terminal event will arrive).
+  for (const turn of codexBridgeQueue.peek()) {
+    if (turn.rpcActive && turn.finalText === undefined) {
+      codexBridgeQueue.stopRpcActive(turn.turnId, turn.dispatchAttempt);
+    }
+  }
+  stopStructuredStartGraceRecheck();
+  structuredRejectedReadyEvidenceGeneration = undefined;
   try { engine?.stop(); } catch { /* best effort */ }
 }
 
@@ -7287,6 +7297,12 @@ async function flushPending(): Promise<void> {
           // surfaces as a normal submit-failure notice.
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
+          // The app-server ack confirms execution has begun, but no local
+          // transcript event will follow to flip started. Mark the turn active
+          // so the lifecycle gate stays asserted for the full server-side run
+          // instead of relying on the bounded 20s confirmation lease (which
+          // would expire mid-turn on a long-running or approval-pending turn).
+          if (bridgeTurnId) codexBridgeQueue.markRpcActive(bridgeTurnId, item.dispatchAttempt);
         } else {
           result = item.codexAppInput && writeAdapter.writeStructuredInput
             ? await writeAdapter.writeStructuredInput(writeBackend, msg, item.codexAppInput)
@@ -7356,6 +7372,7 @@ async function flushPending(): Promise<void> {
           }
         }
         if (bridgeTurnId) {
+          codexBridgeQueue.stopRpcActive(bridgeTurnId, item.dispatchAttempt);
           codexBridgeQueue.finishSubmitVerification(
             bridgeTurnId,
             undefined,
