@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -422,7 +422,7 @@ async function readTerminalRenderDiagnostics(page: Page): Promise<{
 async function closeFeatureTips(page: Page): Promise<void> {
   await page.evaluate(() => {
     const store = window.__store
-    store?.getState().markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+    store?.getState().markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     if (store?.getState().activeModal === 'feature-tips') {
       store.getState().closeModal()
     }
@@ -452,8 +452,8 @@ async function expectAutoWebgl(page: Page): Promise<boolean> {
 }
 
 test.describe('Terminal raw emoji table scroll restore repro', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await orcaBotmuxPage.evaluate(() => {
+  test.beforeEach(async ({ botmuxPage }) => {
+    await botmuxPage.evaluate(() => {
       ;(window as RawTableDebugWindow).getActiveTestPane = () => {
         const store = window.__store
         const state = store?.getState()
@@ -477,30 +477,30 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
   // Why: `auto` should start on the fast renderer for ordinary terminal output;
   // the emoji table golden below proves complex output does not disable it.
   test('uses WebGL by default for ordinary terminal output when available @terminal-rendering-golden', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await closeFeatureTips(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    const marker = `ORCA_AUTO_WEBGL_SMOKE_${randomUUID()}`
+    await waitForSessionReady(botmuxPage)
+    await closeFeatureTips(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    const marker = `BOTMUX_AUTO_WEBGL_SMOKE_${randomUUID()}`
 
-    await sendToTerminal(orcaBotmuxPage, ptyId, `printf ${JSON.stringify(`${marker}\\n`)}\r`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker, 10_000)
+    await sendToTerminal(botmuxPage, ptyId, `printf ${JSON.stringify(`${marker}\\n`)}\r`)
+    await waitForTerminalOutput(botmuxPage, marker, 10_000)
 
-    const expectedWebgl = await expectAutoWebgl(orcaBotmuxPage)
+    const expectedWebgl = await expectAutoWebgl(botmuxPage)
     // Why: WebGL (re)attaches asynchronously via React visibility effects and a
     // transient ESC[?25l during a redraw can momentarily set cursorHidden. Let
     // those eventually-consistent fields settle before the single-shot golden
     // asserts so runner timing can't flake-block the release. hasComplexScriptOutput
     // stays single-shot: its not-ready default is also false, so timing can't
     // turn it into a false failure.
-    let diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+    let diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
     await expect
       .poll(
         async () => {
-          diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+          diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
           return diagnostics.hasWebgl === expectedWebgl && diagnostics.cursorHidden === false
         },
         {
@@ -517,13 +517,13 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
   // Why: this is the minimal golden for the v1.4.51 regression. It fails if
   // xterm underfits by one scrollbar column or counts ZWJ emoji as width 4.
   test('keeps raw emoji box table aligned after restore and scroll @terminal-rendering-golden', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await closeFeatureTips(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    await closeFeatureTips(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'raw emoji table repro needs the seeded secondary worktree')
@@ -531,13 +531,13 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await setWideRenderedTableViewport(orcaBotmuxPage)
-    await waitForActiveTerminalColumns(orcaBotmuxPage, RAW_EMOJI_BOX_TABLE_WIDTH)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await setWideRenderedTableViewport(botmuxPage)
+    await waitForActiveTerminalColumns(botmuxPage, RAW_EMOJI_BOX_TABLE_WIDTH)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-raw-emoji-fixture-table-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-raw-emoji-fixture-table-${runId}.mjs`)
     writeFileSync(scriptPath, rawEmojiFixtureBoxTableScript(EMOJI_TABLE_FIXTURE, runId))
 
     try {
@@ -545,51 +545,51 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
       const frameTailMarker = rawEmojiFixtureFrameTailMarker(runId)
       // Why: the fixture marker is the shell-readiness signal here; an extra
       // Ctrl+C/Ctrl+U preflight can race Windows ConPTY startup and eat input.
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
       // Why: Windows ConPTY can return the PowerShell prompt while xterm is
       // still flushing synchronized output if the pane is hidden immediately.
       // This golden is about restored table geometry, not shell-flush timing.
-      await waitForTerminalOutput(orcaBotmuxPage, completionMarker, 20_000, 30_000)
+      await waitForTerminalOutput(botmuxPage, completionMarker, 20_000, 30_000)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 10_000,
           message: 'raw emoji table synchronized frame tail was not rendered'
         })
         .toContain(frameTailMarker)
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(1_000)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(1_000)
       // Why: switching back can replay hidden terminal contents immediately;
       // make the viewport wide before restore so the table cannot wrap first.
-      await setWideRenderedTableViewport(orcaBotmuxPage)
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+      await setWideRenderedTableViewport(botmuxPage)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
       // Why: activating another worktree can restore the right sidebar. This
       // golden is about terminal renderer restore at a deliberately wide width.
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await setWideRenderedTableViewport(orcaBotmuxPage)
-      await waitForActiveTerminalColumns(orcaBotmuxPage, RAW_EMOJI_BOX_TABLE_WIDTH)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await setWideRenderedTableViewport(botmuxPage)
+      await waitForActiveTerminalColumns(botmuxPage, RAW_EMOJI_BOX_TABLE_WIDTH)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 30_000,
           message: 'raw emoji table marker did not survive workspace switch'
         })
         .toContain(completionMarker)
 
-      await scrollActiveTerminalToText(orcaBotmuxPage, 'Singer')
-      await closeFeatureTips(orcaBotmuxPage)
-      const expectedWebgl = await expectAutoWebgl(orcaBotmuxPage)
+      await scrollActiveTerminalToText(botmuxPage, 'Singer')
+      await closeFeatureTips(botmuxPage)
+      const expectedWebgl = await expectAutoWebgl(botmuxPage)
       // Why: after the worktree switch, WebGL reattaches asynchronously (React
       // visibility effect + attach backoff) and a transient ESC[?25l during the
       // restore redraw can momentarily set cursorHidden. Let those settle before
       // the single-shot golden asserts so runner timing can't flake-block the
       // release; the geometry/wrap/overpaint checks below stay single-shot as the
       // real regression signal.
-      let diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+      let diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
       await expect
         .poll(
           async () => {
-            diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+            diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
             return diagnostics.hasWebgl === expectedWebgl && diagnostics.cursorHidden === false
           },
           {
@@ -598,9 +598,9 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
           }
         )
         .toBe(true)
-      const overpaint = await readTerminalRightEdgeOverpaint(orcaBotmuxPage)
-      const wrapDiagnostics = await readTerminalBoxTableWrapDiagnostics(orcaBotmuxPage)
-      const singerGeometry = await readVisibleSingerRowGeometry(orcaBotmuxPage)
+      const overpaint = await readTerminalRightEdgeOverpaint(botmuxPage)
+      const wrapDiagnostics = await readTerminalBoxTableWrapDiagnostics(botmuxPage)
+      const singerGeometry = await readVisibleSingerRowGeometry(botmuxPage)
       testInfo.annotations.push({
         type: 'raw-emoji-table-singer-geometry',
         description: JSON.stringify(singerGeometry)
@@ -615,7 +615,7 @@ test.describe('Terminal raw emoji table scroll restore repro', () => {
       })
 
       const screenshotPath = testInfo.outputPath('raw-emoji-table-after-switch-scroll.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('raw-emoji-table-after-switch-scroll.png', {
         path: screenshotPath,
         contentType: 'image/png'

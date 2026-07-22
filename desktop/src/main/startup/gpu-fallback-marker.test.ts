@@ -19,7 +19,7 @@ describe('gpu-fallback-marker', () => {
   }
 
   beforeEach(() => {
-    userDataPath = mkdtempSync(join(os.tmpdir(), 'orca-botmux-gpu-fallback-test-'))
+    userDataPath = mkdtempSync(join(os.tmpdir(), 'botmux-gpu-fallback-test-'))
   })
 
   afterEach(() => {

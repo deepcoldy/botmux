@@ -7,7 +7,7 @@
  * Memory dashboard collector.
  *
  * One snapshot covers two sources:
- *   - OrcaBotmux's own Electron processes, via `app.getAppMetrics()`, bucketed
+ *   - Botmux's own Electron processes, via `app.getAppMetrics()`, bucketed
  *     into main / renderer / other.
  *   - Each registered PTY's process subtree, enumerated once from a host-
  *     wide `ps` sweep (`wmic` on Windows).
@@ -386,7 +386,7 @@ function resolveWorktreeNames(
   repoId: string
   repoName: string
 } {
-  // OrcaBotmux worktree ids look like `${repoId}::${absolutePath}`.
+  // Botmux worktree ids look like `${repoId}::${absolutePath}`.
   const parsed = splitWorktreeIdForFilesystem(worktreeId)
   const repoId = parsed?.repoId ?? worktreeId
   const worktreePath = parsed?.worktreePath ?? ''

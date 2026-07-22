@@ -112,7 +112,7 @@ const { registerSshGitProvider, unregisterSshGitProvider } =
 describe('SshRelaySession', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    delete process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
+    delete process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
     muxRequestMock.mockReset()
     muxRequestMock.mockResolvedValue([])
     installRemoteManagedAgentHooksMock.mockReset()
@@ -239,9 +239,9 @@ describe('SshRelaySession', () => {
     ['/bin/tcsh', "'/bin/tcsh' -lc 'printenv GROK_HOME | head -c 4097'"],
     ['/bin/sh', "'/bin/sh' -c 'printenv GROK_HOME | head -c 4097'"]
   ])('uses a shell-independent GROK_HOME probe with login shell %s', async (shell, command) => {
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '1'
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '1'
     muxRequestMock.mockImplementation(async (method: string) =>
-      method === 'session.resolveHome' ? { resolvedPath: '/home/orca_botmux' } : { ok: true }
+      method === 'session.resolveHome' ? { resolvedPath: '/home/botmux' } : { ok: true }
     )
     vi.mocked(execCommand).mockResolvedValueOnce(`${shell}\n`).mockResolvedValueOnce('/srv/grok\n')
     const sftp = { end: vi.fn() }
@@ -261,16 +261,16 @@ describe('SshRelaySession', () => {
       wrapCommand: false,
       timeoutMs: 8_000
     })
-    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/orca_botmux', {
+    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/botmux', {
       grokHomeDir: '/srv/grok'
     })
   })
 
   it('installs remote managed hooks and relay-owned plugin assets before registering the SSH PTY provider', async () => {
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '1'
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '1'
     muxRequestMock.mockImplementation(async (method: string) => {
       if (method === 'session.resolveHome') {
-        return { resolvedPath: '/home/orca_botmux' }
+        return { resolvedPath: '/home/botmux' }
       }
       return { ok: true }
     })
@@ -296,7 +296,7 @@ describe('SshRelaySession', () => {
       ompExtensionSource: expect.stringContaining('/hook/omp')
     })
     expect(mockConn.sftp).toHaveBeenCalledTimes(1)
-    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/orca_botmux', {
+    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/botmux', {
       grokHomeDir: '/srv/grok profile'
     })
     expect(sftp.end).toHaveBeenCalledTimes(1)
@@ -309,9 +309,9 @@ describe('SshRelaySession', () => {
   })
 
   it('falls back to login-home Grok config when the remote env probe is invalid', async () => {
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '1'
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '1'
     muxRequestMock.mockImplementation(async (method: string) =>
-      method === 'session.resolveHome' ? { resolvedPath: '/home/orca_botmux' } : { ok: true }
+      method === 'session.resolveHome' ? { resolvedPath: '/home/botmux' } : { ok: true }
     )
     vi.mocked(execCommand)
       .mockResolvedValueOnce('/bin/bash\n')
@@ -323,13 +323,13 @@ describe('SshRelaySession', () => {
 
     await session.establish(mockConn)
 
-    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/orca_botmux', {
-      grokHomeDir: '/home/orca_botmux/.grok'
+    expect(installRemoteManagedAgentHooksMock).toHaveBeenCalledWith(sftp, '/home/botmux', {
+      grokHomeDir: '/home/botmux/.grok'
     })
   })
 
   it('does not run POSIX managed hook installers on Windows remotes', async () => {
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '1'
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '1'
     const { mockStore, mockPortForward, getMainWindow } = createMockDeps()
     const mockConn = {
       writeFile: vi.fn().mockResolvedValue(undefined)
@@ -343,9 +343,9 @@ describe('SshRelaySession', () => {
       platform: 'win32-x64',
       hostPlatform: getRemoteHostPlatform('win32-x64'),
       remoteHome: 'C:/Users/me',
-      remoteRelayDir: 'C:/Users/me/.orca-botmux-remote/relay-v1',
+      remoteRelayDir: 'C:/Users/me/.botmux-remote/relay-v1',
       nodePath: 'C:/Program Files/nodejs/node.exe',
-      sockPath: '\\\\.\\pipe\\orca-botmux-relay-123'
+      sockPath: '\\\\.\\pipe\\botmux-relay-123'
     })
     const session = new SshRelaySession('target-1', getMainWindow, mockStore, mockPortForward)
 
@@ -358,7 +358,7 @@ describe('SshRelaySession', () => {
   })
 
   it('does not register providers if dispose wins during initial plugin sync', async () => {
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '1'
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '1'
     let resolvePluginInstall!: () => void
     muxRequestMock.mockImplementation(async (method: string) => {
       if (method === AGENT_HOOK_INSTALL_PLUGINS_METHOD) {
@@ -426,7 +426,7 @@ describe('SshRelaySession', () => {
     expect(registerSshPtyProvider).toHaveBeenCalledWith('target-1', expect.anything())
   })
 
-  it('compiles a native Windows OrcaBotmux CLI bridge without a cmd.exe shim', async () => {
+  it('compiles a native Windows Botmux CLI bridge without a cmd.exe shim', async () => {
     const { mockStore, mockPortForward, getMainWindow } = createMockDeps()
     const mockConn = {
       writeFile: vi.fn().mockResolvedValue(undefined)
@@ -440,9 +440,9 @@ describe('SshRelaySession', () => {
       platform: 'win32-x64',
       hostPlatform: getRemoteHostPlatform('win32-x64'),
       remoteHome: 'C:/Users/me',
-      remoteRelayDir: 'C:/Users/me/.orca-botmux-remote/relay-v1',
+      remoteRelayDir: 'C:/Users/me/.botmux-remote/relay-v1',
       nodePath: 'C:/Program Files/nodejs/node.exe',
-      sockPath: '\\\\.\\pipe\\orca-botmux-relay-123'
+      sockPath: '\\\\.\\pipe\\botmux-relay-123'
     })
 
     const session = new SshRelaySession('target-1', getMainWindow, mockStore, mockPortForward)
@@ -453,12 +453,12 @@ describe('SshRelaySession', () => {
     expect(vi.mocked(execCommand).mock.calls[0]?.[1]).toContain('powershell.exe')
     expect(vi.mocked(execCommand).mock.calls[0]?.[2]).toEqual({ wrapCommand: false })
     expect(mockConn.writeFile).toHaveBeenCalledWith(
-      'C:/Users/me/.orca-botmux-relay/bin/orca-botmux-launcher.cs',
+      'C:/Users/me/.botmux-relay/bin/botmux-launcher.cs',
       expect.stringContaining('ProcessStartInfo'),
       { hostPlatform: getRemoteHostPlatform('win32-x64') }
     )
     const launcherSource = vi.mocked(mockConn.writeFile).mock.calls[0]?.[1] as string
-    expect(launcherSource).toContain('ORCA_RELAY_SOCKET_PATH')
+    expect(launcherSource).toContain('BOTMUX_RELAY_SOCKET_PATH')
     expect(launcherSource).not.toContain('cmd.exe')
     expect(launcherSource).not.toContain('%*')
     expect(vi.mocked(execCommand).mock.calls[1]?.[1]).toContain('powershell.exe')

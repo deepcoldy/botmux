@@ -226,7 +226,7 @@ export function shouldBypassXtermKeyboardEvent(
     : event.ctrlKey && !event.metaKey
 
   if (event.defaultPrevented && platformModifierHeld) {
-    // Why: window-level OrcaBotmux shortcuts may have already handled the chord but
+    // Why: window-level Botmux shortcuts may have already handled the chord but
     // not stopped propagation. Do not let xterm also send that shortcut to
     // the shell.
     return true

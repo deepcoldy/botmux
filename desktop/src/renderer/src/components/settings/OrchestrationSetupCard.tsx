@@ -1,7 +1,7 @@
 import type { JSX } from 'react'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  ensureOrcaCliAvailableForAgentSkillTerminal
+  ensureBotmuxCliAvailableForAgentSkillTerminal
 } from '@/lib/agent-skill-cli-prerequisite'
 import {
   ORCHESTRATION_SKILL_INSTALL_COMMAND,
@@ -48,7 +48,7 @@ export function OrchestrationSetupCard(props: {
       )}
       description={translate(
         'auto.components.settings.OrchestrationSetupCard.e7d2a5146c',
-        'Enables agents to hand off context and coordinate work through OrcaBotmux.'
+        'Enables agents to hand off context and coordinate work through Botmux.'
       )}
       command={installCommand}
       installedCommand={updateCommand}
@@ -73,7 +73,7 @@ export function OrchestrationSetupCard(props: {
         useAppStore.getState().recordFeatureInteraction('agent-orchestration-setup')
         await (activeSkillRuntime.agentRuntime?.runtime === 'wsl'
           ? ensureWslCliAvailableForAgentSkillTerminal(activeSkillRuntime.agentRuntime)
-          : ensureOrcaCliAvailableForAgentSkillTerminal())
+          : ensureBotmuxCliAvailableForAgentSkillTerminal())
       }}
       onRecheck={skill.refresh}
       freshnessSkillName={

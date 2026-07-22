@@ -20,7 +20,7 @@ function runGit(repoPath: string, args: string[]): void {
 }
 
 export function createIsolatedLargeDiffRepo(): IsolatedLargeDiffRepo {
-  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-large-diff-repro-')))
+  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'botmux-large-diff-repro-')))
   runGit(repoPath, ['init'])
   runGit(repoPath, ['config', 'user.email', 'e2e@test.local'])
   runGit(repoPath, ['config', 'user.name', 'E2E Test'])
@@ -63,7 +63,7 @@ function modifyLocaleLikeJson(content: string, fileIndex: number): string {
 }
 
 export function createIsolatedStagedLocaleDiffRepo(): IsolatedStagedLocaleDiffRepo {
-  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-staged-locale-repro-')))
+  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'botmux-staged-locale-repro-')))
   runGit(repoPath, ['init'])
   runGit(repoPath, ['config', 'user.email', 'e2e@test.local'])
   runGit(repoPath, ['config', 'user.name', 'E2E Test'])

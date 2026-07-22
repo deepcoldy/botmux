@@ -15,7 +15,7 @@ import type { GitPushTarget, GitStatusResult, GitUpstreamStatus } from '../../..
 const pushTarget: GitPushTarget = {
   remoteName: 'fork',
   branchName: 'feature/pr-head',
-  remoteUrl: 'https://github.com/contributor/orca_botmux.git'
+  remoteUrl: 'https://github.com/contributor/botmux.git'
 }
 
 const unchangedStatus: GitStatusResult = {

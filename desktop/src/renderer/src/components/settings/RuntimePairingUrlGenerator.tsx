@@ -336,7 +336,7 @@ export function RuntimePairingUrlGenerator({
           <Label id="runtime-share-server-label">
             {translate(
               'auto.components.settings.RuntimePairingUrlGenerator.f8500e134a',
-              'Share this OrcaBotmux server'
+              'Share this Botmux server'
             )}
           </Label>
           <p className="text-xs text-muted-foreground">

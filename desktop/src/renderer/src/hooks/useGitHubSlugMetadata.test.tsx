@@ -76,7 +76,7 @@ describe('useGitHubSlugMetadata', () => {
 
     function LabelsProbe(): null {
       renders += 1
-      const metadata = useRepoLabelsBySlug('stablyai', 'orca_botmux', {
+      const metadata = useRepoLabelsBySlug('stablyai', 'botmux', {
         activeRuntimeEnvironmentId: null
       })
       labels = metadata.data
@@ -89,7 +89,7 @@ describe('useGitHubSlugMetadata', () => {
     expect(labels).toEqual(['bug'])
     expect(apiMocks.listLabelsBySlug).toHaveBeenCalledExactlyOnceWith({
       owner: 'stablyai',
-      repo: 'orca_botmux'
+      repo: 'botmux'
     })
     expect(renders).toBeLessThanOrEqual(4)
   })
@@ -104,7 +104,7 @@ describe('useGitHubSlugMetadata', () => {
 
     function AssigneesProbe(): null {
       renders += 1
-      const metadata = useRepoAssigneesBySlug('stablyai', 'orca_botmux', ['jinwoo'], {
+      const metadata = useRepoAssigneesBySlug('stablyai', 'botmux', ['jinwoo'], {
         activeRuntimeEnvironmentId: null
       })
       assigneeLogins = metadata.data.map((user) => user.login)
@@ -117,7 +117,7 @@ describe('useGitHubSlugMetadata', () => {
     expect(assigneeLogins).toEqual(['jinwoo'])
     expect(apiMocks.listAssignableUsersBySlug).toHaveBeenCalledExactlyOnceWith({
       owner: 'stablyai',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       seedLogins: ['jinwoo']
     })
     expect(renders).toBeLessThanOrEqual(4)
@@ -133,7 +133,7 @@ describe('useGitHubSlugMetadata', () => {
 
     function FailingLabelsProbe(): null {
       renders += 1
-      const metadata = useRepoLabelsBySlug('stablyai', 'orca_botmux', {
+      const metadata = useRepoLabelsBySlug('stablyai', 'botmux', {
         activeRuntimeEnvironmentId: null
       })
       error = metadata.error
@@ -158,7 +158,7 @@ describe('useGitHubSlugMetadata', () => {
 
     function FailingAssigneesProbe(): null {
       renders += 1
-      const metadata = useRepoAssigneesBySlug('stablyai', 'orca_botmux', ['jinwoo'], {
+      const metadata = useRepoAssigneesBySlug('stablyai', 'botmux', ['jinwoo'], {
         activeRuntimeEnvironmentId: null
       })
       error = metadata.error

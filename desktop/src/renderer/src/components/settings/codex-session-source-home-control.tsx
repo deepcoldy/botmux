@@ -125,7 +125,7 @@ export function AgentSessionSourceHomeInput({
           <TooltipContent side="top" sideOffset={6} className="max-w-xs">
             {translate(
               'auto.components.settings.AgentsPane.codexSessionSourceTooltip',
-              'OrcaBotmux runs Codex in an isolated home. Point this at your existing Codex home to import that session history. Empty uses ~/.codex.'
+              'Botmux runs Codex in an isolated home. Point this at your existing Codex home to import that session history. Empty uses ~/.codex.'
             )}
           </TooltipContent>
         </Tooltip>

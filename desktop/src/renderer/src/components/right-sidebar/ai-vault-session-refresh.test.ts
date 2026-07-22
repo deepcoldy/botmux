@@ -325,7 +325,7 @@ describe('useAiVaultSessionRefresh refocus behavior', () => {
 })
 
 describe('useAiVaultSessionRefresh in-app agent session behavior', () => {
-  it('force re-scans when an agent session starts inside OrcaBotmux', async () => {
+  it('force re-scans when an agent session starts inside Botmux', async () => {
     await renderHook()
     await flushMicrotasks()
     expect(listSessionsMock).toHaveBeenCalledTimes(1)

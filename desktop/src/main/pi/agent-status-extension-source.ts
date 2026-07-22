@@ -3,17 +3,17 @@
 // etc.). To get pi panes into the unified agent-hooks pipeline alongside
 // Claude/Codex/Gemini/OpenCode/Cursor, we ship a bundled extension into
 // the selected Pi/OMP extension dir (PiTitlebarExtensionService) that POSTs to
-// /hook/<kind> using the same ORCA_AGENT_HOOK_* + ORCA_PANE_KEY env that every
+// /hook/<kind> using the same BOTMUX_AGENT_HOOK_* + BOTMUX_PANE_KEY env that every
 // PTY already receives from ipc/pty.ts.
 //
 // Each Pi process gets its own paneKey through env. Like the OpenCode plugin,
 // the returned source is a string (loaded by jiti from disk inside the pi process), so we
 // keep the source body in plain JS without TS types and avoid pulling pi or
-// any OrcaBotmux dep into the pi runtime.
+// any Botmux dep into the pi runtime.
 import type { PiAgentKind } from '../../shared/pi-agent-kind'
 import { getPiAgentStatusHandlerSourceLines } from './agent-status-handler-source'
 
-export const ORCA_PI_AGENT_STATUS_EXTENSION_FILE = 'orca-botmux-agent-status.ts'
+export const BOTMUX_PI_AGENT_STATUS_EXTENSION_FILE = 'botmux-agent-status.ts'
 
 export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): string {
   const sessionMetadataSourceLines =
@@ -52,9 +52,9 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
       : '    payload: { hook_event_name: hookEventName, ...extra },'
 
   // Why: keep this string self-contained — it runs inside the pi process,
-  // so it cannot import from OrcaBotmux's main bundle. fs/http coords come from
+  // so it cannot import from Botmux's main bundle. fs/http coords come from
   // the same endpoint file the OpenCode plugin reads (process.env is frozen
-  // at PTY spawn, so on OrcaBotmux restart we have to re-read it from disk).
+  // at PTY spawn, so on Botmux restart we have to re-read it from disk).
   return [
     '// Why: no package-specific type import here. Pi and OMP expose the same',
     '// extension API, but publish their types under different package names.',
@@ -63,7 +63,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     'let warnedBadEndpoint = false',
     '// Why: Pi awaits extension handlers. Status delivery stays off that',
     '// critical path, and the latest-only pending slot prevents a stalled',
-    '// OrcaBotmux receiver from building an unbounded queue of obsolete snapshots.',
+    '// Botmux receiver from building an unbounded queue of obsolete snapshots.',
     'const HOOK_POST_TIMEOUT_MS = 1000',
     'let activePost = false',
     'let pendingPost: { hookEventName: string; extra: Record<string, unknown> } | null = null',
@@ -76,7 +76,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     'let cachedEndpointValues: Record<string, string> | null = null',
     '',
     'function readEndpointFile(): Record<string, string> | null {',
-    '  const path = process.env.ORCA_AGENT_HOOK_ENDPOINT',
+    '  const path = process.env.BOTMUX_AGENT_HOOK_ENDPOINT',
     '  if (!path) return null',
     '  try {',
     "    const fs = require('fs')",
@@ -107,7 +107,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     '    const code = (err as { code?: string } | null)?.code',
     "    if (err && code !== 'ENOENT' && !warnedBadEndpoint) {",
     '      warnedBadEndpoint = true',
-    "      console.warn('[orca-botmux-pi-status] failed to parse endpoint file:', (err as Error).message)",
+    "      console.warn('[botmux-pi-status] failed to parse endpoint file:', (err as Error).message)",
     '    }',
     '    return null',
     '  }',
@@ -116,10 +116,10 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     'function resolveHookCoords() {',
     '  const fileEnv = readEndpointFile() || {}',
     '  return {',
-    '    port: fileEnv.ORCA_AGENT_HOOK_PORT || process.env.ORCA_AGENT_HOOK_PORT,',
-    '    token: fileEnv.ORCA_AGENT_HOOK_TOKEN || process.env.ORCA_AGENT_HOOK_TOKEN,',
-    "    env: fileEnv.ORCA_AGENT_HOOK_ENV || process.env.ORCA_AGENT_HOOK_ENV || '',",
-    "    version: fileEnv.ORCA_AGENT_HOOK_VERSION || process.env.ORCA_AGENT_HOOK_VERSION || '',",
+    '    port: fileEnv.BOTMUX_AGENT_HOOK_PORT || process.env.BOTMUX_AGENT_HOOK_PORT,',
+    '    token: fileEnv.BOTMUX_AGENT_HOOK_TOKEN || process.env.BOTMUX_AGENT_HOOK_TOKEN,',
+    "    env: fileEnv.BOTMUX_AGENT_HOOK_ENV || process.env.BOTMUX_AGENT_HOOK_ENV || '',",
+    "    version: fileEnv.BOTMUX_AGENT_HOOK_VERSION || process.env.BOTMUX_AGENT_HOOK_VERSION || '',",
     '  }',
     '}',
     '',
@@ -170,14 +170,14 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     '  extra: Record<string, unknown>',
     '): Promise<void> {',
     '  const coords = resolveHookCoords()',
-    '  const paneKey = process.env.ORCA_PANE_KEY',
+    '  const paneKey = process.env.BOTMUX_PANE_KEY',
     '  if (!coords.port || !coords.token || !paneKey) return',
     '  const url = `http://127.0.0.1:${coords.port}${resolveHookPath()}`',
     '  const body = JSON.stringify({',
     '    paneKey,',
-    "    launchToken: process.env.ORCA_AGENT_LAUNCH_TOKEN || '',",
-    "    tabId: process.env.ORCA_TAB_ID || '',",
-    "    worktreeId: process.env.ORCA_WORKTREE_ID || '',",
+    "    launchToken: process.env.BOTMUX_AGENT_LAUNCH_TOKEN || '',",
+    "    tabId: process.env.BOTMUX_TAB_ID || '',",
+    "    worktreeId: process.env.BOTMUX_WORKTREE_ID || '',",
     '    env: coords.env,',
     '    version: coords.version,',
     payloadLine,
@@ -187,7 +187,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     '  const timeoutPromise = new Promise<never>((_resolve, reject) => {',
     '    timeout = setTimeout(() => {',
     '      controller?.abort()',
-    "      reject(new Error('OrcaBotmux hook delivery timed out'))",
+    "      reject(new Error('Botmux hook delivery timed out'))",
     '    }, HOOK_POST_TIMEOUT_MS)',
     "    if (typeof timeout.unref === 'function') timeout.unref()",
     '  })',
@@ -197,7 +197,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     "        method: 'POST',",
     '        headers: {',
     "          'Content-Type': 'application/json',",
-    "          'X-OrcaBotmux-Agent-Hook-Token': coords.token,",
+    "          'X-Botmux-Agent-Hook-Token': coords.token,",
     '        },',
     '        body,',
     '        ...(controller ? { signal: controller.signal } : {}),',
@@ -205,8 +205,8 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     '      timeoutPromise,',
     '    ])',
     '  } catch {',
-    '    // Why: status reporting must never fail the pi run just because OrcaBotmux',
-    '    // is unavailable or the loopback request failed (e.g. OrcaBotmux restart).',
+    '    // Why: status reporting must never fail the pi run just because Botmux',
+    '    // is unavailable or the loopback request failed (e.g. Botmux restart).',
     '    if (!isWslRuntime()) return',
     '    postViaWindowsCurl(url, coords, body)',
     '  } finally {',
@@ -257,8 +257,8 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     '}',
     '',
     '// Why: WSL loopback is not the Windows loopback, so a WSL-side POST cannot',
-    '// reach OrcaBotmux. curl.exe runs on the Windows side, where 127.0.0.1 IS the',
-    '// listener OrcaBotmux binds. Fire-and-forget: blocking on the spawn would stall',
+    '// reach Botmux. curl.exe runs on the Windows side, where 127.0.0.1 IS the',
+    '// listener Botmux binds. Fire-and-forget: blocking on the spawn would stall',
     '// the pi event loop (and the TUI) on every hook event.',
     'function postViaWindowsCurl(url: string, coords: { token: string }, body: string): void {',
     '  const curlPath = resolveWindowsCurlPath()',
@@ -279,7 +279,7 @@ export function getPiAgentStatusExtensionSource(kind: PiAgentKind = 'pi'): strin
     "        '-o', 'NUL',",
     "        '-X', 'POST',",
     "        '-H', 'Content-Type: application/json',",
-    "        '-H', `X-OrcaBotmux-Agent-Hook-Token: ${coords.token}`,",
+    "        '-H', `X-Botmux-Agent-Hook-Token: ${coords.token}`,",
     "        '--data-binary', '@-',",
     '        url',
     '      ],',

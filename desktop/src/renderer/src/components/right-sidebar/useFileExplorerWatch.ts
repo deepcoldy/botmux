@@ -48,7 +48,7 @@ export function getExternalFileChangeRelativePath(
   }
 
   // Why: EditorPanel only reloads open tabs after the renderer emits
-  // `orca_botmux:editor-external-file-change` with a worktree-relative path. The
+  // `botmux:editor-external-file-change` with a worktree-relative path. The
   // filesystem watcher reports absolute paths, so normalize them here before
   // the explorer refresh path returns; otherwise terminal edits refresh the
   // tree but leave the editor's cached file contents stale.

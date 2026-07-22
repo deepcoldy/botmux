@@ -9,7 +9,7 @@ import { translate } from '@/i18n/i18n'
 import type { AutomationWorkspaceMode } from '../../../../shared/automations-types'
 import type {
   GlobalSettings,
-  OrcaHooks,
+  BotmuxHooks,
   ProjectHostSetup,
   Repo,
   Worktree
@@ -33,7 +33,7 @@ type AutomationEditorDialogFooterProps = {
   canSave: boolean
   repos: Repo[]
   projectHostSetups: ProjectHostSetup[]
-  automationYamlHooksByRepoKey: Record<string, OrcaHooks | null>
+  automationYamlHooksByRepoKey: Record<string, BotmuxHooks | null>
   getAutomationHooksCacheKey: (repoId: string) => string
   repoMap: Map<string, Repo>
   worktrees: Worktree[]
@@ -198,7 +198,7 @@ export function AutomationEditorDialogFooter({
         {isHermesTarget ? scheduleField : null}
       </div>
 
-      {/* Why: Hermes uses one compact footer row, while OrcaBotmux adds agent,
+      {/* Why: Hermes uses one compact footer row, while Botmux adds agent,
           session, schedule, and missed-run controls. Animate that row so
           switching the target changes the dialog height smoothly. */}
       <div
@@ -252,7 +252,7 @@ export function AutomationEditorDialogFooter({
               switch is a per-automation preference, not a peer of the compact
               column pickers, so it reads cleaner spanning the dialog. */}
           <AutomationSetupDecisionField
-            createTarget={isHermesTarget ? 'hermes' : 'orca_botmux'}
+            createTarget={isHermesTarget ? 'hermes' : 'botmux'}
             draft={draft}
             repos={repos}
             projectHostSetups={projectHostSetups}

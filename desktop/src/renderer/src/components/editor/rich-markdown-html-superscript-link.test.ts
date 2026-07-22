@@ -142,7 +142,7 @@ describe('rich Markdown HTML superscript links', () => {
 
   it('preserves authored current-key and legacy transport-looking text', () => {
     const transport = createRichMarkdownSourceTransport(TEST_KEY)
-    const authored = `${transport.create('inline-html', '<b>authored</b>')} [[ORCA_RAW_HTML_INLINE:%3Ci%3Ex%3C%2Fi%3E]]`
+    const authored = `${transport.create('inline-html', '<b>authored</b>')} [[BOTMUX_RAW_HTML_INLINE:%3Ci%3Ex%3C%2Fi%3E]]`
     const editor = createEditor(authored)
     try {
       editor.commands.insertContentAt(editor.state.doc.content.size - 1, '!')
@@ -199,7 +199,7 @@ describe('rich Markdown HTML superscript links', () => {
     expect(parseHtmlSuperscriptLinkSource('<sup><a href="a" href="b">[1]</a></sup>')).toBeNull()
   })
 
-  it('renders inert live DOM while exposing link semantics through OrcaBotmux context', () => {
+  it('renders inert live DOM while exposing link semantics through Botmux context', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const source = '<sup><a href="https://example.com">[12]</a></sup>'
@@ -370,7 +370,7 @@ describe('rich Markdown HTML superscript links', () => {
     const encodeSpy = vi.spyOn(TextEncoder.prototype, 'encode')
     try {
       editor.commands.setContent(
-        `<sup data-rich-markdown-html-superscript-link="1" data-orca-botmux-superscript-link-source="${oversizedSource}"><a>x</a></sup>`,
+        `<sup data-rich-markdown-html-superscript-link="1" data-botmux-superscript-link-source="${oversizedSource}"><a>x</a></sup>`,
         { contentType: 'html' }
       )
       expect(nodeNames(editor)).not.toContain('richMarkdownHtmlSuperscriptLink')
@@ -424,7 +424,7 @@ describe('rich Markdown HTML superscript links', () => {
         } as unknown as ClipboardEvent
         expect(handleRichMarkdownCut(citationOnly.view, event)).toBe(true)
         expect(clipboard.get('text/plain')).toBe('[12]')
-        expect(clipboard.get('text/html')).toContain('data-orca-botmux-superscript-link-source')
+        expect(clipboard.get('text/html')).toContain('data-botmux-superscript-link-source')
         expect(citationOnly.getMarkdown()).toBe('')
       } finally {
         citationOnly.destroy()

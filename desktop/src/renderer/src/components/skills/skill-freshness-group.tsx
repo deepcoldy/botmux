@@ -47,7 +47,7 @@ function chipTooltip(chip: SkillLocationChip): string {
     case 'inaccessible':
       return translate(
         'auto.components.skills.SkillFreshnessRow.tipInaccessible',
-        'OrcaBotmux couldn’t read this copy (a permissions or file error).'
+        'Botmux couldn’t read this copy (a permissions or file error).'
       )
     case 'duplicate':
       return translate(
@@ -57,7 +57,7 @@ function chipTooltip(chip: SkillLocationChip): string {
     case 'external-link':
       return translate(
         'auto.components.skills.SkillFreshnessRow.tipExternalLink',
-        'A shortcut pointing outside OrcaBotmux’s skill folders.'
+        'A shortcut pointing outside Botmux’s skill folders.'
       )
     case 'broken-link':
       return translate(
@@ -102,42 +102,42 @@ function skippedReason(locations: readonly SkillLocationRow[]): string {
     case 'unrecognized':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonUnrecognized',
-        'The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. OrcaBotmux left it out of the update so it won’t overwrite it. Remove it if you want OrcaBotmux to update this skill.'
+        'The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. Botmux left it out of the update so it won’t overwrite it. Remove it if you want Botmux to update this skill.'
       )
     case 'read-only':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonReadOnly',
-        'This copy is in a read-only location, so OrcaBotmux left it out of the update. Change its permissions to let OrcaBotmux update it.'
+        'This copy is in a read-only location, so Botmux left it out of the update. Change its permissions to let Botmux update it.'
       )
     case 'inaccessible':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonInaccessible',
-        'OrcaBotmux couldn’t read this copy, so it left the skill out of the update.'
+        'Botmux couldn’t read this copy, so it left the skill out of the update.'
       )
     case 'in-a-repo':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonInRepo',
-        'This is a project skill, not a global one — OrcaBotmux only updates your global skills, so it left this out of the update.'
+        'This is a project skill, not a global one — Botmux only updates your global skills, so it left this out of the update.'
       )
     case 'plugin-cache':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonPluginCache',
-        'A plugin manages this skill, so OrcaBotmux left it out of the update — update the plugin instead.'
+        'A plugin manages this skill, so Botmux left it out of the update — update the plugin instead.'
       )
     case 'external-link':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonExternalLink',
-        'This copy is a shortcut pointing outside OrcaBotmux’s skill folders, so OrcaBotmux left it out of the update.'
+        'This copy is a shortcut pointing outside Botmux’s skill folders, so Botmux left it out of the update.'
       )
     case 'broken-link':
       return translate(
         'auto.components.skills.SkillFreshnessRow.skippedReasonBrokenLink',
-        'This copy is a shortcut to something that no longer exists, so OrcaBotmux left it out — you can safely delete it.'
+        'This copy is a shortcut to something that no longer exists, so Botmux left it out — you can safely delete it.'
       )
     default:
       return translate(
         'auto.components.skills.SkillFreshnessRow.cantUpdateReason',
-        'OrcaBotmux left this skill out of the update command.'
+        'Botmux left this skill out of the update command.'
       )
   }
 }

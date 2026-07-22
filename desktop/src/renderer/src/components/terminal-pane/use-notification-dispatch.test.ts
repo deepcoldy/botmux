@@ -138,7 +138,7 @@ describe('dispatchTerminalNotification', () => {
           }
         ]
       },
-      repos: [{ id: 'repo1', displayName: 'orca_botmux', connectionId: null }],
+      repos: [{ id: 'repo1', displayName: 'botmux', connectionId: null }],
       settings: { experimentalTerminalAttention: true, notifications: { customSoundPath: null } },
       markWorktreeUnread: vi.fn(),
       markTerminalTabUnread: vi.fn(),
@@ -175,7 +175,7 @@ describe('dispatchTerminalNotification', () => {
         }),
         worktreeId: 'wt-primary',
         paneKey,
-        repoLabel: 'orca_botmux',
+        repoLabel: 'botmux',
         worktreeLabel: 'master',
         terminalTitle: 'codex',
         isActiveWorktree: false,
@@ -338,7 +338,7 @@ describe('dispatchTerminalNotification', () => {
     expect(mockState.markTerminalPaneUnread).toHaveBeenCalledWith(siblingPaneKey)
   })
 
-  it('marks the selected worktree unread when OrcaBotmux is backgrounded', () => {
+  it('marks the selected worktree unread when Botmux is backgrounded', () => {
     mockState.settings.experimentalTerminalAttention = false
     mockState.activeWorktreeId = 'wt-primary'
     stubDocumentFocus({ visibilityState: 'hidden', focused: false })
@@ -669,7 +669,7 @@ describe('dispatchTerminalNotification', () => {
 
     dispatchTerminalNotification('wt-primary', {
       source: 'agent-task-complete',
-      terminalTitle: '/workspace/orca_botmux',
+      terminalTitle: '/workspace/botmux',
       paneKey
     })
 

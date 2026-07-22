@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { ElectronApplication, Locator } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 
 const tempRoots: string[] = []
@@ -32,7 +32,7 @@ async function createShallowPriorityTruncationFixture(): Promise<{
   // repo.path / projectGroup.parentPath on macOS, where os.tmpdir() (/var/...)
   // symlinks to /private/var/... and the app canonicalizes paths on import.
   const parentPath = realpathSync(
-    await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-shallow-priority-'))
+    await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-shallow-priority-'))
   )
   tempRoots.push(parentPath)
   const archivePath = path.join(parentPath, 'archive')
@@ -63,7 +63,7 @@ async function createCancellableScanFixture(): Promise<{
   // canonicalized repo.path / projectGroup.parentPath on macOS (os.tmpdir()
   // /var/... symlinks to /private/var/...).
   const parentPath = realpathSync(
-    await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-cancellable-scan-'))
+    await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-cancellable-scan-'))
   )
   tempRoots.push(parentPath)
   const apiPath = path.join(parentPath, 'api')
@@ -160,21 +160,21 @@ test.afterEach(() => {
 
 test('prioritizes shallow sibling repositories in a bounded nested scan', async ({
   electronApp,
-  orcaBotmuxPage
+  botmuxPage
 }) => {
-  await waitForSessionReady(orcaBotmuxPage)
+  await waitForSessionReady(botmuxPage)
   const fixture = await createShallowPriorityTruncationFixture()
   await chooseFolderInNativeDialog(electronApp, fixture.parentPath)
 
-  await orcaBotmuxPage
+  await botmuxPage
     .getByRole('button', { name: /Add Project/i })
     .first()
     .click()
-  const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Add a project/i })
+  const dialog = botmuxPage.getByRole('dialog', { name: /Add a project/i })
   await expect(dialog).toBeVisible()
   await dialog.getByRole('button', { name: /Browse folder/i }).click()
 
-  const importDialog = orcaBotmuxPage.getByRole('dialog', {
+  const importDialog = botmuxPage.getByRole('dialog', {
     name: /Import repositories from folder/i
   })
   await expect(importDialog.getByText(/Found 100 repositories in/)).toBeVisible()
@@ -192,7 +192,7 @@ test('prioritizes shallow sibling repositories in a bounded nested scan', async 
   await expect
     .poll(
       () =>
-        orcaBotmuxPage.evaluate(
+        botmuxPage.evaluate(
           (args) => {
             const state = window.__store?.getState()
             if (!state) {
@@ -227,20 +227,20 @@ test('prioritizes shallow sibling repositories in a bounded nested scan', async 
       importedArchiveCount: 0
     })
 
-  await orcaBotmuxPage.evaluate(() => {
+  await botmuxPage.evaluate(() => {
     const state = window.__store?.getState()
     state?.closeModal()
     state?.setGroupBy('repo')
   })
-  await expect(orcaBotmuxPage.getByText(fixture.groupName)).toBeVisible()
-  await expect(orcaBotmuxPage.getByText('z-web-client').first()).toBeVisible()
+  await expect(botmuxPage.getByText(fixture.groupName)).toBeVisible()
+  await expect(botmuxPage.getByText('z-web-client').first()).toBeVisible()
 })
 
 test('can stop a nested repo scan and import repositories found so far', async ({
   electronApp,
-  orcaBotmuxPage
+  botmuxPage
 }) => {
-  await waitForSessionReady(orcaBotmuxPage)
+  await waitForSessionReady(botmuxPage)
   const fixture = await createCancellableScanFixture()
   await installCancellableNestedScanMock(electronApp, {
     selectedPath: fixture.parentPath,
@@ -256,14 +256,14 @@ test('can stop a nested repo scan and import repositories found so far', async (
   })
   await chooseFolderInNativeDialog(electronApp, fixture.parentPath)
 
-  await orcaBotmuxPage
+  await botmuxPage
     .getByRole('button', { name: /Add Project/i })
     .first()
     .click()
-  const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Add a project/i })
+  const dialog = botmuxPage.getByRole('dialog', { name: /Add a project/i })
   await dialog.getByRole('button', { name: /Browse folder/i }).click()
 
-  const importDialog = orcaBotmuxPage.getByRole('dialog', {
+  const importDialog = botmuxPage.getByRole('dialog', {
     name: /Import repositories from folder/i
   })
   await expect(importDialog.getByText(/Scanning\.\.\.\s*Found 1 repository in/)).toBeVisible()
@@ -278,7 +278,7 @@ test('can stop a nested repo scan and import repositories found so far', async (
   await expect
     .poll(
       () =>
-        orcaBotmuxPage.evaluate((args) => {
+        botmuxPage.evaluate((args) => {
           const state = window.__store?.getState()
           if (!state) {
             return null

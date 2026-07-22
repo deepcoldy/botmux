@@ -1,4 +1,4 @@
-export type CodexUsageScope = 'orca_botmux' | 'all'
+export type CodexUsageScope = 'botmux' | 'all'
 export type CodexUsageRange = '7d' | '30d' | '90d' | 'all'
 export type CodexUsageBreakdownKind = 'model' | 'project'
 

@@ -129,12 +129,12 @@ function git(cwd, ...cmd) {
  *  cards total. Native paths keep the benchmark portable and representative of
  *  the default local workflow, unlike the WSL-specific apphang fixture. */
 function createLocalRepoFixture() {
-  const baseDir = mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-termperf-'))
+  const baseDir = mkdtempSync(path.join(os.tmpdir(), 'botmux-termperf-'))
   const repoPath = path.join(baseDir, 'repo')
   mkdirSync(repoPath, { recursive: true })
   git(repoPath, 'init', '--initial-branch=main')
-  git(repoPath, 'config', 'user.email', 'bench@orca_botmux.local')
-  git(repoPath, 'config', 'user.name', 'OrcaBotmux Bench')
+  git(repoPath, 'config', 'user.email', 'bench@botmux.local')
+  git(repoPath, 'config', 'user.name', 'Botmux Bench')
   writeFileSync(path.join(repoPath, 'README.md'), '# terminal perf fixture\n')
   git(repoPath, 'add', '.')
   git(repoPath, 'commit', '-m', 'init', '--no-gpg-sign')
@@ -149,7 +149,7 @@ function createLocalRepoFixture() {
 
 async function setupWorkspaces(page, fixture) {
   return await runWithTimeout(
-    'fixture registration in OrcaBotmux',
+    'fixture registration in Botmux',
     () =>
       page.evaluate(
         async ({ repoPath, importedWorktreePaths }) => {
@@ -572,7 +572,7 @@ async function main() {
         report.cleanupErrors.push(error instanceof Error ? error.message : String(error))
       }
       report.appLogsTail = launched.logs.slice(-80)
-      // Main-process phase attribution (requires ORCA_PTY_SPAWN_TIMING=1 in the
+      // Main-process phase attribution (requires BOTMUX_PTY_SPAWN_TIMING=1 in the
       // benchmark's environment; launchDevApp inherits it into the app).
       report.ptySpawnTimings = launched.logs
         .filter((entry) => entry.line.includes('[pty-spawn-timing]'))

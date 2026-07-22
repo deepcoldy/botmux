@@ -66,7 +66,7 @@ describe('registerMobileHandlers', () => {
     })
     const createMobilePairingOffer = vi.fn().mockResolvedValue({
       available: true,
-      pairingUrl: 'orca_botmux://pair#mobile',
+      pairingUrl: 'botmux://pair#mobile',
       endpoint: 'ws://100.102.47.57:6768',
       deviceId: 'mobile-1',
       connectionMode: 'automatic'
@@ -77,7 +77,7 @@ describe('registerMobileHandlers', () => {
 
     await expect(handlers.get('mobile:getPairingQR')?.(null, {})).resolves.toMatchObject({
       available: true,
-      pairingUrl: 'orca_botmux://pair#mobile',
+      pairingUrl: 'botmux://pair#mobile',
       endpoint: 'ws://100.102.47.57:6768',
       deviceId: 'mobile-1',
       // The encoded mode passes through so the UI can flag a degraded mint.
@@ -98,7 +98,7 @@ describe('registerMobileHandlers', () => {
     })
     const createMobilePairingOffer = vi.fn().mockResolvedValue({
       available: true,
-      pairingUrl: 'orca_botmux://pair#local',
+      pairingUrl: 'botmux://pair#local',
       endpoint: 'ws://192.168.1.24:6768',
       deviceId: 'mobile-local',
       connectionMode: 'local-only'
@@ -158,7 +158,7 @@ describe('registerMobileHandlers', () => {
   it('generates runtime-scoped pairing urls for web and desktop clients', async () => {
     const createPairingOffer = vi.fn().mockReturnValue({
       available: true,
-      pairingUrl: 'orca_botmux://pair#runtime',
+      pairingUrl: 'botmux://pair#runtime',
       webClientUrl: 'http://100.64.1.20:6768/web-index.html?pairing=runtime',
       endpoint: 'ws://100.64.1.20:6768',
       deviceId: 'runtime-1'
@@ -174,7 +174,7 @@ describe('registerMobileHandlers', () => {
       })
     ).resolves.toEqual({
       available: true,
-      pairingUrl: 'orca_botmux://pair#runtime',
+      pairingUrl: 'botmux://pair#runtime',
       webClientUrl: 'http://100.64.1.20:6768/web-index.html?pairing=runtime',
       endpoint: 'ws://100.64.1.20:6768',
       deviceId: 'runtime-1'
@@ -289,7 +289,7 @@ describe('registerMobileHandlers', () => {
       firewallEnvironment: {
         platform: 'win32',
         isPackaged: true,
-        executablePath: 'C:\\Program Files\\OrcaBotmux\\OrcaBotmux.exe',
+        executablePath: 'C:\\Program Files\\Botmux\\Botmux.exe',
         runPowerShell
       }
     })
@@ -311,7 +311,7 @@ describe('registerMobileHandlers', () => {
       firewallEnvironment: {
         platform: 'win32',
         isPackaged: true,
-        executablePath: 'C:\\Program Files\\OrcaBotmux\\OrcaBotmux.exe',
+        executablePath: 'C:\\Program Files\\Botmux\\Botmux.exe',
         runPowerShell
       }
     })

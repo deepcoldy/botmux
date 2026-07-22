@@ -126,10 +126,10 @@ describe('GitHub PR local runtime routing', () => {
 
   it('routes PR details and mutations through the selected WSL distro', async () => {
     const localGitOptions = { wslDistro: 'Ubuntu' }
-    const prRepo = { owner: 'acme', repo: 'orca_botmux' }
+    const prRepo = { owner: 'acme', repo: 'botmux' }
     getOwnerRepoMock.mockResolvedValue(prRepo)
     ghExecFileAsyncMock.mockImplementation(async (args: string[]) => {
-      const endpoint = args.find((arg) => arg.startsWith('repos/acme/orca_botmux/')) ?? ''
+      const endpoint = args.find((arg) => arg.startsWith('repos/acme/botmux/')) ?? ''
       const query = args.find((arg) => arg.startsWith('query=')) ?? ''
 
       if (args[0] === 'pr' && args[1] === 'view') {
@@ -139,7 +139,7 @@ describe('GitHub PR local runtime routing', () => {
             number: 7,
             title: 'PR',
             state: 'OPEN',
-            url: 'https://github.com/acme/orca_botmux/pull/7',
+            url: 'https://github.com/acme/botmux/pull/7',
             statusCheckRollup: [],
             updatedAt: '2026-04-01T00:00:00Z',
             isDraft: false,

@@ -27,14 +27,18 @@ import { translate } from '@/i18n/i18n'
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-function releaseUrlForVersion(version: string | null): string {
-  // Why: when no version is cached (typically a failed check), point at the
-  // plain releases listing rather than /releases/latest — /latest also breaks
-  // when GitHub's release API is degraded, and the listing is the most
-  // reliable manual fallback.
-  return version
-    ? `https://github.com/stablyai/orca_botmux/releases/tag/v${version}`
-    : 'https://github.com/stablyai/orca_botmux/releases'
+// Why: reserved until Botmux publishes GitHub releases under its fork.
+// Empty keeps UpdateCard from opening a dead or wrong-org link.
+function releaseUrlForVersion(_version: string | null): string {
+  return ''
+}
+
+function openReleaseNotesUrl(url: string | null | undefined): void {
+  const trimmed = url?.trim()
+  if (!trimmed) {
+    return
+  }
+  void window.api.shell.openUrl(trimmed)
 }
 
 function isAnimatedGif(url: string | undefined): boolean {
@@ -372,7 +376,7 @@ export function UpdateCard() {
         ? {
             variant: 'http1Compatibility',
             title: translate('auto.components.UpdateCard.1339b82cee', 'HTTP/2 Download Blocked'),
-            summary: 'OrcaBotmux can retry through HTTP/1.1 compatibility mode.',
+            summary: 'Botmux can retry through HTTP/1.1 compatibility mode.',
             explainer: translate(
               'auto.components.UpdateCard.90559b14e3',
               'This turns on a process-wide Electron networking switch after restart. Use it for corporate VPNs or proxies that reject HTTP/2 update downloads.'
@@ -394,7 +398,7 @@ export function UpdateCard() {
               title: translate('auto.components.UpdateCard.5b309b19f3', "Update Wasn't Installed"),
               summary: translate(
                 'auto.components.UpdateCard.092f09fc14',
-                "The installer's publisher doesn't match OrcaBotmux, so we stopped the update. Don't install this download; check official releases for a corrected version."
+                "The installer's publisher doesn't match Botmux, so we stopped the update. Don't install this download; check official releases for a corrected version."
               ),
               detail: status.message,
               // Why: linking the rejected version directly would invite users
@@ -424,7 +428,7 @@ export function UpdateCard() {
               }
             : {
                 // Why: title is scoped to the operation that failed so check-time
-                // failures (commonly GitHub-side) don't read as a bug in OrcaBotmux.
+                // failures (commonly GitHub-side) don't read as a bug in Botmux.
                 title: cachedVersion ? 'Update Error' : 'Update Check Failed',
                 summary: cachedVersion
                   ? 'Could not complete the update.'
@@ -771,23 +775,27 @@ function RichCardContent({
         {releasesBehind !== null && releasesBehind > 1 && (
           <>
             {' '}
-            <button
-              className="text-xs text-muted-foreground/70 underline hover:text-foreground inline"
-              onClick={() => void window.api.shell.openUrl(release.releaseNotesUrl)}
-            >
-              +{releasesBehind - 1}{' '}
-              {translate('auto.components.UpdateCard.ccd8b0a793', 'more since your last update')}
-            </button>
+            {release.releaseNotesUrl ? (
+              <button
+                className="text-xs text-muted-foreground/70 underline hover:text-foreground inline"
+                onClick={() => openReleaseNotesUrl(release.releaseNotesUrl)}
+              >
+                +{releasesBehind - 1}{' '}
+                {translate('auto.components.UpdateCard.ccd8b0a793', 'more since your last update')}
+              </button>
+            ) : null}
           </>
         )}
       </p>
 
-      <button
-        className="text-xs text-muted-foreground underline hover:text-foreground self-start"
-        onClick={() => void window.api.shell.openUrl(release.releaseNotesUrl)}
-      >
-        {translate('auto.components.UpdateCard.aad383aecc', 'Read the full release notes')}
-      </button>
+      {release.releaseNotesUrl ? (
+        <button
+          className="text-xs text-muted-foreground underline hover:text-foreground self-start"
+          onClick={() => openReleaseNotesUrl(release.releaseNotesUrl)}
+        >
+          {translate('auto.components.UpdateCard.aad383aecc', 'Read the full release notes')}
+        </button>
+      ) : null}
 
       <Button variant="default" size="sm" onClick={onUpdate} className="w-full cursor-pointer">
         {translate('auto.components.UpdateCard.ec8fe71cfc', 'Update')}
@@ -827,7 +835,7 @@ function SimpleCardContent({
       </div>
 
       <p className="text-sm text-muted-foreground">
-        {translate('auto.components.UpdateCard.05ad78a6d1', 'OrcaBotmux v{{value0}} is ready.', {
+        {translate('auto.components.UpdateCard.05ad78a6d1', 'Botmux v{{value0}} is ready.', {
           value0: version
         })}
       </p>
@@ -836,12 +844,14 @@ function SimpleCardContent({
         {translate('auto.components.UpdateCard.fdd4a364fa', "Sessions won't be interrupted.")}
       </p>
 
-      <button
-        className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground self-start"
-        onClick={() => void window.api.shell.openUrl(releaseUrl)}
-      >
-        {translate('auto.components.UpdateCard.44324ef542', 'Release notes')}
-      </button>
+      {releaseUrl ? (
+        <button
+          className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground self-start"
+          onClick={() => openReleaseNotesUrl(releaseUrl)}
+        >
+          {translate('auto.components.UpdateCard.44324ef542', 'Release notes')}
+        </button>
+      ) : null}
 
       <Button
         variant="default"
@@ -927,23 +937,27 @@ function DownloadingContent({
       <p className="text-sm text-muted-foreground">
         {release
           ? release.description
-          : translate('auto.components.UpdateCard.93794ea932', 'OrcaBotmux v{{value0}} is downloading.', {
+          : translate('auto.components.UpdateCard.93794ea932', 'Botmux v{{value0}} is downloading.', {
               value0: version
             })}
       </p>
 
-      <button
-        className="text-xs text-muted-foreground underline hover:text-foreground self-start"
-        onClick={() =>
-          void window.api.shell.openUrl(
-            release ? release.releaseNotesUrl : releaseUrlForVersion(version)
-          )
+      {(() => {
+        const notesUrl = release ? release.releaseNotesUrl : releaseUrlForVersion(version)
+        if (!notesUrl) {
+          return null
         }
-      >
-        {release
-          ? translate('auto.components.UpdateCard.aad383aecc', 'Read the full release notes')
-          : translate('auto.components.UpdateCard.44324ef542', 'Release notes')}
-      </button>
+        return (
+          <button
+            className="text-xs text-muted-foreground underline hover:text-foreground self-start"
+            onClick={() => openReleaseNotesUrl(notesUrl)}
+          >
+            {release
+              ? translate('auto.components.UpdateCard.aad383aecc', 'Read the full release notes')
+              : translate('auto.components.UpdateCard.44324ef542', 'Release notes')}
+          </button>
+        )
+      })()}
 
       <div className="flex flex-col gap-2 mt-1">
         <Progress value={percent} className="h-1.5" />
@@ -1076,14 +1090,17 @@ function ErrorCardContent({
               : primaryAction.label}
           </Button>
         )}
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void window.api.shell.openUrl(releaseUrl)}
-          className="flex-1"
-        >
-          {manualLabel ?? translate('auto.components.UpdateCard.47126bcf57', 'Download Manually')}
-        </Button>
+        {releaseUrl ? (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => openReleaseNotesUrl(releaseUrl)}
+            className="flex-1"
+          >
+            {manualLabel ??
+              translate('auto.components.UpdateCard.47126bcf57', 'Download Manually')}
+          </Button>
+        ) : null}
       </div>
     </div>
   )
@@ -1120,7 +1137,7 @@ function ReadyToInstallContent({
       <p className="text-sm text-muted-foreground">
         {translate(
           'auto.components.UpdateCard.6714206e5a',
-          "OrcaBotmux v{{value0}} is downloaded. Restart when you're ready.",
+          "Botmux v{{value0}} is downloaded. Restart when you're ready.",
           { value0: version }
         )}
       </p>

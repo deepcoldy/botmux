@@ -368,7 +368,7 @@ describe('resolveTabAgentFromSignals', () => {
       resolveTabAgentFromSignals({
         hasObservedAgentSignal: false,
         isRemote: false,
-        title: '. Compare Opencode Vs OrcaBotmux',
+        title: '. Compare Opencode Vs Botmux',
         hookAgent: null,
         launchAgent: 'opencode'
       })

@@ -8,7 +8,7 @@
  * composition exactly like a real OS IME session.
  */
 import type { CDPSession, Locator, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { getStoreState, waitForSessionReady } from './helpers/store'
 import type { Repo } from '../../src/shared/types'
 
@@ -122,16 +122,16 @@ async function typeHangulGanadaSlowly(
 }
 
 test.describe('Repository Display Name IME composition', () => {
-  test('keeps Hangul syllables composed while typing slowly', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test('keeps Hangul syllables composed while typing slowly', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
 
-    const repos = await getStoreState<Repo[]>(orcaBotmuxPage, 'repos')
+    const repos = await getStoreState<Repo[]>(botmuxPage, 'repos')
     expect(repos.length).toBeGreaterThan(0)
     const repo = repos[0]
 
-    await openRepoSettings(orcaBotmuxPage, repo.id)
+    await openRepoSettings(botmuxPage, repo.id)
 
-    const repoSection = orcaBotmuxPage.locator(`[data-settings-section="repo-${repo.id}"]`)
+    const repoSection = botmuxPage.locator(`[data-settings-section="repo-${repo.id}"]`)
     const displayNameInput = repoSection.getByLabel('Display Name')
     await expect(displayNameInput).toHaveValue(repo.displayName)
 
@@ -140,8 +140,8 @@ test.describe('Repository Display Name IME composition', () => {
     await displayNameInput.fill('')
     await expect(displayNameInput).toHaveValue('')
 
-    const session = await orcaBotmuxPage.context().newCDPSession(orcaBotmuxPage)
-    await typeHangulGanadaSlowly(session, orcaBotmuxPage, displayNameInput)
+    const session = await botmuxPage.context().newCDPSession(botmuxPage)
+    await typeHangulGanadaSlowly(session, botmuxPage, displayNameInput)
 
     // Why: with the store-bound controlled input, the async updateRepo echo
     // reset the field mid-composition, aborting the IME session per keystroke
@@ -152,7 +152,7 @@ test.describe('Repository Display Name IME composition', () => {
     await expect
       .poll(
         async () => {
-          const current = await getStoreState<Repo[]>(orcaBotmuxPage, 'repos')
+          const current = await getStoreState<Repo[]>(botmuxPage, 'repos')
           return current.find((entry) => entry.id === repo.id)?.displayName
         },
         { timeout: 5_000, message: 'display name did not persist to the store' }

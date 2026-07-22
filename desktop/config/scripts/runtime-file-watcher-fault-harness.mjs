@@ -83,8 +83,8 @@ async function main() {
   watcherError.catch(() => undefined)
 
   try {
-    createdRootPath = await mkdtemp(join(tmpdir(), 'orca-botmux-runtime-watcher-fault-'))
-    bundleDir = await mkdtemp(join(tmpdir(), 'orca-botmux-runtime-watcher-harness-'))
+    createdRootPath = await mkdtemp(join(tmpdir(), 'botmux-runtime-watcher-fault-'))
+    bundleDir = await mkdtemp(join(tmpdir(), 'botmux-runtime-watcher-harness-'))
     // Parcel reports canonical event paths on macOS, where tmpdir() may use the
     // /var symlink spelling. Keep the oracle in the same path domain.
     rootPath = await realpath(createdRootPath)

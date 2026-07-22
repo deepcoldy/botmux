@@ -1,6 +1,6 @@
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
 import type { SkillDiscoveryResult } from '../../src/shared/skills'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { getStoreState, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 
 const CHECKLIST_TEXT = 'Onboarding checklist'
@@ -11,56 +11,56 @@ type SetupGuideFlashMonitor = {
 }
 
 test.describe('Setup guide sidebar entry', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   test('does not flash while completed setup waits for capability readiness', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     await installBlockedCompletedCapabilityFakes(electronApp)
-    await orcaBotmuxPage.reload()
-    await orcaBotmuxPage.waitForFunction(() => Boolean(window.__store), null, { timeout: 30_000 })
-    await waitForSessionReady(orcaBotmuxPage)
-    await seedCompletedSetupExceptCapabilityReadiness(orcaBotmuxPage)
+    await botmuxPage.reload()
+    await botmuxPage.waitForFunction(() => Boolean(window.__store), null, { timeout: 30_000 })
+    await waitForSessionReady(botmuxPage)
+    await seedCompletedSetupExceptCapabilityReadiness(botmuxPage)
 
     await expect
-      .poll(async () => getStoreState<boolean>(orcaBotmuxPage, 'setupGuideSidebarDismissed'), {
+      .poll(async () => getStoreState<boolean>(botmuxPage, 'setupGuideSidebarDismissed'), {
         timeout: 5_000
       })
       .toBe(false)
-    await expect(orcaBotmuxPage.getByText(CHECKLIST_TEXT)).toHaveCount(0)
+    await expect(botmuxPage.getByText(CHECKLIST_TEXT)).toHaveCount(0)
 
-    await startSetupGuideFlashMonitor(orcaBotmuxPage)
+    await startSetupGuideFlashMonitor(botmuxPage)
 
-    await setActiveViewForFlashProbe(orcaBotmuxPage, 'tasks')
+    await setActiveViewForFlashProbe(botmuxPage, 'tasks')
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe('tasks')
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.waitForTimeout(500)
 
-    await setActiveViewForFlashProbe(orcaBotmuxPage, 'automations')
+    await setActiveViewForFlashProbe(botmuxPage, 'automations')
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe('automations')
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.waitForTimeout(500)
 
-    await setActiveViewForFlashProbe(orcaBotmuxPage, 'mobile')
+    await setActiveViewForFlashProbe(botmuxPage, 'mobile')
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe('mobile')
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.waitForTimeout(500)
 
-    const flashSamples = await stopSetupGuideFlashMonitor(orcaBotmuxPage)
+    const flashSamples = await stopSetupGuideFlashMonitor(botmuxPage)
     expect(flashSamples, `setup guide sidebar flashed at ${flashSamples.join(', ')}`).toEqual([])
 
     // Unblock pending skill discovery IPC calls before teardown. Completion
     // after release is covered by the focused progress unit tests.
     await releaseBlockedSkillDiscovery(electronApp)
-    await orcaBotmuxPage.evaluate(() => {
-      window.dispatchEvent(new CustomEvent('orca_botmux:installed-agent-skills-changed'))
+    await botmuxPage.evaluate(() => {
+      window.dispatchEvent(new CustomEvent('botmux:installed-agent-skills-changed'))
     })
   })
 })
@@ -107,9 +107,9 @@ async function installBlockedCompletedCapabilityFakes(
       providers: ['agent-skills'],
       sourceKind: 'home',
       sourceLabel: 'E2E skill home',
-      rootPath: '/tmp/orca-botmux-e2e-skills',
-      directoryPath: `/tmp/orca-botmux-e2e-skills/${name}`,
-      skillFilePath: `/tmp/orca-botmux-e2e-skills/${name}/SKILL.md`,
+      rootPath: '/tmp/botmux-e2e-skills',
+      directoryPath: `/tmp/botmux-e2e-skills/${name}`,
+      skillFilePath: `/tmp/botmux-e2e-skills/${name}/SKILL.md`,
       installed: true,
       fileCount: 1,
       updatedAt: 1
@@ -120,7 +120,7 @@ async function installBlockedCompletedCapabilityFakes(
       await waitForSkillDiscoveryRelease()
       return {
         skills: [
-          makeSkill('orca-botmux-cli', 'e2e-orca-botmux-cli'),
+          makeSkill('botmux-cli', 'e2e-botmux-cli'),
           makeSkill('computer-use', 'e2e-computer-use'),
           makeSkill('orchestration', 'e2e-orchestration')
         ],

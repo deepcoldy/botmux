@@ -239,7 +239,7 @@ describe('Linux process start-time parsing', () => {
     fields[0] = 'S'
     fields[19] = '987654'
 
-    expect(parseLinuxProcStartTicks(`123 (orca_botmux daemon) ${fields.join(' ')}`)).toBe(987654)
+    expect(parseLinuxProcStartTicks(`123 (botmux daemon) ${fields.join(' ')}`)).toBe(987654)
   })
 
   it('parses boot time seconds from proc stat output', () => {
@@ -249,7 +249,7 @@ describe('Linux process start-time parsing', () => {
   it('does not use line-array or whitespace-regex splitting', () => {
     const splitSpy = vi.spyOn(String.prototype, 'split')
 
-    parseLinuxProcStartTicks('123 (orca_botmux daemon) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 42')
+    parseLinuxProcStartTicks('123 (botmux daemon) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 42')
     parseLinuxBootTimeSeconds('cpu 1 2 3\nbtime 1700000000')
 
     const usedUnboundedSplit = splitSpy.mock.calls.some(
@@ -312,15 +312,15 @@ describe('parseWindowsProcessIdentityJson', () => {
   it('parses command line and start time from the CIM query output', () => {
     expect(
       parseWindowsProcessIdentityJson(
-        '{"cmd":"OrcaBotmux.exe daemon-entry.js","start":1700000000000}\r\n'
+        '{"cmd":"Botmux.exe daemon-entry.js","start":1700000000000}\r\n'
       )
-    ).toEqual({ commandLine: 'OrcaBotmux.exe daemon-entry.js', startedAtMs: 1_700_000_000_000 })
+    ).toEqual({ commandLine: 'Botmux.exe daemon-entry.js', startedAtMs: 1_700_000_000_000 })
   })
 
   it('returns a null start time when CreationDate was unavailable', () => {
     expect(
-      parseWindowsProcessIdentityJson('{"cmd":"OrcaBotmux.exe daemon-entry.js","start":null}')
-    ).toEqual({ commandLine: 'OrcaBotmux.exe daemon-entry.js', startedAtMs: null })
+      parseWindowsProcessIdentityJson('{"cmd":"Botmux.exe daemon-entry.js","start":null}')
+    ).toEqual({ commandLine: 'Botmux.exe daemon-entry.js', startedAtMs: null })
   })
 
   it('returns null for a missing process or inaccessible command line', () => {

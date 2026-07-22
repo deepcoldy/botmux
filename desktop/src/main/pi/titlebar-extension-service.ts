@@ -4,15 +4,15 @@ import { join } from 'node:path'
 import { app } from 'electron'
 import { createHash } from 'node:crypto'
 import {
-  ORCA_PI_AGENT_STATUS_EXTENSION_FILE,
+  BOTMUX_PI_AGENT_STATUS_EXTENSION_FILE,
   getPiAgentStatusExtensionSource
 } from './agent-status-extension-source'
 import {
-  ORCA_PI_PREFILL_EXTENSION_FILE,
+  BOTMUX_PI_PREFILL_EXTENSION_FILE,
   getPiPrefillExtensionSource
 } from './prefill-extension-source'
-export { ORCA_OMP_PREFILL_ENV_VAR, ORCA_PI_PREFILL_ENV_VAR } from './prefill-extension-source'
-import { ORCA_PI_EXTENSION_FILE, getPiTitlebarExtensionSource } from './titlebar-extension-source'
+export { BOTMUX_OMP_PREFILL_ENV_VAR, BOTMUX_PI_PREFILL_ENV_VAR } from './prefill-extension-source'
+import { BOTMUX_PI_EXTENSION_FILE, getPiTitlebarExtensionSource } from './titlebar-extension-source'
 import {
   isSafeDescendCandidate as sharedIsSafeDescendCandidate,
   safeRemoveOverlay
@@ -27,7 +27,7 @@ import type { PiAgentKind } from '../../shared/pi-agent-kind'
 export const isSafeDescendCandidate = sharedIsSafeDescendCandidate
 
 const PI_AGENT_SUBDIR = 'agent'
-const ORCA_MANAGED_EXTENSION_MARKER = '@orca-botmux-managed-pi-extension'
+const BOTMUX_MANAGED_EXTENSION_MARKER = '@botmux-managed-pi-extension'
 const OMP_MANAGED_STATUS_EXTENSION_DIR = 'omp-managed-status-extension'
 
 type ManagedExtensionWriteResult = 'written' | 'skipped-user-owned' | 'failed'
@@ -38,7 +38,7 @@ type PiManagedExtensionEnv = {
   statusExtensionPath?: string
 }
 
-// Why: old OrcaBotmux versions used per-kind overlay roots. Keep the names so
+// Why: old Botmux versions used per-kind overlay roots. Keep the names so
 // upgrade-time cleanup can remove stale PTY-scoped Pi/OMP overlay dirs without
 // guessing which agent a terminated pane launched.
 const OVERLAY_ROOT_DIR_NAME: Record<PiAgentKind, string> = {
@@ -50,7 +50,7 @@ const OVERLAY_ROOT_DIR_NAME: Record<PiAgentKind, string> = {
 // by which `~/.<agent>/agent` dir happens to exist on disk first. A
 // cross-agent fallback (Pi -> OMP or vice versa) silently shadows the other
 // agent's user extensions when both are installed and the user picks the
-// shadowed one in OrcaBotmux's per-launch agent picker.
+// shadowed one in Botmux's per-launch agent picker.
 const AGENT_HOME_DIR_NAME: Record<PiAgentKind, string> = {
   pi: '.pi',
   omp: '.omp'
@@ -64,10 +64,10 @@ function toSafeOverlayDirName(ptyId: string): string {
   return createHash('sha256').update(ptyId).digest('hex').slice(0, 32)
 }
 
-function withOrcaManagedExtensionMarker(source: string): string {
-  return source.includes(ORCA_MANAGED_EXTENSION_MARKER)
+function withBotmuxManagedExtensionMarker(source: string): string {
+  return source.includes(BOTMUX_MANAGED_EXTENSION_MARKER)
     ? source
-    : `// ${ORCA_MANAGED_EXTENSION_MARKER}\n${source}`
+    : `// ${BOTMUX_MANAGED_EXTENSION_MARKER}\n${source}`
 }
 
 export class PiTitlebarExtensionService {
@@ -82,7 +82,7 @@ export class PiTitlebarExtensionService {
   }
 
   private getPtyOverlayDir(ptyId: string, kind: PiAgentKind): string {
-    // Why: old OrcaBotmux versions used PTY-scoped hashed overlays. Keep resolving
+    // Why: old Botmux versions used PTY-scoped hashed overlays. Keep resolving
     // that path so new spawns/teardowns can clean stale pre-migration dirs.
     return join(this.getOverlayRoot(kind), toSafeOverlayDirName(ptyId))
   }
@@ -100,7 +100,7 @@ export class PiTitlebarExtensionService {
 
   private canOverwriteManagedExtension(path: string): boolean {
     try {
-      return readFileSync(path, 'utf8').includes(ORCA_MANAGED_EXTENSION_MARKER)
+      return readFileSync(path, 'utf8').includes(BOTMUX_MANAGED_EXTENSION_MARKER)
     } catch {
       return true
     }
@@ -127,7 +127,7 @@ export class PiTitlebarExtensionService {
       return undefined
     }
 
-    const fallbackPath = join(fallbackDir, ORCA_PI_AGENT_STATUS_EXTENSION_FILE)
+    const fallbackPath = join(fallbackDir, BOTMUX_PI_AGENT_STATUS_EXTENSION_FILE)
     return this.writeManagedExtension(fallbackPath, source) === 'written' ? fallbackPath : undefined
   }
 
@@ -143,15 +143,15 @@ export class PiTitlebarExtensionService {
     }
 
     this.writeManagedExtension(
-      join(extensionsDir, ORCA_PI_EXTENSION_FILE),
-      withOrcaManagedExtensionMarker(getPiTitlebarExtensionSource())
+      join(extensionsDir, BOTMUX_PI_EXTENSION_FILE),
+      withBotmuxManagedExtensionMarker(getPiTitlebarExtensionSource())
     )
     this.writeManagedExtension(
-      join(extensionsDir, ORCA_PI_PREFILL_EXTENSION_FILE),
-      withOrcaManagedExtensionMarker(getPiPrefillExtensionSource(kind))
+      join(extensionsDir, BOTMUX_PI_PREFILL_EXTENSION_FILE),
+      withBotmuxManagedExtensionMarker(getPiPrefillExtensionSource(kind))
     )
-    const statusExtensionPath = join(extensionsDir, ORCA_PI_AGENT_STATUS_EXTENSION_FILE)
-    const statusSource = withOrcaManagedExtensionMarker(getPiAgentStatusExtensionSource(kind))
+    const statusExtensionPath = join(extensionsDir, BOTMUX_PI_AGENT_STATUS_EXTENSION_FILE)
+    const statusSource = withBotmuxManagedExtensionMarker(getPiAgentStatusExtensionSource(kind))
     const statusResult = this.writeManagedExtension(statusExtensionPath, statusSource)
 
     return {
@@ -187,12 +187,12 @@ export class PiTitlebarExtensionService {
     const installed = this.installManagedExtensions(sourceAgentDir, kind)
     const env: Record<string, string> = {}
     if (kind === 'omp') {
-      env.ORCA_OMP_SOURCE_AGENT_DIR = installed.sourceAgentDir
+      env.BOTMUX_OMP_SOURCE_AGENT_DIR = installed.sourceAgentDir
       if (installed.statusExtensionPath) {
-        env.ORCA_OMP_STATUS_EXTENSION = installed.statusExtensionPath
+        env.BOTMUX_OMP_STATUS_EXTENSION = installed.statusExtensionPath
       }
     } else {
-      env.ORCA_PI_SOURCE_AGENT_DIR = installed.sourceAgentDir
+      env.BOTMUX_PI_SOURCE_AGENT_DIR = installed.sourceAgentDir
     }
     return env
   }

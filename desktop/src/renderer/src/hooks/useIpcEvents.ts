@@ -134,6 +134,7 @@ import { closeTerminalTab } from '@/components/terminal/terminal-tab-actions'
 import { initialAgentTabViewModeProps } from '@/lib/native-chat-initial-view-mode'
 import { getConnectionIdFromState } from '@/lib/connection-context'
 import { isNativeChatTranscriptLocalReadable } from '@/lib/native-chat-transcript-readability'
+import { openBotmuxSessionInMainWorkspace } from '@/lib/open-botmux-session-in-workspace'
 
 function getShortcutPlatform(): NodeJS.Platform {
   if (navigator.userAgent.includes('Mac')) {
@@ -948,7 +949,7 @@ export function useIpcEvents(): void {
         useAppStore.getState().migrateWorktreeIdentity(renamed.oldWorktreeId, renamed.newWorktreeId)
       }
       // Why: diff before vs. after fetchWorktrees to detect server-side
-      // deletions (CLI `orca_botmux worktree rm`, other window, out-of-band RPC)
+      // deletions (CLI `botmux worktree rm`, other window, out-of-band RPC)
       // and purge worktree-scoped state for removed ids. Without this,
       // `ptyIdsByTabId` would retain entries for tabs whose worktree is
       // gone, and SessionsStatusSegment's `boundPtyIds` set would keep
@@ -1280,6 +1281,31 @@ export function useIpcEvents(): void {
       )
     }
 
+    // Why: mobile `botmuxBridge.openTerminal` (and any main-process open) used to
+    // spawn a write-link BrowserWindow webview. Prefer the same attach path as
+    // the sidebar so agent sessions land on a native PTY + optional chat view.
+    if (window.api.botmuxBridge?.onOpenSession) {
+      unsubs.push(
+        window.api.botmuxBridge.onOpenSession((payload) => {
+          console.info('[botmux-open]', 'ipc:openSession', payload)
+          void openBotmuxSessionInMainWorkspace(
+            {
+              sessionId: payload.sessionId,
+              hostId: payload.hostId,
+              hostLabel: payload.hostLabel,
+              title: payload.title,
+              cwd: payload.cwd,
+              botName: payload.botName,
+              cliType: payload.cliType
+            },
+            payload.mode === 'web' ? 'web' : 'attach'
+          ).then((r) => {
+            console.info('[botmux-open]', 'ipc:openSession:result', r)
+          })
+        })
+      )
+    }
+
     unsubs.push(
       window.api.ui.onOpenSettings(() => {
         useAppStore.getState().openSettingsPage()
@@ -1304,7 +1330,7 @@ export function useIpcEvents(): void {
       }) ?? (() => {})
     )
 
-    // Why: feature-wall product tour / UG surface is disabled for orca_botmux.
+    // Why: feature-wall product tour / UG surface is disabled for botmux.
     unsubs.push(window.api.ui.onOpenFeatureTour(() => {}) ?? (() => {}))
 
     // Why: the View > Appearance menu toggles settings directly in main (so
@@ -2215,7 +2241,7 @@ export function useIpcEvents(): void {
       })
     )
 
-    // Why: `orca_botmux tab switch --focus` lands here after the bridge's state-only
+    // Why: `botmux tab switch --focus` lands here after the bridge's state-only
     // `tabSwitch`. We deliberately DO NOT call `setActiveWorktree` — multiple
     // agents drive browsers in parallel worktrees, so a global focus call from
     // one agent's tab switch would steal the user's view from whichever
@@ -2244,7 +2270,7 @@ export function useIpcEvents(): void {
     )
 
     unsubs.push(
-      window.api.browser.onOpenLinkInOrcaTab(({ browserPageId, url }) => {
+      window.api.browser.onOpenLinkInBotmuxTab(({ browserPageId, url }) => {
         const store = useAppStore.getState()
         const sourcePage = Object.values(store.browserPagesByWorkspace)
           .flat()
@@ -2255,7 +2281,7 @@ export function useIpcEvents(): void {
         if (getRuntimeEnvironmentIdForWorktree(store, sourcePage.worktreeId)) {
           return
         }
-        // Why: only the renderer owns OrcaBotmux's tab model. Creating the tab with
+        // Why: only the renderer owns Botmux's tab model. Creating the tab with
         // the default activation behavior brings the clicked link forward.
         store.createBrowserTab(sourcePage.worktreeId, url, { title: url })
       })
@@ -2361,7 +2387,7 @@ export function useIpcEvents(): void {
         // Why: watcher may detect a helper while a simulator tab is already mounted; push stream info so the pane updates without re-attach.
         window.setTimeout(() => {
           window.dispatchEvent(
-            new CustomEvent('orca_botmux:emulator-auto-attach', {
+            new CustomEvent('botmux:emulator-auto-attach', {
               detail: { worktreeId, info }
             })
           )

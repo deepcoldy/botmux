@@ -159,7 +159,7 @@ export function SetupScriptPromptBody({
           'This repo ignores shared'
         )}{' '}
         <code>
-          {translate('auto.components.sidebar.SetupScriptPromptCardViews.8f6be51aa1', 'orca_botmux.yaml')}
+          {translate('auto.components.sidebar.SetupScriptPromptCardViews.8f6be51aa1', 'botmux.yaml')}
         </code>{' '}
         {translate(
           'auto.components.sidebar.SetupScriptPromptCardViews.660cdc17f8',
@@ -173,7 +173,7 @@ export function SetupScriptPromptBody({
       <>
         {translate(
           'auto.components.sidebar.SetupScriptPromptCardViews.aef6c0a213',
-          'Save the detected command to run it whenever OrcaBotmux creates a worktree.'
+          'Save the detected command to run it whenever Botmux creates a worktree.'
         )}
       </>
     )
@@ -197,7 +197,7 @@ export function SetupScriptPromptBody({
     <>
       {translate(
         'auto.components.sidebar.SetupScriptPromptCardViews.0a98169776',
-        'Add a setup command to run when OrcaBotmux creates new worktrees.'
+        'Add a setup command to run when Botmux creates new worktrees.'
       )}
     </>
   )

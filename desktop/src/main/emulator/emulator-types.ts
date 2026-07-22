@@ -18,5 +18,5 @@ export type EmulatorSessionInfo = {
 export type EmulatorCliTarget = {
   worktreeId?: string
   deviceUdid?: string
-  emulatorId?: string // OrcaBotmux-generated id from list (for stability, like browserPageId)
+  emulatorId?: string // Botmux-generated id from list (for stability, like browserPageId)
 }

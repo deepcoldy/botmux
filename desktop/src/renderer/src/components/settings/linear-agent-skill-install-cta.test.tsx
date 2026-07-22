@@ -40,14 +40,14 @@ let container: HTMLDivElement | null = null
 function discoveredSkill(overrides: Partial<DiscoveredSkill>): DiscoveredSkill {
   return {
     id: 'skill-1',
-    name: 'orca-botmux-linear',
+    name: 'botmux-linear',
     description: null,
     providers: ['agent-skills'],
     sourceKind: 'home',
     sourceLabel: 'Agent skills home',
     rootPath: '/Users/test/.agents/skills',
-    directoryPath: '/Users/test/.agents/skills/orca-botmux-linear',
-    skillFilePath: '/Users/test/.agents/skills/orca-botmux-linear/SKILL.md',
+    directoryPath: '/Users/test/.agents/skills/botmux-linear',
+    skillFilePath: '/Users/test/.agents/skills/botmux-linear/SKILL.md',
     installed: true,
     fileCount: 1,
     updatedAt: null,
@@ -111,11 +111,11 @@ describe('LinearAgentSkillInstallCta', () => {
     const rendered = await renderCta()
 
     expect(rendered.textContent).toContain('Agent skill:')
-    expect(rendered.textContent).toContain('orca-botmux-linear')
+    expect(rendered.textContent).toContain('botmux-linear')
     expect(rendered.textContent).toContain('Not installed')
     expect(rendered.textContent).toContain('Let your agents read and edit Linear tasks.')
     expect(rendered.textContent).toContain(
-      'npx skills add https://github.com/stablyai/orca_botmux --skill orca-botmux-linear --global'
+      'npx skills add https://github.com/stablyai/botmux --skill botmux-linear --global'
     )
   })
 
@@ -129,20 +129,20 @@ describe('LinearAgentSkillInstallCta', () => {
     })
 
     expect(mocks.clipboardWrite).toHaveBeenCalledWith(
-      'npx skills add https://github.com/stablyai/orca_botmux --skill orca-botmux-linear --global'
+      'npx skills add https://github.com/stablyai/botmux --skill botmux-linear --global'
     )
     expect(mocks.toastSuccess).toHaveBeenCalled()
   })
 
   it('shows a subtle confirmation and the update command when installed', async () => {
     mocks.skillState.installed = true
-    mocks.skillState.skills = [discoveredSkill({ name: 'orca-botmux-linear' })]
+    mocks.skillState.skills = [discoveredSkill({ name: 'botmux-linear' })]
 
     const rendered = await renderCta()
 
     expect(rendered.textContent).toContain('Installed')
     expect(rendered.textContent).toContain('Agent skill installed. To update it, run:')
-    expect(rendered.textContent).toContain('npx skills update orca-botmux-linear --global')
+    expect(rendered.textContent).toContain('npx skills update botmux-linear --global')
     expect(rendered.textContent).not.toContain('Not installed')
   })
 

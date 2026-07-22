@@ -33,7 +33,7 @@ export function handleTerminalWebLinkClick(
       requestOpenLinksInAppPreference: deps.requestOpenLinksInAppPreference
     })
   ) {
-    // Why: WebLinksAddon only knows the physical row; OrcaBotmux's logical hit-test
+    // Why: WebLinksAddon only knows the physical row; Botmux's logical hit-test
     // preserves the complete URL rendered across hard-wrapped TUI rows.
     event.preventDefault()
     handled = true

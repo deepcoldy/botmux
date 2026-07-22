@@ -97,7 +97,7 @@ async function stopWrapperAndTrackedPids(wrapper: ChildProcess, pids: number[]):
 function devWrapperTestEnv(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = { ...process.env }
   for (const key of Object.keys(env)) {
-    if (key.startsWith('ORCA_DEV_')) {
+    if (key.startsWith('BOTMUX_DEV_')) {
       delete env[key]
     }
   }
@@ -136,7 +136,7 @@ describe('run-electron-vite-dev', () => {
   it.skipIf(process.platform === 'win32')(
     'kills the descendant process tree on SIGINT',
     async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+      const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
       const pidFile = join(tempDir, 'grandchild.pid')
       const wrapperPath = resolve('config/scripts/run-electron-vite-dev.mjs')
       const fakeCliPath = resolve('src/main/startup/__fixtures__/fake-electron-vite-dev-cli.mjs')
@@ -144,11 +144,11 @@ describe('run-electron-vite-dev', () => {
       const wrapper = spawn(process.execPath, [wrapperPath], {
         cwd: resolve('.'),
         env: devWrapperTestEnv({
-          ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-          ORCA_SKIP_DEV_CLI_PREPARE: '1',
-          ORCA_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
-          ORCA_SKIP_DEV_WEB_PREPARE: '1',
-          ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile
+          BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+          BOTMUX_SKIP_DEV_CLI_PREPARE: '1',
+          BOTMUX_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
+          BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+          BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile
         }),
         stdio: 'ignore'
       })
@@ -180,7 +180,7 @@ describe('run-electron-vite-dev', () => {
   )
 
   it('forwards dev instance identity to electron-vite', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+    const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
     const pidFile = join(tempDir, 'grandchild.pid')
     const envFile = join(tempDir, 'env.json')
     const wrapperPath = resolve('config/scripts/run-electron-vite-dev.mjs')
@@ -189,14 +189,14 @@ describe('run-electron-vite-dev', () => {
     const wrapper = spawn(process.execPath, [wrapperPath, '--remote-debugging-port=9444'], {
       cwd: resolve('.'),
       env: devWrapperTestEnv({
-        ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-        ORCA_SKIP_DEV_CLI_PREPARE: '1',
-        ORCA_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
-        ORCA_SKIP_DEV_WEB_PREPARE: '1',
-        ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile,
-        ORCA_DEV_WRAPPER_TEST_ENV_FILE: envFile,
-        ORCA_DEV_BRANCH: 'feature/billing-shell',
-        ORCA_DEV_WORKTREE_NAME: 'payment-ui'
+        BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+        BOTMUX_SKIP_DEV_CLI_PREPARE: '1',
+        BOTMUX_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
+        BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+        BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile,
+        BOTMUX_DEV_WRAPPER_TEST_ENV_FILE: envFile,
+        BOTMUX_DEV_BRANCH: 'feature/billing-shell',
+        BOTMUX_DEV_WORKTREE_NAME: 'payment-ui'
       }),
       stdio: 'ignore'
     })
@@ -231,7 +231,7 @@ describe('run-electron-vite-dev', () => {
     expect(envSnapshot.worktreeName).toBe('payment-ui')
     expect(envSnapshot.repoRoot).toBe(resolve('.'))
     expect(envSnapshot.badgeLabel).toBeNull()
-    expect(envSnapshot.dockTitle).toBe('OrcaBotmux: feature/billing-shell')
+    expect(envSnapshot.dockTitle).toBe('Botmux: feature/billing-shell')
     expect(envSnapshot.stableName).toBeNull()
     expect(envSnapshot.electronExecPath).toBeNull()
 
@@ -239,9 +239,9 @@ describe('run-electron-vite-dev', () => {
   })
 
   it.skipIf(process.platform === 'win32')(
-    'prepares userData orca_botmux and orca-botmux-desktop-dev wrappers for dev terminals',
+    'prepares userData botmux and botmux-desktop-dev wrappers for dev terminals',
     async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+      const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
       const userDataPath = join(tempDir, 'userData')
       const pidFile = join(tempDir, 'grandchild.pid')
       const envFile = join(tempDir, 'env.json')
@@ -251,12 +251,12 @@ describe('run-electron-vite-dev', () => {
       const wrapper = spawn(process.execPath, [wrapperPath], {
         cwd: resolve('.'),
         env: devWrapperTestEnv({
-          ORCA_DEV_USER_DATA_PATH: userDataPath,
-          ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-          ORCA_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
-          ORCA_SKIP_DEV_WEB_PREPARE: '1',
-          ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile,
-          ORCA_DEV_WRAPPER_TEST_ENV_FILE: envFile
+          BOTMUX_DEV_USER_DATA_PATH: userDataPath,
+          BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+          BOTMUX_SKIP_DEV_ELECTRON_APP_PREPARE: '1',
+          BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+          BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile,
+          BOTMUX_DEV_WRAPPER_TEST_ENV_FILE: envFile
         }),
         stdio: 'ignore'
       })
@@ -273,10 +273,10 @@ describe('run-electron-vite-dev', () => {
       })
 
       const trackedPids = trackPidFile(pidFile)
-      const devWrapper = readFileSync(join(userDataPath, 'cli', 'bin', 'orca-botmux-desktop-dev'), 'utf8')
-      const publicAliasWrapper = readFileSync(join(userDataPath, 'cli', 'bin', 'orca_botmux'), 'utf8')
+      const devWrapper = readFileSync(join(userDataPath, 'cli', 'bin', 'botmux-desktop-dev'), 'utf8')
+      const publicAliasWrapper = readFileSync(join(userDataPath, 'cli', 'bin', 'botmux'), 'utf8')
       expect(publicAliasWrapper).toBe(devWrapper)
-      expect(publicAliasWrapper).toContain('ORCA_USER_DATA_PATH')
+      expect(publicAliasWrapper).toContain('BOTMUX_USER_DATA_PATH')
       expect(publicAliasWrapper).toContain('out/cli/index.js')
 
       await stopWrapperAndTrackedPids(wrapper, trackedPids)
@@ -284,7 +284,7 @@ describe('run-electron-vite-dev', () => {
   )
 
   it('consumes the stable-name flag before forwarding args to electron-vite', async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+    const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
     const pidFile = join(tempDir, 'grandchild.pid')
     const envFile = join(tempDir, 'env.json')
     const wrapperPath = resolve('config/scripts/run-electron-vite-dev.mjs')
@@ -296,13 +296,13 @@ describe('run-electron-vite-dev', () => {
       {
         cwd: resolve('.'),
         env: devWrapperTestEnv({
-          ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-          ORCA_SKIP_DEV_CLI_PREPARE: '1',
-          ORCA_SKIP_DEV_WEB_PREPARE: '1',
-          ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile,
-          ORCA_DEV_WRAPPER_TEST_ENV_FILE: envFile,
-          ORCA_DEV_BRANCH: 'feature/stable-name',
-          ORCA_DEV_WORKTREE_NAME: 'stable-ui'
+          BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+          BOTMUX_SKIP_DEV_CLI_PREPARE: '1',
+          BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+          BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile,
+          BOTMUX_DEV_WRAPPER_TEST_ENV_FILE: envFile,
+          BOTMUX_DEV_BRANCH: 'feature/stable-name',
+          BOTMUX_DEV_WORKTREE_NAME: 'stable-ui'
         }),
         stdio: 'ignore'
       }
@@ -337,15 +337,15 @@ describe('run-electron-vite-dev', () => {
   it.skipIf(process.platform !== 'darwin')(
     'rebuilds the copied Electron app when Chromium resources are missing',
     async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+      const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
       const wrapperPath = resolve('config/scripts/run-electron-vite-dev.mjs')
       const fakeCliPath = resolve('src/main/startup/__fixtures__/fake-electron-vite-dev-cli.mjs')
       const baseEnv = devWrapperTestEnv({
-        ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-        ORCA_SKIP_DEV_CLI_PREPARE: '1',
-        ORCA_SKIP_DEV_WEB_PREPARE: '1',
-        ORCA_DEV_BRANCH: 'feature/rebuild-electron-app',
-        ORCA_DEV_WORKTREE_NAME: 'electron-app-rebuild'
+        BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+        BOTMUX_SKIP_DEV_CLI_PREPARE: '1',
+        BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+        BOTMUX_DEV_BRANCH: 'feature/rebuild-electron-app',
+        BOTMUX_DEV_WORKTREE_NAME: 'electron-app-rebuild'
       })
 
       async function runWrapper(runId: string): Promise<{ electronExecPath: string }> {
@@ -355,8 +355,8 @@ describe('run-electron-vite-dev', () => {
           cwd: resolve('.'),
           env: {
             ...baseEnv,
-            ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile,
-            ORCA_DEV_WRAPPER_TEST_ENV_FILE: envFile
+            BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile,
+            BOTMUX_DEV_WRAPPER_TEST_ENV_FILE: envFile
           },
           stdio: 'ignore'
         })
@@ -415,7 +415,7 @@ describe('run-electron-vite-dev', () => {
   it.skipIf(process.platform !== 'darwin')(
     'preserves relative Electron framework symlinks in the copied mac dev app',
     async () => {
-      const tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-dev-wrapper-'))
+      const tempDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-dev-wrapper-'))
       const pidFile = join(tempDir, 'grandchild.pid')
       const envFile = join(tempDir, 'env.json')
       const wrapperPath = resolve('config/scripts/run-electron-vite-dev.mjs')
@@ -424,13 +424,13 @@ describe('run-electron-vite-dev', () => {
       const wrapper = spawn(process.execPath, [wrapperPath, '--remote-debugging-port=9448'], {
         cwd: resolve('.'),
         env: devWrapperTestEnv({
-          ORCA_ELECTRON_VITE_CLI: fakeCliPath,
-          ORCA_SKIP_DEV_CLI_PREPARE: '1',
-          ORCA_SKIP_DEV_WEB_PREPARE: '1',
-          ORCA_DEV_WRAPPER_TEST_PID_FILE: pidFile,
-          ORCA_DEV_WRAPPER_TEST_ENV_FILE: envFile,
-          ORCA_DEV_BRANCH: 'feature/framework-symlinks',
-          ORCA_DEV_WORKTREE_NAME: 'symlink-ui'
+          BOTMUX_ELECTRON_VITE_CLI: fakeCliPath,
+          BOTMUX_SKIP_DEV_CLI_PREPARE: '1',
+          BOTMUX_SKIP_DEV_WEB_PREPARE: '1',
+          BOTMUX_DEV_WRAPPER_TEST_PID_FILE: pidFile,
+          BOTMUX_DEV_WRAPPER_TEST_ENV_FILE: envFile,
+          BOTMUX_DEV_BRANCH: 'feature/framework-symlinks',
+          BOTMUX_DEV_WORKTREE_NAME: 'symlink-ui'
         }),
         stdio: 'ignore'
       })

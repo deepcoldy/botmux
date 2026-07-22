@@ -1,6 +1,6 @@
-export const ORCHESTRATION_SETUP_STATE_EVENT = 'orca_botmux:orchestration-setup-state'
-export const ORCHESTRATION_ENABLED_STORAGE_KEY = 'orca_botmux.orchestration.enabled'
-export const ORCHESTRATION_SETUP_DISMISSED_STORAGE_KEY = 'orca_botmux.orchestration.setupDismissed'
+export const ORCHESTRATION_SETUP_STATE_EVENT = 'botmux:orchestration-setup-state'
+export const ORCHESTRATION_ENABLED_STORAGE_KEY = 'botmux.orchestration.enabled'
+export const ORCHESTRATION_SETUP_DISMISSED_STORAGE_KEY = 'botmux.orchestration.setupDismissed'
 
 export function isOrchestrationSetupEnabled(): boolean {
   return localStorage.getItem(ORCHESTRATION_ENABLED_STORAGE_KEY) === '1'

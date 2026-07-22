@@ -3,10 +3,11 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 /** How a supported agent session opens: the raw terminal or the native chat view. */
 export type MobileSessionView = 'terminal' | 'chat'
 
-const DEFAULT_SESSION_VIEW_KEY = 'orca:defaultSessionView'
-const NATIVE_CHAT_TABS_PREFIX = 'orca:nativeChatTabs:'
+const DEFAULT_SESSION_VIEW_KEY = 'botmux:defaultSessionView'
+const NATIVE_CHAT_TABS_PREFIX = 'botmux:nativeChatTabs:'
 
-// Why: default stays terminal so native chat remains strictly opt-in.
+// Why: default stays terminal so native chat remains opt-in; get the plain
+// CLI / attach path stable first.
 export const DEFAULT_SESSION_VIEW: MobileSessionView = 'terminal'
 
 let defaultViewWriteBarrier: Promise<void> | null = null

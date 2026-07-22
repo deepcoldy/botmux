@@ -46,14 +46,14 @@ export function runInternalDevSetup({
   access = accessSync,
   spawn = spawnSync
 } = {}) {
-  const setupPath = env.ORCA_INTERNAL_DEV_SETUP?.trim()
+  const setupPath = env.BOTMUX_INTERNAL_DEV_SETUP?.trim()
   if (!setupPath || !exists(setupPath) || !isExecutable(setupPath, platform, access)) {
     return 0
   }
 
   // Why: this hook is an optional local accelerator; failures should not block
   // creating a worktree or running the normal dependency install.
-  spawnOptionalSetup(spawn, setupPath, env.ORCA_WORKTREE_PATH || cwd, platform, env)
+  spawnOptionalSetup(spawn, setupPath, env.BOTMUX_WORKTREE_PATH || cwd, platform, env)
 
   return 0
 }

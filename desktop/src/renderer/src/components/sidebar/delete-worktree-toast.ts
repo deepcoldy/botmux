@@ -60,7 +60,7 @@ export function getDeleteWorktreeToastCopy(
         ),
         description: translate(
           'auto.components.sidebar.delete.worktree.toast.905fc8efac',
-          'Git already removed this workspace. Use Force Delete to clear it from OrcaBotmux.'
+          'Git already removed this workspace. Use Force Delete to clear it from Botmux.'
         ),
         isDestructive: false
       }
@@ -77,7 +77,7 @@ export function getDeleteWorktreeToastCopy(
       ),
       // Why: git commonly refuses the first delete when the worktree still has
       // modified or untracked files. Showing raw stderr in a destructive toast
-      // made a normal cleanup step look like an OrcaBotmux bug, so this common case
+      // made a normal cleanup step look like an Botmux bug, so this common case
       // gets a concise explanation plus the force-delete path instead.
       isDestructive: false
     }

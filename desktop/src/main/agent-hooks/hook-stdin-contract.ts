@@ -12,7 +12,7 @@ export function buildPosixHookPayloadCapture(
   return ['payload=$(cat)', 'if [ -z "$payload" ]; then', ...emptyPayloadLines, 'fi']
 }
 
-export const WINDOWS_HOOK_STDIN_DRAIN_LABEL = 'orca_botmux_agent_hook_drain_stdin'
+export const WINDOWS_HOOK_STDIN_DRAIN_LABEL = 'botmux_agent_hook_drain_stdin'
 export const WINDOWS_HOOK_STDIN_DRAIN_COMMAND = '"%SystemRoot%\\System32\\more.com" >nul 2>nul'
 
 // Why: batch payloads stream directly to curl and cannot be buffered safely in
@@ -20,9 +20,9 @@ export const WINDOWS_HOOK_STDIN_DRAIN_COMMAND = '"%SystemRoot%\\System32\\more.c
 export function buildWindowsHookEnvironmentGuardLines(): string[] {
   const drainTarget = `goto :${WINDOWS_HOOK_STDIN_DRAIN_LABEL}`
   return [
-    `if "%ORCA_AGENT_HOOK_PORT%"=="" ${drainTarget}`,
-    `if "%ORCA_AGENT_HOOK_TOKEN%"=="" ${drainTarget}`,
-    `if "%ORCA_PANE_KEY%"=="" ${drainTarget}`
+    `if "%BOTMUX_AGENT_HOOK_PORT%"=="" ${drainTarget}`,
+    `if "%BOTMUX_AGENT_HOOK_TOKEN%"=="" ${drainTarget}`,
+    `if "%BOTMUX_PANE_KEY%"=="" ${drainTarget}`
   ]
 }
 

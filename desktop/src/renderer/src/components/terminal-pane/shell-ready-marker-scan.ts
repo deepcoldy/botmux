@@ -1,4 +1,4 @@
-const SHELL_READY_MARKER = '\x1b]777;orca-botmux-shell-ready'
+const SHELL_READY_MARKER = '\x1b]777;botmux-shell-ready'
 
 export type ShellReadyMarkerScanState = {
   matchPos: number

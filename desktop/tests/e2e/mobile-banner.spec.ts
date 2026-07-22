@@ -1,5 +1,5 @@
 import type { ElectronApplication, Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveWorktreeId,
@@ -28,21 +28,21 @@ import {
 test.describe.configure({ mode: 'serial' })
 
 test('mobile subscribe mounts overlay; collapse → chip; Take back dismisses', async ({
-  orcaBotmuxPage,
+  botmuxPage,
   electronApp
 }, testInfo) => {
-  await waitForSessionReady(orcaBotmuxPage)
-  await waitForActiveWorktree(orcaBotmuxPage)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+  await waitForSessionReady(botmuxPage)
+  await waitForActiveWorktree(botmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  const ptyId = await waitForActivePanePtyId(botmuxPage)
   await installRestoreTerminalFitRecorder(electronApp)
 
-  const overlay = orcaBotmuxPage.locator('.mobile-driver-banner')
+  const overlay = botmuxPage.locator('.mobile-driver-banner')
   await expect(overlay).toHaveCount(0)
 
   // Fire the IPC events main emits when a mobile client subscribes in 'auto'
-  // mode (handleMobileSubscribe in src/main/runtime/orca-botmux-runtime.ts). The
+  // mode (handleMobileSubscribe in src/main/runtime/botmux-runtime.ts). The
   // renderer's listener calls setFitOverride + setDriverForPty, the banner
   // observes the change, and MobileDriverOverlay mounts in loud mode.
   await sendMobileSubscribeIpc(electronApp, { ptyId, cols: 45, rows: 20 })
@@ -50,7 +50,7 @@ test('mobile subscribe mounts overlay; collapse → chip; Take back dismisses', 
   await expect(overlay).toBeVisible({ timeout: 15_000 })
   await expect(overlay).toContainText(/from your phone/i)
   await expect(overlay).toContainText(/your phone is in control/i)
-  await expectExpandedOverlayLeavesPaneReadable(orcaBotmuxPage, ptyId)
+  await expectExpandedOverlayLeavesPaneReadable(botmuxPage, ptyId)
 
   const takeBackThisTerminal = overlay.getByRole('button', { name: /take back this terminal/i })
   const takeBackAllTerminals = overlay.getByRole('button', { name: /take back all terminals/i })
@@ -59,7 +59,7 @@ test('mobile subscribe mounts overlay; collapse → chip; Take back dismisses', 
   await expect(takeBackAllTerminals).toBeVisible()
   await expect(collapse).toBeVisible()
 
-  await captureAttachment(orcaBotmuxPage, testInfo, 'overlay-loud.png')
+  await captureAttachment(botmuxPage, testInfo, 'overlay-loud.png')
 
   // Click Collapse → loud overlay swaps to the corner chip while the lock stays
   // engaged. The user can keep watching live mobile output while the chip
@@ -68,13 +68,13 @@ test('mobile subscribe mounts overlay; collapse → chip; Take back dismisses', 
   await expect(overlay).toContainText(/phone driving/i)
   await expect(overlay.getByRole('button', { name: /take back/i })).toBeVisible()
   await expect(overlay).not.toContainText(/your phone is in control/i)
-  await expectChipIsCompactInPane(orcaBotmuxPage, ptyId)
+  await expectChipIsCompactInPane(botmuxPage, ptyId)
 
-  await captureAttachment(orcaBotmuxPage, testInfo, 'overlay-collapsed.png')
+  await captureAttachment(botmuxPage, testInfo, 'overlay-collapsed.png')
 
   await overlay.getByRole('button', { name: /phone driving/i }).click()
   await expect(overlay).toContainText(/your phone is in control/i)
-  await expectExpandedOverlayLeavesPaneReadable(orcaBotmuxPage, ptyId)
+  await expectExpandedOverlayLeavesPaneReadable(botmuxPage, ptyId)
 
   await collapse.click()
   await expect(overlay).not.toContainText(/your phone is in control/i)
@@ -90,17 +90,17 @@ test('mobile subscribe mounts overlay; collapse → chip; Take back dismisses', 
 })
 
 test('held phone-fit state mounts restore overlay without collapse', async ({
-  orcaBotmuxPage,
+  botmuxPage,
   electronApp
 }, testInfo) => {
-  await waitForSessionReady(orcaBotmuxPage)
-  await waitForActiveWorktree(orcaBotmuxPage)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+  await waitForSessionReady(botmuxPage)
+  await waitForActiveWorktree(botmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  const ptyId = await waitForActivePanePtyId(botmuxPage)
   await installRestoreTerminalFitRecorder(electronApp)
 
-  const overlay = orcaBotmuxPage.locator('.mobile-driver-banner')
+  const overlay = botmuxPage.locator('.mobile-driver-banner')
   await expect(overlay).toHaveCount(0)
 
   // Held-fit is the post-mobile-disconnect state: the phone-fit override remains
@@ -116,9 +116,9 @@ test('held phone-fit state mounts restore overlay without collapse', async ({
   await expect(overlay.getByRole('button', { name: /restore all terminals/i })).toBeVisible()
   await expect(overlay.getByRole('button', { name: /^collapse$/i })).toHaveCount(0)
   await expect(overlay.getByRole('button', { name: /take back/i })).toHaveCount(0)
-  await expectExpandedOverlayLeavesPaneReadable(orcaBotmuxPage, ptyId)
+  await expectExpandedOverlayLeavesPaneReadable(botmuxPage, ptyId)
 
-  await captureAttachment(orcaBotmuxPage, testInfo, 'overlay-held-fit.png')
+  await captureAttachment(botmuxPage, testInfo, 'overlay-held-fit.png')
 
   await overlay.getByRole('button', { name: /restore this terminal/i }).click()
   await expectRestoreTerminalFitCalls(electronApp, [ptyId])
@@ -126,30 +126,30 @@ test('held phone-fit state mounts restore overlay without collapse', async ({
   await expect(overlay).toBeHidden({ timeout: 15_000 })
 })
 
-test('restore this terminal refits the active restored pane', async ({ orcaBotmuxPage, electronApp }) => {
-  await waitForSessionReady(orcaBotmuxPage)
-  await waitForActiveWorktree(orcaBotmuxPage)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+test('restore this terminal refits the active restored pane', async ({ botmuxPage, electronApp }) => {
+  await waitForSessionReady(botmuxPage)
+  await waitForActiveWorktree(botmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  const ptyId = await waitForActivePanePtyId(botmuxPage)
   await installRestoreTerminalFitAutoRestoreRecorder(electronApp)
 
   await sendHeldPhoneFitIpc(electronApp, { ptyId, cols: 1, rows: 20 })
-  await expect(orcaBotmuxPage.locator('.mobile-driver-banner')).toHaveCount(1, { timeout: 15_000 })
+  await expect(botmuxPage.locator('.mobile-driver-banner')).toHaveCount(1, { timeout: 15_000 })
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, ptyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, ptyId), {
       message: 'test harness should hold the active pane in the bad narrow state'
     })
     .toBeLessThanOrEqual(2)
 
-  await orcaBotmuxPage
+  await botmuxPage
     .locator(`[data-pty-id="${ptyId}"] .mobile-driver-banner`)
     .getByRole('button', { name: /restore this terminal/i })
     .click()
 
   await expectRestoreTerminalFitCalls(electronApp, [ptyId])
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, ptyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, ptyId), {
       timeout: 5_000,
       message: 'Restore this terminal should refit the active restored pane'
     })
@@ -157,16 +157,16 @@ test('restore this terminal refits the active restored pane', async ({ orcaBotmu
 })
 
 test('restore all refits non-focused restored terminal panes', async ({
-  orcaBotmuxPage,
+  botmuxPage,
   electronApp
 }) => {
-  await waitForSessionReady(orcaBotmuxPage)
-  await waitForActiveWorktree(orcaBotmuxPage)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-  const ptyIds = await waitForVisiblePanePtyIds(orcaBotmuxPage, 2)
-  const focusPtyId = await waitForActivePanePtyId(orcaBotmuxPage)
+  await waitForSessionReady(botmuxPage)
+  await waitForActiveWorktree(botmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  await splitActiveTerminalPane(botmuxPage, 'vertical')
+  const ptyIds = await waitForVisiblePanePtyIds(botmuxPage, 2)
+  const focusPtyId = await waitForActivePanePtyId(botmuxPage)
   const inactivePtyId = ptyIds.find((ptyId) => ptyId !== focusPtyId)
   if (!inactivePtyId || !focusPtyId) {
     throw new Error('Expected two visible terminal panes with PTY bindings')
@@ -175,23 +175,23 @@ test('restore all refits non-focused restored terminal panes', async ({
 
   await sendHeldPhoneFitIpc(electronApp, { ptyId: inactivePtyId, cols: 45, rows: 20 })
   await sendHeldPhoneFitIpc(electronApp, { ptyId: focusPtyId, cols: 45, rows: 20 })
-  await expect(orcaBotmuxPage.locator('.mobile-driver-banner')).toHaveCount(2, { timeout: 15_000 })
+  await expect(botmuxPage.locator('.mobile-driver-banner')).toHaveCount(2, { timeout: 15_000 })
 
-  await forcePaneToOneColumn(orcaBotmuxPage, inactivePtyId)
+  await forcePaneToOneColumn(botmuxPage, inactivePtyId)
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, inactivePtyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, inactivePtyId), {
       message: 'test harness should force the non-focused pane into the bad narrow state'
     })
     .toBeLessThanOrEqual(2)
 
-  await orcaBotmuxPage
+  await botmuxPage
     .locator(`[data-pty-id="${focusPtyId}"] .mobile-driver-banner`)
     .getByRole('button', { name: /restore all terminals/i })
     .click()
 
   await expectRestoreTerminalFitCallSet(electronApp, [inactivePtyId, focusPtyId])
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, inactivePtyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, inactivePtyId), {
       timeout: 5_000,
       message: 'Restore all should refit the non-focused restored pane'
     })
@@ -199,12 +199,12 @@ test('restore all refits non-focused restored terminal panes', async ({
 })
 
 test('restore all recovers a hidden workspace held at narrow terminal geometry', async ({
-  orcaBotmuxPage,
+  botmuxPage,
   electronApp
 }) => {
-  await waitForSessionReady(orcaBotmuxPage)
-  const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-  const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+  await waitForSessionReady(botmuxPage)
+  const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+  const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
     (worktreeId) => worktreeId !== firstWorktreeId
   )
   test.skip(!secondWorktreeId, 'hidden-workspace restore repro needs the seeded secondary worktree')
@@ -212,51 +212,51 @@ test('restore all recovers a hidden workspace held at narrow terminal geometry',
     return
   }
 
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  const hiddenWorkspacePtyId = await waitForActivePanePtyId(orcaBotmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  const hiddenWorkspacePtyId = await waitForActivePanePtyId(botmuxPage)
   await sendHeldPhoneFitIpc(electronApp, { ptyId: hiddenWorkspacePtyId, cols: 45, rows: 20 })
-  await expect(orcaBotmuxPage.locator('.mobile-driver-banner')).toHaveCount(1, { timeout: 15_000 })
+  await expect(botmuxPage.locator('.mobile-driver-banner')).toHaveCount(1, { timeout: 15_000 })
 
-  await forcePaneToOneColumnAndSwitchWorktree(orcaBotmuxPage, hiddenWorkspacePtyId, secondWorktreeId)
+  await forcePaneToOneColumnAndSwitchWorktree(botmuxPage, hiddenWorkspacePtyId, secondWorktreeId)
   await expect
-    .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+    .poll(() => getActiveWorktreeId(botmuxPage), {
       timeout: 5_000,
       message: 'second worktree should become active before restore-all'
     })
     .toBe(secondWorktreeId)
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, hiddenWorkspacePtyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, hiddenWorkspacePtyId), {
       message: 'test harness should hold workspace 1 in the bad narrow state'
     })
     .toBeLessThanOrEqual(2)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
-  const activeWorkspacePtyId = await waitForActivePanePtyId(orcaBotmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
+  const activeWorkspacePtyId = await waitForActivePanePtyId(botmuxPage)
   await installRestoreTerminalFitAutoRestoreRecorder(electronApp)
   await sendHeldPhoneFitIpc(electronApp, { ptyId: activeWorkspacePtyId, cols: 45, rows: 20 })
   await expect(
-    orcaBotmuxPage.locator(`[data-pty-id="${activeWorkspacePtyId}"] .mobile-driver-banner`)
+    botmuxPage.locator(`[data-pty-id="${activeWorkspacePtyId}"] .mobile-driver-banner`)
   ).toBeVisible({ timeout: 15_000 })
 
-  await orcaBotmuxPage
+  await botmuxPage
     .locator(`[data-pty-id="${activeWorkspacePtyId}"] .mobile-driver-banner`)
     .getByRole('button', { name: /restore all terminals/i })
     .click()
 
   await expectRestoreTerminalFitCallSet(electronApp, [hiddenWorkspacePtyId, activeWorkspacePtyId])
 
-  await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+  await switchToWorktree(botmuxPage, firstWorktreeId)
   await expect
-    .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+    .poll(() => getActiveWorktreeId(botmuxPage), {
       timeout: 5_000,
       message: 'first worktree should become active after restore-all'
     })
     .toBe(firstWorktreeId)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage)
   await expect
-    .poll(() => getPaneTerminalCols(orcaBotmuxPage, hiddenWorkspacePtyId), {
+    .poll(() => getPaneTerminalCols(botmuxPage, hiddenWorkspacePtyId), {
       timeout: 5_000,
       message: 'Restore all should refit the hidden workspace when it becomes visible'
     })

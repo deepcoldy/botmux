@@ -1,11 +1,11 @@
 import { Import, Loader2 } from 'lucide-react'
 import {
-  ORCA_CLI_SKILL_INSTALL_COMMAND,
-  ORCA_CLI_SKILL_UPDATE_COMMAND
+  BOTMUX_CLI_SKILL_INSTALL_COMMAND,
+  BOTMUX_CLI_SKILL_UPDATE_COMMAND
 } from '@/lib/agent-feature-install-commands'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  ensureOrcaCliAvailableForAgentSkillTerminal
+  ensureBotmuxCliAvailableForAgentSkillTerminal
 } from '@/lib/agent-skill-cli-prerequisite'
 import { cn } from '@/lib/utils'
 import { useMobileEmulatorAgentSetupState } from '../emulator-pane/use-mobile-emulator-agent-setup-state'
@@ -18,16 +18,16 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/
 import { translate } from '@/i18n/i18n'
 
 const EMULATOR_CLI_COMMANDS = [
-  'orca_botmux emulator list --json',
-  'orca_botmux emulator attach "iPhone 16 Pro" --json',
-  'orca_botmux emulator tap 0.5 0.7 --json',
-  'orca_botmux emulator type "hello" --json'
+  'botmux emulator list --json',
+  'botmux emulator attach "iPhone 16 Pro" --json',
+  'botmux emulator tap 0.5 0.7 --json',
+  'botmux emulator type "hello" --json'
 ] as const
 
 export function MobileEmulatorAgentControlRow(): React.JSX.Element {
   const setup = useMobileEmulatorAgentSetupState(true)
-  const cliSkillInstallCommand = buildSkillCommandForRuntime(ORCA_CLI_SKILL_INSTALL_COMMAND)
-  const cliSkillUpdateCommand = buildSkillCommandForRuntime(ORCA_CLI_SKILL_UPDATE_COMMAND)
+  const cliSkillInstallCommand = buildSkillCommandForRuntime(BOTMUX_CLI_SKILL_INSTALL_COMMAND)
+  const cliSkillUpdateCommand = buildSkillCommandForRuntime(BOTMUX_CLI_SKILL_UPDATE_COMMAND)
 
   const handleEnableCli = async (): Promise<void> => {
     await setup.handleEnableCli()
@@ -46,7 +46,7 @@ export function MobileEmulatorAgentControlRow(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.MobileEmulatorAgentControlRow.ff4b7e65d6',
-              'Let coding agents control the active mobile emulator with OrcaBotmux CLI commands.'
+              'Let coding agents control the active mobile emulator with Botmux CLI commands.'
             )}
           </p>
         </div>
@@ -71,13 +71,13 @@ export function MobileEmulatorAgentControlRow(): React.JSX.Element {
             <p className="text-sm font-medium">
               {translate(
                 'auto.components.settings.MobileEmulatorAgentControlRow.4f2205f3b6',
-                'Enable OrcaBotmux CLI'
+                'Enable Botmux CLI'
               )}
             </p>
             <p className="text-xs text-muted-foreground">
               {translate(
                 'auto.components.settings.MobileEmulatorAgentControlRow.2fef055608',
-                'Registers the OrcaBotmux CLI command so agents can control the active emulator from their shell.'
+                'Registers the Botmux CLI command so agents can control the active emulator from their shell.'
               )}
             </p>
             {setup.cliInstallStatus?.commandPath && setup.cliEnabled ? (
@@ -98,7 +98,7 @@ export function MobileEmulatorAgentControlRow(): React.JSX.Element {
               <p className="text-[11px] leading-snug text-muted-foreground">
                 {translate(
                   'auto.components.settings.MobileEmulatorAgentControlRow.3d34423e88',
-                  'Registering the OrcaBotmux CLI'
+                  'Registering the Botmux CLI'
                 )}{' '}
                 {setup.cliInstallStatus?.commandPath ? (
                   <code className="rounded bg-muted px-1 py-0.5">
@@ -146,17 +146,17 @@ export function MobileEmulatorAgentControlRow(): React.JSX.Element {
             variant="inline"
             title={translate(
               'auto.components.settings.MobileEmulatorAgentControlRow.67e19ee03c',
-              'OrcaBotmux CLI skill'
+              'Botmux CLI skill'
             )}
             description={translate(
               'auto.components.settings.MobileEmulatorAgentControlRow.d94ca6a623',
-              'Enables agents to use OrcaBotmux CLI commands, including mobile emulator control.'
+              'Enables agents to use Botmux CLI commands, including mobile emulator control.'
             )}
             command={cliSkillInstallCommand}
             installedCommand={cliSkillUpdateCommand}
-            terminalTitle="OrcaBotmux CLI skill setup"
-            terminalAriaLabel="OrcaBotmux CLI skill install terminal"
-            terminalWorktreeId="settings-mobile-emulator-orca-botmux-cli-skill-terminal"
+            terminalTitle="Botmux CLI skill setup"
+            terminalAriaLabel="Botmux CLI skill install terminal"
+            terminalWorktreeId="settings-mobile-emulator-botmux-cli-skill-terminal"
             installed={setup.cliSkillInstalled}
             loading={setup.cliSkillLoading}
             error={setup.cliSkillError}
@@ -165,10 +165,10 @@ export function MobileEmulatorAgentControlRow(): React.JSX.Element {
             preInstallNotice={AGENT_SKILL_CLI_PREREQUISITE_NOTICE}
             openingHint={translate(
               'auto.components.settings.MobileEmulatorAgentControlRow.3941719a56',
-              'Checking OrcaBotmux CLI before opening skill setup.'
+              'Checking Botmux CLI before opening skill setup.'
             )}
             onBeforeOpenTerminal={async () => {
-              await ensureOrcaCliAvailableForAgentSkillTerminal()
+              await ensureBotmuxCliAvailableForAgentSkillTerminal()
             }}
             onRecheck={setup.refreshCliSkill}
           />

@@ -106,7 +106,7 @@ describe('useNativeChatExternalAttachments', () => {
       connectionId: 'conn-1',
       worktreePath: '/remote/wt'
     })
-    mocks.uploadNativeChatAttachmentPaths.mockResolvedValue(['/remote/wt/.orca_botmux/drops/a.txt'])
+    mocks.uploadNativeChatAttachmentPaths.mockResolvedValue(['/remote/wt/.botmux/drops/a.txt'])
     const attachResolvedPaths = vi.fn()
     const probe = await renderProbe({ attachResolvedPaths })
     await act(async () => {
@@ -117,7 +117,7 @@ describe('useNativeChatExternalAttachments', () => {
       connectionId: 'conn-1',
       worktreePath: '/remote/wt'
     })
-    expect(attachResolvedPaths).toHaveBeenCalledWith(['/remote/wt/.orca_botmux/drops/a.txt'])
+    expect(attachResolvedPaths).toHaveBeenCalledWith(['/remote/wt/.botmux/drops/a.txt'])
   })
 
   it('shows the not-ready notice instead of attaching unresolved paths', async () => {
@@ -151,7 +151,7 @@ describe('useNativeChatExternalAttachments', () => {
     })
     await probe.setDisabled(true)
     await act(async () => {
-      resolveUpload(['/remote/wt/.orca_botmux/drops/a.txt'])
+      resolveUpload(['/remote/wt/.botmux/drops/a.txt'])
     })
     expect(attachResolvedPaths).not.toHaveBeenCalled()
   })

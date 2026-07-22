@@ -5,16 +5,16 @@ describe('tabGroupBodyAnchorName', () => {
   it('returns a valid CSS custom anchor name for UUID-style group ids', () => {
     const anchorName = tabGroupBodyAnchorName('11111111-1111-4111-8111-111111111111')
 
-    expect(anchorName).toMatch(/^--orca-botmux-tab-group-body-[0-9a-f-]+$/)
+    expect(anchorName).toMatch(/^--botmux-tab-group-body-[0-9a-f-]+$/)
   })
 
   it('encodes remote runtime group ids that include path separators', () => {
     const anchorName = tabGroupBodyAnchorName(
-      'headless-terminals:repo::/Users/jinwoohong/orca_botmux/workspaces/orca_botmux/branch'
+      'headless-terminals:repo::/Users/jinwoohong/botmux/workspaces/botmux/branch'
     )
 
     expect(anchorName).not.toContain(':')
     expect(anchorName).not.toContain('/')
-    expect(anchorName).toMatch(/^--orca-botmux-tab-group-body-[0-9a-f-]+$/)
+    expect(anchorName).toMatch(/^--botmux-tab-group-body-[0-9a-f-]+$/)
   })
 })

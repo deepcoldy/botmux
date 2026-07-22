@@ -8,7 +8,7 @@ import {
   isDirectClaudeCommand,
   type ClaudeAgentTeamsMode
 } from '../../shared/claude-agent-teams-tmux-compat'
-import { getOrcaCliCommandNameForPlatform } from '../../shared/orca-botmux-cli-command-name'
+import { getBotmuxCliCommandNameForPlatform } from '../../shared/botmux-cli-command-name'
 
 export type ClaudeAgentTeamsLaunchPlan = {
   command: string
@@ -47,29 +47,29 @@ export async function buildClaudeAgentTeamsLaunchPlan(args: {
   return {
     command: addClaudeTeammateModeAuto(args.command),
     env,
-    envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+    envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
   }
 }
 
 export function resolveClaudeAgentTeamsShimBin(
   env: Record<string, string | undefined> = process.env
 ): string {
-  if (env.ORCA_AGENT_TEAMS_SHIM_BIN) {
-    return env.ORCA_AGENT_TEAMS_SHIM_BIN
+  if (env.BOTMUX_AGENT_TEAMS_SHIM_BIN) {
+    return env.BOTMUX_AGENT_TEAMS_SHIM_BIN
   }
   const bundled = bundledLauncherPath()
   if (bundled && isExecutableFile(bundled)) {
     return bundled
   }
   return (
-    findExecutableOnPath(process.platform === 'win32' ? 'orca-botmux-desktop-dev.cmd' : 'orca-botmux-desktop-dev', env.PATH) ??
-    findExecutableOnPath(getOrcaCliCommandNameForPlatform(process.platform), env.PATH) ??
-    getOrcaCliCommandNameForPlatform(process.platform)
+    findExecutableOnPath(process.platform === 'win32' ? 'botmux-desktop-dev.cmd' : 'botmux-desktop-dev', env.PATH) ??
+    findExecutableOnPath(getBotmuxCliCommandNameForPlatform(process.platform), env.PATH) ??
+    getBotmuxCliCommandNameForPlatform(process.platform)
   )
 }
 
 function defaultShimRoot(): string {
-  return join(homedir(), '.orca_botmux', 'claude-agent-teams-bin')
+  return join(homedir(), '.botmux', 'claude-agent-teams-bin')
 }
 
 function bundledLauncherPath(): string | null {
@@ -77,13 +77,13 @@ function bundledLauncherPath(): string | null {
     return null
   }
   if (process.platform === 'darwin') {
-    return join(process.resourcesPath, 'bin', 'orca_botmux')
+    return join(process.resourcesPath, 'bin', 'botmux')
   }
   if (process.platform === 'linux') {
-    return join(process.resourcesPath, 'bin', 'orca-botmux-ide')
+    return join(process.resourcesPath, 'bin', 'botmux-ide')
   }
   if (process.platform === 'win32') {
-    return join(process.resourcesPath, 'bin', 'orca_botmux.exe')
+    return join(process.resourcesPath, 'bin', 'botmux.exe')
   }
   return null
 }
@@ -117,7 +117,7 @@ function unixShimScript(): string {
   return [
     '#!/usr/bin/env sh',
     'set -eu',
-    `exec "\${ORCA_AGENT_TEAMS_SHIM_BIN:-${getOrcaCliCommandNameForPlatform(process.platform)}}" agent-teams-tmux "$@"`,
+    `exec "\${BOTMUX_AGENT_TEAMS_SHIM_BIN:-${getBotmuxCliCommandNameForPlatform(process.platform)}}" agent-teams-tmux "$@"`,
     ''
   ].join('\n')
 }
@@ -126,10 +126,10 @@ function windowsShimScript(): string {
   return [
     '@echo off',
     'setlocal',
-    'if "%ORCA_AGENT_TEAMS_SHIM_BIN%"=="" (',
-    `  set "ORCA_AGENT_TEAMS_SHIM_BIN=${getOrcaCliCommandNameForPlatform(process.platform)}"`,
+    'if "%BOTMUX_AGENT_TEAMS_SHIM_BIN%"=="" (',
+    `  set "BOTMUX_AGENT_TEAMS_SHIM_BIN=${getBotmuxCliCommandNameForPlatform(process.platform)}"`,
     ')',
-    '"%ORCA_AGENT_TEAMS_SHIM_BIN%" agent-teams-tmux %*',
+    '"%BOTMUX_AGENT_TEAMS_SHIM_BIN%" agent-teams-tmux %*',
     ''
   ].join('\r\n')
 }

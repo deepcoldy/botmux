@@ -60,7 +60,7 @@ function handleBrowserSelectWebAuthnAccount(
 ): void {
   event.preventDefault()
   // Why: Electron cancels discoverable WebAuthn when no listener exists. Pick
-  // only the unambiguous single-account case until OrcaBotmux has account-picker UI.
+  // only the unambiguous single-account case until Botmux has account-picker UI.
   callback(details.accounts.length === 1 ? details.accounts[0].credentialId : null)
 }
 

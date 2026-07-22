@@ -2,7 +2,7 @@ import type { Page } from '@stablyai/playwright-test'
 import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   focusActiveTerminalInput,
   getTerminalContent,
@@ -61,32 +61,32 @@ function median(values: number[]): number {
 
 test.describe('Terminal typing latency', () => {
   test('interactive prompt echoes typed keys without visible lag', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-typing-benchmark-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-typing-benchmark-${runId}.mjs`)
     writeFileSync(scriptPath, interactivePromptScript(runId))
     let commandSent = false
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       commandSent = true
-      await waitForTerminalOutput(orcaBotmuxPage, `TYPING_READY_${runId}`, 10_000)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await waitForTerminalOutput(botmuxPage, `TYPING_READY_${runId}`, 10_000)
+      await focusActiveTerminalInput(botmuxPage)
 
       const latencies: number[] = []
       for (const [index, char] of [...KEY_LATENCY_SAMPLES].entries()) {
         const seq = index + 1
         const marker = `TYPING_KEY_${runId}_${seq}`
         const start = performance.now()
-        await orcaBotmuxPage.keyboard.type(char)
-        await waitForMarkerLatency(orcaBotmuxPage, marker, MAX_WORST_KEY_LATENCY_MS)
+        await botmuxPage.keyboard.type(char)
+        await waitForMarkerLatency(botmuxPage, marker, MAX_WORST_KEY_LATENCY_MS)
         latencies.push(performance.now() - start)
       }
 
@@ -103,7 +103,7 @@ test.describe('Terminal typing latency', () => {
       expect(worstLatency).toBeLessThan(MAX_WORST_KEY_LATENCY_MS)
     } finally {
       if (commandSent) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }

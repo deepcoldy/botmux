@@ -80,8 +80,8 @@ vi.mock('sonner', () => ({
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-cloned',
-    path: '/srv/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/srv/botmux',
+    displayName: 'botmux',
     badgeColor: '#999999',
     addedAt: 1,
     kind: 'git',
@@ -96,7 +96,7 @@ describe('useAddRepoCloneFlow', () => {
     mocks.stateSetters = []
     mocks.refIndex = 0
     mocks.refValues = []
-    mocks.stateValues = ['https://github.com/stablyai/orca_botmux.git', '/srv', false, null, null]
+    mocks.stateValues = ['https://github.com/stablyai/botmux.git', '/srv', false, null, null]
     mocks.storeState.repos = []
     mocks.storeState.projects = []
     mocks.storeState.projectHostSetups = []
@@ -131,7 +131,7 @@ describe('useAddRepoCloneFlow', () => {
 
     expect(mocks.cloneRemote).toHaveBeenCalledWith({
       connectionId: 'ssh-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/srv'
     })
     expect(mocks.cloneLocal).not.toHaveBeenCalled()
@@ -148,25 +148,25 @@ describe('useAddRepoCloneFlow', () => {
   })
 
   it('does not prefill SSH clone destinations from the local workspace directory', async () => {
-    mocks.stateValues = ['https://github.com/stablyai/orca_botmux.git', '', false, null, null]
+    mocks.stateValues = ['https://github.com/stablyai/botmux.git', '', false, null, null]
     const { useAddRepoCloneFlow } = await import('./useAddRepoCloneFlow')
 
     const result = useAddRepoCloneFlow({
       step: 'clone',
       activeRuntimeEnvironmentId: null,
       sshTargetId: 'ssh-1',
-      workspaceDir: '/private/tmp/orca-botmux-setup-e2e.hOWO1f',
+      workspaceDir: '/private/tmp/botmux-setup-e2e.hOWO1f',
       fetchWorktrees: mocks.fetchWorktrees,
       onGitRepoReady: mocks.onGitRepoReady
     })
 
     expect(result.cloneDestination).toBe('')
-    expect(mocks.stateSetters[1]).not.toHaveBeenCalledWith('/private/tmp/orca-botmux-setup-e2e.hOWO1f')
+    expect(mocks.stateSetters[1]).not.toHaveBeenCalledWith('/private/tmp/botmux-setup-e2e.hOWO1f')
   })
 
   it('strips Electron IPC wrappers from clone errors', async () => {
     const cloneError =
-      'Clone failed: Destination already exists and is not empty: /srv/orca_botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
+      'Clone failed: Destination already exists and is not empty: /srv/botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
     mocks.cloneRemote.mockRejectedValue(
       new Error(`Error invoking remote method 'repos:cloneRemote': Error: ${cloneError}`)
     )
@@ -205,7 +205,7 @@ describe('useAddRepoCloneFlow', () => {
       { kind: 'environment', environmentId: 'env-1' },
       'repo.clone',
       {
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/srv'
       },
       { timeoutMs: 10 * 60_000 }

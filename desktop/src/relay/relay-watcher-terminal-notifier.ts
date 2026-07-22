@@ -21,7 +21,7 @@ export function emitRelayWatcherTerminalFailure(
     if (watchId === undefined) {
       continue
     }
-    // Why: a shared relay may serve multiple OrcaBotmux clients; only owners of
+    // Why: a shared relay may serve multiple Botmux clients; only owners of
     // this exact logical watch should invalidate their provider state.
     dispatcher.notifyClient(clientId, 'fs.watchFailed', {
       rootPath: state.rootPath,

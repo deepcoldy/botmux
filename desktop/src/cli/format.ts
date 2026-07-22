@@ -78,7 +78,7 @@ export function printResult<TResult>(
 export function formatCliError(error: unknown, context: CliErrorContext = {}): string {
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof RuntimeClientError && error.code === 'runtime_unavailable') {
-    return `${message}\nOrca is not running. Run 'orca_botmux open' first.`
+    return `${message}\nBotmux is not running. Run 'botmux open' first.`
   }
   // Why: error-specific recovery must win over the generic computer fallback.
   if (error instanceof RuntimeClientError) {
@@ -97,7 +97,7 @@ export function formatCliError(error: unknown, context: CliErrorContext = {}): s
     error instanceof RuntimeRpcFailureError &&
     error.response.error.code === 'runtime_unavailable'
   ) {
-    return `${message}\nOrca is not running. Run 'orca_botmux open' first.`
+    return `${message}\nBotmux is not running. Run 'botmux open' first.`
   }
   if (error instanceof RuntimeRpcFailureError) {
     return formatMessageWithNextSteps(message, nextStepsFromData(error.response.error.data))

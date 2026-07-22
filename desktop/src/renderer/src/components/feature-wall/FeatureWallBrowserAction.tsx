@@ -71,7 +71,7 @@ export function BrowserAction(props: { done: boolean }): React.JSX.Element {
 }
 
 // Scope the shared feature setup to just browser use — the grab→agent flow only
-// needs the OrcaBotmux CLI and browser skill, not Computer Use or orchestration.
+// needs the Botmux CLI and browser skill, not Computer Use or orchestration.
 const BROWSER_ONLY_FEATURE_SETUP: OnboardingFeatureSetupSelection = {
   browserUse: true,
   computerUse: false,
@@ -79,8 +79,8 @@ const BROWSER_ONLY_FEATURE_SETUP: OnboardingFeatureSetupSelection = {
   linearTickets: false
 }
 
-// The grab→agent flow relies on the OrcaBotmux CLI and browser skill, so offer the same
-// install action the Enable OrcaBotmux CLI step uses, scoped to just browser use.
+// The grab→agent flow relies on the Botmux CLI and browser skill, so offer the same
+// install action the Enable Botmux CLI step uses, scoped to just browser use.
 function BrowserSkillInstallButton(): React.JSX.Element {
   const recordFeatureInteraction = useAppStore((s) => s.recordFeatureInteraction)
   const [command, setCommand] = useState<string | null>(null)

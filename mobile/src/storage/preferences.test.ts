@@ -53,10 +53,10 @@ describe('session view preference', () => {
   it('defaults to terminal and persists the chat default', async () => {
     vi.mocked(AsyncStorage.getItem).mockResolvedValue(null)
     await expect(loadDefaultSessionView()).resolves.toBe('terminal')
-    expect(AsyncStorage.getItem).toHaveBeenCalledWith('orca:defaultSessionView')
+    expect(AsyncStorage.getItem).toHaveBeenCalledWith('botmux:defaultSessionView')
 
     await saveDefaultSessionView('chat')
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:defaultSessionView', 'chat')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:defaultSessionView', 'chat')
 
     vi.mocked(AsyncStorage.getItem).mockResolvedValue('bogus')
     await expect(loadDefaultSessionView()).resolves.toBe('terminal')
@@ -73,12 +73,12 @@ describe('session view preference', () => {
       ['tab-2', 'terminal']
     ])
     expect(AsyncStorage.getItem).toHaveBeenCalledWith(
-      'orca:nativeChatTabs:host%2Fone:folder%3AC%3A%5Crepo'
+      'botmux:nativeChatTabs:host%2Fone:folder%3AC%3A%5Crepo'
     )
 
     await updateSessionViewOverride('host/one', 'folder:C:\\repo', 'tab-2', 'chat')
     expect(AsyncStorage.setItem).toHaveBeenCalledWith(
-      'orca:nativeChatTabs:host%2Fone:folder%3AC%3A%5Crepo',
+      'botmux:nativeChatTabs:host%2Fone:folder%3AC%3A%5Crepo',
       JSON.stringify({ 'tab-1': 'chat', 'tab-2': 'chat' })
     )
   })
@@ -117,8 +117,8 @@ describe('session view preference', () => {
     await Promise.all([older, newer])
 
     await expect(reloaded).resolves.toBe('terminal')
-    expect(AsyncStorage.setItem).toHaveBeenNthCalledWith(1, 'orca:defaultSessionView', 'chat')
-    expect(AsyncStorage.setItem).toHaveBeenNthCalledWith(2, 'orca:defaultSessionView', 'terminal')
+    expect(AsyncStorage.setItem).toHaveBeenNthCalledWith(1, 'botmux:defaultSessionView', 'chat')
+    expect(AsyncStorage.setItem).toHaveBeenNthCalledWith(2, 'botmux:defaultSessionView', 'terminal')
   })
 
   it('continues the shared default queue after a failed write', async () => {
@@ -185,7 +185,7 @@ describe('session view preference', () => {
     await updateSessionViewOverride('other-host', 'worktree', 'tab', 'terminal')
 
     expect(AsyncStorage.setItem).toHaveBeenCalledWith(
-      'orca:nativeChatTabs:other-host:worktree',
+      'botmux:nativeChatTabs:other-host:worktree',
       JSON.stringify({ tab: 'terminal' })
     )
     blockedWrite.resolve()
@@ -232,7 +232,7 @@ describe('session view preference', () => {
     await updateSessionViewOverride('host', 'worktree', 'tab', 'chat')
 
     expect(AsyncStorage.setItem).toHaveBeenCalledWith(
-      'orca:nativeChatTabs:host:worktree',
+      'botmux:nativeChatTabs:host:worktree',
       JSON.stringify({ tab: 'chat' })
     )
   })
@@ -271,10 +271,10 @@ describe('push notification preference', () => {
 
   it('persists the onboarding decision in the existing mobile toggle', async () => {
     await savePushNotificationsEnabled(true)
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:pushNotificationsEnabled', 'true')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:pushNotificationsEnabled', 'true')
 
     await savePushNotificationsEnabled(false)
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:pushNotificationsEnabled', 'false')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:pushNotificationsEnabled', 'false')
   })
 })
 
@@ -288,7 +288,7 @@ describe('terminal autocomplete preference', () => {
     vi.mocked(AsyncStorage.getItem).mockResolvedValue(null)
 
     await expect(loadTerminalAutocompleteEnabled()).resolves.toBe(false)
-    expect(AsyncStorage.getItem).toHaveBeenCalledWith('orca:terminalAutocompleteEnabled')
+    expect(AsyncStorage.getItem).toHaveBeenCalledWith('botmux:terminalAutocompleteEnabled')
   })
 
   it('loads enabled only from the persisted true value', async () => {
@@ -310,11 +310,11 @@ describe('terminal autocomplete preference', () => {
   it('persists the selected value', async () => {
     await saveTerminalAutocompleteEnabled(true)
 
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:terminalAutocompleteEnabled', 'true')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:terminalAutocompleteEnabled', 'true')
 
     await saveTerminalAutocompleteEnabled(false)
 
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:terminalAutocompleteEnabled', 'false')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:terminalAutocompleteEnabled', 'false')
   })
 })
 
@@ -368,7 +368,7 @@ describe('terminal live input disabled handles preference', () => {
     )
 
     expect(AsyncStorage.setItem).toHaveBeenCalledWith(
-      'orca:terminalLiveInputDisabled:host%2Fone:folder%3AC%3A%5Crepo',
+      'botmux:terminalLiveInputDisabled:host%2Fone:folder%3AC%3A%5Crepo',
       JSON.stringify(['pty-2', 'pty-1'])
     )
   })
@@ -408,7 +408,7 @@ describe('host sidebar width preference', () => {
     await saveHostSidebarWidth(HOST_SIDEBAR_MIN_WIDTH - 20)
 
     expect(AsyncStorage.setItem).toHaveBeenCalledWith(
-      'orca:hostSidebarWidth',
+      'botmux:hostSidebarWidth',
       String(HOST_SIDEBAR_MIN_WIDTH)
     )
   })
@@ -428,11 +428,11 @@ describe('terminal link open mode preference', () => {
     vi.mocked(AsyncStorage.setItem).mockReset()
   })
 
-  it('defaults to Orca browser when unset', async () => {
+  it('defaults to Botmux browser when unset', async () => {
     vi.mocked(AsyncStorage.getItem).mockResolvedValue(null)
 
-    await expect(loadTerminalLinkOpenMode()).resolves.toBe('orca-browser')
-    expect(AsyncStorage.getItem).toHaveBeenCalledWith('orca:terminalLinkOpenMode')
+    await expect(loadTerminalLinkOpenMode()).resolves.toBe('botmux-browser')
+    expect(AsyncStorage.getItem).toHaveBeenCalledWith('botmux:terminalLinkOpenMode')
   })
 
   it('loads only known modes', async () => {
@@ -440,18 +440,18 @@ describe('terminal link open mode preference', () => {
     await expect(loadTerminalLinkOpenMode()).resolves.toBe('phone-browser')
 
     vi.mocked(AsyncStorage.getItem).mockResolvedValue('external')
-    await expect(loadTerminalLinkOpenMode()).resolves.toBe('orca-browser')
+    await expect(loadTerminalLinkOpenMode()).resolves.toBe('botmux-browser')
   })
 
-  it('falls back to Orca browser when storage cannot be read', async () => {
+  it('falls back to Botmux browser when storage cannot be read', async () => {
     vi.mocked(AsyncStorage.getItem).mockRejectedValue(new Error('storage unavailable'))
 
-    await expect(loadTerminalLinkOpenMode()).resolves.toBe('orca-browser')
+    await expect(loadTerminalLinkOpenMode()).resolves.toBe('botmux-browser')
   })
 
   it('persists the selected mode', async () => {
     await saveTerminalLinkOpenMode('phone-browser')
 
-    expect(AsyncStorage.setItem).toHaveBeenCalledWith('orca:terminalLinkOpenMode', 'phone-browser')
+    expect(AsyncStorage.setItem).toHaveBeenCalledWith('botmux:terminalLinkOpenMode', 'phone-browser')
   })
 })

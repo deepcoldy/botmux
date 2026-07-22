@@ -178,7 +178,7 @@ describe('browserManager grab operations', () => {
       const result = await browserManager.setGrabMode('tab-1', true, guest)
       expect(result).toBe(true)
       expect(guestExecuteJavaScriptMock).toHaveBeenCalledTimes(1)
-      expect(guestExecuteJavaScriptMock.mock.calls[0][0]).toContain('__orca-grab-host')
+      expect(guestExecuteJavaScriptMock.mock.calls[0][0]).toContain('__botmux-grab-host')
     })
 
     it('cancels active grab op when disabling', async () => {
@@ -394,7 +394,7 @@ describe('browserManager grab operations', () => {
     })
 
     it('resolves with cancelled when guest returns teardown cancellation marker', async () => {
-      guestExecuteJavaScriptMock.mockResolvedValueOnce({ __orcaCancelled: true })
+      guestExecuteJavaScriptMock.mockResolvedValueOnce({ __botmuxCancelled: true })
 
       const result = await browserManager.awaitGrabSelection('tab-1', 'op-1', guest)
       expect(result).toEqual({ opId: 'op-1', kind: 'cancelled', reason: 'user' })
@@ -858,11 +858,11 @@ describe('browserManager grab operations', () => {
       })
       expect(guestExecuteJavaScriptMock).toHaveBeenNthCalledWith(
         1,
-        expect.stringContaining('__orcaGrab')
+        expect.stringContaining('__botmuxGrab')
       )
       expect(guestExecuteJavaScriptMock).toHaveBeenNthCalledWith(
         2,
-        expect.stringContaining('__orcaGrab')
+        expect.stringContaining('__botmuxGrab')
       )
       expect(guestExecuteJavaScriptMock).toHaveBeenNthCalledWith(3, 'window.innerWidth')
     })

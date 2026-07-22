@@ -5,7 +5,7 @@ import {
 } from './setup-runner-command'
 
 const DEFAULT_WAIT_TIMEOUT_SECONDS = 2 * 60 * 60
-export const SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV = 'ORCA_SEQUENCED_STARTUP_COMMAND'
+export const SETUP_AGENT_SEQUENCE_STARTUP_COMMAND_ENV = 'BOTMUX_SEQUENCED_STARTUP_COMMAND'
 
 export type SequencedSetupAgentCommands = {
   setupCommand: string
@@ -167,14 +167,14 @@ function hasUnquotedPosixCommandSeparator(command: string): boolean {
 
 function buildWindowsSetupCommand(setupCommand: string, markerPath: string, nonce: string): string {
   return wrapCmd([
-    `set "ORCA_SETUP_MARKER=${escapeCmdSetValue(markerPath)}"`,
-    `set "ORCA_SETUP_NONCE=${escapeCmdSetValue(nonce)}"`,
-    'del /f /q "!ORCA_SETUP_MARKER!" "!ORCA_SETUP_MARKER!.tmp" 2>nul',
+    `set "BOTMUX_SETUP_MARKER=${escapeCmdSetValue(markerPath)}"`,
+    `set "BOTMUX_SETUP_NONCE=${escapeCmdSetValue(nonce)}"`,
+    'del /f /q "!BOTMUX_SETUP_MARKER!" "!BOTMUX_SETUP_MARKER!.tmp" 2>nul',
     `call ${setupCommand}`,
-    'set "ORCA_SETUP_STATUS=!ERRORLEVEL!"',
-    '> "!ORCA_SETUP_MARKER!.tmp" echo !ORCA_SETUP_NONCE!:!ORCA_SETUP_STATUS!',
-    'move /y "!ORCA_SETUP_MARKER!.tmp" "!ORCA_SETUP_MARKER!" >nul',
-    'exit /b !ORCA_SETUP_STATUS!'
+    'set "BOTMUX_SETUP_STATUS=!ERRORLEVEL!"',
+    '> "!BOTMUX_SETUP_MARKER!.tmp" echo !BOTMUX_SETUP_NONCE!:!BOTMUX_SETUP_STATUS!',
+    'move /y "!BOTMUX_SETUP_MARKER!.tmp" "!BOTMUX_SETUP_MARKER!" >nul',
+    'exit /b !BOTMUX_SETUP_STATUS!'
   ])
 }
 
@@ -187,9 +187,9 @@ function buildWindowsStartupCommand(
   // Why: native Windows setup runners launch through cmd.exe, but PowerShell
   // gives us safe bounded file polling/parsing without a fragile batch label loop.
   const script = [
-    '$marker = $env:ORCA_SETUP_MARKER',
+    '$marker = $env:BOTMUX_SETUP_MARKER',
     '$tmp = $marker + ".tmp"',
-    '$nonce = $env:ORCA_SETUP_NONCE',
+    '$nonce = $env:BOTMUX_SETUP_NONCE',
     `$deadline = (Get-Date).AddSeconds(${timeout})`,
     'while ($true) {',
     '  if (Test-Path -LiteralPath $marker) {',
@@ -221,12 +221,12 @@ function buildWindowsStartupCommand(
   ].join('; ')
 
   return wrapCmd([
-    `set "ORCA_SETUP_MARKER=${escapeCmdSetValue(markerPath)}"`,
-    `set "ORCA_SETUP_NONCE=${escapeCmdSetValue(nonce)}"`,
+    `set "BOTMUX_SETUP_MARKER=${escapeCmdSetValue(markerPath)}"`,
+    `set "BOTMUX_SETUP_NONCE=${escapeCmdSetValue(nonce)}"`,
     'echo Waiting for setup to finish before starting agent... 1>&2',
     `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ${quoteWindowsArg(script)}`,
-    'set "ORCA_SETUP_STATUS=!ERRORLEVEL!"',
-    'exit /b !ORCA_SETUP_STATUS!'
+    'set "BOTMUX_SETUP_STATUS=!ERRORLEVEL!"',
+    'exit /b !BOTMUX_SETUP_STATUS!'
   ])
 }
 

@@ -44,7 +44,7 @@ describe('browser automation visibility leases', () => {
     })
     const { isBrowserAutomationVisible } = await import('./browser-automation-visibility')
 
-    const bridge = window.__orcaBrowserAutomationVisibility
+    const bridge = window.__botmuxBrowserAutomationVisibility
     expect(bridge).toBeTruthy()
 
     const acquirePromise = bridge?.acquire('page-2')
@@ -76,7 +76,7 @@ describe('browser automation visibility leases', () => {
     try {
       const { isBrowserAutomationVisible } = await import('./browser-automation-visibility')
 
-      const bridge = window.__orcaBrowserAutomationVisibility
+      const bridge = window.__botmuxBrowserAutomationVisibility
       expect(bridge).toBeTruthy()
 
       const acquirePromise = bridge?.acquire('page-hung-paint')

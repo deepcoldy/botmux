@@ -1,6 +1,5 @@
 import React, { useState } from 'react'
 import {
-  BookOpen,
   CircleHelp,
   ExternalLink,
   Github,
@@ -35,11 +34,12 @@ import { SidebarFeedbackDialog } from './SidebarFeedbackDialog'
 import { translate } from '@/i18n/i18n'
 import { getUpdateCheckClickOptions, getUpdateCheckHint } from '@/lib/update-check-click-options'
 
-const DOCS_URL = 'https://www.onorca.dev/docs'
-const CHANGELOG_URL = 'https://onorca.dev/changelog'
-const GITHUB_URL = 'https://github.com/stablyai/orca_botmux'
+// Why: Botmux has no public changelog host yet. Keep the slot empty so Help
+// does not open example.test; fill when a Botmux changelog URL exists.
+const CHANGELOG_URL = ''
+const GITHUB_URL = 'https://github.com/deepcoldy/botmux'
 const DISCORD_URL = 'https://discord.gg/fzjDKHxv8Q'
-const X_URL = 'https://x.com/orca_botmux_build'
+const X_URL = 'https://x.com/botmux_build'
 const NO_UPDATE_CHECK_MODIFIERS = { ctrlKey: false, metaKey: false, shiftKey: false }
 
 function openExternalUrl(url: string): void {
@@ -91,7 +91,7 @@ export function SidebarSettingsHelpMenu(): React.JSX.Element {
   const [menuOpen, setMenuOpen] = useState(false)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
   const [showAdminOptions, setShowAdminOptions] = useState(false)
-  const [isRestartingOrca, setIsRestartingOrca] = useState(false)
+  const [isRestartingBotmux, setIsRestartingBotmux] = useState(false)
   const lastShowOnboardingAtRef = React.useRef(0)
   const updateCheckModifiersRef = React.useRef(NO_UPDATE_CHECK_MODIFIERS)
   const mountedRef = useMountedRef()
@@ -123,21 +123,21 @@ export function SidebarSettingsHelpMenu(): React.JSX.Element {
     void showOnboardingFromRenderer()
   }
 
-  const handleRestartOrca = (): void => {
-    if (isRestartingOrca) {
+  const handleRestartBotmux = (): void => {
+    if (isRestartingBotmux) {
       return
     }
-    setIsRestartingOrca(true)
+    setIsRestartingBotmux(true)
     toast.info(
-      translate('auto.components.sidebar.SidebarSettingsHelpMenu.5161eef55d', 'Restarting OrcaBotmux…')
+      translate('auto.components.sidebar.SidebarSettingsHelpMenu.5161eef55d', 'Restarting Botmux…')
     )
     void window.api.app.restart().catch((error) => {
       if (mountedRef.current) {
-        setIsRestartingOrca(false)
+        setIsRestartingBotmux(false)
         toast.error(
           translate(
             'auto.components.sidebar.SidebarSettingsHelpMenu.4e8f5710d3',
-            "Couldn't restart OrcaBotmux."
+            "Couldn't restart Botmux."
           ),
           {
             description: error instanceof Error ? error.message : undefined
@@ -275,22 +275,16 @@ export function SidebarSettingsHelpMenu(): React.JSX.Element {
                 )}
               </DropdownMenuItem>
             ) : null}
-            <ExternalMenuItem
-              label={translate(
-                'auto.components.sidebar.SidebarSettingsHelpMenu.cdc87f897e',
-                'Docs'
-              )}
-              url={DOCS_URL}
-              icon={<BookOpen className="size-3.5" />}
-            />
-            <ExternalMenuItem
-              label={translate(
-                'auto.components.sidebar.SidebarSettingsHelpMenu.5f83d86d92',
-                'Changelog'
-              )}
-              url={CHANGELOG_URL}
-              icon={<ScrollText className="size-3.5" />}
-            />
+            {CHANGELOG_URL ? (
+              <ExternalMenuItem
+                label={translate(
+                  'auto.components.sidebar.SidebarSettingsHelpMenu.5f83d86d92',
+                  'Changelog'
+                )}
+                url={CHANGELOG_URL}
+                icon={<ScrollText className="size-3.5" />}
+              />
+            ) : null}
             <DropdownMenuSeparator />
             <ExternalMenuItem
               label={translate(
@@ -330,11 +324,11 @@ export function SidebarSettingsHelpMenu(): React.JSX.Element {
             {showAdminOptions ? (
               <>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={handleRestartOrca} disabled={isRestartingOrca}>
+                <DropdownMenuItem onSelect={handleRestartBotmux} disabled={isRestartingBotmux}>
                   <RotateCw className="size-3.5" />
                   {translate(
                     'auto.components.sidebar.SidebarSettingsHelpMenu.ad3d3ed7f1',
-                    'Restart OrcaBotmux'
+                    'Restart Botmux'
                   )}
                 </DropdownMenuItem>
               </>

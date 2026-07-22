@@ -36,75 +36,75 @@ describe('resolveRepoBackedProjectDialogState', () => {
 
 describe('resolveMissingRepoProjectDialogState', () => {
   it('clears fallback dialogs while the slug index is rebuilding', () => {
-    const slugDialog = { origin: { owner: 'stablyai', repo: 'orca_botmux' } }
-    const repoNotInOrca = { owner: 'stablyai', repo: 'orca_botmux', url: null }
+    const slugDialog = { origin: { owner: 'stablyai', repo: 'botmux' } }
+    const repoNotInBotmux = { owner: 'stablyai', repo: 'botmux', url: null }
 
     expect(
       resolveMissingRepoProjectDialogState({
         slugIndexReady: false,
         slugDialog,
-        repoNotInOrca,
+        repoNotInBotmux,
         lookupSlug: () => [{ id: 'repo-1' }],
         selectedRepoIds: new Set(['repo-1'])
       })
-    ).toEqual({ slugDialog: null, repoNotInOrca: null })
+    ).toEqual({ slugDialog: null, repoNotInBotmux: null })
   })
 
   it('clears slug fallback dialogs once the repo slug resolves', () => {
-    const slugDialog = { origin: { owner: 'stablyai', repo: 'orca_botmux' } }
-    const repoNotInOrca = { owner: 'other', repo: 'tool', url: null }
+    const slugDialog = { origin: { owner: 'stablyai', repo: 'botmux' } }
+    const repoNotInBotmux = { owner: 'other', repo: 'tool', url: null }
     const result = resolveMissingRepoProjectDialogState({
       slugIndexReady: true,
       slugDialog,
-      repoNotInOrca,
-      lookupSlug: (slug) => (slug === 'stablyai/orca_botmux' ? [{ id: 'repo-1' }] : []),
+      repoNotInBotmux,
+      lookupSlug: (slug) => (slug === 'stablyai/botmux' ? [{ id: 'repo-1' }] : []),
       selectedRepoIds: new Set(['repo-1'])
     })
 
     expect(result.slugDialog).toBeNull()
-    expect(result.repoNotInOrca).toBe(repoNotInOrca)
+    expect(result.repoNotInBotmux).toBe(repoNotInBotmux)
   })
 
-  it('clears repo-not-in-orca_botmux dialogs once the repo slug resolves', () => {
+  it('clears repo-not-in-botmux dialogs once the repo slug resolves', () => {
     const slugDialog = { origin: { owner: 'other', repo: 'tool' } }
-    const repoNotInOrca = { owner: 'stablyai', repo: 'orca_botmux', url: null }
+    const repoNotInBotmux = { owner: 'stablyai', repo: 'botmux', url: null }
     const result = resolveMissingRepoProjectDialogState({
       slugIndexReady: true,
       slugDialog,
-      repoNotInOrca,
-      lookupSlug: (slug) => (slug === 'stablyai/orca_botmux' ? [{ id: 'repo-1' }] : []),
+      repoNotInBotmux,
+      lookupSlug: (slug) => (slug === 'stablyai/botmux' ? [{ id: 'repo-1' }] : []),
       selectedRepoIds: new Set(['repo-1'])
     })
 
     expect(result.slugDialog).toBe(slugDialog)
-    expect(result.repoNotInOrca).toBeNull()
+    expect(result.repoNotInBotmux).toBeNull()
   })
 
   it('clears fallback dialogs when the repo is globally known but not selected', () => {
-    const slugDialog = { origin: { owner: 'stablyai', repo: 'orca_botmux' } }
-    const repoNotInOrca = { owner: 'stablyai', repo: 'orca_botmux', url: null }
+    const slugDialog = { origin: { owner: 'stablyai', repo: 'botmux' } }
+    const repoNotInBotmux = { owner: 'stablyai', repo: 'botmux', url: null }
     const result = resolveMissingRepoProjectDialogState({
       slugIndexReady: true,
       slugDialog,
-      repoNotInOrca,
+      repoNotInBotmux,
       lookupSlug: () => [{ id: 'repo-2' }],
       selectedRepoIds: new Set(['repo-1'])
     })
 
-    expect(result).toEqual({ slugDialog: null, repoNotInOrca: null })
+    expect(result).toEqual({ slugDialog: null, repoNotInBotmux: null })
   })
 
   it('keeps missing-repo fallback dialogs when there are no global matches', () => {
-    const slugDialog = { origin: { owner: 'stablyai', repo: 'orca_botmux' } }
-    const repoNotInOrca = { owner: 'stablyai', repo: 'orca_botmux', url: null }
+    const slugDialog = { origin: { owner: 'stablyai', repo: 'botmux' } }
+    const repoNotInBotmux = { owner: 'stablyai', repo: 'botmux', url: null }
     const result = resolveMissingRepoProjectDialogState({
       slugIndexReady: true,
       slugDialog,
-      repoNotInOrca,
+      repoNotInBotmux,
       lookupSlug: () => [],
       selectedRepoIds: new Set(['repo-1'])
     })
 
-    expect(result).toEqual({ slugDialog, repoNotInOrca })
+    expect(result).toEqual({ slugDialog, repoNotInBotmux })
   })
 })

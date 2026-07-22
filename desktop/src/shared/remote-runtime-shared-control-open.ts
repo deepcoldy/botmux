@@ -84,7 +84,7 @@ export function openSharedControlSocket(
       }
       liveness.onDead(
         remoteRuntimeUnavailableError(
-          'Remote OrcaBotmux runtime stopped responding; resetting the control connection.'
+          'Remote Botmux runtime stopped responding; resetting the control connection.'
         )
       )
     },

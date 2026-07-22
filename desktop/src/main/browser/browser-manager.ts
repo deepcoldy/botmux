@@ -5,7 +5,7 @@ in one file avoids scattering the browser security boundary across modules. */
 import { randomUUID } from 'node:crypto'
 
 import { shell, webContents } from 'electron'
-import { ORCA_BROWSER_BLANK_URL } from '../../shared/constants'
+import { BOTMUX_BROWSER_BLANK_URL } from '../../shared/constants'
 import {
   normalizeBrowserNavigationUrl,
   normalizeExternalBrowserUrl,
@@ -91,7 +91,7 @@ function releaseAutomationVisibilityToken(renderer: Electron.WebContents, token:
   renderer
     .executeJavaScript(
       `(function() {
-        var bridge = window.__orcaBrowserAutomationVisibility;
+        var bridge = window.__botmuxBrowserAutomationVisibility;
         if (!bridge || typeof bridge.release !== 'function') return false;
         return bridge.release(${JSON.stringify(token)});
       })()`
@@ -398,7 +398,7 @@ export class BrowserManager {
     return renderer
   }
 
-  // Why: screenshot sessions target guest page ids, but OrcaBotmux's visible browser
+  // Why: screenshot sessions target guest page ids, but Botmux's visible browser
   // chrome is keyed by workspace ids. If we activate the page id directly, the
   // webview stays hidden under the terminal pane and Page.captureScreenshot
   // times out even though the guest still exists.
@@ -587,7 +587,7 @@ export class BrowserManager {
                 ${JSON.stringify(prev?.targetBrowserPageId)} &&
               typeof state.setActiveBrowserPage === 'function'
             ) {
-              // Why: OrcaBotmux remembers the last browser workspace/page even when
+              // Why: Botmux remembers the last browser workspace/page even when
               // the user is currently in terminal/editor view. Screenshot prep
               // temporarily switches that hidden browser selection state, so
               // restore it independently of the visible tab type.
@@ -623,11 +623,11 @@ export class BrowserManager {
     }
 
     // Why: agent browser commands need a paintable webview for lazy-loading
-    // sites, but must not steal the user's visible OrcaBotmux tab/worktree.
+    // sites, but must not steal the user's visible Botmux tab/worktree.
     const acquirePromise = renderer
       .executeJavaScript(
         `(async function() {
-            var bridge = window.__orcaBrowserAutomationVisibility;
+            var bridge = window.__botmuxBrowserAutomationVisibility;
             if (!bridge || typeof bridge.acquire !== 'function') return null;
             return await bridge.acquire(${JSON.stringify(browserPageId)});
           })()`
@@ -660,10 +660,10 @@ export class BrowserManager {
       this.popupOwnerContextByGuestId.set(guest.id, inheritedOwnerContext)
     }
     // Why: OAuth child windows must retain normal link/window relationships;
-    // only the primary embedded browser converts new-tab clicks to OrcaBotmux tabs.
+    // only the primary embedded browser converts new-tab clicks to Botmux tabs.
     const clickedLinkFrameName = inheritedOwnerContext
       ? null
-      : `__orca_clicked_link_foreground_${randomUUID()}`
+      : `__botmux_clicked_link_foreground_${randomUUID()}`
     if (clickedLinkFrameName) {
       this.clickedLinkFrameNameByGuestId.set(guest.id, clickedLinkFrameName)
     }
@@ -677,7 +677,7 @@ export class BrowserManager {
 
     // Why: background throttling must be disabled so agent-driven screenshots
     // (Page.captureScreenshot via CDP proxy) can capture frames even when the
-    // OrcaBotmux window is not the focused foreground app. With throttling enabled,
+    // Botmux window is not the focused foreground app. With throttling enabled,
     // the compositor stops producing frames and capturePage() returns empty.
     guest.setBackgroundThrottling(false)
     const installClickedLinkRouting = (): void => {
@@ -722,7 +722,7 @@ export class BrowserManager {
       if (!clickedLinkRoutingActive || frame.isDestroyed()) {
         return
       }
-      const name = `__orca_clicked_link_iframe_foreground_${randomUUID()}`
+      const name = `__botmux_clicked_link_iframe_foreground_${randomUUID()}`
       iframeFrameNameByFrame.set(frame, name)
       iframeFrameByFrameName.set(name, frame)
       // Why: child-frame tokens live in the page world, so they are consumed
@@ -782,10 +782,10 @@ export class BrowserManager {
       }
 
       if (isClickedLink) {
-        if (browserTabId && browserUrl && this.openLinkInOrcaTab(browserTabId, browserUrl)) {
+        if (browserTabId && browserUrl && this.openLinkInBotmuxTab(browserTabId, browserUrl)) {
           this.forwardOrQueuePopupEvent(guest.id, {
             origin: safeOrigin(browserUrl),
-            action: 'opened-in-orca_botmux'
+            action: 'opened-in-botmux'
           })
         }
         // Why: a recognized user gesture must never fall through to a native
@@ -795,7 +795,7 @@ export class BrowserManager {
 
       // Why: file URLs are valid for user-opened in-pane previews, but remote
       // content must not create native child windows targeting local paths.
-      const canOpenAsChild = Boolean(externalUrl || browserUrl === ORCA_BROWSER_BLANK_URL)
+      const canOpenAsChild = Boolean(externalUrl || browserUrl === BOTMUX_BROWSER_BLANK_URL)
       if (browserTabId && canOpenAsChild) {
         // Why: OAuth may request ordinary size/position features, but browser
         // content must not create deceptive or inescapable native chrome.
@@ -803,7 +803,7 @@ export class BrowserManager {
           action: 'allow',
           overrideBrowserWindowOptions: SAFE_POPUP_WINDOW_OPTIONS,
           // Why: a default child window has no address bar, so users cannot
-          // verify a popup's destination. Host it in an OrcaBotmux window with an
+          // verify a popup's destination. Host it in an Botmux window with an
           // origin bar while keeping the shared session + window.opener.
           createWindow: (options: PopupChildWindowOptions) =>
             this.createPopupChildWindowWithOriginBar(guest, url, options)
@@ -995,7 +995,7 @@ export class BrowserManager {
     )
     this.forwardOrQueuePopupEvent(openerGuest.id, {
       origin: safeOrigin(targetUrl),
-      action: 'opened-in-orca_botmux'
+      action: 'opened-in-botmux'
     })
     // Why: parity with Electron's default child-window lifecycle — closing the
     // owning browser tab must not leave orphaned session-bearing popups.
@@ -1175,7 +1175,7 @@ export class BrowserManager {
     this.annotationViewportBridgeOpsByTabId.delete(browserTabId)
   }
 
-  // Why: headless orca-botmux-desktop serve has no renderer window to mount a <webview>, so its
+  // Why: headless botmux-desktop serve has no renderer window to mount a <webview>, so its
   // browser pages are backed by main-process offscreen WebContents instead. This
   // registers such a page into the same resolution maps the bridge/screencast/
   // input handlers read, but skips the webview-only guards and the renderer setup
@@ -1216,7 +1216,7 @@ export class BrowserManager {
     // Cancel all active grab ops before tearing down registrations
     this.grabSessionController.cancelAll('evicted')
     for (const downloadId of this.downloadsById.keys()) {
-      this.cancelDownloadInternal(downloadId, 'OrcaBotmux is shutting down.')
+      this.cancelDownloadInternal(downloadId, 'Botmux is shutting down.')
     }
     browserDownloadDestinationReservations.clear()
     for (const browserTabId of this.webContentsIdByTabId.keys()) {
@@ -1455,7 +1455,7 @@ export class BrowserManager {
         item.cancel()
       } catch {
         // Why: failing setSavePath can leave Electron in a partially finalized
-        // state; cancellation is best-effort after OrcaBotmux has made the UI terminal.
+        // state; cancellation is best-effort after Botmux has made the UI terminal.
       }
       return
     }
@@ -1510,7 +1510,7 @@ export class BrowserManager {
     return true
   }
 
-  // Why: guest browser surfaces are intentionally isolated from OrcaBotmux's preload
+  // Why: guest browser surfaces are intentionally isolated from Botmux's preload
   // bridge, so renderer code cannot directly call Electron WebContents APIs on
   // them. Main owns the devtools escape hatch and only after tab→guest lookup.
   async openDevTools(browserTabId: string): Promise<boolean> {
@@ -2112,7 +2112,7 @@ export class BrowserManager {
     } catch {
       // Why: DownloadItem.cancel can throw after the item has already
       // finalized. Cleanup here is best-effort because the UI state is the
-      // source of truth for whether OrcaBotmux still considers the request active.
+      // source of truth for whether Botmux still considers the request active.
     }
 
     if (shouldSendCancel) {
@@ -2215,18 +2215,18 @@ export class BrowserManager {
     })
   }
 
-  private openLinkInOrcaTab(browserTabId: string, rawUrl: string): boolean {
+  private openLinkInBotmuxTab(browserTabId: string, rawUrl: string): boolean {
     const renderer = this.resolveRendererForBrowserTab(browserTabId)
     if (!renderer) {
       return false
     }
     const normalizedUrl = normalizeBrowserNavigationUrl(rawUrl)
-    if (!normalizedUrl || normalizedUrl === ORCA_BROWSER_BLANK_URL) {
+    if (!normalizedUrl || normalizedUrl === BOTMUX_BROWSER_BLANK_URL) {
       return false
     }
-    // Why: only the renderer owns OrcaBotmux's worktree/tab model. Main forwards a
+    // Why: only the renderer owns Botmux's worktree/tab model. Main forwards a
     // validated URL instead of letting arbitrary guest content mutate it.
-    renderer.send('browser:open-link-in-orca-botmux-tab', {
+    renderer.send('browser:open-link-in-botmux-tab', {
       browserPageId: browserTabId,
       url: normalizedUrl
     })

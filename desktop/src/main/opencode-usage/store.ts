@@ -60,12 +60,12 @@ export function normalizePersistedState(
 }
 
 export function initOpenCodeUsagePath(): void {
-  _openCodeUsageFile = join(app.getPath('userData'), 'orca-botmux-opencode-usage.json')
+  _openCodeUsageFile = join(app.getPath('userData'), 'botmux-opencode-usage.json')
 }
 
 function getOpenCodeUsageFile(): string {
   if (!_openCodeUsageFile) {
-    _openCodeUsageFile = join(app.getPath('userData'), 'orca-botmux-opencode-usage.json')
+    _openCodeUsageFile = join(app.getPath('userData'), 'botmux-opencode-usage.json')
   }
   return _openCodeUsageFile
 }
@@ -476,7 +476,7 @@ export class OpenCodeUsageStore {
   ): OpenCodeUsageDailyAggregate[] {
     const cutoff = getRangeCutoff(range)
     return this.state.dailyAggregates.filter((row) => {
-      if (scope === 'orca_botmux' && !row.worktreeId) {
+      if (scope === 'botmux' && !row.worktreeId) {
         return false
       }
       if (cutoff && row.day < cutoff) {
@@ -489,7 +489,7 @@ export class OpenCodeUsageStore {
   private getFilteredSessions(scope: OpenCodeUsageScope, range: OpenCodeUsageRange) {
     const cutoff = getRangeCutoff(range)
     return this.state.sessions.filter((session) => {
-      if (scope === 'orca_botmux' && !session.primaryWorktreeId) {
+      if (scope === 'botmux' && !session.primaryWorktreeId) {
         return false
       }
       if (cutoff) {

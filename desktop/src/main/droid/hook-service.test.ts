@@ -32,8 +32,8 @@ describe('DroidHookService', () => {
   let userDataDir: string
 
   beforeEach(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-droid-home-'))
-    userDataDir = mkdtempSync(join(tmpdir(), 'orca-botmux-droid-user-data-'))
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-droid-home-'))
+    userDataDir = mkdtempSync(join(tmpdir(), 'botmux-droid-user-data-'))
     homedirMock.mockReturnValue(homeDir)
     getPathMock.mockImplementation((name: string) => {
       if (name === 'userData') {
@@ -77,7 +77,7 @@ describe('DroidHookService', () => {
       process.platform === 'win32' ? WINDOWS_POWERSHELL_LAUNCHER : /droid-hook/
     )
     if (process.platform !== 'win32') {
-      expect(config.hooks.PreToolUse[0].hooks[0].command).toContain(join(homeDir, '.orca_botmux'))
+      expect(config.hooks.PreToolUse[0].hooks[0].command).toContain(join(homeDir, '.botmux'))
     }
     expect(config.hooks.PreToolUse[0].hooks[0].command).not.toContain(userDataDir)
   })
@@ -89,7 +89,7 @@ describe('DroidHookService', () => {
   it.skipIf(process.platform !== 'win32')(
     'wraps the managed hook command to survive spaces in the profile path (#6078)',
     () => {
-      const spaceHome = join(tmpdir(), 'orca_botmux droid home with spaces')
+      const spaceHome = join(tmpdir(), 'botmux droid home with spaces')
       mkdirSync(spaceHome, { recursive: true })
       homedirMock.mockReturnValue(spaceHome)
       try {

@@ -12,7 +12,7 @@ const TAILSCALE_DOWNLOAD_URL = 'https://tailscale.com/download'
 // Why: only the "runtime is unreachable" family of failures has a Tailscale
 // remedy; auth/protocol errors pass through untouched.
 const REMOTE_RUNTIME_UNREACHABLE_RE =
-  /could not connect to the remote orca_botmux runtime|remote orca_botmux runtime closed the connection|timed out (?:waiting for|while connecting to) the remote orca_botmux runtime/i
+  /could not connect to the remote botmux runtime|remote botmux runtime closed the connection|timed out (?:waiting for|while connecting to) the remote botmux runtime/i
 
 const TAILSCALE_MAGIC_DNS_SUFFIX_RE = /(?:^|\.)ts\.net$/i
 // Why: gate the CGNAT check on a full IPv4 literal — the range regex alone also

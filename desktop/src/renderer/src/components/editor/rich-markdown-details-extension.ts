@@ -198,7 +198,7 @@ export function exitEmptyDetailsBody(editor: Editor): boolean {
   return true
 }
 
-const OrcaDetails = Details.extend({
+const BotmuxDetails = Details.extend({
   // Why: details summary Enter must run before StarterKit's generic paragraph
   // splitting so typing a toggle title then pressing Enter moves into the body.
   priority: 1000,
@@ -208,10 +208,10 @@ const OrcaDetails = Details.extend({
       ...this.parent?.(),
       variant: {
         default: null,
-        parseHTML: (element) => parseToggleHeadingVariant(element.getAttribute('data-orca-botmux-toggle')),
+        parseHTML: (element) => parseToggleHeadingVariant(element.getAttribute('data-botmux-toggle')),
         renderHTML: ({ variant }) => {
           const parsed = parseToggleHeadingVariant(variant)
-          return parsed ? { 'data-orca-botmux-toggle': parsed } : {}
+          return parsed ? { 'data-botmux-toggle': parsed } : {}
         }
       }
     }
@@ -286,7 +286,7 @@ const OrcaDetails = Details.extend({
   }
 })
 
-const OrcaDetailsContent = DetailsContent.extend({
+const BotmuxDetailsContent = DetailsContent.extend({
   // Why: detailsContent's double-Enter escape must run before StarterKit's
   // generic paragraph split, otherwise users can get stuck inside a toggle.
   priority: 1000,
@@ -306,15 +306,15 @@ const OrcaDetailsContent = DetailsContent.extend({
   }
 })
 
-export function createOrcaDetailsExtensions(): AnyExtension[] {
+export function createBotmuxDetailsExtensions(): AnyExtension[] {
   return [
-    OrcaDetails.configure({
+    BotmuxDetails.configure({
       persist: true,
       HTMLAttributes: {
-        class: 'orca-botmux-details'
+        class: 'botmux-details'
       }
     }),
     DetailsSummary,
-    OrcaDetailsContent
+    BotmuxDetailsContent
   ]
 }

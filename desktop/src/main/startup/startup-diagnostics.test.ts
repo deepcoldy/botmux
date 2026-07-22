@@ -28,11 +28,11 @@ describe('logStartupDiagnostic', () => {
   it('formats event details as a synchronous startup diagnostic line', () => {
     const write = vi.fn()
 
-    logStartupDiagnostic('before-lock', { packaged: true, userData: '/tmp/orca_botmux' }, write)
+    logStartupDiagnostic('before-lock', { packaged: true, userData: '/tmp/botmux' }, write)
 
     expect(write).toHaveBeenCalledWith(
       2,
-      '[startup] before-lock packaged=true userData="/tmp/orca_botmux"\n'
+      '[startup] before-lock packaged=true userData="/tmp/botmux"\n'
     )
   })
 })

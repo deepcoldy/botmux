@@ -141,7 +141,7 @@ describe('HeroFlow height', () => {
     expect(screen.getByTestId('relay-degraded-notice')).toHaveTextContent(
       'only works on your local network'
     )
-    expect(screen.getByText('OrcaBotmux Relay is in beta.')).toBeInTheDocument()
+    expect(screen.getByText('Botmux Relay is in beta.')).toBeInTheDocument()
   })
 
   it('hides the degradation notice when the code encodes what was selected', () => {

@@ -8,8 +8,8 @@ export function getTerminalFileOpenHint(): string {
     : 'Ctrl+click to open or Shift+Ctrl+click for default app'
 }
 
-export function getTerminalOrcaFileOpenHint(): string {
-  return isMacPlatform() ? '⌘+click to open in OrcaBotmux' : 'Ctrl+click to open in OrcaBotmux'
+export function getTerminalBotmuxFileOpenHint(): string {
+  return isMacPlatform() ? '⌘+click to open in Botmux' : 'Ctrl+click to open in Botmux'
 }
 
 // Why: detected local .html/.htm file paths keep the same modifier gate as

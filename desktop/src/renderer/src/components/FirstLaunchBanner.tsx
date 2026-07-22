@@ -1,10 +1,10 @@
 // Existing-user first-launch notice. Shown to users whose cohort marker is
 // `existedBeforeTelemetryRelease === true` and whose `optedIn` is still
-// `null`, i.e. users who installed OrcaBotmux before the telemetry release and
+// `null`, i.e. users who installed Botmux before the telemetry release and
 // have not yet resolved the notice.
 //
 // Why existing users see a notice at all (and new users do not): pre-
-// telemetry users installed OrcaBotmux under a "no telemetry" social contract,
+// telemetry users installed Botmux under a "no telemetry" social contract,
 // so default-on for them would be a silent policy flip. New users are
 // covered by the install-time disclosure and receive no first-launch UI —
 // see telemetry-plan.md §First-launch experience.
@@ -37,7 +37,7 @@ import { useState } from 'react'
 import { X } from 'lucide-react'
 
 import { Button } from './ui/button'
-import { acknowledgeBanner, PRIVACY_URL, setOptIn as telemetrySetOptIn } from '../lib/telemetry'
+import { acknowledgeBanner, setOptIn as telemetrySetOptIn } from '../lib/telemetry'
 import { useMountedRef } from '@/hooks/useMountedRef'
 import { translate } from '@/i18n/i18n'
 
@@ -144,15 +144,7 @@ export function FirstLaunchBanner({
           {translate(
             'auto.components.FirstLaunchBanner.958d2cc31b',
             'Anonymous counts of which features you use help us prioritize what to build. No file contents, prompts, terminal output, or anything that identifies you. Change anytime in Settings -> Privacy & Telemetry.'
-          )}{' '}
-          <button
-            type="button"
-            className="underline underline-offset-2 hover:text-foreground"
-            onClick={() => void window.api.shell.openUrl(PRIVACY_URL)}
-          >
-            {translate('auto.components.FirstLaunchBanner.d1deebb050', 'Privacy policy')}
-          </button>
-          .
+          )}
         </p>
       </div>
       {/* Action column — vertically centered against the text block.

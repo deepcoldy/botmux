@@ -29,7 +29,7 @@ export const remoteRepo: Repo = {
 
 export const sshRepo: Repo = {
   id: 'ssh-repo',
-  path: '/home/orca_botmux/project',
+  path: '/home/botmux/project',
   displayName: 'SSH',
   badgeColor: '#222',
   addedAt: 3,
@@ -54,7 +54,7 @@ export const projectGroupsMoveProject: Mock = vi.fn()
 export const ptyKill: Mock = vi.fn()
 export const runtimeEnvironmentCall: Mock = vi.fn()
 export const runtimeEnvironmentTransportCall: Mock = vi.fn()
-export const orcaProfileFindProjectProfiles: Mock = vi.fn()
+export const botmuxProfileFindProjectProfiles: Mock = vi.fn()
 export const uiSet: Mock = vi.fn()
 
 // Registers the per-test reset + window stub. Call once inside the suite's module scope.
@@ -81,7 +81,7 @@ export function installReposRuntimeRoutingHarness(): void {
     projectsUpdate.mockReset()
     projectGroupsMoveProject.mockReset()
     ptyKill.mockReset()
-    orcaProfileFindProjectProfiles.mockReset()
+    botmuxProfileFindProjectProfiles.mockReset()
     runtimeEnvironmentCall.mockReset()
     runtimeEnvironmentTransportCall.mockReset()
     uiSet.mockReset()
@@ -112,8 +112,8 @@ export function installReposRuntimeRoutingHarness(): void {
         projectGroups: {
           moveProject: projectGroupsMoveProject
         },
-        orcaBotmuxProfiles: {
-          findProjectProfiles: orcaProfileFindProjectProfiles
+        botmuxProfiles: {
+          findProjectProfiles: botmuxProfileFindProjectProfiles
         },
         pty: { kill: ptyKill },
         runtimeEnvironments: { call: runtimeEnvironmentTransportCall },

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { CommandHandler } from '../dispatch'
 import { RuntimeClientError } from '../runtime-client'
-import { parseOrcaYaml } from '../../shared/orca-botmux-yaml'
+import { parseBotmuxYaml } from '../../shared/botmux-yaml'
 import {
   getEphemeralVmRecipeResultProjectRoot,
   getEphemeralVmRecipeResultWarnings,
@@ -17,7 +17,7 @@ import {
   runEphemeralVmRecipeCleanup,
   runEphemeralVmRecipeStart
 } from '../../shared/ephemeral-vm-recipe-runner'
-import type { OrcaVmRecipe } from '../../shared/types'
+import type { BotmuxVmRecipe } from '../../shared/types'
 
 export const VM_HANDLERS: Record<string, CommandHandler> = {
   'vm recipe doctor': async ({ flags, cwd, json }) => {
@@ -42,7 +42,7 @@ export const VM_HANDLERS: Record<string, CommandHandler> = {
 }
 
 function doctorRecipe(repoPath: string, recipeId: string): DoctorResult {
-  const yamlPath = join(repoPath, 'orca_botmux.yaml')
+  const yamlPath = join(repoPath, 'botmux.yaml')
   if (!existsSync(yamlPath)) {
     return {
       recipeId,
@@ -50,21 +50,21 @@ function doctorRecipe(repoPath: string, recipeId: string): DoctorResult {
       ok: false,
       checks: [
         {
-          id: 'orca_botmux_yaml.exists',
+          id: 'botmux_yaml.exists',
           status: 'fail',
-          message: `No orca_botmux.yaml found at ${yamlPath}`,
-          remediation: 'Add environmentRecipes to the repo orca_botmux.yaml.'
+          message: `No botmux.yaml found at ${yamlPath}`,
+          remediation: 'Add environmentRecipes to the repo botmux.yaml.'
         }
       ]
     }
   }
 
-  const hooks = parseOrcaYaml(readTextFile(yamlPath))
+  const hooks = parseBotmuxYaml(readTextFile(yamlPath))
   const parseCheck: EphemeralVmRecipeDoctorCheck = {
-    id: 'orca_botmux_yaml.parse',
+    id: 'botmux_yaml.parse',
     status: hooks ? 'pass' : 'fail',
-    message: hooks ? 'orca_botmux.yaml parsed successfully.' : 'orca_botmux.yaml has no supported OrcaBotmux config.',
-    ...(hooks ? {} : { remediation: 'Add an environmentRecipes entry to orca_botmux.yaml.' })
+    message: hooks ? 'botmux.yaml parsed successfully.' : 'botmux.yaml has no supported Botmux config.',
+    ...(hooks ? {} : { remediation: 'Add an environmentRecipes entry to botmux.yaml.' })
   }
   const result = doctorEphemeralVmRecipe({
     repoPath,
@@ -258,8 +258,8 @@ function buildProvisionFailureRemediation(stderr: string, stdout: string): strin
     : 'Check recipe stderr and ensure stdout contains the VM recipe result JSON.'
 }
 
-function loadRecipe(repoPath: string, recipeId: string): OrcaVmRecipe | null {
-  const hooks = parseOrcaYaml(readTextFile(join(repoPath, 'orca_botmux.yaml')))
+function loadRecipe(repoPath: string, recipeId: string): BotmuxVmRecipe | null {
+  const hooks = parseBotmuxYaml(readTextFile(join(repoPath, 'botmux.yaml')))
   return hooks?.environmentRecipes?.find((entry) => entry.id === recipeId) ?? null
 }
 

@@ -16,7 +16,7 @@ export async function sendRequest<TResult>(
       reject(
         new RuntimeClientError(
           'runtime_unavailable',
-          'No compatible transport found in OrcaBotmux runtime metadata.'
+          'No compatible transport found in Botmux runtime metadata.'
         )
       )
       return
@@ -35,7 +35,7 @@ export async function sendRequest<TResult>(
       reject(
         new RuntimeClientError(
           'runtime_timeout',
-          'Timed out waiting for the OrcaBotmux runtime to respond.'
+          'Timed out waiting for the Botmux runtime to respond.'
         )
       )
     }, timeoutMs)
@@ -62,7 +62,7 @@ export async function sendRequest<TResult>(
         ok: false,
         error: new RuntimeClientError(
           'runtime_unavailable',
-          'Could not connect to the running OrcaBotmux app. Restart OrcaBotmux and try again.'
+          'Could not connect to the running Botmux app. Restart Botmux and try again.'
         )
       })
     })
@@ -75,7 +75,7 @@ export async function sendRequest<TResult>(
         ok: false,
         error: new RuntimeClientError(
           'runtime_unavailable',
-          'The OrcaBotmux runtime closed the connection before responding. Restart OrcaBotmux and try again.'
+          'The Botmux runtime closed the connection before responding. Restart Botmux and try again.'
         )
       })
     })
@@ -103,14 +103,14 @@ export async function sendRequest<TResult>(
             ok: false,
             error: new RuntimeClientError(
               'invalid_runtime_response',
-              'The OrcaBotmux runtime returned an invalid response frame.'
+              'The Botmux runtime returned an invalid response frame.'
             )
           })
           return
         }
 
         // Fast-path: ignore keepalives without running the full schema.
-        // setTimeout().refresh() is stable since Node 10 (OrcaBotmux ships on
+        // setTimeout().refresh() is stable since Node 10 (Botmux ships on
         // Node 20+ via Electron and the standalone CLI targets the same
         // major). See §7 risk #9.
         if (isKeepaliveFrame(raw)) {
@@ -120,7 +120,7 @@ export async function sendRequest<TResult>(
         }
 
         // Why: validate the envelope shape (id, ok, result/error, _meta) at
-        // the decode boundary so version skew between the CLI and the OrcaBotmux
+        // the decode boundary so version skew between the CLI and the Botmux
         // main runtime surfaces as a single invalid_runtime_response instead
         // of a downstream mis-typed field access. `result` is left as
         // unknown — the TResult generic is the caller's responsibility.
@@ -130,7 +130,7 @@ export async function sendRequest<TResult>(
             ok: false,
             error: new RuntimeClientError(
               'invalid_runtime_response',
-              'The OrcaBotmux runtime returned an invalid response frame.'
+              'The Botmux runtime returned an invalid response frame.'
             )
           })
           return
@@ -151,7 +151,7 @@ export async function sendRequest<TResult>(
             ok: false,
             error: new RuntimeClientError(
               'invalid_runtime_response',
-              'The OrcaBotmux runtime returned a mismatched response id.'
+              'The Botmux runtime returned a mismatched response id.'
             )
           })
           return
@@ -161,7 +161,7 @@ export async function sendRequest<TResult>(
             ok: false,
             error: new RuntimeClientError(
               'runtime_unavailable',
-              'The OrcaBotmux runtime changed while the request was in flight. Retry the command.'
+              'The Botmux runtime changed while the request was in flight. Retry the command.'
             )
           })
           return

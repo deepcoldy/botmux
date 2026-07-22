@@ -11,7 +11,7 @@ vi.mock('../runtime-client', () => {
     readonly isRemote: boolean
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
 
     constructor() {
       this.isRemote = remoteMock()
@@ -46,7 +46,7 @@ vi.mock('../runtime-client', () => {
 import { main } from '../index'
 import { okFixture, queueFixtures } from '../test-fixtures'
 
-describe('orca_botmux emulator CLI handlers', () => {
+describe('botmux emulator CLI handlers', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     callMock.mockReset()

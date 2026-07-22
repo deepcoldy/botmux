@@ -22,13 +22,13 @@ describe('getDefaultTaskRepoSelection', () => {
   it('selects one source per logical GitHub project', () => {
     const selection = getDefaultTaskRepoSelection([
       repo({
-        id: 'local-orca_botmux',
-        upstream: { owner: 'StablyAI', repo: 'orca_botmux' }
+        id: 'local-botmux',
+        upstream: { owner: 'StablyAI', repo: 'botmux' }
       }),
       repo({
-        id: 'ssh-orca_botmux',
+        id: 'ssh-botmux',
         connectionId: 'builder',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       repo({
         id: 'other',
@@ -36,25 +36,25 @@ describe('getDefaultTaskRepoSelection', () => {
       })
     ])
 
-    expect([...selection].sort()).toEqual(['local-orca_botmux', 'other'])
+    expect([...selection].sort()).toEqual(['local-botmux', 'other'])
   })
 
   it('prefers local checkout over a remote checkout for the same project', () => {
     const selection = getDefaultTaskRepoSelection([
       repo({
-        id: 'ssh-orca_botmux',
+        id: 'ssh-botmux',
         addedAt: 1,
         connectionId: 'builder',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       repo({
-        id: 'local-orca_botmux',
+        id: 'local-botmux',
         addedAt: 2,
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       })
     ])
 
-    expect([...selection]).toEqual(['local-orca_botmux'])
+    expect([...selection]).toEqual(['local-botmux'])
   })
 
   it('keeps same-named folders separate when provider identity is missing', () => {
@@ -99,13 +99,13 @@ describe('getTaskProjectPickerRepos', () => {
   it('shows one picker row per logical GitHub project', () => {
     const pickerRepos = getTaskProjectPickerRepos([
       repo({
-        id: 'local-orca_botmux',
-        upstream: { owner: 'StablyAI', repo: 'orca_botmux' }
+        id: 'local-botmux',
+        upstream: { owner: 'StablyAI', repo: 'botmux' }
       }),
       repo({
-        id: 'ssh-orca_botmux',
+        id: 'ssh-botmux',
         connectionId: 'builder',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       repo({
         id: 'other',
@@ -113,26 +113,26 @@ describe('getTaskProjectPickerRepos', () => {
       })
     ])
 
-    expect(pickerRepos.map((candidate) => candidate.id)).toEqual(['local-orca_botmux', 'other'])
+    expect(pickerRepos.map((candidate) => candidate.id)).toEqual(['local-botmux', 'other'])
   })
 
   it('uses an explicitly selected remote source as the visible project row', () => {
     const pickerRepos = getTaskProjectPickerRepos(
       [
         repo({
-          id: 'local-orca_botmux',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          id: 'local-botmux',
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
-          id: 'ssh-orca_botmux',
+          id: 'ssh-botmux',
           connectionId: 'builder',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         })
       ],
-      new Set(['ssh-orca_botmux'])
+      new Set(['ssh-botmux'])
     )
 
-    expect(pickerRepos.map((candidate) => candidate.id)).toEqual(['ssh-orca_botmux'])
+    expect(pickerRepos.map((candidate) => candidate.id)).toEqual(['ssh-botmux'])
   })
 
   it('collapses legacy local and SSH rows that share a GitHub repo icon identity', () => {
@@ -168,13 +168,13 @@ describe('getTaskProjectPickerGroups', () => {
   it('keeps all host sources under one logical project row', () => {
     const groups = getTaskProjectPickerGroups([
       repo({
-        id: 'local-orca_botmux',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        id: 'local-botmux',
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       repo({
-        id: 'ssh-orca_botmux',
+        id: 'ssh-botmux',
         connectionId: 'builder',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       repo({
         id: 'docs',
@@ -184,10 +184,10 @@ describe('getTaskProjectPickerGroups', () => {
 
     expect(groups).toHaveLength(2)
     expect(groups[0]).toMatchObject({
-      projectKey: 'github:stablyai/orca_botmux',
-      repo: { id: 'local-orca_botmux' }
+      projectKey: 'github:stablyai/botmux',
+      repo: { id: 'local-botmux' }
     })
-    expect(groups[0]?.sources.map((source) => source.id)).toEqual(['local-orca_botmux', 'ssh-orca_botmux'])
+    expect(groups[0]?.sources.map((source) => source.id)).toEqual(['local-botmux', 'ssh-botmux'])
     expect(groups[1]).toMatchObject({
       projectKey: 'github:stablyai/docs',
       repo: { id: 'docs' }
@@ -198,20 +198,20 @@ describe('getTaskProjectPickerGroups', () => {
     const groups = getTaskProjectPickerGroups(
       [
         repo({
-          id: 'local-orca_botmux',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          id: 'local-botmux',
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
-          id: 'ssh-orca_botmux',
+          id: 'ssh-botmux',
           connectionId: 'builder',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         })
       ],
-      new Set(['ssh-orca_botmux'])
+      new Set(['ssh-botmux'])
     )
 
-    expect(groups[0]?.repo.id).toBe('ssh-orca_botmux')
-    expect(groups[0]?.sources.map((source) => source.id)).toEqual(['local-orca_botmux', 'ssh-orca_botmux'])
+    expect(groups[0]?.repo.id).toBe('ssh-botmux')
+    expect(groups[0]?.sources.map((source) => source.id)).toEqual(['local-botmux', 'ssh-botmux'])
   })
 })
 
@@ -220,60 +220,60 @@ describe('normalizeTaskRepoSelection', () => {
     const selection = normalizeTaskRepoSelection(
       [
         repo({
-          id: 'local-orca_botmux',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          id: 'local-botmux',
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
-          id: 'ssh-orca_botmux',
+          id: 'ssh-botmux',
           connectionId: 'builder',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         })
       ],
-      new Set(['local-orca_botmux', 'ssh-orca_botmux'])
+      new Set(['local-botmux', 'ssh-botmux'])
     )
 
-    expect([...selection]).toEqual(['local-orca_botmux'])
+    expect([...selection]).toEqual(['local-botmux'])
   })
 
   it('preserves a single explicit remote source selection', () => {
     const selection = normalizeTaskRepoSelection(
       [
         repo({
-          id: 'local-orca_botmux',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          id: 'local-botmux',
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
-          id: 'ssh-orca_botmux',
+          id: 'ssh-botmux',
           connectionId: 'builder',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         })
       ],
-      new Set(['ssh-orca_botmux'])
+      new Set(['ssh-botmux'])
     )
 
-    expect([...selection]).toEqual(['ssh-orca_botmux'])
+    expect([...selection]).toEqual(['ssh-botmux'])
   })
 
   it('normalizes raw all-host selection to one source per logical project', () => {
     const selection = normalizeTaskRepoSelection(
       [
         repo({
-          id: 'local-orca_botmux',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          id: 'local-botmux',
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
-          id: 'ssh-orca_botmux',
+          id: 'ssh-botmux',
           connectionId: 'builder',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }),
         repo({
           id: 'docs',
           upstream: { owner: 'stablyai', repo: 'docs' }
         })
       ],
-      new Set(['local-orca_botmux', 'ssh-orca_botmux', 'docs'])
+      new Set(['local-botmux', 'ssh-botmux', 'docs'])
     )
 
-    expect([...selection].sort()).toEqual(['docs', 'local-orca_botmux'])
+    expect([...selection].sort()).toEqual(['docs', 'local-botmux'])
   })
 })

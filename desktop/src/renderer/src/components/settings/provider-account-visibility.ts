@@ -68,7 +68,7 @@ export function providerAccountMatchesView(
   const accountView = getProviderAccountRuntime(account)
 
   if (options.remoteOwner) {
-    // Why: provider accounts belong to the OrcaBotmux runtime, not its client or a
+    // Why: provider accounts belong to the Botmux runtime, not its client or a
     // downstream SSH host; a Windows runtime owns both host and WSL accounts.
     return options.ownerPlatform === 'win32' || accountView.runtime !== 'wsl'
   }

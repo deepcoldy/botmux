@@ -45,8 +45,8 @@ function renderHeader({
         title: isGitLab ? 'Fix GitLab MR creation' : 'fix: pr-bug-scan validated finding',
         state: 'open',
         url: isGitLab
-          ? 'https://gitlab.com/acme/orca_botmux/-/merge_requests/31'
-          : 'https://github.com/stablyai/orca_botmux/pull/2964',
+          ? 'https://gitlab.com/acme/botmux/-/merge_requests/31'
+          : 'https://github.com/stablyai/botmux/pull/2964',
         status: 'pending',
         updatedAt: '2026-05-31T22:58:01Z',
         mergeable: 'UNKNOWN'

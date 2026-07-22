@@ -590,10 +590,10 @@ describe('attachMainWindowServices', () => {
     notifier.worktreesChanged('repo-1')
     notifier.reposChanged()
     notifier.activateWorktree('repo-1', 'wt-1', {
-      runnerScriptPath: '/tmp/repo/.git/orca_botmux/setup-runner.sh',
+      runnerScriptPath: '/tmp/repo/.git/botmux/setup-runner.sh',
       envVars: {
-        ORCA_ROOT_PATH: '/tmp/repo',
-        ORCA_WORKTREE_PATH: '/tmp/worktrees/wt-1'
+        BOTMUX_ROOT_PATH: '/tmp/repo',
+        BOTMUX_WORKTREE_PATH: '/tmp/worktrees/wt-1'
       }
     })
 
@@ -606,10 +606,10 @@ describe('attachMainWindowServices', () => {
           repoId: 'repo-1',
           worktreeId: 'wt-1',
           setup: {
-            runnerScriptPath: '/tmp/repo/.git/orca_botmux/setup-runner.sh',
+            runnerScriptPath: '/tmp/repo/.git/botmux/setup-runner.sh',
             envVars: {
-              ORCA_ROOT_PATH: '/tmp/repo',
-              ORCA_WORKTREE_PATH: '/tmp/worktrees/wt-1'
+              BOTMUX_ROOT_PATH: '/tmp/repo',
+              BOTMUX_WORKTREE_PATH: '/tmp/worktrees/wt-1'
             }
           }
         }

@@ -66,7 +66,7 @@ function resolveUnshiftedCharacterForCode(code: string | undefined): string | un
 
 /**
  * Resolves terminal keyboard events before xterm receives them.
- * Keeps configurable OrcaBotmux shortcuts and terminal byte fallbacks in one
+ * Keeps configurable Botmux shortcuts and terminal byte fallbacks in one
  * platform-aware policy so renderer handlers do not duplicate key checks.
  */
 export function resolveTerminalShortcutAction(

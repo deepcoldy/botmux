@@ -32,7 +32,7 @@
 import type { Page, TestInfo } from '@stablyai/playwright-test'
 import { writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveWorktreeId,
@@ -132,7 +132,7 @@ async function closeRightSidebarAndFeatureTips(page: Page): Promise<void> {
     if (!store) {
       return
     }
-    store.getState().markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+    store.getState().markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     if (store.getState().rightSidebarOpen) {
       store.getState().setRightSidebarOpen(false)
     }
@@ -189,7 +189,7 @@ async function driveHiddenResizeRevealCycles(args: CycleDriverArgs): Promise<Cyc
   await waitForPtyShellEcho(page, ptyId, 15_000)
 
   const runId = Math.random().toString(36).slice(2, 10)
-  const scriptPath = path.join(testRepoPath, `.orca-botmux-bottom-bar-${runId}.cjs`)
+  const scriptPath = path.join(testRepoPath, `.botmux-bottom-bar-${runId}.cjs`)
   writeFileSync(scriptPath, bottomBarTuiScript(runId))
   await sendToTerminal(page, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
   await expect
@@ -257,12 +257,12 @@ async function driveHiddenResizeRevealCycles(args: CycleDriverArgs): Promise<Cyc
 
 test.describe('Terminal reveal stale PTY resize repro', () => {
   test('applied PTY size converges across hidden-resize/reveal cycles (natural read ordering)', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
     test.setTimeout(300_000)
     const failures = await driveHiddenResizeRevealCycles({
-      page: orcaBotmuxPage,
+      page: botmuxPage,
       testInfo,
       testRepoPath,
       cycles: 8,
@@ -275,13 +275,13 @@ test.describe('Terminal reveal stale PTY resize repro', () => {
   })
 
   test('the PTY is never resized back to its stale pre-reveal grid under slow applied-size reads', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
     test.setTimeout(300_000)
     const staleSamples: { cycle: number; snapshot: GridSnapshot }[] = []
     const failures = await driveHiddenResizeRevealCycles({
-      page: orcaBotmuxPage,
+      page: botmuxPage,
       testInfo,
       testRepoPath,
       cycles: 12,

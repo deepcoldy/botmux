@@ -18,7 +18,7 @@ export function registerKeybindingHandlers(service: KeybindingService): void {
 
   ipcMain.handle('keybindings:ensureFile', () => {
     const snapshot = service.ensureFile()
-    // Why: keybindings.json lives in OrcaBotmux's app config directory, not inside a
+    // Why: keybindings.json lives in Botmux's app config directory, not inside a
     // workspace. Opening it in the editor still needs normal fs IPC access.
     authorizeExternalPath(snapshot.path)
     broadcastKeybindingsChanged(snapshot)

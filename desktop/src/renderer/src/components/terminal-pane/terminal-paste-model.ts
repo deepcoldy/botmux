@@ -35,7 +35,7 @@ export type TerminalPastePlan = {
   target: TerminalPasteTarget
   payload: TerminalPastePayload
   mode: 'direct' | 'chunked' | 'bracketed-terminal' | 'reject'
-  // Why: 'terminal-cr' marks plans whose paste bytes OrcaBotmux constructs itself, so
+  // Why: 'terminal-cr' marks plans whose paste bytes Botmux constructs itself, so
   // every write path applies xterm's native \r?\n -> \r before ConPTY sees LF.
   newlinePolicy: 'preserve' | 'terminal-cr'
   runtimeKey: string

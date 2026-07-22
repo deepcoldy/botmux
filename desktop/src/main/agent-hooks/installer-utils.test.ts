@@ -33,7 +33,7 @@ let tmpDir: string
 let configPath: string
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), 'orca-botmux-installer-utils-test-'))
+  tmpDir = mkdtempSync(join(tmpdir(), 'botmux-installer-utils-test-'))
   configPath = join(tmpDir, 'settings.json')
 })
 
@@ -135,13 +135,13 @@ describe('createManagedCommandMatcher', () => {
 
   it('matches commands containing the agent-hooks/<scriptFileName> path', () => {
     expect(
-      match('/bin/sh "/Users/alice/Library/Application Support/OrcaBotmux/agent-hooks/claude-hook.sh"')
+      match('/bin/sh "/Users/alice/Library/Application Support/Botmux/agent-hooks/claude-hook.sh"')
     ).toBe(true)
     expect(match('/bin/sh "/some/other/location/agent-hooks/claude-hook.sh"')).toBe(true)
   })
 
   it('normalizes Windows backslashes so cmd-style paths still match', () => {
-    expect(match('C:\\Users\\alice\\AppData\\Roaming\\OrcaBotmux\\agent-hooks\\claude-hook.sh')).toBe(
+    expect(match('C:\\Users\\alice\\AppData\\Roaming\\Botmux\\agent-hooks\\claude-hook.sh')).toBe(
       true
     )
   })
@@ -164,13 +164,13 @@ describe('createManagedCommandMatcher', () => {
     // still recognize them or reinstalling would retain a stale duplicate.
     expect(
       match(
-        'if [ -x "/Users/alice/Library/Application Support/OrcaBotmux/agent-hooks/claude-hook.sh" ]; then /bin/sh "/Users/alice/Library/Application Support/OrcaBotmux/agent-hooks/claude-hook.sh"; fi'
+        'if [ -x "/Users/alice/Library/Application Support/Botmux/agent-hooks/claude-hook.sh" ]; then /bin/sh "/Users/alice/Library/Application Support/Botmux/agent-hooks/claude-hook.sh"; fi'
       )
     ).toBe(true)
   })
 
   it('matches encoded Windows launcher commands by decoding their script path', () => {
-    const command = wrapWindowsHookCommand('C:\\Users\\alice\\.orca_botmux\\agent-hooks\\claude-hook.cmd')
+    const command = wrapWindowsHookCommand('C:\\Users\\alice\\.botmux\\agent-hooks\\claude-hook.cmd')
     expect(match(command)).toBe(true)
   })
 
@@ -178,20 +178,20 @@ describe('createManagedCommandMatcher', () => {
     const matchPosix = createManagedCommandMatcher('copilot-hook.sh')
     const matchPowerShell = createManagedCommandMatcher('copilot-hook.ps1')
 
-    expect(matchPosix("& 'C:\\Users\\alice\\.orca_botmux\\agent-hooks\\copilot-hook.ps1'")).toBe(true)
+    expect(matchPosix("& 'C:\\Users\\alice\\.botmux\\agent-hooks\\copilot-hook.ps1'")).toBe(true)
     expect(
-      matchPosix(wrapWindowsHookCommand('C:\\Users\\alice\\.orca_botmux\\agent-hooks\\copilot-hook.ps1'))
+      matchPosix(wrapWindowsHookCommand('C:\\Users\\alice\\.botmux\\agent-hooks\\copilot-hook.ps1'))
     ).toBe(true)
-    expect(matchPowerShell("/bin/sh '/home/alice/.orca_botmux/agent-hooks/copilot-hook.sh'")).toBe(true)
+    expect(matchPowerShell("/bin/sh '/home/alice/.botmux/agent-hooks/copilot-hook.sh'")).toBe(true)
   })
 
-  it('matches the legacy per-userData script path AND the new shared ~/.orca_botmux path', () => {
+  it('matches the legacy per-userData script path AND the new shared ~/.botmux path', () => {
     // Why: install() must sweep old per-userData commands when migrating to
-    // the shared ~/.orca_botmux script path, or stale launchers keep failing.
+    // the shared ~/.botmux script path, or stale launchers keep failing.
     expect(
-      match("/bin/sh '/Users/alice/Library/Application Support/orca_botmux/agent-hooks/claude-hook.sh'")
+      match("/bin/sh '/Users/alice/Library/Application Support/botmux/agent-hooks/claude-hook.sh'")
     ).toBe(true)
-    expect(match("/bin/sh '/Users/alice/.orca_botmux/agent-hooks/claude-hook.sh'")).toBe(true)
+    expect(match("/bin/sh '/Users/alice/.botmux/agent-hooks/claude-hook.sh'")).toBe(true)
   })
 })
 
@@ -203,12 +203,12 @@ describe('removeManagedCommands', () => {
       [
         {
           type: 'command',
-          bash: '/bin/sh "/Users/alice/OrcaBotmux/agent-hooks/copilot-hook.sh"',
+          bash: '/bin/sh "/Users/alice/Botmux/agent-hooks/copilot-hook.sh"',
           timeoutSec: 5
         },
         {
           type: 'command',
-          powershell: "& 'C:\\Users\\alice\\OrcaBotmux\\agent-hooks\\copilot-hook.sh'",
+          powershell: "& 'C:\\Users\\alice\\Botmux\\agent-hooks\\copilot-hook.sh'",
           timeoutSec: 5
         },
         {
@@ -246,7 +246,7 @@ describe('hookDefinitionHasManagedCommand', () => {
 
     expect(
       hookDefinitionHasManagedCommand(
-        { bash: '/bin/sh "/Users/alice/OrcaBotmux/agent-hooks/copilot-hook.sh"' },
+        { bash: '/bin/sh "/Users/alice/Botmux/agent-hooks/copilot-hook.sh"' },
         match
       )
     ).toBe(true)
@@ -261,13 +261,13 @@ describe('hookDefinitionHasManagedCommand', () => {
 })
 
 describe('getSharedManagedScriptPath', () => {
-  it("returns ~/.orca_botmux/agent-hooks/<scriptFileName> rooted at the user's home", () => {
+  it("returns ~/.botmux/agent-hooks/<scriptFileName> rooted at the user's home", () => {
     expect(getSharedManagedScriptPath('claude-hook.sh')).toBe(
-      join(homedir(), '.orca_botmux', 'agent-hooks', 'claude-hook.sh')
+      join(homedir(), '.botmux', 'agent-hooks', 'claude-hook.sh')
     )
   })
 
-  it('does not depend on Electron app.getPath, so two OrcaBotmux instances resolve to the same path', () => {
+  it('does not depend on Electron app.getPath, so two Botmux instances resolve to the same path', () => {
     // Why: using userData here would reintroduce dev/prod settings thrash.
     const a = getSharedManagedScriptPath('claude-hook.sh')
     const b = getSharedManagedScriptPath('claude-hook.sh')
@@ -303,8 +303,8 @@ describe('wrapPosixHookCommand', () => {
     // Why: Electron's userData on macOS lives under "Application Support" with
     // a space. The guard must keep the path quoted so each file test and
     // `/bin/sh` see one argument.
-    const cmd = wrapPosixHookCommand('/Users/a/Library/Application Support/OrcaBotmux/agent-hooks/x.sh')
-    expect(cmd).toContain("'/Users/a/Library/Application Support/OrcaBotmux/agent-hooks/x.sh'")
+    const cmd = wrapPosixHookCommand('/Users/a/Library/Application Support/Botmux/agent-hooks/x.sh')
+    expect(cmd).toContain("'/Users/a/Library/Application Support/Botmux/agent-hooks/x.sh'")
   })
 
   it('escapes embedded single quotes so the wrapped command stays well-formed', () => {
@@ -319,10 +319,10 @@ describe('wrapPosixHookCommand', () => {
 
   it('can scope environment variables to the guarded script invocation', () => {
     const cmd = wrapPosixHookCommand('/does/not/exist.sh', {
-      ORCA_COPILOT_HOOK_EVENT: 'UserPromptSubmit'
+      BOTMUX_COPILOT_HOOK_EVENT: 'UserPromptSubmit'
     })
     expect(cmd).toBe(
-      "if [ -f '/does/not/exist.sh' ] && [ -r '/does/not/exist.sh' ] && [ -x '/does/not/exist.sh' ]; then ORCA_COPILOT_HOOK_EVENT='UserPromptSubmit' /bin/sh '/does/not/exist.sh'; else cat >/dev/null 2>&1 || :; fi"
+      "if [ -f '/does/not/exist.sh' ] && [ -r '/does/not/exist.sh' ] && [ -x '/does/not/exist.sh' ]; then BOTMUX_COPILOT_HOOK_EVENT='UserPromptSubmit' /bin/sh '/does/not/exist.sh'; else cat >/dev/null 2>&1 || :; fi"
     )
   })
 
@@ -397,20 +397,20 @@ function expectedDecodedWindowsHookCommand(scriptPath: string): string {
 
 describe('wrapWindowsHookCommand', () => {
   it('invokes the .cmd through an encoded PowerShell command', () => {
-    const command = wrapWindowsHookCommand('C:\\Users\\alice\\.orca_botmux\\agent-hooks\\codex-hook.cmd')
+    const command = wrapWindowsHookCommand('C:\\Users\\alice\\.botmux\\agent-hooks\\codex-hook.cmd')
     expect(command).toMatch(qualifiedWindowsPowerShellCommand)
     expect(command).not.toMatch(/^powershell\b/i)
     expect(decodeWindowsHookCommand(command)).toBe(
-      expectedDecodedWindowsHookCommand('C:\\Users\\alice\\.orca_botmux\\agent-hooks\\codex-hook.cmd')
+      expectedDecodedWindowsHookCommand('C:\\Users\\alice\\.botmux\\agent-hooks\\codex-hook.cmd')
     )
   })
 
   it('scopes environment variables inside the encoded launcher', () => {
     const command = wrapWindowsHookCommand('C:\\hooks\\copilot-hook.ps1', {
-      ORCA_COPILOT_HOOK_EVENT: 'UserPromptSubmit'
+      BOTMUX_COPILOT_HOOK_EVENT: 'UserPromptSubmit'
     })
     expect(decodeWindowsHookCommand(command)).toContain(
-      "$env:ORCA_COPILOT_HOOK_EVENT = 'UserPromptSubmit'; if (Test-Path"
+      "$env:BOTMUX_COPILOT_HOOK_EVENT = 'UserPromptSubmit'; if (Test-Path"
     )
   })
 
@@ -418,34 +418,34 @@ describe('wrapWindowsHookCommand', () => {
   // #6078 — the raw path used to be split at the space. The wrapper must keep
   // the whole path inside the encoded command so shells do not split it.
   it('preserves spaces in the script path (user profile with space case)', () => {
-    const cmd = wrapWindowsHookCommand('C:\\Users\\Jorge Silva\\.orca_botmux\\agent-hooks\\codex-hook.cmd')
+    const cmd = wrapWindowsHookCommand('C:\\Users\\Jorge Silva\\.botmux\\agent-hooks\\codex-hook.cmd')
     expect(cmd).toMatch(qualifiedWindowsPowerShellCommand)
     expect(decodeWindowsHookCommand(cmd)).toBe(
       expectedDecodedWindowsHookCommand(
-        'C:\\Users\\Jorge Silva\\.orca_botmux\\agent-hooks\\codex-hook.cmd'
+        'C:\\Users\\Jorge Silva\\.botmux\\agent-hooks\\codex-hook.cmd'
       )
     )
   })
 
   it('keeps cmd.exe percent expansion and caret escapes out of the command line', () => {
-    const cmd = wrapWindowsHookCommand('C:\\Users\\%ORCA_TEST%\\a^b\\codex-hook.cmd')
-    expect(cmd).not.toContain('%ORCA_TEST%')
+    const cmd = wrapWindowsHookCommand('C:\\Users\\%BOTMUX_TEST%\\a^b\\codex-hook.cmd')
+    expect(cmd).not.toContain('%BOTMUX_TEST%')
     expect(cmd).not.toContain('^')
     expect(decodeWindowsHookCommand(cmd)).toBe(
-      expectedDecodedWindowsHookCommand('C:\\Users\\%ORCA_TEST%\\a^b\\codex-hook.cmd')
+      expectedDecodedWindowsHookCommand('C:\\Users\\%BOTMUX_TEST%\\a^b\\codex-hook.cmd')
     )
   })
 
   it.skipIf(process.platform !== 'win32')(
     'executes a script path containing a cmd.exe caret literally',
     () => {
-      const scriptDir = join(tmpDir, 'home with ^ caret', '.orca_botmux', 'agent-hooks')
+      const scriptDir = join(tmpDir, 'home with ^ caret', '.botmux', 'agent-hooks')
       mkdirSync(scriptDir, { recursive: true })
       const scriptPath = join(scriptDir, 'codex-hook.cmd')
       writeFileSync(scriptPath, '@echo off\r\nexit /b 7\r\n', 'utf-8')
 
       const result = spawnSync('cmd.exe', ['/d', '/c', wrapWindowsHookCommand(scriptPath)], {
-        env: { ...process.env, ORCA_WRAP_TEST: 'expanded' }
+        env: { ...process.env, BOTMUX_WRAP_TEST: 'expanded' }
       })
 
       expect(result.status).toBe(7)
@@ -459,7 +459,7 @@ describe('wrapWindowsCmdHookCommand', () => {
     // not via cmd.exe, so the launcher must be a single spawnable token — a bare
     // .cmd path. A cmd-builtin `if …` launcher has argv[0] = `if`, which is
     // unspawnable and fails every hook with exit 1 (#8430 regression).
-    const scriptPath = 'C:\\Users\\alice\\.orca_botmux\\agent-hooks\\codex-hook.cmd'
+    const scriptPath = 'C:\\Users\\alice\\.botmux\\agent-hooks\\codex-hook.cmd'
     const command = wrapWindowsCmdHookCommand(scriptPath)
     expect(command).toBe(scriptPath)
     expect(command).not.toMatch(/^if\b/)
@@ -484,7 +484,7 @@ describe('wrapWindowsCmdHookCommand', () => {
   )
 
   it('falls back to the encoded launcher when cmd.exe would split or expand the path', () => {
-    const scriptPath = 'C:\\Users\\Jane Doe\\%ORCA_TEST%\\codex-hook.cmd'
+    const scriptPath = 'C:\\Users\\Jane Doe\\%BOTMUX_TEST%\\codex-hook.cmd'
     const command = wrapWindowsCmdHookCommand(scriptPath)
     expect(command).toMatch(qualifiedWindowsPowerShellCommand)
     expect(decodeWindowsHookCommand(command)).toBe(expectedDecodedWindowsHookCommand(scriptPath))
@@ -494,21 +494,21 @@ describe('wrapWindowsCmdHookCommand', () => {
 describe('wrapWindowsGitBashHookCommand', () => {
   it('guards the forward-slash fast path and drains when missing', () => {
     expect(
-      wrapWindowsGitBashHookCommand('C:\\Users\\alice\\.orca_botmux\\agent-hooks\\claude-hook.cmd')
+      wrapWindowsGitBashHookCommand('C:\\Users\\alice\\.botmux\\agent-hooks\\claude-hook.cmd')
     ).toBe(
-      "if [ -f 'C:/Users/alice/.orca_botmux/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/alice/.orca_botmux/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi"
+      "if [ -f 'C:/Users/alice/.botmux/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/alice/.botmux/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi"
     )
   })
 
   it('falls back to the encoded launcher when bash would split the path', () => {
-    const scriptPath = 'C:\\Users\\Jane Doe\\.orca_botmux\\agent-hooks\\claude-hook.cmd'
+    const scriptPath = 'C:\\Users\\Jane Doe\\.botmux\\agent-hooks\\claude-hook.cmd'
     const command = wrapWindowsGitBashHookCommand(scriptPath)
     expect(command).toMatch(qualifiedWindowsPowerShellCommand)
     expect(decodeWindowsHookCommand(command)).toBe(expectedDecodedWindowsHookCommand(scriptPath))
   })
 
   it('falls back to the encoded launcher when bash metacharacters are present', () => {
-    const scriptPath = 'C:\\Users\\alice & bob\\.orca_botmux\\agent-hooks\\claude-hook.cmd'
+    const scriptPath = 'C:\\Users\\alice & bob\\.botmux\\agent-hooks\\claude-hook.cmd'
     const command = wrapWindowsGitBashHookCommand(scriptPath)
     expect(command).toMatch(qualifiedWindowsPowerShellCommand)
     expect(command).not.toContain('& bob')
@@ -523,8 +523,8 @@ describe('buildWindowsAgentHookPostCommand', () => {
     expect(command).toContain('"%SystemRoot%\\System32\\curl.exe" -sS -X POST')
     expect(command).toContain('--connect-timeout 0.5 --max-time 1.5')
     expect(command).toContain('-H "Content-Type: application/x-www-form-urlencoded"')
-    expect(command).toContain('-H "X-OrcaBotmux-Agent-Hook-Token: %ORCA_AGENT_HOOK_TOKEN%"')
-    expect(command).toContain('--data-urlencode "paneKey=%ORCA_PANE_KEY%"')
+    expect(command).toContain('-H "X-Botmux-Agent-Hook-Token: %BOTMUX_AGENT_HOOK_TOKEN%"')
+    expect(command).toContain('--data-urlencode "paneKey=%BOTMUX_PANE_KEY%"')
     expect(command).toContain('--data-urlencode "payload@-"')
     expect(command).toContain('/hook/codex')
     expect(command).not.toContain('powershell')
@@ -547,11 +547,11 @@ describe('buildWindowsAgentHookCurlPostCommand', () => {
     // is the regression this replaces.
     expect(command).not.toMatch(/powershell/i)
     expect(command).toContain('%SystemRoot%\\System32\\curl.exe')
-    expect(command).toContain('http://127.0.0.1:%ORCA_AGENT_HOOK_PORT%/hook/codex')
+    expect(command).toContain('http://127.0.0.1:%BOTMUX_AGENT_HOOK_PORT%/hook/codex')
     expect(command).toContain('-H "Content-Type: application/x-www-form-urlencoded"')
-    expect(command).toContain('-H "X-OrcaBotmux-Agent-Hook-Token: %ORCA_AGENT_HOOK_TOKEN%"')
-    expect(command).toContain('--data-urlencode "paneKey=%ORCA_PANE_KEY%"')
-    expect(command).toContain('--data-urlencode "worktreeId=%ORCA_WORKTREE_ID%"')
+    expect(command).toContain('-H "X-Botmux-Agent-Hook-Token: %BOTMUX_AGENT_HOOK_TOKEN%"')
+    expect(command).toContain('--data-urlencode "paneKey=%BOTMUX_PANE_KEY%"')
+    expect(command).toContain('--data-urlencode "worktreeId=%BOTMUX_WORKTREE_ID%"')
     // Why: `payload@-` makes curl read raw bytes from stdin and urlencode them,
     // so UTF-8 prompts survive without a code-page conversion.
     expect(command).toContain('--data-urlencode "payload@-"')

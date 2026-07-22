@@ -113,7 +113,7 @@ export function suggestCommands(specs: CommandSpec[], commandPath: string[]): st
 export function unknownCommandData(specs: CommandSpec[], commandPath: string[]): CommandErrorData {
   const suggestions = suggestCommands(specs, commandPath)
   const nextSteps = suggestions.length
-    ? [`Did you mean: ${suggestions.map((path) => `orca_botmux ${path}`).join(', ')}`]
+    ? [`Did you mean: ${suggestions.map((path) => `botmux ${path}`).join(', ')}`]
     : []
   return { suggestions, nextSteps }
 }

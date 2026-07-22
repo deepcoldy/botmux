@@ -1,6 +1,6 @@
 import type { Page } from '@stablyai/playwright-test'
 
-import { expect, test } from './helpers/orca-botmux-app'
+import { expect, test } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveWorktreeId,
@@ -119,22 +119,22 @@ async function reloadBrowserGuest(page: Page, browserTabId: string): Promise<voi
 }
 
 test.describe('local HTTPS certificate trust', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   test('approves one exact local certificate endpoint without trusting sibling tabs or ports', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const firstServer = await startLocalHttpsServer()
     const secondPortServer = await startLocalHttpsServer()
     const siblingProbeServer = await startLocalHttpProbeServer(firstServer)
     try {
-      const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-      const firstTab = await createBrowserTab(orcaBotmuxPage, worktreeId, firstServer.schemeLessUrl)
-      const firstSlot = browserSlot(orcaBotmuxPage, firstTab.id)
+      const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+      const firstTab = await createBrowserTab(botmuxPage, worktreeId, firstServer.schemeLessUrl)
+      const firstSlot = browserSlot(botmuxPage, firstTab.id)
 
       await expect(firstSlot.getByRole('button', { name: 'Try HTTPS' })).toBeVisible()
       await firstSlot.getByRole('button', { name: 'Try HTTPS' }).click()
@@ -149,16 +149,16 @@ test.describe('local HTTPS certificate trust', () => {
       await expect(firstSlot.getByText(/make sure the server is running/i)).toHaveCount(0)
       await firstSlot.getByRole('button', { name: 'Proceed Anyway (Unsafe)' }).click()
       await expect
-        .poll(() => readBrowserHeading(orcaBotmuxPage, firstTab.id), { timeout: 10_000 })
+        .poll(() => readBrowserHeading(botmuxPage, firstTab.id), { timeout: 10_000 })
         .toBe('Local HTTPS request 1')
       await expect
-        .poll(() => readBrowserState(orcaBotmuxPage, firstTab.id, '__localTlsState'))
+        .poll(() => readBrowserState(botmuxPage, firstTab.id, '__localTlsState'))
         .toEqual({ asset: true, webSocket: true })
       expect(firstServer.assetRequestCount()).toBe(1)
       expect(firstServer.webSocketConnectionCount()).toBe(1)
 
-      const secondTab = await createBrowserTab(orcaBotmuxPage, worktreeId, firstServer.secureUrl)
-      const secondSlot = browserSlot(orcaBotmuxPage, secondTab.id)
+      const secondTab = await createBrowserTab(botmuxPage, worktreeId, firstServer.secureUrl)
+      const secondSlot = browserSlot(botmuxPage, secondTab.id)
       await expect(
         secondSlot.getByRole('heading', { name: "Connection isn't secure" })
       ).toBeVisible()
@@ -168,23 +168,23 @@ test.describe('local HTTPS certificate trust', () => {
         secondSlot.getByRole('button', { name: 'Proceed Anyway (Unsafe)' })
       ).toBeVisible()
 
-      const probeTab = await createBrowserTab(orcaBotmuxPage, worktreeId, siblingProbeServer.url)
+      const probeTab = await createBrowserTab(botmuxPage, worktreeId, siblingProbeServer.url)
       await expect
-        .poll(() => readBrowserState(orcaBotmuxPage, probeTab.id, '__siblingTlsProbe'))
+        .poll(() => readBrowserState(botmuxPage, probeTab.id, '__siblingTlsProbe'))
         .toEqual({ asset: 'blocked', webSocket: 'blocked' })
       expect(firstServer.assetRequestCount()).toBe(1)
       expect(firstServer.webSocketConnectionCount()).toBe(1)
 
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, firstTab.id)
-      await reloadBrowserGuest(orcaBotmuxPage, firstTab.id)
+      await switchToBrowserTab(botmuxPage, worktreeId, firstTab.id)
+      await reloadBrowserGuest(botmuxPage, firstTab.id)
       await expect.poll(firstServer.documentRequestCount, { timeout: 10_000 }).toBe(2)
       await expect
-        .poll(() => readBrowserHeading(orcaBotmuxPage, firstTab.id), { timeout: 10_000 })
+        .poll(() => readBrowserHeading(botmuxPage, firstTab.id), { timeout: 10_000 })
         .toBe('Local HTTPS request 2')
       await expect.poll(firstServer.assetRequestCount).toBe(2)
       await expect.poll(firstServer.webSocketConnectionCount).toBe(2)
 
-      const firstAddressBar = firstSlot.locator('[data-orca-botmux-browser-address-bar="true"]')
+      const firstAddressBar = firstSlot.locator('[data-botmux-browser-address-bar="true"]')
       await firstAddressBar.fill(secondPortServer.secureUrl)
       await firstAddressBar.press('Enter')
       await expect(

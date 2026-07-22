@@ -1,7 +1,7 @@
 import { ipcMain } from 'electron'
 import type { Store } from '../persistence'
 import type { IPtyProvider } from '../providers/types'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import { listRegisteredPtys } from '../memory/pty-registry'
 import { getSshPtyProvider } from './pty'
 import {
@@ -17,7 +17,7 @@ import { scanWorkspaceCleanup } from './workspace-cleanup-scan'
 export { scanWorkspaceCleanup }
 
 type WorkspaceCleanupHandlerDeps = {
-  runtime?: OrcaRuntimeService
+  runtime?: BotmuxRuntimeService
   getLocalPtyProvider?: () => IPtyProvider
 }
 

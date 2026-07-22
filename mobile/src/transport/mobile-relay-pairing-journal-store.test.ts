@@ -38,8 +38,8 @@ const offer = {
   publicKeyB64: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
   relay: {
     v: 1,
-    directorUrl: 'https://relay.onorca.dev',
-    cellUrl: 'https://relay-c1.onorca.dev',
+    directorUrl: 'https://relay.example.test',
+    cellUrl: 'https://relay-c1.example.test',
     assignmentEpoch: 7,
     relayHostId: 'AbCdEf0123_-xyZ9',
     inviteToken: 'abcdefghijklmnopqrstuvwxyzABCDEFGH012345678',

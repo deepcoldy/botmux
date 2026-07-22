@@ -159,7 +159,7 @@ describe('getUpstreamStatus', () => {
         return Promise.reject(new Error('fatal: no upstream configured'))
       }
       if (args[0] === 'config' && args.includes('branch.imp/chinese-translation.remote')) {
-        return Promise.resolve({ stdout: 'https://github.com/pynickle/orca_botmux.git\n' })
+        return Promise.resolve({ stdout: 'https://github.com/pynickle/botmux.git\n' })
       }
       if (args[0] === 'config' && args.includes('branch.imp/chinese-translation.merge')) {
         return Promise.resolve({ stdout: 'refs/heads/imp/chinese-translation\n' })
@@ -168,17 +168,17 @@ describe('getUpstreamStatus', () => {
         return Promise.reject(new Error('missing branch base'))
       }
       if (args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'origin') {
-        return Promise.resolve({ stdout: 'https://github.com/stablyai/orca_botmux.git\n' })
+        return Promise.resolve({ stdout: 'https://github.com/stablyai/botmux.git\n' })
       }
-      if (args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'pr-pynickle-orca_botmux') {
-        return Promise.resolve({ stdout: 'https://github.com/pynickle/orca_botmux.git\n' })
+      if (args[0] === 'remote' && args[1] === 'get-url' && args[2] === 'pr-pynickle-botmux') {
+        return Promise.resolve({ stdout: 'https://github.com/pynickle/botmux.git\n' })
       }
       if (args[0] === 'remote') {
-        return Promise.resolve({ stdout: 'origin\npr-pynickle-orca_botmux\n' })
+        return Promise.resolve({ stdout: 'origin\npr-pynickle-botmux\n' })
       }
       if (
         args[0] === 'rev-parse' &&
-        args.includes('refs/remotes/pr-pynickle-orca_botmux/imp/chinese-translation')
+        args.includes('refs/remotes/pr-pynickle-botmux/imp/chinese-translation')
       ) {
         return Promise.resolve({ stdout: 'fork-head\n' })
       }
@@ -192,7 +192,7 @@ describe('getUpstreamStatus', () => {
 
     expect(result).toEqual({
       hasUpstream: true,
-      upstreamName: 'pr-pynickle-orca_botmux/imp/chinese-translation',
+      upstreamName: 'pr-pynickle-botmux/imp/chinese-translation',
       ahead: 2,
       behind: 0
     })
@@ -243,13 +243,13 @@ describe('getUpstreamStatus', () => {
         return Promise.reject(new Error('fatal: no upstream configured'))
       }
       if (args[0] === 'config' && args.includes('branch.imp/chinese-translation.pushRemote')) {
-        return Promise.resolve({ stdout: 'https://github.com/pynickle/orca_botmux.git\n' })
+        return Promise.resolve({ stdout: 'https://github.com/pynickle/botmux.git\n' })
       }
       if (args[0] === 'config' && args.includes('remote.pushDefault')) {
         return Promise.reject(new Error('missing pushDefault'))
       }
       if (args[0] === 'config' && args.includes('branch.imp/chinese-translation.remote')) {
-        return Promise.resolve({ stdout: 'https://github.com/pynickle/orca_botmux.git\n' })
+        return Promise.resolve({ stdout: 'https://github.com/pynickle/botmux.git\n' })
       }
       if (args[0] === 'config' && args.includes('branch.imp/chinese-translation.merge')) {
         return Promise.resolve({ stdout: 'refs/heads/imp/chinese-translation\n' })
@@ -258,7 +258,7 @@ describe('getUpstreamStatus', () => {
         return Promise.reject(new Error('missing branch base'))
       }
       if (args[0] === 'remote' && args[1] === 'get-url') {
-        return Promise.resolve({ stdout: 'https://github.com/stablyai/orca_botmux.git\n' })
+        return Promise.resolve({ stdout: 'https://github.com/stablyai/botmux.git\n' })
       }
       if (args[0] === 'remote') {
         return Promise.resolve({ stdout: 'origin\n' })

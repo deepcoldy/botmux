@@ -429,13 +429,13 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
           kind: 'ready',
           id: 'setup-local',
           label: 'Local Mac',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         },
         {
           kind: 'ready',
           id: 'setup-builder',
           label: 'Builder',
-          path: '/workspace/orca_botmux'
+          path: '/workspace/botmux'
         }
       ] as never,
       selectedProjectHostSetupId: 'setup-local',
@@ -444,8 +444,8 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
         {
           id: 'vercel',
           name: 'Vercel Sandbox',
-          create: './scripts/orca-botmux-vm/vercel.start.sh',
-          destroy: './scripts/orca-botmux-vm/vercel.cleanup.sh',
+          create: './scripts/botmux-vm/vercel.start.sh',
+          destroy: './scripts/botmux-vm/vercel.cleanup.sh',
           destroyDisabled: false
         }
       ] as never,
@@ -486,13 +486,13 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
           kind: 'ready',
           id: 'setup-local',
           label: 'Local Mac',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         },
         {
           kind: 'ready',
           id: 'setup-builder',
           label: 'Builder',
-          path: '/workspace/orca_botmux'
+          path: '/workspace/botmux'
         }
       ] as never,
       selectedProjectHostSetupId: 'setup-local',
@@ -501,7 +501,7 @@ describe('NewWorkspaceComposerCard folder task source mode', () => {
         {
           id: 'vercel',
           name: 'Vercel Sandbox',
-          create: './scripts/orca-botmux-vm/vercel.start.sh',
+          create: './scripts/botmux-vm/vercel.start.sh',
           destroyDisabled: true
         }
       ] as never,

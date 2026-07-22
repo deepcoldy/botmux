@@ -130,7 +130,7 @@ export function FloatingWorkspacePane({
           )}
           description={translate(
             'auto.components.settings.FloatingWorkspacePane.81afb79785',
-            "New floating terminal tabs start here. Markdown notes are saved in OrcaBotmux's app-owned floating workspace."
+            "New floating terminal tabs start here. Markdown notes are saved in Botmux's app-owned floating workspace."
           )}
           control={
             <div className="flex w-72 max-w-full gap-2">

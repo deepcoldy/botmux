@@ -117,7 +117,7 @@ export class ClaudeAgentTeamsTmuxDispatcher {
       direction: splitTarget.direction,
       command: parsed.positional.join(' ') || undefined,
       env: paneEnv(team, fakePaneId),
-      envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR'],
+      envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR'],
       activate: false
     })
     const pane: TeamPane = {
@@ -138,7 +138,7 @@ export class ClaudeAgentTeamsTmuxDispatcher {
 
   // Why: Claude Code's pane backend creates a teammate pane in two steps — it
   // splits a holding pane running `cat`, then `respawn-pane -k`s it with the
-  // real teammate command. OrcaBotmux panes are PTYs that cannot swap their program in
+  // real teammate command. Botmux panes are PTYs that cannot swap their program in
   // place, so we honor respawn by closing the placeholder terminal and
   // re-splitting from the same origin with the real command, keeping the fake
   // pane id stable so later send-keys/kill-pane/list-panes still resolve.
@@ -168,7 +168,7 @@ export class ClaudeAgentTeamsTmuxDispatcher {
       direction: pane.splitDirection ?? 'horizontal',
       command,
       env: paneEnv(team, pane.fakePaneId),
-      envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR'],
+      envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR'],
       activate: false
     })
     try {

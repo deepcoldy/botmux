@@ -9,7 +9,7 @@
    daemon reconnect, and handler registration. Splitting the orchestration
    would hide the startup order, which is the important invariant here. */
 
-// OrcaBotmux Relay — lightweight daemon deployed to remote hosts.
+// Botmux Relay — lightweight daemon deployed to remote hosts.
 // Communicates over stdin/stdout using the framed JSON-RPC protocol.
 // The Electron app (client) deploys this script via SCP and launches
 // it via an SSH exec channel.
@@ -69,7 +69,7 @@ const SOCK_NAME = 'relay.sock'
 const CONNECT_TIMEOUT_MS = 5_000
 const STALE_SOCKET_PROBE_TIMEOUT_MS = 500
 const EMPTY_DETACHED_STARTUP_GRACE_MS = parseNonNegativeIntEnv(
-  'ORCA_RELAY_EMPTY_STARTUP_GRACE_MS',
+  'BOTMUX_RELAY_EMPTY_STARTUP_GRACE_MS',
   60_000
 )
 
@@ -136,7 +136,7 @@ function parseArgs(argv: string[]): {
       i++
     } else if (argv[i] === '--connect') {
       connectMode = true
-    } else if (argv[i] === '--orca-botmux-cli') {
+    } else if (argv[i] === '--botmux-cli') {
       cliMode = true
     } else if (argv[i] === '--detached') {
       detached = true
@@ -222,9 +222,9 @@ function runConnectMode(sockPath: string): void {
   })
 }
 
-async function runOrcaCliMode(sockPath: string, argv: string[]): Promise<void> {
+async function runBotmuxCliMode(sockPath: string, argv: string[]): Promise<void> {
   const myVersion = readLaunchVersion()
-  const stdin = shouldReadRemoteCliStdin(argv) ? await readOrcaCliStdin() : undefined
+  const stdin = shouldReadRemoteCliStdin(argv) ? await readBotmuxCliStdin() : undefined
   const sock = createConnection({ path: sockPath })
   let nextSeq = 1
   let highestReceivedSeq = 0
@@ -236,7 +236,7 @@ async function runOrcaCliMode(sockPath: string, argv: string[]): Promise<void> {
       {
         jsonrpc: '2.0',
         id: requestId,
-        method: 'orca_botmux.cli',
+        method: 'botmux.cli',
         params: {
           argv,
           cwd: process.cwd(),
@@ -283,7 +283,7 @@ async function runOrcaCliMode(sockPath: string, argv: string[]): Promise<void> {
   })
 
   const connectTimeout = setTimeout(() => {
-    process.stderr.write(`[orca-botmux-cli] Relay connection timed out after ${CONNECT_TIMEOUT_MS}ms\n`)
+    process.stderr.write(`[botmux-cli] Relay connection timed out after ${CONNECT_TIMEOUT_MS}ms\n`)
     sock.destroy()
     process.exit(1)
   }, CONNECT_TIMEOUT_MS)
@@ -305,12 +305,12 @@ async function runOrcaCliMode(sockPath: string, argv: string[]): Promise<void> {
 
   sock.on('error', (err) => {
     clearTimeout(connectTimeout)
-    process.stderr.write(`[orca-botmux-cli] Relay socket error: ${err.message}\n`)
+    process.stderr.write(`[botmux-cli] Relay socket error: ${err.message}\n`)
     process.exit(1)
   })
 }
 
-async function readOrcaCliStdin(): Promise<string | undefined> {
+async function readBotmuxCliStdin(): Promise<string | undefined> {
   if (process.stdin.isTTY) {
     return undefined
   }
@@ -333,13 +333,13 @@ async function main(): Promise<void> {
     return
   }
   if (cliMode) {
-    const marker = process.argv.indexOf('--orca-botmux-cli')
-    await runOrcaCliMode(sockPath, marker >= 0 ? process.argv.slice(marker + 1) : [])
+    const marker = process.argv.indexOf('--botmux-cli')
+    await runBotmuxCliMode(sockPath, marker >= 0 ? process.argv.slice(marker + 1) : [])
     return
   }
 
   // Why: only the long-lived detached daemon accumulates relay.log; --connect
-  // bridges and --orca-botmux-cli are short-lived and already returned above. Route all
+  // bridges and --botmux-cli are short-lived and already returned above. Route all
   // relay logging through a size-capped rotator so relay.log can't grow forever.
   if (detached && logFile) {
     installRelayLogRotation(logFile)
@@ -486,8 +486,8 @@ async function main(): Promise<void> {
   const _workspaceSessionHandler = new WorkspaceSessionHandler(dispatcher)
   void _workspaceSessionHandler
 
-  dispatcher.onRequest('orca_botmux.cli', async (params, context) => {
-    return await dispatcher.requestAnyClient('orca_botmux.cli', params, {
+  dispatcher.onRequest('botmux.cli', async (params, context) => {
+    return await dispatcher.requestAnyClient('botmux.cli', params, {
       excludeClientId: context.clientId,
       timeoutMs: remoteCliRequestTimeoutMs(params)
     })
@@ -513,7 +513,7 @@ async function main(): Promise<void> {
   // ── Agent-hook server ─────────────────────────────────────────────
   // Why: hosts a loopback HTTP receiver inside the relay process so agent
   // CLIs running in remote PTYs can post hook events without leaving the
-  // host. Each parsed payload is forwarded to OrcaBotmux via an `agent.hook`
+  // host. Each parsed payload is forwarded to Botmux via an `agent.hook`
   // JSON-RPC notification on the existing SSH channel — see
   // docs/design/agent-status-over-ssh.md §2-§5.
   const hookServer = new RelayAgentHookServer({
@@ -525,7 +525,7 @@ async function main(): Promise<void> {
       // Why: dispatcher.notify is fire-and-forget — when the SSH channel is
       // mid-reconnect the write callback no-ops and the notification is
       // silently dropped. The per-paneKey cache inside `hookServer` lets us
-      // replay the last status for each live pane after OrcaBotmux re-wires its
+      // replay the last status for each live pane after Botmux re-wires its
       // handler post-`--connect`.
       dispatcher.notify(
         AGENT_HOOK_NOTIFICATION_METHOD,
@@ -535,7 +535,7 @@ async function main(): Promise<void> {
   })
   // Why: await the hook-server bind before announcing readiness so the very
   // first PTY spawn (which can land within milliseconds of the sentinel)
-  // already sees populated ORCA_AGENT_HOOK_* env. The bind is a local-loopback
+  // already sees populated BOTMUX_AGENT_HOOK_* env. The bind is a local-loopback
   // listen — measured in ms — so the latency cost is trivial and removes a
   // class of "first agent invocation has no status" races. Bind failure is
   // treated as soft: log and continue, the augmenter returns {} and agent
@@ -548,7 +548,7 @@ async function main(): Promise<void> {
     )
   }
 
-  // Why: every relay-spawned PTY needs the live ORCA_AGENT_HOOK_* coords. The
+  // Why: every relay-spawned PTY needs the live BOTMUX_AGENT_HOOK_* coords. The
   // augmenter is read on every spawn so a hook-server bind that succeeded
   // late (or after a stop/start) lands in the next PTY's env without a
   // restart.
@@ -570,15 +570,15 @@ async function main(): Promise<void> {
       const dir = pluginOverlay.materializeOpenCode(overlayId, sourceDir)
       if (dir) {
         env.OPENCODE_CONFIG_DIR = dir
-        env.ORCA_OPENCODE_CONFIG_DIR = dir
+        env.BOTMUX_OPENCODE_CONFIG_DIR = dir
         if (sourceDir) {
-          env.ORCA_OPENCODE_SOURCE_CONFIG_DIR = sourceDir
+          env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR = sourceDir
         }
       }
     }
     if (pluginOverlay.hasPiSource()) {
       // Why: source-dir defaulting is keyed on which Pi-compatible agent is
-      // being launched (Pi vs OMP). Install OrcaBotmux's guarded extension into that
+      // being launched (Pi vs OMP). Install Botmux's guarded extension into that
       // real remote agent dir without redirecting PI_CODING_AGENT_DIR.
       const launchCommandHint = resolveSetupAgentSequenceLaunchCommand(ctx.env, ctx.command)
       const kind = detectPiAgentKindFromCommand(launchCommandHint)
@@ -589,7 +589,7 @@ async function main(): Promise<void> {
         const sourceDir = resolvePiSourceAgentDir(ctx.env, ctx.shell, 'pi')
         const dir = pluginOverlay.materializePi(overlayId, sourceDir, 'pi')
         if (dir) {
-          env.ORCA_PI_SOURCE_AGENT_DIR = dir
+          env.BOTMUX_PI_SOURCE_AGENT_DIR = dir
         }
       }
       if (shouldPrepareOmpShadow) {
@@ -598,11 +598,11 @@ async function main(): Promise<void> {
         const sourceDir =
           kind === 'omp'
             ? resolvePiSourceAgentDir(ctx.env, ctx.shell, 'omp')
-            : ctx.env.ORCA_OMP_SOURCE_AGENT_DIR
+            : ctx.env.BOTMUX_OMP_SOURCE_AGENT_DIR
         const dir = pluginOverlay.materializePi(overlayId, sourceDir, 'omp')
         if (dir) {
-          env.ORCA_OMP_STATUS_EXTENSION = getRelayPiStatusExtensionPath(dir)
-          env.ORCA_OMP_SOURCE_AGENT_DIR = dir
+          env.BOTMUX_OMP_STATUS_EXTENSION = getRelayPiStatusExtensionPath(dir)
+          env.BOTMUX_OMP_SOURCE_AGENT_DIR = dir
         }
       }
     }
@@ -620,7 +620,7 @@ async function main(): Promise<void> {
     pluginOverlay.clearOverlay(paneKey ?? id)
   })
 
-  // Why: request-driven replay. OrcaBotmux issues this *after* it re-wires the
+  // Why: request-driven replay. Botmux issues this *after* it re-wires the
   // `agent.hook` filter on the new mux post-`--connect`. We forward each
   // cached entry as a fresh notification BEFORE returning so the response
   // strictly trails all replays on the dispatcher's single write callback —
@@ -631,13 +631,13 @@ async function main(): Promise<void> {
     return { replayed }
   })
 
-  // Why: OrcaBotmux ships the OpenCode plugin / Pi extension source bodies over
+  // Why: Botmux ships the OpenCode plugin / Pi extension source bodies over
   // the wire at session-ready (the renderer's bundled hook-service strings
   // change as new agent events are added — pinning them to the relay binary
-  // would force a relay redeploy on every OrcaBotmux update). Cache them so each
+  // would force a relay redeploy on every Botmux update). Cache them so each
   // subsequent PTY spawn can materialize the remote OpenCode overlay and
   // install Pi/OMP managed extensions. See docs/design/agent-status-over-ssh.md §4.
-  // Why: bound the per-source size so a buggy/hostile OrcaBotmux can't OOM the
+  // Why: bound the per-source size so a buggy/hostile Botmux can't OOM the
   // relay by pushing a giant string. The HTTP path has HOOK_REQUEST_MAX_BYTES
   // = 1 MB; the JSON-RPC path needs an equivalent ceiling. Real plugin sources
   // are <50 KB today; 256 KB leaves generous headroom.

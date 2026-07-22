@@ -16,8 +16,8 @@ describe('resolveAgentStatusTerminalTitle', () => {
 
   it('keeps descriptive completed titles that are already non-working', () => {
     expect(
-      resolveAgentStatusTerminalTitle({ agentType: 'cursor', state: 'done' }, 'OrcaBotmux Cursor Done')
-    ).toBe('OrcaBotmux Cursor Done')
+      resolveAgentStatusTerminalTitle({ agentType: 'cursor', state: 'done' }, 'Botmux Cursor Done')
+    ).toBe('Botmux Cursor Done')
   })
 
   it('uses permission titles for synthetic agents waiting on user input', () => {

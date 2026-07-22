@@ -5,19 +5,19 @@ import { createRoot, type Root } from 'react-dom/client'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  ORCA_LINEAR_SKILL_INSTALL_COMMAND,
-  ORCA_LINEAR_SKILL_NAME
+  BOTMUX_LINEAR_SKILL_INSTALL_COMMAND,
+  BOTMUX_LINEAR_SKILL_NAME
 } from '@/lib/agent-feature-install-commands'
 import { getLinearUsageExamples } from '@/lib/linear-usage-examples'
 import { LinearAgentSkillPane } from './LinearAgentSkillPane'
 
-const UPDATE_COMMAND = 'npx skills update orca-botmux-linear --global'
+const UPDATE_COMMAND = 'npx skills update botmux-linear --global'
 
 const mocks = vi.hoisted(() => ({
   panelProps: [] as Record<string, unknown>[],
   runtime: 'native' as 'native' | 'wsl',
   skillInstalled: true,
-  updateSkillName: 'orca-botmux-linear'
+  updateSkillName: 'botmux-linear'
 }))
 
 vi.mock('./AgentSkillSetupPanel', () => ({
@@ -94,7 +94,7 @@ describe('LinearAgentSkillPane', () => {
     mocks.panelProps.length = 0
     mocks.runtime = 'native'
     mocks.skillInstalled = true
-    mocks.updateSkillName = 'orca-botmux-linear'
+    mocks.updateSkillName = 'botmux-linear'
   })
 
   it('renders the Linear skill card and the usage examples', () => {
@@ -106,19 +106,19 @@ describe('LinearAgentSkillPane', () => {
     expect(examples).toHaveLength(5)
     for (const example of examples) {
       expect(markup).toContain(example.title)
-      expect(example.prompt).toContain('/orca-botmux-linear')
+      expect(example.prompt).toContain('/botmux-linear')
       expect(example.prompt).not.toContain('{{value0}}')
     }
   })
 
-  it('passes the orca-botmux-linear install/update commands and freshness on a local runtime', async () => {
+  it('passes the botmux-linear install/update commands and freshness on a local runtime', async () => {
     await renderPane()
 
     expect(mocks.panelProps.at(-1)).toEqual(
       expect.objectContaining({
-        command: ORCA_LINEAR_SKILL_INSTALL_COMMAND,
+        command: BOTMUX_LINEAR_SKILL_INSTALL_COMMAND,
         installedCommand: UPDATE_COMMAND,
-        freshnessSkillName: ORCA_LINEAR_SKILL_NAME
+        freshnessSkillName: BOTMUX_LINEAR_SKILL_NAME
       })
     )
   })

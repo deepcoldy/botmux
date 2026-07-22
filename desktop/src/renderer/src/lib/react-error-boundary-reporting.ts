@@ -23,7 +23,7 @@ const MAX_REPORTED_RENDERER_ERROR_KEYS = 50
 let pendingReactErrorBoundaryReport: CrashReportRecord | null = null
 
 export const REACT_ERROR_BOUNDARY_REPORT_AVAILABLE_EVENT =
-  'orca_botmux:react-error-boundary-report-available'
+  'botmux:react-error-boundary-report-available'
 
 function stringFromThrown(value: unknown): { name: string; message: string; stack?: string } {
   if (value instanceof Error) {

@@ -1,7 +1,7 @@
 import type { EmulatorStreamInfo } from '@/components/emulator-pane/emulator-pane-types'
 
-export const EMULATOR_MANUAL_LAUNCH_STARTED_EVENT = 'orca_botmux:emulator-launch-started'
-export const EMULATOR_MANUAL_LAUNCH_FAILED_EVENT = 'orca_botmux:emulator-launch-failed'
+export const EMULATOR_MANUAL_LAUNCH_STARTED_EVENT = 'botmux:emulator-launch-started'
+export const EMULATOR_MANUAL_LAUNCH_FAILED_EVENT = 'botmux:emulator-launch-failed'
 
 const manualLaunchesByWorktree = new Set<string>()
 type PrelaunchedSimulatorSession = {

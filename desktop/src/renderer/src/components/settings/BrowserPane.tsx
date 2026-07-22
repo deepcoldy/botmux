@@ -124,7 +124,7 @@ export function BrowserPane({
               ? translate('auto.components.settings.BrowserPane.86b7c83fee', 'This computer')
               : translate(
                   'auto.components.settings.BrowserPane.c0f85056d9',
-                  'Browser profiles on this OrcaBotmux server.'
+                  'Browser profiles on this Botmux server.'
                 )
         })),
     [

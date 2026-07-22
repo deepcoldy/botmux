@@ -31,7 +31,7 @@ export const getActionDescriptions = createLocalizedCatalog(
     ),
     branchName: translate(
       'auto.components.settings.source.control.action.recipe.options.branchName',
-      'Rename OrcaBotmux-created branches from the initial agent task.'
+      'Rename Botmux-created branches from the initial agent task.'
     ),
     fixCommitFailure: translate(
       'auto.components.settings.source.control.action.recipe.options.fixCommitFailure',

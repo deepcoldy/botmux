@@ -248,7 +248,7 @@ export function runWorktreeDelete(worktreeId: string): void {
   if (target.isMainWorktree) {
     const repo = state.repos.find((entry) => entry.id === target.repoId)
     // Why: git refuses to delete the primary checkout, but users can still
-    // remove the owning project from OrcaBotmux without deleting disk contents.
+    // remove the owning project from Botmux without deleting disk contents.
     state.openModal('confirm-remove-folder', {
       repoId: target.repoId,
       displayName: repo?.displayName ?? target.displayName

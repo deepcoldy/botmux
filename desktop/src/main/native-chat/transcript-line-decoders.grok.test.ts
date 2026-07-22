@@ -34,11 +34,11 @@ describe('decodeGrokTranscriptLine', () => {
   })
 
   it.each([
-    'C:\\Users\\me\\AppData\\Local\\Temp\\orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
-    '/tmp/orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
-    'C:\\orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
-    '/orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
-    '\\\\server\\temp\\orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png'
+    'C:\\Users\\me\\AppData\\Local\\Temp\\botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
+    '/tmp/botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
+    'C:\\botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
+    '/botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png',
+    '\\\\server\\temp\\botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png'
   ])('restores a pasted image and prompt from Grok transcript text for %s', (imagePath) => {
     const line = JSON.stringify({
       type: 'user',
@@ -60,7 +60,7 @@ describe('decodeGrokTranscriptLine', () => {
   })
 
   it('restores an attachment-only pasted image from Grok transcript text', () => {
-    const imagePath = '/tmp/orca-botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png'
+    const imagePath = '/tmp/botmux-paste-1783675302563-2207c073-535f-4b83-a181-61127c8bbd68.png'
     const line = JSON.stringify({
       type: 'user',
       content: [{ type: 'text', text: `<user_query>${imagePath}</user_query>` }]
@@ -73,7 +73,7 @@ describe('decodeGrokTranscriptLine', () => {
   })
 
   it('preserves ordinary prompts that mention pasted-image filenames', () => {
-    const text = 'Explain what an orca-botmux-paste-123-example.png file is'
+    const text = 'Explain what an botmux-paste-123-example.png file is'
     const line = JSON.stringify({
       type: 'user',
       content: [{ type: 'text', text: `<user_query>${text}</user_query>` }]

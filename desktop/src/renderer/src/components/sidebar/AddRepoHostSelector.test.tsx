@@ -55,7 +55,7 @@ describe('AddRepoHostSelector', () => {
     expect(html).toContain('Add SSH host')
     expect(html).toContain('Use an existing machine over SSH.')
     expect(html).toContain('Add remote server')
-    expect(html).toContain('Pair with OrcaBotmux running on another computer.')
+    expect(html).toContain('Pair with Botmux running on another computer.')
   })
 
   it('shows disconnected SSH hosts with a connect action in Add Project', () => {
@@ -109,7 +109,7 @@ describe('AddRepoHostSelector', () => {
           {
             id: 'runtime:old-server',
             label: 'Old server',
-            detail: 'OrcaBotmux server',
+            detail: 'Botmux server',
             kind: 'runtime',
             health: 'blocked',
             presence: 'active',
@@ -130,8 +130,8 @@ describe('AddRepoHostSelector', () => {
     )
 
     expect(html).toContain('Update needed')
-    expect(html).toContain('The selected OrcaBotmux server is too old for this client.')
-    expect(html).toContain('Update OrcaBotmux on the server.')
+    expect(html).toContain('The selected Botmux server is too old for this client.')
+    expect(html).toContain('Update Botmux on the server.')
     expect(html).toContain('aria-disabled="true"')
   })
 })

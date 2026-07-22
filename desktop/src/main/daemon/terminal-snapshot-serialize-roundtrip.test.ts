@@ -7,7 +7,7 @@
 // reset 22, so "1;22" wiped a freshly set bold and a bare "22" dropped a
 // still-set bold/dim.
 //
-// BUG C (hardened OrcaBotmux-side via serializeWithAbsoluteCursor): a final content
+// BUG C (hardened Botmux-side via serializeWithAbsoluteCursor): a final content
 // row filled exactly to the right margin leaves replay wrap-pending, and the
 // addon's RELATIVE cursor restore then lands one column short.
 import './xterm-env-polyfill'
@@ -142,7 +142,7 @@ describe('cursor restore after wrap-pending replay (BUG C, absolute-cursor harde
   const REPRO = '0123456789\x1b[3;5H'
 
   it('documents the upstream defect: plain serialize lands one column short', async () => {
-    // Why this pin: the OrcaBotmux hardening exists only because of this relative-
+    // Why this pin: the Botmux hardening exists only because of this relative-
     // restore defect. If an addon bump makes this fail, the hardening can go.
     const { terminal, addon } = createTerminal(10, 5)
     await write(terminal, REPRO)

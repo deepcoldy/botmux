@@ -10,8 +10,8 @@ import { markRemoteAgentWorkspaceTrusted } from '../remote-agent-trust-presets'
 /**
  * Why: cursor-agent, GitHub Copilot CLI, and Codex gate first-launch in an
  * unfamiliar directory behind a "Do you trust this folder?" menu that consumes
- * keystrokes (numbered options / single-letter shortcuts). OrcaBotmux's draft-URL
- * paste flow needs the input box, not the menu, so before OrcaBotmux spawns the
+ * keystrokes (numbered options / single-letter shortcuts). Botmux's draft-URL
+ * paste flow needs the input box, not the menu, so before Botmux spawns the
  * agent it asks main to write the same trust artifacts the agents write
  * after the user accepts. Best-effort: any IO error is swallowed so a failed
  * trust write never blocks the workspace from opening.

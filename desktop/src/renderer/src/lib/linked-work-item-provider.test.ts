@@ -9,9 +9,9 @@ describe('getLinkedWorkItemProvider', () => {
         type: 'issue',
         provider: 'jira',
         number: 0,
-        title: 'ORCA-123 Fix Jira',
-        url: 'https://example.atlassian.net/browse/ORCA-123',
-        jiraIdentifier: 'ORCA-123'
+        title: 'BMUX-123 Fix Jira',
+        url: 'https://example.atlassian.net/browse/BMUX-123',
+        jiraIdentifier: 'BMUX-123'
       },
       'jira'
     ],
@@ -20,8 +20,8 @@ describe('getLinkedWorkItemProvider', () => {
       {
         type: 'issue',
         number: 0,
-        title: 'ORCA-123 Fix Jira',
-        url: 'https://example.atlassian.net/browse/ORCA-123'
+        title: 'BMUX-123 Fix Jira',
+        url: 'https://example.atlassian.net/browse/BMUX-123'
       },
       'jira'
     ],

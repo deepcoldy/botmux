@@ -43,8 +43,8 @@ function giteaPr(index = 7, branch = 'feature/gitea') {
 describe('Gitea client', () => {
   beforeEach(() => {
     process.env = { ...OLD_ENV }
-    process.env.ORCA_GITEA_TOKEN = 'gitea-token'
-    delete process.env.ORCA_GITEA_API_BASE_URL
+    process.env.BOTMUX_GITEA_TOKEN = 'gitea-token'
+    delete process.env.BOTMUX_GITEA_API_BASE_URL
     gitExecFileAsyncMock.mockReset()
     gitExecFileAsyncMock.mockResolvedValue({
       stdout: 'https://git.example.com/team/repo.git\n',
@@ -253,7 +253,7 @@ describe('Gitea client', () => {
   })
 
   it('uses an API base URL override for subpath or non-standard deployments', async () => {
-    process.env.ORCA_GITEA_API_BASE_URL = 'https://git.example.com/code'
+    process.env.BOTMUX_GITEA_API_BASE_URL = 'https://git.example.com/code'
     const fetchMock = vi.fn(async (url: string | URL) => {
       if (String(url).includes('/commits/abc123/status')) {
         return Response.json({ state: 'pending' })
@@ -301,7 +301,7 @@ describe('Gitea client', () => {
   })
 
   it('verifies token auth when a global API base URL is configured', async () => {
-    process.env.ORCA_GITEA_API_BASE_URL = 'https://git.example.com'
+    process.env.BOTMUX_GITEA_API_BASE_URL = 'https://git.example.com'
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
       Response.json({ login: 'gitea-user' })
     )

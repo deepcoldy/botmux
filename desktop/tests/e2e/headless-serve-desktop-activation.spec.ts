@@ -3,10 +3,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import os from 'node:os'
 import path from 'node:path'
 import { _electron as electron, type ElectronApplication } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { TEST_REPO_PATH_FILE } from './global-setup'
 import { getE2ECompletedOnboardingProfile } from './helpers/e2e-completed-onboarding-profile'
-import { getOrcaElectronLaunchArgs } from './helpers/electron-launch-args'
+import { getBotmuxElectronLaunchArgs } from './helpers/electron-launch-args'
 import { cleanupE2EDaemons, closeElectronAppForE2E } from './helpers/electron-process-shutdown'
 import {
   discoverActivePtyId,
@@ -38,11 +38,11 @@ function createLaunchEnv(userDataDir: string): NodeJS.ProcessEnv {
   return {
     ...cleanEnv,
     NODE_ENV: 'development',
-    ORCA_E2E_USER_DATA_DIR: userDataDir,
-    ORCA_E2E_HEADLESS: '1',
+    BOTMUX_E2E_USER_DATA_DIR: userDataDir,
+    BOTMUX_E2E_HEADLESS: '1',
     // Why: production builds always use the lock; this opt-in makes the dev
     // E2E bundle exercise the same second-instance ownership path.
-    ORCA_E2E_ENFORCE_SINGLE_INSTANCE_LOCK: '1'
+    BOTMUX_E2E_ENFORCE_SINGLE_INSTANCE_LOCK: '1'
   }
 }
 
@@ -86,19 +86,19 @@ test('promotes the headless owner without replacing its daemon terminal', async 
   }
 
   const mainPath = path.join(process.cwd(), 'out', 'main', 'index.js')
-  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-e2e-serve-promotion-'))
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'botmux-e2e-serve-promotion-'))
   const env = createLaunchEnv(userDataDir)
   let serveApp: ElectronApplication | null = null
   let activatingProcess: ChildProcess | null = null
 
   writeFileSync(
-    path.join(userDataDir, 'orca-botmux-data.json'),
+    path.join(userDataDir, 'botmux-data.json'),
     `${JSON.stringify(getE2ECompletedOnboardingProfile(), null, 2)}\n`
   )
 
   try {
     serveApp = await electron.launch({
-      args: [...getOrcaElectronLaunchArgs(mainPath, false), '--serve', '--serve-no-pairing'],
+      args: [...getBotmuxElectronLaunchArgs(mainPath, false), '--serve', '--serve-no-pairing'],
       env
     })
     const ownerPid = serveApp.process().pid
@@ -142,7 +142,7 @@ test('promotes the headless owner without replacing its daemon terminal', async 
       )
       .toContain(beforeMarker)
 
-    activatingProcess = spawn(electronPath, getOrcaElectronLaunchArgs(mainPath, false), {
+    activatingProcess = spawn(electronPath, getBotmuxElectronLaunchArgs(mainPath, false), {
       env,
       stdio: 'ignore'
     })

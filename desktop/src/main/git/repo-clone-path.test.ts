@@ -6,7 +6,7 @@ import { deriveValidatedClonePath, getClonePathComparisonKey } from './repo-clon
 
 describe('repo clone path helpers', () => {
   it('allows safe repository names that start with two dots', async () => {
-    const destination = await mkdtemp(join(tmpdir(), 'orca-botmux-clone-path-'))
+    const destination = await mkdtemp(join(tmpdir(), 'botmux-clone-path-'))
     try {
       expect(
         deriveValidatedClonePath({
@@ -25,25 +25,25 @@ describe('repo clone path helpers', () => {
     }
     expect(() =>
       deriveValidatedClonePath({
-        url: 'https://example.com/orca_botmux.git',
+        url: 'https://example.com/botmux.git',
         destination: 'C:\\Users\\me\\src'
       })
     ).toThrow('Clone destination must be an absolute path')
     expect(() =>
       deriveValidatedClonePath({
-        url: 'https://example.com/orca_botmux.git',
+        url: 'https://example.com/botmux.git',
         destination: '\\\\server\\share'
       })
     ).toThrow('Clone destination must be an absolute path')
     expect(() =>
       deriveValidatedClonePath({
-        url: 'https://example.com/orca_botmux.git',
+        url: 'https://example.com/botmux.git',
         destination: '//server/share'
       })
     ).toThrow('Clone destination must be an absolute path')
     expect(() =>
       deriveValidatedClonePath({
-        url: 'https://example.com/orca_botmux.git',
+        url: 'https://example.com/botmux.git',
         destination: '//wsl.localhost/Ubuntu/home/me'
       })
     ).toThrow('Clone destination must be an absolute path')

@@ -91,8 +91,8 @@ class FakeLogicalClient extends FakeSession implements StableLogicalRpcClient {
 
 const relay = {
   v: 1 as const,
-  directorUrl: 'https://relay.onorca.dev',
-  cellUrl: 'https://relay-c1.onorca.dev',
+  directorUrl: 'https://relay.example.test',
+  cellUrl: 'https://relay-c1.example.test',
   assignmentEpoch: 7,
   relayHostId: 'AbCdEf0123_-xyZ9',
   e2eeFraming: 2 as const
@@ -106,7 +106,7 @@ const host: HostProfile = {
   lastConnected: 1,
   endpoints: [
     { id: 'direct-primary', kind: 'lan', url: 'ws://192.168.1.10:6768' },
-    { id: 'relay-primary', kind: 'relay', url: 'wss://relay-c1.onorca.dev/v1/connect/id' }
+    { id: 'relay-primary', kind: 'relay', url: 'wss://relay-c1.example.test/v1/connect/id' }
   ],
   relayHostId: relay.relayHostId,
   relay
@@ -197,7 +197,7 @@ describe('mobile endpoint supervisor', () => {
       .fn()
       .mockReturnValueOnce(new FakeRelaySession('disconnected', new RelayOuterError(4409)))
       .mockReturnValueOnce(new FakeRelaySession('connected'))
-    const resolved = { ...relay, cellUrl: 'https://relay-c2.onorca.dev', assignmentEpoch: 8 }
+    const resolved = { ...relay, cellUrl: 'https://relay-c2.example.test', assignmentEpoch: 8 }
     const deps = dependencies({
       openRelay,
       resolveRelay: vi.fn(async () => resolved)

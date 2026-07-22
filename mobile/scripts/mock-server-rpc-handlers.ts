@@ -44,14 +44,14 @@ let fakeQuickCommands: TerminalQuickCommand[] = [
 const FAKE_TERMINALS = [
   {
     handle: 'term-1',
-    worktreeId: fakeWorktrees[0]?.worktreeId ?? 'repo-1::/tmp/orca-mobile-repro/orca',
+    worktreeId: fakeWorktrees[0]?.worktreeId ?? 'repo-1::/tmp/botmux-mobile-repro/botmux',
     title: 'Claude — auth refactor',
     isActive: true,
     hasRunningProcess: true
   },
   {
     handle: 'term-2',
-    worktreeId: fakeWorktrees[0]?.worktreeId ?? 'repo-1::/tmp/orca-mobile-repro/orca',
+    worktreeId: fakeWorktrees[0]?.worktreeId ?? 'repo-1::/tmp/botmux-mobile-repro/botmux',
     title: 'zsh',
     isActive: false,
     hasRunningProcess: false
@@ -194,7 +194,7 @@ export function handleRequest(
             hideDefaultBranchWorkspace: false,
             filterRepoIds: [],
             collapsedGroups: [],
-            trustedOrcaHooks: {}
+            trustedBotmuxHooks: {}
           }
         })
       )
@@ -261,7 +261,7 @@ export function handleRequest(
       respond(
         success(request.id, {
           worktree: {
-            id: next?.worktreeId ?? `repo-1::/tmp/orca-mobile-repro/${name}`,
+            id: next?.worktreeId ?? `repo-1::/tmp/botmux-mobile-repro/${name}`,
             worktreeId: next?.worktreeId
           }
         })

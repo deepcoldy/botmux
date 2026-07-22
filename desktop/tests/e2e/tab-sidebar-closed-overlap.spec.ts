@@ -22,18 +22,18 @@
  * without updating the measured wrapper.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree, ensureTerminalVisible } from './helpers/store'
 import { pressShortcut } from './helpers/shortcuts'
 
 test.describe('Tab visibility with closed sidebar', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
-  test('first tab stays visible after Cmd+B collapses the sidebar', async ({ orcaBotmuxPage }) => {
+  test('first tab stays visible after Cmd+B collapses the sidebar', async ({ botmuxPage }) => {
     // Why: the bug title is literally "Cmd+B collapse occludes first tab",
     // so exercise the real keyboard path that App.tsx routes to
     // `actions.toggleSidebar()` at line ~620. Driving
@@ -50,7 +50,7 @@ test.describe('Tab visibility with closed sidebar', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const store = window.__store
             if (!store) {
               // Why: match helpers/store.ts — a missing store in dev means
@@ -76,14 +76,14 @@ test.describe('Tab visibility with closed sidebar', () => {
     // fixture change leaves focus on a rich input the keypress would
     // silently no-op. Blur any non-xterm focused element defensively so
     // the chord reaches the toggleSidebar branch.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const active = document.activeElement
       if (active instanceof HTMLElement && !active.classList.contains('xterm-helper-textarea')) {
         active.blur()
       }
     })
 
-    await pressShortcut(orcaBotmuxPage, 'b')
+    await pressShortcut(botmuxPage, 'b')
 
     // Why: Cmd+B flips `sidebarOpen` synchronously, but the React
     // re-render and the ResizeObserver that sizes
@@ -95,7 +95,7 @@ test.describe('Tab visibility with closed sidebar', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const store = window.__store
             if (!store) {
               throw new Error('window.__store is not available — is the app in dev mode?')
@@ -116,7 +116,7 @@ test.describe('Tab visibility with closed sidebar', () => {
       firstTabWidth: number
       centerIsTabOrDescendant: boolean
     } | null> =>
-      orcaBotmuxPage.evaluate(() => {
+      botmuxPage.evaluate(() => {
         const titlebarLeft = document.querySelector<HTMLElement>('.titlebar-left')
         // Why: split tab groups render multiple sortable-tab elements, and
         // DOM order is not guaranteed to match visual order. The tab the
@@ -207,9 +207,9 @@ test.describe('Tab visibility with closed sidebar', () => {
   })
 
   test('sidebar toggle and Back button stay separated after sidebar collapse', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await orcaBotmuxPage.addInitScript(() => {
+    await botmuxPage.addInitScript(() => {
       // Why: #2082 was reported against Windows-only titlebar chrome. Reloading
       // with a Windows UA makes App.tsx take that renderer branch on any CI host.
       const userAgent =
@@ -219,16 +219,16 @@ test.describe('Tab visibility with closed sidebar', () => {
         configurable: true
       })
     })
-    await orcaBotmuxPage.reload({ waitUntil: 'domcontentloaded' })
-    await orcaBotmuxPage.waitForFunction(() => Boolean(window.__store), null, { timeout: 30_000 })
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+    await botmuxPage.reload({ waitUntil: 'domcontentloaded' })
+    await botmuxPage.waitForFunction(() => Boolean(window.__store), null, { timeout: 30_000 })
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
 
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(() => ({
+          botmuxPage.evaluate(() => ({
             hasWindowsUserAgent: navigator.userAgent.includes('Windows'),
             hasWindowsTitlebarChrome:
               Boolean(document.querySelector('button[aria-label="Application menu"]')) &&
@@ -241,7 +241,7 @@ test.describe('Tab visibility with closed sidebar', () => {
       )
       .toEqual({ hasWindowsUserAgent: true, hasWindowsTitlebarChrome: true })
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available — is the app in dev mode?')
@@ -252,7 +252,7 @@ test.describe('Tab visibility with closed sidebar', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const store = window.__store
             if (!store) {
               throw new Error('window.__store is not available — is the app in dev mode?')
@@ -267,7 +267,7 @@ test.describe('Tab visibility with closed sidebar', () => {
       )
       .toEqual({ activeView: 'terminal', sidebarOpen: true })
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available — is the app in dev mode?')
@@ -281,7 +281,7 @@ test.describe('Tab visibility with closed sidebar', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const store = window.__store
             if (!store) {
               throw new Error('window.__store is not available — is the app in dev mode?')
@@ -301,7 +301,7 @@ test.describe('Tab visibility with closed sidebar', () => {
       backLeft: number
       backCenterHitsBack: boolean
     } | null> =>
-      orcaBotmuxPage.evaluate(() => {
+      botmuxPage.evaluate(() => {
         const titlebarLeft = document.querySelector<HTMLElement>('.titlebar-left')
         const sidebarToggle = titlebarLeft?.querySelector<HTMLButtonElement>(
           'button[aria-label="Toggle sidebar"]'

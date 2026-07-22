@@ -1,24 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 function installRegistryMock(): {
-  configureForOrcaProfileMock: ReturnType<typeof vi.fn>
+  configureForBotmuxProfileMock: ReturnType<typeof vi.fn>
   applyPendingCookieImportMock: ReturnType<typeof vi.fn>
   initializeBrowserSessionsFromPersistedStateMock: ReturnType<typeof vi.fn>
 } {
-  const configureForOrcaProfileMock = vi.fn()
+  const configureForBotmuxProfileMock = vi.fn()
   const applyPendingCookieImportMock = vi.fn()
   const initializeBrowserSessionsFromPersistedStateMock = vi.fn()
 
   vi.doMock('./browser-session-registry', () => ({
     browserSessionRegistry: {
-      configureForOrcaProfile: configureForOrcaProfileMock,
+      configureForBotmuxProfile: configureForBotmuxProfileMock,
       applyPendingCookieImport: applyPendingCookieImportMock,
       initializeBrowserSessionsFromPersistedState: initializeBrowserSessionsFromPersistedStateMock
     }
   }))
 
   return {
-    configureForOrcaProfileMock,
+    configureForBotmuxProfileMock,
     applyPendingCookieImportMock,
     initializeBrowserSessionsFromPersistedStateMock
   }
@@ -44,24 +44,24 @@ describe('initializeBrowserSessionsForApp', () => {
     )
   })
 
-  it('configures the active OrcaBotmux profile before replaying browser sessions', async () => {
+  it('configures the active Botmux profile before replaying browser sessions', async () => {
     const {
-      configureForOrcaProfileMock,
+      configureForBotmuxProfileMock,
       applyPendingCookieImportMock,
       initializeBrowserSessionsFromPersistedStateMock
     } = installRegistryMock()
     const { initializeBrowserSessionsForApp } = await import('./browser-session-startup')
 
     initializeBrowserSessionsForApp({
-      orcaProfileId: 'local-work',
+      botmuxProfileId: 'local-work',
       profileDirectory: '/profiles/local-work'
     })
 
-    expect(configureForOrcaProfileMock).toHaveBeenCalledWith({
-      orcaProfileId: 'local-work',
+    expect(configureForBotmuxProfileMock).toHaveBeenCalledWith({
+      botmuxProfileId: 'local-work',
       profileDirectory: '/profiles/local-work'
     })
-    expect(configureForOrcaProfileMock.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(configureForBotmuxProfileMock.mock.invocationCallOrder[0]).toBeLessThan(
       applyPendingCookieImportMock.mock.invocationCallOrder[0]
     )
     expect(applyPendingCookieImportMock.mock.invocationCallOrder[0]).toBeLessThan(

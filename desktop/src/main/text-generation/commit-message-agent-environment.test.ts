@@ -25,12 +25,12 @@ afterEach(() => {
 
 function makeHome(): string {
   Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' })
-  const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-commit-env-'))
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-commit-env-'))
   tempDirs.push(dir)
   process.env.HOME = dir
   process.env.SHELL = '/bin/zsh'
-  delete process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR
-  delete process.env.ORCA_PI_SOURCE_AGENT_DIR
+  delete process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
+  delete process.env.BOTMUX_PI_SOURCE_AGENT_DIR
   return dir
 }
 
@@ -51,8 +51,8 @@ describe('prepareLocalCommitMessageAgentEnv', () => {
   })
 
   it('prefers the original OpenCode config root over inherited PTY overlays', async () => {
-    process.env.OPENCODE_CONFIG_DIR = '/tmp/orca-botmux-opencode-overlay'
-    process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR = '/Users/tester/company/opencode'
+    process.env.OPENCODE_CONFIG_DIR = '/tmp/botmux-opencode-overlay'
+    process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR = '/Users/tester/company/opencode'
 
     const result = await prepareLocalCommitMessageAgentEnv('opencode', undefined)
 
@@ -80,8 +80,8 @@ describe('prepareLocalCommitMessageAgentEnv', () => {
   })
 
   it('prefers the original Pi agent root over inherited PTY overlays', async () => {
-    process.env.PI_CODING_AGENT_DIR = '/tmp/orca-botmux-pi-overlay'
-    process.env.ORCA_PI_SOURCE_AGENT_DIR = '/Users/tester/.pi/agent'
+    process.env.PI_CODING_AGENT_DIR = '/tmp/botmux-pi-overlay'
+    process.env.BOTMUX_PI_SOURCE_AGENT_DIR = '/Users/tester/.pi/agent'
 
     const result = await prepareLocalCommitMessageAgentEnv('pi', undefined)
 
@@ -113,13 +113,13 @@ describe('prepareLocalCommitMessageAgentEnv', () => {
   it('sets CODEX_HOME for host managed Codex accounts', async () => {
     const result = await prepareLocalCommitMessageAgentEnv('codex', {
       prepareForCodexLaunch: () =>
-        'C:\\Users\\tester\\AppData\\Roaming\\OrcaBotmux\\codex-accounts\\a\\home'
+        'C:\\Users\\tester\\AppData\\Roaming\\Botmux\\codex-accounts\\a\\home'
     })
 
     expect(result).toEqual({
       ok: true,
       env: expect.objectContaining({
-        CODEX_HOME: 'C:\\Users\\tester\\AppData\\Roaming\\OrcaBotmux\\codex-accounts\\a\\home'
+        CODEX_HOME: 'C:\\Users\\tester\\AppData\\Roaming\\Botmux\\codex-accounts\\a\\home'
       })
     })
   })
@@ -129,7 +129,7 @@ describe('prepareLocalCommitMessageAgentEnv', () => {
 
     const result = await prepareLocalCommitMessageAgentEnv('codex', {
       prepareForCodexLaunch: () =>
-        '\\\\wsl.localhost\\Ubuntu\\home\\tester\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
+        '\\\\wsl.localhost\\Ubuntu\\home\\tester\\.local\\share\\botmux\\codex-accounts\\a\\home'
     })
 
     expect(result).toEqual({ ok: true })

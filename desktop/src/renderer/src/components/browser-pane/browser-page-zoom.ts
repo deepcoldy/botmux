@@ -14,7 +14,7 @@ export {
   type BrowserPageZoomDirection
 } from '../../../../shared/browser-page-zoom'
 
-export const ORCA_BROWSER_PAGE_ZOOM_EVENT = 'orca_botmux:browser-page-zoom'
+export const BOTMUX_BROWSER_PAGE_ZOOM_EVENT = 'botmux:browser-page-zoom'
 
 export type BrowserPageZoomEventDetail = {
   browserPageId: string
@@ -83,7 +83,7 @@ export function getBrowserPageZoomIndicatorState({
 
 export function dispatchBrowserPageZoomEvent(detail: BrowserPageZoomEventDetail): void {
   window.dispatchEvent(
-    new CustomEvent<BrowserPageZoomEventDetail>(ORCA_BROWSER_PAGE_ZOOM_EVENT, {
+    new CustomEvent<BrowserPageZoomEventDetail>(BOTMUX_BROWSER_PAGE_ZOOM_EVENT, {
       detail
     })
   )
@@ -95,6 +95,6 @@ export function addBrowserPageZoomEventListener(
   const listener = (event: Event): void => {
     callback((event as CustomEvent<BrowserPageZoomEventDetail>).detail)
   }
-  window.addEventListener(ORCA_BROWSER_PAGE_ZOOM_EVENT, listener)
-  return () => window.removeEventListener(ORCA_BROWSER_PAGE_ZOOM_EVENT, listener)
+  window.addEventListener(BOTMUX_BROWSER_PAGE_ZOOM_EVENT, listener)
+  return () => window.removeEventListener(BOTMUX_BROWSER_PAGE_ZOOM_EVENT, listener)
 }

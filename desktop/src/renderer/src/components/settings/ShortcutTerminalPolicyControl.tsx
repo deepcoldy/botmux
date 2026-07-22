@@ -25,7 +25,7 @@ export function ShortcutTerminalPolicyControl({
       )}
       description={translate(
         'auto.components.settings.ShortcutTerminalPolicyControl.0f55c6f15c',
-        'Choose whether OrcaBotmux or the focused terminal wins when shortcuts overlap.'
+        'Choose whether Botmux or the focused terminal wins when shortcuts overlap.'
       )}
       keywords={keywords}
       className="max-w-none"
@@ -52,10 +52,10 @@ export function ShortcutTerminalPolicyControl({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="orca-botmux-first">
+              <SelectItem value="botmux-first">
                 {translate(
                   'auto.components.settings.ShortcutTerminalPolicyControl.63308571d8',
-                  'OrcaBotmux first'
+                  'Botmux first'
                 )}
               </SelectItem>
               <SelectItem value="terminal-first">

@@ -5,7 +5,7 @@ const DRAG_MARGIN = 8
 const TITLEBAR_SAFE_TOP = 36
 
 export const FLOATING_TERMINAL_TRIGGER_POSITION_STORAGE_KEY =
-  'orca-botmux-floating-terminal-trigger-position-v2'
+  'botmux-floating-terminal-trigger-position-v2'
 
 export type FloatingTerminalTriggerPosition = {
   left: number

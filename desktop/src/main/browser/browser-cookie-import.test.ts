@@ -143,7 +143,7 @@ describe('importCookiesFromFile', () => {
   let cookiesSetMock: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'orca-botmux-cookie-test-'))
+    tmpDir = mkdtempSync(join(tmpdir(), 'botmux-cookie-test-'))
     cookiesSetMock = vi.fn().mockResolvedValue(undefined)
     sessionFromPartitionMock.mockReset()
     sessionFromPartitionMock.mockReturnValue({
@@ -336,7 +336,7 @@ describe('importCookiesFromBrowser Safari', () => {
   let cookiesSetMock: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'orca-botmux-safari-cookie-test-'))
+    tmpDir = mkdtempSync(join(tmpdir(), 'botmux-safari-cookie-test-'))
     cookiesSetMock = vi.fn().mockResolvedValue(undefined)
     sessionFromPartitionMock.mockReset()
     sessionFromPartitionMock.mockReturnValue({
@@ -374,7 +374,7 @@ describe('importCookiesFromBrowser Chromium', () => {
   let clearStorageDataMock: ReturnType<typeof vi.fn>
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'orca-botmux-chromium-cookie-test-'))
+    tmpDir = mkdtempSync(join(tmpdir(), 'botmux-chromium-cookie-test-'))
     cookiesSetMock = vi.fn().mockResolvedValue(undefined)
     cookiesRemoveMock = vi.fn().mockResolvedValue(undefined)
     cookiesFlushStoreMock = vi.fn().mockResolvedValue(undefined)

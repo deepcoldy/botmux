@@ -18,24 +18,24 @@ describe('extractWorkIdentifier', () => {
   it('reads a Bitbucket Server pull-requests URL', () => {
     expect(
       extractWorkIdentifier(
-        'Review https://bitbucket.example.com/projects/ENG/repos/orca_botmux/pull-requests/1288'
+        'Review https://bitbucket.example.com/projects/ENG/repos/botmux/pull-requests/1288'
       )
     ).toEqual({ label: 'PR 1288', tokens: ['pr', '1288'] })
     // Personal (fork) repos live under /users instead of /projects.
     expect(
       extractWorkIdentifier(
-        'see https://bitbucket.example.com/users/jane/repos/orca_botmux/pull-requests/9/overview'
+        'see https://bitbucket.example.com/users/jane/repos/botmux/pull-requests/9/overview'
       )?.label
     ).toBe('PR 9')
   })
 
   it('reads Azure DevOps pull request URLs (dev.azure.com and visualstudio.com)', () => {
     expect(
-      extractWorkIdentifier('Look at https://dev.azure.com/contoso/OrcaBotmux/_git/orca_botmux/pullrequest/4521')
+      extractWorkIdentifier('Look at https://dev.azure.com/contoso/Botmux/_git/botmux/pullrequest/4521')
     ).toEqual({ label: 'PR 4521', tokens: ['pr', '4521'] })
     expect(
       extractWorkIdentifier(
-        'https://contoso.visualstudio.com/OrcaBotmux/_git/orca_botmux/pullrequest/4521?_a=files'
+        'https://contoso.visualstudio.com/Botmux/_git/botmux/pullrequest/4521?_a=files'
       )?.label
     ).toBe('PR 4521')
   })

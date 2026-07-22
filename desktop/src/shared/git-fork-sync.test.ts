@@ -21,7 +21,7 @@ function createRunner(overrides: {
   const runGit = vi.fn(async (args: string[]) => {
     calls.push(args)
     if (args[0] === 'remote' && args[1] === 'get-url') {
-      return { stdout: overrides.upstreamUrl ?? 'git@github.com:stablyai/orca_botmux.git\n' }
+      return { stdout: overrides.upstreamUrl ?? 'git@github.com:stablyai/botmux.git\n' }
     }
     if (args[0] === 'remote') {
       return { stdout: overrides.remotes ?? 'origin\nupstream\n' }
@@ -158,12 +158,12 @@ describe('syncForkDefaultBranch', () => {
 
   it('blocks when the upstream remote no longer matches the expected fork metadata', async () => {
     const { runGit, calls } = createRunner({
-      upstreamUrl: 'git@github.com:someone-else/orca_botmux.git\n'
+      upstreamUrl: 'git@github.com:someone-else/botmux.git\n'
     })
 
     await expect(
       syncForkDefaultBranch(runGit, {
-        expectedUpstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        expectedUpstream: { owner: 'stablyai', repo: 'botmux' }
       })
     ).resolves.toMatchObject({
       status: 'blocked',
@@ -175,12 +175,12 @@ describe('syncForkDefaultBranch', () => {
 
   it('blocks when a non-GitHub upstream remote has the expected owner and repo suffix', async () => {
     const { runGit, calls } = createRunner({
-      upstreamUrl: 'ssh://evil.example.com/stablyai/orca_botmux.git\n'
+      upstreamUrl: 'ssh://evil.example.com/stablyai/botmux.git\n'
     })
 
     await expect(
       syncForkDefaultBranch(runGit, {
-        expectedUpstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        expectedUpstream: { owner: 'stablyai', repo: 'botmux' }
       })
     ).resolves.toMatchObject({
       status: 'blocked',
@@ -195,7 +195,7 @@ describe('syncForkDefaultBranch', () => {
 
     await expect(
       syncForkDefaultBranch(runGit, {
-        expectedUpstream: { owner: '   ', repo: 'orca_botmux' }
+        expectedUpstream: { owner: '   ', repo: 'botmux' }
       })
     ).rejects.toThrow('Invalid expected upstream.')
   })

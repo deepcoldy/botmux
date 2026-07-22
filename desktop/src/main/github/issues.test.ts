@@ -55,29 +55,29 @@ describe('issue source operations', () => {
   })
 
   it('gets a single issue from the issue owner/repo', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({
       stdout: JSON.stringify({
         number: 923,
         title: 'Use upstream issues',
         state: 'open',
-        html_url: 'https://github.com/stablyai/orca_botmux/issues/923',
+        html_url: 'https://github.com/stablyai/botmux/issues/923',
         labels: []
       })
     })
 
     await expect(getIssue('/repo-root', 923)).resolves.toMatchObject({ number: 923 })
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
-      ['api', '--cache', '300s', 'repos/stablyai/orca_botmux/issues/923'],
+      ['api', '--cache', '300s', 'repos/stablyai/botmux/issues/923'],
       { cwd: '/repo-root' }
     )
   })
 
   it('routes local WSL issue operations through repo resolution and gh execution options', async () => {
     const localGitOptions = { wslDistro: 'Ubuntu' }
-    getIssueOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'botmux' })
     resolveIssueSourceMock.mockResolvedValue({
-      source: { owner: 'stablyai', repo: 'orca_botmux' },
+      source: { owner: 'stablyai', repo: 'botmux' },
       fellBack: false
     })
     ghExecFileAsyncMock
@@ -86,7 +86,7 @@ describe('issue source operations', () => {
           number: 923,
           title: 'Use upstream issues',
           state: 'open',
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/923',
+          html_url: 'https://github.com/stablyai/botmux/issues/923',
           labels: []
         })
       })
@@ -94,7 +94,7 @@ describe('issue source operations', () => {
       .mockResolvedValueOnce({
         stdout: JSON.stringify({
           number: 924,
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/924'
+          html_url: 'https://github.com/stablyai/botmux/issues/924'
         })
       })
       .mockResolvedValueOnce({ stdout: '' })
@@ -104,7 +104,7 @@ describe('issue source operations', () => {
           user: { login: 'octo', avatar_url: '', type: 'User' },
           body: 'Comment',
           created_at: '2026-06-16T00:00:00.000Z',
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/923#issuecomment-1'
+          html_url: 'https://github.com/stablyai/botmux/issues/923#issuecomment-1'
         })
       })
       .mockResolvedValueOnce({ stdout: 'bug\nfrontend\n' })
@@ -139,7 +139,7 @@ describe('issue source operations', () => {
   })
 
   it('lists issues from the issue owner/repo', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({ stdout: '[]' })
 
     await expect(listIssues('/repo-root', 5)).resolves.toEqual({ items: [] })
@@ -149,7 +149,7 @@ describe('issue source operations', () => {
         'api',
         '--cache',
         '120s',
-        'repos/stablyai/orca_botmux/issues?per_page=5&state=open&sort=updated&direction=desc'
+        'repos/stablyai/botmux/issues?per_page=5&state=open&sort=updated&direction=desc'
       ],
       { cwd: '/repo-root' }
     )
@@ -159,7 +159,7 @@ describe('issue source operations', () => {
     // Why: parent design doc §3 — a 403 on a private upstream must not
     // masquerade as "No issues". The envelope carries an error the UI can
     // render as a banner with retry, not a silent empty list.
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockRejectedValueOnce(
       new Error('HTTP 403: Resource not accessible by integration')
     )
@@ -171,25 +171,25 @@ describe('issue source operations', () => {
   })
 
   it('creates issues in the issue owner/repo', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({
       stdout: JSON.stringify({
         number: 924,
-        html_url: 'https://github.com/stablyai/orca_botmux/issues/924'
+        html_url: 'https://github.com/stablyai/botmux/issues/924'
       })
     })
 
     await expect(createIssue('/repo-root', 'New issue', 'Body')).resolves.toEqual({
       ok: true,
       number: 924,
-      url: 'https://github.com/stablyai/orca_botmux/issues/924'
+      url: 'https://github.com/stablyai/botmux/issues/924'
     })
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
       [
         'api',
         '-X',
         'POST',
-        'repos/stablyai/orca_botmux/issues',
+        'repos/stablyai/botmux/issues',
         '--raw-field',
         'title=New issue',
         '--raw-field',
@@ -200,11 +200,11 @@ describe('issue source operations', () => {
   })
 
   it('creates issues with labels and assignees', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({
       stdout: JSON.stringify({
         number: 925,
-        html_url: 'https://github.com/stablyai/orca_botmux/issues/925'
+        html_url: 'https://github.com/stablyai/botmux/issues/925'
       })
     })
 
@@ -216,14 +216,14 @@ describe('issue source operations', () => {
     ).resolves.toEqual({
       ok: true,
       number: 925,
-      url: 'https://github.com/stablyai/orca_botmux/issues/925'
+      url: 'https://github.com/stablyai/botmux/issues/925'
     })
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
       [
         'api',
         '-X',
         'POST',
-        'repos/stablyai/orca_botmux/issues',
+        'repos/stablyai/botmux/issues',
         '--raw-field',
         'title=New issue',
         '--raw-field',
@@ -245,13 +245,13 @@ describe('issue source operations', () => {
     expect(body).toContain('data:image')
     expect(body).toHaveLength(133596)
 
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock
       .mockRejectedValueOnce(new Error('HTTP 422: body is too long (maximum is 65536 characters)'))
       .mockResolvedValueOnce({
         stdout: JSON.stringify({
           number: 926,
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/926'
+          html_url: 'https://github.com/stablyai/botmux/issues/926'
         })
       })
       .mockResolvedValueOnce({ stdout: '' })
@@ -264,7 +264,7 @@ describe('issue source operations', () => {
     ).resolves.toEqual({
       ok: true,
       number: 926,
-      url: 'https://github.com/stablyai/orca_botmux/issues/926'
+      url: 'https://github.com/stablyai/botmux/issues/926'
     })
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       1,
@@ -283,13 +283,13 @@ describe('issue source operations', () => {
     )
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       3,
-      ['api', '-X', 'PATCH', 'repos/stablyai/orca_botmux/issues/926', '--raw-field', `body=${body}`],
+      ['api', '-X', 'PATCH', 'repos/stablyai/botmux/issues/926', '--raw-field', `body=${body}`],
       { cwd: '/repo-root' }
     )
   })
 
   it('recognizes the oversized-body response from structured gh stderr', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock
       .mockRejectedValueOnce(
         Object.assign(new Error('Command failed: gh'), {
@@ -299,7 +299,7 @@ describe('issue source operations', () => {
       .mockResolvedValueOnce({
         stdout: JSON.stringify({
           number: 929,
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/929'
+          html_url: 'https://github.com/stablyai/botmux/issues/929'
         })
       })
       .mockResolvedValueOnce({ stdout: '' })
@@ -307,13 +307,13 @@ describe('issue source operations', () => {
     await expect(createIssue('/repo-root', 'Image issue', 'data:image')).resolves.toEqual({
       ok: true,
       number: 929,
-      url: 'https://github.com/stablyai/orca_botmux/issues/929'
+      url: 'https://github.com/stablyai/botmux/issues/929'
     })
     expect(ghExecFileAsyncMock).toHaveBeenCalledTimes(3)
   })
 
   it('does not retry unrelated create failures', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockRejectedValueOnce(new Error('HTTP 422: assignees is invalid'))
 
     await expect(createIssue('/repo-root', 'Invalid issue', 'Body')).resolves.toEqual({
@@ -325,7 +325,7 @@ describe('issue source operations', () => {
 
   it('stops when placeholder create fails during oversized-body recovery', async () => {
     const body = `data:image/png;base64,${'x'.repeat(100)}`
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock
       .mockRejectedValueOnce(new Error('body is too long (maximum is 65536 characters)'))
       .mockRejectedValueOnce(new Error('HTTP 500: create failed'))
@@ -340,7 +340,7 @@ describe('issue source operations', () => {
   it('preserves fields during oversized-body recovery', async () => {
     const localGitOptions = { wslDistro: 'Ubuntu' }
     const body = `data:image/png;base64,${'x'.repeat(100)}`
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock
       .mockRejectedValueOnce(new Error('body is too long (maximum is 65536 characters)'))
       .mockResolvedValueOnce({ stdout: JSON.stringify({ number: 927, url: 'issue-url' }) })
@@ -376,13 +376,13 @@ describe('issue source operations', () => {
   })
 
   it('reports partial success when oversized-body patch fails', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock
       .mockRejectedValueOnce(new Error('body is too long (maximum is 65536 characters)'))
       .mockResolvedValueOnce({
         stdout: JSON.stringify({
           number: 928,
-          html_url: 'https://github.com/stablyai/orca_botmux/issues/928'
+          html_url: 'https://github.com/stablyai/botmux/issues/928'
         })
       })
       .mockRejectedValueOnce(new Error('HTTP 500: update failed'))
@@ -390,27 +390,27 @@ describe('issue source operations', () => {
     await expect(createIssue('/repo-root', 'Partial issue', 'data:image')).resolves.toEqual({
       ok: true,
       number: 928,
-      url: 'https://github.com/stablyai/orca_botmux/issues/928',
+      url: 'https://github.com/stablyai/botmux/issues/928',
       bodySaveWarning:
-        'Issue https://github.com/stablyai/orca_botmux/issues/928 was created, but saving its body failed: HTTP 500: update failed'
+        'Issue https://github.com/stablyai/botmux/issues/928 was created, but saving its body failed: HTTP 500: update failed'
     })
   })
 
   it('updates issue body through the REST issue endpoint', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({ stdout: '' })
 
     await expect(updateIssue('/repo-root', 924, { body: 'Updated body' })).resolves.toEqual({
       ok: true
     })
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
-      ['api', '-X', 'PATCH', 'repos/stablyai/orca_botmux/issues/924', '--raw-field', 'body=Updated body'],
+      ['api', '-X', 'PATCH', 'repos/stablyai/botmux/issues/924', '--raw-field', 'body=Updated body'],
       { cwd: '/repo-root' }
     )
   })
 
   it('closes issues with completed, not planned, and duplicate reasons', async () => {
-    getIssueOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValue({ stdout: '' })
 
     await expect(
@@ -429,30 +429,30 @@ describe('issue source operations', () => {
 
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       1,
-      ['issue', 'close', '924', '--repo', 'stablyai/orca_botmux', '--reason', 'completed'],
+      ['issue', 'close', '924', '--repo', 'stablyai/botmux', '--reason', 'completed'],
       { cwd: '/repo-root' }
     )
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       2,
-      ['issue', 'close', '925', '--repo', 'stablyai/orca_botmux', '--reason', 'not planned'],
+      ['issue', 'close', '925', '--repo', 'stablyai/botmux', '--reason', 'not planned'],
       { cwd: '/repo-root' }
     )
     expect(ghExecFileAsyncMock).toHaveBeenNthCalledWith(
       3,
-      ['issue', 'close', '926', '--repo', 'stablyai/orca_botmux', '--duplicate-of', '99'],
+      ['issue', 'close', '926', '--repo', 'stablyai/botmux', '--duplicate-of', '99'],
       { cwd: '/repo-root' }
     )
   })
 
   it('reopens issues through gh issue reopen', async () => {
-    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'orca_botmux' })
+    getIssueOwnerRepoMock.mockResolvedValueOnce({ owner: 'stablyai', repo: 'botmux' })
     ghExecFileAsyncMock.mockResolvedValueOnce({ stdout: '' })
 
     await expect(updateIssue('/repo-root', 924, { state: 'open' })).resolves.toEqual({
       ok: true
     })
     expect(ghExecFileAsyncMock).toHaveBeenCalledWith(
-      ['issue', 'reopen', '924', '--repo', 'stablyai/orca_botmux'],
+      ['issue', 'reopen', '924', '--repo', 'stablyai/botmux'],
       { cwd: '/repo-root' }
     )
   })

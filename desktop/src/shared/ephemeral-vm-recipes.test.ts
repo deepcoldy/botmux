@@ -58,7 +58,7 @@ describe('parseEphemeralVmRecipeResult', () => {
     }
   })
 
-  it('parses an orca-botmux-server connection result', () => {
+  it('parses an botmux-server connection result', () => {
     const pairingCode = makePairingCode()
 
     expect(
@@ -66,7 +66,7 @@ describe('parseEphemeralVmRecipeResult', () => {
         JSON.stringify({
           schemaVersion: 1,
           connection: {
-            type: 'orca-botmux-server',
+            type: 'botmux-server',
             pairingCode,
             projectRoot: '/workspace/repo'
           }
@@ -77,7 +77,7 @@ describe('parseEphemeralVmRecipeResult', () => {
       result: {
         schemaVersion: 1,
         connection: {
-          type: 'orca-botmux-server',
+          type: 'botmux-server',
           pairingCode,
           projectRoot: '/workspace/repo'
         }
@@ -165,7 +165,7 @@ describe('parseEphemeralVmRecipeResult', () => {
       )
     ).toEqual({
       ok: false,
-      error: 'Recipe result pairingCode is not a valid OrcaBotmux pairing code.'
+      error: 'Recipe result pairingCode is not a valid Botmux pairing code.'
     })
   })
 
@@ -242,7 +242,7 @@ describe('parseEphemeralVmRecipeResult', () => {
       })
     ).toEqual({
       schemaVersion: 1,
-      pairingCode: 'orca_botmux://pair?code=[redacted]',
+      pairingCode: 'botmux://pair?code=[redacted]',
       projectRoot: '/workspace/repo',
       userData: {
         providerResourceId: 'sandbox-123',

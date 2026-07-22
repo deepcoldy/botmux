@@ -30,7 +30,7 @@ export function getMonacoCodebaseSearchQuery(
     return null
   }
 
-  // Why: until OrcaBotmux has semantic LSP references, the editor affordance should
+  // Why: until Botmux has semantic LSP references, the editor affordance should
   // still work from a cursor by searching the visible symbol text in files.
   return normalizeSelectedTextForFileSearch(model.getWordAtPosition(position)?.word)
 }

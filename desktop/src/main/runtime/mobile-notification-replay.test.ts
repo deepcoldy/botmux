@@ -3,7 +3,7 @@ import {
   MobileNotificationReplayBuffer,
   type ReplayableMobileNotification
 } from './mobile-notification-replay'
-import type { MobileNotificationDispatchEvent } from './orca-botmux-runtime'
+import type { MobileNotificationDispatchEvent } from './botmux-runtime'
 
 function dispatch(
   buffer: MobileNotificationReplayBuffer,

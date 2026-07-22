@@ -15,6 +15,7 @@ import {
   detectAutocompleteTrigger,
   rankSuggestions
 } from './mobile-native-chat-autocomplete'
+import { useMobileI18n } from '../i18n/mobile-i18n'
 
 // Common agent slash commands offered as autocomplete; sending them is just text
 // to the agent's terminal, so the set is intentionally provider-agnostic.
@@ -66,6 +67,7 @@ export function MobileNativeChatComposer({
   filePaths = NO_FILE_PATHS,
   onNeedFiles
 }: Props): React.JSX.Element {
+  const { t } = useMobileI18n()
   const [cursor, setCursor] = useState(0)
   // Transiently drives the native caret after a mid-text autocomplete insert,
   // then released on the next selection change so manual caret placement still
@@ -148,7 +150,7 @@ export function MobileNativeChatComposer({
       <View style={styles.bar}>
         {onAttachImage ? (
           <Pressable
-            accessibilityLabel="Attach image"
+            accessibilityLabel={t('Attach image')}
             style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
             onPress={onAttachImage}
             disabled={isAttaching || disabled}
@@ -179,7 +181,7 @@ export function MobileNativeChatComposer({
         />
         {onMicPress ? (
           <Pressable
-            accessibilityLabel={micActive ? 'Stop dictation' : 'Dictate'}
+            accessibilityLabel={t(micActive ? 'Stop dictation' : 'Dictate')}
             style={({ pressed }) => [styles.iconButton, pressed && styles.pressed]}
             // Hold mode is walkie-talkie (press-in/out); toggle mode taps.
             onPress={dictationMode === 'hold' ? undefined : onMicPress}
@@ -200,7 +202,7 @@ export function MobileNativeChatComposer({
           </Pressable>
         ) : null}
         <Pressable
-          accessibilityLabel="Send message"
+          accessibilityLabel={t('Send message')}
           style={({ pressed }) => [
             styles.sendButton,
             !canSend && styles.sendButtonDisabled,

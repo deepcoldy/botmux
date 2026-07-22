@@ -110,10 +110,10 @@ export function MobilePairingConnectionOptions({
   onChange: (value: MobilePairingConnectionMode) => void
   compact?: boolean
 }): React.JSX.Element {
-  const authStatus = useAppStore((state) => state.orcaProfileAuthStatus)
-  const connecting = useAppStore((state) => state.orcaProfileConnecting)
-  const connect = useAppStore((state) => state.connectCurrentOrcaProfile)
-  const fetchAuthStatus = useAppStore((state) => state.fetchOrcaProfileAuthStatus)
+  const authStatus = useAppStore((state) => state.botmuxProfileAuthStatus)
+  const connecting = useAppStore((state) => state.botmuxProfileConnecting)
+  const connect = useAppStore((state) => state.connectCurrentBotmuxProfile)
+  const fetchAuthStatus = useAppStore((state) => state.fetchBotmuxProfileAuthStatus)
   const [relayStatus, setRelayStatus] = useState<MobileRelayStatus>('offline')
   const signedIn = authStatus?.state === 'connected'
   const reconnectRequired = authStatus?.state === 'reconnect-required'
@@ -189,7 +189,7 @@ export function MobilePairingConnectionOptions({
           onSelect={() => onChange('automatic')}
           title={translate(
             'auto.components.settings.MobilePairingConnectionOptions.anywhereTitle',
-            'OrcaBotmux Relay'
+            'Botmux Relay'
           )}
           description={translate(
             'auto.components.settings.MobilePairingConnectionOptions.anywhereDescription',
@@ -230,7 +230,7 @@ export function MobilePairingConnectionOptions({
           <p className="min-w-0 flex-1 text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.MobilePairingConnectionOptions.signInRequired',
-              'Sign in to use OrcaBotmux Mobile Relay.'
+              'Sign in to use Botmux Mobile Relay.'
             )}
           </p>
           <Button
@@ -264,7 +264,7 @@ export function MobilePairingConnectionOptions({
           <p className="min-w-0 flex-1 text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.MobilePairingConnectionOptions.relayUnavailable',
-              'OrcaBotmux Relay isn’t available in this build. Use Local network.'
+              'Botmux Relay isn’t available in this build. Use Local network.'
             )}
           </p>
           <Badge variant="outline" className="shrink-0">

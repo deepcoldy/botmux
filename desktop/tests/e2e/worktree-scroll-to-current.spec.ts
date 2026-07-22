@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 
 async function prepareSidebarForScrollTest(page: Page): Promise<void> {
@@ -22,14 +22,14 @@ async function prepareSidebarForScrollTest(page: Page): Promise<void> {
 }
 
 test.describe('Reveal active workspace button', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
+  test.beforeEach(async ({ botmuxPage }) => {
     // Why: headless Electron under xvfb never ticks a smooth-scroll animation,
     // so the reveal's `scrollTo({ behavior: 'smooth' })` would never reach its
     // target. Reduced-motion makes the reveal jump instantly (see
     // worktree-sidebar-reveal.ts) so the geometry assertions are deterministic.
-    await orcaBotmuxPage.emulateMedia({ reducedMotion: 'reduce' })
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await botmuxPage.emulateMedia({ reducedMotion: 'reduce' })
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   // Note: the "clipped in the production sidebar" pixel-containment test was
@@ -39,11 +39,11 @@ test.describe('Reveal active workspace button', () => {
   // the "outside the virtualized window" test below.
 
   test('clears sidebar filters before revealing a hidden current workspace', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await prepareSidebarForScrollTest(orcaBotmuxPage)
+    await prepareSidebarForScrollTest(botmuxPage)
 
-    const renderedOptions = orcaBotmuxPage.locator('[data-worktree-sidebar] [role="option"]')
+    const renderedOptions = botmuxPage.locator('[data-worktree-sidebar] [role="option"]')
     await expect(renderedOptions).toHaveCount(2)
 
     const targetId = await renderedOptions.last().getAttribute('data-worktree-id')
@@ -51,13 +51,13 @@ test.describe('Reveal active workspace button', () => {
       throw new Error('Bottom workspace row did not expose a data-worktree-id')
     }
 
-    const targetRows = orcaBotmuxPage.locator(
+    const targetRows = botmuxPage.locator(
       `[data-worktree-sidebar] [data-worktree-id=${JSON.stringify(targetId)}]`
     )
     const targetRow = targetRows.first()
-    const revealButton = orcaBotmuxPage.getByRole('button', { name: 'Reveal active workspace' })
+    const revealButton = botmuxPage.getByRole('button', { name: 'Reveal active workspace' })
 
-    await orcaBotmuxPage.evaluate((targetId) => {
+    await botmuxPage.evaluate((targetId) => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -78,7 +78,7 @@ test.describe('Reveal active workspace button', () => {
     }, targetId)
     await expect(targetRow).toHaveAttribute('aria-current', 'page')
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -98,7 +98,7 @@ test.describe('Reveal active workspace button', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const store = window.__store
             if (!store) {
               throw new Error('window.__store is not available')
@@ -114,11 +114,11 @@ test.describe('Reveal active workspace button', () => {
   })
 
   test('reveals the current workspace when it starts outside the virtualized window', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await prepareSidebarForScrollTest(orcaBotmuxPage)
+    await prepareSidebarForScrollTest(botmuxPage)
 
-    const targetId = await orcaBotmuxPage.evaluate(() => {
+    const targetId = await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -174,11 +174,11 @@ test.describe('Reveal active workspace button', () => {
       return target.id
     })
 
-    const scroller = orcaBotmuxPage.locator('[data-worktree-sidebar]')
+    const scroller = botmuxPage.locator('[data-worktree-sidebar]')
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(() => {
+          botmuxPage.evaluate(() => {
             const scroller = document.querySelector<HTMLElement>('[data-worktree-sidebar]')
             return scroller?.scrollTop ?? null
           }),
@@ -193,7 +193,7 @@ test.describe('Reveal active workspace button', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((targetId) => {
+          botmuxPage.evaluate((targetId) => {
             const scroller = document.querySelector<HTMLElement>('[data-worktree-sidebar]')
             const target = [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(
               (candidate) => candidate.dataset.worktreeId === targetId
@@ -212,12 +212,12 @@ test.describe('Reveal active workspace button', () => {
       )
       .toBe(false)
 
-    const revealButton = orcaBotmuxPage.getByRole('button', { name: 'Reveal active workspace' })
+    const revealButton = botmuxPage.getByRole('button', { name: 'Reveal active workspace' })
     await expect(revealButton).toBeVisible()
     await expect(revealButton).toBeEnabled()
 
     await revealButton.click()
-    const targetRow = orcaBotmuxPage
+    const targetRow = botmuxPage
       .locator(`[data-worktree-sidebar] [data-worktree-id=${JSON.stringify(targetId)}]`)
       .first()
     await expect(targetRow).toBeVisible()
@@ -225,11 +225,11 @@ test.describe('Reveal active workspace button', () => {
   })
 
   test('uses the active workspace key when the legacy active worktree id is not set', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await prepareSidebarForScrollTest(orcaBotmuxPage)
+    await prepareSidebarForScrollTest(botmuxPage)
 
-    const folderWorktreeId = await orcaBotmuxPage.evaluate(() => {
+    const folderWorktreeId = await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -283,7 +283,7 @@ test.describe('Reveal active workspace button', () => {
       return folderWorktreeId
     })
 
-    const scroller = orcaBotmuxPage.locator('[data-worktree-sidebar]')
+    const scroller = botmuxPage.locator('[data-worktree-sidebar]')
     await scroller.evaluate((element) => {
       element.scrollTop = 0
       element.dispatchEvent(new Event('scroll', { bubbles: true }))
@@ -291,7 +291,7 @@ test.describe('Reveal active workspace button', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((targetId) => {
+          botmuxPage.evaluate((targetId) => {
             const scroller = document.querySelector<HTMLElement>('[data-worktree-sidebar]')
             const target = [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(
               (candidate) => candidate.dataset.worktreeId === targetId
@@ -310,7 +310,7 @@ test.describe('Reveal active workspace button', () => {
       )
       .toBe(false)
 
-    const revealButton = orcaBotmuxPage.getByRole('button', { name: 'Reveal active workspace' })
+    const revealButton = botmuxPage.getByRole('button', { name: 'Reveal active workspace' })
     await expect(revealButton).toBeVisible()
     await expect(revealButton).toBeEnabled()
     await revealButton.click()
@@ -318,7 +318,7 @@ test.describe('Reveal active workspace button', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((targetId) => {
+          botmuxPage.evaluate((targetId) => {
             const scroller = document.querySelector<HTMLElement>('[data-worktree-sidebar]')
             const target = [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(
               (candidate) => candidate.dataset.worktreeId === targetId

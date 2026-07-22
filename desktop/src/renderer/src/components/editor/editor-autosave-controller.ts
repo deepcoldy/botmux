@@ -18,11 +18,11 @@ import {
   getOpenFilesForExternalFileChange,
   isAutosaveSuspendedForFile,
   normalizeAutoSaveDelayMs,
-  ORCA_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
-  ORCA_EDITOR_FILE_SAVED_EVENT,
-  ORCA_EDITOR_QUIESCE_FILE_SAVES_EVENT,
-  ORCA_EDITOR_SAVE_AND_CLOSE_EVENT,
-  ORCA_EDITOR_SAVE_FILE_EVENT,
+  BOTMUX_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
+  BOTMUX_EDITOR_FILE_SAVED_EVENT,
+  BOTMUX_EDITOR_QUIESCE_FILE_SAVES_EVENT,
+  BOTMUX_EDITOR_SAVE_AND_CLOSE_EVENT,
+  BOTMUX_EDITOR_SAVE_FILE_EVENT,
   type EditorFileSavedDetail,
   type EditorPathMutationTarget,
   type EditorSaveFileDetail,
@@ -44,8 +44,8 @@ import {
   getDuplicateDirtySavePaths
 } from './editor-autosave-state-projections'
 import {
-  ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT,
-  ORCA_EDITOR_SAVE_DIRTY_FILES_EVENT,
+  BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT,
+  BOTMUX_EDITOR_SAVE_DIRTY_FILES_EVENT,
   type EditorPrepareHotExitDetail,
   type EditorSaveDirtyFilesDetail
 } from '../../../../shared/editor-save-events'
@@ -172,7 +172,7 @@ export function attachEditorAutosaveController(store: AppStoreApi): () => void {
         }
 
         window.dispatchEvent(
-          new CustomEvent<EditorFileSavedDetail>(ORCA_EDITOR_FILE_SAVED_EVENT, {
+          new CustomEvent<EditorFileSavedDetail>(BOTMUX_EDITOR_FILE_SAVED_EVENT, {
             detail: { fileId: file.id, content: contentToSave }
           })
         )
@@ -441,7 +441,7 @@ export function attachEditorAutosaveController(store: AppStoreApi): () => void {
     for (const file of matchingFiles) {
       if (file.isDirty) {
         // Why: the self-write check keeps this backstop from marking on the
-        // echo of OrcaBotmux's own save (the combined-Changes reload notification
+        // echo of Botmux's own save (the combined-Changes reload notification
         // routes through here and would otherwise bypass the watch hook's
         // echo verification).
         if (!hasRecentSelfWrite(file.filePath, file.runtimeEnvironmentId)) {
@@ -478,34 +478,34 @@ export function attachEditorAutosaveController(store: AppStoreApi): () => void {
   })
   syncAutoSave()
 
-  window.addEventListener(ORCA_EDITOR_SAVE_DIRTY_FILES_EVENT, handleSaveDirtyFiles as EventListener)
-  window.addEventListener(ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT, handlePrepareHotExit as EventListener)
-  window.addEventListener(ORCA_EDITOR_SAVE_AND_CLOSE_EVENT, handleSaveAndClose as EventListener)
-  window.addEventListener(ORCA_EDITOR_SAVE_FILE_EVENT, handleSaveFile as EventListener)
-  window.addEventListener(ORCA_EDITOR_QUIESCE_FILE_SAVES_EVENT, handleQuiesce as EventListener)
+  window.addEventListener(BOTMUX_EDITOR_SAVE_DIRTY_FILES_EVENT, handleSaveDirtyFiles as EventListener)
+  window.addEventListener(BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT, handlePrepareHotExit as EventListener)
+  window.addEventListener(BOTMUX_EDITOR_SAVE_AND_CLOSE_EVENT, handleSaveAndClose as EventListener)
+  window.addEventListener(BOTMUX_EDITOR_SAVE_FILE_EVENT, handleSaveFile as EventListener)
+  window.addEventListener(BOTMUX_EDITOR_QUIESCE_FILE_SAVES_EVENT, handleQuiesce as EventListener)
   window.addEventListener(
-    ORCA_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
+    BOTMUX_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
     handleExternalFileChange as EventListener
   )
 
   return () => {
     unsubscribe()
     window.removeEventListener(
-      ORCA_EDITOR_SAVE_DIRTY_FILES_EVENT,
+      BOTMUX_EDITOR_SAVE_DIRTY_FILES_EVENT,
       handleSaveDirtyFiles as EventListener
     )
     window.removeEventListener(
-      ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT,
+      BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT,
       handlePrepareHotExit as EventListener
     )
     window.removeEventListener(
-      ORCA_EDITOR_SAVE_AND_CLOSE_EVENT,
+      BOTMUX_EDITOR_SAVE_AND_CLOSE_EVENT,
       handleSaveAndClose as EventListener
     )
-    window.removeEventListener(ORCA_EDITOR_SAVE_FILE_EVENT, handleSaveFile as EventListener)
-    window.removeEventListener(ORCA_EDITOR_QUIESCE_FILE_SAVES_EVENT, handleQuiesce as EventListener)
+    window.removeEventListener(BOTMUX_EDITOR_SAVE_FILE_EVENT, handleSaveFile as EventListener)
+    window.removeEventListener(BOTMUX_EDITOR_QUIESCE_FILE_SAVES_EVENT, handleQuiesce as EventListener)
     window.removeEventListener(
-      ORCA_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
+      BOTMUX_EDITOR_EXTERNAL_FILE_CHANGE_EVENT,
       handleExternalFileChange as EventListener
     )
     for (const timerId of autoSaveTimers.values()) {

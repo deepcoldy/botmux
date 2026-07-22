@@ -142,7 +142,7 @@ describe('isMarkdownPreviewSystemBrowserModifier', () => {
 
 describe('resolveMarkdownPreviewHttpOpenOptions', () => {
   // forceSystemBrowser -> shell.openExternal (system default browser);
-  // worktreeId (no force) -> openHttpLink routes into the OrcaBotmux browser per the
+  // worktreeId (no force) -> openHttpLink routes into the Botmux browser per the
   // openLinksInApp setting. See http-link-routing.test.ts for that mapping.
   it('forces the system browser on Cmd+Shift-click on macOS', () => {
     expect(
@@ -166,7 +166,7 @@ describe('resolveMarkdownPreviewHttpOpenOptions', () => {
     ).toEqual({ forceSystemBrowser: true, sourceOwner: { kind: 'local' } })
   })
 
-  it('routes a plain Cmd-click through the worktree so it can open in OrcaBotmux', () => {
+  it('routes a plain Cmd-click through the worktree so it can open in Botmux', () => {
     expect(
       resolveMarkdownPreviewHttpOpenOptions(
         { metaKey: true, ctrlKey: false, shiftKey: false },

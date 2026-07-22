@@ -41,7 +41,7 @@ function makeRepo(overrides: Partial<Repo> = {}): Repo {
 
 describe('folder workspace path status', () => {
   it('reports existing local directories and local files', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-folder-status-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-folder-status-'))
     try {
       const filePath = join(root, 'notes.txt')
       await writeFile(filePath, 'hello')
@@ -75,7 +75,7 @@ describe('folder workspace path status', () => {
   })
 
   it('reports missing local directories', async () => {
-    const missingPath = join(tmpdir(), `orca-botmux-folder-status-missing-${randomUUID()}`)
+    const missingPath = join(tmpdir(), `botmux-folder-status-missing-${randomUUID()}`)
 
     await expect(
       getFolderWorkspacePathStatusForPath(

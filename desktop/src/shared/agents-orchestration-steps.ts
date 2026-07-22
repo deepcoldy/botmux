@@ -1,4 +1,4 @@
-// Per-step copy for the agents-orchestration tile in the Explore OrcaBotmux modal.
+// Per-step copy for the agents-orchestration tile in the Explore Botmux modal.
 
 export type AgentsStepId = 'statuses' | 'usage' | 'orchestration'
 
@@ -27,7 +27,7 @@ export const AGENTS_STEPS: readonly AgentsStep[] = [
     id: 'orchestration',
     name: 'Orchestration',
     subtitle: 'Orchestration',
-    description: 'Enable agents to manage and coordinate OrcaBotmux workspaces to execute larger tasks.'
+    description: 'Enable agents to manage and coordinate Botmux workspaces to execute larger tasks.'
   },
   {
     id: 'usage',

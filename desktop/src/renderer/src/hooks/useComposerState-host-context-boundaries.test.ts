@@ -31,7 +31,7 @@ describe('useComposerState host-context boundaries', () => {
     expect(isExplicitWorkspaceNameInput({ name: '#1234', lastAutoName: '' })).toBe(false)
     expect(
       isExplicitWorkspaceNameInput({
-        name: 'https://github.com/stablyai/orca_botmux/pull/1234',
+        name: 'https://github.com/stablyai/botmux/pull/1234',
         lastAutoName: ''
       })
     ).toBe(false)
@@ -64,7 +64,7 @@ describe('useComposerState host-context boundaries', () => {
         resolutionKind: 'pr-start-point',
         smartWorkspaceName: 'title-derived-name',
         smartDisplayName: 'Title derived name',
-        fallbackWorkspaceName: 'https://github.com/stablyai/orca_botmux/pull/6772',
+        fallbackWorkspaceName: 'https://github.com/stablyai/botmux/pull/6772',
         nameIsAutoManaged: true
       })
     ).toEqual({ workspaceName: 'title-derived-name', displayName: 'Title derived name' })
@@ -79,7 +79,7 @@ describe('useComposerState host-context boundaries', () => {
           provider: 'github',
           number: 1234,
           title: 'Fix workspace name',
-          url: 'https://github.com/stablyai/orca_botmux/issues/1234'
+          url: 'https://github.com/stablyai/botmux/issues/1234'
         }
       })
     ).toBe('fix-workspace-name')
@@ -623,7 +623,7 @@ describe('useComposerState host-context boundaries', () => {
   })
 
   it('keeps Linear starts out of issue-command templates without special draft routing', () => {
-    expect(HOOK_SOURCE).not.toContain('isOrcaCliAvailableForLaunch')
+    expect(HOOK_SOURCE).not.toContain('isBotmuxCliAvailableForLaunch')
     expect(HOOK_SOURCE).not.toContain('hasGeneratedLinearSourceContext')
     expect(HOOK_SOURCE).not.toContain('shouldDraftGeneratedLinearContext')
     expect(HOOK_SOURCE).toMatch(

@@ -118,36 +118,36 @@ describe('WorkspaceDirectorySetting', () => {
 
     typePath('o')
     typePath('or')
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
 
     expect(updateSettings).not.toHaveBeenCalled()
 
     blurInput()
 
     expect(updateSettings).toHaveBeenCalledTimes(1)
-    expect(updateSettings).toHaveBeenCalledWith({ workspaceDir: 'orca-botmux-workspaces' })
+    expect(updateSettings).toHaveBeenCalledWith({ workspaceDir: 'botmux-workspaces' })
   })
 
   it('commits Enter once even though Enter also blurs the input', () => {
     const updateSettings = vi.fn()
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
     pressInputKey('Enter')
     blurInput()
 
     expect(updateSettings).toHaveBeenCalledTimes(1)
-    expect(updateSettings).toHaveBeenCalledWith({ workspaceDir: 'orca-botmux-workspaces' })
+    expect(updateSettings).toHaveBeenCalledWith({ workspaceDir: 'botmux-workspaces' })
   })
 
   it('does not commit Enter while IME composition is active', () => {
     const updateSettings = vi.fn()
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
     pressInputKey('Enter', { isComposing: true })
 
-    expect(getInput().value).toBe('orca-botmux-workspaces')
+    expect(getInput().value).toBe('botmux-workspaces')
     expect(updateSettings).not.toHaveBeenCalled()
   })
 
@@ -155,7 +155,7 @@ describe('WorkspaceDirectorySetting', () => {
     const updateSettings = vi.fn()
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
     pressInputKey('Escape')
     blurInput()
 
@@ -167,10 +167,10 @@ describe('WorkspaceDirectorySetting', () => {
     const updateSettings = vi.fn()
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
     pressInputKey('Escape', { isComposing: true })
 
-    expect(getInput().value).toBe('orca-botmux-workspaces')
+    expect(getInput().value).toBe('botmux-workspaces')
     expect(updateSettings).not.toHaveBeenCalled()
   })
 
@@ -179,7 +179,7 @@ describe('WorkspaceDirectorySetting', () => {
     pickFolderMock.mockResolvedValue('/Users/alice/workspaces')
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-w')
+    typePath('botmux-w')
     await clickBrowseAfterInputBlur()
 
     expect(updateSettings).toHaveBeenCalledTimes(1)
@@ -191,7 +191,7 @@ describe('WorkspaceDirectorySetting', () => {
     pickFolderMock.mockResolvedValue(null)
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-w')
+    typePath('botmux-w')
     await clickBrowseAfterInputBlur()
 
     expect(getInput().value).toBe(getDefaultSettings('/tmp').workspaceDir)
@@ -202,12 +202,12 @@ describe('WorkspaceDirectorySetting', () => {
     const updateSettings = vi.fn()
     renderWorkspaceDirectorySetting({ updateSettings })
 
-    typePath('orca-botmux-workspaces')
+    typePath('botmux-workspaces')
     blurInput()
     blurInput()
 
     expect(updateSettings).toHaveBeenCalledTimes(2)
-    expect(updateSettings).toHaveBeenNthCalledWith(1, { workspaceDir: 'orca-botmux-workspaces' })
-    expect(updateSettings).toHaveBeenNthCalledWith(2, { workspaceDir: 'orca-botmux-workspaces' })
+    expect(updateSettings).toHaveBeenNthCalledWith(1, { workspaceDir: 'botmux-workspaces' })
+    expect(updateSettings).toHaveBeenNthCalledWith(2, { workspaceDir: 'botmux-workspaces' })
   })
 })

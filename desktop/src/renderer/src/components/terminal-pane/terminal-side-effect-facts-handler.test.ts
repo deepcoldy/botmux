@@ -189,8 +189,8 @@ describe('registerTerminalSideEffectFactConsumer', () => {
         {
           kind: 'pr-link',
           link: {
-            url: 'https://github.com/acme/orca_botmux/pull/42',
-            slug: { owner: 'acme', repo: 'orca_botmux' },
+            url: 'https://github.com/acme/botmux/pull/42',
+            slug: { owner: 'acme', repo: 'botmux' },
             number: 42
           }
         },
@@ -200,7 +200,7 @@ describe('registerTerminalSideEffectFactConsumer', () => {
 
     expect(events).toEqual([
       ['finished', 130],
-      ['pr', 'https://github.com/acme/orca_botmux/pull/42', 42],
+      ['pr', 'https://github.com/acme/botmux/pull/42', 42],
       ['finished', null]
     ])
   })
@@ -304,8 +304,8 @@ describe('registerTerminalSideEffectFactConsumer', () => {
           {
             kind: 'pr-link',
             link: {
-              url: 'https://github.com/acme/orca_botmux/pull/42',
-              slug: { owner: 'acme', repo: 'orca_botmux' },
+              url: 'https://github.com/acme/botmux/pull/42',
+              slug: { owner: 'acme', repo: 'botmux' },
               number: 42
             }
           }

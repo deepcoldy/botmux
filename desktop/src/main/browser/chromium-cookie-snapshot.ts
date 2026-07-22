@@ -117,7 +117,7 @@ export function createChromiumCookieSnapshot(
   sourcePath: string,
   options: ChromiumCookieSnapshotOptions = {}
 ): ChromiumCookieSnapshot {
-  const snapshotDir = mkdtempSync(join(options.tempRoot ?? tmpdir(), 'orca-botmux-cookie-import-'))
+  const snapshotDir = mkdtempSync(join(options.tempRoot ?? tmpdir(), 'botmux-cookie-import-'))
   const databasePath = join(snapshotDir, 'Cookies')
   let keepSnapshot = false
 

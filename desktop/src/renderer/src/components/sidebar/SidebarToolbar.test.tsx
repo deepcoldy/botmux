@@ -36,8 +36,8 @@ vi.mock('./SidebarSettingsHelpMenu', () => ({
   SidebarSettingsHelpMenu: () => <button type="button">Settings</button>
 }))
 
-vi.mock('../orca-botmux-profiles/OrcaProfileSwitcher', () => ({
-  OrcaProfileSwitcher: ({ placement }: { placement?: string }) => (
+vi.mock('../botmux-profiles/BotmuxProfileSwitcher', () => ({
+  BotmuxProfileSwitcher: ({ placement }: { placement?: string }) => (
     <button type="button" data-placement={placement}>
       Profile
     </button>
@@ -114,7 +114,7 @@ describe('SidebarToolbar moved workspace board hint', () => {
 
     expect(onWorkspaceBoardToggle).toHaveBeenCalledOnce()
     expect(container.textContent).not.toContain('Workspace board moved to the bottom bar')
-    expect(window.localStorage.getItem('orca_botmux.workspaceBoardMovedHintSeen.v1')).toBeNull()
+    expect(window.localStorage.getItem('botmux.workspaceBoardMovedHintSeen.v1')).toBeNull()
   })
 
   it('shows the moved hint once to users who had already used the workspace board', async () => {
@@ -128,7 +128,7 @@ describe('SidebarToolbar moved workspace board hint', () => {
     const { container } = await renderToolbar()
 
     expect(container.textContent).toContain('Workspace board moved to the bottom bar')
-    expect(window.localStorage.getItem('orca_botmux.workspaceBoardMovedHintSeen.v1')).toBe('true')
+    expect(window.localStorage.getItem('botmux.workspaceBoardMovedHintSeen.v1')).toBe('true')
   })
 
   it('renders the profile switcher before settings in the footer controls', async () => {

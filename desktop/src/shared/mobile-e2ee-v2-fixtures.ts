@@ -10,7 +10,7 @@ export function createMobileE2EEV2Fixture(): {
   sharedSecret: Uint8Array
 } {
   const context = {
-    protocol: 'orca-botmux-mobile-e2ee' as const,
+    protocol: 'botmux-mobile-e2ee' as const,
     initiator: 'mobile' as const,
     responder: 'desktop' as const,
     transport: 'relay' as const,
@@ -39,9 +39,9 @@ export function createMobileE2EEV2Fixture(): {
 }
 
 export const MOBILE_E2EE_V2_VECTOR = {
-  transcriptLength: 1347,
-  transcriptHashHex: 'ca6385f8bbf64a223fdd59587bfb67e2373891ce9e6d85ab41df8b7a20a168e3',
-  mobileToDesktopKeyHex: 'df17ff534df77fd3a30999f4e6200c8fcedefbb15d369301ca62c3cdfea9559a',
-  desktopToMobileKeyHex: '71365fcf8212a6d63caf909ee28de3c8f689682ef298a374136055e0ab1cde4a',
-  sessionIdHex: '339ae1f2bdff63481857d2813c2f19dd1f5aa4824705d5e5daeb25dae7b9196e'
+  transcriptLength: 1353,
+  transcriptHashHex: '177ebdd01cdc9dcb5c6c0f3b5f3b931431e9febcc5e2e36c9de2b98be1852977',
+  mobileToDesktopKeyHex: 'ecd545d2ae85fe1d2f2401ffe2bca935ac685b94ae2a37a19769631c6ed9f124',
+  desktopToMobileKeyHex: 'bcae9f7ba2d28e13266da5f4703585590a9c563fa51acaf7dc6043f27231f0a9',
+  sessionIdHex: '7133821b54f5fa54e301fa9f2eda31e8e8210639a4b21709e48b205c7a30ea90'
 } as const

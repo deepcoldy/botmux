@@ -238,7 +238,7 @@ describe('ghExecFileAsync WSL fallback', () => {
     })
 
     await expect(
-      ghExecFileAsync(['api', '-X', 'POST', 'repos/stablyai/orca_botmux/issues'])
+      ghExecFileAsync(['api', '-X', 'POST', 'repos/stablyai/botmux/issues'])
     ).rejects.toThrow('HTTP 502 Bad Gateway')
 
     expect(execFileMock).toHaveBeenCalledTimes(1)
@@ -277,7 +277,7 @@ describe('ghExecFileAsync WSL fallback', () => {
     })
 
     await expect(
-      ghExecFileAsync(['issue', 'edit', '5', '--repo', 'stablyai/orca_botmux'])
+      ghExecFileAsync(['issue', 'edit', '5', '--repo', 'stablyai/botmux'])
     ).rejects.toThrow('HTTP 502 Bad Gateway')
 
     expect(execFileMock).toHaveBeenCalledTimes(1)
@@ -318,7 +318,7 @@ describe('ghExecFileAsync WSL fallback', () => {
     })
 
     await expect(
-      glabExecFileAsync(['api', '-X', 'POST', 'projects/stablyai%2Forca/issues/5/notes'], {
+      glabExecFileAsync(['api', '-X', 'POST', 'projects/botmux%2Fexample-project/issues/5/notes'], {
         cwd: String.raw`C:\repo`
       })
     ).rejects.toThrow('HTTP 502 Bad Gateway')
@@ -337,7 +337,7 @@ describe('ghExecFileAsync WSL fallback', () => {
     })
 
     await expect(
-      glabExecFileAsync(['issue', 'update', '5', '-R', 'stablyai/orca_botmux'], {
+      glabExecFileAsync(['issue', 'update', '5', '-R', 'stablyai/botmux'], {
         cwd: String.raw`C:\repo`
       })
     ).rejects.toThrow('HTTP 502 Bad Gateway')
@@ -481,7 +481,7 @@ describe('ghExecFileAsync WSL fallback', () => {
       })
 
     await expect(
-      glabExecFileAsync(['api', 'projects/stablyai%2Forca/issues'], {
+      glabExecFileAsync(['api', 'projects/botmux%2Fexample-project/issues'], {
         cwd: String.raw`C:\repo`
       })
     ).resolves.toEqual({ stdout: '[]', stderr: '' })

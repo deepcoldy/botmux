@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 import type { ElectronApplication, Locator } from '@stablyai/playwright-test'
 
@@ -33,7 +33,7 @@ async function createNestedRepoFixture(): Promise<{
   // canonicalized repo.path / projectGroup.parentPath on macOS, where
   // os.tmpdir() (/var/...) symlinks to /private/var/... and the app canonicalizes
   // imported paths via `git rev-parse --show-toplevel`.
-  const parentPath = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-folder-setup-')))
+  const parentPath = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-folder-setup-')))
   tempRoots.push(parentPath)
   const repoNames = ['api-service', 'web-client']
   const projectPaths = repoNames.map((name) => path.join(parentPath, name))
@@ -59,7 +59,7 @@ async function createLargeNestedRepoFixture(): Promise<{
   // canonicalized repo.path on macOS (os.tmpdir() /var/... symlinks to
   // /private/var/...).
   const parentPath = realpathSync(
-    await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-large-folder-setup-'))
+    await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-large-folder-setup-'))
   )
   tempRoots.push(parentPath)
   const nestedParent = path.join(
@@ -116,21 +116,21 @@ function getImportAsGroupButton(importDialog: Locator): Locator {
 test.describe('Folder setup', () => {
   test('imports nested repositories from the add-project dialog as a project group', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const fixture = await createNestedRepoFixture()
     await chooseFolderInNativeDialog(electronApp, fixture.parentPath)
 
-    await orcaBotmuxPage
+    await botmuxPage
       .getByRole('button', { name: /Add Project/i })
       .first()
       .click()
-    const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Add a project/i })
+    const dialog = botmuxPage.getByRole('dialog', { name: /Add a project/i })
     await expect(dialog).toBeVisible()
     await dialog.getByRole('button', { name: /Browse folder/i }).click()
 
-    const importDialog = orcaBotmuxPage.getByRole('dialog', {
+    const importDialog = botmuxPage.getByRole('dialog', {
       name: /Import repositories from folder/i
     })
     await expect(
@@ -144,7 +144,7 @@ test.describe('Folder setup', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(async (args) => {
+          botmuxPage.evaluate(async (args) => {
             const state = window.__store?.getState()
             if (!state) {
               return null
@@ -174,31 +174,31 @@ test.describe('Folder setup', () => {
         projectGroupOrders: [0, 1]
       })
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       state?.closeModal()
       state?.setGroupBy('repo')
     })
-    await expect(orcaBotmuxPage.getByText(fixture.groupName)).toBeVisible()
+    await expect(botmuxPage.getByText(fixture.groupName)).toBeVisible()
   })
 
   test('imports a small selection from a large nested folder without modal overflow', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const fixture = await createLargeNestedRepoFixture()
     await chooseFolderInNativeDialog(electronApp, fixture.parentPath)
 
-    await orcaBotmuxPage
+    await botmuxPage
       .getByRole('button', { name: /Add Project/i })
       .first()
       .click()
-    const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Add a project/i })
+    const dialog = botmuxPage.getByRole('dialog', { name: /Add a project/i })
     await expect(dialog).toBeVisible()
     await dialog.getByRole('button', { name: /Browse folder/i }).click()
 
-    const importDialog = orcaBotmuxPage.getByRole('dialog', {
+    const importDialog = botmuxPage.getByRole('dialog', {
       name: /Import repositories from folder/i
     })
     await expect(importDialog.getByText(/Found 87 repositories in/)).toBeVisible()
@@ -231,7 +231,7 @@ test.describe('Folder setup', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(async (args) => {
+          botmuxPage.evaluate(async (args) => {
             const state = window.__store?.getState()
             if (!state) {
               return null

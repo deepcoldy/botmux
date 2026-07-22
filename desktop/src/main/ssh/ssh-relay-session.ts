@@ -70,8 +70,8 @@ import {
   SSH_RELAY_CONFIGURE_GRACE_TIME_METHOD
 } from '../../shared/ssh-types'
 import type { Store } from '../persistence'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
-import { runRemoteOrcaCli } from './ssh-remote-orca-botmux-cli'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
+import { runRemoteBotmuxCli } from './ssh-remote-botmux-cli'
 import { toSshExecutionHostId, type ExecutionHostId } from '../../shared/execution-host'
 import { isTerminalLeafId, makePaneKey } from '../../shared/stable-pane-id'
 import { isValidTerminalTabId } from '../../shared/terminal-tab-id'
@@ -233,7 +233,7 @@ export class SshRelaySession {
     private getMainWindow: () => BrowserWindow | null,
     private store: Store,
     private portForwardManager: SshPortForwardManager,
-    private runtime?: OrcaRuntimeService,
+    private runtime?: BotmuxRuntimeService,
     private onDetectedPortsChanged?: (
       targetId: string,
       ports: DetectedPort[],
@@ -245,7 +245,7 @@ export class SshRelaySession {
     getMainWindow: () => BrowserWindow | null,
     store: Store,
     portForwardManager: SshPortForwardManager,
-    runtime?: OrcaRuntimeService,
+    runtime?: BotmuxRuntimeService,
     onDetectedPortsChanged?: (targetId: string, ports: DetectedPort[], platform: string) => void
   ): void {
     this.getMainWindow = getMainWindow
@@ -338,7 +338,7 @@ export class SshRelaySession {
         remoteHome && remoteRelayDir && nodePath && sockPath && hostPlatform
           ? {
               remoteHome,
-              binDir: joinRemotePath(hostPlatform, remoteHome, '.orca-botmux-relay', 'bin'),
+              binDir: joinRemotePath(hostPlatform, remoteHome, '.botmux-relay', 'bin'),
               relayDir: remoteRelayDir,
               nodePath,
               sockPath,
@@ -466,7 +466,7 @@ export class SshRelaySession {
         remoteHome && remoteRelayDir && nodePath && sockPath && hostPlatform
           ? {
               remoteHome,
-              binDir: joinRemotePath(hostPlatform, remoteHome, '.orca-botmux-relay', 'bin'),
+              binDir: joinRemotePath(hostPlatform, remoteHome, '.botmux-relay', 'bin'),
               relayDir: remoteRelayDir,
               nodePath,
               sockPath,
@@ -604,7 +604,7 @@ export class SshRelaySession {
     this.stopPortScanning()
     this.broadcastEmptyLists()
     // Why: app/window disconnect is non-destructive for remote PTYs. The relay
-    // owns the grace timer, so OrcaBotmux must unregister local providers without
+    // owns the grace timer, so Botmux must unregister local providers without
     // clearing PTY ownership needed for reattach.
     this.teardownProviders('connection_lost')
     this.store.markSshRemotePtyLeases(this.targetId, 'detached')
@@ -653,14 +653,14 @@ export class SshRelaySession {
     }
 
     try {
-      await this.installRemoteOrcaCliLauncher()
+      await this.installRemoteBotmuxCliLauncher()
     } catch (error) {
-      // Why: the remote `orca_botmux` CLI launcher is a convenience bridge. On session-
+      // Why: the remote `botmux` CLI launcher is a convenience bridge. On session-
       // limited remotes (MaxSessions=1) the relay bridge holds the only slot,
       // so this raw-connection install can fail — that must not fail the
       // whole connection, matching the managed-hook install above.
       console.warn(
-        `[ssh-relay-session] remote orca_botmux CLI launcher install failed for ${this.targetId}: ${
+        `[ssh-relay-session] remote botmux CLI launcher install failed for ${this.targetId}: ${
           error instanceof Error ? error.message : String(error)
         }`
       )
@@ -669,7 +669,7 @@ export class SshRelaySession {
       return false
     }
 
-    this.wireUpRemoteOrcaCli(mux)
+    this.wireUpRemoteBotmuxCli(mux)
 
     const ptyProvider = new SshPtyProvider(this.targetId, mux, this.remoteCliBridgeEnv ?? undefined)
     registerSshPtyProvider(this.targetId, ptyProvider)
@@ -728,9 +728,9 @@ export class SshRelaySession {
     })
   }
 
-  // Why: the relay can inject ORCA_AGENT_HOOK_* env into SSH PTYs, but
+  // Why: the relay can inject BOTMUX_AGENT_HOOK_* env into SSH PTYs, but
   // hook-script agents (Claude/Codex/Gemini/etc.) still need their config
-  // files on the remote host to call OrcaBotmux's managed script. Install those
+  // files on the remote host to call Botmux's managed script. Install those
   // configs before registering the PTY provider so newly spawned agent panes
   // report status from their first prompt.
   private async installManagedHooksOnRemote(mux: SshChannelMultiplexer): Promise<void> {
@@ -784,7 +784,7 @@ export class SshRelaySession {
     }
   }
 
-  private async installRemoteOrcaCliLauncher(): Promise<void> {
+  private async installRemoteBotmuxCliLauncher(): Promise<void> {
     if (!this.remoteCliBridgeEnv) {
       return
     }
@@ -819,10 +819,10 @@ export class SshRelaySession {
     }
   }
 
-  private wireUpRemoteOrcaCli(mux: SshChannelMultiplexer): void {
-    mux.onRequest('orca_botmux.cli', async (params) => {
+  private wireUpRemoteBotmuxCli(mux: SshChannelMultiplexer): void {
+    mux.onRequest('botmux.cli', async (params) => {
       if (!this.runtime) {
-        throw new Error('OrcaBotmux runtime is unavailable')
+        throw new Error('Botmux runtime is unavailable')
       }
       const argv = Array.isArray(params.argv)
         ? params.argv.filter((item): item is string => typeof item === 'string')
@@ -839,7 +839,7 @@ export class SshRelaySession {
             )
           : {}
       const stdin = typeof params.stdin === 'string' ? params.stdin : undefined
-      return await runRemoteOrcaCli(this.runtime, {
+      return await runRemoteBotmuxCli(this.runtime, {
         argv,
         cwd,
         env,
@@ -852,7 +852,7 @@ export class SshRelaySession {
   // so it can materialize overlay dirs and inject OPENCODE_CONFIG_DIR
   // / PI_CODING_AGENT_DIR into spawn env. The strings change as we add agent
   // events (recent additions: cursor, pi); pinning them to the relay binary
-  // would force a relay redeploy on every OrcaBotmux update. See
+  // would force a relay redeploy on every Botmux update. See
   // docs/design/agent-status-over-ssh.md §4 + §8 (commit #7).
   //
   // Best-effort: a -32601 from an older relay (no handler installed) is
@@ -901,15 +901,15 @@ export class SshRelaySession {
     })
   }
 
-  // Why: route the relay's `agent.hook` JSON-RPC notification into OrcaBotmux's
+  // Why: route the relay's `agent.hook` JSON-RPC notification into Botmux's
   // shared `agentHookServer` via `ingestRemote`. The wire envelope carries
-  // `connectionId: null` (the relay does not know OrcaBotmux's local handle); we
+  // `connectionId: null` (the relay does not know Botmux's local handle); we
   // stamp the real value here from `this.targetId` so the renderer can drop
   // in-flight events for connections that have torn down. After wiring is
   // in place we kick off a request-driven replay so any cached payload from
   // before the channel was up survives the reconnect — see §5 Path 3.
   //
-  // The OrcaBotmux-side mux's `notificationHandlers` is a flat array — each
+  // The Botmux-side mux's `notificationHandlers` is a flat array — each
   // handler must filter by method name itself.
   private wireUpAgentHookEvents(mux: SshChannelMultiplexer): void {
     if (!isRemoteAgentHooksEnabled()) {
@@ -946,7 +946,7 @@ export class SshRelaySession {
       if (typeof envelope.paneKey !== 'string') {
         return
       }
-      // Why: forward env/version verbatim so OrcaBotmux's warn-once cross-build /
+      // Why: forward env/version verbatim so Botmux's warn-once cross-build /
       // dev-vs-prod diagnostics fire on remote events the same as on local
       // ones — see docs/design/agent-status-over-ssh.md §3 ("Replay /
       // version mismatch") and the relay's wire envelope at

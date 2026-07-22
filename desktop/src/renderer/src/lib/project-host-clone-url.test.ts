@@ -22,11 +22,11 @@ describe('getProjectHostCloneUrl', () => {
           providerIdentity: {
             provider: 'github',
             owner: ' stablyai ',
-            repo: ' orca_botmux '
+            repo: ' botmux '
           }
         })
       )
-    ).toBe('https://github.com/stablyai/orca_botmux.git')
+    ).toBe('https://github.com/stablyai/botmux.git')
   })
 
   it('returns null when provider identity is missing or incomplete', () => {
@@ -37,7 +37,7 @@ describe('getProjectHostCloneUrl', () => {
           providerIdentity: {
             provider: 'github',
             owner: '',
-            repo: 'orca_botmux'
+            repo: 'botmux'
           }
         })
       )

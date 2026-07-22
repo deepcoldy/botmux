@@ -38,8 +38,8 @@
       ]
     },
     {
-      "name": "orca-botmux-cli",
-      "sourcePath": "skills/orca-botmux-cli",
+      "name": "botmux-cli",
+      "sourcePath": "skills/botmux-cli",
       "releaseRevision": 32,
       "packageDigest": "51740ff13f379ac5743d3fd28a14b17168dcef40f7048c20182dce166098c45f",
       "gitTreeSha": "ded93000a5f654e2b4f324501282459bd56afe19",
@@ -56,8 +56,8 @@
       ]
     },
     {
-      "name": "orca-botmux-emulator",
-      "sourcePath": "skills/orca-botmux-emulator",
+      "name": "botmux-emulator",
+      "sourcePath": "skills/botmux-emulator",
       "releaseRevision": 4,
       "packageDigest": "453b1d9aa20b51b8a4d32c7b6def6a93f7ef9c730de32abbcbc1788ad1b1820b",
       "gitTreeSha": "66be6abe99f1807da85934aee0e22daefc8f7656",
@@ -74,8 +74,8 @@
       ]
     },
     {
-      "name": "orca-botmux-emulator-android",
-      "sourcePath": "skills/orca-botmux-emulator-android",
+      "name": "botmux-emulator-android",
+      "sourcePath": "skills/botmux-emulator-android",
       "releaseRevision": 2,
       "packageDigest": "12272cf82e0731f11e424822b961882457034e730358cc65ea28e4eb9c8ff7f5",
       "gitTreeSha": "f7b0fc8cbf5cd78ca5156f6bbe3a20f1462d8f83",
@@ -92,8 +92,8 @@
       ]
     },
     {
-      "name": "orca-botmux-linear",
-      "sourcePath": "skills/orca-botmux-linear",
+      "name": "botmux-linear",
+      "sourcePath": "skills/botmux-linear",
       "releaseRevision": 2,
       "packageDigest": "d44d09e6ecb6a64da177083aad26a95f031cd1cf26ba059fdc888c2628aef64f",
       "gitTreeSha": "c34f42030f43e5a85737996fa375bbd79cb5bea8",
@@ -110,8 +110,8 @@
       ]
     },
     {
-      "name": "orca-botmux-per-workspace-env",
-      "sourcePath": "skills/orca-botmux-per-workspace-env",
+      "name": "botmux-per-workspace-env",
+      "sourcePath": "skills/botmux-per-workspace-env",
       "releaseRevision": 2,
       "packageDigest": "fa3b65a1a107fca3f0375c696852477b62f58c154b9eb5c0663c41edc4bcd30d",
       "gitTreeSha": "354e775b79ea6952ec63acac4d3ee8a9ae07a650",

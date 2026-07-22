@@ -957,7 +957,7 @@ describe('createEditorSlice floating editor activation', () => {
 
     store.getState().openFile(
       {
-        filePath: '/tmp/orca_botmux/notes.md',
+        filePath: '/tmp/botmux/notes.md',
         relativePath: 'notes.md',
         worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
         runtimeEnvironmentId: null,
@@ -970,7 +970,7 @@ describe('createEditorSlice floating editor activation', () => {
     const tab = store.getState().unifiedTabsByWorktree[FLOATING_TERMINAL_WORKTREE_ID]?.[0]
     expect(tab).toMatchObject({
       contentType: 'editor',
-      entityId: '/tmp/orca_botmux/notes.md',
+      entityId: '/tmp/botmux/notes.md',
       label: 'notes.md',
       worktreeId: FLOATING_TERMINAL_WORKTREE_ID
     })
@@ -979,7 +979,7 @@ describe('createEditorSlice floating editor activation', () => {
       tabOrder: [tab?.id]
     })
     expect(store.getState().activeFileIdByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe(
-      '/tmp/orca_botmux/notes.md'
+      '/tmp/botmux/notes.md'
     )
   })
 
@@ -993,7 +993,7 @@ describe('createEditorSlice floating editor activation', () => {
     } as Partial<AppState>)
 
     store.getState().openFile({
-      filePath: '/tmp/orca_botmux/untitled.md',
+      filePath: '/tmp/botmux/untitled.md',
       relativePath: 'untitled.md',
       worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
       language: 'markdown',
@@ -1004,7 +1004,7 @@ describe('createEditorSlice floating editor activation', () => {
     expect(store.getState().activeFileId).toBe('/repo/main.md')
     expect(store.getState().activeTabType).toBe('editor')
     expect(store.getState().activeFileIdByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe(
-      '/tmp/orca_botmux/untitled.md'
+      '/tmp/botmux/untitled.md'
     )
     expect(store.getState().activeTabTypeByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe('editor')
   })
@@ -4192,8 +4192,8 @@ describe('createEditorSlice activateMarkdownLink', () => {
 
     store.getState().openFile(
       {
-        filePath: '/remote/.orca_botmux/drops/log.txt',
-        relativePath: '.orca_botmux/drops/log.txt',
+        filePath: '/remote/.botmux/drops/log.txt',
+        relativePath: '.botmux/drops/log.txt',
         worktreeId: 'wt-1',
         language: 'text',
         mode: 'edit'
@@ -4202,7 +4202,7 @@ describe('createEditorSlice activateMarkdownLink', () => {
     )
 
     expect(store.getState().openFiles[0]).toMatchObject({
-      filePath: '/remote/.orca_botmux/drops/log.txt'
+      filePath: '/remote/.botmux/drops/log.txt'
     })
     expect(store.getState().openFiles[0]?.runtimeEnvironmentId).toBeNull()
   })
@@ -4409,7 +4409,7 @@ describe('createEditorSlice activateMarkdownLink', () => {
     })
   })
 
-  it('opens in-worktree file links in OrcaBotmux', async () => {
+  it('opens in-worktree file links in Botmux', async () => {
     const store = createEditorStore()
     await store.getState().activateMarkdownLink('./image.png', {
       sourceFilePath: '/repo/docs/note.md',
@@ -4452,7 +4452,7 @@ describe('createEditorSlice activateMarkdownLink', () => {
     })
   })
 
-  it('opens explicit file URLs inside the worktree in OrcaBotmux', async () => {
+  it('opens explicit file URLs inside the worktree in Botmux', async () => {
     const store = createEditorStore()
     await store.getState().activateMarkdownLink('file:///repo/docs/image.png', {
       sourceFilePath: '/repo/docs/note.md',
@@ -4470,7 +4470,7 @@ describe('createEditorSlice activateMarkdownLink', () => {
     expect(openFileUriMock).not.toHaveBeenCalled()
   })
 
-  it('opens explicit file URLs outside the worktree in OrcaBotmux after authorizing them', async () => {
+  it('opens explicit file URLs outside the worktree in Botmux after authorizing them', async () => {
     const store = createEditorStore()
     await store.getState().activateMarkdownLink('file:///tmp/image.png', {
       sourceFilePath: '/repo/docs/note.md',

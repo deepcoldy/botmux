@@ -47,7 +47,7 @@ export function MobilePairingSetupSection({
         <p className="text-xs text-muted-foreground">
           {translate(
             'auto.components.settings.MobilePairingSetupSection.overview',
-            'Generate a QR code, then scan it in OrcaBotmux Mobile under Pair Desktop.'
+            'Generate a QR code, then scan it in Botmux Mobile under Pair Desktop.'
           )}
         </p>
       </div>

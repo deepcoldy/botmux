@@ -5,7 +5,9 @@ import { verdictDisplayLabel } from '../transport/connection-health'
 import { mobileConnectionPathLabel } from '../transport/mobile-connection-path-label'
 import type { MobileConnectionPath } from '../transport/stable-logical-rpc-client'
 import type { ConnectionState, HostProfile } from '../transport/types'
-import { colors, radii, spacing } from '../theme/mobile-theme'
+import { colors } from '../theme/mobile-theme'
+import { appleRadii, appleSurfaces, appleType } from '../theme/apple-tokens'
+import { rowStyleForGroupIndex } from './apple/GroupedList'
 import { StatusDot } from './StatusDot'
 
 export function MobileHostCard(props: {
@@ -14,6 +16,9 @@ export function MobileHostCard(props: {
   verdict: ConnectionVerdict
   path: MobileConnectionPath
   worktreeCounts?: { total: number; active: number }
+  /** Row position inside the grouped card (drives rounded corners). */
+  groupIndex: number
+  groupCount: number
   onPress: () => void
   onLongPress: () => void
 }) {
@@ -24,13 +29,19 @@ export function MobileHostCard(props: {
     : null
   return (
     <Pressable
-      style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
+      // Why: iOS grouped rows highlight on touch-down (no scale — that's for
+      // standalone cards/buttons).
+      style={({ pressed }) => [
+        styles.row,
+        rowStyleForGroupIndex(props.groupIndex, props.groupCount),
+        pressed && styles.rowPressed
+      ]}
       onPress={props.onPress}
       onLongPress={props.onLongPress}
       delayLongPress={400}
     >
       <View style={styles.icon}>
-        <Monitor size={20} color={connected ? colors.textPrimary : colors.textSecondary} />
+        <Monitor size={19} color={connected ? appleSurfaces.tint : colors.textSecondary} />
       </View>
       <View style={styles.main}>
         <Text
@@ -53,7 +64,7 @@ export function MobileHostCard(props: {
         ) : null}
         {props.verdict.kind === 'unreachable' && !props.host.relay ? (
           <Text style={styles.discoveryHint} numberOfLines={2}>
-            Update desktop Orca and sign in to connect from anywhere
+            Update desktop Botmux and sign in to connect from anywhere
           </Text>
         ) : null}
       </View>
@@ -62,39 +73,38 @@ export function MobileHostCard(props: {
   )
 }
 
+/** Leading inset for separators between host rows (icon edge → text edge). */
+export const HOST_ROW_SEPARATOR_INSET = 12 + 40 + 14
+
 const styles = StyleSheet.create({
-  card: {
+  row: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: spacing.md,
-    paddingVertical: 12,
-    borderRadius: radii.card,
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle
+    paddingHorizontal: 12,
+    paddingVertical: 12
   },
-  cardPressed: { backgroundColor: colors.bgRaised },
+  rowPressed: { backgroundColor: appleSurfaces.raised },
   icon: {
-    width: 46,
-    height: 46,
-    borderRadius: 13,
+    width: 40,
+    height: 40,
+    borderRadius: appleRadii.tile,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.bgRaised,
+    backgroundColor: appleSurfaces.raised,
     marginRight: 14
   },
-  main: { flex: 1, minWidth: 0, marginRight: spacing.sm },
-  name: { color: colors.textPrimary, fontSize: 15, fontWeight: '600', lineHeight: 20 },
+  main: { flex: 1, minWidth: 0, marginRight: 8 },
+  name: { ...appleType.callout, fontWeight: '600', color: colors.textPrimary, lineHeight: 20 },
   meta: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 3, minWidth: 0 },
-  metaText: { flex: 1, fontSize: 12, color: colors.textSecondary },
+  metaText: { flex: 1, ...appleType.footnote, color: colors.textSecondary },
   worktreeMetaText: {
     marginTop: 2,
-    marginLeft: spacing.xl,
-    fontSize: 12,
+    marginLeft: 24,
+    ...appleType.footnote,
     color: colors.textMuted
   },
   discoveryHint: {
-    marginTop: spacing.xs,
+    marginTop: 4,
     fontSize: 11,
     lineHeight: 15,
     color: colors.textMuted

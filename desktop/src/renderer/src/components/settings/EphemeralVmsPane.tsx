@@ -10,7 +10,7 @@ import { EphemeralVmRecipeRow } from './EphemeralVmRecipeRow'
 import { translate } from '@/i18n/i18n'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  ensureOrcaCliAvailableForAgentSkillTerminal
+  ensureBotmuxCliAvailableForAgentSkillTerminal
 } from '@/lib/agent-skill-cli-prerequisite'
 import {
   EPHEMERAL_VMS_SKILL_INSTALL_COMMAND,
@@ -35,7 +35,7 @@ type RecipeCatalogEntry = Awaited<
 // Why: the pane leans on the skill, so the nudge is one line — the skill carries
 // provider choice, prerequisites, the snapshot build, agent auth, and validation.
 const AGENT_PROMPT =
-  'Use the orca-botmux-per-workspace-env skill to set up a per-workspace environment for this repo.'
+  'Use the botmux-per-workspace-env skill to set up a per-workspace environment for this repo.'
 
 export function EphemeralVmsPane(): React.JSX.Element {
   const openModal = useAppStore((state) => state.openModal)
@@ -160,7 +160,7 @@ export function EphemeralVmsPane(): React.JSX.Element {
         onBeforeOpenTerminal={async () => {
           await (activeSkillRuntime.agentRuntime?.runtime === 'wsl'
             ? ensureWslCliAvailableForAgentSkillTerminal(activeSkillRuntime.agentRuntime)
-            : ensureOrcaCliAvailableForAgentSkillTerminal())
+            : ensureBotmuxCliAvailableForAgentSkillTerminal())
         }}
         onRecheck={refreshSkill}
         freshnessSkillName={
@@ -179,7 +179,7 @@ export function EphemeralVmsPane(): React.JSX.Element {
           <WhatItem
             text={translate(
               'auto.components.settings.EphemeralVmsPane.whatScaffold',
-              'Writes the recipe & scripts for your provider — connected over an OrcaBotmux server or SSH.'
+              'Writes the recipe & scripts for your provider — connected over an Botmux server or SSH.'
             )}
           />
           <WhatItem
@@ -236,7 +236,7 @@ export function EphemeralVmsPane(): React.JSX.Element {
             <p className="text-xs text-muted-foreground">
               {translate(
                 'auto.components.settings.EphemeralVmsPane.recipesHelp',
-                'Recipes your agent adds to orca_botmux.yaml show up here, ready to launch a workspace on.'
+                'Recipes your agent adds to botmux.yaml show up here, ready to launch a workspace on.'
               )}
             </p>
           </div>

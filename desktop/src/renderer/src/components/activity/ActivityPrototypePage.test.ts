@@ -299,7 +299,7 @@ describe('buildActivityEvents', () => {
       entries: {
         [PANE_KEY]: {
           ...makeWorkingEntryWithoutHistory(),
-          prompt: 'You are working inside OrcaBotmux, a multi-agent IDE.',
+          prompt: 'You are working inside Botmux, a multi-agent IDE.',
           orchestration: {
             taskId: 'task-1',
             dispatchId: 'ctx-1',

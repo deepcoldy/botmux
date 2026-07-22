@@ -9,7 +9,7 @@ export async function resolveWorktreeAddBaseRef(
   }
 
   // Why: `git worktree add` receives a revision, so short names can collide
-  // with tags. Prefer the namespace implied by OrcaBotmux's base picker: remote
+  // with tags. Prefer the namespace implied by Botmux's base picker: remote
   // display names like `origin/main` first, otherwise local branches.
   const candidates = baseRef.includes('/')
     ? [`refs/remotes/${baseRef}`, `refs/heads/${baseRef}`]

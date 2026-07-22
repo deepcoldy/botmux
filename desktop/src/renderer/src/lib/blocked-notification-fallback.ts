@@ -18,12 +18,12 @@ export function showBlockedNotificationFallbackToast(): void {
   toast.warning(
     translate(
       'auto.lib.blocked.notification.fallback.de50bef680',
-      'macOS is blocking OrcaBotmux notifications'
+      'macOS is blocking Botmux notifications'
     ),
     {
       description: translate(
         'auto.components.onboarding.mac.notification.permission.card.721d2bedb6',
-        'Turn on Allow notifications for OrcaBotmux in System Settings.'
+        'Turn on Allow notifications for Botmux in System Settings.'
       ),
       action: {
         label: translate(

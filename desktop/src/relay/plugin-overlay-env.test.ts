@@ -71,7 +71,7 @@ describe('plugin overlay env source resolution', () => {
       resolveOpenCodeSourceConfigDir(
         {
           HOME: homeDir,
-          ORCA_OPENCODE_SOURCE_CONFIG_DIR: '/remote/original-opencode',
+          BOTMUX_OPENCODE_SOURCE_CONFIG_DIR: '/remote/original-opencode',
           OPENCODE_CONFIG_DIR: '/tmp/inherited-opencode-overlay'
         },
         '/bin/zsh'

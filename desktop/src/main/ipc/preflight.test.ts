@@ -518,13 +518,13 @@ describe('preflight', () => {
     await expect(detectInstalledAgents()).resolves.toEqual(['claude', 'cursor'])
   })
 
-  it('does not report Claude Agent Teams when only the OrcaBotmux shim is present', async () => {
+  it('does not report Claude Agent Teams when only the Botmux shim is present', async () => {
     execFileAsyncMock.mockImplementation(async (command, args) => {
       if (command !== 'which') {
         throw new Error(`unexpected command ${String(command)}`)
       }
-      if (String(args[0]) === 'orca_botmux') {
-        return { stdout: '/Applications/OrcaBotmux.app/Contents/MacOS/orca_botmux\n' }
+      if (String(args[0]) === 'botmux') {
+        return { stdout: '/Applications/Botmux.app/Contents/MacOS/botmux\n' }
       }
       throw new Error('not found')
     })
@@ -532,7 +532,7 @@ describe('preflight', () => {
     await expect(detectInstalledAgents()).resolves.toEqual([])
   })
 
-  it('reports Claude Agent Teams when both OrcaBotmux and Claude are present', async () => {
+  it('reports Claude Agent Teams when both Botmux and Claude are present', async () => {
     execFileAsyncMock.mockImplementation(async (command, args) => {
       if (command !== 'which') {
         throw new Error(`unexpected command ${String(command)}`)
@@ -540,8 +540,8 @@ describe('preflight', () => {
       if (String(args[0]) === 'claude') {
         return { stdout: '/Users/test/.local/bin/claude\n' }
       }
-      if (String(args[0]) === 'orca_botmux') {
-        return { stdout: '/Applications/OrcaBotmux.app/Contents/MacOS/orca_botmux\n' }
+      if (String(args[0]) === 'botmux') {
+        return { stdout: '/Applications/Botmux.app/Contents/MacOS/botmux\n' }
       }
       throw new Error('not found')
     })
@@ -561,8 +561,8 @@ describe('preflight', () => {
       if (String(args[0]) === 'claude') {
         return { stdout: '/mock/windows/npm/claude.cmd\n' }
       }
-      if (String(args[0]) === 'orca_botmux') {
-        return { stdout: '/mock/windows/programs/orca_botmux.cmd\n' }
+      if (String(args[0]) === 'botmux') {
+        return { stdout: '/mock/windows/programs/botmux.cmd\n' }
       }
       throw new Error('not found')
     })
@@ -701,7 +701,7 @@ describe('preflight', () => {
       }
       const script = String(args[5])
       if (script.includes("'claude'")) {
-        return { stdout: '__ORCA_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
+        return { stdout: '__BOTMUX_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
       }
       throw new Error('not found')
     })
@@ -722,11 +722,11 @@ describe('preflight', () => {
         throw new Error(`unexpected command ${String(command)}`)
       }
       const script = String(args[5])
-      expect(script).not.toContain("'orca_botmux'")
-      expect(script).not.toContain("'orca-botmux-desktop-dev'")
-      expect(script).not.toContain("'orca-botmux-ide'")
+      expect(script).not.toContain("'botmux'")
+      expect(script).not.toContain("'botmux-desktop-dev'")
+      expect(script).not.toContain("'botmux-ide'")
       if (script.includes("'claude'")) {
-        return { stdout: '__ORCA_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
+        return { stdout: '__BOTMUX_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
       }
       throw new Error('not found')
     })
@@ -848,7 +848,7 @@ describe('preflight', () => {
       }
       const script = String(args[5])
       if (script.includes("'claude'")) {
-        return { stdout: '__ORCA_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
+        return { stdout: '__BOTMUX_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
       }
       throw new Error('not found')
     })
@@ -882,7 +882,7 @@ describe('preflight', () => {
       }
       const script = String(args[3])
       if (script.includes("'codex'")) {
-        return { stdout: '__ORCA_AGENT_PATH__codex\t/home/test/.local/bin/codex\n' }
+        return { stdout: '__BOTMUX_AGENT_PATH__codex\t/home/test/.local/bin/codex\n' }
       }
       throw new Error('not found')
     })
@@ -940,7 +940,7 @@ describe('preflight', () => {
       }
       const script = String(args[5])
       if (script.includes("'claude'")) {
-        return { stdout: '__ORCA_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
+        return { stdout: '__BOTMUX_AGENT_PATH__claude\t/home/test/.local/bin/claude\n' }
       }
       throw new Error('not found')
     })

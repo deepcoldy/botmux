@@ -2,19 +2,19 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { loadWorktreesUntilPathsPresent } from './helpers/worktree-registration'
 
 test.describe('Workspace Space git status checks', () => {
   test('checks every scanned deletable row, including rows after the first 50', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    // Why: on symlinked tmpdirs (/var→/private/var on macOS, /tmp→… on CI) OrcaBotmux
+    // Why: on symlinked tmpdirs (/var→/private/var on macOS, /tmp→… on CI) Botmux
     // registers worktrees under their realpath, so the parent must be canonical
     // before `git worktree add` or the recorded paths won't match and rows drop.
     const worktreeParent = realpathSync(
-      mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-space-git-status-'))
+      mkdtempSync(path.join(os.tmpdir(), 'botmux-space-git-status-'))
     )
     const worktreePaths = Array.from({ length: 60 }, (_, index) =>
       path.join(worktreeParent, `worktree-${index}`)
@@ -31,7 +31,7 @@ test.describe('Workspace Space git status checks', () => {
         realpathSync(worktreePath)
       )
 
-      const repoId = await orcaBotmuxPage.evaluate((testRepoPath) => {
+      const repoId = await botmuxPage.evaluate((testRepoPath) => {
         const store = window.__store
         if (!store) {
           throw new Error('Expected e2e store to be exposed')
@@ -45,9 +45,9 @@ test.describe('Workspace Space git status checks', () => {
 
       // Why: the 60 worktrees were added via raw git, so poll past the 5s scan
       // cache TTL until every path registers before deriving the space rows.
-      await loadWorktreesUntilPathsPresent(orcaBotmuxPage, repoId, registeredWorktreePaths)
+      await loadWorktreesUntilPathsPresent(botmuxPage, repoId, registeredWorktreePaths)
 
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.evaluate(
         async ({ testRepoPath, worktreePaths }) => {
           const store = window.__store
           if (!store) {
@@ -136,7 +136,7 @@ test.describe('Workspace Space git status checks', () => {
       await expect
         .poll(
           () =>
-            orcaBotmuxPage.evaluate(() => {
+            botmuxPage.evaluate(() => {
               const state = window.__store?.getState()
               if (!state?.workspaceSpaceAnalysis) {
                 return 60
@@ -149,7 +149,7 @@ test.describe('Workspace Space git status checks', () => {
         )
         .toBe(0)
 
-      await expect(orcaBotmuxPage.getByText('Keep: git not checked')).toHaveCount(0)
+      await expect(botmuxPage.getByText('Keep: git not checked')).toHaveCount(0)
     } finally {
       for (const worktreePath of worktreePaths) {
         try {

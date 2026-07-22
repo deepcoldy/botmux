@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   focusActiveTerminalInput,
@@ -23,7 +23,7 @@ function keyboardPasteChord(): string {
 }
 
 function largePastePayload(runId: string): string {
-  return `ORCA_LARGE_PASTE_${runId}_0123456789abcdef`.repeat(4096)
+  return `BOTMUX_LARGE_PASTE_${runId}_0123456789abcdef`.repeat(4096)
 }
 
 function sha256(text: string): string {
@@ -97,37 +97,37 @@ async function stopRendererHeartbeat(page: Page): Promise<void> {
 test.describe('large terminal paste responsiveness', () => {
   test('chunked keyboard paste keeps the renderer responsive while PTY writes are pending', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
     const payload = largePastePayload(runId)
     const expectedBytes = Buffer.byteLength(payload, 'utf8')
     const expectedHash = sha256(payload)
     const doneLine = `LARGE_PASTE_DONE_${runId}:${expectedBytes}:${expectedHash}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-large-paste-${runId}.cjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-large-paste-${runId}.cjs`)
     writeFileSync(scriptPath, pasteReceiverScript(runId, expectedBytes, expectedHash))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `LARGE_PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `LARGE_PASTE_READY_${runId}`, 10_000)
 
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
       await clearTerminalPtyWriteLog(electronApp)
       await setTerminalPtyWriteDelay(electronApp, 35)
-      await installRendererHeartbeat(orcaBotmuxPage)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await installRendererHeartbeat(botmuxPage)
+      await focusActiveTerminalInput(botmuxPage)
 
-      const pasteKey = orcaBotmuxPage.keyboard.press(keyboardPasteChord())
+      const pasteKey = botmuxPage.keyboard.press(keyboardPasteChord())
       await expect
         .poll(
           async () =>
@@ -140,13 +140,13 @@ test.describe('large terminal paste responsiveness', () => {
         )
         .toBeGreaterThan(1)
 
-      const heartbeatBefore = await readRendererHeartbeat(orcaBotmuxPage)
-      await orcaBotmuxPage.waitForTimeout(150)
-      const heartbeatAfter = await readRendererHeartbeat(orcaBotmuxPage)
+      const heartbeatBefore = await readRendererHeartbeat(botmuxPage)
+      await botmuxPage.waitForTimeout(150)
+      const heartbeatAfter = await readRendererHeartbeat(botmuxPage)
       expect(heartbeatAfter).toBeGreaterThan(heartbeatBefore)
 
       await pasteKey
-      await waitForTerminalOutput(orcaBotmuxPage, doneLine, 20_000, 12_000)
+      await waitForTerminalOutput(botmuxPage, doneLine, 20_000, 12_000)
 
       const writes = (await readTerminalPtyWriteEntries(electronApp)).filter(
         (entry) => entry.id === ptyId
@@ -154,9 +154,9 @@ test.describe('large terminal paste responsiveness', () => {
       expect(writes.length).toBeGreaterThan(1)
     } finally {
       await setTerminalPtyWriteDelay(electronApp, 0).catch(() => undefined)
-      await stopRendererHeartbeat(orcaBotmuxPage).catch(() => undefined)
+      await stopRendererHeartbeat(botmuxPage).catch(() => undefined)
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }

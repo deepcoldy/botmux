@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   sendToTerminal,
@@ -38,7 +38,7 @@ type CursorBlinkSample = {
   paintedCursorCellCount: number
 }
 
-const EMOJI_TABLE_MARKER = 'ORCA_EMOJI_TABLE_RENDER_DONE'
+const EMOJI_TABLE_MARKER = 'BOTMUX_EMOJI_TABLE_RENDER_DONE'
 
 function emojiTableScript(marker: string): string {
   const table = [
@@ -255,30 +255,30 @@ async function enableRiskyTerminalRendererPath(page: Page): Promise<void> {
 
 test.describe('OpenCode emoji table terminal rendering', () => {
   test('keeps emoji table output visually sane and restores the cursor', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await enableRiskyTerminalRendererPath(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await enableRiskyTerminalRendererPath(botmuxPage)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 20_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 20_000)
     const runId = randomUUID()
     const marker = `${EMOJI_TABLE_MARKER}_${runId}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-opencode-emoji-table-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-opencode-emoji-table-${runId}.mjs`)
     writeFileSync(scriptPath, emojiTableScript(marker))
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, marker, 10_000)
-      await orcaBotmuxPage.waitForTimeout(250)
-      await forceCursorProbeTheme(orcaBotmuxPage)
-      await orcaBotmuxPage.waitForTimeout(50)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await waitForTerminalOutput(botmuxPage, marker, 10_000)
+      await botmuxPage.waitForTimeout(250)
+      await forceCursorProbeTheme(botmuxPage)
+      await botmuxPage.waitForTimeout(50)
 
-      const renderState = await readActiveTerminalRenderState(orcaBotmuxPage)
-      const blinkSamples = await sampleCursorBlink(orcaBotmuxPage)
+      const renderState = await readActiveTerminalRenderState(botmuxPage)
+      const blinkSamples = await sampleCursorBlink(botmuxPage)
 
       testInfo.annotations.push({
         type: 'opencode-emoji-table-rendering',
@@ -301,37 +301,37 @@ test.describe('OpenCode emoji table terminal rendering', () => {
   })
 
   test('local real OpenCode demo keeps table rendering and cursor visible', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.skip(
-      process.env.ORCA_E2E_REAL_OPENCODE !== '1',
-      'Set ORCA_E2E_REAL_OPENCODE=1 to exercise the locally installed OpenCode TUI'
+      process.env.BOTMUX_E2E_REAL_OPENCODE !== '1',
+      'Set BOTMUX_E2E_REAL_OPENCODE=1 to exercise the locally installed OpenCode TUI'
     )
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await enableRiskyTerminalRendererPath(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await enableRiskyTerminalRendererPath(botmuxPage)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     await sendToTerminal(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       'opencode run --demo --interactive "Give me markdown table dummy data a long table with emojis in it"\r'
     )
     try {
-      await waitForTerminalOutput(orcaBotmuxPage, 'Give me markdown table', 15_000)
-      await waitForTerminalOutput(orcaBotmuxPage, 'Emoji', 60_000)
-      await waitForTerminalOutput(orcaBotmuxPage, 'Alice', 60_000)
-      await orcaBotmuxPage.waitForTimeout(1_500)
+      await waitForTerminalOutput(botmuxPage, 'Give me markdown table', 15_000)
+      await waitForTerminalOutput(botmuxPage, 'Emoji', 60_000)
+      await waitForTerminalOutput(botmuxPage, 'Alice', 60_000)
+      await botmuxPage.waitForTimeout(1_500)
 
       await testInfo.attach('real-opencode-demo-table', {
-        body: await orcaBotmuxPage.screenshot({ fullPage: true }),
+        body: await botmuxPage.screenshot({ fullPage: true }),
         contentType: 'image/png'
       })
 
-      const renderState = await readActiveTerminalRenderState(orcaBotmuxPage)
+      const renderState = await readActiveTerminalRenderState(botmuxPage)
       testInfo.annotations.push({
         type: 'real-opencode-demo-rendering',
         description: JSON.stringify(renderState)
@@ -339,7 +339,7 @@ test.describe('OpenCode emoji table terminal rendering', () => {
       expect(renderState.coreCursorHidden).toBe(false)
       expect(renderState.cursorVisibleElementCount).toBeGreaterThan(0)
     } finally {
-      await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+      await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
     }
   })
 })

@@ -3,13 +3,13 @@ import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { OnboardingInlineCommandTerminal } from '@/components/onboarding/OnboardingInlineCommandTerminal'
-import { ORCA_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND } from '@/lib/agent-feature-install-commands'
+import { BOTMUX_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND } from '@/lib/agent-feature-install-commands'
 import { translate } from '@/i18n/i18n'
 
 export function CliSkillSetupTerminal(): React.JSX.Element {
   const handleCopySkillCommand = async (): Promise<void> => {
     try {
-      await window.api.ui.writeClipboardText(ORCA_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND)
+      await window.api.ui.writeClipboardText(BOTMUX_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND)
       toast.success(
         translate(
           'auto.components.feature.tips.CliSkillSetupTerminal.b8ad063571',
@@ -32,7 +32,7 @@ export function CliSkillSetupTerminal(): React.JSX.Element {
     <div className="min-w-0">
       <div className="flex min-w-0 items-center gap-2 rounded-md border border-border bg-muted/35 px-3 py-2">
         <code className="scrollbar-sleek min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-mono text-xs text-muted-foreground">
-          {ORCA_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND}
+          {BOTMUX_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND}
         </code>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -58,18 +58,18 @@ export function CliSkillSetupTerminal(): React.JSX.Element {
         </Tooltip>
       </div>
       <OnboardingInlineCommandTerminal
-        command={ORCA_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND}
+        command={BOTMUX_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND}
         title={translate(
           'auto.components.feature.tips.CliSkillSetupTerminal.84e9576dac',
           'Skill setup'
         )}
         ariaLabel={translate(
           'auto.components.feature.tips.CliSkillSetupTerminal.43b60ec5c3',
-          'OrcaBotmux CLI and orchestration skill install terminal'
+          'Botmux CLI and orchestration skill install terminal'
         )}
         description={translate(
           'auto.components.feature.tips.CliSkillSetupTerminal.1953e90447',
-          'Press Enter to install the OrcaBotmux CLI orchestration skill for your agents.'
+          'Press Enter to install the Botmux CLI orchestration skill for your agents.'
         )}
         terminalHeightPx={280}
         terminalTopMarginPx={8}

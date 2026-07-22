@@ -12,7 +12,7 @@ describe('WSL CLI registration registry', () => {
   let userDataPath: string
 
   beforeEach(async () => {
-    userDataPath = await mkdtemp(join(tmpdir(), 'orca-botmux-wsl-cli-registry-'))
+    userDataPath = await mkdtemp(join(tmpdir(), 'botmux-wsl-cli-registry-'))
   })
 
   afterEach(async () => {
@@ -46,7 +46,7 @@ describe('WSL CLI registration registry', () => {
   })
 
   it('skips a registered distro already reconciled by this build against this launcher', async () => {
-    const reconciled = { target: 'C:\\OrcaBotmux\\resources\\bin\\orca_botmux.exe', appVersion: '1.4.138' }
+    const reconciled = { target: 'C:\\Botmux\\resources\\bin\\botmux.exe', appVersion: '1.4.138' }
     await recordWslCliRegistrationObservations(userDataPath, [
       { distro: 'Ubuntu', inspected: true, managed: true, reconciled }
     ])
@@ -60,7 +60,7 @@ describe('WSL CLI registration registry', () => {
     // A launcher move or app update re-probes the registered distro.
     await expect(
       getWslCliRegistrationCandidates(userDataPath, ['Ubuntu'], {
-        currentTarget: 'D:\\Elsewhere\\orca_botmux.exe',
+        currentTarget: 'D:\\Elsewhere\\botmux.exe',
         appVersion: reconciled.appVersion
       })
     ).resolves.toEqual(['Ubuntu'])

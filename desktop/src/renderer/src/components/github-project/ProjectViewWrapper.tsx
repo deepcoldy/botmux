@@ -68,7 +68,7 @@ type Props = {
   selectedRepoIds: ReadonlySet<string>
 }
 
-const ORCA_FEATURE_REQUEST_URL = 'https://github.com/stablyai/orca_botmux/issues/new'
+const BOTMUX_FEATURE_REQUEST_URL = 'https://github.com/stablyai/botmux/issues/new'
 
 function listProjectViewsForRuntime(
   settings: Parameters<typeof getActiveRuntimeTarget>[0],
@@ -395,8 +395,8 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
   // ── Row action state ────────────────────────────────────────────────
   // Why: when a row matches a registered repo, we open the full
   // `GitHubItemDialog` in repo-backed mode; when it doesn't, we open the
-  // simplified slug-mode dialog. `repoNotInOrca` drives the fallback modal
-  // from the design doc's `repo-not-in-orca_botmux` interaction state.
+  // simplified slug-mode dialog. `repoNotInBotmux` drives the fallback modal
+  // from the design doc's `repo-not-in-botmux` interaction state.
   const [dialogRepoItem, setDialogRepoItem] = useState<{
     workItem: GitHubWorkItem
     repoPath: string
@@ -404,13 +404,13 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
     origin: GitHubItemDialogProjectOrigin
   } | null>(null)
   // Why: the slug dialog is only opened for rows whose repo isn't registered
-  // in OrcaBotmux (matched repos go through the full GitHubItemDialog above), so
-  // there's no `matchedRepo` to track here. The repo-not-in-orca_botmux modal —
+  // in Botmux (matched repos go through the full GitHubItemDialog above), so
+  // there's no `matchedRepo` to track here. The repo-not-in-botmux modal —
   // owned by this parent, not the slug dialog — handles "Start work".
   const [slugDialog, setSlugDialog] = useState<{
     origin: GitHubItemDialogProjectOrigin
   } | null>(null)
-  const [repoNotInOrca, setRepoNotInOrca] = useState<{
+  const [repoNotInBotmux, setRepoNotInBotmux] = useState<{
     owner: string
     repo: string
     url: string | null
@@ -424,7 +424,7 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
   )
   if (resolvedDialogRepoItem !== dialogRepoItem) {
     // Why: repo-backed Project dialogs cannot edit after their repo leaves
-    // OrcaBotmux; clear them before the modal tree receives stale repo ids.
+    // Botmux; clear them before the modal tree receives stale repo ids.
     setDialogRepoItem(resolvedDialogRepoItem)
   }
   const resolvedDialogRepo = resolvedDialogRepoItem
@@ -441,7 +441,7 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
   const resolvedMissingRepoDialogs = resolveMissingRepoProjectDialogState({
     slugIndexReady,
     slugDialog,
-    repoNotInOrca,
+    repoNotInBotmux,
     lookupSlug,
     selectedRepoIds
   })
@@ -450,8 +450,8 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
     // use the full repo-backed dialog instead of the slug fallback.
     setSlugDialog(resolvedMissingRepoDialogs.slugDialog)
   }
-  if (resolvedMissingRepoDialogs.repoNotInOrca !== repoNotInOrca) {
-    setRepoNotInOrca(resolvedMissingRepoDialogs.repoNotInOrca)
+  if (resolvedMissingRepoDialogs.repoNotInBotmux !== repoNotInBotmux) {
+    setRepoNotInBotmux(resolvedMissingRepoDialogs.repoNotInBotmux)
   }
 
   const buildWorkItem = useCallback(
@@ -625,7 +625,7 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
         return
       }
       if (resolution.status === 'no_global_match') {
-        setRepoNotInOrca({
+        setRepoNotInBotmux({
           owner: origin.owner,
           repo: origin.repo,
           url: row.content.url ?? null
@@ -977,9 +977,9 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
         />
       ) : null}
 
-      {/* Slug-only simplified dialog for rows whose repo isn't added to OrcaBotmux.
+      {/* Slug-only simplified dialog for rows whose repo isn't added to Botmux.
           Why: no Start-work affordance lives inside the slug dialog — the
-          parent's `handleStartWork`/`repoNotInOrca` modal owns that flow, so
+          parent's `handleStartWork`/`repoNotInBotmux` modal owns that flow, so
           having a duplicate (always-disabled or always-routing-to-fallback)
           button here would only confuse the user. */}
       <ProjectItemSlugDialog
@@ -988,44 +988,44 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
         onClose={() => setSlugDialog(null)}
       />
 
-      {/* repo-not-in-orca_botmux prompt: see design doc Interaction States. */}
+      {/* repo-not-in-botmux prompt: see design doc Interaction States. */}
       <Dialog
-        open={resolvedMissingRepoDialogs.repoNotInOrca !== null}
-        onOpenChange={(open) => !open && setRepoNotInOrca(null)}
+        open={resolvedMissingRepoDialogs.repoNotInBotmux !== null}
+        onOpenChange={(open) => !open && setRepoNotInBotmux(null)}
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
               {translate(
                 'auto.components.github.project.ProjectViewWrapper.7037c8f5f1',
-                'Repository not in OrcaBotmux'
+                'Repository not in Botmux'
               )}
             </DialogTitle>
             <DialogDescription>
-              {resolvedMissingRepoDialogs.repoNotInOrca
+              {resolvedMissingRepoDialogs.repoNotInBotmux
                 ? translate(
                     'auto.components.github.project.ProjectViewWrapper.1850fceac8',
-                    "{{value0}}/{{value1}} isn't added to OrcaBotmux. Add it to start work, or open in GitHub.",
+                    "{{value0}}/{{value1}} isn't added to Botmux. Add it to start work, or open in GitHub.",
                     {
-                      value0: resolvedMissingRepoDialogs.repoNotInOrca.owner,
-                      value1: resolvedMissingRepoDialogs.repoNotInOrca.repo
+                      value0: resolvedMissingRepoDialogs.repoNotInBotmux.owner,
+                      value1: resolvedMissingRepoDialogs.repoNotInBotmux.repo
                     }
                   )
                 : null}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="gap-2 sm:justify-end">
-            <Button variant="ghost" onClick={() => setRepoNotInOrca(null)}>
+            <Button variant="ghost" onClick={() => setRepoNotInBotmux(null)}>
               {translate('auto.components.github.project.ProjectViewWrapper.dffa899f36', 'Cancel')}
             </Button>
-            {resolvedMissingRepoDialogs.repoNotInOrca?.url ? (
+            {resolvedMissingRepoDialogs.repoNotInBotmux?.url ? (
               <Button
                 variant="outline"
                 onClick={() => {
-                  if (resolvedMissingRepoDialogs.repoNotInOrca?.url) {
-                    void window.api.shell.openUrl(resolvedMissingRepoDialogs.repoNotInOrca.url)
+                  if (resolvedMissingRepoDialogs.repoNotInBotmux?.url) {
+                    void window.api.shell.openUrl(resolvedMissingRepoDialogs.repoNotInBotmux.url)
                   }
-                  setRepoNotInOrca(null)
+                  setRepoNotInBotmux(null)
                 }}
               >
                 {translate(
@@ -1041,7 +1041,7 @@ export default function ProjectViewWrapper({ selectedRepoIds }: Props): React.JS
                 // from a row click is out of v1 scope (design doc §Row
                 // actions). Close the modal regardless so the user isn't
                 // trapped if they cancel the picker.
-                setRepoNotInOrca(null)
+                setRepoNotInBotmux(null)
                 await addRepoFromStore()
               }}
             >
@@ -1227,8 +1227,8 @@ function ViewTabStrip({
                 ? v.name
                 : translate(
                     'auto.components.github.project.ProjectViewWrapper.2edf5e7e77',
-                    "{{value0}} — OrcaBotmux doesn't support {{value1}} project views yet. File a feature request at {{value2}}.",
-                    { value0: v.name, value1: layoutLabel, value2: ORCA_FEATURE_REQUEST_URL }
+                    "{{value0}} — Botmux doesn't support {{value1}} project views yet. File a feature request at {{value2}}.",
+                    { value0: v.name, value1: layoutLabel, value2: BOTMUX_FEATURE_REQUEST_URL }
                   )
             }
             className={cn(
@@ -1247,7 +1247,7 @@ function ViewTabStrip({
         if (supported) {
           return tab
         }
-        const unsupportedMessage = `OrcaBotmux doesn't support ${layoutLabel} project views yet.`
+        const unsupportedMessage = `Botmux doesn't support ${layoutLabel} project views yet.`
         return (
           <HoverCard key={v.id} openDelay={200} closeDelay={100}>
             <HoverCardTrigger asChild>
@@ -1256,7 +1256,7 @@ function ViewTabStrip({
                 aria-label={translate(
                   'auto.components.github.project.ProjectViewWrapper.55de4fb57a',
                   '{{value0}}. {{value1}} File a feature request at {{value2}}.',
-                  { value0: v.name, value1: unsupportedMessage, value2: ORCA_FEATURE_REQUEST_URL }
+                  { value0: v.name, value1: unsupportedMessage, value2: BOTMUX_FEATURE_REQUEST_URL }
                 )}
                 className="inline-flex shrink-0 cursor-not-allowed rounded-t-md outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
               >
@@ -1269,14 +1269,14 @@ function ViewTabStrip({
                   {unsupportedMessage}{' '}
                   {translate(
                     'auto.components.github.project.ProjectViewWrapper.1bf8c01c8b',
-                    'Switch to a Table view to work with this project in OrcaBotmux.'
+                    'Switch to a Table view to work with this project in Botmux.'
                   )}
                 </p>
                 <Button
                   type="button"
                   size="xs"
                   variant="outline"
-                  onClick={() => void window.api.shell.openUrl(ORCA_FEATURE_REQUEST_URL)}
+                  onClick={() => void window.api.shell.openUrl(BOTMUX_FEATURE_REQUEST_URL)}
                 >
                   {translate(
                     'auto.components.github.project.ProjectViewWrapper.4d2a77a119',
@@ -1323,9 +1323,9 @@ function ErrorState({
   }
   const copy =
     error.type === 'too_large'
-      ? `This view has ${totalCount ?? 'many'} items — too large to render in OrcaBotmux. Narrow the view's filter on GitHub.`
+      ? `This view has ${totalCount ?? 'many'} items — too large to render in Botmux. Narrow the view's filter on GitHub.`
       : error.type === 'unsupported_layout'
-        ? 'OrcaBotmux only renders table views yet. This is a Board or Roadmap view.'
+        ? 'Botmux only renders table views yet. This is a Board or Roadmap view.'
         : error.type === 'not_found'
           ? 'Could not find this project or view.'
           : error.type === 'schema_drift'

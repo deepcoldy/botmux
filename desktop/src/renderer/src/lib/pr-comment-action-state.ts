@@ -4,7 +4,7 @@ import { getPRCommentGroupId, getPRCommentGroupRoot } from './pr-comment-groups'
 /** How a comment group should read in the PR sidebar triage UI. */
 export type PRCommentGroupActionState = 'open' | 'conversation' | 'resolved'
 
-/** Whether OrcaBotmux knows this thread is still open on the host. */
+/** Whether Botmux knows this thread is still open on the host. */
 export function getPRCommentGroupActionState(group: PRCommentGroup): PRCommentGroupActionState {
   const root = getPRCommentGroupRoot(group)
   if (root.isResolved === true) {

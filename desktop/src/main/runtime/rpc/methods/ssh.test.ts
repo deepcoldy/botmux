@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import { SSH_METHODS } from './ssh'
 
 const {
@@ -36,7 +36,7 @@ describe('ssh RPC methods', () => {
       reconnectAttempt: 0
     }
     getRegisteredSshStateMock.mockReturnValueOnce(state)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: SSH_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('ssh.getState', { targetId: 'ssh-1' }))
@@ -53,7 +53,7 @@ describe('ssh RPC methods', () => {
       reconnectAttempt: 0
     }
     connectRegisteredSshTargetMock.mockResolvedValueOnce(state)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: SSH_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('ssh.connect', { targetId: 'ssh-1' }))
@@ -64,7 +64,7 @@ describe('ssh RPC methods', () => {
 
   it('returns null when the target has no registered state yet', async () => {
     getRegisteredSshStateMock.mockReturnValueOnce(undefined)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: SSH_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('ssh.getState', { targetId: 'ssh-1' }))
@@ -75,7 +75,7 @@ describe('ssh RPC methods', () => {
   it('lists the registered SSH targets for paired clients', async () => {
     const targets = [{ id: 'ssh-1', label: 'Dev box', host: 'dev', port: 22, username: 'me' }]
     listRegisteredSshTargetsMock.mockReturnValueOnce(targets)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: SSH_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('ssh.listTargets'))
@@ -86,7 +86,7 @@ describe('ssh RPC methods', () => {
   it('lists removed-target labels for ghost-host display on paired clients', async () => {
     const labels = { 'ssh-old': 'Dev box' }
     listRegisteredRemovedSshTargetLabelsMock.mockReturnValueOnce(labels)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: SSH_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('ssh.listRemovedTargetLabels'))

@@ -54,7 +54,7 @@ const runtimeEnvironmentSubscribe = vi.fn()
 const runtimeCall = vi.fn()
 
 beforeEach(() => {
-  delete (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
+  delete (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__
   clearRuntimeCompatibilityCacheForTests()
   fsReadFile.mockReset()
   fsOnChanged.mockReset()
@@ -730,7 +730,7 @@ describe('runtime file client', () => {
         '/remote/repo/archive.zip',
         'archive.zip'
       )
-    ).rejects.toThrow('Remote file download requires a newer OrcaBotmux server')
+    ).rejects.toThrow('Remote file download requires a newer Botmux server')
 
     expect(fsStartDownloadedFile).not.toHaveBeenCalled()
     expect(fsSaveDownloadedFile).not.toHaveBeenCalled()
@@ -1067,7 +1067,7 @@ describe('runtime file client', () => {
       params: { relativePath: string }
     }
     expect(smallWriteCall.params.relativePath).toMatch(
-      /^uploads\/assets\/\.logo\.png\.orca-botmux-upload-/
+      /^uploads\/assets\/\.logo\.png\.botmux-upload-/
     )
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(5, {
       selector: 'env-1',
@@ -1187,7 +1187,7 @@ describe('runtime file client', () => {
     const chunkWriteCall = runtimeEnvironmentCall.mock.calls[3]?.[0] as {
       params: { relativePath: string }
     }
-    expect(chunkWriteCall.params.relativePath).toMatch(/^uploads\/\.large\.bin\.orca-botmux-upload-/)
+    expect(chunkWriteCall.params.relativePath).toMatch(/^uploads\/\.large\.bin\.botmux-upload-/)
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(4, {
       selector: 'env-1',
       method: 'files.writeBase64Chunk',
@@ -1394,7 +1394,7 @@ describe('runtime file client', () => {
     if (!writeCall) {
       throw new Error('missing failed file write call')
     }
-    expect(writeCall.params.relativePath).toMatch(/^uploads\/assets\/\.logo\.png\.orca-botmux-upload-/)
+    expect(writeCall.params.relativePath).toMatch(/^uploads\/assets\/\.logo\.png\.botmux-upload-/)
     expect(runtimeEnvironmentCall).toHaveBeenLastCalledWith({
       selector: 'env-1',
       method: 'files.delete',
@@ -1971,7 +1971,7 @@ describe('runtime file client', () => {
   })
 
   it('delegates stopped pre-ready web shared file watch cleanup to the subscription handle', async () => {
-    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    ;(globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ = true
     const onPayload = vi.fn()
     const unsubscribe = vi.fn()
     let onResponse: ((response: unknown) => void) | undefined
@@ -2009,7 +2009,7 @@ describe('runtime file client', () => {
   })
 
   it('delegates stopped ready web shared file watch cleanup to the subscription handle', async () => {
-    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    ;(globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ = true
     const onPayload = vi.fn()
     const unsubscribe = vi.fn()
     let onResponse: ((response: unknown) => void) | undefined

@@ -15,7 +15,7 @@ import { resolveCompatibleAgentTypeForOwner } from '../../../shared/agent-title-
 import { resolvePaneAgentOwner } from '../../../shared/pane-agent-owner'
 import type { TerminalTab, TuiAgent } from '../../../shared/types'
 
-// A shell name, or the tab's neutral default title — where OrcaBotmux's
+// A shell name, or the tab's neutral default title — where Botmux's
 // inferred-interrupt reset parks it. Blank titles are no evidence either way.
 function titleShowsNoAgent(title: string, defaultTitle?: string): boolean {
   const trimmed = title.trim()
@@ -216,7 +216,7 @@ export function resolveTabAgentFromSignals(args: {
  *    live hook, process, and any reuse-title are absent. Suppressed on a local
  *    pane once OSC 133;D proves the agent exited.
  * 5. Sleeping session identity — a hibernated pane's captured session record.
- * 6. launchAgent — what OrcaBotmux launched here; the bootstrap before any hook, hook
+ * 6. launchAgent — what Botmux launched here; the bootstrap before any hook, hook
  *    record, or process signal exists, cleared once exit evidence shows it left.
  * 7. Sibling-pane identity (live, then idle) — split-tab fallback.
  */

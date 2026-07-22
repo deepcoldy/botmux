@@ -6,7 +6,7 @@ vi.mock('../runtime-client', () => {
   class RuntimeClient {
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
   }
 
   class RuntimeClientError extends Error {
@@ -37,7 +37,7 @@ vi.mock('../runtime-client', () => {
 import { main } from '../index'
 import { buildWorktree, okFixture, queueFixtures, worktreeListFixture } from '../test-fixtures'
 
-describe('orca_botmux computer action CLI routing', () => {
+describe('botmux computer action CLI routing', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     callMock.mockReset()
@@ -99,7 +99,7 @@ describe('orca_botmux computer action CLI routing', () => {
 
     const output = vi.mocked(console.log).mock.calls[0][0]
     expect(output).toContain(
-      'Use `orca_botmux computer get-app-state --app com.apple.finder --session manual --window-index 1 --restore-window`'
+      'Use `botmux computer get-app-state --app com.apple.finder --session manual --window-index 1 --restore-window`'
     )
   })
 

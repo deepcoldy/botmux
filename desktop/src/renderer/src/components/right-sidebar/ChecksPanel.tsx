@@ -23,9 +23,9 @@ import {
 import { getGitHubPRCacheKey, getGitHubRepoCacheKey } from '@/store/slices/github-cache-key'
 import { useActiveWorktree, useRepoById } from '@/store/selectors'
 import {
-  buildOrcaBotmuxEphemeralRepo,
-  resolveOrcaBotmuxToolingContext
-} from '@/lib/orca-botmux-tooling-context'
+  buildBotmuxEphemeralRepo,
+  resolveBotmuxToolingContext
+} from '@/lib/botmux-tooling-context'
 import { useChecksPanelTerminalWorktree } from './use-checks-panel-terminal-worktree'
 import { cn } from '@/lib/utils'
 import { openHttpLink } from '@/lib/http-link-routing'
@@ -435,18 +435,18 @@ export default function ChecksPanel(): React.JSX.Element {
   // host (ephemeral git over remote FS). Terminal PTY cwd polling only sees
   // local paths and cannot resolve remote session cwds.
   const botmuxToolingWorktree = useAppStore((s) => {
-    const ctx = resolveOrcaBotmuxToolingContext(s)
+    const ctx = resolveBotmuxToolingContext(s)
     if (!ctx.isBotmuxHost || !ctx.toolingWorktreeId) return null
     return s.getKnownWorktreeById(ctx.toolingWorktreeId) ?? null
   })
   // Primitives only — object snapshots re-render forever (max update depth).
   const isEphemeralBotmuxGit = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).isEphemeralGitSurface
+    (s) => resolveBotmuxToolingContext(s).isEphemeralGitSurface
   )
   const botmuxFilesystemConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
-  const botmuxSurfaceCwd = useAppStore((s) => resolveOrcaBotmuxToolingContext(s).surfaceCwd)
+  const botmuxSurfaceCwd = useAppStore((s) => resolveBotmuxToolingContext(s).surfaceCwd)
   const defaultActiveWorktree = useActiveWorktree()
   const { worktree: terminalResolvedWorktree } = useChecksPanelTerminalWorktree({
     defaultActiveWorktree: botmuxToolingWorktree ?? defaultActiveWorktree,
@@ -460,7 +460,7 @@ export default function ChecksPanel(): React.JSX.Element {
     if (!isEphemeralBotmuxGit || !activeWorktree || !botmuxSurfaceCwd) {
       return null
     }
-    return buildOrcaBotmuxEphemeralRepo({
+    return buildBotmuxEphemeralRepo({
       worktree: activeWorktree,
       connectionId: botmuxFilesystemConnectionId,
       surfaceCwd: botmuxSurfaceCwd
@@ -2540,7 +2540,7 @@ export default function ChecksPanel(): React.JSX.Element {
   )
 
   // Why: force a freshness check on each "entry" into the Checks tab so PRs
-  // opened outside OrcaBotmux, externally force-pushed heads, and stale checks/comments
+  // opened outside Botmux, externally force-pushed heads, and stale checks/comments
   // appear without waiting for the cache TTL. The grace window suppresses
   // duplicate fetches from rapid show/hide toggles. See
   // docs/refresh-on-checks-tab.md.
@@ -3940,7 +3940,7 @@ export default function ChecksPanel(): React.JSX.Element {
       reviewState.autoRetryAt !== undefined && reviewState.autoRetryAt > Date.now()
         ? translate(
             'auto.components.right.sidebar.ChecksPanel.review.auto_retry',
-            'OrcaBotmux will retry at {{time}}.',
+            'Botmux will retry at {{time}}.',
             { time: new Date(reviewState.autoRetryAt).toLocaleTimeString() }
           )
         : null
@@ -4114,7 +4114,7 @@ export default function ChecksPanel(): React.JSX.Element {
   const shouldShowReviewTriageStrip =
     activeConflictReview !== null || getBrokenChecks(checks).length > 0
   // Why: mirror openHttpLink's global routing inputs so the hint only appears
-  // when the actual plain-click path would open inside OrcaBotmux.
+  // when the actual plain-click path would open inside Botmux.
   const showHostedReviewSystemBrowserHint =
     Boolean(activeWorktreeId) &&
     settings?.openLinksInApp === true &&

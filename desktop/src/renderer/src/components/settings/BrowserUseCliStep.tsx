@@ -27,10 +27,10 @@ export function BrowserUseCliStep({
 }: BrowserUseCliStepProps): React.JSX.Element {
   return (
     <SearchableSetting
-      title={translate('auto.components.settings.BrowserUsePane.c6065d205d', 'Enable OrcaBotmux CLI')}
+      title={translate('auto.components.settings.BrowserUsePane.c6065d205d', 'Enable Botmux CLI')}
       description={translate(
         'auto.components.settings.BrowserUsePane.c79eff0213',
-        'Register the OrcaBotmux CLI so agents can drive the browser.'
+        'Register the Botmux CLI so agents can drive the browser.'
       )}
       keywords={getBrowserUsePaneSearchEntries()[0].keywords}
       className="rounded-xl border border-border/60 bg-card/50 p-4"
@@ -39,12 +39,12 @@ export function BrowserUseCliStep({
         <StepBadge index={1} state={cliEnabled ? 'done' : cliBusy ? 'in-progress' : 'pending'} />
         <div className="min-w-0 flex-1 space-y-1">
           <p className="text-sm font-medium">
-            {translate('auto.components.settings.BrowserUsePane.c6065d205d', 'Enable OrcaBotmux CLI')}
+            {translate('auto.components.settings.BrowserUsePane.c6065d205d', 'Enable Botmux CLI')}
           </p>
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.BrowserUsePane.9fca1f7f5d',
-              'Registers the OrcaBotmux CLI command so agents can orchestrate the browser from their shell.'
+              'Registers the Botmux CLI command so agents can orchestrate the browser from their shell.'
             )}
           </p>
           {cliStatus?.commandPath && cliEnabled ? (

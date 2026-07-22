@@ -8,15 +8,15 @@ import {
 describe('composer drop upload result', () => {
   it('separates imported files and folders while counting skipped or failed paths', () => {
     const results: ComposerDropUploadImportResult[] = [
-      { status: 'imported', kind: 'file', destPath: '/repo/.orca_botmux/drops/file.txt' },
-      { status: 'imported', kind: 'directory', destPath: '/repo/.orca_botmux/drops/folder' },
+      { status: 'imported', kind: 'file', destPath: '/repo/.botmux/drops/file.txt' },
+      { status: 'imported', kind: 'directory', destPath: '/repo/.botmux/drops/folder' },
       { status: 'skipped' },
       { status: 'failed' }
     ]
 
     expect(collectComposerDropUploadResult(results)).toEqual({
-      filePaths: ['/repo/.orca_botmux/drops/file.txt'],
-      folderPaths: ['/repo/.orca_botmux/drops/folder'],
+      filePaths: ['/repo/.botmux/drops/file.txt'],
+      folderPaths: ['/repo/.botmux/drops/folder'],
       skippedOrFailed: 2
     })
   })

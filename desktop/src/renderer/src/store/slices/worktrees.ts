@@ -36,6 +36,9 @@ import {
   isRemovedRuntimeHostId
 } from './stale-runtime-host-rows'
 import { ensureHooksConfirmed } from '@/lib/ensure-hooks-confirmed'
+import { ensureSshTargetConnected } from '@/lib/ensure-ssh-target-connected'
+import { getConnectionIdFromState } from '@/lib/connection-owner-resolution'
+import { isRuntimeOwnedSshTargetId } from '../../../../shared/execution-host'
 import { cleanupEphemeralVmRuntimesForDeleted } from '@/lib/ephemeral-vm-runtime-cleanup'
 import { tabHasLivePty } from '@/lib/tab-has-live-pty'
 import { disposeRemovedWorktreeParkedTerminalWatchers } from '../../components/terminal-pane/terminal-parked-watcher-registry'
@@ -76,10 +79,10 @@ import {
 } from '../../../../shared/execution-host'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
 import {
-  getCachedOrcaBotmuxControlPlaneWorktree,
-  isOrcaBotmuxControlPlaneHostId,
+  getCachedBotmuxControlPlaneWorktree,
+  isBotmuxControlPlaneHostId,
   isSyntheticTerminalHostId
-} from '../../../../shared/orca-botmux-main-terminal-host'
+} from '../../../../shared/botmux-main-terminal-host'
 import {
   folderWorkspaceKey,
   getActiveSidebarWorkspaceId,
@@ -196,7 +199,7 @@ function showLocalBaseRefRefreshToast(result: LocalBaseRefRefreshResult | undefi
     {
       description: translate(
         'auto.store.slices.worktrees.903b51c2ed',
-        'Workspace created from {{value0}}, but OrcaBotmux could not fast-forward local {{value1}} because {{value2}}',
+        'Workspace created from {{value0}}, but Botmux could not fast-forward local {{value1}} because {{value2}}',
         { value0: result.baseRef, value1: result.localBranch, value2: reason }
       )
     }
@@ -578,7 +581,7 @@ function toLegacyDetectedWorktreeResult(
     source: 'session-fallback',
     worktrees: result.worktrees.map((worktree) => ({
       ...worktree,
-      ownership: 'orca-botmux-managed',
+      ownership: 'botmux-managed',
       selectedCheckout: false,
       visible: true
     }))
@@ -608,7 +611,7 @@ function notifyRuntimeScopeForbiddenIfNeeded(error: unknown): boolean {
       id: RUNTIME_SCOPE_FORBIDDEN_TOAST_ID,
       description: translate(
         'auto.store.slices.worktrees.runtimeScopeForbiddenDescription',
-        'Workspaces are unavailable on a mobile-scope pairing. Reconnect using the browser access link from Settings → Runtime Environments → Share this OrcaBotmux server.'
+        'Workspaces are unavailable on a mobile-scope pairing. Reconnect using the browser access link from Settings → Runtime Environments → Share this Botmux server.'
       )
     }
   )
@@ -643,13 +646,13 @@ function findKnownWorktreeById(
   state: Pick<AppState, 'worktreesByRepo' | 'detectedWorktreesByRepo' | 'folderWorkspaces'>,
   worktreeId: string
 ): Worktree | DetectedWorktreeListResult['worktrees'][number] | undefined {
-  // OrcaBotmux control-plane hosts (main or per-session). Stable cached refs only.
-  const orcaBotmuxHost = getCachedOrcaBotmuxControlPlaneWorktree(worktreeId)
-  if (orcaBotmuxHost) {
-    return orcaBotmuxHost
+  // Botmux control-plane hosts (main or per-session). Stable cached refs only.
+  const botmuxHost = getCachedBotmuxControlPlaneWorktree(worktreeId)
+  if (botmuxHost) {
+    return botmuxHost
   }
   // Session host may not be cached yet (hydration); still recognize the id.
-  if (isOrcaBotmuxControlPlaneHostId(worktreeId)) {
+  if (isBotmuxControlPlaneHostId(worktreeId)) {
     return undefined
   }
   const workspaceScope = parseWorkspaceKey(worktreeId)
@@ -1274,7 +1277,7 @@ async function persistWorktreeMeta(
   worktreeId: string,
   updates: Partial<WorktreeMeta>
 ): Promise<void> {
-  // Why: orca_botmux:session:* / main / floating hosts are terminal surfaces, not
+  // Why: botmux:session:* / main / floating hosts are terminal surfaces, not
   // projects. PTY activity must not write them into durable worktreeMeta.
   if (isSyntheticTerminalHostId(worktreeId)) {
     return
@@ -2815,8 +2818,8 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       // Why: botmux control-plane hosts are synthetic (not in worktreesByRepo).
       // Still stamp head/branch on the session Worktree cache so SC can show
       // identity after remote git.status for ephemeral session cwds.
-      if (isOrcaBotmuxControlPlaneHostId(worktreeId)) {
-        const cached = getCachedOrcaBotmuxControlPlaneWorktree(worktreeId)
+      if (isBotmuxControlPlaneHostId(worktreeId)) {
+        const cached = getCachedBotmuxControlPlaneWorktree(worktreeId)
         if (cached) {
           const nextHead = identity.head ?? cached.head
           const nextBranch =
@@ -3372,7 +3375,7 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
       ) {
         throw new Error(WORKTREE_REMOVAL_AMBIGUOUS_ERROR)
       }
-      // Why: forget-local always clears OrcaBotmux's own records via the local IPC
+      // Why: forget-local always clears Botmux's own records via the local IPC
       // handler regardless of the workspace's execution host — the whole point
       // is that the remote (SSH relay / runtime) is gone or unreachable.
       const target = getActiveRuntimeTarget(
@@ -4898,6 +4901,24 @@ export const createWorktreeSlice: StateCreator<AppState, [], [], WorktreeSlice> 
         console.error('Failed to persist worktree activation state:', err)
         void get().fetchWorktrees(getRepoIdFromWorktreeId(worktreeId))
       })
+    }
+
+    // Why: botmux sessions and SSH-backed workspaces need the host online for
+    // file tree + terminal restore. Auto-ensure SSH when activating so the UI
+    // does not sit on "Connecting..." after a missed connected push.
+    if (worktreeId) {
+      const connectionId = getConnectionIdFromState(get(), worktreeId)
+      if (
+        typeof connectionId === 'string' &&
+        connectionId.length > 0 &&
+        !isRuntimeOwnedSshTargetId(connectionId)
+      ) {
+        void ensureSshTargetConnected(connectionId, {
+          getState: (args) => window.api.ssh.getState(args),
+          connect: (args) => window.api.ssh.connect(args),
+          publishState: (targetId, state) => get().setSshConnectionState(targetId, state)
+        }).catch(() => {})
+      }
     }
   },
 

@@ -31,18 +31,18 @@ function placement(
 
 describe('groupSkillFreshness', () => {
   it('marks an eligible outdated skill as update-available with one location', () => {
-    const groups = groupSkillFreshness([placement('orca-botmux-cli')], ['orca-botmux-cli'])
+    const groups = groupSkillFreshness([placement('botmux-cli')], ['botmux-cli'])
     expect(groups).toHaveLength(1)
-    expect(groups[0]).toMatchObject({ name: 'orca-botmux-cli', status: 'update-available' })
+    expect(groups[0]).toMatchObject({ name: 'botmux-cli', status: 'update-available' })
     expect(groups[0]?.locations).toEqual([
-      { id: expect.any(String), path: '/home/.agents/skills/orca-botmux-cli', chip: null }
+      { id: expect.any(String), path: '/home/.agents/skills/botmux-cli', chip: null }
     ])
   })
 
   it('hides skills with nothing out of date (current, unrecognized-only, unreadable-only)', () => {
     const groups = groupSkillFreshness(
       [
-        placement('orca-botmux-cli', { status: 'current' }),
+        placement('botmux-cli', { status: 'current' }),
         placement('dataviz', { status: 'unrecognized', topology: 'independent-copy' }),
         placement('linear-tickets', { status: 'inaccessible' })
       ],

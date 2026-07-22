@@ -10,7 +10,7 @@
  *   - Shortcuts no-op in non-terminal views (buttons also hidden there).
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import type { Page } from '@stablyai/playwright-test'
 import {
   waitForSessionReady,
@@ -85,59 +85,59 @@ const isMac = process.platform === 'darwin'
 const mod = isMac ? 'Meta' : 'Control'
 
 test.describe('Workspace Back/Forward Navigation', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
-  test('buttons are hidden outside the terminal view', async ({ orcaBotmuxPage }) => {
-    await expect(await getBackButton(orcaBotmuxPage)).toBeVisible()
-    await expect(await getForwardButton(orcaBotmuxPage)).toBeVisible()
+  test('buttons are hidden outside the terminal view', async ({ botmuxPage }) => {
+    await expect(await getBackButton(botmuxPage)).toBeVisible()
+    await expect(await getForwardButton(botmuxPage)).toBeVisible()
 
     // Why: the Back/Forward pair is conditional on `activeView === 'terminal'`.
     // Settings, Tasks, and Landing must not render the buttons at all (not just
     // disable them) so the titlebar stays compact and the semantics unambiguous.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.__store!.getState().openSettingsPage()
     })
 
-    await expect(await getBackButton(orcaBotmuxPage)).toHaveCount(0)
-    await expect(await getForwardButton(orcaBotmuxPage)).toHaveCount(0)
+    await expect(await getBackButton(botmuxPage)).toHaveCount(0)
+    await expect(await getForwardButton(botmuxPage)).toHaveCount(0)
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.__store!.getState().setActiveView('terminal')
     })
-    await expect(await getBackButton(orcaBotmuxPage)).toBeVisible()
+    await expect(await getBackButton(botmuxPage)).toBeVisible()
   })
 
-  test('both buttons disabled at cold start with a single history entry', async ({ orcaBotmuxPage }) => {
+  test('both buttons disabled at cold start with a single history entry', async ({ botmuxPage }) => {
     // The test fixture already activated a worktree during setup, so one entry
     // may or may not exist. Reset the slice to a known empty baseline, then
     // record the current worktree as the single entry.
-    const activeId = await getActiveWorktreeId(orcaBotmuxPage)
+    const activeId = await getActiveWorktreeId(botmuxPage)
     expect(activeId).not.toBeNull()
 
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, activeId!)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, activeId!)
 
-    const back = await getBackButton(orcaBotmuxPage)
-    const forward = await getForwardButton(orcaBotmuxPage)
+    const back = await getBackButton(botmuxPage)
+    const forward = await getForwardButton(botmuxPage)
     await expect(back).toBeDisabled()
     await expect(forward).toBeDisabled()
   })
 
-  test('clicking Back and Forward walks the history stack', async ({ orcaBotmuxPage }) => {
-    const worktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test('clicking Back and Forward walks the history stack', async ({ botmuxPage }) => {
+    const worktreeIds = await getAllWorktreeIds(botmuxPage)
     test.skip(worktreeIds.length < 2, 'Need at least two worktrees to exercise back/forward')
     const [primaryId, secondaryId] = worktreeIds
 
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, primaryId)
-    await seedVisit(orcaBotmuxPage, secondaryId)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, primaryId)
+    await seedVisit(botmuxPage, secondaryId)
 
-    const back = await getBackButton(orcaBotmuxPage)
-    const forward = await getForwardButton(orcaBotmuxPage)
+    const back = await getBackButton(botmuxPage)
+    const forward = await getForwardButton(botmuxPage)
     await expect(back).toBeEnabled()
     await expect(forward).toBeDisabled()
 
@@ -145,12 +145,12 @@ test.describe('Workspace Back/Forward Navigation', () => {
     // worktree is currently active". `aria-selected` is reserved for batch
     // multi-select state, so a store-only `activeWorktreeId` check would miss
     // render-layer regressions in the active row.
-    const primaryRow = worktreeRow(orcaBotmuxPage, primaryId)
-    const secondaryRow = worktreeRow(orcaBotmuxPage, secondaryId)
+    const primaryRow = worktreeRow(botmuxPage, primaryId)
+    const secondaryRow = worktreeRow(botmuxPage, secondaryId)
 
     await back.click()
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(async () => getActiveWorktreeId(botmuxPage), {
         message: 'Back click did not activate the previous worktree'
       })
       .toBe(primaryId)
@@ -161,7 +161,7 @@ test.describe('Workspace Back/Forward Navigation', () => {
 
     await forward.click()
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(async () => getActiveWorktreeId(botmuxPage), {
         message: 'Forward click did not re-activate the next worktree'
       })
       .toBe(secondaryId)
@@ -170,23 +170,23 @@ test.describe('Workspace Back/Forward Navigation', () => {
     await expect(forward).toBeDisabled()
   })
 
-  test('re-activating the current worktree is a no-op (dedupe)', async ({ orcaBotmuxPage }) => {
-    const activeId = await getActiveWorktreeId(orcaBotmuxPage)
+  test('re-activating the current worktree is a no-op (dedupe)', async ({ botmuxPage }) => {
+    const activeId = await getActiveWorktreeId(botmuxPage)
     expect(activeId).not.toBeNull()
 
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, activeId!)
-    await seedVisit(orcaBotmuxPage, activeId!)
-    await seedVisit(orcaBotmuxPage, activeId!)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, activeId!)
+    await seedVisit(botmuxPage, activeId!)
+    await seedVisit(botmuxPage, activeId!)
 
-    const snapshot = await getNavHistorySnapshot(orcaBotmuxPage)
+    const snapshot = await getNavHistorySnapshot(botmuxPage)
     expect(snapshot.history).toEqual([activeId])
     expect(snapshot.index).toBe(0)
-    await expect(await getBackButton(orcaBotmuxPage)).toBeDisabled()
+    await expect(await getBackButton(botmuxPage)).toBeDisabled()
   })
 
-  test('new navigation after going back truncates the forward stack', async ({ orcaBotmuxPage }) => {
-    const worktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test('new navigation after going back truncates the forward stack', async ({ botmuxPage }) => {
+    const worktreeIds = await getAllWorktreeIds(botmuxPage)
     test.skip(worktreeIds.length < 2, 'Need at least two worktrees to exercise forward truncation')
     const [primaryId, secondaryId] = worktreeIds
 
@@ -195,83 +195,83 @@ test.describe('Workspace Back/Forward Navigation', () => {
     // from mid-history). The current-entry dedupe should kick in, but if we
     // instead activate secondary while sitting on primary mid-history, the
     // forward entry pointing at secondary must be truncated.
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, primaryId)
-    await seedVisit(orcaBotmuxPage, secondaryId)
-    await (await getBackButton(orcaBotmuxPage)).click()
-    await expect.poll(() => getActiveWorktreeId(orcaBotmuxPage)).toBe(primaryId)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, primaryId)
+    await seedVisit(botmuxPage, secondaryId)
+    await (await getBackButton(botmuxPage)).click()
+    await expect.poll(() => getActiveWorktreeId(botmuxPage)).toBe(primaryId)
 
     // Forward button is live — a forward entry exists.
-    await expect(await getForwardButton(orcaBotmuxPage)).toBeEnabled()
+    await expect(await getForwardButton(botmuxPage)).toBeEnabled()
 
     // Fresh activation from mid-history. Using secondary again is the simplest
     // way to prove truncation happened: after this call, the stack must be
     // [primary, secondary] with index=1, so Forward is disabled even though
     // there *was* a forward entry moments ago.
-    await seedVisit(orcaBotmuxPage, secondaryId)
-    const snapshot = await getNavHistorySnapshot(orcaBotmuxPage)
+    await seedVisit(botmuxPage, secondaryId)
+    const snapshot = await getNavHistorySnapshot(botmuxPage)
     expect(snapshot.history).toEqual([primaryId, secondaryId])
     expect(snapshot.index).toBe(1)
-    await expect(await getForwardButton(orcaBotmuxPage)).toBeDisabled()
+    await expect(await getForwardButton(botmuxPage)).toBeDisabled()
   })
 
-  test(`${isMac ? 'Cmd' : 'Ctrl'}+Alt+Left/Right shortcuts walk history`, async ({ orcaBotmuxPage }) => {
-    const worktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test(`${isMac ? 'Cmd' : 'Ctrl'}+Alt+Left/Right shortcuts walk history`, async ({ botmuxPage }) => {
+    const worktreeIds = await getAllWorktreeIds(botmuxPage)
     test.skip(worktreeIds.length < 2, 'Need at least two worktrees to exercise shortcuts')
     const [primaryId, secondaryId] = worktreeIds
 
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, primaryId)
-    await seedVisit(orcaBotmuxPage, secondaryId)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, primaryId)
+    await seedVisit(botmuxPage, secondaryId)
 
     // Why: focus body so the window-level keydown capture handler runs without
     // an `isEditableTarget` bail-out. The xterm helper textarea is explicitly
     // treated as non-editable, but body is the simplest stable target in a
     // hidden-window Electron run.
-    await orcaBotmuxPage.evaluate(() => document.body.focus())
+    await botmuxPage.evaluate(() => document.body.focus())
 
-    await orcaBotmuxPage.keyboard.press(`${mod}+Alt+ArrowLeft`)
+    await botmuxPage.keyboard.press(`${mod}+Alt+ArrowLeft`)
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(async () => getActiveWorktreeId(botmuxPage), {
         message: `${mod}+Alt+Left did not navigate back`
       })
       .toBe(primaryId)
 
-    await orcaBotmuxPage.keyboard.press(`${mod}+Alt+ArrowRight`)
+    await botmuxPage.keyboard.press(`${mod}+Alt+ArrowRight`)
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(async () => getActiveWorktreeId(botmuxPage), {
         message: `${mod}+Alt+Right did not navigate forward`
       })
       .toBe(secondaryId)
   })
 
-  test('shortcut is a no-op in settings view', async ({ orcaBotmuxPage }) => {
-    const worktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test('shortcut is a no-op in settings view', async ({ botmuxPage }) => {
+    const worktreeIds = await getAllWorktreeIds(botmuxPage)
     test.skip(worktreeIds.length < 2, 'Need at least two worktrees to exercise settings gating')
     const [primaryId, secondaryId] = worktreeIds
 
-    await resetNavHistory(orcaBotmuxPage)
-    await seedVisit(orcaBotmuxPage, primaryId)
-    await seedVisit(orcaBotmuxPage, secondaryId)
+    await resetNavHistory(botmuxPage)
+    await seedVisit(botmuxPage, primaryId)
+    await seedVisit(botmuxPage, secondaryId)
 
     // Enter settings. The back shortcut must not change the active worktree,
     // matching the view-guard in App.tsx and useIpcEvents.ts.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.__store!.getState().openSettingsPage()
     })
     await expect
-      .poll(async () => orcaBotmuxPage.evaluate(() => window.__store!.getState().activeView))
+      .poll(async () => botmuxPage.evaluate(() => window.__store!.getState().activeView))
       .toBe('settings')
 
-    const idBefore = await getActiveWorktreeId(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(() => document.body.focus())
-    await orcaBotmuxPage.keyboard.press(`${mod}+Alt+ArrowLeft`)
+    const idBefore = await getActiveWorktreeId(botmuxPage)
+    await botmuxPage.evaluate(() => document.body.focus())
+    await botmuxPage.keyboard.press(`${mod}+Alt+ArrowLeft`)
 
     // Give any erroneous nav a beat to land, then assert the active worktree
     // and the slice index both stayed put.
-    await orcaBotmuxPage.waitForTimeout(150)
-    expect(await getActiveWorktreeId(orcaBotmuxPage)).toBe(idBefore)
-    const snapshot = await getNavHistorySnapshot(orcaBotmuxPage)
+    await botmuxPage.waitForTimeout(150)
+    expect(await getActiveWorktreeId(botmuxPage)).toBe(idBefore)
+    const snapshot = await getNavHistorySnapshot(botmuxPage)
     expect(snapshot.index).toBe(1)
   })
 })

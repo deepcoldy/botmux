@@ -11,7 +11,7 @@ import {
 import { dirname, join, resolve } from 'node:path'
 import { writeFileAtomically } from '../codex-accounts/fs-utils'
 import { parseWslUncPath } from '../../shared/wsl-paths'
-import { getOrcaManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
+import { getBotmuxManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
 import {
   createTomlLineScanState,
   getTomlTableHeader,
@@ -21,8 +21,8 @@ import {
 
 // Why: the config mirror rewrites the runtime config.toml from ~/.codex on
 // every launch (and on background rate-limit fetches), so settings the user
-// changes inside OrcaBotmux-launched Codex silently revert. Promotion diffs the
-// runtime file against a baseline of what OrcaBotmux last wrote — anything that
+// changes inside Botmux-launched Codex silently revert. Promotion diffs the
+// runtime file against a baseline of what Botmux last wrote — anything that
 // differs is a change Codex persisted for the user and belongs in ~/.codex.
 
 // Why: only the user-preference scalars the Codex TUI itself persists
@@ -49,7 +49,7 @@ type SettingsBaselineFile = {
 }
 
 function getSettingsBaselinePath(runtimeHomePath: string): string {
-  return join(runtimeHomePath, '.orca-botmux-config-settings-baseline.json')
+  return join(runtimeHomePath, '.botmux-config-settings-baseline.json')
 }
 
 function readSettingsBaseline(runtimeHomePath: string): Map<string, string> | null {
@@ -109,18 +109,18 @@ function readTopLevelSettingValues(configPath: string): Map<string, TopLevelSett
 
 /**
  * Records the promotable top-level settings the runtime config.toml holds
- * after a mirror, so the next promotion can tell "value OrcaBotmux mirrored" apart
+ * after a mirror, so the next promotion can tell "value Botmux mirrored" apart
  * from "value Codex wrote for the user". Call after a successful mirror only —
  * advancing the baseline past an unpromoted change would strand it forever.
  */
 export function snapshotCodexRuntimeSettingsBaseline(
-  runtimeHomePath = getOrcaManagedCodexHomePath()
+  runtimeHomePath = getBotmuxManagedCodexHomePath()
 ): void {
   try {
     const runtimeTomlPath = join(runtimeHomePath, 'config.toml')
     // Why: a missing runtime config still records an empty baseline — when
     // Codex later creates the file for a user with no ~/.codex/config.toml,
-    // that first change must diff against "OrcaBotmux left nothing" and promote.
+    // that first change must diff against "Botmux left nothing" and promote.
     const settings: Record<string, string> = {}
     for (const [key, value] of readTopLevelSettingValues(runtimeTomlPath)) {
       if (!value.multiline) {
@@ -151,13 +151,13 @@ export type CodexSettingsPromotionHomes = {
 
 function getHostPromotionHomes(): CodexSettingsPromotionHomes {
   return {
-    runtimeHomePath: getOrcaManagedCodexHomePath(),
+    runtimeHomePath: getBotmuxManagedCodexHomePath(),
     systemHomePath: getSystemCodexHomePath()
   }
 }
 
 /**
- * Promotes setting changes the user made inside OrcaBotmux-launched Codex (written
+ * Promotes setting changes the user made inside Botmux-launched Codex (written
  * by Codex into the runtime config.toml) into ~/.codex/config.toml. Runs
  * before the config mirror so the promoted values survive the same mirror
  * pass instead of reverting. WSL callers pass explicit per-distro homes; the
@@ -185,7 +185,7 @@ function promoteCodexRuntimeSettingsToSystemUnsafe(homes: CodexSettingsPromotion
   if (!existsSync(runtimeTomlPath)) {
     return
   }
-  // Why: without a baseline of what OrcaBotmux last mirrored (first launch after
+  // Why: without a baseline of what Botmux last mirrored (first launch after
   // upgrading to a build with promotion, or a corrupted snapshot), a stale
   // runtime value is indistinguishable from a fresh in-Codex change. Skip
   // this pass — the mirror writes the first baseline and promotion starts on
@@ -203,7 +203,7 @@ function promoteCodexRuntimeSettingsToSystemUnsafe(homes: CodexSettingsPromotion
       continue
     }
     if (runtime.raw === baseline.get(key)) {
-      // OrcaBotmux mirrored this value and nothing touched it since — not a change.
+      // Botmux mirrored this value and nothing touched it since — not a change.
       continue
     }
     const system = systemValues.get(key)

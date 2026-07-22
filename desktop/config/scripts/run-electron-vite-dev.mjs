@@ -31,10 +31,10 @@ const rawForwardedArgs = process.argv.slice(2)
 // Why: keep an escape hatch for tools that key off Electron's stock app name.
 // The flag is runner-only and must not leak into Chromium/electron-vite.
 const useStableElectronName =
-  process.env.ORCA_DEV_STABLE_NAME === '1' || rawForwardedArgs.includes(STABLE_NAME_FLAG)
+  process.env.BOTMUX_DEV_STABLE_NAME === '1' || rawForwardedArgs.includes(STABLE_NAME_FLAG)
 const forwardedRaw = rawForwardedArgs.filter((arg) => arg !== STABLE_NAME_FLAG)
 if (useStableElectronName) {
-  process.env.ORCA_DEV_STABLE_NAME = '1'
+  process.env.BOTMUX_DEV_STABLE_NAME = '1'
 }
 
 function readGitValue(args) {
@@ -64,33 +64,33 @@ function formatDevInstanceLabel(branch, worktreeName) {
 }
 
 function createDockTitle(branch, label) {
-  return `OrcaBotmux: ${branch || label || 'dev'}`
+  return `Botmux: ${branch || label || 'dev'}`
 }
 
 function seedDevInstanceIdentityEnv() {
   const branch =
-    process.env.ORCA_DEV_BRANCH ||
+    process.env.BOTMUX_DEV_BRANCH ||
     readGitValue(['symbolic-ref', '--quiet', '--short', 'HEAD']) ||
     readGitValue(['rev-parse', '--short', 'HEAD'])
-  const worktreeName = process.env.ORCA_DEV_WORKTREE_NAME || path.basename(repoRoot)
-  const label = process.env.ORCA_DEV_INSTANCE_LABEL || formatDevInstanceLabel(branch, worktreeName)
-  const identitySeed = process.env.ORCA_DEV_INSTANCE_KEY || repoRoot
-  const dockTitle = process.env.ORCA_DEV_DOCK_TITLE || createDockTitle(branch, label)
+  const worktreeName = process.env.BOTMUX_DEV_WORKTREE_NAME || path.basename(repoRoot)
+  const label = process.env.BOTMUX_DEV_INSTANCE_LABEL || formatDevInstanceLabel(branch, worktreeName)
+  const identitySeed = process.env.BOTMUX_DEV_INSTANCE_KEY || repoRoot
+  const dockTitle = process.env.BOTMUX_DEV_DOCK_TITLE || createDockTitle(branch, label)
 
-  process.env.ORCA_DEV_REPO_ROOT ||= repoRoot
-  process.env.ORCA_DEV_INSTANCE_KEY ||= identitySeed
+  process.env.BOTMUX_DEV_REPO_ROOT ||= repoRoot
+  process.env.BOTMUX_DEV_INSTANCE_KEY ||= identitySeed
   if (branch) {
-    process.env.ORCA_DEV_BRANCH ||= branch
+    process.env.BOTMUX_DEV_BRANCH ||= branch
   }
   if (worktreeName) {
-    process.env.ORCA_DEV_WORKTREE_NAME ||= worktreeName
+    process.env.BOTMUX_DEV_WORKTREE_NAME ||= worktreeName
   }
   if (label) {
     // Why: parallel `pn dev` runs need a stable origin label for window titles,
     // Dock names, and automation sessions without re-running git in Electron.
-    process.env.ORCA_DEV_INSTANCE_LABEL ||= label
+    process.env.BOTMUX_DEV_INSTANCE_LABEL ||= label
   }
-  process.env.ORCA_DEV_DOCK_TITLE ||= dockTitle
+  process.env.BOTMUX_DEV_DOCK_TITLE ||= dockTitle
 }
 
 function setPlistValue(plistPath, key, value) {
@@ -106,7 +106,7 @@ function sanitizeMacAppBundleName(value) {
       .join('')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 120) || 'orca_botmux'
+      .slice(0, 120) || 'botmux'
   )
 }
 
@@ -126,8 +126,8 @@ function prepareMacDevElectronApp() {
     electronVersion = JSON.parse(readFileSync(electronPackagePath, 'utf8')).version ?? null
   } catch {}
 
-  const title = process.env.ORCA_DEV_DOCK_TITLE || 'OrcaBotmux: dev'
-  const identityKey = process.env.ORCA_DEV_INSTANCE_KEY || repoRoot
+  const title = process.env.BOTMUX_DEV_DOCK_TITLE || 'Botmux: dev'
+  const identityKey = process.env.BOTMUX_DEV_INSTANCE_KEY || repoRoot
   // v6: bundle the notification-status helper (real permission readout) and
   // ad-hoc re-sign after plist edits so Notification Center accepts the
   // bundle; bumping forces stale cached copies to be recreated.
@@ -143,10 +143,10 @@ function prepareMacDevElectronApp() {
   // electron-vite's direct binary launch path, even when Info.plist is patched.
   const appBundleName = `${sanitizeMacAppBundleName(title)}.app`
   const appPath = path.join(distDir, appBundleName)
-  const markerPath = path.join(distDir, 'orca-botmux-desktop-dev-electron-app.json')
+  const markerPath = path.join(distDir, 'botmux-desktop-dev-electron-app.json')
   // Why: one stable id for every dev instance. Per-instance ids registered a
   // new macOS Notification Settings entry for each branch × Electron version,
-  // piling up "OrcaBotmux: <branch>" rows forever and breaking the notification
+  // piling up "Botmux: <branch>" rows forever and breaking the notification
   // settings deep-link (System Settings can't resolve an id it has no entry
   // for and falls back to the root list). macOS keys notification permission
   // by bundle id, so a single id also means granting notifications to one dev
@@ -154,8 +154,8 @@ function prepareMacDevElectronApp() {
   // once, macOS may route a notification click to the other instance —
   // Electron drops clicks for notification ids it didn't create, so the
   // click is lost, not misdirected.
-  const bundleId = 'com.orca_botmux.desktop.dev'
-  process.env.ORCA_DEV_MACOS_BUNDLE_ID = bundleId
+  const bundleId = 'com.botmux.desktop.dev'
+  process.env.BOTMUX_DEV_MACOS_BUNDLE_ID = bundleId
   const expectedMarker = JSON.stringify(
     { title, appBundleName, bundleId, sourceAppPath, electronVersion, bundleLayoutVersion },
     null,
@@ -224,13 +224,13 @@ function prepareMacDevElectronApp() {
         bundleId,
         '--single-arch',
         '--output',
-        path.join(appPath, 'Contents', 'MacOS', 'orca-botmux-notification-status')
+        path.join(appPath, 'Contents', 'MacOS', 'botmux-notification-status')
       ],
       { stdio: 'inherit' }
     )
   } catch (error) {
     console.warn(
-      `[orca-botmux-desktop-dev] notification-status helper build failed (permission card falls back to probes): ${error?.message ?? error}`
+      `[botmux-desktop-dev] notification-status helper build failed (permission card falls back to probes): ${error?.message ?? error}`
     )
   }
 
@@ -245,7 +245,7 @@ function prepareMacDevElectronApp() {
     execFileSync('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', appPath])
   } catch (error) {
     console.warn(
-      `[orca-botmux-desktop-dev] ad-hoc codesign failed (dev notifications will not deliver): ${error?.message ?? error}`
+      `[botmux-desktop-dev] ad-hoc codesign failed (dev notifications will not deliver): ${error?.message ?? error}`
     )
   }
   writeFileSync(markerPath, expectedMarker, 'utf8')
@@ -295,21 +295,21 @@ function restoreElectronFrameworkSymlinks(appPath) {
 }
 
 function getDevUserDataPath() {
-  if (process.env.ORCA_DEV_USER_DATA_PATH) {
-    return process.env.ORCA_DEV_USER_DATA_PATH
+  if (process.env.BOTMUX_DEV_USER_DATA_PATH) {
+    return process.env.BOTMUX_DEV_USER_DATA_PATH
   }
   if (process.platform === 'darwin') {
-    return path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'orca-botmux-desktop-dev')
+    return path.join(process.env.HOME ?? '', 'Library', 'Application Support', 'botmux-desktop-dev')
   }
   if (process.platform === 'win32') {
     return path.join(
       process.env.APPDATA ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming'),
-      'orca-botmux-desktop-dev'
+      'botmux-desktop-dev'
     )
   }
   return path.join(
     process.env.XDG_CONFIG_HOME ?? path.join(process.env.HOME ?? '', '.config'),
-    'orca-botmux-desktop-dev'
+    'botmux-desktop-dev'
   )
 }
 
@@ -323,29 +323,29 @@ function prepareDevCliWrapper() {
 
   if (process.platform === 'win32') {
     writeFileSync(
-      path.join(binDir, 'orca-botmux-desktop-dev.cmd'),
-      `@echo off\r\nset "ORCA_USER_DATA_PATH=${userDataPath}"\r\nset "ORCA_APP_EXECUTABLE=${electronBin}"\r\nset "ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT=1"\r\nnode "${cliPath}" %*\r\n`,
+      path.join(binDir, 'botmux-desktop-dev.cmd'),
+      `@echo off\r\nset "BOTMUX_USER_DATA_PATH=${userDataPath}"\r\nset "BOTMUX_APP_EXECUTABLE=${electronBin}"\r\nset "BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT=1"\r\nnode "${cliPath}" %*\r\n`,
       'utf8'
     )
   } else {
-    const wrapperContent = `#!/usr/bin/env bash\nexport ORCA_USER_DATA_PATH=${JSON.stringify(userDataPath)}\nexport ORCA_APP_EXECUTABLE=${JSON.stringify(electronBin)}\nexport ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT=1\nexec node ${JSON.stringify(cliPath)} "$@"\n`
-    const wrapperPath = path.join(binDir, 'orca-botmux-desktop-dev')
+    const wrapperContent = `#!/usr/bin/env bash\nexport BOTMUX_USER_DATA_PATH=${JSON.stringify(userDataPath)}\nexport BOTMUX_APP_EXECUTABLE=${JSON.stringify(electronBin)}\nexport BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT=1\nexec node ${JSON.stringify(cliPath)} "$@"\n`
+    const wrapperPath = path.join(binDir, 'botmux-desktop-dev')
     writeFileSync(wrapperPath, wrapperContent, 'utf8')
     chmodSync(wrapperPath, 0o755)
 
     mkdirSync(userDataBinDir, { recursive: true })
-    for (const commandName of ['orca-botmux-desktop-dev', 'orca_botmux']) {
+    for (const commandName of ['botmux-desktop-dev', 'botmux']) {
       const userDataWrapperPath = path.join(userDataBinDir, commandName)
-      // Why: dev OrcaBotmux terminals prepend this directory to PATH; refreshing the
-      // `orca_botmux` alias prevents stale global/userData wrappers from hijacking
-      // OrcaBotmux-owned commands such as `orca_botmux claude-teams`.
+      // Why: dev Botmux terminals prepend this directory to PATH; refreshing the
+      // `botmux` alias prevents stale global/userData wrappers from hijacking
+      // Botmux-owned commands such as `botmux claude-teams`.
       writeFileSync(userDataWrapperPath, wrapperContent, 'utf8')
       chmodSync(userDataWrapperPath, 0o755)
     }
   }
 
   process.env.PATH = `${binDir}${path.delimiter}${process.env.PATH ?? ''}`
-  console.log(`[orca-botmux-desktop-dev] Prepared wrapper in ${binDir}`)
+  console.log(`[botmux-desktop-dev] Prepared wrapper in ${binDir}`)
 }
 
 function getElectronExecutable() {
@@ -355,22 +355,22 @@ function getElectronExecutable() {
   return path.join(repoRoot, 'node_modules', '.bin', 'electron')
 }
 
-if (process.env.ORCA_SKIP_DEV_CLI_PREPARE !== '1') {
+if (process.env.BOTMUX_SKIP_DEV_CLI_PREPARE !== '1') {
   prepareDevCliWrapper()
 }
 
 seedDevInstanceIdentityEnv()
-if (!useStableElectronName && process.env.ORCA_SKIP_DEV_ELECTRON_APP_PREPARE !== '1') {
+if (!useStableElectronName && process.env.BOTMUX_SKIP_DEV_ELECTRON_APP_PREPARE !== '1') {
   prepareMacDevElectronApp()
 }
 
 // Why: tests inject a tiny fake CLI here so they can verify Ctrl+C tears down
 // the full child tree without depending on a real electron-vite install.
 const electronViteCli =
-  process.env.ORCA_ELECTRON_VITE_CLI ||
+  process.env.BOTMUX_ELECTRON_VITE_CLI ||
   path.join(path.dirname(require.resolve('electron-vite/package.json')), 'bin', 'electron-vite.js')
 const viteCli =
-  process.env.ORCA_VITE_CLI ||
+  process.env.BOTMUX_VITE_CLI ||
   path.join(path.dirname(require.resolve('vite/package.json')), 'bin', 'vite.js')
 
 function getMtimeMs(filePath) {
@@ -424,21 +424,21 @@ function isDevWebClientFresh() {
 }
 
 function prepareDevWebClient() {
-  if (process.env.ORCA_SKIP_DEV_WEB_PREPARE === '1' || isHelpOrVersion) {
+  if (process.env.BOTMUX_SKIP_DEV_WEB_PREPARE === '1' || isHelpOrVersion) {
     return
   }
   // Why: fresh worktrees should start Electron immediately; pairing already
   // falls back to non-browser URLs when the optional web bundle is unavailable.
-  if (!existsSync(getDevWebClientIndexPath()) && process.env.ORCA_DEV_WEB_PREPARE !== '1') {
+  if (!existsSync(getDevWebClientIndexPath()) && process.env.BOTMUX_DEV_WEB_PREPARE !== '1') {
     console.error(
-      '[orca-botmux-desktop-dev] Web client bundle missing; skipping pairing web build. Run `pnpm run build:web` or set ORCA_DEV_WEB_PREPARE=1 when you need browser pairing.'
+      '[botmux-desktop-dev] Web client bundle missing; skipping pairing web build. Run `pnpm run build:web` or set BOTMUX_DEV_WEB_PREPARE=1 when you need browser pairing.'
     )
     return
   }
   if (isDevWebClientFresh()) {
     return
   }
-  console.error('[orca-botmux-desktop-dev] Building web client for pairing...')
+  console.error('[botmux-desktop-dev] Building web client for pairing...')
   execFileSync(
     process.execPath,
     [viteCli, 'build', '--config', path.join(repoRoot, 'vite.web.config.ts')],
@@ -502,8 +502,8 @@ const userPassedPort = forwardedRaw.some(
 // Why: --help/--version exit immediately; binding a probe socket and printing
 // a debug-port line would be noise.
 const isHelpOrVersion = forwardedRaw.some((a) => a === '--help' || a === '-h' || a === '--version')
-if (!isHelpOrVersion && process.env.ORCA_DEV_INSTANCE_LABEL) {
-  console.error(`[orca-botmux-desktop-dev] Instance: ${process.env.ORCA_DEV_INSTANCE_LABEL}`)
+if (!isHelpOrVersion && process.env.BOTMUX_DEV_INSTANCE_LABEL) {
+  console.error(`[botmux-desktop-dev] Instance: ${process.env.BOTMUX_DEV_INSTANCE_LABEL}`)
 }
 let forwardedExtras = []
 if (!userPassedPort && !isHelpOrVersion) {
@@ -513,7 +513,7 @@ if (!userPassedPort && !isHelpOrVersion) {
     port = parseDebugPortEnv(envPortRaw)
     if (port === null) {
       console.error(
-        `[orca-botmux-desktop-dev] Ignoring invalid REMOTE_DEBUGGING_PORT=${JSON.stringify(envPortRaw)}; falling back to probe.`
+        `[botmux-desktop-dev] Ignoring invalid REMOTE_DEBUGGING_PORT=${JSON.stringify(envPortRaw)}; falling back to probe.`
       )
     }
   }
@@ -525,10 +525,10 @@ if (!userPassedPort && !isHelpOrVersion) {
     // Why: stderr keeps stdout clean for downstream parsing; log uses
     // 127.0.0.1 to match the interface we actually probed (localhost may
     // resolve to ::1 on IPv6-first hosts).
-    console.error(`[orca-botmux-desktop-dev] Remote debugging on http://127.0.0.1:${port}`)
+    console.error(`[botmux-desktop-dev] Remote debugging on http://127.0.0.1:${port}`)
   } else {
     console.error(
-      '[orca-botmux-desktop-dev] No free debug port found in sweep; starting without --remote-debugging-port.'
+      '[botmux-desktop-dev] No free debug port found in sweep; starting without --remote-debugging-port.'
     )
   }
 }

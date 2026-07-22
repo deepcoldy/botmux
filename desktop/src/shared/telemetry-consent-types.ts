@@ -12,6 +12,6 @@ export type TelemetryConsentState =
   | { effective: 'enabled' }
   | {
       effective: 'disabled'
-      reason: 'do_not_track' | 'orca_botmux_disabled' | 'ci' | 'user_opt_out'
+      reason: 'do_not_track' | 'botmux_disabled' | 'ci' | 'user_opt_out'
     }
   | { effective: 'pending_banner' }

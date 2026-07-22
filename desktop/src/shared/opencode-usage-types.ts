@@ -1,4 +1,4 @@
-export type OpenCodeUsageScope = 'orca_botmux' | 'all'
+export type OpenCodeUsageScope = 'botmux' | 'all'
 export type OpenCodeUsageRange = '7d' | '30d' | '90d' | 'all'
 export type OpenCodeUsageBreakdownKind = 'model' | 'project'
 

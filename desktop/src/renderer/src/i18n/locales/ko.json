@@ -1,9 +1,9 @@
 {
   "app": {
     "recoverableError": {
-      "rootTitle": "OrcaBotmux에 렌더러 오류가 발생했습니다.",
-      "rootDescription": "앱 셸에서 렌더링을 완료할 수 없습니다. 다시 마운트해 보거나 오류가 지속되면 OrcaBotmux를 다시 시작하세요.",
-      "webTitle": "OrcaBotmux 웹에 렌더러 오류가 발생했습니다.",
+      "rootTitle": "Botmux에 렌더러 오류가 발생했습니다.",
+      "rootDescription": "앱 셸에서 렌더링을 완료할 수 없습니다. 다시 마운트해 보거나 오류가 지속되면 Botmux를 다시 시작하세요.",
+      "webTitle": "Botmux 웹에 렌더러 오류가 발생했습니다.",
       "webDescription": "웹 클라이언트를 다시 시도하거나 페어링된 런타임에 다시 연결하세요."
     }
   },
@@ -11,7 +11,7 @@
     "appearance": {
       "language": {
         "title": "언어",
-        "description": "OrcaBotmux 인터페이스에서 사용되는 언어를 선택합니다.",
+        "description": "Botmux 인터페이스에서 사용되는 언어를 선택합니다.",
         "system": "시스템",
         "english": "English",
         "chinese": "中文（简体）",
@@ -26,7 +26,7 @@
         "opencodeGoToggleDescription": "활성 워크스페이스에 대한 OpenCode Go 토큰 및 비용 사용량을 표시합니다.",
         "kimiToggleDescription": "활성 워크스페이스의 Kimi 구독 사용량을 표시합니다.",
         "minimaxToggleDescription": "활성 워크스페이스의 MiniMax 구독 사용량을 표시합니다.",
-        "sshToggleDescription": "사용 가능한 SSH 및 원격 OrcaBotmux 호스트가 있으면 표시합니다.",
+        "sshToggleDescription": "사용 가능한 SSH 및 원격 Botmux 호스트가 있으면 표시합니다.",
         "resourceUsageToggleDescription": "리소스 관리자를 표시합니다. 클릭하면 CPU, 메모리, 세션, 데몬 제어, 워크스페이스 디스크 스캔을 볼 수 있습니다.",
         "portsToggleDescription": "라이브 워크스페이스 포트를 표시합니다. 워크스페이스 범위 포트 및 외부 수신기를 보려면 클릭하세요.",
         "antigravityToggleDescription": "활성 워크스페이스에 대한 Antigravity 구독 사용량을 표시합니다.",
@@ -34,17 +34,17 @@
       },
       "menuBarIcon": {
         "title": "메뉴 바 아이콘 표시",
-        "description": "macOS 메뉴 바에 OrcaBotmux 바로가기 및 활동 표시기를 유지합니다."
+        "description": "macOS 메뉴 바에 Botmux 바로가기 및 활동 표시기를 유지합니다."
       }
     },
-    "orcaBotmuxBridge": {
+    "botmuxBridge": {
       "navTitle": "Botmux 세션",
-      "navDescription": "로컬 또는 SSH 원격 orca_botmux daemon/dashboard에 연결합니다(Feishu 세션).",
-      "searchLocal": "Local orca_botmux dashboard",
-      "searchSsh": "SSH remote orca_botmux",
-      "searchMulti": "Multi-host orca_botmux",
+      "navDescription": "로컬 또는 SSH 원격 botmux daemon/dashboard에 연결합니다(Feishu 세션).",
+      "searchLocal": "Local botmux dashboard",
+      "searchSsh": "SSH remote botmux",
+      "searchMulti": "Multi-host botmux",
       "searchSessions": "Botmux sessions",
-      "sidebarTitle": "orca_botmux",
+      "sidebarTitle": "botmux",
       "statusWorking": "작업 중",
       "statusStarting": "시작 중",
       "statusAnalyzing": "분석 중",
@@ -54,7 +54,7 @@
       "statusClosed": "닫힘",
       "statusUnknown": "알 수 없음",
       "sessionCountTitle": "세션 {{count}}개",
-      "controlPlaneTitle": "멀티 호스트 OrcaBotmux 제어 평면",
+      "controlPlaneTitle": "멀티 호스트 Botmux 제어 평면",
       "controlPlaneBody": "Connect local, platform tunnel, and multiple SSH remotes at once. Sessions merge with host labels. Pending ask-hooks appear above the session list (multi-question supported).",
       "connected": "Connected",
       "connectedHosts": "Connected hosts",
@@ -63,7 +63,7 @@
       "connectLocal": "로컬 연결",
       "local": "로컬",
       "platform": "플랫폼",
-      "platformTitle": "Use ~/.orca_botmux/platform.json machine URL",
+      "platformTitle": "Use ~/.botmux/platform.json machine URL",
       "addSsh": "SSH 추가",
       "addSshFromSettings": "Add SSH (from Settings → SSH)",
       "selectHost": "— select host —",
@@ -92,8 +92,8 @@
       "openedWeb": "Opened web terminal in browser tab",
       "openedExternal": "Opened in system browser",
       "openedTerminal": "Opened terminal",
-      "ipcMissing": "orcaBotmuxBridge IPC not available — rebuild desktop preload.",
-      "ipcMissingShort": "orcaBotmuxBridge unavailable — rebuild desktop.",
+      "ipcMissing": "botmuxBridge IPC not available — rebuild desktop preload.",
+      "ipcMissingShort": "botmuxBridge unavailable — rebuild desktop.",
       "openWorktreePty": "Open a worktree first for native PTY tabs.",
       "openWorktreePtyLong": "Open a worktree first, then use PTY for a native Desktop terminal tab.",
       "ptyUnavailable": "PTY relay unavailable",
@@ -128,13 +128,13 @@
       "localLabel": "Local",
       "disconnected": "Disconnect",
       "knownSshHosts": "Known SSH hosts",
-      "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach orca_botmux over that host.",
+      "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach botmux over that host.",
       "noKnownSsh": "No SSH hosts yet. Add them in Settings → SSH or import ~/.ssh/config.",
       "openSshSettings": "Open Settings → SSH",
       "connectBotmux": "Connect",
-      "botmuxLinked": "OrcaBotmux linked",
-      "orcaSshConnected": "SSH connected",
-      "orcaSshIdle": "SSH idle",
+      "botmuxLinked": "Botmux linked",
+      "botmuxSshConnected": "SSH connected",
+      "botmuxSshIdle": "SSH idle",
       "sourceConfig": "from ~/.ssh/config",
       "sourceManual": "manual",
       "manualOptional": "Manual destination (optional)",
@@ -143,7 +143,7 @@
       "attach": "Attach",
       "openedAttach": "Opened native terminal (tmux attach)",
       "filterWorktree": "이 작업 트리",
-      "worktreeSessionBadge": "{{count}} orca_botmux session(s) in this directory",
+      "worktreeSessionBadge": "{{count}} botmux session(s) in this directory",
       "addMachine": "머신 추가",
       "platformTunnel": "플랫폼 터널",
       "sshHostsSection": "SSH 호스트",
@@ -165,7 +165,7 @@
       "moreSessions": "{{count}}개 더…",
       "showLessSessions": "접기",
       "emptyMachinesTitle": "연결된 머신 없음",
-      "emptyMachinesHint": "이 머신 또는 SSH 호스트를 연결하면 여기에 orca_botmux 세션이 표시됩니다.",
+      "emptyMachinesHint": "이 머신 또는 SSH 호스트를 연결하면 여기에 botmux 세션이 표시됩니다.",
       "dismissError": "닫기",
       "showClosed": "Show closed ({{count}})",
       "hideClosed": "Hide closed",
@@ -183,8 +183,8 @@
   "menu": {
     "checkForUpdates": "업데이트 확인...",
     "settings": "설정",
-    "exploreOrca": "OrcaBotmux 둘러보기",
-    "gettingStarted": "OrcaBotmux 시작하기",
+    "exploreBotmux": "Botmux 둘러보기",
+    "gettingStarted": "Botmux 시작하기",
     "reportCrash": "크래시 신고...",
     "file": "파일",
     "exit": "종료",
@@ -195,7 +195,7 @@
     "showStatusBar": "상태 표시줄 표시",
     "showTasksButton": "작업 버튼 표시",
     "showAutomationsButton": "자동화 버튼 표시",
-    "showMobileButton": "OrcaBotmux 모바일 버튼 표시",
+    "showMobileButton": "Botmux 모바일 버튼 표시",
     "showTitlebarAppName": "제목 표시줄 앱 이름 표시",
     "view": "보기",
     "reload": "새로고침",
@@ -209,12 +209,12 @@
     "paste": "붙여넣기"
   },
   "tray": {
-    "openOrca": "OrcaBotmux 열기",
+    "openBotmux": "Botmux 열기",
     "quit": "종료",
     "minimizeNotice": {
-      "body": "OrcaBotmux가 시스템 트레이에서 계속 실행 중입니다"
+      "body": "Botmux가 시스템 트레이에서 계속 실행 중입니다"
     },
-    "activityWaiting": "OrcaBotmux - 활동 대기 중",
+    "activityWaiting": "Botmux - 활동 대기 중",
     "activityWaitingSuffix": "activity waiting"
   },
   "worktreeJumpPalette": {
@@ -238,7 +238,7 @@
       "1b3024bcd6": "플로팅 워크스페이스에 오류가 발생했습니다.",
       "8d1e160ed1": "사이드바를 다시 시도하거나 탭을 전환해 이 화면을 다시 불러오세요.",
       "ed6b168d00": "오른쪽 사이드바에 오류가 발생했습니다.",
-      "03a14f6b5b": "페이지를 다시 시도하거나 다른 OrcaBotmux 화면으로 이동하세요.",
+      "03a14f6b5b": "페이지를 다시 시도하거나 다른 Botmux 화면으로 이동하세요.",
       "b7a714db1e": "이 페이지에 오류가 발생했습니다.",
       "98d4ea2823": "이 워크스페이스에서 Terminal, 브라우저 또는 편집기 렌더링에 실패했습니다. 다시 시도해 보세요.",
       "5a9519aef0": "워크스페이스 워크벤치에 오류가 발생했습니다.",
@@ -250,7 +250,7 @@
       "df1d56bf87": "워크스페이스 셸에 오류가 발생했습니다.",
       "9e0b441a91": "오른쪽 사이드바 표시/숨기기",
       "e81217c1b7": "앱 이름 숨기기",
-      "5096cbbc86": "orca_botmux",
+      "5096cbbc86": "botmux",
       "8b0b8eb54f": "애플리케이션 메뉴",
       "caea5b51b9": "지금 재시작",
       "0a9e810705": "다시 시작할 때까지 변경사항이 저장되지 않습니다. 이전 탭은 디스크에 안전합니다.",
@@ -281,12 +281,12 @@
         "b411ec0069": "연결",
         "2cf9e5a294": "저장된 서버 지우기",
         "4a4c017be1": "엔드포인트:",
-        "27393856e4": "orca_botmux://pair?code=...",
+        "27393856e4": "botmux://pair?code=...",
         "7a566540de": "페어링 URL 또는 코드",
         "cb4d287238": "서버 이름",
-        "3affe7de3a": "이 브라우저가 연결할 수 있는 OrcaBotmux 서버의 페어링 URL을 붙여넣습니다.",
-        "e3bcd082ac": "OrcaBotmux에 연결",
-        "mobileScopeRejected": "이 QR 코드는 제한된(모바일) 액세스 권한만 제공합니다. 전체 웹 앱을 사용하려면 설정 → 원격 OrcaBotmux 서버 → 이 OrcaBotmux 서버 공유 → 새 링크에서 브라우저 액세스 링크를 여세요."
+        "3affe7de3a": "이 브라우저가 연결할 수 있는 Botmux 서버의 페어링 URL을 붙여넣습니다.",
+        "e3bcd082ac": "Botmux에 연결",
+        "mobileScopeRejected": "이 QR 코드는 제한된(모바일) 액세스 권한만 제공합니다. 전체 웹 앱을 사용하려면 설정 → 원격 Botmux 서버 → 이 Botmux 서버 공유 → 새 링크에서 브라우저 액세스 링크를 여세요."
       },
       "webPreloadApi": {
         "aiVaultUnavailableForHost": "이 실행 호스트에서는 Agent 세션 기록을 사용할 수 없습니다."
@@ -367,7 +367,7 @@
         },
         "worktrees": {
           "5a58e03a26": "\"{{value0}}\"을(를) 삭제했습니다.",
-          "d1d78a7baa": "Git이 \"{{value0}}\"{{value1}} 브랜치를 안전하게 삭제할 수 없어, 로컬 commits 손실을 방지하기 위해 OrcaBotmux가 브랜치를 유지했습니다.",
+          "d1d78a7baa": "Git이 \"{{value0}}\"{{value1}} 브랜치를 안전하게 삭제할 수 없어, 로컬 commits 손실을 방지하기 위해 Botmux가 브랜치를 유지했습니다.",
           "4e6496f3d2": "{{value0}} 삭제됨, 브랜치 유지됨",
           "e50495aae6": "브랜치 강제 삭제",
           "889487d8bb": "닫기",
@@ -376,21 +376,21 @@
           "fa9299a66f": "새 워크트리는 최신이지만 로컬 {{value0}}은(는) {{value1}} {{value2}} 뒤처져 있습니다. AI diff가 최근 commits을 놓칠 수 있습니다.",
           "14bc053a47": "로컬 {{value0}}이(가) 새로 고쳐지지 않았습니다.",
           "4a18052018": "로컬 {{value0}}이(가) {{value1}} 뒤에 있습니다.",
-          "903b51c2ed": "{{value0}}에서 워크스페이스를 만들었지만 {{value2}} 때문에 OrcaBotmux가 로컬 {{value1}}을(를) fast-forward할 수 없습니다.",
+          "903b51c2ed": "{{value0}}에서 워크스페이스를 만들었지만 {{value2}} 때문에 Botmux가 로컬 {{value1}}을(를) fast-forward할 수 없습니다.",
           "0216895fb5": "브랜치를 삭제하지 못했습니다.",
           "19db0085fb": "로컬 브랜치가 삭제되었습니다.",
           "2b0afc7f14": "로컬 {{value0}}을(를) 최신 상태로 유지할 수 없습니다.",
           "670864ab52": "로컬 {{value0}}을 최신 상태로 유지",
           "5366d13eec": "워크스페이스가 삭제되었고 브랜치는 유지되었습니다",
           "2e17f825d4": "워크트리가 삭제되었고 브랜치는 유지되었습니다",
-          "78e08cd877": "Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 OrcaBotmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
-          "3b57982bf6": "\"{{value1}}\" 워크스페이스를 삭제한 후 Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 OrcaBotmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
-          "81f13f48d2": "\"{{value1}}\" 워크트리를 삭제한 후 Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 OrcaBotmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
+          "78e08cd877": "Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 Botmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
+          "3b57982bf6": "\"{{value1}}\" 워크스페이스를 삭제한 후 Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 Botmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
+          "81f13f48d2": "\"{{value1}}\" 워크트리를 삭제한 후 Git이 \"{{value0}}\" 브랜치를 안전하게 삭제할 수 없어 Botmux가 로컬 커밋 손실을 방지하기 위해 유지했습니다.",
           "runtimeScopeForbiddenTitle": "이 연결은 제한된(모바일) 액세스입니다",
-          "runtimeScopeForbiddenDescription": "모바일 범위 페어링에서는 워크스페이스를 사용할 수 없습니다. 설정 → 원격 OrcaBotmux 서버 → 이 OrcaBotmux 서버 공유에서 브라우저 액세스 링크로 다시 연결하세요."
+          "runtimeScopeForbiddenDescription": "모바일 범위 페어링에서는 워크스페이스를 사용할 수 없습니다. 설정 → 원격 Botmux 서버 → 이 Botmux 서버 공유에서 브라우저 액세스 링크로 다시 연결하세요."
         },
         "repos": {
-          "2975400634": "이 런타임에서 Git이 아닌 폴더를 열려면 OrcaBotmux 서버를 업데이트하세요.",
+          "2975400634": "이 런타임에서 Git이 아닌 폴더를 열려면 Botmux 서버를 업데이트하세요.",
           "b7e14472ae": "폴더를 추가하지 못했습니다.",
           "e649269645": "선택한 호스트에 경로를 입력하려면 프로젝트 추가를 사용하세요.",
           "c6e022ddfc": "프로젝트를 추가하지 못했습니다.",
@@ -417,13 +417,13 @@
         "linear": {
           "37d36984d0": "더 새로운 요청이 있어 Linear 연결 요청을 건너뛰었습니다."
         },
-        "orca_botmux": {
+        "botmux": {
           "profiles": {
             "612f7f6861": "프로필을 생성하지 못했습니다",
             "319d7cf39b": "클라우드 프로필이 생성되었습니다",
             "d6e764e7db": "이 프로필을 다시 연결하세요",
             "f0c9e11a6d": "클라우드 프로필을 생성하지 못했습니다",
-            "8b8fa73174": "OrcaBotmux Cloud 로그인이 구성되어 있지 않습니다",
+            "8b8fa73174": "Botmux Cloud 로그인이 구성되어 있지 않습니다",
             "33290e88ed": "프로필을 연결하지 못했습니다",
             "9fcb07a796": "프로필이 연결되었습니다",
             "2f6c78a039": "프로필 인증을 새로 고치지 못했습니다",
@@ -478,13 +478,13 @@
         "skill": {
           "cli": {
             "prerequisite": {
-              "79371593b0": "OrcaBotmux CLI는 아직 PATH에 표시되지 않습니다.",
-              "e99d7dc36f": "OrcaBotmux CLI 등록에 주의가 필요함",
-              "2db0bd7515": "OrcaBotmux CLI 등록을 사용할 수 없습니다.",
-              "8d6eedf97e": "PATH에 OrcaBotmux CLI를 등록하지 못했습니다.",
-              "0f116999f1": "설정하기 전에 셸을 다시 시작하거나 OrcaBotmux CLI 디렉터리를 PATH에 추가하세요.",
-              "15cbedc3e3": "agent 스킬 설정을 실행하기 전에 OrcaBotmux CLI를 설치하십시오.",
-              "windowsPathUnknown": "OrcaBotmux could not check your Windows user PATH"
+              "79371593b0": "Botmux CLI는 아직 PATH에 표시되지 않습니다.",
+              "e99d7dc36f": "Botmux CLI 등록에 주의가 필요함",
+              "2db0bd7515": "Botmux CLI 등록을 사용할 수 없습니다.",
+              "8d6eedf97e": "PATH에 Botmux CLI를 등록하지 못했습니다.",
+              "0f116999f1": "설정하기 전에 셸을 다시 시작하거나 Botmux CLI 디렉터리를 PATH에 추가하세요.",
+              "15cbedc3e3": "agent 스킬 설정을 실행하기 전에 Botmux CLI를 설치하십시오.",
+              "windowsPathUnknown": "Botmux could not check your Windows user PATH"
             }
           }
         }
@@ -669,7 +669,7 @@
         "create": {
           "error": {
             "format": {
-              "37cf0bc991": "OrcaBotmux가 이 워크스페이스에 대해 사용 가능한 기본 참조를 확인할 수 없습니다.",
+              "37cf0bc991": "Botmux가 이 워크스페이스에 대해 사용 가능한 기본 참조를 확인할 수 없습니다.",
               "64555d0014": "기본 브랜치를 찾을 수 없습니다."
             }
           }
@@ -693,10 +693,10 @@
           "unavailable": "폴더를 확인할 수 없습니다"
         },
         "description": {
-          "missing": "OrcaBotmux가 {{path}}을(를) 찾을 수 없습니다. 이 폴더 워크스페이스를 제거하고 다시 가져오세요.",
+          "missing": "Botmux가 {{path}}을(를) 찾을 수 없습니다. 이 폴더 워크스페이스를 제거하고 다시 가져오세요.",
           "notDirectory": "{{path}}이(가) 존재하지만 폴더가 아닙니다.",
-          "ambiguousConnection": "OrcaBotmux가 이 폴더 범위를 소유한 SSH 연결을 확인할 수 없습니다.",
-          "unavailable": "OrcaBotmux가 지금 이 폴더를 확인할 수 없습니다. 런타임 또는 SSH 연결을 확인한 후 다시 시도하세요."
+          "ambiguousConnection": "Botmux가 이 폴더 범위를 소유한 SSH 연결을 확인할 수 없습니다.",
+          "unavailable": "Botmux가 지금 이 폴더를 확인할 수 없습니다. 런타임 또는 SSH 연결을 확인한 후 다시 시도하세요."
         },
         "createError": {
           "title": {
@@ -707,10 +707,10 @@
             "generic": "폴더 워크스페이스를 만들지 못했습니다"
           },
           "description": {
-            "missing": "OrcaBotmux가 {{path}}을(를) 찾을 수 없습니다. 폴더를 제거하고 다시 가져오세요.",
+            "missing": "Botmux가 {{path}}을(를) 찾을 수 없습니다. 폴더를 제거하고 다시 가져오세요.",
             "notDirectory": "{{path}}이(가) 존재하지만 폴더가 아닙니다.",
-            "ambiguousConnection": "OrcaBotmux가 이 폴더 범위를 소유한 SSH 연결을 확인할 수 없습니다.",
-            "unavailable": "OrcaBotmux가 지금 이 폴더를 확인할 수 없습니다. 런타임 또는 SSH 연결을 확인한 후 다시 시도하세요."
+            "ambiguousConnection": "Botmux가 이 폴더 범위를 소유한 SSH 연결을 확인할 수 없습니다.",
+            "unavailable": "Botmux가 지금 이 폴더를 확인할 수 없습니다. 런타임 또는 SSH 연결을 확인한 후 다시 시도하세요."
           }
         }
       },
@@ -729,7 +729,7 @@
       "blocked": {
         "notification": {
           "fallback": {
-            "de50bef680": "macOS가 OrcaBotmux 알림을 차단하고 있습니다"
+            "de50bef680": "macOS가 Botmux 알림을 차단하고 있습니다"
           }
         }
       },
@@ -814,8 +814,8 @@
         "31e57d1c70": "SSH를 통해 기존 머신의 파일, terminals, Git, 워크스페이스를 사용합니다.",
         "94a5afe910": "SSH 호스트",
         "40d80bad8a": "베타",
-        "de0c2907a1": "원격 OrcaBotmux 서버",
-        "b351014180": "OrcaBotmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
+        "de0c2907a1": "원격 Botmux 서버",
+        "b351014180": "Botmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
         "d72a58b5b9": "통계 및 사용량",
         "dcd0d9b74f": "일반 작업에 대한 키보드 단축키입니다.",
         "94295ebfb3": "단축키",
@@ -827,7 +827,7 @@
         "93d88d20bf": "외관",
         "2d0659f6f0": "전역 terminal, 브라우저 및 markdown 탭.",
         "65b19f5bde": "플로팅 워크스페이스",
-        "3d65d3f1b9": "OrcaBotmux 및 코딩 agents의 모바일 에뮬레이터 지원을 구성합니다.",
+        "3d65d3f1b9": "Botmux 및 코딩 agents의 모바일 에뮬레이터 지원을 구성합니다.",
         "1e761cff2b": "모바일 에뮬레이터",
         "e815fd01bd": "홈페이지, 링크 라우팅 및 세션 쿠키.",
         "8c197f74a1": "브라우저",
@@ -844,16 +844,16 @@
         "2cd4ea75da": "워크스페이스 기본값, 앱 설정 및 유지 관리.",
         "13241992bd": "일반",
         "724c440e72": "시작하기",
-        "0505d0df29": "OrcaBotmux 시작하기",
+        "0505d0df29": "Botmux 시작하기",
         "ea0b1bc7b8": "설정 가이드",
         "17005c73d4": "설정 및 마일스톤 단계에 대한 온보딩 체크리스트를 엽니다.",
         "ded9e9032f": "온보딩 체크리스트",
-        "5f32ac08f3": "핵심 OrcaBotmux 워크플로에 대한 온보딩 체크리스트를 완료하세요.",
+        "5f32ac08f3": "핵심 Botmux 워크플로에 대한 온보딩 체크리스트를 완료하세요.",
         "8ac3de82f5": "온디바이스 모델을 사용한 로컬 음성-텍스트 받아쓰기.",
         "6a50cdcd7c": "음성",
         "0059bd17f3": "agents가 컴퓨터의 모든 앱을 제어할 수 있도록 하세요.",
         "b35e92364b": "컴퓨터 사용",
-        "cd50cec5d7": "OrcaBotmux를 통해 여러 코딩 agents를 조정합니다.",
+        "cd50cec5d7": "Botmux를 통해 여러 코딩 agents를 조정합니다.",
         "58a868e8e4": "오케스트레이션",
         "7c79d3b7bf": "선택 사항",
         "b1c2f8b0ac": "Claude, Codex, Gemini, OpenCode Go, MiniMax, Grok의 선택적 계정 전환 및 사용량 설정.",
@@ -1202,13 +1202,13 @@
         "76a95f7f47": "생성",
         "f05d237049": "먼저 프로젝트를 추가하세요.",
         "f9eaa9e12d": "프로젝트 추가",
-        "6ca6ff404e": "orca_botmux",
-        "520304a067": "OrcaBotmux 로고",
+        "6ca6ff404e": "botmux",
+        "520304a067": "Botmux 로고",
         "ce44fad849": "종속성 누락",
         "c1cf168479": "숨기기",
         "00cee697c1": "GitHub 계정을 연결하려면 terminal에서 \"gh auth login\"을 실행하세요.",
         "9f96d018b7": "GitHub CLI가 인증되지 않았습니다.",
-        "73e1ad4282": "OrcaBotmux는 GitHub CLI(gh)를 사용하여 PR, 이슈 및 검사를 표시합니다.",
+        "73e1ad4282": "Botmux는 GitHub CLI(gh)를 사용하여 PR, 이슈 및 검사를 표시합니다.",
         "5beaef5f9e": "GitHub CLI가 설치되지 않았습니다.",
         "b673e7cf1b": "Git 프로젝트, 소스 제어 및 워크스페이스 관리에는 Git이 필요합니다.",
         "e5b7296d9d": "Git이 설치되지 않았습니다.",
@@ -1337,12 +1337,12 @@
         "dccd26d4e4": "프로젝트 선택",
         "d6b0a96f32": "프로젝트 추가",
         "969a8bff66": "프로젝트",
-        "23bb365554": "orca_botmux.yaml",
+        "23bb365554": "botmux.yaml",
         "a239038146": "SSH 연결 오류",
         "9a70e4859e": "이 워크스페이스를 만들기 전에 설정을 실행할지 여부를 선택하세요.",
         "803b7fe72f": "설정 구성을 확인하는 중...",
         "92e34f0311": "로컬 설정",
-        "326a578923": "orca_botmux.yaml + 로컬",
+        "326a578923": "botmux.yaml + 로컬",
         "2132b670da": "둘 다",
         "0e587e31fb": "yaml",
         "ac3748dcda": "이름 또는 '다음에서 만들기'",
@@ -1599,9 +1599,9 @@
         "92b0f9d921": "인증된 후 다시 시도하세요.",
         "cd8c34aac1": "gh",
         "cf82170065": "repo에 스타를 표시할 수 없습니다. 다음을 확인하세요",
-        "30c36231c1": "OrcaBotmux는 오픈 소스입니다. 오늘 도움이 되었다면 GitHub 스타가 다른 개발자가 OrcaBotmux를 찾는 데 도움이 됩니다.",
+        "30c36231c1": "Botmux는 오픈 소스입니다. 오늘 도움이 되었다면 GitHub 스타가 다른 개발자가 Botmux를 찾는 데 도움이 됩니다.",
         "b5e685e4d9": "닫기",
-        "5f6df21046": "OrcaBotmux를 즐기고 있나요?",
+        "5f6df21046": "Botmux를 즐기고 있나요?",
         "2d67b6c849": "GitHub에서 별표 주기",
         "af3c9bbb37": "스타 표시 중…",
         "68a41bc3aa": "별표를 추가할 수 없음:",
@@ -1956,8 +1956,8 @@
       },
       "UpdateCard": {
         "68b235d264": "업데이트하려면 다시 시작하세요.",
-        "6714206e5a": "OrcaBotmux v{{value0}}이(가) 다운로드되었습니다. 준비가 되면 다시 시작하세요.",
-        "93794ea932": "OrcaBotmux v{{value0}}을(를) 다운로드 중입니다.",
+        "6714206e5a": "Botmux v{{value0}}이(가) 다운로드되었습니다. 준비가 되면 다시 시작하세요.",
+        "93794ea932": "Botmux v{{value0}}을(를) 다운로드 중입니다.",
         "8acbdd3961": "상태 표시줄로 최소화",
         "17412483da": "설치 준비 완료",
         "47126bcf57": "수동으로 다운로드",
@@ -1969,7 +1969,7 @@
         "ec8fe71cfc": "업데이트",
         "44324ef542": "릴리스 노트",
         "fdd4a364fa": "세션은 중단되지 않습니다.",
-        "05ad78a6d1": "OrcaBotmux v{{value0}}이(가) 준비되었습니다.",
+        "05ad78a6d1": "Botmux v{{value0}}이(가) 준비되었습니다.",
         "318d3b4bc7": "업데이트 닫기",
         "9abc59f814": "업데이트 가능",
         "aad383aecc": "전체 릴리스 노트 읽기",
@@ -1991,7 +1991,7 @@
         "522df222b9": "스피너",
         "e944c2de43": "Update Verification Blocked",
         "5b309b19f3": "Update Wasn't Installed",
-        "092f09fc14": "The installer's publisher doesn't match OrcaBotmux, so we stopped the update. Don't install this download; check official releases for a corrected version.",
+        "092f09fc14": "The installer's publisher doesn't match Botmux, so we stopped the update. Don't install this download; check official releases for a corrected version.",
         "c9ff9b9ec2": "Check official releases",
         "a05992a26b": "The signature check couldn't run — usually because antivirus software blocked it. Retry the download, or get the installer from our official releases.",
         "5194358929": "Hide details",
@@ -2012,7 +2012,7 @@
         "1ebe225fee": "워크트리, 설정, 탭 및 작업 검색...",
         "4e4ff044d5": "작업 트리, 설정, 탭 및 작업 검색",
         "4ee378034d": "다음으로 이동...",
-        "f7fda8d562": "워크트리를 만들거나 OrcaBotmux에서 탭을 열어 시작하세요.",
+        "f7fda8d562": "워크트리를 만들거나 Botmux에서 탭을 열어 시작하세요.",
         "1628fd7dfa": "활성 워크트리, 설정, 작업 또는 열린 탭이 없습니다.",
         "b781ae05e3": "작업 트리, 설정, 탭 및 작업을 검색하려면 입력하세요.",
         "f60f8730be": "전환할 다른 워크트리가 없습니다.",
@@ -2165,21 +2165,21 @@
             "463f1205c0": "프로젝트 보기 로드 중",
             "23b87ba9f7": "GitHub에서 열기",
             "4d2a77a119": "기능 요청 제출",
-            "1bf8c01c8b": "OrcaBotmux에서 이 프로젝트를 사용하려면 테이블 보기로 전환하세요.",
+            "1bf8c01c8b": "Botmux에서 이 프로젝트를 사용하려면 테이블 보기로 전환하세요.",
             "55de4fb57a": "{{value0}}. {{value1}} {{value2}}에 기능 요청을 제출하세요.",
-            "2edf5e7e77": "{{value0}} — OrcaBotmux는 아직 {{value1}} 프로젝트 보기를 지원하지 않습니다. {{value2}}에 기능 요청을 제출하세요.",
+            "2edf5e7e77": "{{value0}} — Botmux는 아직 {{value1}} 프로젝트 보기를 지원하지 않습니다. {{value2}}에 기능 요청을 제출하세요.",
             "7245c3d7ac": "검색 지우기",
             "c5bc7ec007": "보기 필터: {{value0}}",
             "840c268665": "repo 추가",
             "dffa899f36": "취소",
-            "7037c8f5f1": "OrcaBotmux에 없는 Repos",
+            "7037c8f5f1": "Botmux에 없는 Repos",
             "512fc171d6": "시작하려면 프로젝트를 선택하세요.",
             "71fb69926c": "새로고침",
             "a8fa0d2bf5": "새로고침 중",
             "fd15491034": "GitHub에서 보기 열기",
             "22df63c393": "토큰에 대한 하위 이슈 데이터를 사용할 수 없습니다.",
             "067119985c": "GitHub 검색, 예: assignee:@me is:open",
-            "1850fceac8": "{{value0}}/{{value1}}이(가) OrcaBotmux에 추가되어 있지 않습니다. 작업을 시작하려면 추가하거나 GitHub에서 여세요.",
+            "1850fceac8": "{{value0}}/{{value1}}이(가) Botmux에 추가되어 있지 않습니다. 작업을 시작하려면 추가하거나 GitHub에서 여세요.",
             "1aa7c952b9": "프로젝트 보기",
             "f352abf7c3": "리포지토리 목록을 업데이트 중입니다.",
             "1ce21b8cff": "이 항목은 선택한 리포지토리 밖에 있습니다.",
@@ -2290,7 +2290,7 @@
                 "5509443543": "GitHub API 예산 로드 중…",
                 "34973d4695": "GitHub API 예산을 사용할 수 없습니다.",
                 "d12d3d6f33": "GitHub API 예산 새로 고침",
-                "d5e5de9070": "OrcaBotmux는 GitHub CLI를 통해 REST, 검색 및 GraphQL을 사용합니다.",
+                "d5e5de9070": "Botmux는 GitHub CLI를 통해 REST, 검색 및 GraphQL을 사용합니다.",
                 "58c5f88216": "GitHub API 예산",
                 "6da1858354": "남음 · 재설정까지",
                 "f42790d150": "/",
@@ -2357,7 +2357,7 @@
               "e603ee9156": "워크스페이스 API 설정",
               "dc7ccb0f7c": "개인 API 키",
               "e3100b36b9": "멤버 API 키가 차단된 경우 워크스페이스 관리자에게 워크스페이스 API 설정에서 이를 허용하도록 요청하세요.",
-              "d56d3629f4": "OrcaBotmux가 해당 워크스페이스에서 계정으로 액세스할 수 있는 모든 팀을 표시해야 하는 경우 전체 액세스를 선호합니다. 제한된 키는 허용된 팀만 노출하며 비공개 팀에서는 키 소유자에게 액세스 권한이 필요합니다.",
+              "d56d3629f4": "Botmux가 해당 워크스페이스에서 계정으로 액세스할 수 있는 모든 팀을 표시해야 하는 경우 전체 액세스를 선호합니다. 제한된 키는 허용된 팀만 노출하며 비공개 팀에서는 키 소유자에게 액세스 권한이 필요합니다.",
               "af52a6227f": "계정 > 보안 및 액세스에서 개인 API 키를 생성하세요.",
               "edec49dfae": "lin_api_...",
               "7d498f653c": "개인 API 키",
@@ -2512,7 +2512,7 @@
             "7eee951968": "워크스페이스 안전성 확인 중",
             "191f0bc98e": "닫기",
             "7ae2ad30f4": "새로고침",
-            "e0b5a4deaa": "로컬 파일과 OrcaBotmux 상태를 삭제하기 전에 비활성 워크스페이스를 확인하세요.",
+            "e0b5a4deaa": "로컬 파일과 Botmux 상태를 삭제하기 전에 비활성 워크스페이스를 확인하세요.",
             "b2c1331844": "비활성 워크스페이스 삭제",
             "41d594d01e": "{{value0}} 워크스페이스{{value1}}을(를) 제거할 수 없습니다.",
             "0f00612b6d": "{{value0}} 워크스페이스{{value1}}을(를) 삭제했습니다.",
@@ -2762,7 +2762,7 @@
             "6bee0c8f17": "디스크 공간 분석기 열기",
             "ae20d0ffc2": "닫기",
             "38c282a2c4": "분석기는 여기에서 직접 열립니다. 나중에 공간 분석기를 선택하여 왼쪽 하단 도구 상자 메뉴에서 열 수도 있습니다.",
-            "e2fcf07c0d": "로컬 저장소가 가득 찼거나 쓸 수 없기 때문에 OrcaBotmux가 이 terminal 세션을 저장할 수 없습니다. 디스크 공간 분석기를 열어 정리할 수 있는 워크스페이스 저장소를 찾으세요.",
+            "e2fcf07c0d": "로컬 저장소가 가득 찼거나 쓸 수 없기 때문에 Botmux가 이 terminal 세션을 저장할 수 없습니다. 디스크 공간 분석기를 열어 정리할 수 있는 워크스페이스 저장소를 찾으세요.",
             "678c780a2c": "디스크 공간을 사용할 수 없습니다."
           },
           "osc52": {
@@ -3119,9 +3119,9 @@
             "298f4be7f2": "CPU",
             "2aa2de6cb9": "이름",
             "30ff2c3c31": "고아 {{value0}}개",
-            "6449a95c78": "OrcaBotmux 추적 프로세스가 사용 중인 이 시스템의 물리적 RAM 크기입니다.",
+            "6449a95c78": "Botmux 추적 프로세스가 사용 중인 이 시스템의 물리적 RAM 크기입니다.",
             "e7ccce7e87": "시스템 RAM",
-            "9e2525c89f": "OrcaBotmux가 보유한 상주 메모리와 각 작업 트리 terminals 아래의 프로세스입니다.",
+            "9e2525c89f": "Botmux가 보유한 상주 메모리와 각 작업 트리 terminals 아래의 프로세스입니다.",
             "1fedf94eae": "결합된 CPU 로드. 100%를 초과하는 값은 두 개 이상의 코어가 동시에 작동하고 있음을 의미합니다.",
             "e7cf14ec78": "Terminal 세션을 사용할 수 없습니다. 목록이 오래되었을 수 있습니다.",
             "93b0de3c21": "다시 시작",
@@ -3137,9 +3137,9 @@
             "bbcd9b7b85": "워크스페이스 축소",
             "c4a8968bdd": "워크스페이스 확장",
             "b10695d6ce": "세션 종료",
-            "288a4dd177": "orca_botmux",
-            "53dd5560ae": "OrcaBotmux 접기",
-            "e419d27083": "OrcaBotmux 확장",
+            "288a4dd177": "botmux",
+            "53dd5560ae": "Botmux 접기",
+            "e419d27083": "Botmux 확장",
             "41ae4fa725": "종료 중…",
             "138b99bd80": "이번 세션",
             "888dad8c55": "로드 중…",
@@ -3255,10 +3255,10 @@
             "2201df6987": "업데이트 실패 - 세부정보를 보려면 클릭하세요.",
             "8533c12c3c": "업데이트 실패",
             "962404f68e": "업데이트 설치 준비가 완료되었습니다. 확장하려면 클릭하세요.",
-            "248ee5d8ef": "OrcaBotmux v{{value0}} 다운로드 중… {{value1}}%",
+            "248ee5d8ef": "Botmux v{{value0}} 다운로드 중… {{value1}}%",
             "57a29c3b0e": "업데이트 준비됨",
             "fd1d3b3a1d": "업데이트 다운로드 중, {{value0}}퍼센트. 확장하려면 클릭하세요.",
-            "9d13213a56": "OrcaBotmux v{{value0}} 설치 준비 완료"
+            "9d13213a56": "Botmux v{{value0}} 설치 준비 완료"
           },
           "WorkspaceSpaceCompactPanel": {
             "a471aa9c24": "업데이트됨",
@@ -3401,9 +3401,9 @@
             "cabdc2a9e0": "Claude 로그인 자격 증명을 읽을 수 없습니다.",
             "a7517cccb6": "현재 Claude 사용량을 사용할 수 없습니다.",
             "e2c6a4f917": "Run Grok to refresh",
-            "d1b7f509ac": "Run grok in a terminal on the computer running OrcaBotmux and wait for it to start. If prompted, complete sign-in, then retry usage. You do not need to send a chat message.",
+            "d1b7f509ac": "Run grok in a terminal on the computer running Botmux and wait for it to start. If prompted, complete sign-in, then retry usage. You do not need to send a chat message.",
             "f90b3d7a16": "Run Kimi to refresh",
-            "a37e8c15d4": "Run kimi in a terminal on the computer running OrcaBotmux and wait for it to start, then retry usage."
+            "a37e8c15d4": "Run kimi in a terminal on the computer running Botmux and wait for it to start, then retry usage."
           },
           "SshTargetStatusRow": {
             "sshHost": "SSH 호스트"
@@ -3467,7 +3467,7 @@
           "6afacbee37": "Claude 사용량 추적",
           "0cb1a36d7d": "토큰, 모델 및 세션 통계를 표시하기 위해 로컬 Claude 사용 로그를 읽습니다.",
           "5ce4842c2c": "모든 로컬 Claude 사용",
-          "4f8368c272": "OrcaBotmux 작업 트리만 해당",
+          "4f8368c272": "Botmux 작업 트리만 해당",
           "cfe2282ffa": "알 수 없음",
           "7765a4c3e1": "해당 없음",
           "2d41fd45c6": "• 마지막 스캔 오류: {{value0}}",
@@ -3519,7 +3519,7 @@
           "408210470c": "Codex 사용 추적",
           "13badcd8f2": "토큰, 모델 및 세션 통계를 표시하기 위해 로컬 Codex 사용 로그를 읽습니다.",
           "4fe8820098": "모든 로컬 Codex 사용",
-          "201766b754": "OrcaBotmux 작업 트리만 해당",
+          "201766b754": "Botmux 작업 트리만 해당",
           "bf6cf2d4dd": "알 수 없음",
           "ae255c3dba": "해당 없음",
           "247c93ca92": "• 추정 가격",
@@ -3563,7 +3563,7 @@
           "bea80ceae0": "OpenCode 사용 추적",
           "b8b3522436": "토큰, 모델 및 세션 통계를 표시하기 위해 로컬 OpenCode 사용 로그를 읽습니다.",
           "144a6050e9": "모든 로컬 OpenCode 사용",
-          "e04c58327c": "OrcaBotmux 작업 트리만 해당",
+          "e04c58327c": "Botmux 작업 트리만 해당",
           "362231082f": "알 수 없음",
           "8095a63426": "해당 없음",
           "6cc7782458": "• 마지막 스캔 오류: {{value0}}",
@@ -3586,7 +3586,7 @@
           "2d9eb39264": "총 토큰",
           "beb6f24f37": "예상 비용",
           "da62578d9d": "사용량",
-          "0eb31e79ee": "OrcaBotmux IDE",
+          "0eb31e79ee": "Botmux IDE",
           "960324e9b8": "이벤트",
           "6adac63cfe": "턴"
         },
@@ -3629,7 +3629,7 @@
         "share": {
           "card": {
             "utils": {
-              "19f4b4dc75": "github.com/stablyai/orca_botmux",
+              "19f4b4dc75": "github.com/stablyai/botmux",
               "d864fc5f98": "출력",
               "5d66fdd7c2": "입력",
               "7080aeaebb": "추론",
@@ -3655,7 +3655,7 @@
             "0bba8ca244": "통계",
             "0e2a0b6431": "사용량",
             "372debfac0": "통계",
-            "26bb901fcd": "OrcaBotmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
+            "26bb901fcd": "Botmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
             "cb2430ae6a": "통계 및 사용량",
             "f8a1b2c3d4": "grok",
             "e7f0a1b2c3": "구독",
@@ -3782,16 +3782,16 @@
           "0c74e7ff34": "로컬"
         },
         "SkillFreshnessNudge": {
-          "titleOne": "설치된 OrcaBotmux 스킬이 오래되었습니다",
-          "titleMany": "설치된 OrcaBotmux 스킬 {{value0}}개가 오래되었습니다",
+          "titleOne": "설치된 Botmux 스킬이 오래되었습니다",
+          "titleMany": "설치된 Botmux 스킬 {{value0}}개가 오래되었습니다",
           "updateOne": "스킬 업데이트",
           "updateMany": "스킬 업데이트",
-          "description": "Agents가 이 버전의 OrcaBotmux에 대한 최신 지침을 따르도록 {{value0}}을(를) 업데이트하세요."
+          "description": "Agents가 이 버전의 Botmux에 대한 최신 지침을 따르도록 {{value0}}을(를) 업데이트하세요."
         },
         "SkillFreshnessRow": {
           "statusUpdateAvailable": "업데이트 있음",
           "statusCantUpdate": "업데이트할 수 없음",
-          "cantUpdateReason": "이 스킬은 OrcaBotmux가 안전하게 업데이트할 수 없는 위치에 설치되어 있어, npx skills update 명령이 변경하지 않습니다.",
+          "cantUpdateReason": "이 스킬은 Botmux가 안전하게 업데이트할 수 없는 위치에 설치되어 있어, npx skills update 명령이 변경하지 않습니다.",
           "chipCurrent": "최신",
           "chipUnrecognized": "인식 안 됨",
           "chipInaccessible": "액세스 불가",
@@ -3802,35 +3802,35 @@
           "chipInRepo": "저장소 내",
           "chipPluginCache": "플러그인 캐시",
           "tipCurrent": "여기 있는 스킬은 이미 최신이므로 업데이트해도 변경되지 않습니다.",
-          "tipUnrecognized": "여기 있는 스킬의 콘텐츠가 어떤 공식 버전과도 일치하지 않아 OrcaBotmux가 안전하게 업데이트할 수 없습니다. 업데이트를 허용하려면 여기 있는 항목을 제거하거나 교체하세요.",
-          "tipInaccessible": "OrcaBotmux가 여기 있는 스킬을 읽지 못해(권한 또는 파일 오류) 확인하거나 업데이트할 수 없습니다.",
+          "tipUnrecognized": "여기 있는 스킬의 콘텐츠가 어떤 공식 버전과도 일치하지 않아 Botmux가 안전하게 업데이트할 수 없습니다. 업데이트를 허용하려면 여기 있는 항목을 제거하거나 교체하세요.",
+          "tipInaccessible": "Botmux가 여기 있는 스킬을 읽지 못해(권한 또는 파일 오류) 확인하거나 업데이트할 수 없습니다.",
           "tipDuplicate": "이 스킬은 기본 위치와 별개로 여기에도 설치되어 있어 npx skills update 명령이 접근할 수 없습니다. 업데이트를 허용하려면 제거하세요.",
-          "tipExternalLink": "OrcaBotmux의 스킬 폴더 바깥을 가리키는 바로 가기입니다. 업데이트가 이를 따라가지 않습니다.",
+          "tipExternalLink": "Botmux의 스킬 폴더 바깥을 가리키는 바로 가기입니다. 업데이트가 이를 따라가지 않습니다.",
           "tipBrokenLink": "더 이상 존재하지 않는 대상을 가리키는 바로 가기입니다. 삭제해도 됩니다.",
           "tipReadOnly": "여기 있는 스킬은 읽기 전용 위치에 있어 권한을 변경해야 업데이트할 수 있습니다.",
-          "tipInRepo": "여기 있는 스킬은 전역 스킬이 아니라 프로젝트 안에 있습니다. OrcaBotmux는 전역 스킬만 업데이트합니다.",
+          "tipInRepo": "여기 있는 스킬은 전역 스킬이 아니라 프로젝트 안에 있습니다. Botmux는 전역 스킬만 업데이트합니다.",
           "tipPluginCache": "여기 있는 스킬은 플러그인이 관리합니다. 대신 플러그인을 업데이트하세요.",
-          "skippedReasonUnrecognized": "The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. OrcaBotmux left it out of the update so it won’t overwrite it. Remove it if you want OrcaBotmux to update this skill.",
-          "skippedReasonReadOnly": "This copy is in a read-only location, so OrcaBotmux left it out of the update. Change its permissions to let OrcaBotmux update it.",
-          "skippedReasonInaccessible": "OrcaBotmux couldn’t read this copy, so it left the skill out of the update.",
-          "skippedReasonInRepo": "This is a project skill, not a global one — OrcaBotmux only updates your global skills, so it left this out of the update.",
-          "skippedReasonPluginCache": "A plugin manages this skill, so OrcaBotmux left it out of the update — update the plugin instead.",
-          "skippedReasonExternalLink": "This copy is a shortcut pointing outside OrcaBotmux’s skill folders, so OrcaBotmux left it out of the update.",
-          "skippedReasonBrokenLink": "This copy is a shortcut to something that no longer exists, so OrcaBotmux left it out — you can safely delete it."
+          "skippedReasonUnrecognized": "The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. Botmux left it out of the update so it won’t overwrite it. Remove it if you want Botmux to update this skill.",
+          "skippedReasonReadOnly": "This copy is in a read-only location, so Botmux left it out of the update. Change its permissions to let Botmux update it.",
+          "skippedReasonInaccessible": "Botmux couldn’t read this copy, so it left the skill out of the update.",
+          "skippedReasonInRepo": "This is a project skill, not a global one — Botmux only updates your global skills, so it left this out of the update.",
+          "skippedReasonPluginCache": "A plugin manages this skill, so Botmux left it out of the update — update the plugin instead.",
+          "skippedReasonExternalLink": "This copy is a shortcut pointing outside Botmux’s skill folders, so Botmux left it out of the update.",
+          "skippedReasonBrokenLink": "This copy is a shortcut to something that no longer exists, so Botmux left it out — you can safely delete it."
         },
         "SkillFreshnessUpdateDialog": {
           "title": "스킬 업데이트",
-          "checking": "설치된 OrcaBotmux 스킬을 확인하는 중…",
-          "none": "설치된 OrcaBotmux 스킬을 찾을 수 없습니다.",
+          "checking": "설치된 Botmux 스킬을 확인하는 중…",
+          "none": "설치된 Botmux 스킬을 찾을 수 없습니다.",
           "updateOne": "스킬 1개를 안전하게 업데이트할 수 있습니다",
           "updateMany": "스킬 {{value0}}개를 안전하게 업데이트할 수 있습니다",
-          "success": "설치된 OrcaBotmux 스킬이 모두 최신 상태입니다.",
-          "attention": "일부 설치된 OrcaBotmux 스킬은 자동으로 업데이트할 수 없습니다.",
+          "success": "설치된 Botmux 스킬이 모두 최신 상태입니다.",
+          "attention": "일부 설치된 Botmux 스킬은 자동으로 업데이트할 수 없습니다.",
           "attentionDescription": "각 항목을 업데이트할 수 없는 이유는 업데이트 세부 정보를 열어 확인하세요.",
           "details": "업데이트 세부 정보",
-          "terminalTitle": "OrcaBotmux 스킬 업데이트",
+          "terminalTitle": "Botmux 스킬 업데이트",
           "terminalDescription": "미리 입력된 명령을 검토한 후 Enter 키를 눌러 실행하세요.",
-          "terminalAria": "OrcaBotmux 스킬 업데이트 터미널",
+          "terminalAria": "Botmux 스킬 업데이트 터미널",
           "checkNow": "지금 확인",
           "close": "닫기"
         },
@@ -3844,7 +3844,7 @@
         "AddProjectFromFolderDialog": {
           "7d1f51678c": "프로젝트 추가",
           "7726a16374": "취소",
-          "046751dbfb": "이 폴더를 별도의 OrcaBotmux 프로젝트로 추가합니다.",
+          "046751dbfb": "이 폴더를 별도의 Botmux 프로젝트로 추가합니다.",
           "e643b30398": "원격 프로젝트가 추가되었습니다."
         },
         "AddRepoCreateStep": {
@@ -3857,7 +3857,7 @@
           "45b7c26034": "프로젝트 생성",
           "85085d74d2": "만드는 중…",
           "c7b9f94456": "새 프로젝트 만들기",
-          "b100311784": "이름을 지정하면 OrcaBotmux가 적절한 기본값으로 실제 프로젝트를 만듭니다.",
+          "b100311784": "이름을 지정하면 Botmux가 적절한 기본값으로 실제 프로젝트를 만듭니다.",
           "685b5eefe1": "{{parent}}의 {{kind}}",
           "2a762f3b19": "이 호스트에서 Git 확인 중...",
           "fe1e616c5b": "프로젝트를 만들려면 Git이 필요합니다.",
@@ -3877,7 +3877,7 @@
           "cf9d382ca1": "가져오기",
           "220dd32d83": "스캔 중...",
           "fb33359f69": "이 저장소들을 그룹으로 묶을까요?",
-          "d75170194e": "이 프로젝트들이 함께 속한 경우(모노레포이거나 단순히 관련된 저장소 모음) 이 옵션을 선택하세요. OrcaBotmux가 그룹으로 묶고 상위 폴더에서 작업할 수 있게 합니다.",
+          "d75170194e": "이 프로젝트들이 함께 속한 경우(모노레포이거나 단순히 관련된 저장소 모음) 이 옵션을 선택하세요. Botmux가 그룹으로 묶고 상위 폴더에서 작업할 수 있게 합니다.",
           "39d51212cc": "그룹 이름",
           "aa0247680d": "아니요, 별도로 가져오기",
           "a0bc4d1f8e": "예, 그룹으로 가져오기",
@@ -3927,7 +3927,7 @@
           "0f8aba944c": "디렉터리로 이동한 후 선택을 클릭하여 선택합니다."
         },
         "AddRepoStartSteps": {
-          "acf895cb42": "OrcaBotmux를 시작하려면 프로젝트를 추가하세요.",
+          "acf895cb42": "Botmux를 시작하려면 프로젝트를 추가하세요.",
           "d13757911c": "프로젝트 추가",
           "d301db1c9a": "repos를 스캔하는 중입니다. 중지하려면 클릭하세요.",
           "69ea7f8dc4": "스캔 중지",
@@ -3960,7 +3960,7 @@
           "a23b22d16f": "복사됨",
           "74fc00776f": "오류 세부정보",
           "3afcad0497": "첫 번째 agent 메시지에서.",
-          "ff62a18580": "OrcaBotmux가 다음에 대한 브랜치 이름을 생성할 수 없습니다.",
+          "ff62a18580": "Botmux가 다음에 대한 브랜치 이름을 생성할 수 없습니다.",
           "ca3b225195": "브랜치 자동 이름 지정에 실패했습니다."
         },
         "CreateProjectLocationField": {
@@ -4020,11 +4020,11 @@
           "79fd02cf5f": "이 경로는 {{hostName}}에서 확인되었습니다.",
           "8851b77327": "이 경로는 로컬에서 확인되었습니다."
         },
-        "OrcaYamlTrustDialog": {
+        "BotmuxYamlTrustDialog": {
           "f3e2b868fb": "후크 실행",
           "43b7bec4cd": "실행 안 함",
           "c494b3ccb1": "~에",
-          "79afc6772b": "orca_botmux.yaml",
+          "79afc6772b": "botmux.yaml",
           "531689199b": "항상 신뢰",
           "bf800b7e04": ". 믿을 수 있는 경우에만 실행하세요.",
           "831f2cd9f0": "내 컴퓨터에서 실행",
@@ -4049,7 +4049,7 @@
           "ad407c2d55": "개 더",
           "removeContainedProjectSingular": "포함된 프로젝트 1개 제거",
           "removeContainedProjectPlural": "포함된 프로젝트 {{value0}}개 제거",
-          "eeabb8e8e4": "OrcaBotmux에서 포함된 {{value1}} {{value0}}개 제거",
+          "eeabb8e8e4": "Botmux에서 포함된 {{value1}} {{value0}}개 제거",
           "55f75628c0": "디스크의 프로젝트 폴더는 삭제되지 않습니다.",
           "897e5d3d4c": "그룹 삭제 및 프로젝트 제거",
           "fec7e9c8ae": "그룹 삭제"
@@ -4072,8 +4072,8 @@
           "4dc5b5065b": "제거",
           "d36883e046": "취소",
           "b79b39d865": "프로젝트 제거",
-          "removeDescriptionSsh": "이 작업은 {{name}}을(를) OrcaBotmux에서 제거만 합니다. 파일은 {{host}}에 그대로 남아 있으며, 해당 SSH 호스트를 다시 추가하면 복구할 수 있습니다.",
-          "removeDescriptionLocal": "이 작업은 {{name}}을(를) OrcaBotmux에서 제거만 합니다. 파일은 디스크에 그대로 남아 있습니다."
+          "removeDescriptionSsh": "이 작업은 {{name}}을(를) Botmux에서 제거만 합니다. 파일은 {{host}}에 그대로 남아 있으며, 해당 SSH 호스트를 다시 추가하면 복구할 수 있습니다.",
+          "removeDescriptionLocal": "이 작업은 {{name}}을(를) Botmux에서 제거만 합니다. 파일은 디스크에 그대로 남아 있습니다."
         },
         "ScrollToCurrentWorkspaceToolbarButton": {
           "23989bb663": "활성 워크스페이스로 이동"
@@ -4086,7 +4086,7 @@
           "ff1e819a11": "설정 스크립트 추가",
           "70715947fb": "설정 스크립트는 비워둘 수 없습니다.",
           "888b83bf78": "설정 스크립트를 저장하지 못했습니다.",
-          "a49196d538": "OrcaBotmux가 새 작업 트리를 생성할 때 실행됩니다.",
+          "a49196d538": "Botmux가 새 작업 트리를 생성할 때 실행됩니다.",
           "d9f2db2738": "프로젝트 설정",
           "a5bb8c5135": "여기에 저장됨",
           "dcaa645da5": "좋아요"
@@ -4096,12 +4096,12 @@
           "3933401d28": "구성",
           "31b8b01a45": "설정",
           "4a98f907ae": "다시 시도",
-          "0a98169776": "OrcaBotmux가 새 작업 트리를 생성할 때 실행할 설정 명령을 추가합니다.",
+          "0a98169776": "Botmux가 새 작업 트리를 생성할 때 실행할 설정 명령을 추가합니다.",
           "8349e3fa4c": ". 새 작업 트리에 대해 실행되도록 저장하세요.",
           "b56d1322f7": "다음에서 설정 명령을 찾았습니다.",
-          "aef6c0a213": "OrcaBotmux가 작업 트리를 생성할 때마다 실행되도록 감지된 명령을 저장합니다.",
+          "aef6c0a213": "Botmux가 작업 트리를 생성할 때마다 실행되도록 감지된 명령을 저장합니다.",
           "660cdc17f8": "설정 스크립트. 로컬 명령을 추가하거나 설정에서 소스를 변경하세요.",
-          "8f6be51aa1": "orca_botmux.yaml",
+          "8f6be51aa1": "botmux.yaml",
           "bb879db364": "이 repo는 공유를 무시합니다",
           "0155fb9ed3": "지금은 이 repo의 설정 스크립트를 확인할 수 없습니다.",
           "eefa756190": "수동으로 구성",
@@ -4123,7 +4123,7 @@
           "26108d3699": "Discord 참여",
           "d245c4ef6c": "GitHub 이슈",
           "9b33530b3d": "우리에게 연락하는 다른 방법",
-          "a828fa4aee": "작동하는 부분, 손상된 부분 또는 OrcaBotmux가 다음에 수행해야 할 작업을 공유하세요.",
+          "a828fa4aee": "작동하는 부분, 손상된 부분 또는 Botmux가 다음에 수행해야 할 작업을 공유하세요.",
           "0eb643f07f": "피드백 보내기",
           "60b721e857": "의견을 제출하지 못했습니다. 다시 시도해 주세요.",
           "7a46c228b8": "피드백을 보내주셔서 감사합니다.",
@@ -4159,7 +4159,7 @@
           "80611a8b10": "검색",
           "0c3395fd32": "작업 트리 및 브라우저 탭 검색",
           "c86d83b5c3": "새로 만들기",
-          "1b5c41caee": "OrcaBotmux 모바일",
+          "1b5c41caee": "Botmux 모바일",
           "9c95e1ce91": "에이전트",
           "f323383e9a": "자동화",
           "e7ad3c540d": "Jira 작업 열기",
@@ -4180,7 +4180,7 @@
           "bbbc6e8e3b": "선택되지 않은 일치하는 프로젝트가 없습니다."
         },
         "SidebarSettingsHelpMenu": {
-          "ad3d3ed7f1": "OrcaBotmux 재시작",
+          "ad3d3ed7f1": "Botmux 재시작",
           "29c56f30ee": "업데이트 확인",
           "eb9884e55b": "Discord",
           "5687ab246a": "GitHub",
@@ -4190,8 +4190,8 @@
           "4cf5b868d7": "피드백 보내기",
           "a428c25998": "설정",
           "2991a0106c": "도움말",
-          "4e8f5710d3": "OrcaBotmux를 다시 시작할 수 없습니다.",
-          "5161eef55d": "OrcaBotmux를 다시 시작하는 중…",
+          "4e8f5710d3": "Botmux를 다시 시작할 수 없습니다.",
+          "5161eef55d": "Botmux를 다시 시작하는 중…",
           "d396773ef0": "확인 중",
           "f8a2c91d4e": "마일스톤",
           "b7e4d2a19c": "온보딩",
@@ -4338,7 +4338,7 @@
           "ca74db7550": "SSH를 통한 원격 프로젝트",
           "021538e1d1": "SSH 연결이 끊어졌습니다.",
           "runtimeHostDisconnected": "서버 연결 끊김",
-          "runtimeHostProject": "OrcaBotmux 서버의 프로젝트",
+          "runtimeHostProject": "Botmux 서버의 프로젝트",
           "automationCreated": "자동화로 생성됨",
           "branchIdentity": "브랜치",
           "branchFolderPathIdentity": "브랜치 또는 폴더 경로",
@@ -4359,7 +4359,7 @@
           "dbe2d18972": "추가 {{value0}} 작업",
           "ae76907ca6": "{{value0}} 연결 해제",
           "ad25c3ff05": "{{value0}}에서 보기",
-          "2c67730e07": "OrcaBotmux에서 열기",
+          "2c67730e07": "Botmux에서 열기",
           "e42941631a": "Linear에서 보기",
           "5e982e6128": "Linear {{value0}}",
           "807b13b9ec": "이슈 편집",
@@ -4417,7 +4417,7 @@
           "503ec0f8e6": "프로젝트의 새 그룹",
           "3350101edb": "경로 복사",
           "f4475537d8": "삭제",
-          "f5ac91531d": "OrcaBotmux에서 프로젝트 제거",
+          "f5ac91531d": "Botmux에서 프로젝트 제거",
           "b42391d8bf": "삭제 중…",
           "0918b35e4f": "메모리와 CPU를 확보하려면 이 워크스페이스의 모든 활성 패널을 닫으세요.",
           "7d190f7d2b": "선택한 워크스페이스의 모든 활성 패널을 닫아 메모리와 CPU를 확보하세요.",
@@ -4467,7 +4467,7 @@
           "e97297cb75": "{{value0}}개 하위 워크스페이스 숨기기",
           "0cd15956d4": "{{value0}}개 하위 워크스페이스 숨기기",
           "bd37a57ac8": "{{value0}}에 대한 워크스페이스 만들기",
-          "b667b59632": "일부 프로젝트를 OrcaBotmux에서 제거하지 못했습니다.",
+          "b667b59632": "일부 프로젝트를 Botmux에서 제거하지 못했습니다.",
           "f94466bc39": "그룹 삭제 후에도 {{value0}}/{{value1}} 프로젝트{{value2}}가 남아 있습니다.",
           "groupDeleteFailed": "그룹을 삭제하지 못했습니다.",
           "groupDeleteFailedDesc": "그룹을 삭제하는 중 문제가 발생했습니다. 제거된 프로젝트는 없습니다.",
@@ -4504,7 +4504,7 @@
           "8009ab69a6": "다음에서 열기",
           "bd0e8159f8": "이 컴퓨터의 편집기 명령이나 파일 관리자 구성을 확인하세요.",
           "9a5381eb09": "워크스페이스 폴더를 열 수 없습니다.",
-          "0bed8727db": "이동되었거나 삭제되었을 수 있습니다. 워크스페이스를 새로고침하거나 OrcaBotmux에서 제거하세요.",
+          "0bed8727db": "이동되었거나 삭제되었을 수 있습니다. 워크스페이스를 새로고침하거나 Botmux에서 제거하세요.",
           "3921d3d9a5": "워크스페이스 폴더를 찾을 수 없습니다.",
           "f387af445b": "워크스페이스 경로가 유효한 로컬 경로가 아닙니다.",
           "3ec372b664": "파일 관리자"
@@ -4515,7 +4515,7 @@
           "8df295a78d": "워크스페이스 이름을 바꾸지 못했습니다."
         },
         "WorktreeVisibilityDialog": {
-          "83a5ba8dd1": "OrcaBotmux 외부 워크트리",
+          "83a5ba8dd1": "Botmux 외부 워크트리",
           "f1f71b9f02": "가져오기",
           "759371df43": "숨기기",
           "25ddf19920": "{{value0}} 가져오기 가능",
@@ -4558,7 +4558,7 @@
             "toast": {
               "1d0fa5c0a5": "워크스페이스 {{value0}}을(를) 삭제하지 못했습니다.",
               "ead7b8ee15": "파일이 변경되었습니다. 어쨌든 삭제하려면 강제 삭제를 사용하세요.",
-              "905fc8efac": "Git은 이미 이 워크스페이스를 제거했습니다. 강제 삭제를 사용하여 OrcaBotmux에서 삭제합니다.",
+              "905fc8efac": "Git은 이미 이 워크스페이스를 제거했습니다. 강제 삭제를 사용하여 Botmux에서 삭제합니다.",
               "0899ebdb28": "Git은 이미 이 워크스페이스를 잊어버렸지만 해당 디렉토리는 여전히 디스크에 있습니다. 강제 삭제를 사용하여 분리된 디렉터리를 제거합니다.",
               "locked": "이 워크트리는 Git에 의해 잠겨 있습니다. 저장소에서 git worktree unlock <worktree-path>을 실행한 후 삭제를 다시 시도하세요.",
               "lockedReason": "이 워크트리는 Git에 의해 잠겨 있습니다. Git 보고: {{value0}}. 저장소에서 git worktree unlock <worktree-path>을 실행한 후 삭제를 다시 시도하세요."
@@ -4697,7 +4697,7 @@
                   "670864ab52": "로컬 {{value0}}을 최신 상태로 유지",
                   "84c62e4d7f": "{{value0}}을(를) 켤 수 없습니다.",
                   "442552c656": "설정을 열고 다시 시도하세요.",
-                  "f15fd80989": "새 워크트리는 최신 상태이지만 로컬 {{value0}}이(가) {{value1}} {{value2}} 뒤처져 있어 AI diff가 오래된 기록과 비교될 수 있습니다. OrcaBotmux가 자동으로 최신 상태를 유지하도록 하세요. 언제든지 여기에서 변경할 수 있습니다",
+                  "f15fd80989": "새 워크트리는 최신 상태이지만 로컬 {{value0}}이(가) {{value1}} {{value2}} 뒤처져 있어 AI diff가 오래된 기록과 비교될 수 있습니다. Botmux가 자동으로 최신 상태를 유지하도록 하세요. 언제든지 여기에서 변경할 수 있습니다",
                   "3d260e1a5d": "설정 › {{value0}}",
                   "34a03a6565": "{{value0}} 최신 상태로 유지",
                   "4a18052018": "로컬 {{value0}}이(가) {{value1}}보다 뒤처져 있습니다",
@@ -4709,14 +4709,14 @@
           }
         },
         "LinearAgentSkillSetupPrompt": {
-          "missingCliAndSkill": "OrcaBotmux CLI와 Linear agent 스킬이 없습니다.",
+          "missingCliAndSkill": "Botmux CLI와 Linear agent 스킬이 없습니다.",
           "modalTitle": "Linear 티켓 접근 활성화",
           "modalDescription": "terminal에서 Linear 스킬을 설치합니다.",
           "modalPrompt": "agents가 첨부된 Linear 티켓을 읽고 편집할 수 있게 합니다.",
           "dontShowAgain": "다시 표시하지 않음",
           "notNow": "나중에",
-          "missingBoth": "OrcaBotmux CLI와 Linear agent 스킬이 없습니다.",
-          "missingCli": "OrcaBotmux CLI가 없습니다.",
+          "missingBoth": "Botmux CLI와 Linear agent 스킬이 없습니다.",
+          "missingCli": "Botmux CLI가 없습니다.",
           "missingSkill": "Linear agent 스킬이 없습니다.",
           "title": "Linear agent 스킬 설정",
           "remoteCopy": "호스트 설정을 설치합니다. 원격 agent 환경에는 별도 설정이 필요할 수 있습니다.",
@@ -4737,12 +4737,12 @@
           "done": "완료",
           "wslCopy": "연결된 Linear 작업에서 WSL agent 인계를 위해 설치합니다.",
           "wslLabel": "WSL 기본값",
-          "toastMissingCliAndSkill": "OrcaBotmux CLI와 Linear 스킬이 없습니다",
-          "toastMissingCli": "OrcaBotmux CLI가 없습니다",
+          "toastMissingCliAndSkill": "Botmux CLI와 Linear 스킬이 없습니다",
+          "toastMissingCli": "Botmux CLI가 없습니다",
           "toastMissingSkill": "Linear 스킬이 없습니다",
-          "toastInstallCliAndSkillDescription": "OrcaBotmux CLI와 Linear 스킬을 설치하여 agents가 Linear 작업을 읽고 편집할 수 있게 하세요.",
-          "toastInstallCliDescription": "OrcaBotmux CLI를 설치하여 agents가 Linear 작업을 읽고 편집할 수 있게 하세요.",
-          "toastInstallSkillDescription": "Linear 스킬을 설치하여 agents가 OrcaBotmux CLI를 통해 Linear 작업을 읽고 편집할 수 있게 하세요.",
+          "toastInstallCliAndSkillDescription": "Botmux CLI와 Linear 스킬을 설치하여 agents가 Linear 작업을 읽고 편집할 수 있게 하세요.",
+          "toastInstallCliDescription": "Botmux CLI를 설치하여 agents가 Linear 작업을 읽고 편집할 수 있게 하세요.",
+          "toastInstallSkillDescription": "Linear 스킬을 설치하여 agents가 Botmux CLI를 통해 Linear 작업을 읽고 편집할 수 있게 하세요.",
           "toastRemoteDescription": "{{value0}} 원격 agent 환경에는 자체 설정이 필요할 수 있습니다.",
           "toastWslDescription": "{{value0}} 이 설정은 선택한 WSL agent 런타임에서 실행됩니다."
         },
@@ -4771,10 +4771,10 @@
           "addSshHost": "SSH 호스트 추가",
           "addRemoteServer": "원격 서버 추가",
           "addRemoteHost": "원격 호스트 추가",
-          "addRemoteHostTooltip": "로그인할 수 있는 시스템의 경우 SSH를 선택하고 OrcaBotmux 서버의 경우 원격 서버를 선택합니다.",
+          "addRemoteHostTooltip": "로그인할 수 있는 시스템의 경우 SSH를 선택하고 Botmux 서버의 경우 원격 서버를 선택합니다.",
           "addSshHostDetail": "SSH를 통해 기존 머신을 사용합니다.",
-          "addRemoteServerDetail": "다른 컴퓨터에서 실행 중인 OrcaBotmux와 페어링합니다.",
-          "addRemoteHostDetail": "SSH 호스트 또는 OrcaBotmux 서버"
+          "addRemoteServerDetail": "다른 컴퓨터에서 실행 중인 Botmux와 페어링합니다.",
+          "addRemoteHostDetail": "SSH 호스트 또는 Botmux 서버"
         },
         "sidebarHostOptions": {
           "3e102f111c": "모든 호스트",
@@ -4788,7 +4788,7 @@
           "1a2b3c4d5e": "{{value0}} 제거됨",
           "2b3c4d5e6f": "호스트를 제거하지 못했습니다.",
           "3c4d5e6f7a": "{{value0}}을(를) 제거할까요?",
-          "4d5e6f7a8b": "이 작업은 이 서버를 제거할 수 있는 OrcaBotmux 서버 설정을 엽니다.",
+          "4d5e6f7a8b": "이 작업은 이 서버를 제거할 수 있는 Botmux 서버 설정을 엽니다.",
           "5e6f7a8b9c": "이 컴퓨터에서 저장된 SSH 호스트와 인증 정보를 제거합니다. 원격 파일은 삭제되지 않습니다.",
           "6f7a8b9c0d": "취소",
           "7a8b9c0d1e": "설정 열기",
@@ -4796,12 +4796,12 @@
           "workspacesFailed": "이 호스트에서 워크트리 {{count}}개를 제거할 수 없었습니다. 재시도할 수 있도록 호스트가 유지되었습니다.",
           "oneWorkspace": "워크트리 1개",
           "manyWorkspaces": "워크트리 {{count}}개",
-          "hostHasWorkspacesDefault": "이 컴퓨터에서 {{value0}}과(와) 해당 자격 증명을 제거합니다. {{value1}}은(는) OrcaBotmux에 남아 있습니다 — 원격 파일은 변경되지 않습니다.",
+          "hostHasWorkspacesDefault": "이 컴퓨터에서 {{value0}}과(와) 해당 자격 증명을 제거합니다. {{value1}}은(는) Botmux에 남아 있습니다 — 원격 파일은 변경되지 않습니다.",
           "alsoDeleteRemote": "{{value1}}에서 이러한 {{value0}}도 삭제",
-          "alsoForgetLocal": "OrcaBotmux에서 이러한 {{value0}}도 제거",
+          "alsoForgetLocal": "Botmux에서 이러한 {{value0}}도 제거",
           "advanced": "고급",
           "alsoDeleteRemoteHint": "원격 Git 워크트리와 해당 브랜치를 영구적으로 삭제합니다. 이 작업은 되돌릴 수 없습니다.",
-          "alsoForgetLocalHint": "OrcaBotmux에서만 제거합니다. 원격 파일, 워크트리, 브랜치는 그대로 남아 있습니다."
+          "alsoForgetLocalHint": "Botmux에서만 제거합니다. 원격 파일, 워크트리, 브랜치는 그대로 남아 있습니다."
         },
         "HostRenameDialog": {
           "1a2b3c4d5e": "호스트 이름 바꾸기",
@@ -4854,7 +4854,7 @@
           "e2c4a8d91f": "{{value0}}의 외부에서 생성된 새 워크트리 펼치기",
           "7c4e9b2a81": "외부에서 생성된 새 워크트리",
           "5e1b8d3f62": "외부 워크트리를 영구적으로 숨기기",
-          "4d7a1c9e53": "이 워크트리는 OrcaBotmux 외부에서 생성되었습니다.",
+          "4d7a1c9e53": "이 워크트리는 Botmux 외부에서 생성되었습니다.",
           "8b3f2e1d74": "가져오기",
           "1c9e7a4b28": "숨긴 상태 유지",
           "6f2d8c1e95": "모두 가져오기",
@@ -4869,7 +4869,7 @@
           "a4c2d8f1b0": "외부 워크트리를 숨길까요?",
           "6e91b3c4d2": "{{value0}}에서는 나중에 생성되는 항목을 포함해 외부 워크트리가 사이드바나 이 목록에 더 이상 표시되지 않습니다.",
           "1f8a5d9e73": "나중에 프로젝트 설정에서 다시 켤 수 있습니다.",
-          "8c0b2e7a41": "Non-OrcaBotmux 워크트리 설정 열기",
+          "8c0b2e7a41": "Non-Botmux 워크트리 설정 열기",
           "5d1c9f0a82": "취소",
           "3b7e4a1c96": "외부 워크트리 숨기기"
         },
@@ -4887,7 +4887,7 @@
           "serverSaveFailed": "원격 서버를 추가하지 못했습니다.",
           "serverTitle": "원격 서버 추가",
           "sshTitle": "SSH 호스트 추가",
-          "serverDescription": "다른 컴퓨터에서 실행 중인 OrcaBotmux와 페어링합니다.",
+          "serverDescription": "다른 컴퓨터에서 실행 중인 Botmux와 페어링합니다.",
           "sshDescription": "SSH를 통해 로그인할 수 있는 영구 머신을 추가합니다.",
           "cancel": "취소",
           "saving": "저장 중...",
@@ -4904,9 +4904,9 @@
           "serverName": "서버 이름",
           "serverNamePlaceholder": "Dev box",
           "pairingCode": "페어링 코드",
-          "pairingCodePlaceholder": "orca_botmux://pair?code=...",
+          "pairingCodePlaceholder": "botmux://pair?code=...",
           "pairingHelpPrefix": "서버에서 실행",
-          "pairingCommand": "orca-botmux-desktop serve --pairing-address <host>",
+          "pairingCommand": "botmux-desktop serve --pairing-address <host>",
           "pairingHelpSuffix": "한 다음 출력된 페어링 URL을 붙여넣으세요.",
           "sshImportAlreadySynced": "~/.ssh/config가 이미 동기화되어 있습니다.",
           "sshImportSynced": "{{value0}} 호스트{{value1}}을(를) 동기화했습니다.",
@@ -4917,12 +4917,12 @@
         },
         "ForgetSshWorkspaceDialog": {
           "reconnectFailed": "재연결 실패",
-          "forgetBody": "이 작업 공간을 OrcaBotmux에서만 제거합니다. 파일, Git 워크트리, {{host}}의 브랜치는 그대로 유지됩니다.",
+          "forgetBody": "이 작업 공간을 Botmux에서만 제거합니다. 파일, Git 워크트리, {{host}}의 브랜치는 그대로 유지됩니다.",
           "title": "Delete “{{name}}”?",
-          "disconnectedBody": "이 워크트리의 SSH 호스트가 연결되어 있지 않습니다. 재연결하여 원격에서도 삭제하거나 OrcaBotmux에서만 제거하세요.",
-          "ghostBody": "{{host}}은(는) 더 이상 저장된 SSH 호스트가 아니므로 이 워크스페이스는 라이브 호스트에 연결되어 있지 않습니다. OrcaBotmux에서 제거만 할 수 있으며, 원격의 파일과 브랜치는 그대로 유지됩니다.",
+          "disconnectedBody": "이 워크트리의 SSH 호스트가 연결되어 있지 않습니다. 재연결하여 원격에서도 삭제하거나 Botmux에서만 제거하세요.",
+          "ghostBody": "{{host}}은(는) 더 이상 저장된 SSH 호스트가 아니므로 이 워크스페이스는 라이브 호스트에 연결되어 있지 않습니다. Botmux에서 제거만 할 수 있으며, 원격의 파일과 브랜치는 그대로 유지됩니다.",
           "cancel": "취소",
-          "forget": "OrcaBotmux에서 제거",
+          "forget": "Botmux에서 제거",
           "reconnectAndDelete": "재연결 후 삭제"
         }
       },
@@ -4960,7 +4960,7 @@
       "setup": {
         "guide": {
           "SetupGuideModal": {
-            "3598a3ca0c": "OrcaBotmux를 병렬 agent 작업에 유용하게 만드는 핵심 워크플로를 완료합니다.",
+            "3598a3ca0c": "Botmux를 병렬 agent 작업에 유용하게 만드는 핵심 워크플로를 완료합니다.",
             "48a9e5ef2d": "시작하기",
             "28cf59fcb4": "이렇게 하면 사이드바에서 체크리스트가 숨겨집니다.",
             "f3b5ffb2a6": "사이드바에서 체크리스트 숨기기"
@@ -4974,9 +4974,9 @@
         "AccountsPane": {
           "c2d2751587": "계정 삭제",
           "dbb9626ed1": "취소",
-          "854ebbcc45": "OrcaBotmux는 저장된 계정에 대해 관리되는 Claude 인증을 삭제합니다. 현재 활성화된 경우 OrcaBotmux는 시스템 기본 Claude 로그인으로 대체됩니다.",
+          "854ebbcc45": "Botmux는 저장된 계정에 대해 관리되는 Claude 인증을 삭제합니다. 현재 활성화된 경우 Botmux는 시스템 기본 Claude 로그인으로 대체됩니다.",
           "63843e37e2": "Claude 계정을 삭제하시겠습니까?",
-          "99c8f9e498": "OrcaBotmux는 저장된 계정에 대해 관리되는 Codex 홈을 삭제합니다. 현재 활성화된 경우 OrcaBotmux는 시스템 기본 Codex 로그인으로 대체됩니다.",
+          "99c8f9e498": "Botmux는 저장된 계정에 대해 관리되는 Codex 홈을 삭제합니다. 현재 활성화된 경우 Botmux는 시스템 기본 Codex 로그인으로 대체됩니다.",
           "0d47394635": "Codex 계정을 제거하시겠습니까?",
           "ae3b21eb6c": "opencode.ai/workspace/wrk_…/go",
           "51c9104e13": "opencode.ai에 로그인한 후 URL에서 이를 찾으세요(예:",
@@ -4997,9 +4997,9 @@
           "36223200ac": "OpenCode Go 세션 쿠키",
           "ea631977b5": "OpenCode Go 공급자 설정을 구성합니다.",
           "4ac10b4d08": "OpenCode Go",
-          "c2aee76420": "{{value0}}에서 Google에 인증하기 위해 로컬 Gemini CLI 설치에서 OAuth 자격 증명을 추출합니다. 이는 OrcaBotmux가 아닌 Gemini CLI 앱에 발급된 자격 증명을 사용합니다. Google이 CLI를 업데이트하면 중단될 수 있습니다. 자신의 책임하에 사용하십시오.",
+          "c2aee76420": "{{value0}}에서 Google에 인증하기 위해 로컬 Gemini CLI 설치에서 OAuth 자격 증명을 추출합니다. 이는 Botmux가 아닌 Gemini CLI 앱에 발급된 자격 증명을 사용합니다. Google이 CLI를 업데이트하면 중단될 수 있습니다. 자신의 책임하에 사용하십시오.",
           "96f3649526": "Gemini CLI 자격 증명 사용(실험적)",
-          "d676c41fc6": "Google 인증을 위해 로컬 Gemini CLI 설치에서 OAuth 자격 증명을 추출합니다. 이는 OrcaBotmux가 아닌 Gemini CLI 앱에 발급된 자격 증명을 사용합니다. Google이 CLI를 업데이트하면 중단될 수 있습니다. 자신의 책임하에 사용하십시오.",
+          "d676c41fc6": "Google 인증을 위해 로컬 Gemini CLI 설치에서 OAuth 자격 증명을 추출합니다. 이는 Botmux가 아닌 Gemini CLI 앱에 발급된 자격 증명을 사용합니다. Google이 CLI를 업데이트하면 중단될 수 있습니다. 자신의 책임하에 사용하십시오.",
           "0c7f915b01": "Gemini CLI 자격 증명 사용",
           "973741a871": "Gemini 공급자 설정을 구성합니다.",
           "0c64dc2a64": "Gemini",
@@ -5008,23 +5008,23 @@
           "3d245ef7d9": "Codex에서 이 로그인이 오래되었다고 보고했습니다.",
           "589eba1eee": "재인증 필요",
           "e74831fb6b": "활성",
-          "b4c9450319": "{{value0}}에 대한 관리되는 Codex 계정이 없습니다. OrcaBotmux는 여기에 추가할 때까지 해당 환경의 시스템 기본 Codex 로그인을 사용합니다.",
+          "b4c9450319": "{{value0}}에 대한 관리되는 Codex 계정이 없습니다. Botmux는 여기에 추가할 때까지 해당 환경의 시스템 기본 Codex 로그인을 사용합니다.",
           "93c47b333a": "로그인 필요",
           "f2a265f8c7": "시스템 기본값",
           "b0e948a4f9": "계정 추가",
           "c0a52abfc5": "{{value0}} 계정을 표시 중입니다. 새 계정은 여기에 추가됩니다.",
           "94d351af4a": "계정",
-          "d0d53b7eb0": "OrcaBotmux가 실시간 속도 제한 가져오기에 사용하는 Codex 계정을 관리합니다.",
+          "d0d53b7eb0": "Botmux가 실시간 속도 제한 가져오기에 사용하는 Codex 계정을 관리합니다.",
           "3180536c7a": "Codex 계정",
-          "340d6f7a85": "각 계정은 OrcaBotmux에서 자체 로컬 로그인 컨텍스트를 유지합니다. 계정 인증은 이 기기에 유지됩니다.",
-          "cedfab35ab": "선택 사항. OrcaBotmux는 일반 Codex 로그인을 사용할 수 있습니다. OrcaBotmux에서 빠른 전환을 원하는 경우에만 계정을 추가하세요.",
+          "340d6f7a85": "각 계정은 Botmux에서 자체 로컬 로그인 컨텍스트를 유지합니다. 계정 인증은 이 기기에 유지됩니다.",
+          "cedfab35ab": "선택 사항. Botmux는 일반 Codex 로그인을 사용할 수 있습니다. Botmux에서 빠른 전환을 원하는 경우에만 계정을 추가하세요.",
           "ef91cfa06b": "Codex",
-          "3fe7862418": "{{value0}}에 대한 관리된 Claude 계정이 없습니다. OrcaBotmux는 여기에 추가할 때까지 해당 환경의 시스템 기본 Claude 로그인을 사용합니다.",
+          "3fe7862418": "{{value0}}에 대한 관리된 Claude 계정이 없습니다. Botmux는 여기에 추가할 때까지 해당 환경의 시스템 기본 Claude 로그인을 사용합니다.",
           "3455cf43fa": "Claude 로그인.",
           "fcc4093fc1": "현재 {{value0}} Codex 로그인을 사용하세요.",
           "79e484c3b2": "공유 Claude 인증 파일에 대한 선택적 계정 전환기입니다.",
           "8bbfd74556": "Claude 계정",
-          "72b36ea174": "선택 사항. OrcaBotmux는 일반적인 Claude 로그인을 사용할 수 있습니다. 채팅 세션을 이동하지 않고 빠르게 전환하려는 경우에만 계정을 추가하세요.",
+          "72b36ea174": "선택 사항. Botmux는 일반적인 Claude 로그인을 사용할 수 있습니다. 채팅 세션을 이동하지 않고 빠르게 전환하려는 경우에만 계정을 추가하세요.",
           "26ef4b55be": "Claude",
           "2743cdc0af": "Claude 계정 업데이트에 실패했습니다.",
           "b15ce90870": "{{value0}} -> {{value1}}. 이전 세션을 계속하기 전에 실행 중인 Claude terminals을 다시 시작하세요.",
@@ -5087,7 +5087,7 @@
           "435df0ee51": "Request Headers에서 Cookie 값을 복사합니다.",
           "7492fb3bba": "여기에 붙여넣고 저장을 클릭합니다.",
           "9fec52de4b": "Cookie 복사 방법",
-          "4e32e030b2": "로컬에 저장됩니다. OrcaBotmux는 사용량 새로 고침을 위해 platform.minimax.io로만 전송합니다.",
+          "4e32e030b2": "로컬에 저장됩니다. Botmux는 사용량 새로 고침을 위해 platform.minimax.io로만 전송합니다.",
           "remoteServerFallback": "원격 서버",
           "loadAccountsFailed": "프로바이더 계정을 불러오지 못했습니다.",
           "remoteScopeAccounts": "{{value0}}에서 관리하는 계정을 표시하고 있습니다. 계정 추가나 재인증은 해당 서버에서 진행하세요.",
@@ -5097,7 +5097,7 @@
         },
         "AdvancedPane": {
           "40b29e0bf3": "다시 시작",
-          "87a2cb2ac8": "OrcaBotmux는 시작 시 이 네트워킹 모드를 적용합니다.",
+          "87a2cb2ac8": "Botmux는 시작 시 이 네트워킹 모드를 적용합니다.",
           "89958d7edf": "다시 시작해야 함",
           "b3ad629640": "회사 VPN 또는 프록시가 HTTP/2 프로토콜 오류로 인해 업데이트 다운로드를 중단하는 경우에만 사용하십시오. 다시 시작한 후 모든 Electron 네트워킹에 영향을 미칩니다.",
           "6627e75c92": "HTTP/1.1 호환성 설명",
@@ -5170,13 +5170,13 @@
           "agentPermissions": "Agent 권한",
           "agentPermissionsInfo": "Agent 권한 정보",
           "agentPermissionsTooltip": "Custom agent arguments stay unchanged when switching modes.",
-          "agentPermissionsDescription": "OrcaBotmux가 agents를 실행할 때 권한 프롬프트를 줄일지, 수동 확인을 유지할지 선택합니다.",
+          "agentPermissionsDescription": "Botmux가 agents를 실행할 때 권한 프롬프트를 줄일지, 수동 확인을 유지할지 선택합니다.",
           "agentPermissionsYolo": "Yolo",
           "agentPermissionsManual": "수동",
           "3f1bdf3cb4": "환경 텍스트가 너무 커서 안전하게 파싱할 수 없습니다.",
           "codexSessionSource": "가져올 Codex 홈",
           "codexSessionSourceInfo": "Codex 기록 가져오기 정보",
-          "codexSessionSourceTooltip": "OrcaBotmux는 격리된 홈에서 Codex를 실행합니다. 기존 Codex 홈을 지정하여 세션 기록을 가져옵니다. 비워두면 ~/.codex를 사용합니다."
+          "codexSessionSourceTooltip": "Botmux는 격리된 홈에서 Codex를 실행합니다. 기존 Codex 홈을 지정하여 세션 기록을 가져옵니다. 비워두면 ~/.codex를 사용합니다."
         },
         "AppIconSelector": {
           "d5a112dc9b": "다음 아이콘",
@@ -5187,12 +5187,12 @@
           "3057983501": "할당되지 않음",
           "872af9556e": "시스템 트레이",
           "2edf606c46": "닫을 때 트레이로 최소화",
-          "b707773a0d": "활성화하면 창을 닫아도 OrcaBotmux가 종료되지 않고 시스템 트레이에서 계속 실행됩니다.",
+          "b707773a0d": "활성화하면 창을 닫아도 Botmux가 종료되지 않고 시스템 트레이에서 계속 실행됩니다.",
           "0cd9b8228f": "Dock 및 창 전환기에 표시된 앱 아이콘을 선택합니다.",
           "ca1590d42f": "앱 아이콘",
-          "61d842eca0": "사이드바에 OrcaBotmux Mobile 바로가기를 표시합니다. 도구 상자에서는 계속 사용할 수 있습니다.",
-          "9da1020447": "OrcaBotmux 모바일 버튼 표시",
-          "5db6ba961f": "왼쪽 사이드바 상단에 OrcaBotmux Mobile 버튼을 표시합니다.",
+          "61d842eca0": "사이드바에 Botmux Mobile 바로가기를 표시합니다. 도구 상자에서는 계속 사용할 수 있습니다.",
+          "9da1020447": "Botmux 모바일 버튼 표시",
+          "5db6ba961f": "왼쪽 사이드바 상단에 Botmux Mobile 버튼을 표시합니다.",
           "fa882a3e6b": "왼쪽 사이드바 상단에 자동화 버튼을 표시합니다.",
           "511f270ebb": "자동화 버튼 표시",
           "661942ab7f": "왼쪽 사이드바 상단에 작업 버튼을 표시합니다.",
@@ -5200,7 +5200,7 @@
           "dc29f3cc0d": "사이드바",
           "ea943d0db0": "창 하단에 표시되는 표시기를 선택합니다. 동일한 토글에 대해 상태 표시줄을 마우스 오른쪽 버튼으로 클릭할 수도 있습니다.",
           "3e4175e5c6": "상태 표시줄",
-          "2df8f79aa5": "제목 표시줄에 OrcaBotmux를 표시합니다.",
+          "2df8f79aa5": "제목 표시줄에 Botmux를 표시합니다.",
           "9868f39007": "제목 표시줄 앱 이름",
           "4de76f6902": "애플리케이션 제목 표시줄에 나타나는 내용을 제어합니다.",
           "6a272ca553": "제목 표시줄",
@@ -5208,7 +5208,7 @@
           "0fafabcf35": "Git이 무시한 파일 표시",
           "75f07ab60c": "파일 탐색기에서 .gitignore와 일치하는 파일을 표시합니다.",
           "d496901cd0": "파일 탐색기",
-          "42554f615f": "OrcaBotmux 인터페이스에서 사용되는 글꼴을 선택합니다.",
+          "42554f615f": "Botmux 인터페이스에서 사용되는 글꼴을 선택합니다.",
           "102d6b5f9b": "IDE 글꼴",
           "ef89200c1f": "terminal 패널에 없을 때.",
           "f687711a9b": "전체 애플리케이션 인터페이스를 확장합니다. 사용",
@@ -5218,7 +5218,7 @@
           "7d26ccabe8": "다크",
           "fb0e0b4453": "시스템",
           "932ff1fbff": "테마",
-          "0f28e7b30c": "OrcaBotmux가 앱 창에 표시되는 방식을 선택합니다.",
+          "0f28e7b30c": "Botmux가 앱 창에 표시되는 방식을 선택합니다.",
           "leftSidebarAppearance": {
             "title": "왼쪽 사이드바 모양",
             "rowDescription": "왼쪽 사이드바를 terminal에 맞추거나 기본값을 유지하거나 은은한 색조를 적용합니다.",
@@ -5251,16 +5251,16 @@
           "c71770c455": "{basePrompt}",
           "f19a56498d": "; 브랜치 접두사 설정이 계속 적용됩니다.",
           "800edb1e54": "fix-login-flow",
-          "5d569f5199": ". OrcaBotmux는 다음과 같은 마지막 세그먼트만 생성합니다.",
+          "5d569f5199": ". Botmux는 다음과 같은 마지막 세그먼트만 생성합니다.",
           "570817d126": "그리고",
           "56580dcf60": ". 참고하실 수도 있습니다",
           "9c9b54e4ea": "내장된 브랜치 이름 프롬프트",
-          "69bf4830c2": "OrcaBotmux의 항목을 포함하도록",
+          "69bf4830c2": "Botmux의 항목을 포함하도록",
           "9241b59bf5": "사용",
           "a869d0edd8": "브랜치 이름 명령 템플릿",
           "e784ea62dc": "고급",
-          "d9b65054ef": ") 작업을 요약하는 짧은 이름으로 변경됩니다. OrcaBotmux 라는 이름의 브랜치만 이름이 변경되며 푸시된 후에는 이름이 변경되지 않습니다.",
-          "12ea4a408d": "agent가 새 워크스페이스에서 작업을 시작하면 OrcaBotmux는 자동 생성된 브랜치의 이름을 바꿉니다(예:",
+          "d9b65054ef": ") 작업을 요약하는 짧은 이름으로 변경됩니다. Botmux 라는 이름의 브랜치만 이름이 변경되며 푸시된 후에는 이름이 변경되지 않습니다.",
+          "12ea4a408d": "agent가 새 워크스페이스에서 작업을 시작하면 Botmux는 자동 생성된 브랜치의 이름을 바꿉니다(예:",
           "ef787db0e3": "브랜치 자동 이름 바꾸기",
           "6a051586d2": "agent가 시작되면 작업을 기반으로 자동 생성된 브랜치의 이름을 바꿉니다.",
           "ec3e0c388e": "저장",
@@ -5275,9 +5275,9 @@
           "4416b25d29": "작업에서 도메인 명사를 선호하고, 티켓 ID를 피하고, 리뷰어 친화적인 이름을 유지하세요.",
           "39278f4411": "; 브랜치 접두사 설정이 계속 적용됩니다.",
           "ebb942a2ec": "fix-login-flow",
-          "af2d9a2cc6": ". OrcaBotmux는 다음과 같은 마지막 세그먼트만 생성합니다.",
+          "af2d9a2cc6": ". Botmux는 다음과 같은 마지막 세그먼트만 생성합니다.",
           "182d419b97": "내장된 브랜치 이름 프롬프트",
-          "2f5dc661fe": "OrcaBotmux에 추가됨",
+          "2f5dc661fe": "Botmux에 추가됨",
           "7d6176f506": "프롬프트",
           "5968112152": "저장",
           "54ac229ad4": "저장 중...",
@@ -5332,7 +5332,7 @@
           "7b649a578a": "만드는 중…",
           "4399c77caa": "기본",
           "4af9a17947": "kagi",
-          "c0f85056d9": "이 OrcaBotmux 서버의 브라우저 프로필입니다.",
+          "c0f85056d9": "이 Botmux 서버의 브라우저 프로필입니다.",
           "86b7c83fee": "이 컴퓨터",
           "6480776a03": "선택한 호스트의 브라우저 프로필입니다.",
           "5e19a692f7": "호스트"
@@ -5374,20 +5374,20 @@
           "e44c5d681e": "에서",
           "67d9a53f47": "별도의 로그인을 위한 프로필 관리",
           "112f70adc4": "{{value0}}에서 마지막으로 가져옴",
-          "72d4815523": "agents가 인증된 페이지에 접근할 수 있도록 기존 로그인을 OrcaBotmux로 가져오세요. 기본 프로필로 가져옵니다.",
+          "72d4815523": "agents가 인증된 페이지에 접근할 수 있도록 기존 로그인을 Botmux로 가져오세요. 기본 프로필로 가져옵니다.",
           "2eb906706c": "브라우저 쿠키 가져오기",
           "af8c83ed61": "agents가 로그인을 재사용할 수 있도록 Chrome, Edge 또는 기타 브라우저에서 쿠키를 가져옵니다.",
-          "68ea76eb71": "agents가 OrcaBotmux의 브라우저를 작동할 수 있도록 브라우저 사용 스킬을 설치하세요.",
+          "68ea76eb71": "agents가 Botmux의 브라우저를 작동할 수 있도록 브라우저 사용 스킬을 설치하세요.",
           "2d6ead9ab2": "브라우저 사용 스킬 설치",
           "e9f3f3b488": "설치 위치",
-          "9fca1f7f5d": "agents가 셸에서 브라우저를 조정할 수 있도록 OrcaBotmux CLI 명령을 등록합니다.",
-          "c6065d205d": "OrcaBotmux CLI 활성화",
-          "c79eff0213": "agents가 브라우저를 구동할 수 있도록 OrcaBotmux CLI를 등록하세요.",
+          "9fca1f7f5d": "agents가 셸에서 브라우저를 조정할 수 있도록 Botmux CLI 명령을 등록합니다.",
+          "c6065d205d": "Botmux CLI 활성화",
+          "c79eff0213": "agents가 브라우저를 구동할 수 있도록 Botmux CLI를 등록하세요.",
           "702488a5f7": "코딩 agents가 로그인을 통해 이 브라우저를 구동하게 하세요. 아래 세 단계를 완료하세요.",
           "b8a1f2d84d": "Agent 브라우저 사용",
           "96b91c6349": "코딩 agents가 로그인을 통해 이 브라우저를 구동하게 하세요.",
           "2ea4617e3a": "{{value1}}{{value2}}에서 {{value0}} 쿠키를 가져왔습니다.",
-          "721aee31b4": "PATH에 OrcaBotmux CLI를 등록했습니다.",
+          "721aee31b4": "PATH에 Botmux CLI를 등록했습니다.",
           "180a9abf3a": "CLI 상태를 로드하지 못했습니다.",
           "2ccfc9cff8": "가져오기",
           "0462565413": "다시 가져오기",
@@ -5399,17 +5399,17 @@
           "5301857d88": "{{value0}}에서"
         },
         "BrowserUseSkillStep": {
-          "0871b6998d": "agents가 OrcaBotmux 브라우저에서 페이지를 탐색하고 확인할 수 있습니다.",
+          "0871b6998d": "agents가 Botmux 브라우저에서 페이지를 탐색하고 확인할 수 있습니다.",
           "459e24eebc": "Browser Use 스킬"
         },
         "CliSection": {
           "8671e406f0": "취소",
           "a4aafe46e3": "대상 경로:",
-          "e8012c03a1": "agents가 OrcaBotmux 워크스페이스, terminal 및 진행 명령을 사용할 수 있도록 합니다.",
+          "e8012c03a1": "agents가 Botmux 워크스페이스, terminal 및 진행 명령을 사용할 수 있도록 합니다.",
           "cliSkillTerminalTitle": "CLI 스킬 설정",
           "cliSkillTerminalAria": "CLI 스킬 설치 terminal",
           "6053cf736c": "CLI 스킬",
-          "36a6f919ba": "agents에게 OrcaBotmux 인식 워크스페이스, terminal 및 진행 워크플로를 제공합니다.",
+          "36a6f919ba": "agents에게 Botmux 인식 워크스페이스, terminal 및 진행 워크플로를 제공합니다.",
           "04873eea3e": "Agent 스킬",
           "7f2747f7dd": "현재 이 셸의 PATH에 표시되지 않습니다.",
           "b0c310ab46": "기존 실행기 대상:",
@@ -5417,8 +5417,8 @@
           "5dae812f50": "새로고침",
           "52e640f3a0": "CLI 상태 새로 고침",
           "38edbb5721": "쉘 명령",
-          "6930feda9e": "terminals에서 OrcaBotmux를 사용하여 앱을 열고, 작업 트리를 관리하고, OrcaBotmux terminals과 상호 작용할 수 있습니다.",
-          "c5c0f2641d": "OrcaBotmux CLI",
+          "6930feda9e": "terminals에서 Botmux를 사용하여 앱을 열고, 작업 트리를 관리하고, Botmux terminals과 상호 작용할 수 있습니다.",
+          "c5c0f2641d": "Botmux CLI",
           "d77352f2df": "PATH에서 `{{value0}}`을(를) 제거하지 못했습니다.",
           "af5540930c": "PATH에서 `{{value0}}`을 제거했습니다.",
           "a2b13efa94": "PATH에 `{{value0}}`을(를) 등록하지 못했습니다.",
@@ -5430,8 +5430,8 @@
           "4c7e3e4c5f": "설치",
           "068552b191": "제거 중…",
           "8d96213669": "제거",
-          "aa6536977e": "OrcaBotmux는 {{value0}}을 등록하므로 명령이 terminal에서 작동합니다.",
-          "a030816e3e": "그러면 쉘 명령 심볼릭 링크가 제거됩니다. OrcaBotmux 자체는 설치된 상태로 유지됩니다.",
+          "aa6536977e": "Botmux는 {{value0}}을 등록하므로 명령이 terminal에서 작동합니다.",
+          "a030816e3e": "그러면 쉘 명령 심볼릭 링크가 제거됩니다. Botmux 자체는 설치된 상태로 유지됩니다.",
           "fa87db3d6e": "PATH에 `{{value0}}`을 등록하시겠습니까?",
           "14444243ba": "PATH에서 `{{value0}}`을(를) 제거하시겠습니까?",
           "5d432fe44d": "설치됨",
@@ -5445,7 +5445,7 @@
           "3728a94fb6": "WSL 셸 명령에 주의가 필요함",
           "775a4cfbb8": "WSL 셸 명령 등록을 사용할 수 없습니다.",
           "c47127f222": "WSL 기본값",
-          "0c9f3cf9da": "OrcaBotmux가 글로벌 agent 스킬을 확인하고 설치하는 위치를 선택합니다.",
+          "0c9f3cf9da": "Botmux가 글로벌 agent 스킬을 확인하고 설치하는 위치를 선택합니다.",
           "f00d6aa9b5": "이 컴퓨터에서는 WSL을 사용할 수 없습니다.",
           "7c776ff9d8": "wsl",
           "fc0fcf72fd": "스킬 설정 전 WSL 쉘 명령어를 등록하세요.",
@@ -5466,10 +5466,10 @@
           "e001734396": "작성기에서 변경하지 않는 한 호스팅된 리뷰를 초안으로 생성합니다.",
           "6ba48f07a4": "기본적으로 초안",
           "15b60d54b2": "예: ollama run llama3.1 {prompt}",
-          "3f1b26cc91": "명령 입력을 인수로 전달합니다. 그렇지 않으면 OrcaBotmux가 이를 stdin에 파이프합니다.",
+          "3f1b26cc91": "명령 입력을 인수로 전달합니다. 그렇지 않으면 Botmux가 이를 stdin에 파이프합니다.",
           "4f722a5f53": "사용자 지정 명령을 선택하는 commit 메시지, PR 및 브랜치 이름 레시피에서 사용됩니다. 사용",
           "47e45cbd5a": "사용자 정의 명령",
-          "1ef29f8c29": "명령줄 OrcaBotmux는 텍스트 레시피가 사용자 정의 명령을 사용할 때 실행됩니다.",
+          "1ef29f8c29": "명령줄 Botmux는 텍스트 레시피가 사용자 정의 명령을 사용할 때 실행됩니다.",
           "2339a89104": "해당 작업에 대한 명령 템플릿을 사용하여 선택한 agent를 실행하는 AI 버튼을 추가합니다.",
           "d5b45a3628": "소스 제어 AI 작업 표시",
           "7bcad2b200": "소스 제어 commit, PR, 브랜치 이름 및 수정 작업에 대한 작업 레시피를 추가합니다.",
@@ -5517,8 +5517,8 @@
         },
         "DeveloperPermissionsPane": {
           "4c17304beb": "새로고침",
-          "6326a4c5cc": "CLI, 로컬 앱 또는 자동화 도구에 macOS 개인 정보 보호 액세스가 필요한 경우 이러한 컨트롤을 사용하십시오. OrcaBotmux는 시작 시 묻지 않습니다.",
-          "6f011b9bf6": "Terminal 도구는 OrcaBotmux의 macOS 개인 정보 보호 봉투를 상속합니다.",
+          "6326a4c5cc": "CLI, 로컬 앱 또는 자동화 도구에 macOS 개인 정보 보호 액세스가 필요한 경우 이러한 컨트롤을 사용하십시오. Botmux는 시작 시 묻지 않습니다.",
+          "6f011b9bf6": "Terminal 도구는 Botmux의 macOS 개인 정보 보호 봉투를 상속합니다.",
           "bfa3402305": "권한을 요청할 수 없습니다.",
           "66e94d6cf3": "권한 요청이 전송되었습니다.",
           "fa809e8ada": "macOS 개인정보 보호 및 보안 오픈",
@@ -5558,9 +5558,9 @@
           "dd6f0a1d45": "애완 동물",
           "0e89a574ae": "오른쪽 하단에 떠 있는 애니메이션 애완동물.",
           "agentHibernation": {
-            "copy": "설정된 유휴 시간이 지난 백그라운드 agent terminals을 중지하고, 다시 열 때 지원되는 세션을 재개합니다. Agent 최대 절전은 OrcaBotmux에서 시작한 agent의 시작 옵션을 보존합니다. 수동으로 시작한 agent는 현재 OrcaBotmux 기본값으로 재개될 수 있습니다. 안전 모델을 조정하는 동안 제공되는 실험적 기능입니다.",
+            "copy": "설정된 유휴 시간이 지난 백그라운드 agent terminals을 중지하고, 다시 열 때 지원되는 세션을 재개합니다. Agent 최대 절전은 Botmux에서 시작한 agent의 시작 옵션을 보존합니다. 수동으로 시작한 agent는 현재 Botmux 기본값으로 재개될 수 있습니다. 안전 모델을 조정하는 동안 제공되는 실험적 기능입니다.",
             "description": "설정된 유휴 시간이 지난 백그라운드 agent terminals을 중지하고, 다시 열 때 지원되는 세션을 재개합니다.",
-            "idleMinutesDescription": "완료된 백그라운드 agent를 OrcaBotmux가 최대 절전 모드로 전환하기 전에 기다릴 유휴 시간(분)입니다.",
+            "idleMinutesDescription": "완료된 백그라운드 agent를 Botmux가 최대 절전 모드로 전환하기 전에 기다릴 유휴 시간(분)입니다.",
             "idleMinutesLabel": "최대 절전까지",
             "idleMinutesSuffix": "분",
             "title": "Agent 최대 절전",
@@ -5590,7 +5590,7 @@
           "3c900e26e5": "키보드 단축키는 토글이 표시되는 위치에 관계없이 작동합니다.",
           "5e5a8da236": "토글 버튼 위치",
           "505001823e": "플로팅 워크스페이스 디렉토리 선택",
-          "81afb79785": "새로운 플로팅 terminal 탭이 여기에서 시작됩니다. Markdown 메모는 OrcaBotmux의 앱 소유 플로팅 워크스페이스에 저장됩니다.",
+          "81afb79785": "새로운 플로팅 terminal 탭이 여기에서 시작됩니다. Markdown 메모는 Botmux의 앱 소유 플로팅 워크스페이스에 저장됩니다.",
           "12aa09f10c": "Terminal 디렉토리",
           "41eb95f7f0": "플로팅 워크스페이스 버튼과 패널을 표시합니다.",
           "5136813663": "플로팅 워크스페이스 활성화",
@@ -5625,12 +5625,12 @@
           "b492397d34": "기본적으로 git diff를 표시하기 위해 선호되는 프레젠테이션 형식입니다.",
           "a5db1d3975": "ms",
           "fc5c5306ff": "ms.",
-          "8112cd6dcf": "OrcaBotmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다. 첫 번째 실행의 기본값은 다음과 같습니다.",
+          "8112cd6dcf": "Botmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다. 첫 번째 실행의 기본값은 다음과 같습니다.",
           "d6cf227ca0": "자동 저장 지연",
-          "1bec6d8318": "OrcaBotmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다.",
+          "1bec6d8318": "Botmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다.",
           "70bb30feb1": "잠시 후에 편집기 및 편집 가능한 diff 변경 사항을 자동으로 저장합니다.",
           "0df2e4fd12": "자동 저장 파일",
-          "d21136d9ef": "OrcaBotmux가 파일 편집을 유지하는 방법을 구성합니다.",
+          "d21136d9ef": "Botmux가 파일 편집을 유지하는 방법을 구성합니다.",
           "45c6e85c4d": "편집기",
           "8f1afdfbd8": "Diff 자동 줄 바꿈",
           "4aa4d9fb73": "가로 스크롤을 요구하는 대신 diff 편집기에서 긴 줄을 줄 바꿈합니다.",
@@ -5650,7 +5650,7 @@
           "476f302aca": "http://proxy.example.com:8080",
           "1e214e265a": "시스템 프록시 설정 및 상속된 프록시 환경 변수를 사용하려면 비워 두세요.",
           "f00daf6324": "HTTP 프록시",
-          "823e0f15b1": "OrcaBotmux 네트워크 요청 및 로컬 terminal 하위 항목에 대한 프록시 URL입니다.",
+          "823e0f15b1": "Botmux 네트워크 요청 및 로컬 terminal 하위 항목에 대한 프록시 URL입니다.",
           "d93c7cd531": "앱 수준 네트워크 라우팅을 구성합니다.",
           "c46cdbbd4e": "네트워크",
           "configureProxy": "프록시 구성"
@@ -5664,9 +5664,9 @@
         },
         "GeneralSupportSection": {
           "af7d9f4396": "지원해 주셔서 감사합니다!",
-          "6922c1fa2b": "GitHub에서 OrcaBotmux 스타 누르기",
+          "6922c1fa2b": "GitHub에서 Botmux 스타 누르기",
           "511782265b": "gh CLI를 통해 GitHub 스타로 프로젝트를 지원하세요.",
-          "55a87e5fd1": "OrcaBotmux 지원",
+          "55a87e5fd1": "Botmux 지원",
           "964acc6bb4": "스타",
           "73b327e793": "다시 시도",
           "c9f96d4234": "오류",
@@ -5687,7 +5687,7 @@
           "42717918f4": "업데이트 설치(",
           "02dc082e70": "업데이트 다운로드를 시작할 수 없습니다.",
           "e1a647adc5": "업데이트 확인",
-          "ceb579abaf": "앱 업데이트를 확인하고 최신 OrcaBotmux 버전을 설치하세요.",
+          "ceb579abaf": "앱 업데이트를 확인하고 최신 Botmux 버전을 설치하세요.",
           "d91ebfb87e": "현재 버전: {{value0}}",
           "f2b1ccc12a": "업데이트",
           "bd79d412f0": "업데이트 확인에 실패했습니다. {{value0}}",
@@ -5737,9 +5737,9 @@
           "1f744a72f4": "구성"
         },
         "GitPane": {
-          "d2eede4c54": "commits, PR 및 이슈에 OrcaBotmux 속성을 추가합니다.",
-          "e02ea23a32": "OrcaBotmux 표기",
-          "e71ce09c42": "orca_botmux",
+          "d2eede4c54": "commits, PR 및 이슈에 Botmux 속성을 추가합니다.",
+          "e02ea23a32": "Botmux 표기",
+          "e71ce09c42": "botmux",
           "b9b5771bb1": "표기",
           "b5f534717a": "공동 작성",
           "9838c921ed": "공저자",
@@ -5756,13 +5756,13 @@
           "aa204f185f": "현재 GitHub CLI REST, 검색 및 GraphQL 속도 제한.",
           "612a440e57": "GitHub API 예산",
           "2cde9044a8": "graphql",
-          "36e3de3619": "오래된 기록과 비교하지 않도록 합니다. OrcaBotmux는 해당 브랜치에 commits 되지 않은 변경 사항이나 로컬 전용 commits이 있으면 업데이트를 건너뜁니다.",
+          "36e3de3619": "오래된 기록과 비교하지 않도록 합니다. Botmux는 해당 브랜치에 commits 되지 않은 변경 사항이나 로컬 전용 commits이 있으면 업데이트를 건너뜁니다.",
           "d072a12995": "git diff main...HEAD",
           "db3a127eb1": "이렇게 하면 다음과 같은 명령이 유지됩니다",
           "3ae3de8898": "master",
           "5bf885be48": "또는",
           "ffba483bae": "main",
-          "976afc6b3e": "워크스페이스를 만들면 OrcaBotmux가 원격 기준 브랜치를 새로고침하고, 일치하는 로컬 브랜치를 안전하게 fast-forward합니다. 예:",
+          "976afc6b3e": "워크스페이스를 만들면 Botmux가 원격 기준 브랜치를 새로고침하고, 일치하는 로컬 브랜치를 안전하게 fast-forward합니다. 예:",
           "1ec5c91e1d": "브랜치 이름에 Git 사용자 이름, 사용자 지정 접두사 또는 접두사 없음을 사용할지 선택합니다.",
           "330f584b50": "브랜치 접두사",
           "1ffaadf0a0": "작업 트리를 생성할 때 브랜치 이름에 접두사가 추가됩니다.",
@@ -5805,27 +5805,27 @@
           "264a9b6128": "Linear",
           "4831ba1083": "재확인",
           "01f6c7582e": "자세히 알아보기",
-          "1a62c295c6": "Gitea 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인한 후 환경 변수가 변경된 경우 OrcaBotmux를 다시 시작하세요.",
-          "5a1f86225a": "OrcaBotmux가 원격지에서 API URL을 파생할 수 없는 경우에만 가능합니다.",
-          "6193444689": "ORCA_GITEA_API_BASE_URL",
+          "1a62c295c6": "Gitea 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인한 후 환경 변수가 변경된 경우 Botmux를 다시 시작하세요.",
+          "5a1f86225a": "Botmux가 원격지에서 API URL을 파생할 수 없는 경우에만 가능합니다.",
+          "6193444689": "BOTMUX_GITEA_API_BASE_URL",
           "2c0330ec3e": "비공개 repos의 경우, 그리고",
-          "e678d89e8c": "ORCA_GITEA_TOKEN",
+          "e678d89e8c": "BOTMUX_GITEA_TOKEN",
           "d9467ab026": "공개 repos는 Git 원격에서 감지됩니다. 설정하세요",
           "4ab9b96925": "Gitea",
-          "953b7bf6f7": "Azure DevOps 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰, API 기본 URL 및 repos 권한을 확인한 후 환경 변수가 변경된 경우 OrcaBotmux를 다시 시작하십시오.",
-          "6f317f5132": "OrcaBotmux가 git 원격에서 API 기본 URL을 파생할 수 없는 경우에만 가능합니다.",
-          "ae6b7f5f40": "ORCA_AZURE_DEVOPS_API_BASE_URL",
+          "953b7bf6f7": "Azure DevOps 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰, API 기본 URL 및 repos 권한을 확인한 후 환경 변수가 변경된 경우 Botmux를 다시 시작하십시오.",
+          "6f317f5132": "Botmux가 git 원격에서 API 기본 URL을 파생할 수 없는 경우에만 가능합니다.",
+          "ae6b7f5f40": "BOTMUX_AZURE_DEVOPS_API_BASE_URL",
           "67a9f26a80": ". 설정",
-          "8f960935c1": "ORCA_AZURE_DEVOPS_ACCESS_TOKEN",
+          "8f960935c1": "BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN",
           "ce3c58cd63": "또는 설정",
-          "5ee6ef6405": "ORCA_AZURE_DEVOPS_TOKEN",
+          "5ee6ef6405": "BOTMUX_AZURE_DEVOPS_TOKEN",
           "4ee74d1470": "설정",
           "5efce6953d": "Azure DevOps",
-          "3c3cf05c63": "Bitbucket 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰 및 repos 권한을 확인한 후 환경 변수가 변경된 경우 OrcaBotmux를 다시 시작하십시오.",
-          "6e0ff3403e": "ORCA_BITBUCKET_ACCESS_TOKEN",
-          "44cde4aa01": "ORCA_BITBUCKET_API_TOKEN",
+          "3c3cf05c63": "Bitbucket 자격 증명이 구성되었지만 인증할 수 없습니다. 토큰 및 repos 권한을 확인한 후 환경 변수가 변경된 경우 Botmux를 다시 시작하십시오.",
+          "6e0ff3403e": "BOTMUX_BITBUCKET_ACCESS_TOKEN",
+          "44cde4aa01": "BOTMUX_BITBUCKET_API_TOKEN",
           "a6c2816115": "그리고",
-          "b8a7efb3f6": "ORCA_BITBUCKET_EMAIL",
+          "b8a7efb3f6": "BOTMUX_BITBUCKET_EMAIL",
           "8489c0aa49": "Bitbucket",
           "e74de656ce": "glab auth login",
           "05e5245af7": "GitLab CLI가 설치되어 있지만 인증되지 않았습니다. terminal에서 다음 명령을 실행하세요.",
@@ -5867,9 +5867,9 @@
           "a565377c38": "설치되지 않은",
           "15cf990798": "인증되지 않음",
           "f7eb5f0b24": "설치되지 않음",
-          "3ba07f933b": "OrcaBotmux가 작업을 탐색하고 연결된 컨텍스트로 워크스페이스를 시작하는 데 사용할 이슈 트래커를 연결합니다.",
+          "3ba07f933b": "Botmux가 작업을 탐색하고 연결된 컨텍스트로 워크스페이스를 시작하는 데 사용할 이슈 트래커를 연결합니다.",
           "70e885705b": "작업 제공자",
-          "1683acbac4": "OrcaBotmux가 PR, MR, 체크, 리뷰 상태에 사용할 소스 호스트를 연결합니다.",
+          "1683acbac4": "Botmux가 PR, MR, 체크, 리뷰 상태에 사용할 소스 호스트를 연결합니다.",
           "298c65ecac": "리뷰 제공자"
         },
         "KagiSessionLinkForm": {
@@ -5889,10 +5889,10 @@
           "1637f64033": "VS Code에서 열기",
           "98f1a23e1c": "기본 앱으로 열기",
           "400397a10d": "키바인딩 파일 메뉴 열기",
-          "1c2be2b2c6": "OrcaBotmux에서 파일 편집",
+          "1c2be2b2c6": "Botmux에서 파일 편집",
           "c5886a31cc": "외부 편집기를 열지 못했습니다.",
           "cdf794f46d": "키바인딩 파일을 사용할 수 없습니다.",
-          "dd532a01ce": "OrcaBotmux에서 키 바인딩을 열지 못했습니다."
+          "dd532a01ce": "Botmux에서 키 바인딩을 열지 못했습니다."
         },
         "ManageSessionKillDialog": {
           "6bf4627168": "취소",
@@ -5945,37 +5945,37 @@
           "1861982430": "CLI 상태를 로드하지 못했습니다.",
           "8af7a8bc38": "명령은 현재 작업 트리의 활성 에뮬레이터를 대상으로 합니다. 좌표는 0..1에서 정규화됩니다.",
           "c7f3fe0a6e": "일반 에뮬레이터 명령",
-          "d94ca6a623": "agents가 모바일 에뮬레이터 제어를 포함하여 OrcaBotmux CLI 명령을 사용할 수 있도록 합니다.",
-          "67e19ee03c": "OrcaBotmux CLI 스킬",
+          "d94ca6a623": "agents가 모바일 에뮬레이터 제어를 포함하여 Botmux CLI 명령을 사용할 수 있도록 합니다.",
+          "67e19ee03c": "Botmux CLI 스킬",
           "aaf62a3dd2": "설치 위치",
-          "2fef055608": "agents가 셸에서 활성 에뮬레이터를 제어할 수 있도록 OrcaBotmux CLI 명령을 등록합니다.",
-          "4f2205f3b6": "OrcaBotmux CLI 활성화",
-          "ff4b7e65d6": "코딩 agents가 OrcaBotmux CLI 명령을 사용하여 활성 모바일 에뮬레이터를 제어하도록 합니다.",
+          "2fef055608": "agents가 셸에서 활성 에뮬레이터를 제어할 수 있도록 Botmux CLI 명령을 등록합니다.",
+          "4f2205f3b6": "Botmux CLI 활성화",
+          "ff4b7e65d6": "코딩 agents가 Botmux CLI 명령을 사용하여 활성 모바일 에뮬레이터를 제어하도록 합니다.",
           "2a674aa810": "Agent 모바일 에뮬레이터 제어",
-          "cdeaed9e37": "PATH에 OrcaBotmux CLI를 등록했습니다.",
-          "3d34423e88": "OrcaBotmux CLI를 등록하는 중",
+          "cdeaed9e37": "PATH에 Botmux CLI를 등록했습니다.",
+          "3d34423e88": "Botmux CLI를 등록하는 중",
           "3be27641c9": "agent 셸에서 에뮬레이터 명령을 실행할 수 있도록 합니다.",
-          "3941719a56": "스킬 설정을 열기 전에 OrcaBotmux CLI를 확인하고 있습니다."
+          "3941719a56": "스킬 설정을 열기 전에 Botmux CLI를 확인하고 있습니다."
         },
         "MobileEmulatorExamples": {
           "edf13dd03b": "복사",
           "c12b253997": "예시 프롬프트 복사",
           "d151e25078": "\"",
           "b525ff2b12": "\"",
-          "4daa95f25a": "OrcaBotmux CLI 스킬이 설치된 프로젝트의 Claude Code, Codex 또는 다른 agent에 이들 중 하나를 붙여넣으세요.",
+          "4daa95f25a": "Botmux CLI 스킬이 설치된 프로젝트의 Claude Code, Codex 또는 다른 agent에 이들 중 하나를 붙여넣으세요.",
           "0820b3f84f": "시도해 보세요 - 예시 프롬프트",
           "1f608e7d60": "프롬프트를 복사하지 못했습니다.",
           "2b077b5544": "프롬프트를 복사했습니다."
         },
         "MobileEmulatorSettingsPane": {
-          "19d39113b6": "코딩 agents가 OrcaBotmux CLI 명령을 사용하여 활성 모바일 에뮬레이터를 제어하도록 합니다.",
+          "19d39113b6": "코딩 agents가 Botmux CLI 명령을 사용하여 활성 모바일 에뮬레이터를 제어하도록 합니다.",
           "f2f8d97bb6": "Agent 모바일 에뮬레이터 제어",
           "143961d031": "기본 장치",
           "8aec2f99a0": "에뮬레이터 가용성 새로 고침",
           "ae1612c58c": "가용성",
           "f9af91ea26": "새 모바일 에뮬레이터 작업을 표시하고 agents가 활성 에뮬레이터에 연결할 수 있도록 합니다.",
           "700ddbf9b1": "모바일 에뮬레이터 활성화",
-          "bc39d0f115": "OrcaBotmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
+          "bc39d0f115": "Botmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
           "6593c9ddd3": "모바일 에뮬레이터",
           "a4f1c82d90": "비활성화됨",
           "b5e2d93e01": "확인 중...",
@@ -5984,17 +5984,17 @@
           "06b06429c6": "Android SDK 및 iOS 시뮬레이터 지원을 확인 중입니다.",
           "6d1483d4a0": "1개의 에뮬레이터 장치가 감지되었습니다.",
           "0a452d4d3b": "{{value0}} 에뮬레이터 장치가 감지되었습니다.",
-          "f62a1bb759": "OrcaBotmux는 장치가 감지된 후 에뮬레이터 장치를 자동으로 선택합니다.",
+          "f62a1bb759": "Botmux는 장치가 감지된 후 에뮬레이터 장치를 자동으로 선택합니다.",
           "b2fd62ea75": "새 에뮬레이터 탭 및 agent 연결 명령을 위한 기본 장치입니다. 자동 선택은 이미 실행 중인 장치를 선호합니다."
         },
         "MobileNetworkInterfaceSection": {
-          "63d5e4ae1e": "QR 코드를 재생성하고 OrcaBotmux 모바일 앱에서 스캔하세요.",
+          "63d5e4ae1e": "QR 코드를 재생성하고 Botmux 모바일 앱에서 스캔하세요.",
           "87985ba6f5": "이 네트워크 인터페이스 메뉴에서 Tailscale 주소(일반적으로 100.x.y.z IP)를 선택합니다.",
           "1f7c26d36a": "두 장치 모두에서 동일한 tailnet에 로그인합니다.",
           "668016be7a": "컴퓨터와 휴대폰에서.",
           "1dc87a7fbc": "Tailscale",
           "51d29927eb": "설치",
-          "9fc5d203ff": "OrcaBotmux Mobile은 이 컴퓨터에 직접 연결됩니다. 동일한 로컬 네트워크가 아닌 곳에서 사용하려면 컴퓨터와 휴대폰을 동일한 개인 오버레이 네트워크에 놓은 다음 해당 네트워크 주소를 선택하여 QR 코드를 생성하세요.",
+          "9fc5d203ff": "Botmux Mobile은 이 컴퓨터에 직접 연결됩니다. 동일한 로컬 네트워크가 아닌 곳에서 사용하려면 컴퓨터와 휴대폰을 동일한 개인 오버레이 네트워크에 놓은 다음 해당 네트워크 주소를 선택하여 QR 코드를 생성하세요.",
           "39fad211d9": "tailnet을 사용하여 Wi-Fi 외부에서 연결",
           "a9db5d771d": "네트워크 인터페이스 새로 고침",
           "b2c384cfd6": "인터페이스를 찾을 수 없습니다.",
@@ -6004,14 +6004,14 @@
           "1e64659126": "재생성"
         },
         "MobilePane": {
-          "dd3cd78d04": "OrcaBotmux 모바일로 스캔",
-          "35100bca5d": "휴대폰에서 terminals을 사용하는 동안 OrcaBotmux는 휴대폰 화면에 맞게 terminals을 축소합니다. 앱을 닫거나 다른 곳으로 전환하면 terminals이 휴대폰 크기로 유지되는지(대화형 CLI 도구가 리플로우되지 않음) 또는 데스크탑으로 다시 크기가 조정되는지 여부가 제어됩니다. 배너에서 '이 terminals 복원' 또는 '모든 terminals 복원'을 사용해 언제든지 수동으로 크기를 조정할 수 있습니다.",
+          "dd3cd78d04": "Botmux 모바일로 스캔",
+          "35100bca5d": "휴대폰에서 terminals을 사용하는 동안 Botmux는 휴대폰 화면에 맞게 terminals을 축소합니다. 앱을 닫거나 다른 곳으로 전환하면 terminals이 휴대폰 크기로 유지되는지(대화형 CLI 도구가 리플로우되지 않음) 또는 데스크탑으로 다시 크기가 조정되는지 여부가 제어됩니다. 배너에서 '이 terminals 복원' 또는 '모든 terminals 복원'을 사용해 언제든지 수동으로 크기를 조정할 수 있습니다.",
           "ee56f1c7e4": "모바일 앱을 나갈 때",
           "3939fd062c": "장치를 취소하면 즉시 연결이 끊어집니다.",
           "254a6d09e4": "페어링됨",
           "d7ce676270": "페어링된 장치",
           "e778ecb209": "또는 모바일 앱에 다음 코드를 붙여넣으세요.",
-          "310924ad2c": "OrcaBotmux 모바일 앱으로 이 코드를 스캔하세요. 각 코드는 고유한 장치 토큰을 생성합니다.",
+          "310924ad2c": "Botmux 모바일 앱으로 이 코드를 스캔하세요. 각 코드는 고유한 장치 토큰을 생성합니다.",
           "870e1b5ca5": "기기를 취소하지 못했습니다.",
           "2e3dd0bc29": "기기가 취소되었습니다.",
           "711231348f": "페어링 코드를 복사하지 못했습니다.",
@@ -6024,20 +6024,20 @@
           "aa1263e881": "휴대폰 크기로 유지(기본값)",
           "6436e56546": "모바일 페어링을 위한 QR 코드",
           "1b1b70279a": "아직 페어링된 기기가 없습니다.",
-          "1592afcc7a": "아직 페어링된 기기가 없습니다. OrcaBotmux 모바일 앱으로 QR 코드를 스캔하세요.",
+          "1592afcc7a": "아직 페어링된 기기가 없습니다. Botmux 모바일 앱으로 QR 코드를 스캔하세요.",
           "relayDegradedNotice": "Relay couldn’t be reached — this code only works on your local network. Regenerate to try again."
         },
         "MobileSettingsPane": {
           "9a3c280e49": "GitHub 릴리스",
           "b0088412a1": "또는 다음에서 Android APK를 받으세요",
           "b5a2ed83ff": "앱스토어",
-          "c8491c17ef": "QR 코드를 스캔하여 휴대폰에서 OrcaBotmux를 제어하세요. 베타/초기 미리보기 - 버그 및 주요 변경 사항이 예상됩니다. 다음에서 iOS 앱을 받으세요.",
+          "c8491c17ef": "QR 코드를 스캔하여 휴대폰에서 Botmux를 제어하세요. 베타/초기 미리보기 - 버그 및 주요 변경 사항이 예상됩니다. 다음에서 iOS 앱을 받으세요.",
           "e7a3ae8c4e": "모바일",
           "174f4a3c6d": "휴대폰에서 terminals과 agents를 제어하세요.",
-          "1de96ec8a6": "OrcaBotmux Mobile 버튼 표시",
-          "682293cadf": "왼쪽 사이드바 상단에 OrcaBotmux Mobile 버튼을 표시합니다.",
-          "d4f2b65f30": "사이드바에 OrcaBotmux Mobile 바로가기를 표시합니다.",
-          "installIntro": "다음 스토어에서 OrcaBotmux Mobile 설치",
+          "1de96ec8a6": "Botmux Mobile 버튼 표시",
+          "682293cadf": "왼쪽 사이드바 상단에 Botmux Mobile 버튼을 표시합니다.",
+          "d4f2b65f30": "사이드바에 Botmux Mobile 바로가기를 표시합니다.",
+          "installIntro": "다음 스토어에서 Botmux Mobile 설치",
           "installOutro": "하고 아래에서 페어링하세요.",
           "androidApkLabel": "Android APK"
         },
@@ -6048,7 +6048,7 @@
           "2a42dd8d6f": "알림음 볼륨",
           "4aa5085cd7": "사용자 정의:",
           "c258cb96dc": "알림 소리 선택",
-          "2a2033c388": "데스크톱 알림이 전달될 때 OrcaBotmux가 재생하는 경고를 선택합니다.",
+          "2a2033c388": "데스크톱 알림이 전달될 때 Botmux가 재생하는 경고를 선택합니다.",
           "88686e6ca8": "알림음",
           "b6fc369244": "백그라운드 terminal이 벨 문자를 내보냅니다.",
           "591fe605b9": "Terminal 벨",
@@ -6059,11 +6059,11 @@
           "0fadad17ce": "알림음을 재생할 수 없습니다.",
           "406feb0aa6": "테스트 알림이 전달되지 않았습니다.",
           "6fc3781729": "알림이 비활성화되었습니다.",
-          "4676a95bc3": "OrcaBotmux에 대한 데스크톱 알림 설정을 확인하세요.",
+          "4676a95bc3": "Botmux에 대한 데스크톱 알림 설정을 확인하세요.",
           "0cb93240b8": "시스템이 알림을 표시하지 않았습니다.",
           "145227ca2b": "설정 열기",
           "d3d54e0915": "테스트 알림이 전송되었습니다.",
-          "115437bc35": "macOS 배너가 나타나지 않으면 OrcaBotmux에 대한 알림 허용을 활성화합니다.",
+          "115437bc35": "macOS 배너가 나타나지 않으면 Botmux에 대한 알림 허용을 활성화합니다.",
           "7f45542625": "테스트 알림이 요청되었습니다.",
           "98d70fb261": "맞춤 알림 소리를 재생할 수 없습니다.",
           "c83b05a055": "이 시스템에서는 알림이 지원되지 않습니다.",
@@ -6075,7 +6075,7 @@
         "OpenAiTranscriptionKeyDialog": {
           "fa83512e48": "키 저장",
           "07b26f2742": "키 지우기",
-          "d246b2bdb3": "로컬 런타임 키는 가능한 경우 Electron 암호화 저장소를 사용하여 ~/.orca_botmux에 저장됩니다.",
+          "d246b2bdb3": "로컬 런타임 키는 가능한 경우 Electron 암호화 저장소를 사용하여 ~/.botmux에 저장됩니다.",
           "c3380e4ca5": "sk-...",
           "2f797018f0": "API 키가 구성됨",
           "16015322f9": "API 키",
@@ -6113,13 +6113,13 @@
           "ae79504732": "사용방법",
           "7bc082f4de": "설치 명령 복사",
           "832f1f3ee6": "자신의 terminal을 선호하시나요?",
-          "9bedd2a6e5": "agents가 OrcaBotmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
+          "9bedd2a6e5": "agents가 Botmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
           "07641b9768": "오케스트레이션 스킬",
           "2aacdb0517": "핸드오프, 작업 트리 핸드오버, 하위 agents 작업 전반에 걸쳐 코딩 agents를 조정합니다.",
           "191ac34567": "Agent 오케스트레이션"
         },
         "OrchestrationSetupCard": {
-          "e7d2a5146c": "agents가 OrcaBotmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
+          "e7d2a5146c": "agents가 Botmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
           "2777ff0fdc": "오케스트레이션 스킬"
         },
         "OrchestrationSkillAgentCoverage": {
@@ -6166,7 +6166,7 @@
           "e3970bbbf5": "CI 환경 변수가 설정되었기 때문에 텔레메트리가 비활성화되었습니다. 설정을 해제하고 다시 시작하세요.",
           "fe904ac984": "익명의 사용 데이터 공유",
           "77410e0566": "개인 정보 보호 정책",
-          "8bfdd23a88": "다음에 무엇을 빌드할지 알아내도록 도와주세요. OrcaBotmux는 귀하가 사용하는 기능과 문제가 발생한 부분에 대한 개수를 익명으로 보냅니다.",
+          "8bfdd23a88": "다음에 무엇을 빌드할지 알아내도록 도와주세요. Botmux는 귀하가 사용하는 기능과 문제가 발생한 부분에 대한 개수를 익명으로 보냅니다.",
           "afec8b03be": "ci"
         },
         "QuickCommandsPane": {
@@ -6198,14 +6198,14 @@
           "a867a0889f": "최근 또는 탭 표시줄."
         },
         "RepositoryHooksSection": {
-          "af49e2a19e": "파일이 있지만 OrcaBotmux가 유효한 `scripts` 또는 `issueCommand` 정의를 찾을 수 없습니다.",
+          "af49e2a19e": "파일이 있지만 Botmux가 유효한 `scripts` 또는 `issueCommand` 정의를 찾을 수 없습니다.",
           "3397879bee": "로컬 명령이 존재하는 경우 실행할 명령을 선택하십시오.",
-          "39da2ae12f": "orca_botmux.yaml",
+          "39da2ae12f": "botmux.yaml",
           "ac9038d2cc": "둘 다일 때",
           "32fec28f5b": "명령 소스",
-          "bbbd6e0bc4": "명령 소스 및 orca_botmux.yaml",
+          "bbbd6e0bc4": "명령 소스 및 botmux.yaml",
           "c9bc1bfd8f": "고급",
-          "610d90fdbd": "명령 소스 및 orca_botmux.yaml 세부정보",
+          "610d90fdbd": "명령 소스 및 botmux.yaml 세부정보",
           "52aef29e69": "repo 기본값을 사용하려면 비워 두세요.",
           "4084720f47": "{{artifact_url}} 완료",
           "13394103bd": "사용자 지정 GitHub 이슈 명령",
@@ -6220,7 +6220,7 @@
           "fb6bebcf7e": "설치 실행 시기",
           "30d555acd2": "새 작업 트리가 생성된 후 실행되는 로컬 및 공유 스크립트입니다.",
           "52b31baf02": "설정 스크립트",
-          "8567127a40": "작업 트리가 생성되거나 보관될 때 실행되는 스크립트입니다. 로컬 스크립트는 이 시스템에 저장됩니다. `orca_botmux.yaml` 스크립트는 팀과 공유됩니다.",
+          "8567127a40": "작업 트리가 생성되거나 보관될 때 실행되는 스크립트입니다. 로컬 스크립트는 이 시스템에 저장됩니다. `botmux.yaml` 스크립트는 팀과 공유됩니다.",
           "ff082fe7c6": "작업트리 후크",
           "5d940bde5c": "로컬 스크립트 추가",
           "8c2893fae0": "단일 쉘 스크립트로 실행됩니다. 이 컴퓨터에 저장되었습니다.",
@@ -6234,17 +6234,17 @@
           "b2b06c7ce8": "사용 가능한 환경 변수(자세한 내용을 보려면 마우스를 올리세요):",
           "95a0411b3e": "템플릿",
           "175daba180": "예",
-          "b20c5df6ca": "이 repo의 공유 설정, 아카이브 또는 이슈 자동화 기본값을 사용하려면 `orca_botmux.yaml` 파일을 추가하세요. 예제 템플릿:",
-          "56f9a4a1d0": "`orca_botmux.yaml` 사용 중",
-          "623e0c9f31": "`orca_botmux.yaml`을 구문 분석할 수 없습니다",
-          "5a67e4793d": "`orca_botmux.yaml`을 찾을 수 없습니다",
+          "b20c5df6ca": "이 repo의 공유 설정, 아카이브 또는 이슈 자동화 기본값을 사용하려면 `botmux.yaml` 파일을 추가하세요. 예제 템플릿:",
+          "56f9a4a1d0": "`botmux.yaml` 사용 중",
+          "623e0c9f31": "`botmux.yaml`을 구문 분석할 수 없습니다",
+          "5a67e4793d": "`botmux.yaml`을 찾을 수 없습니다",
           "07ba35bc68": "`scripts:` 아래의 들여쓰기를 확인하세요. 후크 키는 두 칸, 명령 줄은 네 칸을 사용해야 합니다.",
           "787ca433ef": "지원되는 키만 정의하세요: `scripts`, `setup`, `archive`, `issueCommand`.",
           "ecc73d9125": "아래의 작동하는 템플릿과 비교하고 필요한 경우 그 형식을 복사하세요.",
           "925f9e0dc4": "text-foreground",
-          "0cc712b823": "핵심 구성 파일이 repo 루트에 있지만 OrcaBotmux가 아직 지원되는 후크 정의를 구문 분석할 수 없습니다.",
+          "0cc712b823": "핵심 구성 파일이 repo 루트에 있지만 Botmux가 아직 지원되는 후크 정의를 구문 분석할 수 없습니다.",
           "c90b858573": "text-amber-700 dark:text-amber-300",
-          "aba825233f": "파일에는 이 버전의 OrcaBotmux가 인식하지 못하는 구성 키가 포함되어 있습니다. OrcaBotmux를 업데이트하거나 파일에 오타가 있는지 확인해야 할 수도 있습니다.",
+          "aba825233f": "파일에는 이 버전의 Botmux가 인식하지 못하는 구성 키가 포함되어 있습니다. Botmux를 업데이트하거나 파일에 오타가 있는지 확인해야 할 수도 있습니다.",
           "ca424ff135": "공유 후크 및 이슈 자동화 기본값은 repo에 정의되어 있으며 이를 사용하는 모든 사람이 사용할 수 있습니다.",
           "32f417fe17": "text-emerald-700 dark:text-emerald-300",
           "8bfe65fc60": "로컬 명령 사용",
@@ -6252,15 +6252,15 @@
           "0fa21e19ec": "일반적으로 브랜치 이름을 기반으로 하는 워크스페이스의 이름입니다.",
           "54c73d88d0": "생성되는 작업 트리의 경로입니다. 설치 명령은 이 디렉터리에서 실행됩니다.",
           "30952c4aa4": "기본 repo 체크아웃 경로입니다. .env와 같은 공유 파일을 작업 트리에 복사하는 데 유용합니다.",
-          "9b821fa19d": "# 예: echo \"$ORCA_WORKSPACE_NAME 정리 중\"",
+          "9b821fa19d": "# 예: echo \"$BOTMUX_WORKSPACE_NAME 정리 중\"",
           "6f90ebe3fd": "작업 트리가 보관되거나 제거되기 전에 실행됩니다.",
-          "a3fc966677": "# 예: pnpm install cp \"$ORCA_ROOT_PATH/.env\" \"$ORCA_WORKTREE_PATH/.env\"",
+          "a3fc966677": "# 예: pnpm install cp \"$BOTMUX_ROOT_PATH/.env\" \"$BOTMUX_WORKTREE_PATH/.env\"",
           "f0710e1c83": "새 작업 트리가 생성된 후 실행됩니다. deps를 설치하고, env 파일을 복사하고, 마이그레이션을 실행하세요.",
-          "8561b0665f": "orca_botmux.yaml을 먼저 사용한 다음 로컬 명령을 실행합니다.",
-          "0e8b2a520d": "orca_botmux.yaml을 무시하십시오. 로컬 명령만 실행하세요.",
+          "8561b0665f": "botmux.yaml을 먼저 사용한 다음 로컬 명령을 실행합니다.",
+          "0e8b2a520d": "botmux.yaml을 무시하십시오. 로컬 명령만 실행하세요.",
           "83dc78202a": "로컬 전용",
           "29397e8bbc": "commit 된 repo 명령만 실행하고 로컬 명령은 무시합니다.",
-          "d88b6ff88f": "orca_botmux.yaml 전용",
+          "d88b6ff88f": "botmux.yaml 전용",
           "99e3264a49": "선택한 경우에만 설정을 실행하세요.",
           "15debc1fd9": "기본적으로 건너뛰기",
           "022ba10cf2": "자동으로 설정을 실행합니다.",
@@ -6277,8 +6277,8 @@
           "4611b78617": "명령 소스",
           "c5a55a2d2e": "고급",
           "b5e3e77e89": "작업",
-          "0ce113fd7b": "로컬 스크립트는 저장되지만 스크립트 소스는 orca_botmux.yaml로만 설정됩니다.",
-          "7f78e5eea6": "로컬 스크립트가 저장됩니다. OrcaBotmux는 사용할 스크립트 소스를 추천하기 전에 orca_botmux.yaml을 계속 확인하고 있습니다.",
+          "0ce113fd7b": "로컬 스크립트는 저장되지만 스크립트 소스는 botmux.yaml로만 설정됩니다.",
+          "7f78e5eea6": "로컬 스크립트가 저장됩니다. Botmux는 사용할 스크립트 소스를 추천하기 전에 botmux.yaml을 계속 확인하고 있습니다.",
           "2b6356e744": "저장됨",
           "81057d5f71": "저장 중...",
           "da37d6f10e": "복사",
@@ -6319,7 +6319,7 @@
           "26fef02bf3": "프로젝트 아이콘",
           "c7ef4415de": "표시 이름",
           "b0a0c14a1c": "사이드바 및 탭에 대한 프로젝트별 표시 세부 정보입니다.",
-          "removeProjectAllHosts": "구성된 모든 호스트의 OrcaBotmux에서 이 프로젝트를 제거합니다.",
+          "removeProjectAllHosts": "구성된 모든 호스트의 Botmux에서 이 프로젝트를 제거합니다.",
           "0909e5d650": "프로젝트 제거",
           "ee5a290616": "폴더로 열렸습니다. 이 워크스페이스에서는 Git 기능을 사용할 수 없습니다.",
           "323debba71": "유형:",
@@ -6337,8 +6337,8 @@
           "setupPathPending": "경로 대기 중",
           "openSetup": "열기",
           "removeSetup": "제거",
-          "hostSetupBlockedVersion": "OrcaBotmux 서버 버전이 호환되지 않습니다.",
-          "hostSetupMissingCapability": "프로젝트를 설정하려면 이 호스트의 OrcaBotmux를 업데이트하세요.",
+          "hostSetupBlockedVersion": "Botmux 서버 버전이 호환되지 않습니다.",
+          "hostSetupMissingCapability": "프로젝트를 설정하려면 이 호스트의 Botmux를 업데이트하세요.",
           "setupProjectOnHost": "다른 호스트에 설정",
           "setupProjectOnHostHelp": "호스트를 선택한 뒤 기존 체크아웃을 가져오거나, repos를 클론하거나, 나중에 준비될 설정을 추적합니다.",
           "setupExistingFolder": "기존 폴더 가져오기",
@@ -6441,16 +6441,16 @@
           "bb90dd6487": "서버 제거",
           "d2e00809e4": "전환",
           "05e0fc3ebf": "전환 대상",
-          "b2290ed203": "OrcaBotmux가 이 호스트로 포커스를 옮기고 해당 프로젝트를 로드합니다. 다른 호스트의 기존 terminals과 브라우저 탭은 계속 유지됩니다.",
+          "b2290ed203": "Botmux가 이 호스트로 포커스를 옮기고 해당 프로젝트를 로드합니다. 다른 호스트의 기존 terminals과 브라우저 탭은 계속 유지됩니다.",
           "d570c35a99": "서버 전환",
-          "84b9b2be05": "브라우저나 다른 OrcaBotmux 클라이언트가 연결할 수 있도록 취소 가능한 액세스 권한을 생성합니다.",
-          "6e1280ca55": "이 OrcaBotmux 서버 공유",
+          "84b9b2be05": "브라우저나 다른 Botmux 클라이언트가 연결할 수 있도록 취소 가능한 액세스 권한을 생성합니다.",
+          "6e1280ca55": "이 Botmux 서버 공유",
           "9a3758d983": "저장된 서버가 없습니다.",
           "9bee6bbeeb": "서버 추가",
           "55fcc964cd": "을(를) 서버에서 실행하고 출력된 페어링 URL을 붙여넣으세요.",
-          "960e901ae4": "orca-botmux-desktop serve --pairing-address <host>",
+          "960e901ae4": "botmux-desktop serve --pairing-address <host>",
           "163671f7b5": "실행",
-          "c3d772c514": "orca_botmux://pair?code=...",
+          "c3d772c514": "botmux://pair?code=...",
           "9bc9b83474": "페어링 코드",
           "e038625857": "개발 환경",
           "54ebacc600": "서버 이름",
@@ -6468,12 +6468,12 @@
           "0c55a47480": "이름과 페어링 코드가 필요합니다.",
           "e6410d72c3": "런타임 환경을 로드하지 못했습니다.",
           "6ef71985da": "엔드포인트 없음",
-          "ed3e3f069d": "그러면 OrcaBotmux에서 저장된 서버가 제거됩니다. 활성 서버는 변경되지 않습니다.",
+          "ed3e3f069d": "그러면 Botmux에서 저장된 서버가 제거됩니다. 활성 서버는 변경되지 않습니다.",
           "b2fda48c39": "활성 서버를 제거하면 이 브라우저가 해당 호스트에서 연결 해제됩니다. 기존 호스트 세션은 그대로 유지됩니다.",
-          "9f7665a01b": "활성 서버를 제거하면 먼저 OrcaBotmux가 로컬 데스크톱으로 다시 전환됩니다. 기존 호스트 세션은 그대로 유지됩니다.",
+          "9f7665a01b": "활성 서버를 제거하면 먼저 Botmux가 로컬 데스크톱으로 다시 전환됩니다. 기존 호스트 세션은 그대로 유지됩니다.",
           "3595fd1948": "새 링크",
           "54dee18f5c": "양식 숨기기",
-          "8cf8790697": "저장된 서버는 페어링된 OrcaBotmux 런타임을 통해 이 브라우저를 라우팅합니다.",
+          "8cf8790697": "저장된 서버는 페어링된 Botmux 런타임을 통해 이 브라우저를 라우팅합니다.",
           "f75ce1c7a5": "로컬은 현재 데스크톱 동작을 유지합니다. 저장된 서버는 지원되는 클라이언트 호출을 원격 런타임을 통해 라우팅합니다.",
           "d25f0688b1": "제거",
           "f3a3d6d834": "{{value0}} 기능",
@@ -6491,29 +6491,29 @@
           "hostModelCapabilityTaskSourceContext": "작업 소스 컨텍스트",
           "hostModelCapabilityWorkspaceRunContext": "워크스페이스 실행 컨텍스트",
           "3f67e8078a": "기본적으로 이 컴퓨터를 사용합니다. 지원되는 프로젝트, 파일, terminals, 공급자 확인, 브라우저/모바일 핸드오프를 해당 서버를 통해 실행하려는 경우에만 저장된 서버를 선택하세요.",
-          "2c85efb3e8": "저장된 서버를 선택하면 이 브라우저가 페어링된 OrcaBotmux 런타임을 기본 호스트로 사용합니다.",
+          "2c85efb3e8": "저장된 서버를 선택하면 이 브라우저가 페어링된 Botmux 런타임을 기본 호스트로 사용합니다.",
           "serverConnected": "연결됨",
           "serverChecking": "확인 중…",
           "serverDisconnected": "연결 해제됨",
           "disconnectedServer": "{{value0}}에서 연결이 해제되었습니다.",
           "connectToRemoteServers": "원격 서버에 연결",
-          "connectToRemoteServersHelp": "다른 OrcaBotmux 런타임을 페어링한 다음 여기에서 연결하거나 연결 해제하세요. 기본 호스트를 변경하려는 경우에만 고급 > 활성 서버를 사용하세요.",
+          "connectToRemoteServersHelp": "다른 Botmux 런타임을 페어링한 다음 여기에서 연결하거나 연결 해제하세요. 기본 호스트를 변경하려는 경우에만 고급 > 활성 서버를 사용하세요.",
           "activeServerRowHelp": "서버를 통해 라우팅되는 프로젝트, terminals, 공급자 확인에 사용할 활성 서버입니다.",
           "disconnect": "연결 해제",
           "connect": "연결",
           "advanced": "고급",
           "serverDetails": "서버 세부 정보",
           "advertiseThisApp": "이 앱을 서버로 알리기",
-          "advertiseThisAppHelp": "브라우저, 모바일 클라이언트 또는 다른 OrcaBotmux 클라이언트가 실행 중인 이 앱에 다시 연결할 수 있도록 액세스 링크를 만듭니다.",
+          "advertiseThisAppHelp": "브라우저, 모바일 클라이언트 또는 다른 Botmux 클라이언트가 실행 중인 이 앱에 다시 연결할 수 있도록 액세스 링크를 만듭니다.",
           "runtimeReachable": "{{value0}}에 연결할 수 있습니다."
         },
         "RuntimePairingGeneratedUrlRows": {
           "0495f68959": "{{value0}} 복사"
         },
         "RuntimePairingUrlGenerator": {
-          "849825e829": "이 페어링 URL을 다른 OrcaBotmux 클라이언트에 붙여넣습니다.",
-          "2e5c4e3c93": "다른 OrcaBotmux 클라이언트와 페어링",
-          "f7cafdc9f3": "이 빌드에서는 브라우저 링크를 사용할 수 없습니다. OrcaBotmux 클라이언트에서는 페어링 URL이 계속 작동합니다.",
+          "849825e829": "이 페어링 URL을 다른 Botmux 클라이언트에 붙여넣습니다.",
+          "2e5c4e3c93": "다른 Botmux 클라이언트와 페어링",
+          "f7cafdc9f3": "이 빌드에서는 브라우저 링크를 사용할 수 없습니다. Botmux 클라이언트에서는 페어링 URL이 계속 작동합니다.",
           "6b9ca3e69b": "브라우저에서 열기",
           "1ca2e5194d": "선택한 주소에 접근할 수 있는 브라우저에서 이 URL을 사용하세요.",
           "8de0f84fff": "액세스 링크 생성",
@@ -6524,7 +6524,7 @@
           "de6d5cff95": "이 컴퓨터(",
           "de77eb1b65": "연결 주소",
           "ff80904fc4": "브라우저 또는 데스크톱 클라이언트에 대해 취소 가능한 액세스 권한을 만듭니다.",
-          "f8500e134a": "이 OrcaBotmux 서버 공유",
+          "f8500e134a": "이 Botmux 서버 공유",
           "d6c081adf4": "URL을 복사하지 못했습니다.",
           "df0aa45a86": "페어링 URL을 복사했습니다.",
           "13704d635e": "웹 클라이언트 URL을 복사했습니다.",
@@ -6560,10 +6560,10 @@
           "c40dadaac8": "모바일",
           "c2ee313198": "SSH를 통해 기존 머신의 파일, terminals, Git, 워크스페이스를 사용합니다.",
           "9b02492d1f": "SSH 호스트",
-          "b5ee17826b": "지속 세션, 더 풍부한 원격 상태, 웹 또는 모바일 핸드오프를 위해 원격 OrcaBotmux 런타임을 페어링합니다.",
-          "7686cb5c36": "이 브라우저를 저장된 OrcaBotmux 서버에 연결하세요.",
-          "bd0181eeca": "원격 OrcaBotmux 서버",
-          "8acf3f22e0": "OrcaBotmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
+          "b5ee17826b": "지속 세션, 더 풍부한 원격 상태, 웹 또는 모바일 핸드오프를 위해 원격 Botmux 런타임을 페어링합니다.",
+          "7686cb5c36": "이 브라우저를 저장된 Botmux 서버에 연결하세요.",
+          "bd0181eeca": "원격 Botmux 서버",
+          "8acf3f22e0": "Botmux 통계와 Claude, Codex, OpenCode 토큰 분석 및 Grok 구독 사용량.",
           "954a8f5aef": "통계 및 사용량",
           "a737a4bb22": "일반 작업에 대한 키보드 단축키입니다.",
           "23bf7a1ad4": "단축키",
@@ -6575,7 +6575,7 @@
           "2b4474780a": "외관",
           "3d9adfe6a5": "전역 terminal, 브라우저, Markdown 탭.",
           "3eb22a3ada": "플로팅 워크스페이스",
-          "01f9d36292": "OrcaBotmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
+          "01f9d36292": "Botmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
           "f75daf1002": "모바일 에뮬레이터",
           "ad9788036f": "홈페이지, 링크 라우팅 및 세션 쿠키.",
           "c46215ea03": "브라우저",
@@ -6591,15 +6591,15 @@
           "c9ca101a3b": "연동",
           "f9b77539fd": "워크스페이스 기본값, 앱 설정 및 유지 관리.",
           "7807c11c4d": "일반",
-          "6855b0f77d": "OrcaBotmux를 병렬 agent 작업에 유용하게 만드는 핵심 워크플로를 완료합니다.",
+          "6855b0f77d": "Botmux를 병렬 agent 작업에 유용하게 만드는 핵심 워크플로를 완료합니다.",
           "6d119427ef": "온보딩 체크리스트",
           "eb1176a14e": "온디바이스 모델을 사용한 로컬 음성-텍스트 받아쓰기.",
           "5063bb47a5": "음성",
           "7118953f14": "agents가 컴퓨터의 모든 앱을 제어할 수 있도록 하세요.",
           "c9841721cb": "컴퓨터 사용",
-          "475980f53d": "OrcaBotmux를 통해 여러 코딩 agents를 조정합니다.",
+          "475980f53d": "Botmux를 통해 여러 코딩 agents를 조정합니다.",
           "00c3a7950d": "오케스트레이션",
-          "21f09426ea": "선택 사항. OrcaBotmux는 기존 공급자 로그인과 함께 작동합니다. OrcaBotmux가 계정 간 전환을 돕도록 원하는 경우에만 계정을 추가하세요.",
+          "21f09426ea": "선택 사항. Botmux는 기존 공급자 로그인과 함께 작동합니다. Botmux가 계정 간 전환을 돕도록 원하는 경우에만 계정을 추가하세요.",
           "ad6c529693": "AI 제공업체 계정",
           "ec1ba547f7": "AI agents를 관리하고, 기본값을 설정하고, 명령을 사용자 정의하세요.",
           "8afa676615": "에이전트",
@@ -6666,10 +6666,10 @@
         },
         "ShortcutTerminalPolicyControl": {
           "0762983d13": "Terminal 우선",
-          "63308571d8": "OrcaBotmux 먼저",
+          "63308571d8": "Botmux 먼저",
           "c43c7ff5f9": "바로가기를 누가 먼저 가로챌지 결정",
           "c3a554288e": "Terminal의 단축키",
-          "0f55c6f15c": "단축키가 겹칠 때 OrcaBotmux와 포커스된 terminal 중 어느 쪽이 우선할지 선택합니다."
+          "0f55c6f15c": "단축키가 겹칠 때 Botmux와 포커스된 terminal 중 어느 쪽이 우선할지 선택합니다."
         },
         "ShortcutsPane": {
           "4b7ae34062": "직접.",
@@ -6678,12 +6678,12 @@
           "f0b35b0b2e": "terminal 또는 TUI에 키보드 포커스가 있는 동안에는 비활성화됩니다.",
           "5c65d5db9d": "Terminal 우선",
           "dfa8ff612f": "terminal 이나 TUI에 키보드 포커스가 있는 동안에도 실행됩니다.",
-          "2a0e8aeccf": "OrcaBotmux 먼저",
+          "2a0e8aeccf": "Botmux 먼저",
           "3c0fac059a": "terminal에 키보드 포커스가 있는 동안에도 계속 실행됩니다.",
           "25b0004fbf": "Terminal 활성",
           "781cb74d22": "terminal 패널에서 실행됩니다.",
           "cb02e00202": "터미널",
-          "d8c988dab4": "~/.orca_botmux/keybindings.json"
+          "d8c988dab4": "~/.botmux/keybindings.json"
         },
         "SourceControlAiActionRecipeDefaults": {
           "2576299196": "인수",
@@ -6692,7 +6692,7 @@
           "2cb4bb7e5d": "CLI 인수",
           "0740d30915": "사용자 정의 명령",
           "ee0e5c2a48": "기본 agent 사용",
-          "bf84dea6af": "OrcaBotmux가 컨텍스트를 삽입하도록 하려는 경우에만 변수를 사용하십시오. 일반 agent 기본 설정을 따르려면 agent를 기본값으로 둡니다.",
+          "bf84dea6af": "Botmux가 컨텍스트를 삽입하도록 하려는 경우에만 변수를 사용하십시오. 일반 agent 기본 설정을 따르려면 agent를 기본값으로 둡니다.",
           "a79c567194": "액션 레시피",
           "cf01d41bce": "각 소스 제어 AI 버튼에서 사용되는 Agent, CLI 인수 및 명령 템플릿입니다.",
           "a9359c8aa9": "알 수 없는 오류",
@@ -6750,7 +6750,7 @@
           "c0f1c80166": "구성된 SSH 대상이 없습니다.",
           "639ceb3698": "대상 추가",
           "51d7dba44d": "가져오기",
-          "a7d28dff81": "OrcaBotmux에서 연결할 원격 호스트를 추가합니다.",
+          "a7d28dff81": "Botmux에서 연결할 원격 호스트를 추가합니다.",
           "94c5284560": "대상",
           "f495689b82": "가져오기 실패",
           "f8050f6307": "동기화된 {{value0}} 서버{{value1}}",
@@ -6817,7 +6817,7 @@
         "SshTargetForm": {
           "fea9cb402e": "취소",
           "1b19b00e93": "제한된 시간 초과는 60초에서 7일 사이여야 합니다.",
-          "137e88ce8d": "OrcaBotmux가 이 호스트에서 연결 해제된 뒤에도 원격 터미널은 계속 실행됩니다.",
+          "137e88ce8d": "Botmux가 이 호스트에서 연결 해제된 뒤에도 원격 터미널은 계속 실행됩니다.",
           "b574994adc": "중지하려면 원격 터미널 종료 또는 릴레이 재설정을 사용하세요.",
           "71fc546097": "재설정할 때까지 터미널 유지",
           "92f80edbfd": "원격 터미널 지속성",
@@ -6877,7 +6877,7 @@
           "52854a5608": "블록",
           "e070e8aeba": "막대",
           "db270cc9a9": "Cursor 모양",
-          "d455f2ef4f": "OrcaBotmux terminal 패널의 기본 커서 모양입니다.",
+          "d455f2ef4f": "Botmux terminal 패널의 기본 커서 모양입니다.",
           "abcb4dd019": "Terminal 커서",
           "70beb1bbc7": "미리보기",
           "31f6e61085": "합자는 현재",
@@ -7020,7 +7020,7 @@
           "db210115c5": "라이트 모드 미리보기",
           "5e0c24b5c8": "라이트 모드에서 패널 사이의 분할 구분선을 제어합니다.",
           "ec2e33ad80": "라이트 디바이더 색상",
-          "d56af60e6f": "OrcaBotmux가 라이트 모드일 때 사용되는 테마를 선택합니다.",
+          "d56af60e6f": "Botmux가 라이트 모드일 때 사용되는 테마를 선택합니다.",
           "8273bc75d7": "라이트 테마",
           "bc8e8a251a": "다크 모드 미리보기",
           "cbe56a0f79": "어두운 모드에서 창 사이의 분할 구분선을 제어합니다.",
@@ -7051,7 +7051,7 @@
           "1afcc1d973": "수직 패딩",
           "25e2f8e8e1": "terminal 그리드 주변의 수평 패딩(픽셀)입니다.",
           "36b8402015": "수평 패딩",
-          "53ce336e15": "창 흐림 변경 사항을 적용하려면 OrcaBotmux를 다시 시작하십시오.",
+          "53ce336e15": "창 흐림 변경 사항을 적용하려면 Botmux를 다시 시작하십시오.",
           "c65bb9ce63": "다시 시작해야 함",
           "97950bb087": "terminal 창에 배경 흐림을 적용합니다. 다시 시작해야 합니다.",
           "2b82242f43": "창 흐림",
@@ -7180,12 +7180,12 @@
           "41a1480d3e": "설치",
           "4598b18464": "제거 중...",
           "7c3bb36706": "제거",
-          "7ee4e52b99": "OrcaBotmux는 명령이 WSL terminals에서 작동하도록 {{value0}}을(를) 등록합니다.",
-          "d8216eb22e": "이렇게 하면 WSL 셸 명령이 제거됩니다. OrcaBotmux 자체는 Windows에 설치된 상태로 유지됩니다.",
+          "7ee4e52b99": "Botmux는 명령이 WSL terminals에서 작동하도록 {{value0}}을(를) 등록합니다.",
+          "d8216eb22e": "이렇게 하면 WSL 셸 명령이 제거됩니다. Botmux 자체는 Windows에 설치된 상태로 유지됩니다.",
           "e49688f67f": "WSL에 `{{value0}}`을(를) 등록하시겠습니까?",
           "61ac55278e": "WSL에서 `{{value0}}`을(를) 제거하시겠습니까?",
           "e2b0ee267f": "오래됨",
-          "7aa456a460": "WSL 내부의 ~/.local/bin에 `orca-botmux-ide`를 등록합니다.",
+          "7aa456a460": "WSL 내부의 ~/.local/bin에 `botmux-ide`를 등록합니다.",
           "0307677bb9": "WSL CLI 등록 확인 중..."
         },
         "accounts": {
@@ -7330,7 +7330,7 @@
             "651f35b2c6": "스위처",
             "e5bc35d59e": "창",
             "d18b54ca90": "독",
-            "1f2880a9d5": "orca_botmux",
+            "1f2880a9d5": "botmux",
             "2cfb3420c0": "앱 아이콘",
             "e80c2af428": "Dock 및 창 전환기에 표시된 앱 아이콘을 선택합니다.",
             "2b313598c6": "앱 아이콘",
@@ -7341,8 +7341,8 @@
             "5bff6a2ef0": "사이드바",
             "5e5b8878bf": "핸드폰",
             "74618577c7": "모바일",
-            "682293cadf": "왼쪽 사이드바 상단에 OrcaBotmux Mobile 버튼을 표시합니다.",
-            "1de96ec8a6": "OrcaBotmux 모바일 버튼 표시",
+            "682293cadf": "왼쪽 사이드바 상단에 Botmux Mobile 버튼을 표시합니다.",
+            "1de96ec8a6": "Botmux 모바일 버튼 표시",
             "4c920ab2d1": "일정",
             "58f4e22fa2": "오토메이션",
             "b186f3cefb": "자동화",
@@ -7357,7 +7357,7 @@
             "51f957ce39": "이름",
             "36e006efc1": "앱",
             "bed343b03e": "제목 표시줄",
-            "18b4c4c30b": "제목 표시줄에 OrcaBotmux를 표시합니다.",
+            "18b4c4c30b": "제목 표시줄에 Botmux를 표시합니다.",
             "fdd31b00d0": "제목 표시줄 앱 이름",
             "c1bca1885a": "파일 탐색기",
             "9f2df826ac": "무시됨",
@@ -7371,7 +7371,7 @@
             "8b36fb3f64": "타이포그래피",
             "a0e09aed9c": "서체",
             "24094af355": "폰트",
-            "07c7c38fac": "OrcaBotmux 인터페이스에서 사용되는 글꼴을 선택합니다.",
+            "07c7c38fac": "Botmux 인터페이스에서 사용되는 글꼴을 선택합니다.",
             "ddb991024d": "IDE 글꼴",
             "0c83659f48": "단축키",
             "0952091186": "배율",
@@ -7381,7 +7381,7 @@
             "3a9b69d734": "시스템",
             "44d873fd18": "라이트",
             "262fe1d24f": "다크",
-            "0709c794f7": "OrcaBotmux가 앱 창에 표시되는 방식을 선택합니다.",
+            "0709c794f7": "Botmux가 앱 창에 표시되는 방식을 선택합니다.",
             "71e06350b4": "테마",
             "dc02c8759d": "워크스페이스",
             "43cfba3b95": "서버",
@@ -7444,7 +7444,7 @@
               "description": "왼쪽 사이드바를 terminal에 맞추거나 기본값을 유지하거나 은은한 색조를 적용합니다."
             },
             "9a115966d3": "닫을 때 트레이로 최소화",
-            "4d5b9427b5": "활성화하면 창을 닫아도 OrcaBotmux가 종료되지 않고 시스템 트레이에서 계속 실행됩니다.",
+            "4d5b9427b5": "활성화하면 창을 닫아도 Botmux가 종료되지 않고 시스템 트레이에서 계속 실행됩니다.",
             "workspaceCardLayout": {
               "title": "워크스페이스 카드 레이아웃",
               "description": "워크스페이스 카드는 컴팩트 또는 상세 레이아웃을 사용할 수 있습니다.",
@@ -7509,7 +7509,7 @@
             "66dd641a47": "세션",
             "29193a51d5": "쿠키",
             "2d2d995c58": "브라우저",
-            "060ac1fcba": "OrcaBotmux 내부의 기존 로그인을 사용하려면 Chrome, Edge 또는 기타 브라우저에서 쿠키를 가져오세요.",
+            "060ac1fcba": "Botmux 내부의 기존 로그인을 사용하려면 Chrome, Edge 또는 기타 브라우저에서 쿠키를 가져오세요.",
             "96afedcb5c": "세션 및 쿠키",
             "a7a07d5415": "편집기",
             "8dd4805991": "파일",
@@ -7548,7 +7548,7 @@
             "a942905148": "새 브라우저 탭을 만들 때 열리는 URL입니다. 빈 탭을 열려면 비워 두세요.",
             "c3903322d2": "기본 홈 페이지",
             "19ea5607cf": "로컬호스트 작업 트리 레이블",
-            "4e0fdf0a3f": "브라우저 탭을 더 쉽게 구분할 수 있도록 작업 트리별 OrcaBotmux 로컬 호스트 URL로 워크스페이스 포트를 엽니다."
+            "4e0fdf0a3f": "브라우저 탭을 더 쉽게 구분할 수 있도록 작업 트리별 Botmux 로컬 호스트 URL로 워크스페이스 포트를 엽니다."
           },
           "use": {
             "search": {
@@ -7573,21 +7573,21 @@
               "cee44fb442": "오토메이션",
               "a57c2172dc": "agent-browser",
               "6ea88e5206": "npx",
-              "f5b8fdddf5": "orca-botmux-cli",
+              "f5b8fdddf5": "botmux-cli",
               "e5a784bc54": "설치",
               "9d97446873": "agent",
               "a2d489263e": "스킬",
-              "a7e82445fa": "agents가 OrcaBotmux의 브라우저를 작동할 수 있도록 브라우저 사용 스킬을 설치하세요.",
+              "a7e82445fa": "agents가 Botmux의 브라우저를 작동할 수 있도록 브라우저 사용 스킬을 설치하세요.",
               "a1414dcefb": "브라우저 사용 스킬 설치",
               "e56c7b55c9": "설정",
               "034c5e8d7f": "활성화",
               "7e0dcb257a": "셸",
               "3ffafc9b95": "명령",
               "30c74aaa1f": "경로",
-              "ff05cbc344": "orca_botmux",
+              "ff05cbc344": "botmux",
               "85fab5e12c": "CLI",
-              "890ddf943d": "agents가 브라우저를 구동할 수 있도록 OrcaBotmux CLI를 등록하세요.",
-              "50f0860e18": "OrcaBotmux CLI 활성화"
+              "890ddf943d": "agents가 브라우저를 구동할 수 있도록 Botmux CLI를 등록하세요.",
+              "50f0860e18": "Botmux CLI 활성화"
             }
           }
         },
@@ -7734,7 +7734,7 @@
             "agentHibernation": {
               "agent": "agent",
               "agents": "에이전트",
-              "description": "설정된 유휴 시간이 지난 백그라운드 agent terminals을 중지하고, 다시 열 때 지원되는 세션을 재개합니다. Agent 최대 절전은 OrcaBotmux에서 시작한 agent의 시작 옵션을 보존합니다. 수동으로 시작한 agent는 현재 OrcaBotmux 기본값으로 재개될 수 있습니다.",
+              "description": "설정된 유휴 시간이 지난 백그라운드 agent terminals을 중지하고, 다시 열 때 지원되는 세션을 재개합니다. Agent 최대 절전은 Botmux에서 시작한 agent의 시작 옵션을 보존합니다. 수동으로 시작한 agent는 현재 Botmux 기본값으로 재개될 수 있습니다.",
               "minutes": "분",
               "sleep": "절전",
               "terminal": "터미널",
@@ -7787,7 +7787,7 @@
             "06ea5a69a6": "GitHub",
             "e4fb4516d0": "스타",
             "e0b8c8bc25": "gh CLI를 통해 GitHub 스타로 프로젝트를 지원하세요.",
-            "36a72f0d9e": "GitHub에서 OrcaBotmux에 스타 주기",
+            "36a72f0d9e": "GitHub에서 Botmux에 스타 주기",
             "c61b14be7c": "그로크",
             "5d9ba08673": "Copilot",
             "f472e97440": "aider",
@@ -7815,20 +7815,20 @@
             "c9d8c1ce66": "릴리스 노트",
             "9e86ccd05c": "버전",
             "f89a94773c": "업데이트",
-            "79ff46776e": "앱 업데이트를 확인하고 최신 OrcaBotmux 버전을 설치하세요.",
+            "79ff46776e": "앱 업데이트를 확인하고 최신 Botmux 버전을 설치하세요.",
             "e15af4eb64": "업데이트 확인",
             "6382fe9724": "npx",
             "baa263d6d8": "에이전트",
             "bda108e66c": "스킬",
-            "244e3fb4c8": "agents가 OrcaBotmux CLI를 사용하도록 OrcaBotmux 스킬을 설치하세요.",
+            "244e3fb4c8": "agents가 Botmux CLI를 사용하도록 Botmux 스킬을 설치하세요.",
             "2d9f7b42df": "Agent 스킬",
             "0a00691c06": "셸 명령",
             "dbeb1f348e": "명령",
             "88d3df9ce9": "터미널",
             "fb4f338a3d": "경로",
             "924a660a78": "CLI",
-            "ca529079bf": "OrcaBotmux CLI 명령을 등록하거나 제거합니다.",
-            "327e3fa70d": "OrcaBotmux CLI",
+            "ca529079bf": "Botmux CLI 명령을 등록하거나 제거합니다.",
+            "327e3fa70d": "Botmux CLI",
             "fb84767421": "전환",
             "f8f0ac213a": "순차적",
             "12ecc640a8": "mru",
@@ -7867,7 +7867,7 @@
             "b2799ba622": "밀리초",
             "146728ac2c": "지연",
             "86f54575c7": "자동 저장",
-            "8ea61ad55c": "OrcaBotmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다.",
+            "8ea61ad55c": "Botmux가 마지막 편집 후 자동으로 저장되기까지 기다리는 시간입니다.",
             "14e46c745b": "자동 저장 지연",
             "4469b6fa4e": "저장",
             "e9d948d3c3": "잠시 후에 편집기 및 편집 가능한 diff 변경 사항을 자동으로 저장합니다.",
@@ -7883,7 +7883,7 @@
             "9da6c875e5": "독",
             "b9096a44cf": "https_proxy",
             "8f03d44672": "http_proxy",
-            "e3b1d42f95": "OrcaBotmux 네트워크 요청 및 로컬 terminal 하위 항목에 대한 프록시 URL입니다.",
+            "e3b1d42f95": "Botmux 네트워크 요청 및 로컬 terminal 하위 항목에 대한 프록시 URL입니다.",
             "c29f23ab57": "HTTP 프록시",
             "6c2ce8457c": "파일 탐색기",
             "c9d9636f24": "파인더",
@@ -7927,7 +7927,7 @@
         },
         "git": {
           "search": {
-            "61eab13403": "orca_botmux",
+            "61eab13403": "botmux",
             "1b93c1143c": "속성",
             "8461c908ae": "공동 집필",
             "61f9f5d1fc": "공저자",
@@ -7935,8 +7935,8 @@
             "6bdea421bb": "PR",
             "16f53f7323": "gh",
             "d088806071": "GitHub",
-            "118c23484b": "commits, PR 및 이슈에 OrcaBotmux 속성을 추가합니다.",
-            "bc7d9f69ce": "OrcaBotmux 속성",
+            "118c23484b": "commits, PR 및 이슈에 Botmux 속성을 추가합니다.",
+            "bc7d9f69ce": "Botmux 속성",
             "40f9b815fd": "API 예산",
             "b7e52124c7": "속도 제한",
             "ead733645f": "glab",
@@ -7958,7 +7958,7 @@
             "564942ffc5": "origin/main",
             "28192e3a63": "master",
             "e3e9adde59": "main",
-            "0e993bf00f": "워크스페이스를 만들면 OrcaBotmux가 원격 기준 브랜치를 새로고침하고, main 또는 master처럼 일치하는 로컬 브랜치를 안전하게 fast-forward합니다. 이렇게 하면 git diff main...HEAD 같은 명령이 오래된 기록과 비교되지 않습니다. 해당 브랜치에 commits 되지 않은 변경 사항이나 로컬 전용 commits이 있으면 OrcaBotmux가 업데이트를 건너뜁니다.",
+            "0e993bf00f": "워크스페이스를 만들면 Botmux가 원격 기준 브랜치를 새로고침하고, main 또는 master처럼 일치하는 로컬 브랜치를 안전하게 fast-forward합니다. 이렇게 하면 git diff main...HEAD 같은 명령이 오래된 기록과 비교되지 않습니다. 해당 브랜치에 commits 되지 않은 변경 사항이나 로컬 전용 commits이 있으면 Botmux가 업데이트를 건너뜁니다.",
             "f8bda25f29": "로컬 메인을 최신 상태로 유지",
             "769ddd7f81": "custom",
             "1d2fae1fa2": "Git 사용자 이름",
@@ -8077,13 +8077,13 @@
         "mobile": {
           "emulator": {
             "search": {
-              "2348045036": "OrcaBotmux가 기본적으로 여는 에뮬레이터 장치를 선택합니다.",
+              "2348045036": "Botmux가 기본적으로 여는 에뮬레이터 장치를 선택합니다.",
               "2bb2e09225": "모바일 스킬",
               "bbe4267416": "에뮬레이터 유형",
               "64494f03c3": "에뮬레이터 연결",
               "6f728f1456": "에뮬레이터 탭",
               "f8b871d655": "agent CLI",
-              "2e0b45b2ba": "OrcaBotmux CLI 명령을 사용하여 모바일 에뮬레이터를 나열하고, 연결하고, 탭하고, 입력하세요.",
+              "2e0b45b2ba": "Botmux CLI 명령을 사용하여 모바일 에뮬레이터를 나열하고, 연결하고, 탭하고, 입력하세요.",
               "ea3eac39bb": "Agent CLI 제어",
               "8ef0f08d36": "런타임",
               "27397fe8e9": "Xcode 명령줄 도구",
@@ -8101,8 +8101,8 @@
               "b8ddd13195": "agent 에뮬레이터",
               "1ad6fb6230": "기본 장치",
               "ac0a985873": "에뮬레이터 스킬",
-              "9353854ff3": "orca_botmux emulator",
-              "d4b7833894": "orca_botmux cli",
+              "9353854ff3": "botmux emulator",
+              "d4b7833894": "botmux cli",
               "84e5706975": "serve-sim",
               "7c5a8a2bee": "Xcode",
               "bec7231663": "아이패드",
@@ -8111,7 +8111,7 @@
               "2d67f708ce": "시뮬레이터",
               "c5eca29310": "iOS 시뮬레이터",
               "25159de808": "모바일 에뮬레이터",
-              "9595354cff": "OrcaBotmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
+              "9595354cff": "Botmux 및 코딩 agents에 대한 모바일 에뮬레이터 지원을 구성합니다.",
               "cdd3c31918": "모바일 에뮬레이터"
             }
           },
@@ -8172,8 +8172,8 @@
               "f213400800": "모바일",
               "671eb4173c": "휴대폰에서 terminals과 agents를 제어하세요.",
               "ffd52a96e4": "모바일",
-              "1de96ec8a6": "OrcaBotmux Mobile 버튼 표시",
-              "682293cadf": "왼쪽 사이드바 상단에 OrcaBotmux Mobile 버튼을 표시합니다.",
+              "1de96ec8a6": "Botmux Mobile 버튼 표시",
+              "682293cadf": "왼쪽 사이드바 상단에 Botmux Mobile 버튼을 표시합니다.",
               "e4f4daea0e": "릴레이",
               "5d5af8e041": "iPhone"
             }
@@ -8199,12 +8199,12 @@
             "57e34a31cd": "wav",
             "5362074f19": "mp3",
             "6e08f78315": "오디오",
-            "c718793e95": "OrcaBotmux가 데스크톱 알림을 위해 재생하는 내장, 시스템 또는 로컬 오디오 파일을 선택합니다.",
+            "c718793e95": "Botmux가 데스크톱 알림을 위해 재생하는 내장, 시스템 또는 로컬 오디오 파일을 선택합니다.",
             "ea8cb8d9ce": "알림음",
             "4ada6bfde9": "필터링",
             "fa60d8e4ab": "억제",
             "a4c3b29a3c": "집중된",
-            "7247b97a31": "OrcaBotmux가 활성 작업 트리에 집중할 때 알림을 보내지 마세요.",
+            "7247b97a31": "Botmux가 활성 작업 트리에 집중할 때 알림을 보내지 마세요.",
             "96562a72c6": "집중하는 동안 억제",
             "a2ab73b325": "주목",
             "ae0487f8fd": "벨",
@@ -8220,7 +8220,7 @@
             "adbc3a0fcf": "네이티브",
             "72539aede4": "시스템",
             "51ae2183e1": "데스크탑",
-            "0534c76311": "OrcaBotmux 데스크톱 알림용 마스터 스위치입니다.",
+            "0534c76311": "Botmux 데스크톱 알림용 마스터 스위치입니다.",
             "4a210b2f72": "알림 활성화"
           }
         },
@@ -8253,7 +8253,7 @@
             "94e04427f6": "환경",
             "664f1a8984": "지속적인 통합",
             "5854a5c752": "ci",
-            "69637f4dc4": "orca_botmux_telemetry_disabled",
+            "69637f4dc4": "botmux_telemetry_disabled",
             "058550f6bc": "do_not_track",
             "83a6cd79b3": "추적하지 마세요",
             "f7a2d9f137": "텔레메트리 전송을 비활성화하는 환경 변수입니다.",
@@ -8268,7 +8268,7 @@
             "b021b9cb81": "익명의",
             "79c319948b": "사용량",
             "77d3180def": "텔레메트리",
-            "b707cc3981": "익명의 기능 사용 이벤트를 보내 OrcaBotmux 개선에 도움을 주세요.",
+            "b707cc3981": "익명의 기능 사용 이벤트를 보내 Botmux 개선에 도움을 주세요.",
             "57b283461a": "익명의 사용 데이터 공유",
             "2b5a5c312f": "포스트호그",
             "4104f6f0f3": "분석",
@@ -8302,13 +8302,13 @@
         },
         "repository": {
           "search": {
-            "bc7e504b8e": ".orca_botmux/issue-command",
-            "603c68b68c": "orca_botmux.yaml",
+            "bc7e504b8e": ".botmux/issue-command",
+            "603c68b68c": "botmux.yaml",
             "9dc60d7f6d": "GitHub",
             "ec70364df2": "작업 흐름",
             "66b584bd6c": "이슈 명령",
             "2011a6a4f2": "GitHub 이슈 명령",
-            "d42d1e49c0": "orca_botmux.yaml 및 선택적 로컬 재정의를 통해 구성된 파일 기반 링크 실행 명령입니다.",
+            "d42d1e49c0": "botmux.yaml 및 선택적 로컬 재정의를 통해 구성된 파일 기반 링크 실행 명령입니다.",
             "d86ea12d16": "사용자 정의 GitHub 이슈 명령",
             "c5e8bdbcbb": "기본적으로 건너뛰기",
             "a69c5cbe90": "기본적으로 실행",
@@ -8323,10 +8323,10 @@
             "0432d2fb7c": "로컬",
             "ed269fad69": "명령 소스",
             "19f58d6d89": "고급의",
-            "d141897c90": "명령 소스 및 orca_botmux.yaml 세부정보",
+            "d141897c90": "명령 소스 및 botmux.yaml 세부정보",
             "cc11699c3d": "고급",
             "bf460fded8": "yaml",
-            "9cad92fe77": "orca_botmux.yaml 후크",
+            "9cad92fe77": "botmux.yaml 후크",
             "6b80f7d3c8": "로컬 설정 스크립트",
             "a1a4c51d58": "아카이브 명령",
             "fbfd2386e8": "아카이브 스크립트",
@@ -8369,7 +8369,7 @@
             "cc876ca5f2": "repos",
             "6469de5368": "프로젝트",
             "3067595d82": "삭제",
-            "c86478c3d8": "OrcaBotmux에서 이 프로젝트를 제거하세요.",
+            "c86478c3d8": "Botmux에서 이 프로젝트를 제거하세요.",
             "c5266c2c9d": "프로젝트 제거",
             "4b9a18a56d": "모노 repo",
             "4e2529722c": "디렉토리",
@@ -8430,13 +8430,13 @@
               "09568ccc65": "서버",
               "ebd5369acf": "환경",
               "d198440ce3": "런타임",
-              "baec27aa8f": "이 브라우저를 저장된 OrcaBotmux 서버에 연결하세요.",
+              "baec27aa8f": "이 브라우저를 저장된 Botmux 서버에 연결하세요.",
               "3517fb2ec0": "활성 서버",
               "c6e5a03aa0": "개발 박스",
               "f1575f1e09": "웹 클라이언트",
               "81444c4102": "페어링 URL",
               "104f4d7dbd": "페어링",
-              "4575341c77": "로컬 데스크톱을 선택하고, 저장된 원격 OrcaBotmux 서버를 추가하거나, 페어링 URL을 생성하세요."
+              "4575341c77": "로컬 데스크톱을 선택하고, 저장된 원격 Botmux 서버를 추가하거나, 페어링 URL을 생성하세요."
             }
           }
         },
@@ -8444,14 +8444,14 @@
           "search": {
             "ca6a0c2df7": "단축키",
             "4811a8264a": "terminal 우선",
-            "afda131738": "OrcaBotmux 먼저",
+            "afda131738": "Botmux 먼저",
             "0ecfc47434": "충돌",
             "0f8cb15582": "agent",
             "f1adebbe8c": "셸",
             "7f1b38f59a": "TUI",
             "7e3fc707aa": "터미널",
             "0ecba9aa5f": "키보드",
-            "ebd7d81e1d": "단축키가 겹칠 때 OrcaBotmux와 포커스된 terminal 중 어느 쪽이 우선할지 선택합니다.",
+            "ebd7d81e1d": "단축키가 겹칠 때 Botmux와 포커스된 terminal 중 어느 쪽이 우선할지 선택합니다.",
             "f052906167": "Terminal의 단축키"
           }
         },
@@ -8626,7 +8626,7 @@
             "77d9f9cd55": "라이트 모드에서 창 사이의 분할 구분선을 제어합니다.",
             "595b97b446": "라이트 모드 구분선 색상",
             "7718d70356": "미리보기",
-            "1dee533bd9": "OrcaBotmux가 라이트 모드일 때 사용되는 테마를 선택합니다.",
+            "1dee533bd9": "Botmux가 라이트 모드일 때 사용되는 테마를 선택합니다.",
             "1d89457764": "라이트 테마",
             "da864e6cec": "라이트 모드",
             "f268092ee3": "라이트 모드는 자체 터미널 테마를 사용할 수 있습니다.",
@@ -8657,7 +8657,7 @@
             "eefd1d8332": "밑줄",
             "015c82349f": "차단",
             "a6e9dcc829": "바",
-            "275a9d6395": "OrcaBotmux terminal 패널의 기본 커서 모양입니다.",
+            "275a9d6395": "Botmux terminal 패널의 기본 커서 모양입니다.",
             "97bcfff662": "커서 모양",
             "1abcf4d7de": "리눅스",
             "7d924d870d": "그래픽",
@@ -8693,7 +8693,7 @@
             "5930244899": "글꼴 크기",
             "warp_import": {
               "title": "Warp에서 가져오기",
-              "description": "Warp 테마를 OrcaBotmux terminal 테마로 가져옵니다.",
+              "description": "Warp 테마를 Botmux terminal 테마로 가져옵니다.",
               "keyword_warp": "warp",
               "keyword_themes": "themes",
               "keyword_yaml": "yaml",
@@ -8701,7 +8701,7 @@
             },
             "yaml_import": {
               "title": "YAML에서 가져오기",
-              "description": "테마 YAML 파일을 OrcaBotmux terminal 테마로 가져옵니다.",
+              "description": "테마 YAML 파일을 Botmux terminal 테마로 가져옵니다.",
               "keyword_yaml": "yaml",
               "keyword_custom": "custom"
             },
@@ -8790,7 +8790,7 @@
                 "options": {
                   "commitMessage": "단계적 변경에서 commit 메시지를 생성합니다.",
                   "pullRequest": "호스팅된 리뷰 제목 및 설명을 생성합니다.",
-                  "branchName": "초기 agent 작업에서 OrcaBotmux가 생성한 브랜치의 이름을 바꿉니다.",
+                  "branchName": "초기 agent 작업에서 Botmux가 생성한 브랜치의 이름을 바꿉니다.",
                   "fixCommitFailure": "commit 후크 또는 git commit이 실패하면 agent를 시작합니다.",
                   "fixChecks": "실패한 호스팅 PR 체크에서 agent를 시작합니다.",
                   "resolveConflicts": "로컬 또는 호스팅 PR 병합 충돌에 대한 agent를 시작합니다.",
@@ -8807,11 +8807,11 @@
         "agent-awake-copy": {
           "e5995ce268": "agents 작업 중 컴퓨터를 깨어 있게 유지",
           "95d3031db2": "agents가 작업하는 동안 이 컴퓨터와 디스플레이를 깨어 있게 유지합니다. 뚜껑을 닫을 때의 동작은 이 기기의 전원 설정을 따릅니다.",
-          "a42f6fbdd8": "agents가 작업하는 동안 이 컴퓨터와 디스플레이를 깨어 있게 유지합니다. OrcaBotmux는 전원 정책에 따라 뚜껑이 닫혀 있을 때도 이 기기를 깨어 있게 유지하도록 요청합니다."
+          "a42f6fbdd8": "agents가 작업하는 동안 이 컴퓨터와 디스플레이를 깨어 있게 유지합니다. Botmux는 전원 정책에 따라 뚜껑이 닫혀 있을 때도 이 기기를 깨어 있게 유지하도록 요청합니다."
         },
         "agent-status-hooks-copy": {
           "7707c15abb": "Agent 상태 훅",
-          "a68a642835": "OrcaBotmux에서 작업 중, 대기 중, 완료 상태를 표시합니다. 끄면 OrcaBotmux가 관리하는 훅을 제거하고 재설치를 중단합니다."
+          "a68a642835": "Botmux에서 작업 중, 대기 중, 완료 상태를 표시합니다. 끄면 Botmux가 관리하는 훅을 제거하고 재설치를 중단합니다."
         },
         "agent-generated-tab-title-copy": {
           "19ad21615a": "탭 제목 자동 생성",
@@ -8834,9 +8834,9 @@
         },
         "WarpThemeImportModal": {
           "title": "Warp에서 가져오기",
-          "description": "Warp 테마를 OrcaBotmux terminal 테마로 가져옵니다.",
+          "description": "Warp 테마를 Botmux terminal 테마로 가져옵니다.",
           "yaml_title": "테마 YAML 가져오기",
-          "yaml_description": "YAML 파일(Warp 형식)을 OrcaBotmux terminal 테마로 가져옵니다.",
+          "yaml_description": "YAML 파일(Warp 형식)을 Botmux terminal 테마로 가져옵니다.",
           "yaml_no_themes_found": "선택한 파일에서 테마를 찾을 수 없습니다.",
           "choose_file": "파일 선택",
           "choose_folder": "폴더 선택",
@@ -8848,7 +8848,7 @@
           "select_all": "모두 선택",
           "colors_only": "색상만",
           "no_themes_found": "사용자 지정 Warp 테마를 찾을 수 없습니다.",
-          "builtin_themes_hint": "Warp의 사전 로드 테마는 Warp 앱의 일부라 디스크에서 읽을 수 없습니다. OrcaBotmux에는 Dracula, Gruvbox, Solarized, Tokyo Night 등 대부분의 테마가 이미 포함되어 있습니다.",
+          "builtin_themes_hint": "Warp의 사전 로드 테마는 Warp 앱의 일부라 디스크에서 읽을 수 없습니다. Botmux에는 Dracula, Gruvbox, Solarized, Tokyo Night 등 대부분의 테마가 이미 포함되어 있습니다.",
           "custom_theme_yaml_hint": "사용자 지정 및 커뮤니티 테마는 자동 가져오기가 찾을 수 있도록 Warp 테마 폴더에 YAML 파일로 있어야 합니다. Warp의 공개 테마 repo를 클론했다면 Choose Folder를 사용해 해당 체크아웃을 가져오세요.",
           "choose_manually": "수동으로 가져올 테마 YAML 파일 또는 폴더를 선택하세요.",
           "skipped_files": "건너뛴 파일",
@@ -8935,33 +8935,33 @@
                 "cards": {
                   "793a06e899": "다시 확인",
                   "1a9475dace": "자세히 알아보기",
-                  "19fb419c12": "Gitea 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인하고, 환경 변수가 변경되었다면 OrcaBotmux를 다시 시작하세요.",
-                  "60708f23da": "OrcaBotmux가 원격에서 API URL을 추론할 수 없는 경우에만 사용하세요.",
-                  "709057ad91": "ORCA_GITEA_API_BASE_URL",
+                  "19fb419c12": "Gitea 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인하고, 환경 변수가 변경되었다면 Botmux를 다시 시작하세요.",
+                  "60708f23da": "Botmux가 원격에서 API URL을 추론할 수 없는 경우에만 사용하세요.",
+                  "709057ad91": "BOTMUX_GITEA_API_BASE_URL",
                   "6da9dfa5de": "비공개 repos의 경우, 그리고",
-                  "6d5c2a3005": "ORCA_GITEA_TOKEN",
+                  "6d5c2a3005": "BOTMUX_GITEA_TOKEN",
                   "fcbe0469fd": "공개 repos는 Git 원격에서 감지됩니다. 설정하세요",
                   "0613928cb3": "이 런타임에서는 아직 Gitea 상태를 사용할 수 없습니다.",
                   "05863d2599": "Gitea REST API를 통한 PR 및 commit 상태입니다.",
                   "52f75876be": "감지된 repos의 PR 및 commit 상태",
                   "0b5242f8a2": "{{value0}} · PR 및 commit 상태",
-                  "40f678df73": "Azure DevOps 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인하고, 환경 변수가 변경되었다면 OrcaBotmux를 다시 시작하세요.",
-                  "7bd345e3f6": "OrcaBotmux가 Git 원격에서 API 기본 URL을 추론할 수 없는 경우에만 사용하세요.",
-                  "186a6689df": "ORCA_AZURE_DEVOPS_API_BASE_URL",
+                  "40f678df73": "Azure DevOps 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰, API 기본 URL, repos 권한을 확인하고, 환경 변수가 변경되었다면 Botmux를 다시 시작하세요.",
+                  "7bd345e3f6": "Botmux가 Git 원격에서 API 기본 URL을 추론할 수 없는 경우에만 사용하세요.",
+                  "186a6689df": "BOTMUX_AZURE_DEVOPS_API_BASE_URL",
                   "b8a10b07c1": ". 설정하세요",
-                  "fbfd237f5e": "ORCA_AZURE_DEVOPS_ACCESS_TOKEN",
+                  "fbfd237f5e": "BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN",
                   "087feb92f1": ", 또는 설정",
-                  "48842720d2": "ORCA_AZURE_DEVOPS_TOKEN",
+                  "48842720d2": "BOTMUX_AZURE_DEVOPS_TOKEN",
                   "7bbc9c64f0": "설정",
                   "f3f47dc7de": "이 런타임에서는 아직 Azure DevOps 상태를 사용할 수 없습니다.",
                   "0eb50d5593": "Azure DevOps REST API 토큰을 통한 PR 및 빌드 상태입니다.",
                   "54636c65d4": "감지된 Azure Repos의 PR 및 빌드 상태",
                   "ea204f5e03": "{{value0}} · PR 및 빌드 상태",
-                  "6154b02093": "Bitbucket 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰과 repos 권한을 확인하고, 환경 변수가 변경되었다면 OrcaBotmux를 다시 시작하세요.",
-                  "e63fe8f627": "ORCA_BITBUCKET_ACCESS_TOKEN",
-                  "19416c874c": "ORCA_BITBUCKET_API_TOKEN",
+                  "6154b02093": "Bitbucket 자격 증명이 구성되어 있지만 인증할 수 없습니다. 토큰과 repos 권한을 확인하고, 환경 변수가 변경되었다면 Botmux를 다시 시작하세요.",
+                  "e63fe8f627": "BOTMUX_BITBUCKET_ACCESS_TOKEN",
+                  "19416c874c": "BOTMUX_BITBUCKET_API_TOKEN",
                   "fc71a0e7aa": "및",
-                  "63a7f47392": "ORCA_BITBUCKET_EMAIL",
+                  "63a7f47392": "BOTMUX_BITBUCKET_EMAIL",
                   "24ac1c69dc": "이 런타임에서는 아직 Bitbucket 상태를 사용할 수 없습니다.",
                   "a924e8dcd1": "Bitbucket Cloud API 토큰을 통한 PR 및 빌드 상태입니다.",
                   "0fa5629dad": "PR 및 빌드 상태"
@@ -8973,7 +8973,7 @@
         "computerUseSummary": {
           "permissionsRequired": "agents가 앱 창을 조작하려면 먼저 {{value0}} 권한{{value1}}이 필요합니다.",
           "checkingTitle": "Computer Use 액세스 확인 중입니다.",
-          "checkingDescription": "OrcaBotmux가 Computer Use 도우미의 macOS 개인정보 보호 권한을 확인하고 있습니다.",
+          "checkingDescription": "Botmux가 Computer Use 도우미의 macOS 개인정보 보호 권한을 확인하고 있습니다.",
           "unavailableTitle": "Computer Use를 사용할 수 없습니다.",
           "unavailableDescription": "{{value0}} 때문에 Computer Use 권한을 사용할 수 없습니다.",
           "readyTitle": "Computer Use를 사용할 준비가 되었습니다.",
@@ -8989,7 +8989,7 @@
           "3c4d5e6f7a": "클라이언트 기본값 재정의",
           "4d5e6f7a8b": "클라이언트 기본값 상속",
           "5e6f7a8b9c": "재설정",
-          "6f7a8b9cad": "상대 경로(예: .orca_botmux/worktrees)를 사용하면 프로젝트별 위치가 되고, 절대 경로를 사용하면 모든 프로젝트가 하나의 폴더를 공유합니다."
+          "6f7a8b9cad": "상대 경로(예: .botmux/worktrees)를 사용하면 프로젝트별 위치가 되고, 절대 경로를 사용하면 모든 프로젝트가 하나의 폴더를 공유합니다."
         },
         "ProviderHostScopeControl": {
           "scope_label": "{{value0}}: {{value1}}",
@@ -8997,11 +8997,11 @@
         },
         "providerAccountScope": {
           "remoteServer": "원격 서버: {{value0}}",
-          "remoteServerCredentials": "이 공급자의 자격 증명과 계정 확인은 이 원격 서버가 소유합니다. 다른 기본 런타임 범위를 편집하려면 설정 > 원격 OrcaBotmux 서버 > 고급을 사용하세요.",
+          "remoteServerCredentials": "이 공급자의 자격 증명과 계정 확인은 이 원격 서버가 소유합니다. 다른 기본 런타임 범위를 편집하려면 설정 > 원격 Botmux 서버 > 고급을 사용하세요.",
           "localMac": "로컬 Mac",
-          "localCredentials": "이 제공자의 자격 증명과 계정 확인은 이 데스크톱 클라이언트가 소유합니다. 서버 소유 자격 증명은 설정 > 원격 OrcaBotmux 서버 > 고급에서 편집하세요.",
-          "remoteServerRateLimit": "{{value0}} API 예산은 이 원격 서버의 CLI에서 가져옵니다. 다른 기본 런타임 예산을 보려면 설정 > 원격 OrcaBotmux 서버 > 고급을 사용하세요.",
-          "localRateLimit": "{{value0}} API 예산은 이 데스크톱 클라이언트의 CLI에서 가져옵니다. 서버 소유 예산을 보려면 설정 > 원격 OrcaBotmux 서버 > 고급을 사용하세요."
+          "localCredentials": "이 제공자의 자격 증명과 계정 확인은 이 데스크톱 클라이언트가 소유합니다. 서버 소유 자격 증명은 설정 > 원격 Botmux 서버 > 고급에서 편집하세요.",
+          "remoteServerRateLimit": "{{value0}} API 예산은 이 원격 서버의 CLI에서 가져옵니다. 다른 기본 런타임 예산을 보려면 설정 > 원격 Botmux 서버 > 고급을 사용하세요.",
+          "localRateLimit": "{{value0}} API 예산은 이 데스크톱 클라이언트의 CLI에서 가져옵니다. 서버 소유 예산을 보려면 설정 > 원격 Botmux 서버 > 고급을 사용하세요."
         },
         "settingOwnership": {
           "clientDefault": "클라이언트 기본값",
@@ -9030,11 +9030,11 @@
           "missingOriginBranch": "origin에 upstream 기본 브랜치가 없습니다.",
           "diverged": "origin에 upstream에 없는 commits이 있습니다.",
           "blocked": "포크 동기화를 건너뜀",
-          "blockedFallback": "OrcaBotmux가 이 포크를 안전하게 fast-forward할 수 없습니다.",
+          "blockedFallback": "Botmux가 이 포크를 안전하게 fast-forward할 수 없습니다.",
           "failed": "포크 동기화 실패",
           "title": "포크를 최신 상태로 유지",
           "description": "이 포크를 upstream에서 안전하게 fast-forward합니다.",
-          "longDescription": "이 포크가 upstream보다 뒤처진 경우 OrcaBotmux가 기본 브랜치를 안전하게 fast-forward할 수 있습니다. 브랜치에 로컬 전용 commits 이나 충돌이 있으면 OrcaBotmux가 업데이트를 건너뜁니다.",
+          "longDescription": "이 포크가 upstream보다 뒤처진 경우 Botmux가 기본 브랜치를 안전하게 fast-forward할 수 있습니다. 브랜치에 로컬 전용 commits 이나 충돌이 있으면 Botmux가 업데이트를 건너뜁니다.",
           "forkOf": "{{owner}}/{{repo}}의 포크",
           "syncing": "동기화 중",
           "syncNow": "지금 동기화",
@@ -9079,8 +9079,8 @@
         },
         "PrivacyDiagnosticsRows": {
           "5a7cbe069a": "DO_NOT_TRACK=1이 설정되어 있어 진단 파일 만들기와 보내기가 비활성화되었습니다.",
-          "63d03261d1": "ORCA_TELEMETRY_DISABLED=1이 설정되어 있어 진단 파일 만들기와 보내기가 비활성화되었습니다.",
-          "d37e92a06b": "ORCA_DIAGNOSTICS_DISABLED=1이 설정되어 있어 앱 진단이 꺼져 있습니다.",
+          "63d03261d1": "BOTMUX_TELEMETRY_DISABLED=1이 설정되어 있어 진단 파일 만들기와 보내기가 비활성화되었습니다.",
+          "d37e92a06b": "BOTMUX_DIAGNOSTICS_DISABLED=1이 설정되어 있어 앱 진단이 꺼져 있습니다.",
           "5ebb31e1fb": "CI에서 실행 중입니다. 진단이 꺼져 있습니다.",
           "e27c8d45bf": "환경 변수로 인해 진단이 비활성화되었습니다."
         },
@@ -9116,7 +9116,7 @@
         },
         "BrowserLocalhostWorktreeLabelsSetting": {
           "8ac8c3ad19": "로컬호스트 작업 트리 레이블",
-          "1db3c8b983": "브라우저 탭을 더 쉽게 구분할 수 있도록 작업 트리별 OrcaBotmux 로컬 호스트 URL로 워크스페이스 포트를 엽니다."
+          "1db3c8b983": "브라우저 탭을 더 쉽게 구분할 수 있도록 작업 트리별 Botmux 로컬 호스트 URL로 워크스페이스 포트를 엽니다."
         },
         "AgentRuntimeSetting": {
           "label": "Agent 런타임",
@@ -9130,7 +9130,7 @@
         },
         "MobileEmulatorSdkStatus": {
           "536026130e": "에뮬레이터 SDK",
-          "dde0ec1cd8": "OrcaBotmux가 에뮬레이터를 실행하는 데 사용하는 도구 체인입니다. Android는 Android SDK를 통해 모든 OS에서 작동합니다. iOS 시뮬레이터에는 macOS에서 Xcode가 필요합니다.",
+          "dde0ec1cd8": "Botmux가 에뮬레이터를 실행하는 데 사용하는 도구 체인입니다. Android는 Android SDK를 통해 모든 OS에서 작동합니다. iOS 시뮬레이터에는 macOS에서 Xcode가 필요합니다.",
           "027cbf668a": "Android SDK",
           "f6d080d128": "구성된 경로 사용",
           "7fe4bd5907": "다음에서 감지됨",
@@ -9175,13 +9175,13 @@
           "notificationPlayground": "Notification playground",
           "notificationPlaygroundDescription": "토스트 레이아웃, 복구 액션, 긴 텍스트 줄바꿈을 확인하기 위한 개발 전용 트리거입니다.",
           "devOnly": "Dev only",
-          "orcaCloud": "OrcaBotmux Cloud",
-          "orcaCloudDescription": "1方클라우드 로그인의 개발자 전용 미리보기. 프로덕션에서는 숨겨집니다. 개발 환경에서는 ORCA_CLOUD_API_URL과 ORCA_CLOUD_CLIENT_ID가 설정되면 사이드바 계정 전환기에도 표시됩니다.",
-          "orcaCloudStatus": "상태",
-          "orcaCloudSignOut": "로그아웃",
-          "orcaCloudConnect": "프로필 연결",
-          "orcaCloudRefresh": "상태 새로고침",
-          "orcaCloudNotConfigured": "ORCA_CLOUD_API_URL과 ORCA_CLOUD_CLIENT_ID를 설정하여 이 개발 빌드에서 OrcaBotmux Cloud 로그인을 미리보세요."
+          "botmuxCloud": "Botmux Cloud",
+          "botmuxCloudDescription": "1方클라우드 로그인의 개발자 전용 미리보기. 프로덕션에서는 숨겨집니다. 개발 환경에서는 BOTMUX_CLOUD_API_URL과 BOTMUX_CLOUD_CLIENT_ID가 설정되면 사이드바 계정 전환기에도 표시됩니다.",
+          "botmuxCloudStatus": "상태",
+          "botmuxCloudSignOut": "로그아웃",
+          "botmuxCloudConnect": "프로필 연결",
+          "botmuxCloudRefresh": "상태 새로고침",
+          "botmuxCloudNotConfigured": "BOTMUX_CLOUD_API_URL과 BOTMUX_CLOUD_CLIENT_ID를 설정하여 이 개발 빌드에서 Botmux Cloud 로그인을 미리보세요."
         },
         "EphemeralVmRecipeRow": {
           "useInWorkspace": "워크스페이스에서 사용"
@@ -9220,14 +9220,14 @@
           "skillTitle": "워크스페이스별 환경 기술",
           "skillDescription": "repo 소유 환경 레시피를 설정, 빌드, 인증 및 검증합니다.",
           "whatTitle": "당신과 함께 기술이 하는 일",
-          "whatScaffold": "OrcaBotmux 서버 또는 SSH를 통해 연결된 공급자를 위한 레시피 및 스크립트를 작성합니다.",
+          "whatScaffold": "Botmux 서버 또는 SSH를 통해 연결된 공급자를 위한 레시피 및 스크립트를 작성합니다.",
           "whatBuild": "재사용 가능한 기본 이미지를 구축하고 agent에 로그인합니다.",
           "whatValidate": "워크스페이스를 생성할 수 있도록 유효성을 검사합니다.",
           "promptHint": "어떤 워크스페이스에서든 agent에게 다음과 같이 질문하세요.",
           "copy": "복사",
           "copied": "복사됨",
           "recipes": "조리법",
-          "recipesHelp": "agent가 orca_botmux.yaml에 추가하는 레시피가 여기에 표시되어 워크스페이스를 시작할 준비가 됩니다.",
+          "recipesHelp": "agent가 botmux.yaml에 추가하는 레시피가 여기에 표시되어 워크스페이스를 시작할 준비가 됩니다.",
           "refresh": "임시 VM 레시피 새로 고침",
           "checking": "레시피 확인 중...",
           "none": "아직 레시피를 찾을 수 없습니다."
@@ -9278,7 +9278,7 @@
           "0d8e77bc40": "Grok CLI 문서",
           "ad47a33f72": "로드 중…",
           "b2c3d4e5f6": "로그인됨",
-          "c3d4e5f6a7": "로그인되었습니다. OrcaBotmux는 디스크의 해당 파일만 읽습니다. 사용량 조회가 실패하면 grok login을 다시 실행하세요.",
+          "c3d4e5f6a7": "로그인되었습니다. Botmux는 디스크의 해당 파일만 읽습니다. 사용량 조회가 실패하면 grok login을 다시 실행하세요.",
           "d4e5f6a7b8": "세션이 만료되었습니다. 터미널에서 grok login을 실행해 갱신하세요.",
           "e5f6a7b8c9": "Grok CLI에 로그인되어 있지 않음",
           "f6a7b8c9d0": "터미널에서 grok login을 실행한 다음 여기에서 사용량 새로 고침을 클릭하세요.",
@@ -9288,8 +9288,8 @@
           "c6d1a8f4e2": "{{when}}에 재설정",
           "e6dadc1e2b": "Monthly usage",
           "75e396bf42": "Grok 통합 결제 계정에 포함된 월간 사용량입니다.",
-          "b36fa2c908": "Signed in. OrcaBotmux reads the Grok CLI session stored on disk.",
-          "f08c41de73": "Session expired — run grok on the computer running OrcaBotmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed."
+          "b36fa2c908": "Signed in. Botmux reads the Grok CLI session stored on disk.",
+          "f08c41de73": "Session expired — run grok on the computer running Botmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed."
         },
         "AppearanceWindowSidebarSection": {
           "usagePercentageDisplayUsed": "사용",
@@ -9304,7 +9304,7 @@
           "connecting": "Connecting",
           "reconnecting": "Reconnecting",
           "offline": "Offline",
-          "title": "OrcaBotmux Relay",
+          "title": "Botmux Relay",
           "automatic": "휴대폰이 페어링되면 어디서나 연결",
           "signInPrompt": "어디서나 연결하려면 이 데스크톱에서 로그인하세요",
           "directStillAvailable": "LAN 및 Tailscale 연결은 계속 사용할 수 있습니다.",
@@ -9322,10 +9322,10 @@
           "signIn": "로그인",
           "localDescription": "휴대폰이 이 Wi‑Fi 또는 Tailscale에 연결되어 있어야 합니다. 로그인이 필요하지 않습니다.",
           "pathGroup": "휴대폰이 이 컴퓨터에 연결되는 방식",
-          "anywhereTitle": "OrcaBotmux Relay",
+          "anywhereTitle": "Botmux Relay",
           "anywhereDescription": "휴대폰이 모바일 네트워크 또는 모든 Wi‑Fi에서 연결 가능합니다. 로그인이 필요합니다.",
-          "signInRequired": "OrcaBotmux Mobile Relay를 사용하려면 로그인하세요.",
-          "relayUnavailable": "이 빌드에서는 OrcaBotmux Relay를 사용할 수 없습니다. 로컬 네트워크를 사용하세요.",
+          "signInRequired": "Botmux Mobile Relay를 사용하려면 로그인하세요.",
+          "relayUnavailable": "이 빌드에서는 Botmux Relay를 사용할 수 없습니다. 로컬 네트워크를 사용하세요.",
           "signInAgain": "다시 로그인",
           "localTitle": "로컬 네트워크"
         },
@@ -9334,14 +9334,14 @@
           "regenerate": "다시 생성",
           "generate": "QR 코드 생성",
           "refresh": "네트워크 인터페이스 새로 고침",
-          "overview": "QR 코드를 생성한 후 OrcaBotmux Mobile의 Pair Desktop에서 스캔하세요.",
+          "overview": "QR 코드를 생성한 후 Botmux Mobile의 Pair Desktop에서 스캔하세요.",
           "step1Title": "연결 방식",
           "step2Title": "이 컴퓨터의 주소",
           "step2RelayDescription": "가까운 곳에서는 빠른 직접 연결에 사용됩니다. 먼 거리에서는 Relay가 원격 액세스를 제공합니다.",
           "step2LocalDescription": "휴대폰이 Wi‑Fi 또는 Tailscale을 통해 이 주소에 접근할 수 있어야 합니다."
         },
         "MobileRelayBetaAvailability": {
-          "about": "OrcaBotmux Relay 베타 정보",
+          "about": "Botmux Relay 베타 정보",
           "beta": "베타",
           "availability": "이용 가능:",
           "testFlight": "TestFlight",
@@ -9358,14 +9358,14 @@
           "title": "Linear",
           "description": "Give agents the skill to read and update your linked Linear tickets.",
           "skillTitle": "Linear skill",
-          "skillDescription": "Enables agents to read linked tickets and post updates to Linear through OrcaBotmux.",
+          "skillDescription": "Enables agents to read linked tickets and post updates to Linear through Botmux.",
           "howToUse": "How to use it",
           "howToUseDescription": "Ask an agent working a Linear-linked worktree to read context, post updates, move the ticket, or attach the PR.",
           "terminalTitle": "Linear skill setup",
           "terminalAriaLabel": "Linear skill install terminal"
         },
         "MobileRelayBetaNotice": {
-          "notice": "OrcaBotmux Relay is in beta."
+          "notice": "Botmux Relay is in beta."
         }
       },
       "right": {
@@ -9415,7 +9415,7 @@
             "495b2f8c4b": "agent를 시작했지만 선택한 댓글을 해결됨으로 표시할 수 없습니다.",
             "3c3ad3a1d2": "agent를 시작했습니다. 호스트에서 해결됨으로 표시할 수 있는 선택된 댓글이 없습니다.",
             "review": {
-              "auto_retry": "OrcaBotmux가 {{time}}에 다시 시도합니다.",
+              "auto_retry": "Botmux가 {{time}}에 다시 시도합니다.",
               "open_review": "검토 열기",
               "retry": "다시 시도"
             },
@@ -9476,7 +9476,7 @@
             "d87a4c42e1": "Markdown 미리보기 열기",
             "c2112579f6": "다운로드",
             "7ac885bd2f": "폴더 다운로드",
-            "dd112c81d2": "OrcaBotmux 브라우저에서 열기",
+            "dd112c81d2": "Botmux 브라우저에서 열기",
             "1bb9be455c": "프로젝트로 추가...",
             "0fec99bfd7": "복제",
             "f61af83316": "새 폴더",
@@ -9731,7 +9731,7 @@
             "fe5bd1a610": "{{value0}} 생성 중...",
             "812cb992ee": "{{value0}}에서 열기",
             "eef5446523": "{{value0}} #{{value1}}은(는) 이미 열려 있습니다.",
-            "0453ca3a9a": "{{value0}}이(가) 생성되었지만 OrcaBotmux가 아직 새로 고칠 수 없습니다.",
+            "0453ca3a9a": "{{value0}}이(가) 생성되었지만 Botmux가 아직 새로 고칠 수 없습니다.",
             "f99560ab29": "중단 {{value0}} 실패",
             "eae7a1da5f": "메모를 지우지 못했습니다.",
             "657e0c90ad": "{{value0}} 메모{{value1}}",
@@ -9885,16 +9885,16 @@
             "1d47db9bf0": "활성화된 agents가 없습니다.",
             "c7ff8cef11": "agents 감지 중...",
             "013c9ac04a": "저장 대상",
-            "1bb611240f": "OrcaBotmux 기본 프롬프트를 사용하려면 {basePrompt}를 사용하세요.",
-            "23280cbab1": "이 템플릿에는 {basePrompt}가 포함되어 있지 않아 agent가 OrcaBotmux 기본 프롬프트를 받지 못합니다.",
+            "1bb611240f": "Botmux 기본 프롬프트를 사용하려면 {basePrompt}를 사용하세요.",
+            "23280cbab1": "이 템플릿에는 {basePrompt}가 포함되어 있지 않아 agent가 Botmux 기본 프롬프트를 받지 못합니다.",
             "5421a96acb": "저장 후 agent 시작",
             "6cefcdfba1": "나중에 Source Control AI 설정에서 변경할 수 있습니다.",
             "c29f9cf266": "이 프롬프트를 저장하고 다음에는 이 리뷰를 표시하지 않기",
-            "d8f40128ee": "{basePrompt}는 OrcaBotmux 기본 프롬프트입니다.",
+            "d8f40128ee": "{basePrompt}는 Botmux 기본 프롬프트입니다.",
             "ea4788705e": "취소",
             "b0da3a4d3e": "실행 레시피가 이미 저장되었습니다",
             "bff4795a6d": "저장된 레시피를 업데이트하려면 agent, 인수 또는 프롬프트 템플릿을 변경하세요.",
-            "5c75b24735": "OrcaBotmux가 시작하기 전에 agent가 받을 내용을 사용자 지정합니다.",
+            "5c75b24735": "Botmux가 시작하기 전에 agent가 받을 내용을 사용자 지정합니다.",
             "repoAgentOverrideNote": "이 저장소는 전역 기본값({{global}})을 재정의하며 현재 {{effective}}을(를) 실행합니다. 이 저장소에서 실행할 항목을 바꾸려면 이 저장소에 저장하세요."
           },
           "SourceControlTextGenerationDialog": {
@@ -9971,7 +9971,7 @@
                 "60186d8498": "충돌로 인해 차단됨",
                 "c16762ac8c": "아래 체크와 댓글은 현재 가져온 컨텍스트를 보여줍니다.",
                 "9d0e7bcefc": "차단 PR 조치 없음",
-                "5856874b59": "OrcaBotmux는 이 패널이 열려 있는 동안 검사를 새로 고칩니다.",
+                "5856874b59": "Botmux는 이 패널이 열려 있는 동안 검사를 새로 고칩니다.",
                 "5341023167": "확인",
                 "b45db92d0e": "수정",
                 "5d4ebf9391": "세부 정보를 검사하거나 AI 수정 패스를 시작하세요.",
@@ -10040,14 +10040,14 @@
               },
               "review": {
                 "detail": {
-                  "positive": "OrcaBotmux에는 확인할 수 없는 저장된 {{reviewLabel}} 정보가 있습니다.",
-                  "rate_limited": "{{provider}}가 요청을 일시적으로 제한하고 있어 OrcaBotmux도 {{reviewLabel}} 상태를 확인할 수 없었습니다.",
-                  "network": "이 환경에서 {{provider}}에 연결할 수 없어 OrcaBotmux도 {{reviewLabel}} 상태를 확인할 수 없었습니다.",
-                  "untyped": "OrcaBotmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다."
+                  "positive": "Botmux에는 확인할 수 없는 저장된 {{reviewLabel}} 정보가 있습니다.",
+                  "rate_limited": "{{provider}}가 요청을 일시적으로 제한하고 있어 Botmux도 {{reviewLabel}} 상태를 확인할 수 없었습니다.",
+                  "network": "이 환경에서 {{provider}}에 연결할 수 없어 Botmux도 {{reviewLabel}} 상태를 확인할 수 없었습니다.",
+                  "untyped": "Botmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다."
                 },
                 "positive": {
                   "title": "{{reviewLabelCap}} 세부 정보를 사용할 수 없음",
-                  "body": "OrcaBotmux는 이 브랜치의 {{reviewLabel}} 정보를 저장했지만 현재 상태를 확인할 수 없었습니다."
+                  "body": "Botmux는 이 브랜치의 {{reviewLabel}} 정보를 저장했지만 현재 상태를 확인할 수 없었습니다."
                 },
                 "no_review": {
                   "title": "{{reviewLabel}}를 찾을 수 없음",
@@ -10055,19 +10055,19 @@
                 },
                 "active": {
                   "title": "{{reviewLabel}} 상태 확인 중",
-                  "body": "OrcaBotmux는 이 브랜치의 {{provider}}에서 {{reviewLabel}}를 확인하고 있습니다."
+                  "body": "Botmux는 이 브랜치의 {{provider}}에서 {{reviewLabel}}를 확인하고 있습니다."
                 },
                 "git_loading": {
                   "title": "브랜치 상태 확인 중",
-                  "body": "OrcaBotmux는 생성 또는 게시 작업을 표시하기 전에 이 브랜치를 확인하고 있습니다."
+                  "body": "Botmux는 생성 또는 게시 작업을 표시하기 전에 이 브랜치를 확인하고 있습니다."
                 },
                 "git_error": {
                   "title": "브랜치 상태를 확인할 수 없음",
-                  "body": "OrcaBotmux는 이 환경에서 이 브랜치의 업스트림을 확인할 수 없었습니다. 게시하거나 {{reviewLabel}}를 만들기 전에 다시 시도하세요."
+                  "body": "Botmux는 이 환경에서 이 브랜치의 업스트림을 확인할 수 없었습니다. 게시하거나 {{reviewLabel}}를 만들기 전에 다시 시도하세요."
                 },
                 "unknown": {
                   "title": "{{reviewLabelCap}} 상태를 사용할 수 없음",
-                  "body": "OrcaBotmux가 이 브랜치의 {{reviewLabel}} 상태를 확인하지 못했습니다. 다시 시도하여 확인하세요."
+                  "body": "Botmux가 이 브랜치의 {{reviewLabel}} 상태를 확인하지 못했습니다. 다시 시도하여 확인하세요."
                 },
                 "paused": {
                   "title": "{{provider}} 새로고침 일시 중지됨",
@@ -10079,11 +10079,11 @@
                 },
                 "unknown_error": {
                   "title": "{{reviewLabel}} 상태를 확인할 수 없음",
-                  "body": "조회에 실패하여 OrcaBotmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다."
+                  "body": "조회에 실패하여 Botmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다."
                 },
                 "untyped": {
                   "title": "{{reviewLabelCap}} 상태를 사용할 수 없음",
-                  "body": "OrcaBotmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다. 다시 시도하여 확인하세요."
+                  "body": "Botmux는 이 브랜치에 이미 {{reviewLabel}}가 있는지 확인할 수 없었습니다. 다시 시도하여 확인하세요."
                 },
                 "auth": {
                   "title": "{{provider}} 인증 실패",
@@ -10099,12 +10099,12 @@
                 },
                 "cli": {
                   "title": "{{provider}} CLI를 사용할 수 없음",
-                  "body": "OrcaBotmux는 이 환경에서 {{provider}} CLI를 실행할 수 없었습니다. 여기에서 설정한 후 다시 시도하세요."
+                  "body": "Botmux는 이 환경에서 {{provider}} CLI를 실행할 수 없었습니다. 여기에서 설정한 후 다시 시도하세요."
                 },
                 "skipped": {
                   "disconnected": {
                     "title": "호스트 연결 끊김",
-                    "body": "이 리포지토리의 실행 호스트가 연결 해제되어 OrcaBotmux가 {{reviewLabel}} 상태를 새로고칠 수 없습니다."
+                    "body": "이 리포지토리의 실행 호스트가 연결 해제되어 Botmux가 {{reviewLabel}} 상태를 새로고칠 수 없습니다."
                   },
                   "bare": {
                     "title": "베어 리포지토리",
@@ -10112,15 +10112,15 @@
                   },
                   "archived": {
                     "title": "리포지토리가 보관됨",
-                    "body": "이 리포지토리가 보관되어 있으므로 OrcaBotmux가 {{reviewLabel}} 상태를 새로고치지 않습니다."
+                    "body": "이 리포지토리가 보관되어 있으므로 Botmux가 {{reviewLabel}} 상태를 새로고치지 않습니다."
                   },
                   "not_git": {
                     "title": "Git 리포지토리가 아님",
-                    "body": "OrcaBotmux는 {{reviewLabel}} 상태용으로 이 폴더를 Git 리포지토리로 처리할 수 없었습니다."
+                    "body": "Botmux는 {{reviewLabel}} 상태용으로 이 폴더를 Git 리포지토리로 처리할 수 없었습니다."
                   },
                   "remote": {
                     "title": "리모트 전용 컨텍스트",
-                    "body": "OrcaBotmux는 이 리모트 컨텍스트의 {{reviewLabel}} 상태를 새로고칠 수 없었습니다. 호스트를 사용할 수 있을 때 다시 시도하세요."
+                    "body": "Botmux는 이 리모트 컨텍스트의 {{reviewLabel}} 상태를 새로고칠 수 없었습니다. 호스트를 사용할 수 있을 때 다시 시도하세요."
                   }
                 },
                 "no_upstream": {
@@ -10133,7 +10133,7 @@
                 },
                 "auth_required": {
                   "title": "{{provider}} 연결",
-                  "body": "OrcaBotmux가 {{reviewLabel}}를 만들려면 이 환경에서 {{provider}}가 연결되어 있어야 합니다."
+                  "body": "Botmux가 {{reviewLabel}}를 만들려면 이 환경에서 {{provider}}가 연결되어 있어야 합니다."
                 },
                 "needs_push": {
                   "title": "브랜치에 푸시하지 않은 커밋이 있음",
@@ -10141,7 +10141,7 @@
                 },
                 "existing": {
                   "title": "{{reviewLabelCap}}이(가) 이미 존재함",
-                  "body": "OrcaBotmux는 이 브랜치의 기존 {{reviewLabel}}를 찾았습니다."
+                  "body": "Botmux는 이 브랜치의 기존 {{reviewLabel}}를 찾았습니다."
                 },
                 "detached": {
                   "title": "현재 브랜치가 없음",
@@ -10157,7 +10157,7 @@
                 },
                 "fork": {
                   "title": "포크 헤드 지원되지 않음",
-                  "body": "OrcaBotmux는 여기에서 이 포크 헤드의 {{reviewLabel}}를 만들 수 없습니다."
+                  "body": "Botmux는 여기에서 이 포크 헤드의 {{reviewLabel}}를 만들 수 없습니다."
                 },
                 "base_missing": {
                   "title": "기본 브랜치가 리모트에 없음",
@@ -10165,7 +10165,7 @@
                 },
                 "unsupported": {
                   "title": "여기서 {{reviewLabelCap}}이(가) 지원되지 않음",
-                  "body": "이 리포지토리 제공자는 OrcaBotmux에서 {{reviewLabel}}를 만드는 것을 지원하지 않습니다."
+                  "body": "이 리포지토리 제공자는 Botmux에서 {{reviewLabel}}를 만드는 것을 지원하지 않습니다."
                 }
               }
             }
@@ -10703,7 +10703,7 @@
           "e6a369bd04": "인기 agents",
           "d7b3ef168b": "시스템에서 감지됨",
           "9c163bb0e0": "설치 지침",
-          "69af7e9c1c": "아직 PATH에 없습니다. OrcaBotmux는 이를 기본값으로 설정하며 언제든지 설치할 수 있습니다.",
+          "69af7e9c1c": "아직 PATH에 없습니다. Botmux는 이를 기본값으로 설정하며 언제든지 설치할 수 있습니다.",
           "1eee1c7bd8": "PATH에서 agents를 찾지 못했습니다. 나중에 설치할 항목을 선택하거나 빈 terminal로 계속 진행하세요.",
           "hideAgents": "agents 숨기기",
           "showMoreAgents": "agents {{value0}}개 더 보기→",
@@ -10756,11 +10756,11 @@
           "3bede04483": "테스트 알림 보내기",
           "dc897423e1": "알림 소리 선택",
           "53aaffe49a": "알림음",
-          "0fe570690c": "데스크톱 알림이 전달된 후 OrcaBotmux가 재생하는 경고를 선택합니다.",
+          "0fe570690c": "데스크톱 알림이 전달된 후 Botmux가 재생하는 경고를 선택합니다.",
           "0af746e41f": "소리를 선택하세요",
           "8124d085a6": "맥 설정 열기",
-          "aa36281b00": "시스템 설정을 열고 OrcaBotmux가 알림을 보낼 수 있는지 확인하세요.",
-          "d2dba86837": "macOS에서 OrcaBotmux 허용",
+          "aa36281b00": "시스템 설정을 열고 Botmux가 알림을 보낼 수 있는지 확인하세요.",
+          "d2dba86837": "macOS에서 Botmux 허용",
           "e52aacf380": "알림 설정 로드 중…",
           "3cd5374e22": "알림 설정이 아직 로드 중입니다.",
           "b6a994e36e": "알림음을 재생할 수 없습니다.",
@@ -10769,25 +10769,25 @@
           "56b836215c": "알림 권한을 확인하는 중…",
           "fd84d3e9b8": "알림이 활성화되었습니다",
           "4f7bce5644": "에이전트가 완료되거나 터미널에 주의가 필요할 때 macOS가 알려 줍니다.",
-          "95d99b52fa": "OrcaBotmux 알림 허용",
+          "95d99b52fa": "Botmux 알림 허용",
           "94562ba367": "macOS가 권한을 요청하고 있습니다. 대화 상자에서 허용을 클릭하면 이 단계가 자동으로 업데이트됩니다.",
           "4f6a1da718": "시스템 설정 열기",
-          "90b5d2e363": "macOS가 OrcaBotmux 알림을 전달하지 않고 있습니다",
-          "2c47f5465f": "시스템 설정에서 OrcaBotmux에 대한 알림 허용을 켜세요. 활성화되면 이 단계가 자동으로 업데이트됩니다."
+          "90b5d2e363": "macOS가 Botmux 알림을 전달하지 않고 있습니다",
+          "2c47f5465f": "시스템 설정에서 Botmux에 대한 알림 허용을 켜세요. 활성화되면 이 단계가 자동으로 업데이트됩니다."
         },
         "OnboardingFlow": {
-          "1b5e182e9f": "OrcaBotmux에 오신 것을 환영합니다",
+          "1b5e182e9f": "Botmux에 오신 것을 환영합니다",
           "4db04f2f57": "/",
           "adaa0aa627": "온보딩 단계 {{value0}}: {{value1}}로 이동",
-          "a249f81538": "orca_botmux",
-          "277ba45540": "OrcaBotmux 온보딩",
+          "a249f81538": "botmux",
+          "277ba45540": "Botmux 온보딩",
           "97c42cda00": "GitHub CLI를 설치하여 다음을 수행합니다.",
           "ae3b00ca82": "GitHub 작업 설정",
-          "ff92d15436": "agents 작업이 완료되거나 도움이 필요할 때 OrcaBotmux가 알려 드립니다.",
+          "ff92d15436": "agents 작업이 완료되거나 도움이 필요할 때 Botmux가 알려 드립니다.",
           "b054332836": "알림 설정",
           "04ae28d8ca": "몇 시간 내내 보고 싶은 테마를 선택하세요.",
           "f396db9f20": "집처럼 느껴지도록 하세요",
-          "322fc50a18": "OrcaBotmux는 모든 CLI agent와 함께 작동합니다. 가장 자주 사용할 agent를 선택하세요. 언제든지 전환할 수 있습니다.",
+          "322fc50a18": "Botmux는 모든 CLI agent와 함께 작동합니다. 가장 자주 사용할 agent를 선택하세요. 언제든지 전환할 수 있습니다.",
           "198b148b3c": "기본 agent를 선택하세요",
           "a5e5da02f7": "연동",
           "35bbaf5ae0": "알림",
@@ -10892,7 +10892,7 @@
           "rightClickMenuDescription": "오른쪽 클릭하면 terminal 메뉴가 열립니다. 메뉴나 키보드로 붙여넣습니다.",
           "loading": "terminal 설정을 불러오는 중...",
           "defaultShell": "기본 셸",
-          "defaultShellDescription": "OrcaBotmux가 Windows terminal의 새 창에서 열 셸을 선택하세요.",
+          "defaultShellDescription": "Botmux가 Windows terminal의 새 창에서 열 셸을 선택하세요.",
           "wslDistribution": "WSL 배포판",
           "wslDistributionDescription": "Windows 기본 배포판을 사용하거나 설치된 특정 배포판을 선택하세요.",
           "loadingDistros": "배포판을 불러오는 중",
@@ -10906,7 +10906,7 @@
               "card": {
                 "f696515944": "macOS 대화 상자에서 허용을 클릭하세요.",
                 "3d18cf71f9": "자동으로 업데이트됩니다.",
-                "721d2bedb6": "시스템 설정에서 OrcaBotmux에 대한 알림 허용을 켜세요."
+                "721d2bedb6": "시스템 설정에서 Botmux에 대한 알림 허용을 켜세요."
               }
             }
           }
@@ -10988,7 +10988,7 @@
           "dfd2aa9d5d": "네트워크",
           "2f077ef4eb": "을 클릭하고 코드를 스캔하세요.",
           "3aa7bb2d8b": "데스크탑 페어링",
-          "d1495e5e64": "OrcaBotmux Mobile을 열고",
+          "d1495e5e64": "Botmux Mobile을 열고",
           "901c98bb93": "페어링",
           "3960f5c339": "2/2단계",
           "3241f3c26a": "QR 설치",
@@ -10996,19 +10996,19 @@
           "aa97420ba4": "설치 링크 복사",
           "ac1eb64952": "Android",
           "711e6f4b47": "iOS",
-          "e75647ace0": "휴대폰으로 QR을 스캔하거나 설치 링크를 열어 OrcaBotmux Mobile을 다운로드하세요.",
+          "e75647ace0": "휴대폰으로 QR을 스캔하거나 설치 링크를 열어 Botmux Mobile을 다운로드하세요.",
           "0d9b33299e": "앱을 받으세요.",
           "92ddfdfa1f": "2단계 중 1단계",
           "ff48d9d520": "다른 장치와 페어링",
           "f9cbf4bb53": "기기 취소",
           "34f878d04f": "{{value0}} 취소",
           "94829abdb1": "페어링됨",
-          "266c18c105": "OrcaBotmux Mobile을 열어 중단한 부분부터 다시 시작하거나 다른 장치를 페어링하세요.",
-          "5410d55d79": "OrcaBotmux 모바일",
+          "266c18c105": "Botmux Mobile을 열어 중단한 부분부터 다시 시작하거나 다른 장치를 페어링하세요.",
+          "5410d55d79": "Botmux 모바일",
           "10d27b4cba": "시작하기",
           "da1d5e5ed0": "지원 플랫폼",
           "ec0607bf66": "지원되는 모바일 플랫폼",
-          "b4ccce5cb7": "휴대폰에서 OrcaBotmux를 제어하세요. 자리를 비운 동안 agents를 확인하고, 변경 사항을 리뷰하고, 작업을 시작하세요.",
+          "b4ccce5cb7": "휴대폰에서 Botmux를 제어하세요. 자리를 비운 동안 agents를 확인하고, 변경 사항을 리뷰하고, 작업을 시작하세요.",
           "cd4e5e816f": "주머니 속의 워크스페이스.",
           "a6cffbbb0b": "코드 생성",
           "e59a252eca": "코드 재생성",
@@ -11036,18 +11036,18 @@
         },
         "MobilePageToolbar": {
           "ad2284a9e2": "닫기 · Esc",
-          "9883b58693": "OrcaBotmux 모바일 닫기",
+          "9883b58693": "Botmux 모바일 닫기",
           "fb5f28330e": "사이드바에 표시",
           "c669abcf8f": "사이드바에서 숨기기",
           "e1c7b4a92d": "설정 > 모바일에서 구성하세요.",
-          "a4f8c2d91e": "왼쪽 사이드바에서 OrcaBotmux Mobile 제거",
-          "b7e3d1c84a": "왼쪽 사이드바에 OrcaBotmux Mobile 표시",
+          "a4f8c2d91e": "왼쪽 사이드바에서 Botmux Mobile 제거",
+          "b7e3d1c84a": "왼쪽 사이드바에 Botmux Mobile 표시",
           "f3d8e5b71a": "단축키를 왼쪽 사이드바에 다시 추가합니다."
         },
         "PhoneCarousel": {
           "96d651cb87": "Terminal 세션",
           "93217b41c1": "워크트리 목록",
-          "89c7713645": "OrcaBotmux 모바일 홈 화면"
+          "89c7713645": "Botmux 모바일 홈 화면"
         },
         "mobile": {
           "platform": {
@@ -11074,7 +11074,7 @@
             "0bad5b07c8": "GitHub 및 Linear",
             "d047197480": "GitHub · Linear",
             "a4c3f7b7aa": "작업",
-            "d33d7a9c29": "orca_botmux  ·  feat/mobile-page",
+            "d33d7a9c29": "botmux  ·  feat/mobile-page",
             "25d6e8a491": "feat/mobile-page",
             "c791677f2f": "재개",
             "cf3f98fa3f": "연결이 끊김",
@@ -11087,7 +11087,7 @@
             "00a6903322": "시작된 Agents",
             "c0e2e9dcd9": "다시 오신 것을 환영합니다",
             "af761a0c0d": "설정",
-            "5d94e8ddcc": "orca_botmux"
+            "5d94e8ddcc": "botmux"
           },
           "TerminalSlide": {
             "0bb39f8fe6": "보내기",
@@ -11108,12 +11108,12 @@
             "a6e7cdc688": "pnpm test --filter mobile",
             "21b67dfc92": "Bash",
             "d6d1041a1c": "⎿ 페어 스캔 슬라이드를 terminal 세션으로 대체했습니다.",
-            "336c0e070e": "mobile/orca-botmux-mobile-sidebar-mock-v3.html",
+            "336c0e070e": "mobile/botmux-mobile-sidebar-mock-v3.html",
             "6d4ebd5833": "편집",
             "fc83e0d5ef": "⎿ 2103줄 읽기",
             "80cc356591": "읽기",
             "2c10d43745": "claude",
-            "e0f98be657": "orca_botmux/feat-mobile-page",
+            "e0f98be657": "botmux/feat-mobile-page",
             "2defc05141": "dev@mac",
             "da121ba48d": "PLAN.md",
             "e4befee569": "셸",
@@ -11149,18 +11149,18 @@
           "add-custom": "사용자 지정 주소 추가…"
         },
         "WindowsFirewallNotice": {
-          "repair-success": "이제 Windows 방화벽이 개인 네트워크에서 OrcaBotmux Mobile을 허용합니다",
+          "repair-success": "이제 Windows 방화벽이 개인 네트워크에서 Botmux Mobile을 허용합니다",
           "repair-failed": "Windows 방화벽 규칙을 업데이트할 수 없습니다",
           "public-title": "Windows가 이 네트워크를 공용으로 표시합니다",
           "missing-title": "Windows 방화벽에서 휴대폰 연결 허용",
-          "public-description": "OrcaBotmux Mobile 연결을 허용하기 전에 이 신뢰할 수 있는 Wi-Fi 네트워크를 개인으로 변경하세요.",
-          "missing-description": "Windows가 페어링 서버를 차단할 수 있습니다. 개인 네트워크에서 이 OrcaBotmux 앱과 TCP 포트 {{port}}에 대한 규칙을 추가하세요.",
+          "public-description": "Botmux Mobile 연결을 허용하기 전에 이 신뢰할 수 있는 Wi-Fi 네트워크를 개인으로 변경하세요.",
+          "missing-description": "Windows가 페어링 서버를 차단할 수 있습니다. 개인 네트워크에서 이 Botmux 앱과 TCP 포트 {{port}}에 대한 규칙을 추가하세요.",
           "open-settings": "네트워크 설정 열기",
           "waiting": "Windows 대기 중…",
           "allow": "휴대폰 연결 허용",
           "repair-unverified": "Windows 방화벽 액세스를 확인할 수 없습니다",
-          "blocked-title": "Windows가 OrcaBotmux Mobile을 차단하고 있을 수 있습니다",
-          "blocked-description": "기존 인바운드 차단 규칙이 페어링 예외보다 우선할 수 있습니다. 복구를 실행하면 이 OrcaBotmux 앱의 충돌하는 TCP 규칙을 제거한 다음 개인 네트워크에서 포트 {{port}}을(를) 허용합니다.",
+          "blocked-title": "Windows가 Botmux Mobile을 차단하고 있을 수 있습니다",
+          "blocked-description": "기존 인바운드 차단 규칙이 페어링 예외보다 우선할 수 있습니다. 복구를 실행하면 이 Botmux 앱의 충돌하는 TCP 규칙을 제거한 다음 개인 네트워크에서 포트 {{port}}을(를) 허용합니다.",
           "repair": "방화벽 액세스 복구"
         }
       },
@@ -11172,7 +11172,7 @@
                 "ebc0e8ecf1": "GitLab API 예산 로드 중...",
                 "a2d3d1fdde": "GitLab API 예산을 사용할 수 없습니다.",
                 "a2f68645ac": "GitLab API 예산 새로 고침",
-                "2f9c16d6c3": "OrcaBotmux는 GitLab CLI를 통해 REST를 사용합니다.",
+                "2f9c16d6c3": "Botmux는 GitLab CLI를 통해 REST를 사용합니다.",
                 "14e144f7a7": "GitLab API 예산",
                 "3e2c982cfa": "남음, 재설정까지",
                 "ea8ad0bae8": "/",
@@ -11192,9 +11192,9 @@
             "0ee79e0674": "상태 표시줄로 이동"
           },
           "FloatingTerminalOrchestrationDialog": {
-            "f726054620": "agents가 OrcaBotmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
+            "f726054620": "agents가 Botmux를 통해 컨텍스트를 넘기고 작업을 조정할 수 있습니다.",
             "1cd3f8af64": "오케스트레이션 스킬",
-            "6f0aed26b8": "agents가 OrcaBotmux를 통해 조정할 수 있도록 OrcaBotmux CLI 및 오케스트레이션 스킬을 설치합니다.",
+            "6f0aed26b8": "agents가 Botmux를 통해 조정할 수 있도록 Botmux CLI 및 오케스트레이션 스킬을 설치합니다.",
             "05d7aabc20": "설치되지 않음",
             "630c0ac8c8": "설치됨",
             "dfd021ce46": "확인 중...",
@@ -11212,7 +11212,7 @@
             "690b6fb98a": "저장되지 않은 변경사항",
             "bbc177f98f": "활성화",
             "adc281394d": "닫기",
-            "8cf80db43b": "agents가 OrcaBotmux를 통해 조정할 수 있도록 OrcaBotmux CLI 및 agents 스킬을 설정합니다.",
+            "8cf80db43b": "agents가 Botmux를 통해 조정할 수 있도록 Botmux CLI 및 agents 스킬을 설정합니다.",
             "2a3c5ddf5e": "오케스트레이션 활성화",
             "d6b563ae24": "편집기 로드 중...",
             "8b14ba6c17": "새 브라우저 탭",
@@ -11245,9 +11245,9 @@
             "b8dc9dd8a2": "설치됨",
             "1b51644c2d": "agents가 데스크톱을 제어하고, 커서를 이동하고, 클릭하고, 모든 앱에서 입력할 수 있도록 하세요.",
             "362a07517d": "컴퓨터 사용",
-            "5e8fe5a72d": "agents가 OrcaBotmux의 브라우저에 직접 액세스할 수 있도록 하여 페이지를 테스트하고, 스크린샷을 캡처하고, 표시된 내용에 따라 조치를 취할 수 있도록 하세요.",
+            "5e8fe5a72d": "agents가 Botmux의 브라우저에 직접 액세스할 수 있도록 하여 페이지를 테스트하고, 스크린샷을 캡처하고, 표시된 내용에 따라 조치를 취할 수 있도록 하세요.",
             "e638da007a": "Agent 브라우저 사용",
-            "c61c91e642": "agents가 OrcaBotmux를 통해 조정하여 대규모 다단계 작업을 완료할 수 있도록 하세요.",
+            "c61c91e642": "agents가 Botmux를 통해 조정하여 대규모 다단계 작업을 완료할 수 있도록 하세요.",
             "ac07f8887f": "Agent 오케스트레이션",
             "e9eb197e12": "열린 컴퓨터 사용 권한",
             "3a59452a67": "리뷰를 위해 스킬 명령을 아래에 복사하여 삽입했습니다.",
@@ -11290,7 +11290,7 @@
             "f39be6ca14": "/signup"
           },
           "BrowserUseSkillSetupCard": {
-            "cbc45022d4": "agents가 OrcaBotmux 브라우저에서 페이지를 탐색하고 확인할 수 있습니다.",
+            "cbc45022d4": "agents가 Botmux 브라우저에서 페이지를 탐색하고 확인할 수 있습니다.",
             "d5bb1cd4ba": "Browser Use 스킬"
           },
           "ComputerUseAnimatedVisual": {
@@ -11338,7 +11338,7 @@
             "24fedd5a52": "login.spec.ts",
             "8279e9d95b": "12개 테스트 실행",
             "6218a9014d": "pnpm playwright test",
-            "04d54d50ec": "orca_botmux · zsh",
+            "04d54d50ec": "botmux · zsh",
             "1aa8a9a24a": "분할 가능한 terminal",
             "2a7cfc82c8": "GH #1842와 연결됨",
             "3822d8d14b": "fix/worktree-picker-truncates",
@@ -11369,8 +11369,8 @@
             "25ec5356d6": "설정"
           },
           "FeatureWallModal": {
-            "33dca8bbbe": "OrcaBotmux에 대한 짧은 워크플로별 둘러보기입니다.",
-            "3567e147c8": "OrcaBotmux에 대해 알아보세요"
+            "33dca8bbbe": "Botmux에 대한 짧은 워크플로별 둘러보기입니다.",
+            "3567e147c8": "Botmux에 대해 알아보세요"
           },
           "FeatureWallPreview": {
             "a666384798": "또한 이 워크플로우에서는"
@@ -11499,7 +11499,7 @@
                   "aae94eeb52": "CLI 및 스킬 설치를 클릭하세요.",
                   "aa8e143a2f": "설치를 확인할 수 없습니다.",
                   "9b33e7fb13": "설치 확인 중",
-                  "4c8e1f92a7": "이 Mac에서 orca_botmux을 여세요",
+                  "4c8e1f92a7": "이 Mac에서 botmux을 여세요",
                   "6d2b0a84e1": "이 빌드에서는 사용할 수 없습니다"
                 }
               }
@@ -11614,7 +11614,7 @@
           },
           "ConnectIntegrationsList": {
             "3dddb2d565": "작업용으로 연결됨",
-            "33b650af52": "팀이 작업을 추적하는 서비스를 연결하세요. OrcaBotmux는 이슈 제목, 링크, 컨텍스트가 이미 첨부된 워크스페이스를 시작합니다.",
+            "33b650af52": "팀이 작업을 추적하는 서비스를 연결하세요. Botmux는 이슈 제목, 링크, 컨텍스트가 이미 첨부된 워크스페이스를 시작합니다.",
             "5b3577a492": "리뷰 상태용으로 연결됨",
             "list_end": ", 그리고 ",
             "list_pair": " and ",
@@ -11622,8 +11622,8 @@
             "code_host_tasks_summary": "이슈를 작업으로 사용할 수 있음 · 팀이 Linear 또는 Jira에서 작업을 계획한다면 추가하세요",
             "code_host_tasks_caption": "코드 호스트의 이슈도 작업으로 사용할 수 있습니다.",
             "review_step_title": "agents가 작업하는 동안 PR 상태 보기",
-            "review_step_description": "OrcaBotmux가 PR 또는 MR 상태, 체크, 리뷰를 표시할 수 있도록 리뷰 공급자를 연결하세요.",
-            "task_step_title": "OrcaBotmux를 떠나지 않고 작업에서 agents 시작"
+            "review_step_description": "Botmux가 PR 또는 MR 상태, 체크, 리뷰를 표시할 수 있도록 리뷰 공급자를 연결하세요.",
+            "task_step_title": "Botmux를 떠나지 않고 작업에서 agents 시작"
           },
           "connect": {
             "integration": {
@@ -11653,8 +11653,8 @@
             "22e62f3bab": "Claude Code 세션이 시작되었습니다."
           },
           "CliSkillSetupTerminal": {
-            "1953e90447": "Enter를 눌러 agents 용 OrcaBotmux CLI 오케스트레이션 스킬을 설치하세요.",
-            "43b60ec5c3": "OrcaBotmux CLI 및 오케스트레이션 스킬 설치 terminal",
+            "1953e90447": "Enter를 눌러 agents 용 Botmux CLI 오케스트레이션 스킬을 설치하세요.",
+            "43b60ec5c3": "Botmux CLI 및 오케스트레이션 스킬 설치 terminal",
             "84e9576dac": "스킬 설정",
             "5c3aee22c0": "명령 복사",
             "5eca672aac": "스킬 설치 명령어 복사",
@@ -11678,8 +11678,8 @@
             "55846c7f95": "“이 PR을 두 개로 나누어",
             "4795ac2d4a": "다음과 같이 질문해 보세요.",
             "53905bd076": "개발 미리보기: 스킬 설정 terminal 열기.",
-            "1da82af45b": "OrcaBotmux CLI에 주의가 필요합니다",
-            "ce13a742d0": "PATH에 'orca_botmux'를 등록했습니다.",
+            "1da82af45b": "Botmux CLI에 주의가 필요합니다",
+            "ce13a742d0": "PATH에 'botmux'를 등록했습니다.",
             "d1a86c7eb5": "설정을 열어 CLI 설정을 완료하세요."
           },
           "CmdJPaletteFeatureTipVisual": {
@@ -11695,7 +11695,7 @@
           "RecoverableRenderErrorBoundary": {
             "55001880db": "다시 시도",
             "34a189ae0f": "앱의 나머지 부분은 아직 실행 중입니다. 이 표면을 다시 시도하거나 다른 곳으로 전환했다가 다시 돌아오세요.",
-            "ab855c11f4": "OrcaBotmux의 이 부분에 오류가 발생했습니다."
+            "ab855c11f4": "Botmux의 이 부분에 오류가 발생했습니다."
           }
         }
       },
@@ -11758,11 +11758,11 @@
                       "7c1b6bdb1e": "활성화",
                       "51074ccb05": "CLI 상태를 불러오지 못했습니다.",
                       "35dea1ae12": "agent 제어가 준비되었습니다.",
-                      "9dff3a6338": "스킬이 설치되었습니다. OrcaBotmux CLI를 활성화하여 설정을 완료하세요.",
-                      "15986a1080": "OrcaBotmux CLI가 준비되었습니다. 스킬을 설치하여 설정을 완료하세요.",
+                      "9dff3a6338": "스킬이 설치되었습니다. Botmux CLI를 활성화하여 설정을 완료하세요.",
+                      "15986a1080": "Botmux CLI가 준비되었습니다. 스킬을 설치하여 설정을 완료하세요.",
                       "4c26913def": "아직 설정되지 않았습니다. agent 제어를 활성화하려면 두 단계를 모두 완료하세요.",
                       "c94ff11e91": "설정 상태를 다시 확인할 수 없습니다.",
-                      "2b519eed94": "OrcaBotmux CLI가 PATH에 등록되었습니다."
+                      "2b519eed94": "Botmux CLI가 PATH에 등록되었습니다."
                     }
                   }
                 },
@@ -11780,7 +11780,7 @@
             "2fda9ff015": "agent 제어 설정",
             "0ac0fef514": "agent 제어가 준비되었습니다.",
             "2bdfff8763": "agent 제어(선택 사항).",
-            "72736b051f": "agents가 이 시뮬레이터를 제어하도록 하려면 OrcaBotmux CLI + 스킬을 설정하세요.",
+            "72736b051f": "agents가 이 시뮬레이터를 제어하도록 하려면 Botmux CLI + 스킬을 설정하세요.",
             "d10ae98046": "완료",
             "3756cbeca7": "나중에",
             "6d950431d2": "숨기기",
@@ -11788,15 +11788,15 @@
             "3f003507f4": "설정에서 전체 설정 열기"
           },
           "MobileEmulatorAgentSetupGuideSteps": {
-            "9b49d892e3": "OrcaBotmux CLI 활성화",
-            "3d8dc52c93": "agents 셸에서 에뮬레이터 제어를 위해 orca_botmux 명령을 등록합니다.",
-            "21f5687c07": "OrcaBotmux CLI 스킬",
-            "64fb057667": "이 워크트리의 orca_botmux 에뮬레이터 명령을 agents에게 알려줍니다.",
-            "5c59ea96ca": "모바일 에뮬레이터 OrcaBotmux CLI 스킬 설정",
-            "bff5341ac3": "모바일 에뮬레이터 OrcaBotmux CLI 스킬 설치 terminal",
-            "3d34423e88": "OrcaBotmux CLI를 등록하는 중",
+            "9b49d892e3": "Botmux CLI 활성화",
+            "3d8dc52c93": "agents 셸에서 에뮬레이터 제어를 위해 botmux 명령을 등록합니다.",
+            "21f5687c07": "Botmux CLI 스킬",
+            "64fb057667": "이 워크트리의 botmux 에뮬레이터 명령을 agents에게 알려줍니다.",
+            "5c59ea96ca": "모바일 에뮬레이터 Botmux CLI 스킬 설정",
+            "bff5341ac3": "모바일 에뮬레이터 Botmux CLI 스킬 설치 terminal",
+            "3d34423e88": "Botmux CLI를 등록하는 중",
             "3be27641c9": "agent 셸에서 에뮬레이터 명령을 실행할 수 있도록 합니다.",
-            "3941719a56": "스킬 설정을 열기 전에 OrcaBotmux CLI를 확인하고 있습니다."
+            "3941719a56": "스킬 설정을 열기 전에 Botmux CLI를 확인하고 있습니다."
           },
           "MobileEmulatorTabIntroCallout": {
             "1924982130": "닫기",
@@ -12154,7 +12154,7 @@
         "RichMarkdownErrorBoundary": {
           "aad0998127": "다시 시도",
           "4a5de9f2f0": "소스 모드로 전환하거나 재시도를 클릭하여 리치 보기를 다시 로드하세요.",
-          "dfdf1cacd4": "리치 markdown 편집기에 예상치 못한 오류가 발생하여 나머지 OrcaBotmux의 응답성을 유지하기 위해 재설정되었습니다."
+          "dfdf1cacd4": "리치 markdown 편집기에 예상치 못한 오류가 발생하여 나머지 Botmux의 응답성을 유지하기 위해 재설정되었습니다."
         },
         "RichMarkdownLinkBubble": {
           "1c99b726e0": "링크 삭제",
@@ -12462,7 +12462,7 @@
           "7afff43472": "받아쓰기가 완료되었지만 텍스트 필드에 초점이 맞춰지지 않았습니다.",
           "55127a3706": "받아쓰기 실패: {{value0}}",
           "bb7f599ee7": "설정 열기",
-          "2d5b9fabf9": "마이크 액세스가 거부되었습니다. 시스템 설정에서 액세스 권한을 부여한 다음 OrcaBotmux를 다시 시작하세요.",
+          "2d5b9fabf9": "마이크 액세스가 거부되었습니다. 시스템 설정에서 액세스 권한을 부여한 다음 Botmux를 다시 시작하세요.",
           "5d2c3e7ae3": "음성이 감지되지 않았습니다."
         }
       },
@@ -12492,7 +12492,7 @@
             "88fea8e84e": "보내지 않음",
             "50b00dc327": "세부정보 복사",
             "6d3ebe216a": "진단 텍스트",
-            "835037edc9": "· OrcaBotmux",
+            "835037edc9": "· Botmux",
             "56a3dfa283": "크래시 보고서를 보내지 못했습니다.",
             "8e24fe4f75": "크래시 보고서가 전송되었습니다.",
             "8b8473c544": "크래시 보고서가 복사되었습니다.",
@@ -12661,7 +12661,7 @@
             "40edfa75cb": "뒤로",
             "efb0e8f7f3": "링크 주소 복사",
             "8ce4f6b12e": "기본 브라우저에서 링크 열기",
-            "b5b87d6cbb": "OrcaBotmux 브라우저에서 링크 열기",
+            "b5b87d6cbb": "Botmux 브라우저에서 링크 열기",
             "87eb75f7d2": "유효한 http(s) 또는 localhost URL을 입력하세요.",
             "27d863542c": "브라우저 주석",
             "e48569ac6d": "이 사이트에 접속할 수 없습니다.",
@@ -12787,7 +12787,7 @@
           "2f8baf5360": "다음에서 생성",
           "578ff46987": "다음 실행",
           "18763ded26": "일정",
-          "dbef8dc110": "이 SSH 자동화는 OrcaBotmux가 SSH 호스트에 연결할 수 있는 동안에만 실행됩니다. 다시 연결에 대화형 자격 증명이 필요하거나 호스트를 사용할 수 없는 경우 실행이 건너뛴 것으로 기록됩니다.",
+          "dbef8dc110": "이 SSH 자동화는 Botmux가 SSH 호스트에 연결할 수 있는 동안에만 실행됩니다. 다시 연결에 대화형 자격 증명이 필요하거나 호스트를 사용할 수 없는 경우 실행이 건너뛴 것으로 기록됩니다.",
           "1f6026358e": "자동화 삭제",
           "d79452fb30": "자동화 재개",
           "91a4155e95": "자동화 일시 중지",
@@ -12823,7 +12823,7 @@
         "AutomationEditorDialogHeader": {
           "31f9253920": "템플릿 사용",
           "7e35393632": "Hermes",
-          "6f309eef8d": "orca_botmux",
+          "6f309eef8d": "botmux",
           "58f56b73d9": "자동화 이름",
           "1d9826933e": "평일 repo 감사",
           "4133d33862": "자동화 생성",
@@ -12839,7 +12839,7 @@
           "521f77cd58": "1시간",
           "e5ad263ae5": "30분",
           "529dc6c0b7": "유예 없음",
-          "3d70c185c8": "OrcaBotmux 또는 실행 호스트를 예약된 시간에 사용할 수 없었다면, 이 기간 안에 다시 사용 가능해졌을 때 OrcaBotmux가 놓친 실행을 한 번 실행합니다. 더 오래된 놓친 실행은 건너뜁니다.",
+          "3d70c185c8": "Botmux 또는 실행 호스트를 예약된 시간에 사용할 수 없었다면, 이 기간 안에 다시 사용 가능해졌을 때 Botmux가 놓친 실행을 한 번 실행합니다. 더 오래된 놓친 실행은 건너뜁니다.",
           "3df53d554a": "누락된 실행 유예 도움말",
           "fc089e5fde": "유예 시간"
         },
@@ -12882,7 +12882,7 @@
         "AutomationSessionField": {
           "f3c76dce51": "재사용",
           "c90888ee94": "새로 시작",
-          "b675112193": "재사용은 향후 실행을 이전 라이브 자동화 세션으로 보냅니다. 해당 세션이 사라지면 OrcaBotmux는 새로운 세션을 시작합니다.",
+          "b675112193": "재사용은 향후 실행을 이전 라이브 자동화 세션으로 보냅니다. 해당 세션이 사라지면 Botmux는 새로운 세션을 시작합니다.",
           "4bdce31f37": "세션 재사용 도움말",
           "5ad314118e": "세션"
         },
@@ -13228,11 +13228,11 @@
             "dialog": {
               "badge": "Terminal 링크",
               "preview": "미리보기",
-              "title": "terminal 링크를 OrcaBotmux 브라우저에서 열까요?",
-              "description": "terminal 링크를 OrcaBotmux 브라우저에서 열거나 시스템 브라우저를 계속 사용합니다.",
-              "orca_botmux": {
-                "button": "OrcaBotmux에서 열기",
-                "note": "OrcaBotmux는 가져온 쿠키를 사용해 로그인된 사이트를 열 수 있습니다."
+              "title": "terminal 링크를 Botmux 브라우저에서 열까요?",
+              "description": "terminal 링크를 Botmux 브라우저에서 열거나 시스템 브라우저를 계속 사용합니다.",
+              "botmux": {
+                "button": "Botmux에서 열기",
+                "note": "Botmux는 가져온 쿠키를 사용해 로그인된 사이트를 열 수 있습니다."
               },
               "settings": {
                 "note": "나중에 설정 → 브라우저에서 변경할 수 있습니다."
@@ -13245,15 +13245,15 @@
               },
               "shortcut": {
                 "note": {
-                  "prefix": "링크가 OrcaBotmux에서 열릴 때,",
+                  "prefix": "링크가 Botmux에서 열릴 때,",
                   "suffix": "클릭하면 한 번만 시스템 브라우저에서 열립니다."
                 }
               },
               "keep": {
-                "title": "terminal 링크를 OrcaBotmux 브라우저에서 계속 열까요?",
+                "title": "terminal 링크를 Botmux 브라우저에서 계속 열까요?",
                 "description": "또는 시스템 브라우저를 기본값으로 사용합니다.",
-                "orca_botmux": {
-                  "button": "OrcaBotmux에서 계속 열기"
+                "botmux": {
+                  "button": "Botmux에서 계속 열기"
                 }
               }
             }
@@ -13276,7 +13276,7 @@
       },
       "taskPageEmptyState": {
         "noProjectSourcesTitle": "선택한 프로젝트 소스 없음",
-        "noProjectSourcesDescription": "OrcaBotmux가 어느 호스트/계정에서 작업을 가져올지 알 수 있도록 프로젝트 소스를 하나 이상 선택하세요.",
+        "noProjectSourcesDescription": "Botmux가 어느 호스트/계정에서 작업을 가져올지 알 수 있도록 프로젝트 소스를 하나 이상 선택하세요.",
         "noMatchingGitHubWorkTitle": "일치하는 GitHub 작업 없음",
         "changeQueryDescription": "쿼리를 변경하거나 지우세요.",
         "noGitLabIssuesTitle": "GitLab 이슈 없음",
@@ -13304,7 +13304,7 @@
             "openGithub": "GitHub 열기",
             "starOnGithub": "GitHub에서 별표 누르기",
             "onboardingCompleted": "온보딩 완료!",
-            "body": "OrcaBotmux가 마음에 드신다면 GitHub 별표가 다른 개발자가 OrcaBotmux를 발견하는 데 도움이 됩니다.",
+            "body": "Botmux가 마음에 드신다면 GitHub 별표가 다른 개발자가 Botmux를 발견하는 데 도움이 됩니다.",
             "dismiss": "닫기",
             "later": "Later"
           }
@@ -13315,11 +13315,11 @@
           "copy": "복사"
         }
       },
-      "orca_botmux": {
+      "botmux": {
         "profiles": {
           "switcher": {
             "cloud": {
-              "unavailable": "OrcaBotmux 로그인 사용 불가"
+              "unavailable": "Botmux 로그인 사용 불가"
             },
             "reconnect": "프로필 다시 연결",
             "connect": "프로필 연결",
@@ -13346,8 +13346,8 @@
             },
             "signInWaiting": "로그인 대기 중…",
             "signInAgain": "다시 로그인",
-            "signIn": "OrcaBotmux에 로그인",
-            "accountTitle": "OrcaBotmux 계정",
+            "signIn": "Botmux에 로그인",
+            "accountTitle": "Botmux 계정",
             "accountSignedIn": "로그인됨",
             "accountSignInRequired": "로그인 필요",
             "accountSignedOut": "로그아웃됨"
@@ -13370,12 +13370,12 @@
               "confirm": {
                 "move": {
                   "title": "프로젝트를 이동하시겠습니까?",
-                  "description": "{{repoName}}을(를) {{targetName}}(으)로 이동합니다. OrcaBotmux가 해당 프로젝트를 {{activeProfileName}}에서 제거한 뒤 파일은 유지하고 {{targetName}}(으)로 다시 시작합니다.",
+                  "description": "{{repoName}}을(를) {{targetName}}(으)로 이동합니다. Botmux가 해당 프로젝트를 {{activeProfileName}}에서 제거한 뒤 파일은 유지하고 {{targetName}}(으)로 다시 시작합니다.",
                   "action": "프로젝트 이동"
                 },
                 "copy": {
                   "title": "프로젝트를 복사하시겠습니까?",
-                  "description": "{{repoName}}을(를) {{targetName}}(으)로 복사합니다. 두 프로필 모두 동일한 파일을 별도의 OrcaBotmux 메타데이터와 함께 가리킵니다.",
+                  "description": "{{repoName}}을(를) {{targetName}}(으)로 복사합니다. 두 프로필 모두 동일한 파일을 별도의 Botmux 메타데이터와 함께 가리킵니다.",
                   "action": "프로젝트 복사"
                 },
                 "live": {
@@ -13393,8 +13393,8 @@
           },
           "signout": {
             "confirm": {
-              "title": "OrcaBotmux에서 로그아웃할까요?",
-              "description": "이 기기의 OrcaBotmux에서 로그아웃됩니다. 로컬 프로젝트와 워크트리에는 영향을 주지 않습니다.",
+              "title": "Botmux에서 로그아웃할까요?",
+              "description": "이 기기의 Botmux에서 로그아웃됩니다. 로컬 프로젝트와 워크트리에는 영향을 주지 않습니다.",
               "cancel": "취소",
               "action": "로그아웃"
             }
@@ -13403,7 +13403,7 @@
             "confirm": {
               "target": "선택된 프로필",
               "title": "프로필을 전환하시겠습니까?",
-              "description": "{{targetName}}(으)로 전환하면 OrcaBotmux가 다시 시작되고 {{activeProfileName}}의 작업 공간이 다시 로드됩니다.",
+              "description": "{{targetName}}(으)로 전환하면 Botmux가 다시 시작되고 {{activeProfileName}}의 작업 공간이 다시 로드됩니다.",
               "live": {
                 "work": "이 프로필의 활성 작업"
               },
@@ -13427,7 +13427,7 @@
               },
               "not": {
                 "signed": {
-                  "in": "아직 OrcaBotmux에 로그인하지 않았습니다."
+                  "in": "아직 Botmux에 로그인하지 않았습니다."
                 }
               },
               "remove": {
@@ -13467,8 +13467,8 @@
                 "failed": "문제가 발생했습니다. 다시 시도해 주세요."
               },
               "subtitle": {
-                "named": "{{orgName}}에서 OrcaBotmux에 협업할 수 있는 사람들.",
-                "default": "조직에서 OrcaBotmux에 협업할 수 있는 사람들."
+                "named": "{{orgName}}에서 Botmux에 협업할 수 있는 사람들.",
+                "default": "조직에서 Botmux에 협업할 수 있는 사람들."
               }
             }
           }
@@ -13687,8 +13687,8 @@
       "cantLoadPage": "Can't load this page",
       "certificateNameMismatch": "The certificate doesn't match {{value0}}.",
       "certificateDateInvalid": "The certificate for {{value0}} isn't valid at the current date and time.",
-      "certificateAuthorityInvalid": "OrcaBotmux doesn't trust the authority that issued the certificate for {{value0}}.",
-      "certificateVerificationFailed": "OrcaBotmux couldn't verify the certificate for {{value0}}.",
+      "certificateAuthorityInvalid": "Botmux doesn't trust the authority that issued the certificate for {{value0}}.",
+      "certificateVerificationFailed": "Botmux couldn't verify the certificate for {{value0}}.",
       "trustedCertificateGuidance": "For local development, use a trusted local certificate when possible.",
       "retry": "Retry",
       "copyAddress": "Copy Address",
@@ -13700,31 +13700,31 @@
       "certificateChallengeExpired": "This certificate approval expired. Retry the page to request a new one.",
       "certificateChallengeChanged": "The certificate request changed. Retry the page and review the new warning.",
       "certificateChallengeUnavailable": "This certificate request is no longer available. Retry the page to request a new one.",
-      "certificateProceedFailed": "OrcaBotmux could not approve this certificate request. Retry the page and try again."
+      "certificateProceedFailed": "Botmux could not approve this certificate request. Retry the page and try again."
     }
   },
-  "ipcMissingShort": "orcaBotmuxBridge unavailable — rebuild desktop.",
+  "ipcMissingShort": "botmuxBridge unavailable — rebuild desktop.",
   "localConnectFailed": "Local connect failed",
   "platformConnectFailed": "Platform connect failed",
   "sshConnectFailed": "SSH connect failed",
   "openFailed": "Open failed",
   "answerFailed": "Answer failed",
   "sendFailed": "Send failed",
-  "sidebarTitle": "orca_botmux",
+  "sidebarTitle": "botmux",
   "refreshTitle": "Refresh all hosts",
   "connectedHosts": "Connected hosts",
   "noneConnect": "None — connect local and/or SSH.",
   "local": "Local",
   "disconnect": "Disconnect",
-  "platformTitle": "Use ~/.orca_botmux/platform.json machine URL",
+  "platformTitle": "Use ~/.botmux/platform.json machine URL",
   "platform": "Platform",
   "knownSshHosts": "Known SSH hosts",
-  "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach orca_botmux over that host.",
+  "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach botmux over that host.",
   "noKnownSsh": "No SSH hosts yet. Add them in Settings → SSH or import ~/.ssh/config.",
-  "orcaSshConnected": "SSH connected",
-  "orcaSshIdle": "SSH idle",
+  "botmuxSshConnected": "SSH connected",
+  "botmuxSshIdle": "SSH idle",
   "sourceConfig": "from ~/.ssh/config",
-  "botmuxLinked": "OrcaBotmux linked",
+  "botmuxLinked": "Botmux linked",
   "connectBotmux": "Connect",
   "showAllHosts": "Show all hosts",
   "needsAnswer": "Needs answer ({{count}})",
@@ -13737,9 +13737,9 @@
   "sendTitle": "Send message",
   "messagePlaceholder": "Message…",
   "send": "Send",
-  "searchMulti": "Multi-host orca_botmux",
-  "searchSessions": "OrcaBotmux sessions",
-  "ipcMissing": "orcaBotmuxBridge IPC not available — rebuild desktop preload.",
+  "searchMulti": "Multi-host botmux",
+  "searchSessions": "Botmux sessions",
+  "ipcMissing": "botmuxBridge IPC not available — rebuild desktop preload.",
   "hostsSessions": "{{hosts}} host(s) · {{sessions}} session(s)",
   "selectSshOrManual": "Select an SSH host or enter a manual destination.",
   "openedAttach": "Opened native terminal (tmux attach)",
@@ -13748,7 +13748,7 @@
   "openedWeb": "Opened web terminal in browser tab",
   "queued": "Queued {{id}}",
   "sent": "Sent",
-  "controlPlaneTitle": "Multi-host OrcaBotmux control plane",
+  "controlPlaneTitle": "Multi-host Botmux control plane",
   "controlPlaneBody": "Connect local, platform tunnel, and multiple SSH remotes at once. Sessions merge with host labels. Pending ask-hooks appear above the session list (multi-question supported).",
   "connected": "Connected",
   "noEndpoints": "No endpoints yet.",
@@ -13770,7 +13770,7 @@
   "filterWorktree": "This worktree",
   "filterAll": "All",
   "filterWorktreeActive": "Under {{path}}",
-  "noSessionsInWorktree": "No orca_botmux sessions under this worktree. Switch to All or start a session in this directory.",
+  "noSessionsInWorktree": "No botmux sessions under this worktree. Switch to All or start a session in this directory.",
   "otherSessions": "Other sessions",
   "hostsSessionsMatched": "{{hosts}} hosts · {{sessions}} sessions · {{matched}} in this worktree",
   "showingClosed": "Showing closed ({{count}})",
@@ -13799,7 +13799,7 @@
   "hostsSessionsHiddenClosed": "{{visible}} open · {{closed}} closed hidden",
   "dismissError": "Dismiss",
   "emptyMachinesTitle": "No machines connected",
-  "emptyMachinesHint": "Connect this machine or an SSH host to see orca_botmux sessions here.",
+  "emptyMachinesHint": "Connect this machine or an SSH host to see botmux sessions here.",
   "noFilterMatch": "No sessions match \"{{query}}\"",
   "disconnectFailed": "Disconnect failed",
   "agentsSection": "Agents",

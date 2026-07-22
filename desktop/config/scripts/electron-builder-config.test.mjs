@@ -49,8 +49,8 @@ describe('electron-builder config', () => {
     expect(electronBuilderConfig.mac.extraResources).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          from: 'native/computer-use-macos/.build/release/OrcaBotmux Computer Use.app',
-          to: 'OrcaBotmux Computer Use.app'
+          from: 'native/computer-use-macos/.build/release/Botmux Computer Use.app',
+          to: 'Botmux Computer Use.app'
         })
       ])
     )
@@ -69,8 +69,8 @@ describe('electron-builder config', () => {
           to: 'computer-use-windows/runtime.ps1'
         }),
         expect.objectContaining({
-          from: 'native/windows-cli-launcher/.build/orca_botmux.exe',
-          to: 'bin/orca_botmux.exe'
+          from: 'native/windows-cli-launcher/.build/botmux.exe',
+          to: 'bin/botmux.exe'
         })
       ])
     )
@@ -82,13 +82,13 @@ describe('electron-builder config', () => {
     expect(electronBuilderConfig.mac.extraFiles).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          from: 'native/notification-status-macos/.build/release/orca-botmux-notification-status',
-          to: 'MacOS/orca-botmux-notification-status'
+          from: 'native/notification-status-macos/.build/release/botmux-notification-status',
+          to: 'MacOS/botmux-notification-status'
         })
       ])
     )
     expect(electronBuilderConfig.mac.extraResources).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ to: 'orca-botmux-notification-status' })])
+      expect.arrayContaining([expect.objectContaining({ to: 'botmux-notification-status' })])
     )
   })
 
@@ -111,46 +111,46 @@ describe('electron-builder config', () => {
   })
 
   it('matches the Linux desktop entry to Electron window class', () => {
-    expect(electronBuilderConfig.linux.desktop.entry.StartupWMClass).toBe('orca_botmux')
+    expect(electronBuilderConfig.linux.desktop.entry.StartupWMClass).toBe('botmux')
   })
 
   it('uses AppImage and deb as local Linux targets without changing existing artifact names', () => {
     expect(electronBuilderConfig.linux.target).toEqual(['AppImage', 'deb'])
-    expect(electronBuilderConfig.appImage.artifactName).toBe('orca_botmux-linux.${ext}')
-    expect(electronBuilderConfig.deb.artifactName).toBe('orca_botmux-ide_${version}_${arch}.${ext}')
+    expect(electronBuilderConfig.appImage.artifactName).toBe('botmux-linux.${ext}')
+    expect(electronBuilderConfig.deb.artifactName).toBe('botmux-ide_${version}_${arch}.${ext}')
     expect(electronBuilderConfig.rpm).toMatchObject({
-      packageName: 'orca-botmux-ide',
-      artifactName: 'orca_botmux-ide-${version}.${arch}.${ext}'
+      packageName: 'botmux-ide',
+      artifactName: 'botmux-ide-${version}.${arch}.${ext}'
     })
   })
 
   it('uses a distinct AppImage name for Linux arm64 release uploads', () => {
     const configPath = require.resolve('../electron-builder.config.cjs')
-    const original = process.env.ORCA_LINUX_ARM64_RELEASE
+    const original = process.env.BOTMUX_LINUX_ARM64_RELEASE
     try {
       delete require.cache[configPath]
-      process.env.ORCA_LINUX_ARM64_RELEASE = '1'
+      process.env.BOTMUX_LINUX_ARM64_RELEASE = '1'
       expect(require('../electron-builder.config.cjs').appImage.artifactName).toBe(
-        'orca_botmux-linux-arm64.${ext}'
+        'botmux-linux-arm64.${ext}'
       )
     } finally {
       if (original === undefined) {
-        delete process.env.ORCA_LINUX_ARM64_RELEASE
+        delete process.env.BOTMUX_LINUX_ARM64_RELEASE
       } else {
-        process.env.ORCA_LINUX_ARM64_RELEASE = original
+        process.env.BOTMUX_LINUX_ARM64_RELEASE = original
       }
       delete require.cache[configPath]
       require('../electron-builder.config.cjs')
     }
   })
 
-  it('uses OrcaBotmux native rebuild hook instead of electron-builder default rebuild', () => {
+  it('uses Botmux native rebuild hook instead of electron-builder default rebuild', () => {
     expect(electronBuilderConfig.beforeBuild).toBe(electronBuilderNativeRebuild)
     expect(electronBuilderConfig.npmRebuild).toBe(true)
   })
 
   it('verifies packaged main runtime deps from Windows-style asar entries', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-runtime-deps-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-runtime-deps-'))
     try {
       await writeFile(join(resourcesDir, 'app.asar'), '', 'utf8')
       await mkdir(join(resourcesDir, 'node_modules', 'yaml'), { recursive: true })
@@ -179,7 +179,7 @@ describe('electron-builder config', () => {
   })
 
   it('prunes non-target node-pty prebuilds from packaged runtime resources', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-node-pty-prune-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-node-pty-prune-'))
     try {
       const prebuildsDir = join(resourcesDir, 'node_modules', 'node-pty', 'prebuilds')
       await mkdir(join(prebuildsDir, 'darwin-arm64'), { recursive: true })
@@ -212,7 +212,7 @@ describe('electron-builder config', () => {
 
   it('copies the Windows node-pty ConPTY runtime beside the rebuilt addon', async () => {
     for (const arch of ['x64', 'arm64']) {
-      const resourcesDir = await mkdtemp(join(tmpdir(), `orca_botmux-node-pty-conpty-${arch}-`))
+      const resourcesDir = await mkdtemp(join(tmpdir(), `botmux-node-pty-conpty-${arch}-`))
       try {
         const nodePtyDir = join(resourcesDir, 'node_modules', 'node-pty')
         const releaseDir = join(nodePtyDir, 'build', 'Release')
@@ -259,7 +259,7 @@ describe('electron-builder config', () => {
   })
 
   it('prunes non-target @parcel/watcher platform subpackages from packaged runtime resources', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-parcel-watcher-prune-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-parcel-watcher-prune-'))
     try {
       const parcelDir = join(resourcesDir, 'node_modules', '@parcel')
       await mkdir(join(parcelDir, 'watcher'), { recursive: true })
@@ -282,7 +282,7 @@ describe('electron-builder config', () => {
   })
 
   it('leaves unrelated @parcel/* runtime deps untouched when pruning the watcher', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-parcel-watcher-prune-unrelated-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-parcel-watcher-prune-unrelated-'))
     try {
       const parcelDir = join(resourcesDir, 'node_modules', '@parcel')
       await mkdir(join(parcelDir, 'watcher'), { recursive: true })
@@ -304,7 +304,7 @@ describe('electron-builder config', () => {
   })
 
   it('prunes type declaration artifacts from packaged runtime node_modules', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-runtime-type-prune-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-runtime-type-prune-'))
     try {
       const packageDir = join(resourcesDir, 'node_modules', 'example-package')
       await mkdir(join(packageDir, 'dist'), { recursive: true })
@@ -322,7 +322,7 @@ describe('electron-builder config', () => {
   })
 
   it('prunes duplicate darwin sherpa-onnx runtime dylib aliases', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-sherpa-prune-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-sherpa-prune-'))
     try {
       const packageDir = join(resourcesDir, 'node_modules', 'sherpa-onnx-darwin-arm64')
       await mkdir(packageDir, { recursive: true })
@@ -342,7 +342,7 @@ describe('electron-builder config', () => {
   })
 
   it('prunes zod TypeScript sources from packaged runtime resources', async () => {
-    const resourcesDir = await mkdtemp(join(tmpdir(), 'orca-botmux-zod-prune-'))
+    const resourcesDir = await mkdtemp(join(tmpdir(), 'botmux-zod-prune-'))
     try {
       const packageDir = join(resourcesDir, 'node_modules', 'zod')
       await mkdir(join(packageDir, 'src'), { recursive: true })
@@ -360,10 +360,10 @@ describe('electron-builder config', () => {
   it.skipIf(process.platform === 'win32')(
     'marks packaged Unix CLI launchers executable',
     async () => {
-      const root = await mkdtemp(join(tmpdir(), 'orca-botmux-electron-builder-config-'))
+      const root = await mkdtemp(join(tmpdir(), 'botmux-electron-builder-config-'))
       try {
         const resourcesDir = join(root, 'linux-unpacked', 'resources')
-        const launcherPath = join(resourcesDir, 'bin', 'orca-botmux-ide')
+        const launcherPath = join(resourcesDir, 'bin', 'botmux-ide')
         await mkdir(join(resourcesDir, 'bin'), { recursive: true })
         await mkdir(join(resourcesDir, 'node_modules', 'zod', 'src'), { recursive: true })
         // Why: afterPack now fails hard when the unpacked daemon entry is

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { waitForActivePaneHookDescriptor, waitForActiveTerminalManager } from './helpers/terminal'
 import type { GlobalSettings } from '../../src/shared/types'
@@ -94,21 +94,21 @@ function claudeTranscriptLines(args: {
 
 test.describe('Native chat first-flush transcript race (#8401)', () => {
   test('stays in loading (never errors) until a not-yet-flushed transcript appears, then hydrates live', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const descriptor = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
+    const descriptor = await waitForActivePaneHookDescriptor(botmuxPage)
     const [tabId] = descriptor.paneKey.split(':')
     const sessionId = `e2e-first-flush-${randomUUID()}`
 
     // Why: a real Claude Code session flushes its first JSONL line up to
     // minutes after launch (#8401) — this directory intentionally has no file
     // yet when the pane resolves its providerSession.
-    const scratchDir = mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-e2e-native-chat-'))
+    const scratchDir = mkdtempSync(path.join(os.tmpdir(), 'botmux-e2e-native-chat-'))
     const transcriptPath = path.join(scratchDir, `${sessionId}.jsonl`)
 
     const screenshotDir = path.join(
@@ -123,39 +123,39 @@ test.describe('Native chat first-flush transcript race (#8401)', () => {
     })
 
     try {
-      await enableNativeChatSetting(orcaBotmuxPage)
-      await seedClaudeProviderSession(orcaBotmuxPage, {
+      await enableNativeChatSetting(botmuxPage)
+      await seedClaudeProviderSession(botmuxPage, {
         paneKey: descriptor.paneKey,
         worktreeId: descriptor.worktreeId,
         sessionId,
         transcriptPath
       })
-      await toggleTerminalTabToChatView(orcaBotmuxPage, { tabId, worktreeId: descriptor.worktreeId })
+      await toggleTerminalTabToChatView(botmuxPage, { tabId, worktreeId: descriptor.worktreeId })
 
-      await expect(orcaBotmuxPage.locator('[data-native-chat-root="true"]')).toBeVisible({
+      await expect(botmuxPage.locator('[data-native-chat-root="true"]')).toBeVisible({
         timeout: 15_000
       })
-      await expect(orcaBotmuxPage.getByText(LOADING_TITLE)).toBeVisible({ timeout: 10_000 })
-      await expect(orcaBotmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
-      await orcaBotmuxPage.screenshot({
+      await expect(botmuxPage.getByText(LOADING_TITLE)).toBeVisible({ timeout: 10_000 })
+      await expect(botmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
+      await botmuxPage.screenshot({
         path: path.join(screenshotDir, '01-loading-no-error.png')
       })
 
       // Why: a short real delay proves the first readSession attempt already
       // hit the not-yet-flushed file (returning notFound) and the renderer's
       // backoff retry — not a lucky first read — is what picks it up below.
-      await orcaBotmuxPage.waitForTimeout(1_500)
-      await expect(orcaBotmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
+      await botmuxPage.waitForTimeout(1_500)
+      await expect(botmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
 
       const userText = 'Explain the native chat first-flush race fix for #8401'
       const assistantText =
         'The main process now retries a not-yet-flushed transcript instead of caching a permanent miss.'
       writeFileSync(transcriptPath, claudeTranscriptLines({ sessionId, userText, assistantText }))
 
-      await expect(orcaBotmuxPage.getByText(userText)).toBeVisible({ timeout: 30_000 })
-      await expect(orcaBotmuxPage.getByText(assistantText)).toBeVisible({ timeout: 30_000 })
-      await expect(orcaBotmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
-      await orcaBotmuxPage.screenshot({
+      await expect(botmuxPage.getByText(userText)).toBeVisible({ timeout: 30_000 })
+      await expect(botmuxPage.getByText(assistantText)).toBeVisible({ timeout: 30_000 })
+      await expect(botmuxPage.getByText(ERROR_TITLE)).toHaveCount(0)
+      await botmuxPage.screenshot({
         path: path.join(screenshotDir, '02-hydrated.png')
       })
     } finally {

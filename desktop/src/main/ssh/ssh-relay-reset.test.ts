@@ -53,9 +53,9 @@ async function runResetScript(lsofMode: LsofMode): Promise<{
   socketExists: boolean
 }> {
   const script = await capturedResetScript()
-  const home = mkdtempSync(join(tmpdir(), 'orca-botmux-'))
+  const home = mkdtempSync(join(tmpdir(), 'botmux-'))
   const binDir = join(home, 'bin')
-  const socketDir = join(home, '.orca-botmux-remote')
+  const socketDir = join(home, '.botmux-remote')
   const socketPath = join(socketDir, relaySocketNameForInstanceId('ssh-1'))
   const killLog = join(home, 'kill.log')
   const pgrepLog = join(home, 'pgrep.log')

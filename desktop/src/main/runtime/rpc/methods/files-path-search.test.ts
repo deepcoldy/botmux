@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import type { RpcRequest } from '../core'
 import { RpcDispatcher } from '../dispatcher'
 import { FILE_METHODS } from './files'
@@ -15,7 +15,7 @@ describe('file path search RPC method', () => {
         totalCount: 1,
         truncated: false
       })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: FILE_METHODS })
     const request: RpcRequest = {
       id: 'req-1',

@@ -21,7 +21,7 @@ const CASES: GuardCase[] = [
   {
     file: 'components/sidebar/SetupScriptPromptCardViews.tsx',
     afterFallback: 'This repo ignores shared',
-    label: 'shared orca_botmux.yaml'
+    label: 'shared botmux.yaml'
   },
   {
     file: 'components/sidebar/SetupScriptPromptCardViews.tsx',
@@ -36,17 +36,17 @@ const CASES: GuardCase[] = [
   {
     file: 'components/settings/RepositoryHooksSection.tsx',
     afterFallback: 'Example',
-    label: 'Example orca_botmux.yaml template'
+    label: 'Example botmux.yaml template'
   },
   {
     file: 'components/settings/RepositoryHooksSection.tsx',
     afterFallback: 'Edit',
-    label: 'Edit orca_botmux.yaml'
+    label: 'Edit botmux.yaml'
   },
   {
     file: 'components/settings/RepositoryHooksSection.tsx',
     afterFallback: 'When both',
-    label: 'When both orca_botmux.yaml'
+    label: 'When both botmux.yaml'
   },
   {
     file: 'components/settings/GitPane.tsx',
@@ -61,7 +61,7 @@ const CASES: GuardCase[] = [
   {
     file: 'components/settings/RuntimeEnvironmentsPane.tsx',
     afterFallback: 'Run',
-    label: 'Run orca-botmux-desktop serve'
+    label: 'Run botmux-desktop serve'
   },
   {
     file: 'components/settings/AutoRenameBranchFromWorkSetting.tsx',

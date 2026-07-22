@@ -24,9 +24,9 @@ function sendJson(res: ServerResponse, body: unknown): void {
 
 describe('Bitbucket hosted review integration', () => {
   beforeEach(() => {
-    process.env = { ...OLD_ENV, ORCA_BITBUCKET_ACCESS_TOKEN: 'local-token' }
-    delete process.env.ORCA_BITBUCKET_EMAIL
-    delete process.env.ORCA_BITBUCKET_API_TOKEN
+    process.env = { ...OLD_ENV, BOTMUX_BITBUCKET_ACCESS_TOKEN: 'local-token' }
+    delete process.env.BOTMUX_BITBUCKET_EMAIL
+    delete process.env.BOTMUX_BITBUCKET_API_TOKEN
     _resetBitbucketRepoRefCache()
   })
 
@@ -76,14 +76,14 @@ describe('Bitbucket hosted review integration', () => {
     })
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
 
-    const repoPath = await mkdtemp(join(tmpdir(), 'orca-botmux-bitbucket-review-'))
+    const repoPath = await mkdtemp(join(tmpdir(), 'botmux-bitbucket-review-'))
     try {
       const address = server.address()
       if (!address || typeof address === 'string') {
         throw new Error('expected TCP server address')
       }
 
-      process.env.ORCA_BITBUCKET_API_BASE_URL = `http://127.0.0.1:${address.port}/2.0`
+      process.env.BOTMUX_BITBUCKET_API_BASE_URL = `http://127.0.0.1:${address.port}/2.0`
       await execFileAsync('git', ['init'], { cwd: repoPath })
       await execFileAsync('git', ['remote', 'add', 'origin', 'git@bitbucket.org:team/repo.git'], {
         cwd: repoPath

@@ -41,7 +41,7 @@ describe('AntigravityHookService', () => {
   let homeDir: string
 
   beforeEach(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-antigravity-home-'))
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-antigravity-home-'))
     homedirMock.mockReturnValue(homeDir)
   })
 
@@ -60,40 +60,40 @@ describe('AntigravityHookService', () => {
     const config = JSON.parse(
       readFileSync(join(homeDir, '.gemini', 'config', 'hooks.json'), 'utf8')
     ) as {
-      'orca-botmux-status': Record<
+      'botmux-status': Record<
         string,
         { matcher?: string; command?: string; hooks?: { command: string }[] }[]
       >
     }
-    expect(Object.keys(config['orca-botmux-status']).sort()).toEqual(
+    expect(Object.keys(config['botmux-status']).sort()).toEqual(
       ['PostInvocation', 'PostToolUse', 'PreInvocation', 'Stop'].sort()
     )
-    expect(config['orca-botmux-status'].PreToolUse).toBeUndefined()
-    expect(config['orca-botmux-status'].PostToolUse[0].matcher).toBe('*')
-    expect(config['orca-botmux-status'].PreInvocation[0].command).toContain(
+    expect(config['botmux-status'].PreToolUse).toBeUndefined()
+    expect(config['botmux-status'].PostToolUse[0].matcher).toBe('*')
+    expect(config['botmux-status'].PreInvocation[0].command).toContain(
       ANTIGRAVITY_PRE_INVOCATION_COMMAND
     )
     if (process.platform === 'win32') {
-      expect(config['orca-botmux-status'].PreInvocation[0].command).not.toContain('ORCA_ANTIGRAVITY_EVENT')
+      expect(config['botmux-status'].PreInvocation[0].command).not.toContain('BOTMUX_ANTIGRAVITY_EVENT')
     } else {
-      expect(config['orca-botmux-status'].PreInvocation[0].command).toContain(
-        "ORCA_ANTIGRAVITY_EVENT='PreInvocation'"
+      expect(config['botmux-status'].PreInvocation[0].command).toContain(
+        "BOTMUX_ANTIGRAVITY_EVENT='PreInvocation'"
       )
-      expect(config['orca-botmux-status'].Stop[0].command).toContain("ORCA_ANTIGRAVITY_EVENT='Stop'")
+      expect(config['botmux-status'].Stop[0].command).toContain("BOTMUX_ANTIGRAVITY_EVENT='Stop'")
     }
 
     const script = readFileSync(
-      join(homeDir, '.orca_botmux', 'agent-hooks', ANTIGRAVITY_SCRIPT_FILE_NAME),
+      join(homeDir, '.botmux', 'agent-hooks', ANTIGRAVITY_SCRIPT_FILE_NAME),
       'utf8'
     )
     expect(script).toContain('/hook/antigravity')
     if (process.platform === 'win32') {
       expect(script).toContain('%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-      expect(script).toContain('hook_event_name=$env:ORCA_ANTIGRAVITY_EVENT')
+      expect(script).toContain('hook_event_name=$env:BOTMUX_ANTIGRAVITY_EVENT')
       expect(script).toContain('[string]::IsNullOrWhiteSpace($inputData)) { @{} }')
       expect(script).not.toContain('[string]::IsNullOrWhiteSpace($inputData)) { exit 0 }')
     } else {
-      expect(script).toContain('hook_event_name=${ORCA_ANTIGRAVITY_EVENT}')
+      expect(script).toContain('hook_event_name=${BOTMUX_ANTIGRAVITY_EVENT}')
       expect(script).toContain('payload=$(cat)')
       expect(script).toContain("payload='{}'")
       expect(script).not.toContain('if [ -z "$payload" ]; then\n  exit 0\nfi')
@@ -111,7 +111,7 @@ describe('AntigravityHookService', () => {
       const configPath = join(homeDir, '.gemini', 'config', 'hooks.json')
       const staleScriptPath = join(
         homeDir,
-        '.orca_botmux',
+        '.botmux',
         'agent-hooks',
         'antigravity-hook.cmd'
       ).replaceAll('/', '\\')
@@ -120,14 +120,14 @@ describe('AntigravityHookService', () => {
         configPath,
         `${JSON.stringify(
           {
-            'orca-botmux-status': {
+            'botmux-status': {
               PreToolUse: [
                 {
                   matcher: '*',
                   hooks: [
                     {
                       type: 'command',
-                      command: `cmd /d /s /c "set "ORCA_ANTIGRAVITY_EVENT=PreToolUse" && call "${staleScriptPath}""`
+                      command: `cmd /d /s /c "set "BOTMUX_ANTIGRAVITY_EVENT=PreToolUse" && call "${staleScriptPath}""`
                     }
                   ]
                 }
@@ -149,12 +149,12 @@ describe('AntigravityHookService', () => {
       expect(status.state).toBe('installed')
 
       const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
-        'orca-botmux-status': Record<
+        'botmux-status': Record<
           string,
           { matcher?: string; command?: string; hooks?: { command: string }[] }[]
         >
       }
-      expect(config['orca-botmux-status'].PreToolUse).toBeUndefined()
+      expect(config['botmux-status'].PreToolUse).toBeUndefined()
 
       const expectedWrappers = {
         PreInvocation: 'antigravity-pre-invocation.cmd',
@@ -163,31 +163,31 @@ describe('AntigravityHookService', () => {
         PostToolUse: 'antigravity-post-tool-use.cmd'
       }
       for (const [eventName, wrapperFileName] of Object.entries(expectedWrappers)) {
-        const definition = config['orca-botmux-status'][eventName][0]
+        const definition = config['botmux-status'][eventName][0]
         const command =
           eventName === 'PostToolUse' ? definition.hooks?.[0]?.command : definition.command
         expect(createManagedCommandMatcher(wrapperFileName)(command)).toBe(true)
         expect(command).not.toContain('cmd /d /s /c')
-        expect(command).not.toContain('ORCA_ANTIGRAVITY_EVENT')
+        expect(command).not.toContain('BOTMUX_ANTIGRAVITY_EVENT')
 
-        const wrapper = readFileSync(join(homeDir, '.orca_botmux', 'agent-hooks', wrapperFileName), 'utf8')
-        expect(wrapper).toContain(`set "ORCA_ANTIGRAVITY_EVENT=${eventName}"`)
-        expect(wrapper).toContain('call "%ORCA_ANTIGRAVITY_CORE%"')
+        const wrapper = readFileSync(join(homeDir, '.botmux', 'agent-hooks', wrapperFileName), 'utf8')
+        expect(wrapper).toContain(`set "BOTMUX_ANTIGRAVITY_EVENT=${eventName}"`)
+        expect(wrapper).toContain('call "%BOTMUX_ANTIGRAVITY_CORE%"')
       }
 
       const script = readFileSync(
-        join(homeDir, '.orca_botmux', 'agent-hooks', 'antigravity-hook.cmd'),
+        join(homeDir, '.botmux', 'agent-hooks', 'antigravity-hook.cmd'),
         'utf8'
       )
       expect(script).toContain('/hook/antigravity')
       expect(script).toContain('%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
-      expect(script).toContain('hook_event_name=$env:ORCA_ANTIGRAVITY_EVENT')
+      expect(script).toContain('hook_event_name=$env:BOTMUX_ANTIGRAVITY_EVENT')
       expect(script).toContain('[string]::IsNullOrWhiteSpace($inputData)) { @{} }')
       expect(script).not.toContain('[string]::IsNullOrWhiteSpace($inputData)) { exit 0 }')
     })
   })
 
-  it('preserves user-authored hook bundles and entries in OrcaBotmux bundle', () => {
+  it('preserves user-authored hook bundles and entries in Botmux bundle', () => {
     const configPath = join(homeDir, '.gemini', 'config', 'hooks.json')
     mkdirSync(dirname(configPath), { recursive: true })
     writeFileSync(
@@ -197,8 +197,8 @@ describe('AntigravityHookService', () => {
           'user-hook': {
             PreInvocation: [{ type: 'command', command: '/usr/local/bin/user-hook' }]
           },
-          'orca-botmux-status': {
-            PreInvocation: [{ type: 'command', command: '/usr/local/bin/orca-botmux-extra' }]
+          'botmux-status': {
+            PreInvocation: [{ type: 'command', command: '/usr/local/bin/botmux-extra' }]
           }
         },
         null,
@@ -210,11 +210,11 @@ describe('AntigravityHookService', () => {
 
     const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
       'user-hook': { PreInvocation: { command: string }[] }
-      'orca-botmux-status': { PreInvocation: { command: string }[] }
+      'botmux-status': { PreInvocation: { command: string }[] }
     }
     expect(config['user-hook'].PreInvocation[0].command).toBe('/usr/local/bin/user-hook')
-    const commands = config['orca-botmux-status'].PreInvocation.map((entry) => entry.command)
-    expect(commands).toContain('/usr/local/bin/orca-botmux-extra')
+    const commands = config['botmux-status'].PreInvocation.map((entry) => entry.command)
+    expect(commands).toContain('/usr/local/bin/botmux-extra')
     expect(commands.some((command) => command.includes(ANTIGRAVITY_PRE_INVOCATION_COMMAND))).toBe(
       true
     )
@@ -227,7 +227,7 @@ describe('AntigravityHookService', () => {
       configPath,
       `${JSON.stringify(
         {
-          'orca-botmux-status': {
+          'botmux-status': {
             OldEvent: [
               {
                 type: 'command',
@@ -250,16 +250,16 @@ describe('AntigravityHookService', () => {
     new AntigravityHookService().install()
 
     const config = JSON.parse(readFileSync(configPath, 'utf8')) as {
-      'orca-botmux-status': Record<string, { command?: string; hooks?: { command: string }[] }[]>
+      'botmux-status': Record<string, { command?: string; hooks?: { command: string }[] }[]>
     }
-    expect(config['orca-botmux-status'].OldEvent).toBeUndefined()
-    expect(config['orca-botmux-status'].PreToolUse).toBeUndefined()
-    const commands = config['orca-botmux-status'].PostToolUse.flatMap((definition) =>
+    expect(config['botmux-status'].OldEvent).toBeUndefined()
+    expect(config['botmux-status'].PreToolUse).toBeUndefined()
+    const commands = config['botmux-status'].PostToolUse.flatMap((definition) =>
       (definition.hooks ?? []).map((hook) => hook.command)
     )
     expect(commands).toHaveLength(1)
     expect(commands[0]).toContain(
-      join(homeDir, '.orca_botmux', 'agent-hooks', ANTIGRAVITY_POST_TOOL_USE_COMMAND)
+      join(homeDir, '.botmux', 'agent-hooks', ANTIGRAVITY_POST_TOOL_USE_COMMAND)
     )
   })
 })

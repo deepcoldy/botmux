@@ -190,7 +190,7 @@ function isTransientWindowsRemovalError(error: unknown): boolean {
 }
 
 export function toHostRemovalPath(targetPath: string): string {
-  // Why: Git for Windows can fail long recursive deletes even after OrcaBotmux has
+  // Why: Git for Windows can fail long recursive deletes even after Botmux has
   // proven the worktree target; Node's host deletion should use Win32 long paths.
   return process.platform === 'win32' ? win32.toNamespacedPath(targetPath) : targetPath
 }

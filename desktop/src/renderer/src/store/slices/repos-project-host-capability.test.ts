@@ -112,7 +112,7 @@ describe('repo slice project-host setup runtime capability', () => {
       store.getState().setupProjectClone({
         projectId: 'project-1',
         hostId: 'runtime:env-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/srv'
       })
     ).resolves.toBeNull()
@@ -137,7 +137,7 @@ describe('repo slice project-host setup runtime capability', () => {
       store.getState().setupProjectClone({
         projectId: 'project-1',
         hostId: 'runtime:env-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/srv'
       })
     ).resolves.toBeNull()

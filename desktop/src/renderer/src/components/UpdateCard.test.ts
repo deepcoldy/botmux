@@ -21,8 +21,8 @@ const RICH_CHANGELOG: ChangelogData = {
   release: {
     title: 'Inline Diffs',
     description: 'Review diffs without leaving the terminal.',
-    mediaUrl: 'https://onorca.dev/media/inline-diffs.png',
-    releaseNotesUrl: 'https://onorca.dev/changelog/1.2.0'
+    mediaUrl: 'https://example.test/media/inline-diffs.png',
+    releaseNotesUrl: 'https://example.test/changelog/1.2.0'
   },
   releasesBehind: 3
 }

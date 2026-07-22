@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Capture one-shot macOS launch diagnostics for a published OrcaBotmux release.
+# Capture one-shot macOS launch diagnostics for a published Botmux release.
 #
 # Usage:
-#   ORCA_DIAGNOSTIC_TAG=v1.4.42-rc.1 bash config/scripts/macos-launch-diagnostics.sh
+#   BOTMUX_DIAGNOSTIC_TAG=v1.4.42-rc.1 bash config/scripts/macos-launch-diagnostics.sh
 #   bash config/scripts/macos-launch-diagnostics.sh --tag v1.4.42-rc.1
 set -euo pipefail
 
-REPO="${ORCA_DIAGNOSTIC_REPO:-stablyai/orca_botmux}"
-TAG="${ORCA_DIAGNOSTIC_TAG:-}"
+REPO="${BOTMUX_DIAGNOSTIC_REPO:-stablyai/botmux}"
+TAG="${BOTMUX_DIAGNOSTIC_TAG:-}"
 KEEP=0
 
 while [[ $# -gt 0 ]]; do
@@ -26,10 +26,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       cat <<'EOF'
-Capture one-shot macOS launch diagnostics for a published OrcaBotmux release.
+Capture one-shot macOS launch diagnostics for a published Botmux release.
 
 Usage:
-  ORCA_DIAGNOSTIC_TAG=v1.4.42-rc.1 bash config/scripts/macos-launch-diagnostics.sh
+  BOTMUX_DIAGNOSTIC_TAG=v1.4.42-rc.1 bash config/scripts/macos-launch-diagnostics.sh
   bash config/scripts/macos-launch-diagnostics.sh --tag v1.4.42-rc.1
 EOF
       exit 0
@@ -48,14 +48,14 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 if [[ -z "$TAG" ]]; then
-  echo "Set ORCA_DIAGNOSTIC_TAG or pass --tag vX.Y.Z-rc.N." >&2
+  echo "Set BOTMUX_DIAGNOSTIC_TAG or pass --tag vX.Y.Z-rc.N." >&2
   exit 2
 fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-  arm64) ASSET="orca_botmux-macos-arm64.dmg" ;;
-  x86_64) ASSET="orca_botmux-macos-x64.dmg" ;;
+  arm64) ASSET="botmux-macos-arm64.dmg" ;;
+  x86_64) ASSET="botmux-macos-x64.dmg" ;;
   *)
     echo "Unsupported macOS architecture: $ARCH" >&2
     exit 2
@@ -63,21 +63,21 @@ case "$ARCH" in
 esac
 
 TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/orca_botmux-launch-diagnostics.XXXXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/botmux-launch-diagnostics.XXXXXXXX")"
 OUT_DIR="$WORK_DIR/output"
 MOUNT_DIR="$WORK_DIR/mount"
-APP_DIR="$WORK_DIR/OrcaBotmux.app"
+APP_DIR="$WORK_DIR/Botmux.app"
 DMG_PATH="$WORK_DIR/$ASSET"
 mkdir -p "$OUT_DIR" "$MOUNT_DIR"
 
 if [[ -d "$HOME/Desktop" ]]; then
-  ZIP_PATH="$HOME/Desktop/orca_botmux-launch-diagnostics-${TAG}-${TIMESTAMP}.zip"
+  ZIP_PATH="$HOME/Desktop/botmux-launch-diagnostics-${TAG}-${TIMESTAMP}.zip"
 else
-  ZIP_PATH="$PWD/orca_botmux-launch-diagnostics-${TAG}-${TIMESTAMP}.zip"
+  ZIP_PATH="$PWD/botmux-launch-diagnostics-${TAG}-${TIMESTAMP}.zip"
 fi
 
 diag_log() {
-  printf '[orca_botmux-diagnostics] %s\n' "$*"
+  printf '[botmux-diagnostics] %s\n' "$*"
 }
 
 run_capture() {
@@ -121,23 +121,23 @@ write_environment_report() {
     echo "## shell"
     echo "$SHELL"
     echo
-    echo "## current OrcaBotmux processes before diagnostics"
-    pgrep -fl 'OrcaBotmux|orca_botmux' || true
+    echo "## current Botmux processes before diagnostics"
+    pgrep -fl 'Botmux|botmux' || true
   } >"$OUT_DIR/environment.txt"
 }
 
-ensure_no_existing_orca() {
+ensure_no_existing_botmux() {
   local existing
-  existing="$(pgrep -x OrcaBotmux || true)"
+  existing="$(pgrep -x Botmux || true)"
   if [[ -z "$existing" ]]; then
     return 0
   fi
 
   {
-    echo "An OrcaBotmux process is already running. Close OrcaBotmux and run this script again."
+    echo "An Botmux process is already running. Close Botmux and run this script again."
     echo
     ps -p "$(printf '%s' "$existing" | paste -sd, -)" -o pid=,ppid=,command= || true
-  } | tee "$OUT_DIR/existing-orca_botmux-process.txt" >&2
+  } | tee "$OUT_DIR/existing-botmux-process.txt" >&2
   exit 2
 }
 
@@ -187,7 +187,7 @@ write_app_report() {
 
 start_log_stream() {
   local file="$1"
-  local predicate='process == "OrcaBotmux" OR eventMessage CONTAINS[c] "OrcaBotmux" OR eventMessage CONTAINS[c] "com.stablyai.orca_botmux"'
+  local predicate='process == "Botmux" OR eventMessage CONTAINS[c] "Botmux" OR eventMessage CONTAINS[c] "com.botmux.desktop_botmux"'
   if command -v log >/dev/null 2>&1; then
     command log stream --style compact --predicate "$predicate" >"$file" 2>&1 &
     echo "$!"
@@ -204,8 +204,8 @@ stop_log_stream() {
   fi
 }
 
-latest_orca_pid_for_app() {
-  pgrep -nf "$APP_DIR/Contents/MacOS/OrcaBotmux" || true
+latest_botmux_pid_for_app() {
+  pgrep -nf "$APP_DIR/Contents/MacOS/Botmux" || true
 }
 
 sample_process_once() {
@@ -218,7 +218,7 @@ sample_process_once() {
 
 terminate_app_processes() {
   local pid
-  pid="$(latest_orca_pid_for_app)"
+  pid="$(latest_botmux_pid_for_app)"
   if [[ -n "$pid" ]]; then
     kill "$pid" >/dev/null 2>&1 || true
     sleep 1
@@ -237,7 +237,7 @@ wait_for_probe() {
 
   for i in $(seq 1 200); do
     local app_pid
-    app_pid="$(latest_orca_pid_for_app)"
+    app_pid="$(latest_botmux_pid_for_app)"
     if [[ "$sampled" -eq 0 && -n "$app_pid" ]]; then
       sampled=1
       echo "sampled_pid=$app_pid" >>"$OUT_DIR/$label.meta"
@@ -284,9 +284,9 @@ run_launchservices_probe() {
       --stdout "$stdout_file" \
       --stderr "$stderr_file" \
       --env ELECTRON_ENABLE_LOGGING=1 \
-      --env ORCA_STARTUP_DIAGNOSTICS=trace \
-      --env ORCA_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
-      --env ORCA_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
+      --env BOTMUX_STARTUP_DIAGNOSTICS=trace \
+      --env BOTMUX_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
+      --env BOTMUX_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
       --env "$extra_env_name=$extra_env_value" \
       "$APP_DIR" &
   else
@@ -294,9 +294,9 @@ run_launchservices_probe() {
       --stdout "$stdout_file" \
       --stderr "$stderr_file" \
       --env ELECTRON_ENABLE_LOGGING=1 \
-      --env ORCA_STARTUP_DIAGNOSTICS=trace \
-      --env ORCA_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
-      --env ORCA_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
+      --env BOTMUX_STARTUP_DIAGNOSTICS=trace \
+      --env BOTMUX_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
+      --env BOTMUX_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
       "$APP_DIR" &
   fi
   local runner_pid="$!"
@@ -322,10 +322,10 @@ run_direct_exec_probe() {
   } >"$OUT_DIR/$label.meta"
 
   ELECTRON_ENABLE_LOGGING=1 \
-    ORCA_STARTUP_DIAGNOSTICS=trace \
-    ORCA_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
-    ORCA_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
-    "$APP_DIR/Contents/MacOS/OrcaBotmux" >"$stdout_file" 2>"$stderr_file" &
+    BOTMUX_STARTUP_DIAGNOSTICS=trace \
+    BOTMUX_STARTUP_DIAGNOSTICS_TRACE_LIMIT=30000 \
+    BOTMUX_STARTUP_DIAGNOSTICS_FILE="$bootstrap_file" \
+    "$APP_DIR/Contents/MacOS/Botmux" >"$stdout_file" 2>"$stderr_file" &
   local runner_pid="$!"
   wait_for_probe "$runner_pid" "$label"
   echo "ended_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >>"$OUT_DIR/$label.meta"
@@ -333,7 +333,7 @@ run_direct_exec_probe() {
 }
 
 write_system_log_snapshot() {
-  local predicate='process == "OrcaBotmux" OR eventMessage CONTAINS[c] "OrcaBotmux" OR eventMessage CONTAINS[c] "com.stablyai.orca_botmux"'
+  local predicate='process == "Botmux" OR eventMessage CONTAINS[c] "Botmux" OR eventMessage CONTAINS[c] "com.botmux.desktop_botmux"'
   if command -v log >/dev/null 2>&1; then
     diag_log "capturing recent unified log snapshot"
     command log show --style syslog --last 10m --predicate "$predicate" >"$OUT_DIR/system-log-last-10m.log" 2>&1 || true
@@ -356,11 +356,11 @@ package_results() {
 }
 
 write_environment_report
-ensure_no_existing_orca
+ensure_no_existing_botmux
 download_and_copy_app
 write_app_report
 run_launchservices_probe "launchservices-trace"
-run_launchservices_probe "launchservices-bypass-lock" "ORCA_BYPASS_SINGLE_INSTANCE_LOCK" "1"
+run_launchservices_probe "launchservices-bypass-lock" "BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK" "1"
 run_direct_exec_probe
 write_system_log_snapshot
 package_results

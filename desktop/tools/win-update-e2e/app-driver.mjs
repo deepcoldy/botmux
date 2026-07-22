@@ -1,4 +1,4 @@
-// Drive the installed, packaged OrcaBotmux app with Playwright's Electron driver.
+// Drive the installed, packaged Botmux app with Playwright's Electron driver.
 //
 // This targets a PRODUCTION build, so it must NOT depend on the e2e-only store
 // exposure (window.__store / window.__paneManagers) — those exist only under a
@@ -32,10 +32,10 @@ const XTERM_CONTAINER_VISIBLE = '.xterm:visible'
 const XTERM_INPUT = '.xterm-helper-textarea'
 
 /**
- * Launch the installed OrcaBotmux.exe. Pointing userDataDir at a harness-owned temp
+ * Launch the installed Botmux.exe. Pointing userDataDir at a harness-owned temp
  * dir isolates this run's daemon (its socket/token path becomes unique), so
- * daemon lookups never collide with other OrcaBotmux installs/daemons on the box.
- * Pass `seedProfile` (a buildFreshProfile object) to write orca-botmux-data.json
+ * daemon lookups never collide with other Botmux installs/daemons on the box.
+ * Pass `seedProfile` (a buildFreshProfile object) to write botmux-data.json
  * BEFORE this launch — do so only on the FIRST launch, never before the
  * post-update relaunch, or the persisted session under test is destroyed.
  */
@@ -55,9 +55,9 @@ export async function launchInstalledApp({
     args: [],
     env: {
       ...cleanEnv,
-      // Packaged main honors ORCA_E2E_USER_DATA_DIR to relocate userData
+      // Packaged main honors BOTMUX_E2E_USER_DATA_DIR to relocate userData
       // (logs/daemon/terminal-history) under a controlled dir.
-      ORCA_E2E_USER_DATA_DIR: userDataDir,
+      BOTMUX_E2E_USER_DATA_DIR: userDataDir,
       ...extraEnv
     }
   })

@@ -1,8 +1,8 @@
 export function computerProviderUnavailableMessage(platform: NodeJS.Platform): string {
   if (platform === 'darwin') {
     return [
-      'computer-use has no native provider for darwin because OrcaBotmux Computer Use.app was not found or this macOS version is unsupported.',
-      'For local development, run pnpm build:computer-macos and restart OrcaBotmux from this worktree.'
+      'computer-use has no native provider for darwin because Botmux Computer Use.app was not found or this macOS version is unsupported.',
+      'For local development, run pnpm build:computer-macos and restart Botmux from this worktree.'
     ].join(' ')
   }
   if (platform === 'linux' || platform === 'win32') {

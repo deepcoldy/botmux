@@ -209,7 +209,7 @@ export const ORCHESTRATION_METHODS: RpcMethod[] = [
     handler: async (params, { runtime }) => {
       const db = runtime.getOrchestrationDb()
       const from = params.from ?? 'unknown'
-      // Why: older live shells may lack ORCA_PANE_KEY, but the runtime still
+      // Why: older live shells may lack BOTMUX_PANE_KEY, but the runtime still
       // knows the pane behind their resolved handle; persist that authority.
       const senderPaneKey = params.senderPaneKey ?? runtime.getTerminalPaneKey(from) ?? undefined
 

@@ -111,7 +111,7 @@ export const MOBILE_TUI_AGENT_FAVICON_DOMAINS: Partial<Record<TuiAgent, string>>
 
 export const MOBILE_TUI_AGENT_LAUNCH_COMMANDS: Record<TuiAgent, string> = {
   claude: 'claude',
-  'claude-agent-teams': 'orca claude-teams',
+  'claude-agent-teams': 'botmux claude-teams',
   openclaude: 'openclaude',
   codex: 'codex',
   grok: 'grok',

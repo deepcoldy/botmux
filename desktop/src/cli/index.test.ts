@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   callMock,
   runtimeClientConstructorMock,
-  serveOrcaAppMock,
+  serveBotmuxAppMock,
   getDefaultUserDataPathMock,
   addEnvironmentFromPairingCodeMock,
   listEnvironmentsMock,
@@ -15,8 +15,8 @@ const {
 } = vi.hoisted(() => ({
   callMock: vi.fn(),
   runtimeClientConstructorMock: vi.fn(),
-  serveOrcaAppMock: vi.fn(),
-  getDefaultUserDataPathMock: vi.fn(() => '/tmp/orca-botmux-user-data'),
+  serveBotmuxAppMock: vi.fn(),
+  getDefaultUserDataPathMock: vi.fn(() => '/tmp/botmux-user-data'),
   addEnvironmentFromPairingCodeMock: vi.fn(),
   listEnvironmentsMock: vi.fn(),
   spawnMock: vi.fn()
@@ -27,7 +27,7 @@ vi.mock('./runtime-client', () => {
     readonly isRemote: boolean
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
 
     constructor(
       _userDataPath?: string,
@@ -38,10 +38,10 @@ vi.mock('./runtime-client', () => {
       runtimeClientConstructorMock()
       const effectivePairingCode =
         remotePairingCode === undefined
-          ? (process.env.ORCA_PAIRING_CODE ?? process.env.ORCA_REMOTE_PAIRING)
+          ? (process.env.BOTMUX_PAIRING_CODE ?? process.env.BOTMUX_REMOTE_PAIRING)
           : remotePairingCode
       const effectiveEnvironment =
-        environmentSelector === undefined ? process.env.ORCA_ENVIRONMENT : environmentSelector
+        environmentSelector === undefined ? process.env.BOTMUX_ENVIRONMENT : environmentSelector
       if (effectivePairingCode && effectiveEnvironment) {
         throw new RuntimeClientError(
           'invalid_argument',
@@ -76,7 +76,7 @@ vi.mock('./runtime-client', () => {
     RuntimeClient,
     RuntimeClientError,
     RuntimeRpcFailureError,
-    serveOrcaApp: serveOrcaAppMock,
+    serveBotmuxApp: serveBotmuxAppMock,
     getDefaultUserDataPath: getDefaultUserDataPathMock
   }
 })
@@ -210,8 +210,8 @@ describe('command aliases dispatch to the canonical handler', () => {
   })
 
   it('keeps `agent-context` local when remote environment variables are set', async () => {
-    vi.stubEnv('ORCA_PAIRING_CODE', 'pairing-code')
-    vi.stubEnv('ORCA_ENVIRONMENT', 'stale-environment')
+    vi.stubEnv('BOTMUX_PAIRING_CODE', 'pairing-code')
+    vi.stubEnv('BOTMUX_ENVIRONMENT', 'stale-environment')
     try {
       await main(['agent-context', '--json'], '/tmp/repo')
 
@@ -242,7 +242,7 @@ describe('unknown command surfaces a suggestion', () => {
     expect(process.exitCode).toBe(1)
     const stderr = errorSpy.mock.calls.map((call) => String(call[0])).join('\n')
     expect(stderr).toContain('Unknown command: worktree remov')
-    expect(stderr).toContain('orca_botmux worktree')
+    expect(stderr).toContain('botmux worktree')
   })
 
   it('reports a mistyped pre-command flag without swallowing the command', async () => {
@@ -301,13 +301,13 @@ describe('unknown help command surfaces a suggestion', () => {
     await main(argv, '/tmp/repo')
 
     expect(process.exitCode).toBe(1)
-    expect(logSpy.mock.calls.flat().join('\n')).toContain('Did you mean: orca_botmux worktree')
+    expect(logSpy.mock.calls.flat().join('\n')).toContain('Did you mean: botmux worktree')
     logSpy.mockRestore()
     process.exitCode = 0
   })
 })
 
-describe('orca_botmux root help', () => {
+describe('botmux root help', () => {
   it('advertises machine-readable agent discovery', async () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
@@ -348,7 +348,7 @@ describe('orca_botmux root help', () => {
       '`worktree create --agent` creates a new checkout with an agent.'
     )
     expect(logSpy.mock.calls[0][0]).toContain(
-      'orca_botmux terminal create --worktree active --command "codex"'
+      'botmux terminal create --worktree active --command "codex"'
     )
     expect(callMock).not.toHaveBeenCalled()
   })
@@ -368,7 +368,7 @@ describe('orca_botmux root help', () => {
     await main(['linear', '--help'], '/tmp/repo')
 
     const groupHelp = String(logSpy.mock.calls[0][0])
-    expect(groupHelp).toContain('orca_botmux linear')
+    expect(groupHelp).toContain('botmux linear')
     expect(groupHelp).toContain('issue')
     expect(groupHelp).toContain('search')
     expect(groupHelp).not.toContain('--comments')
@@ -378,7 +378,7 @@ describe('orca_botmux root help', () => {
     await main(['linear', 'issue', '--help'], '/tmp/repo')
 
     const issueHelp = String(logSpy.mock.calls[0][0])
-    expect(issueHelp).toContain('orca_botmux linear issue [<id>]')
+    expect(issueHelp).toContain('botmux linear issue [<id>]')
     expect(issueHelp).toContain('--comments             Include threaded Linear comments')
     expect(issueHelp).toContain('--attachments          Include attachment metadata and URLs')
     expect(issueHelp).toContain('--workspace <id>      Connected Linear workspace id')
@@ -388,7 +388,7 @@ describe('orca_botmux root help', () => {
     await main(['linear', 'search', '--help'], '/tmp/repo')
 
     const searchHelp = String(logSpy.mock.calls[0][0])
-    expect(searchHelp).toContain('orca_botmux linear search <query>')
+    expect(searchHelp).toContain('botmux linear search <query>')
     expect(searchHelp).toContain('--workspace <id|all>  Connected Linear workspace id, or all')
     expect(searchHelp).toContain('--query <text>        Text to search across Linear issues')
     expect(callMock).not.toHaveBeenCalled()
@@ -442,13 +442,13 @@ describe('orca_botmux root help', () => {
     expect(createHelp).not.toContain('checkout/workspace')
     expect(createHelp).not.toContain('caller workspace')
     expect(createHelp).not.toContain('current workspace')
-    expect(createHelp).not.toContain('active OrcaBotmux workspace')
+    expect(createHelp).not.toContain('active Botmux workspace')
     expect(createHelp).not.toContain('folderWorkspaceId')
     expect(createHelp).toContain('folder:<id>')
     expect(createHelp).toContain('folder:<folderId>')
     expect(createHelp).toContain('worktree:<worktreeId>')
     expect(createHelp).toContain(
-      '--no-parent only affects OrcaBotmux lineage; omit --base-branch to use the repo default base'
+      '--no-parent only affects Botmux lineage; omit --base-branch to use the repo default base'
     )
 
     logSpy.mockClear()
@@ -469,7 +469,7 @@ describe('orca_botmux root help', () => {
 
     expect(String(logSpy.mock.calls[0][0])).toContain('This creates a new checkout.')
     expect(String(logSpy.mock.calls[0][0])).toContain(
-      'orca_botmux terminal create --worktree active --command "codex"'
+      'botmux terminal create --worktree active --command "codex"'
     )
 
     logSpy.mockClear()
@@ -478,31 +478,31 @@ describe('orca_botmux root help', () => {
     const terminalHelp = String(logSpy.mock.calls[0][0])
     expect(terminalHelp).toContain('Use this, not worktree create')
     expect(terminalHelp).toContain(
-      'orca_botmux terminal create --worktree active --command "codex" --json'
+      'botmux terminal create --worktree active --command "codex" --json'
     )
     expect(callMock).not.toHaveBeenCalled()
   })
 })
 
-describe('orca_botmux cli worktree awareness', () => {
-  const originalTerminalHandle = process.env.ORCA_TERMINAL_HANDLE
-  const originalUserDataPath = process.env.ORCA_USER_DATA_PATH
-  const originalPairingCode = process.env.ORCA_PAIRING_CODE
-  const originalRemotePairing = process.env.ORCA_REMOTE_PAIRING
-  const originalEnvironment = process.env.ORCA_ENVIRONMENT
-  const originalWorkspaceId = process.env.ORCA_WORKSPACE_ID
-  const originalWorktreeId = process.env.ORCA_WORKTREE_ID
+describe('botmux cli worktree awareness', () => {
+  const originalTerminalHandle = process.env.BOTMUX_TERMINAL_HANDLE
+  const originalUserDataPath = process.env.BOTMUX_USER_DATA_PATH
+  const originalPairingCode = process.env.BOTMUX_PAIRING_CODE
+  const originalRemotePairing = process.env.BOTMUX_REMOTE_PAIRING
+  const originalEnvironment = process.env.BOTMUX_ENVIRONMENT
+  const originalWorkspaceId = process.env.BOTMUX_WORKSPACE_ID
+  const originalWorktreeId = process.env.BOTMUX_WORKTREE_ID
 
   beforeEach(() => {
     callMock.mockReset()
-    delete process.env.ORCA_TERMINAL_HANDLE
-    delete process.env.ORCA_USER_DATA_PATH
-    delete process.env.ORCA_WORKSPACE_ID
-    delete process.env.ORCA_WORKTREE_ID
+    delete process.env.BOTMUX_TERMINAL_HANDLE
+    delete process.env.BOTMUX_USER_DATA_PATH
+    delete process.env.BOTMUX_WORKSPACE_ID
+    delete process.env.BOTMUX_WORKTREE_ID
     // Isolate the pane key so claude-teams tests that set it don't leak a
     // senderPaneKey into later orchestration.send assertions.
-    delete process.env.ORCA_PANE_KEY
-    serveOrcaAppMock.mockReset()
+    delete process.env.BOTMUX_PANE_KEY
+    serveBotmuxAppMock.mockReset()
     getDefaultUserDataPathMock.mockClear()
     addEnvironmentFromPairingCodeMock.mockReset()
     listEnvironmentsMock.mockReset()
@@ -532,39 +532,39 @@ describe('orca_botmux cli worktree awareness', () => {
   afterEach(() => {
     vi.restoreAllMocks()
     if (originalTerminalHandle === undefined) {
-      delete process.env.ORCA_TERMINAL_HANDLE
+      delete process.env.BOTMUX_TERMINAL_HANDLE
     } else {
-      process.env.ORCA_TERMINAL_HANDLE = originalTerminalHandle
+      process.env.BOTMUX_TERMINAL_HANDLE = originalTerminalHandle
     }
     if (originalUserDataPath === undefined) {
-      delete process.env.ORCA_USER_DATA_PATH
+      delete process.env.BOTMUX_USER_DATA_PATH
     } else {
-      process.env.ORCA_USER_DATA_PATH = originalUserDataPath
+      process.env.BOTMUX_USER_DATA_PATH = originalUserDataPath
     }
     if (originalPairingCode === undefined) {
-      delete process.env.ORCA_PAIRING_CODE
+      delete process.env.BOTMUX_PAIRING_CODE
     } else {
-      process.env.ORCA_PAIRING_CODE = originalPairingCode
+      process.env.BOTMUX_PAIRING_CODE = originalPairingCode
     }
     if (originalRemotePairing === undefined) {
-      delete process.env.ORCA_REMOTE_PAIRING
+      delete process.env.BOTMUX_REMOTE_PAIRING
     } else {
-      process.env.ORCA_REMOTE_PAIRING = originalRemotePairing
+      process.env.BOTMUX_REMOTE_PAIRING = originalRemotePairing
     }
     if (originalEnvironment === undefined) {
-      delete process.env.ORCA_ENVIRONMENT
+      delete process.env.BOTMUX_ENVIRONMENT
     } else {
-      process.env.ORCA_ENVIRONMENT = originalEnvironment
+      process.env.BOTMUX_ENVIRONMENT = originalEnvironment
     }
     if (originalWorkspaceId === undefined) {
-      delete process.env.ORCA_WORKSPACE_ID
+      delete process.env.BOTMUX_WORKSPACE_ID
     } else {
-      process.env.ORCA_WORKSPACE_ID = originalWorkspaceId
+      process.env.BOTMUX_WORKSPACE_ID = originalWorkspaceId
     }
     if (originalWorktreeId === undefined) {
-      delete process.env.ORCA_WORKTREE_ID
+      delete process.env.BOTMUX_WORKTREE_ID
     } else {
-      process.env.ORCA_WORKTREE_ID = originalWorktreeId
+      process.env.BOTMUX_WORKTREE_ID = originalWorktreeId
     }
   })
 
@@ -612,11 +612,11 @@ describe('orca_botmux cli worktree awareness', () => {
     expect(logSpy).toHaveBeenCalledTimes(1)
   })
 
-  it('resolves the invocation cwd from ORCA_CLI_CWD when no cwd is passed', async () => {
-    // Why: the SSH relay bridge runs the CLI on the OrcaBotmux host with the remote
-    // shell's cwd carried in ORCA_CLI_CWD (#7716); cwd-based selectors must
+  it('resolves the invocation cwd from BOTMUX_CLI_CWD when no cwd is passed', async () => {
+    // Why: the SSH relay bridge runs the CLI on the Botmux host with the remote
+    // shell's cwd carried in BOTMUX_CLI_CWD (#7716); cwd-based selectors must
     // resolve against it, not the host process cwd.
-    process.env.ORCA_CLI_CWD = '/tmp/repo/feature/src'
+    process.env.BOTMUX_CLI_CWD = '/tmp/repo/feature/src'
     try {
       queueFixtures(
         callMock,
@@ -640,23 +640,23 @@ describe('orca_botmux cli worktree awareness', () => {
         worktree: 'id:repo::/tmp/repo/feature'
       })
     } finally {
-      delete process.env.ORCA_CLI_CWD
+      delete process.env.BOTMUX_CLI_CWD
     }
   })
 
   it.skipIf(process.platform === 'win32')(
-    'prepares and starts Claude Agent Teams in the current OrcaBotmux terminal',
+    'prepares and starts Claude Agent Teams in the current Botmux terminal',
     async () => {
-      process.env.ORCA_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
+      process.env.BOTMUX_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
       queueFixtures(
         callMock,
         okFixture('req_agent_teams_prepare', {
           launch: {
             env: {
               CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-              TMUX: '/tmp/orca-botmux-claude-agent-teams/team-1,0,1',
+              TMUX: '/tmp/botmux-claude-agent-teams/team-1,0,1',
               TMUX_PANE: '%1',
-              PATH: '/tmp/orca-botmux-shim:/usr/bin'
+              PATH: '/tmp/botmux-shim:/usr/bin'
             }
           }
         })
@@ -667,7 +667,7 @@ describe('orca_botmux cli worktree awareness', () => {
       expect(callMock).toHaveBeenCalledWith('agentTeams.prepareLaunch', {
         paneKey: 'tab-1:11111111-1111-4111-8111-111111111111',
         env: expect.objectContaining({
-          ORCA_PANE_KEY: 'tab-1:11111111-1111-4111-8111-111111111111'
+          BOTMUX_PANE_KEY: 'tab-1:11111111-1111-4111-8111-111111111111'
         })
       })
       expect(spawnMock).toHaveBeenCalledWith('claude', ['--teammate-mode', 'auto'], {
@@ -683,16 +683,16 @@ describe('orca_botmux cli worktree awareness', () => {
   it.skipIf(process.platform === 'win32')(
     'passes Claude Agent Teams arguments through to Claude Code',
     async () => {
-      process.env.ORCA_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
+      process.env.BOTMUX_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
       queueFixtures(
         callMock,
         okFixture('req_agent_teams_prepare', {
           launch: {
             env: {
               CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-              TMUX: '/tmp/orca-botmux-claude-agent-teams/team-1,0,1',
+              TMUX: '/tmp/botmux-claude-agent-teams/team-1,0,1',
               TMUX_PANE: '%1',
-              PATH: '/tmp/orca-botmux-shim:/usr/bin'
+              PATH: '/tmp/botmux-shim:/usr/bin'
             }
           }
         })
@@ -720,16 +720,16 @@ describe('orca_botmux cli worktree awareness', () => {
   it.skipIf(process.platform === 'win32')(
     'does not duplicate an explicit Claude teammate mode',
     async () => {
-      process.env.ORCA_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
+      process.env.BOTMUX_PANE_KEY = 'tab-1:11111111-1111-4111-8111-111111111111'
       queueFixtures(
         callMock,
         okFixture('req_agent_teams_prepare', {
           launch: {
             env: {
               CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-              TMUX: '/tmp/orca-botmux-claude-agent-teams/team-1,0,1',
+              TMUX: '/tmp/botmux-claude-agent-teams/team-1,0,1',
               TMUX_PANE: '%1',
-              PATH: '/tmp/orca-botmux-shim:/usr/bin'
+              PATH: '/tmp/botmux-shim:/usr/bin'
             }
           }
         })
@@ -1327,11 +1327,11 @@ describe('orca_botmux cli worktree awareness', () => {
         setups: [
           {
             id: 'setup-local',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'local',
             repoId: 'repo-local',
-            path: '/tmp/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/tmp/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -1339,11 +1339,11 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: 'repo-gpu',
-            path: '/srv/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/srv/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -1352,7 +1352,7 @@ describe('orca_botmux cli worktree awareness', () => {
         ]
       }),
       okFixture('req_create', {
-        worktree: buildWorktree('/srv/orca_botmux/feature', 'feature', 'abc', 'repo-gpu'),
+        worktree: buildWorktree('/srv/botmux/feature', 'feature', 'abc', 'repo-gpu'),
         lineage: null,
         warnings: []
       })
@@ -1364,7 +1364,7 @@ describe('orca_botmux cli worktree awareness', () => {
         'worktree',
         'create',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--host',
         'runtime:gpu',
         '--name',
@@ -1397,11 +1397,11 @@ describe('orca_botmux cli worktree awareness', () => {
         setups: [
           {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: 'repo-gpu',
-            path: '/srv/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/srv/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -1410,7 +1410,7 @@ describe('orca_botmux cli worktree awareness', () => {
         ]
       }),
       okFixture('req_create', {
-        worktree: buildWorktree('/srv/orca_botmux/feature', 'feature', 'abc', 'repo-gpu'),
+        worktree: buildWorktree('/srv/botmux/feature', 'feature', 'abc', 'repo-gpu'),
         lineage: null,
         warnings: []
       })
@@ -1450,7 +1450,7 @@ describe('orca_botmux cli worktree awareness', () => {
         '--repo',
         'id:repo-local',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--name',
         'feature',
         '--json'
@@ -1643,7 +1643,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('passes folder workspace environment lineage through worktree.create', async () => {
-    process.env.ORCA_WORKSPACE_ID = 'folder:folder-1'
+    process.env.BOTMUX_WORKSPACE_ID = 'folder:folder-1'
     queueFixtures(
       callMock,
       worktreeListFixture([buildWorktree('/tmp/repo', 'main', 'abc', 'repo-1')]),
@@ -1976,7 +1976,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('passes caller terminal handle through worktree.create with cwd fallback', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_parent'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_parent'
     queueFixtures(
       callMock,
       worktreeListFixture([buildWorktree('/tmp/repo', 'main', 'abc', 'repo-1')]),
@@ -2011,15 +2011,15 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('starts a foreground headless server through `serve`', async () => {
-    serveOrcaAppMock.mockResolvedValue(0)
-    process.env.ORCA_ENVIRONMENT = 'stale-env'
+    serveBotmuxAppMock.mockResolvedValue(0)
+    process.env.BOTMUX_ENVIRONMENT = 'stale-env'
 
     await main(
       ['serve', '--json', '--port', '6768', '--pairing-address', '100.64.1.20', '--no-pairing'],
       '/tmp/repo'
     )
 
-    expect(serveOrcaAppMock).toHaveBeenCalledWith({
+    expect(serveBotmuxAppMock).toHaveBeenCalledWith({
       json: true,
       port: '6768',
       pairingAddress: '100.64.1.20',
@@ -2031,14 +2031,14 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('starts a foreground headless server with mobile pairing enabled', async () => {
-    serveOrcaAppMock.mockResolvedValue(0)
+    serveBotmuxAppMock.mockResolvedValue(0)
 
     await main(
       ['serve', '--pairing-address', '100.64.1.20', '--mobile-pairing', '--json'],
       '/tmp/repo'
     )
 
-    expect(serveOrcaAppMock).toHaveBeenCalledWith({
+    expect(serveBotmuxAppMock).toHaveBeenCalledWith({
       json: true,
       port: null,
       pairingAddress: '100.64.1.20',
@@ -2050,7 +2050,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('starts a recipe JSON headless server for VM recipes', async () => {
-    serveOrcaAppMock.mockResolvedValue(0)
+    serveBotmuxAppMock.mockResolvedValue(0)
 
     await main(
       [
@@ -2064,7 +2064,7 @@ describe('orca_botmux cli worktree awareness', () => {
       '/tmp/repo'
     )
 
-    expect(serveOrcaAppMock).toHaveBeenCalledWith({
+    expect(serveBotmuxAppMock).toHaveBeenCalledWith({
       json: false,
       port: null,
       pairingAddress: 'wss://sandbox.example.com',
@@ -2076,23 +2076,23 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('runs vm recipe doctor locally without contacting the app runtime', async () => {
-    const repoPath = mkdtempSync(path.join(tmpdir(), 'orca-botmux-vm-doctor-'))
+    const repoPath = mkdtempSync(path.join(tmpdir(), 'botmux-vm-doctor-'))
     try {
-      mkdirSync(path.join(repoPath, 'scripts', 'orca-botmux-vm'), { recursive: true })
-      const startScript = path.join(repoPath, 'scripts', 'orca-botmux-vm', 'start.sh')
-      const cleanupScript = path.join(repoPath, 'scripts', 'orca-botmux-vm', 'cleanup.sh')
+      mkdirSync(path.join(repoPath, 'scripts', 'botmux-vm'), { recursive: true })
+      const startScript = path.join(repoPath, 'scripts', 'botmux-vm', 'start.sh')
+      const cleanupScript = path.join(repoPath, 'scripts', 'botmux-vm', 'cleanup.sh')
       writeFileSync(startScript, '#!/bin/sh\n')
       writeFileSync(cleanupScript, '#!/bin/sh\n')
       chmodSync(startScript, 0o755)
       chmodSync(cleanupScript, 0o755)
       writeFileSync(
-        path.join(repoPath, 'orca_botmux.yaml'),
+        path.join(repoPath, 'botmux.yaml'),
         [
           'environmentRecipes:',
           '  - id: cloud-sandbox',
           '    name: Cloud Sandbox',
-          '    create: ./scripts/orca-botmux-vm/start.sh',
-          '    destroy: ./scripts/orca-botmux-vm/cleanup.sh'
+          '    create: ./scripts/botmux-vm/start.sh',
+          '    destroy: ./scripts/botmux-vm/cleanup.sh'
         ].join('\n')
       )
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
@@ -2109,7 +2109,7 @@ describe('orca_botmux cli worktree awareness', () => {
       expect(output.ok).toBe(true)
       expect(output.checks).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ id: 'orca_botmux_yaml.parse', status: 'pass' }),
+          expect.objectContaining({ id: 'botmux_yaml.parse', status: 'pass' }),
           expect.objectContaining({ id: 'recipe.exists', status: 'pass' }),
           expect.objectContaining({ id: 'recipe.create', status: 'pass' }),
           expect.objectContaining({ id: 'recipe.destroy', status: 'pass' })
@@ -2122,17 +2122,17 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('warns when vm recipe doctor finds no cleanup hook', async () => {
-    const repoPath = mkdtempSync(path.join(tmpdir(), 'orca-botmux-vm-doctor-'))
+    const repoPath = mkdtempSync(path.join(tmpdir(), 'botmux-vm-doctor-'))
     try {
-      mkdirSync(path.join(repoPath, 'scripts', 'orca-botmux-vm'), { recursive: true })
-      writeFileSync(path.join(repoPath, 'scripts', 'orca-botmux-vm', 'start.sh'), '#!/bin/sh\n')
+      mkdirSync(path.join(repoPath, 'scripts', 'botmux-vm'), { recursive: true })
+      writeFileSync(path.join(repoPath, 'scripts', 'botmux-vm', 'start.sh'), '#!/bin/sh\n')
       writeFileSync(
-        path.join(repoPath, 'orca_botmux.yaml'),
+        path.join(repoPath, 'botmux.yaml'),
         [
           'environmentRecipes:',
           '  - id: manual-sandbox',
           '    name: Manual Sandbox',
-          '    create: ./scripts/orca-botmux-vm/start.sh'
+          '    create: ./scripts/botmux-vm/start.sh'
         ].join('\n')
       )
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
@@ -2160,7 +2160,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('runs vm recipe doctor provision mode and invokes cleanup', async () => {
-    const repoPath = mkdtempSync(path.join(tmpdir(), 'orca-botmux-vm-doctor-provision-'))
+    const repoPath = mkdtempSync(path.join(tmpdir(), 'botmux-vm-doctor-provision-'))
     const pairingCode = encodePairingOffer({
       v: PAIRING_OFFER_VERSION,
       endpoint: 'ws://sandbox.example.com:6767',
@@ -2168,9 +2168,9 @@ describe('orca_botmux cli worktree awareness', () => {
       publicKeyB64: 'public-key'
     })
     try {
-      mkdirSync(path.join(repoPath, 'scripts', 'orca-botmux-vm'), { recursive: true })
+      mkdirSync(path.join(repoPath, 'scripts', 'botmux-vm'), { recursive: true })
       writeFileSync(
-        path.join(repoPath, 'scripts', 'orca-botmux-vm', 'start.js'),
+        path.join(repoPath, 'scripts', 'botmux-vm', 'start.js'),
         [
           'console.log(JSON.stringify({',
           '  schemaVersion: 1,',
@@ -2180,7 +2180,7 @@ describe('orca_botmux cli worktree awareness', () => {
         ].join('\n')
       )
       writeFileSync(
-        path.join(repoPath, 'scripts', 'orca-botmux-vm', 'cleanup.js'),
+        path.join(repoPath, 'scripts', 'botmux-vm', 'cleanup.js'),
         [
           "const fs = require('fs')",
           "const input = fs.readFileSync(0, 'utf8')",
@@ -2189,13 +2189,13 @@ describe('orca_botmux cli worktree awareness', () => {
         ].join('\n')
       )
       writeFileSync(
-        path.join(repoPath, 'orca_botmux.yaml'),
+        path.join(repoPath, 'botmux.yaml'),
         [
           'environmentRecipes:',
           '  - id: cloud-sandbox',
           '    name: Cloud Sandbox',
-          `    create: ${JSON.stringify(`${process.execPath} ./scripts/orca-botmux-vm/start.js`)}`,
-          `    destroy: ${JSON.stringify(`${process.execPath} ./scripts/orca-botmux-vm/cleanup.js`)}`
+          `    create: ${JSON.stringify(`${process.execPath} ./scripts/botmux-vm/start.js`)}`,
+          `    destroy: ${JSON.stringify(`${process.execPath} ./scripts/botmux-vm/cleanup.js`)}`
         ].join('\n')
       )
       const { EventEmitter } = await import('node:events')
@@ -2283,17 +2283,17 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('returns the full create transcript when provision fails so the agent can self-diagnose', async () => {
-    const repoPath = mkdtempSync(path.join(tmpdir(), 'orca-botmux-vm-doctor-provision-fail-'))
+    const repoPath = mkdtempSync(path.join(tmpdir(), 'botmux-vm-doctor-provision-fail-'))
     try {
-      mkdirSync(path.join(repoPath, 'scripts', 'orca-botmux-vm'), { recursive: true })
-      writeFileSync(path.join(repoPath, 'scripts', 'orca-botmux-vm', 'start.js'), 'process.exit(0)')
+      mkdirSync(path.join(repoPath, 'scripts', 'botmux-vm'), { recursive: true })
+      writeFileSync(path.join(repoPath, 'scripts', 'botmux-vm', 'start.js'), 'process.exit(0)')
       writeFileSync(
-        path.join(repoPath, 'orca_botmux.yaml'),
+        path.join(repoPath, 'botmux.yaml'),
         [
           'environmentRecipes:',
           '  - id: cloud-sandbox',
           '    name: Cloud Sandbox',
-          `    create: ${JSON.stringify(`${process.execPath} ./scripts/orca-botmux-vm/start.js`)}`,
+          `    create: ${JSON.stringify(`${process.execPath} ./scripts/botmux-vm/start.js`)}`,
           '    destroy: none'
         ].join('\n')
       )
@@ -2363,7 +2363,7 @@ describe('orca_botmux cli worktree awareness', () => {
 
     await main(['serve', '--recipe-json'], '/tmp/repo')
 
-    expect(serveOrcaAppMock).not.toHaveBeenCalled()
+    expect(serveBotmuxAppMock).not.toHaveBeenCalled()
     expect([...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n')).toContain(
       'Recipe JSON output requires --project-root.'
     )
@@ -2382,7 +2382,7 @@ describe('orca_botmux cli worktree awareness', () => {
       '/tmp/repo'
     )
 
-    expect(serveOrcaAppMock).not.toHaveBeenCalled()
+    expect(serveBotmuxAppMock).not.toHaveBeenCalled()
     expect([...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n')).toContain(
       'Recipe JSON output requires runtime pairing; remove --mobile-pairing.'
     )
@@ -2398,7 +2398,7 @@ describe('orca_botmux cli worktree awareness', () => {
 
     await main(['serve', '--mobile-pairing', '--no-pairing', '--json'], '/tmp/repo')
 
-    expect(serveOrcaAppMock).not.toHaveBeenCalled()
+    expect(serveBotmuxAppMock).not.toHaveBeenCalled()
     expect([...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n')).toContain(
       'Use either --mobile-pairing or --no-pairing, not both.'
     )
@@ -2414,7 +2414,7 @@ describe('orca_botmux cli worktree awareness', () => {
 
     await main(['serve', '--port', 'not-a-port', '--json'], '/tmp/repo')
 
-    expect(serveOrcaAppMock).not.toHaveBeenCalled()
+    expect(serveBotmuxAppMock).not.toHaveBeenCalled()
     expect([...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n')).toContain(
       'Invalid --port value: not-a-port'
     )
@@ -2430,7 +2430,7 @@ describe('orca_botmux cli worktree awareness', () => {
 
     await main(['serve', '--port', '--json'], '/tmp/repo')
 
-    expect(serveOrcaAppMock).not.toHaveBeenCalled()
+    expect(serveBotmuxAppMock).not.toHaveBeenCalled()
     expect([...logSpy.mock.calls, ...errSpy.mock.calls].flat().join('\n')).toContain(
       'Missing value for --port.'
     )
@@ -2439,31 +2439,31 @@ describe('orca_botmux cli worktree awareness', () => {
     process.exitCode = priorExitCode
   })
 
-  it('lists saved environments even when ORCA_ENVIRONMENT is set', async () => {
-    process.env.ORCA_ENVIRONMENT = 'stale-env'
+  it('lists saved environments even when BOTMUX_ENVIRONMENT is set', async () => {
+    process.env.BOTMUX_ENVIRONMENT = 'stale-env'
     listEnvironmentsMock.mockReturnValue([addEnvironmentFromPairingCodeMock()])
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     await main(['environment', 'list', '--json'], '/tmp/repo')
 
-    expect(listEnvironmentsMock).toHaveBeenCalledWith('/tmp/orca-botmux-user-data')
+    expect(listEnvironmentsMock).toHaveBeenCalledWith('/tmp/botmux-user-data')
     expect(callMock).not.toHaveBeenCalled()
     expect(logSpy.mock.calls[0]?.[0]).not.toContain('token')
     expect(logSpy.mock.calls[0]?.[0]).not.toContain('publicKeyB64')
   })
 
-  it('adds saved environments even when ORCA_ENVIRONMENT is set', async () => {
-    process.env.ORCA_ENVIRONMENT = 'stale-env'
+  it('adds saved environments even when BOTMUX_ENVIRONMENT is set', async () => {
+    process.env.BOTMUX_ENVIRONMENT = 'stale-env'
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     await main(
-      ['environment', 'add', '--name', 'desk', '--pairing-code', 'orca_botmux://pair#abc', '--json'],
+      ['environment', 'add', '--name', 'desk', '--pairing-code', 'botmux://pair#abc', '--json'],
       '/tmp/repo'
     )
 
-    expect(addEnvironmentFromPairingCodeMock).toHaveBeenCalledWith('/tmp/orca-botmux-user-data', {
+    expect(addEnvironmentFromPairingCodeMock).toHaveBeenCalledWith('/tmp/botmux-user-data', {
       name: 'desk',
-      pairingCode: 'orca_botmux://pair#abc'
+      pairingCode: 'botmux://pair#abc'
     })
     expect(callMock).not.toHaveBeenCalled()
     expect(logSpy.mock.calls[0]?.[0]).not.toContain('token')
@@ -2496,13 +2496,13 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_project_list', {
         projects: [
           {
-            id: 'github:stablyai/orca_botmux',
-            displayName: 'orca_botmux',
+            id: 'github:stablyai/botmux',
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             providerIdentity: {
               provider: 'github',
               owner: 'stablyai',
-              repo: 'orca_botmux'
+              repo: 'botmux'
             },
             sourceRepoIds: ['repo-1'],
             createdAt: 1,
@@ -2525,11 +2525,11 @@ describe('orca_botmux cli worktree awareness', () => {
         setups: [
           {
             id: 'setup-local',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'local',
             repoId: 'repo-local',
-            path: '/tmp/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/tmp/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -2537,11 +2537,11 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           {
             id: 'setup-remote',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: 'repo-remote',
-            path: '/srv/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/srv/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -2553,7 +2553,7 @@ describe('orca_botmux cli worktree awareness', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
 
     await main(
-      ['project', 'setups', '--project', 'github:stablyai/orca_botmux', '--host', 'runtime:gpu'],
+      ['project', 'setups', '--project', 'github:stablyai/botmux', '--host', 'runtime:gpu'],
       '/tmp/repo'
     )
 
@@ -2568,8 +2568,8 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_project_setup', {
         result: {
           project: {
-            id: 'github:stablyai/orca_botmux',
-            displayName: 'orca_botmux',
+            id: 'github:stablyai/botmux',
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             sourceRepoIds: ['repo-1'],
             createdAt: 1,
@@ -2577,11 +2577,11 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           setup: {
             id: 'setup-local',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'local',
             repoId: 'repo-1',
-            path: path.resolve('/tmp/orca_botmux'),
-            displayName: 'orca_botmux',
+            path: path.resolve('/tmp/botmux'),
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'imported-existing-folder',
             createdAt: 1,
@@ -2589,8 +2589,8 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           repo: {
             id: 'repo-1',
-            path: path.resolve('/tmp/orca_botmux'),
-            displayName: 'orca_botmux',
+            path: path.resolve('/tmp/botmux'),
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             addedAt: 1
           }
@@ -2604,7 +2604,7 @@ describe('orca_botmux cli worktree awareness', () => {
         'project',
         'setup-existing-folder',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--host',
         'local',
         '--path',
@@ -2612,18 +2612,18 @@ describe('orca_botmux cli worktree awareness', () => {
         '--kind',
         'git',
         '--display-name',
-        'orca_botmux',
+        'botmux',
         '--json'
       ],
-      '/tmp/orca_botmux/worktrees/feature'
+      '/tmp/botmux/worktrees/feature'
     )
 
     expect(callMock).toHaveBeenCalledWith('projectHostSetup.setupExistingFolder', {
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'local',
-      path: path.resolve('/tmp/orca_botmux/worktrees'),
+      path: path.resolve('/tmp/botmux/worktrees'),
       kind: 'git',
-      displayName: 'orca_botmux'
+      displayName: 'botmux'
     })
   })
 
@@ -2637,11 +2637,11 @@ describe('orca_botmux cli worktree awareness', () => {
         'project',
         'setup-existing-folder',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--host',
         'runtime:gpu',
         '--path',
-        './orca_botmux',
+        './botmux',
         '--pairing-code',
         'remote-runtime',
         '--json'
@@ -2683,7 +2683,7 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_repo_add', {
         repo: {
           id: 'repo-1',
-          path: '/srv/orca_botmux/web',
+          path: '/srv/botmux/web',
           displayName: 'web'
         }
       })
@@ -2691,12 +2691,12 @@ describe('orca_botmux cli worktree awareness', () => {
     vi.spyOn(console, 'log').mockImplementation(() => {})
 
     await main(
-      ['repo', 'add', '--path', '/srv/orca_botmux/web', '--pairing-code', 'remote-runtime', '--json'],
+      ['repo', 'add', '--path', '/srv/botmux/web', '--pairing-code', 'remote-runtime', '--json'],
       '/tmp/repo'
     )
 
     expect(callMock).toHaveBeenCalledWith('repo.add', {
-      path: '/srv/orca_botmux/web'
+      path: '/srv/botmux/web'
     })
   })
 
@@ -3403,7 +3403,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('formats group orchestration sends in text mode', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_sender'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_sender'
     callMock.mockResolvedValueOnce({
       id: 'req_send',
       ok: true,
@@ -3482,7 +3482,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('rejects unknown task-update status with an enum-aware error', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_coord'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_coord'
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const priorExitCode = process.exitCode
@@ -3507,7 +3507,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('passes the caller terminal handle through orchestration task-create', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_creator'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_creator'
     callMock.mockResolvedValueOnce({
       id: 'req_task_create',
       ok: true,
@@ -3545,8 +3545,8 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('passes dev mode to injected orchestration dispatches', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_sender'
-    process.env.ORCA_USER_DATA_PATH = '/tmp/orca-botmux-desktop-dev'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_sender'
+    process.env.BOTMUX_USER_DATA_PATH = '/tmp/botmux-desktop-dev'
     callMock.mockResolvedValueOnce({
       id: 'req_dispatch',
       ok: true,
@@ -3614,7 +3614,7 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_terminal_create', {
         terminal: {
           handle: 'term_1',
-          worktreeId: 'repo-1::/srv/orca_botmux/feature',
+          worktreeId: 'repo-1::/srv/botmux/feature',
           title: 'Server terminal'
         }
       })
@@ -3626,7 +3626,7 @@ describe('orca_botmux cli worktree awareness', () => {
         'terminal',
         'create',
         '--worktree',
-        'id:repo-1::/srv/orca_botmux/feature',
+        'id:repo-1::/srv/botmux/feature',
         '--pairing-code',
         'remote-runtime',
         '--json'
@@ -3635,7 +3635,7 @@ describe('orca_botmux cli worktree awareness', () => {
     )
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
-      worktree: 'id:repo-1::/srv/orca_botmux/feature',
+      worktree: 'id:repo-1::/srv/botmux/feature',
       command: undefined,
       title: undefined,
       focus: false
@@ -3659,7 +3659,7 @@ describe('orca_botmux cli worktree awareness', () => {
             worktreeId: 'repo::/tmp/repo/feature',
             worktreeName: 'feature',
             repoId: 'repo',
-            repoName: 'orca_botmux',
+            repoName: 'botmux',
             cpu: 2.5,
             memory: 1024 * 1024,
             sessions: [
@@ -3699,7 +3699,7 @@ describe('orca_botmux cli worktree awareness', () => {
   })
 
   it('exits nonzero when terminal wait returns an unsatisfied blocked result', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_worker'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_worker'
     callMock.mockResolvedValueOnce({
       id: 'req_terminal_wait',
       ok: true,
@@ -3745,7 +3745,7 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_terminal_create', {
         terminal: {
           handle: 'term_1',
-          worktreeId: 'repo-1::/srv/orca_botmux/feature',
+          worktreeId: 'repo-1::/srv/botmux/feature',
           title: 'Codex'
         }
       })
@@ -3757,7 +3757,7 @@ describe('orca_botmux cli worktree awareness', () => {
         'terminal',
         'create',
         '--worktree',
-        'id:repo-1::/srv/orca_botmux/feature',
+        'id:repo-1::/srv/botmux/feature',
         '--command',
         'codex',
         '--title',
@@ -3770,7 +3770,7 @@ describe('orca_botmux cli worktree awareness', () => {
     )
 
     expect(callMock).toHaveBeenCalledWith('terminal.create', {
-      worktree: 'id:repo-1::/srv/orca_botmux/feature',
+      worktree: 'id:repo-1::/srv/botmux/feature',
       command: 'codex',
       title: 'Codex',
       focus: false
@@ -3787,7 +3787,7 @@ describe('orca_botmux cli worktree awareness', () => {
           url: 'https://example.com',
           title: 'Example',
           active: true,
-          worktreeId: 'repo-1::/srv/orca_botmux/feature'
+          worktreeId: 'repo-1::/srv/botmux/feature'
         }
       })
     )
@@ -3961,11 +3961,11 @@ describe('orca_botmux cli worktree awareness', () => {
         setups: [
           {
             id: 'setup-local',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'local',
             repoId: 'repo-local',
-            path: '/tmp/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/tmp/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -3973,11 +3973,11 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: 'repo-gpu',
-            path: '/srv/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/srv/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -4004,7 +4004,7 @@ describe('orca_botmux cli worktree awareness', () => {
         '--provider',
         'codex',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--host',
         'runtime:gpu',
         '--json'
@@ -4020,11 +4020,11 @@ describe('orca_botmux cli worktree awareness', () => {
         repo: 'id:repo-gpu',
         runContext: {
           kind: 'workspace-run',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'runtime:gpu',
           projectHostSetupId: 'setup-gpu',
           repoId: 'repo-gpu',
-          path: '/srv/orca_botmux'
+          path: '/srv/botmux'
         },
         workspace: undefined,
         workspaceMode: 'new_per_run'
@@ -4039,11 +4039,11 @@ describe('orca_botmux cli worktree awareness', () => {
         setups: [
           {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: 'repo-gpu',
-            path: '/srv/orca_botmux',
-            displayName: 'orca_botmux',
+            path: '/srv/botmux',
+            displayName: 'botmux',
             setupState: 'ready',
             setupMethod: 'legacy-repo',
             createdAt: 1,
@@ -4072,11 +4072,11 @@ describe('orca_botmux cli worktree awareness', () => {
           repo: 'id:repo-gpu',
           runContext: {
             kind: 'workspace-run',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             projectHostSetupId: 'setup-gpu',
             repoId: 'repo-gpu',
-            path: '/srv/orca_botmux'
+            path: '/srv/botmux'
           }
         })
       })
@@ -4087,11 +4087,11 @@ describe('orca_botmux cli worktree awareness', () => {
     const sourceContext = {
       kind: 'task-source',
       provider: 'github',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu',
       projectHostSetupId: 'setup-gpu',
       repoId: 'repo-gpu',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' },
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' },
       accountLabel: 'gpu-bot'
     }
     queueFixtures(
@@ -4670,8 +4670,8 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_project_setup_update', {
         result: {
           project: {
-            id: 'github:stablyai/orca_botmux',
-            displayName: 'orca_botmux',
+            id: 'github:stablyai/botmux',
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             sourceRepoIds: [],
             createdAt: 1,
@@ -4679,10 +4679,10 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           setup: {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: '',
-            path: '/srv/orca_botmux',
+            path: '/srv/botmux',
             displayName: 'GPU VM',
             setupState: 'ready',
             setupMethod: 'imported-existing-folder',
@@ -4703,7 +4703,7 @@ describe('orca_botmux cli worktree awareness', () => {
         '--display-name',
         'GPU VM',
         '--path',
-        '/srv/orca_botmux',
+        '/srv/botmux',
         '--worktree-base-path',
         '../worktrees',
         '--state',
@@ -4719,7 +4719,7 @@ describe('orca_botmux cli worktree awareness', () => {
       setupId: 'setup-gpu',
       updates: {
         displayName: 'GPU VM',
-        path: path.resolve('/tmp/repo', '/srv/orca_botmux'),
+        path: path.resolve('/tmp/repo', '/srv/botmux'),
         worktreeBasePath: '../worktrees',
         gitUsername: undefined,
         kind: undefined,
@@ -4735,8 +4735,8 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_project_setup_create', {
         result: {
           project: {
-            id: 'github:stablyai/orca_botmux',
-            displayName: 'orca_botmux',
+            id: 'github:stablyai/botmux',
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             sourceRepoIds: [],
             createdAt: 1,
@@ -4744,7 +4744,7 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           setup: {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: '',
             path: '',
@@ -4764,7 +4764,7 @@ describe('orca_botmux cli worktree awareness', () => {
         'project',
         'setup-create',
         '--project',
-        'github:stablyai/orca_botmux',
+        'github:stablyai/botmux',
         '--host',
         'runtime:gpu',
         '--setup-id',
@@ -4781,7 +4781,7 @@ describe('orca_botmux cli worktree awareness', () => {
     )
 
     expect(callMock).toHaveBeenCalledWith('projectHostSetup.create', {
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu',
       setupId: 'setup-gpu',
       path: undefined,
@@ -4800,8 +4800,8 @@ describe('orca_botmux cli worktree awareness', () => {
       okFixture('req_project_setup_delete', {
         result: {
           project: {
-            id: 'github:stablyai/orca_botmux',
-            displayName: 'orca_botmux',
+            id: 'github:stablyai/botmux',
+            displayName: 'botmux',
             badgeColor: '#7c3aed',
             sourceRepoIds: [],
             createdAt: 1,
@@ -4809,10 +4809,10 @@ describe('orca_botmux cli worktree awareness', () => {
           },
           setup: {
             id: 'setup-gpu',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:gpu',
             repoId: '',
-            path: '/srv/orca_botmux',
+            path: '/srv/botmux',
             displayName: 'GPU VM',
             setupState: 'ready',
             setupMethod: 'imported-existing-folder',

@@ -7,7 +7,7 @@ import type { Row } from './worktree-list-groups'
 const repo: Repo = {
   id: 'repo-1',
   path: '/repo',
-  displayName: 'orca_botmux',
+  displayName: 'botmux',
   badgeColor: '#000',
   addedAt: 1
 }
@@ -91,7 +91,7 @@ describe('getStickyHeaderIndexes', () => {
       projectGroupId: projectGroup.id,
       projectGroupOrder: 0
     }
-    const ungroupedRepo: Repo = { ...repo, id: 'repo-orca_botmux', displayName: 'orca_botmux' }
+    const ungroupedRepo: Repo = { ...repo, id: 'repo-botmux', displayName: 'botmux' }
     const groupedWorktree: Worktree = {
       ...makeWorktree('main'),
       id: 'wt-autogenie-main',
@@ -100,7 +100,7 @@ describe('getStickyHeaderIndexes', () => {
     }
     const ungroupedWorktree: Worktree = {
       ...makeWorktree('main'),
-      id: 'wt-orca-botmux-main',
+      id: 'wt-botmux-main',
       repoId: ungroupedRepo.id,
       isMainWorktree: true
     }
@@ -129,7 +129,7 @@ describe('getStickyHeaderIndexes', () => {
     expect(rows.filter((row) => row.type === 'header').map((row) => row.key)).toEqual([
       'project-group:group-personal',
       'repo:repo-autogenie',
-      'repo:repo-orca_botmux'
+      'repo:repo-botmux'
     ])
     expect(getStickyHeaderIndexes(rows)).toEqual([0, 3])
   })

@@ -225,7 +225,7 @@ export const getStatusBarToggles = createLocalizedCatalog(
       ],
       toggleDescription: translate(
         'settings.appearance.statusBar.sshToggleDescription',
-        'Show configured SSH and remote OrcaBotmux hosts when any are available.'
+        'Show configured SSH and remote Botmux hosts when any are available.'
       )
     },
     {

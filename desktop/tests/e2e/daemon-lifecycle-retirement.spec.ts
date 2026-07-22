@@ -141,7 +141,7 @@ async function stopFixture(fixture: FixtureDaemon): Promise<void> {
 }
 
 test('v22 stays reattachable while v24 retires after its last empty client disconnects', async () => {
-  const rootDir = mkdtempSync(path.join(tmpdir(), 'orca-botmux-daemon-lifecycle-'))
+  const rootDir = mkdtempSync(path.join(tmpdir(), 'botmux-daemon-lifecycle-'))
   const daemonDir = path.join(rootDir, 'daemon')
   mkdirSync(daemonDir, { recursive: true })
   const entryPath = path.join(rootDir, 'daemon-lifecycle-entry.cjs')

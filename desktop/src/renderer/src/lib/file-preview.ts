@@ -6,7 +6,7 @@ import { findSiblingGroupId } from '@/store/slices/tabs'
 
 export type PreviewableLanguage = 'html'
 export const REMOTE_FILE_BROWSER_UNSUPPORTED_MESSAGE =
-  'Open in OrcaBotmux Browser is only available for local files.'
+  'Open in Botmux Browser is only available for local files.'
 
 export type WorkspaceFileBrowserOpenTarget =
   | {
@@ -26,7 +26,7 @@ export function getWorkspaceFileBrowserOpenTarget(params: {
 }): WorkspaceFileBrowserOpenTarget {
   if (getConnectionId(params.worktreeId)) {
     // Why: Chromium resolves file:// URLs on the local machine. Remote files
-    // need an OrcaBotmux-served URL before the browser can render them correctly.
+    // need an Botmux-served URL before the browser can render them correctly.
     return {
       status: 'unsupported',
       reason: 'remote-worktree',

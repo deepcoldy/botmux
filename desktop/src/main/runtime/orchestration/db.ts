@@ -58,7 +58,7 @@ function addLifecycleRejectionMarker(payload: string | null, reason: string): st
   }
   return JSON.stringify({
     ...parsed,
-    _orcaLifecycleRejection: { code: 'sender_not_assignee', reason }
+    _botmuxLifecycleRejection: { code: 'sender_not_assignee', reason }
   })
 }
 
@@ -406,7 +406,7 @@ export class OrchestrationDb {
     }
 
     const originalBody = message.body ? `\n\nOriginal body:\n${message.body}` : ''
-    const body = `OrcaBotmux rejected this ${message.type}: ${reason}${originalBody}`
+    const body = `Botmux rejected this ${message.type}: ${reason}${originalBody}`
     const payload = addLifecycleRejectionMarker(message.payload, reason)
     // Why: rejected lifecycle signals must remain auditable without reaching
     // later read paths as actionable completion or liveness events.

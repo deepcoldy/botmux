@@ -35,7 +35,7 @@ const FEATURE_SETUP_ROWS: readonly FeatureSetupRow[] = [
         'Agents can navigate sites, inspect pages, and work through browser tasks.'
       )
     },
-    setupSummary: 'Enables browser use, prepares orca-botmux-cli, and leaves cookies for Settings.',
+    setupSummary: 'Enables browser use, prepares botmux-cli, and leaves cookies for Settings.',
     icon: <Globe2 className="size-4" />
   },
   {
@@ -52,7 +52,7 @@ const FEATURE_SETUP_ROWS: readonly FeatureSetupRow[] = [
         'Agents can inspect app windows and operate local apps when you ask.'
       )
     },
-    setupSummary: 'Registers the OrcaBotmux CLI, opens permissions, and prepares the skill.',
+    setupSummary: 'Registers the Botmux CLI, opens permissions, and prepares the skill.',
     icon: <MonitorCog className="size-4" />
   },
   {
@@ -69,7 +69,7 @@ const FEATURE_SETUP_ROWS: readonly FeatureSetupRow[] = [
         'Agents can message each other, take tasks, and coordinate handoffs.'
       )
     },
-    setupSummary: 'Registers the OrcaBotmux CLI, enables orchestration, and prepares the skill.',
+    setupSummary: 'Registers the Botmux CLI, enables orchestration, and prepares the skill.',
     icon: <Workflow className="size-4" />
   },
   {

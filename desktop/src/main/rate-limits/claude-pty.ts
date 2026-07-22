@@ -195,7 +195,7 @@ function describeClaudeUsageFailure(output: string): string {
     return 'Claude plan usage is unavailable for this Claude CLI session.'
   }
 
-  // Why: parser failures are an implementation detail of OrcaBotmux's PTY fallback.
+  // Why: parser failures are an implementation detail of Botmux's PTY fallback.
   // The UI should explain the user-visible outcome, not leak internal parsing
   // mechanics that the user cannot act on.
   return 'Claude usage is unavailable right now.'

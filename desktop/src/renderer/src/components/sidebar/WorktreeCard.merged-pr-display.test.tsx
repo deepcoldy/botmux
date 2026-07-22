@@ -73,16 +73,16 @@ vi.mock('./SshDisconnectedDialog', () => ({
 
 vi.mock('./WorktreeContextMenu', () => ({
   default: ({ children }: { children: ReactNode }) => <>{children}</>,
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca_botmux:test-close-context-menus',
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux:test-close-context-menus',
   WORKTREE_NATIVE_CONTEXT_MENU_ATTR: 'data-worktree-native-context-menu',
-  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-orca-botmux-context-menu-scope'
+  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-botmux-context-menu-scope'
 }))
 
 function makeRepo(): Repo {
   return {
     id: 'repo-1',
     path: '/repo',
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#999999',
     addedAt: 1
   }
@@ -116,7 +116,7 @@ function makePRInfo(overrides: Partial<PRInfo> = {}): PRInfo {
     number: 6340,
     title: 'Merged PR still checked out',
     state: 'merged',
-    url: 'https://github.com/acme/orca_botmux/pull/6340',
+    url: 'https://github.com/acme/botmux/pull/6340',
     checksStatus: 'success',
     updatedAt: '2026-05-17T00:00:00.000Z',
     mergeable: 'MERGEABLE',

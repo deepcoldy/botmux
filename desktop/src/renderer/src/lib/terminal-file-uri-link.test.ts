@@ -3,15 +3,15 @@ import { detectTerminalFileUriLinks } from './terminal-file-uri-link'
 
 describe('detectTerminalFileUriLinks', () => {
   it('decodes a localhost-less file URI to an absolute path', () => {
-    const line = 'Report: file:///Users/dev/orca_botmux/report.html'
+    const line = 'Report: file:///Users/dev/botmux/report.html'
     const [link] = detectTerminalFileUriLinks(line)
     expect(link).toMatchObject({
-      pathText: '/Users/dev/orca_botmux/report.html',
+      pathText: '/Users/dev/botmux/report.html',
       line: null,
       column: null
     })
-    expect(line.slice(link.startIndex, link.endIndex)).toBe('file:///Users/dev/orca_botmux/report.html')
-    expect(link.displayText).toBe('file:///Users/dev/orca_botmux/report.html')
+    expect(line.slice(link.startIndex, link.endIndex)).toBe('file:///Users/dev/botmux/report.html')
+    expect(link.displayText).toBe('file:///Users/dev/botmux/report.html')
   })
 
   it('percent-decodes spaces in the path', () => {

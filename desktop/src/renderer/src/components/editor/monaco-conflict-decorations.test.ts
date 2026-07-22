@@ -105,17 +105,17 @@ describe('buildGitConflictDecorations', () => {
     expect(decorations).toHaveLength(5)
     expect(decorations[0]).toMatchObject({
       range: { startLineNumber: 2, endLineNumber: 2 },
-      options: { className: 'orca-botmux-conflict-section-line orca-botmux-conflict-current-line' }
+      options: { className: 'botmux-conflict-section-line botmux-conflict-current-line' }
     })
     expect(decorations[1]).toMatchObject({
       range: { startLineNumber: 4, endLineNumber: 4 },
-      options: { className: 'orca-botmux-conflict-section-line orca-botmux-conflict-incoming-line' }
+      options: { className: 'botmux-conflict-section-line botmux-conflict-incoming-line' }
     })
     expect(decorations[2]).toMatchObject({
       range: { startLineNumber: 1, endLineNumber: 1 },
       options: {
-        className: 'orca-botmux-conflict-marker-line',
-        linesDecorationsClassName: 'orca-botmux-conflict-line-decoration',
+        className: 'botmux-conflict-marker-line',
+        linesDecorationsClassName: 'botmux-conflict-line-decoration',
         after: { content: ' Current change' }
       }
     })

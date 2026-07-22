@@ -114,10 +114,10 @@ export function AutomationEditorDialogHeader({
               size="sm"
               className="grid grid-cols-2"
             >
-              <ToggleGroupItem value="orca_botmux" className={modeToggleItemClassName}>
+              <ToggleGroupItem value="botmux" className={modeToggleItemClassName}>
                 {translate(
                   'auto.components.automations.AutomationEditorDialogHeader.6f309eef8d',
-                  'orca_botmux'
+                  'botmux'
                 )}
               </ToggleGroupItem>
               <ToggleGroupItem value="hermes" className={modeToggleItemClassName}>

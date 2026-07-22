@@ -13,7 +13,7 @@ describe('Bitbucket pull request mappers', () => {
     expect(mapBitbucketPullRequestState('SUPERSEDED')).toBe('closed')
   })
 
-  it('derives OrcaBotmux check status from Bitbucket build statuses', () => {
+  it('derives Botmux check status from Bitbucket build statuses', () => {
     expect(deriveBitbucketBuildStatus([])).toBe('neutral')
     expect(deriveBitbucketBuildStatus([{ state: 'SUCCESSFUL' }])).toBe('success')
     expect(deriveBitbucketBuildStatus([{ state: 'INPROGRESS' }])).toBe('pending')

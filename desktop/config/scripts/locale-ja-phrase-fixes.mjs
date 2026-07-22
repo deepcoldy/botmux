@@ -9,7 +9,7 @@ export const JA_PHRASE_FIXES = [
   { pattern: /会議/g, replacement: 'セッション', whenEnIncludes: 'session' },
   { pattern: /広報/g, replacement: 'PR', whenEnIncludes: 'PR' },
   { pattern: /端末/g, replacement: 'ターミナル', whenEnIncludes: 'erminal' },
-  { pattern: /シャチ:\/\//g, replacement: 'orca_botmux://', whenEnIncludes: 'orca_botmux://' },
+  { pattern: /シャチ:\/\//g, replacement: 'botmux://', whenEnIncludes: 'botmux://' },
   { pattern: /線形/g, replacement: 'Linear', whenEnIncludes: 'Linear' },
   { pattern: /グラフQL/g, replacement: 'GraphQL', whenEnIncludes: 'GraphQL' },
   { pattern: /不和/g, replacement: 'Discord', whenEnIncludes: 'Discord' },
@@ -17,7 +17,7 @@ export const JA_PHRASE_FIXES = [
   { pattern: /殺害/g, replacement: '終了中', whenEnIncludes: 'Killing' },
   { pattern: /殺す/g, replacement: '強制終了', whenEnIncludes: 'Kill' },
   { pattern: /皆殺し/g, replacement: 'すべて終了', whenEnIncludes: 'kill all' },
-  { pattern: /崩壊させる/g, replacement: '折りたたむ', whenEnIncludes: 'Collapse OrcaBotmux' },
+  { pattern: /崩壊させる/g, replacement: '折りたたむ', whenEnIncludes: 'Collapse Botmux' },
   { pattern: /崩壊/g, replacement: '折りたたむ', whenEnIncludes: 'Collapse' },
   { pattern: /一般的な/g, replacement: '一般', whenEnIncludes: 'General' },
   { pattern: /高度な/g, replacement: '詳細設定', whenEnIncludes: 'Advanced' },
@@ -55,7 +55,7 @@ export const JA_PHRASE_FIXES = [
     replacement: 'マージされています',
     whenEnIncludes: 'already merged'
   },
-  { pattern: /再起動します/g, replacement: '再起動', whenEnIncludes: 'Restart OrcaBotmux' },
+  { pattern: /再起動します/g, replacement: '再起動', whenEnIncludes: 'Restart Botmux' },
   { pattern: /オウムガイ/g, replacement: 'Nautilus', whenEnIncludes: 'Nautilus' },
   {
     pattern: /Kim サブスクリプション/g,

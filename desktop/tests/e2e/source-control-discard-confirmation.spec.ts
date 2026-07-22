@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import type { Locator, Page } from '@playwright/test'
 
@@ -33,7 +33,7 @@ async function seedUntrackedFile(page: Page): Promise<SeededUntrackedFile> {
     }
 
     const separator = worktree.path.includes('\\') ? '\\' : '/'
-    const fileName = `orca-botmux-discard-confirm-${Date.now()}.txt`
+    const fileName = `botmux-discard-confirm-${Date.now()}.txt`
     const relativePath = fileName
     await window.api.fs.writeFile({
       filePath: `${worktree.path}${separator}${relativePath}`,
@@ -91,31 +91,31 @@ async function confirmPendingDelete(page: Page): Promise<void> {
 }
 
 test.describe('Source Control discard confirmation', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('deletes an untracked file without confirmation', async ({ orcaBotmuxPage }) => {
-    const seededFile = await seedUntrackedFile(orcaBotmuxPage)
-    await openSourceControl(orcaBotmuxPage)
+  test('deletes an untracked file without confirmation', async ({ botmuxPage }) => {
+    const seededFile = await seedUntrackedFile(botmuxPage)
+    await openSourceControl(botmuxPage)
 
-    const row = orcaBotmuxPage
+    const row = botmuxPage
       .locator('[data-testid="source-control-entry"]')
       .filter({ hasText: seededFile.fileName })
     await expect(row).toBeVisible()
 
     await deleteUntrackedFileFromRow(row)
-    await confirmPendingDelete(orcaBotmuxPage)
+    await confirmPendingDelete(botmuxPage)
 
     await expect(
-      orcaBotmuxPage.getByRole('dialog', { name: `Delete "${seededFile.fileName}"?` })
+      botmuxPage.getByRole('dialog', { name: `Delete "${seededFile.fileName}"?` })
     ).toHaveCount(0)
     await expect(row).toHaveCount(0, { timeout: 10_000 })
 
-    await refreshGitStatus(orcaBotmuxPage)
+    await refreshGitStatus(botmuxPage)
     await expect(
-      orcaBotmuxPage.locator('[data-testid="source-control-entry"]').filter({
+      botmuxPage.locator('[data-testid="source-control-entry"]').filter({
         hasText: seededFile.fileName
       })
     ).toHaveCount(0)

@@ -115,7 +115,7 @@ describe('handleTerminalFileDrop', () => {
         {
           sourcePath: '/Users/me/logo.png',
           status: 'imported',
-          destPath: '/remote/repo/.orca_botmux/drops/logo.png',
+          destPath: '/remote/repo/.botmux/drops/logo.png',
           kind: 'file',
           renamed: false
         }
@@ -146,10 +146,10 @@ describe('handleTerminalFileDrop', () => {
         worktreePath: '/remote/repo'
       },
       ['/Users/me/logo.png'],
-      '/remote/repo/.orca_botmux/drops'
+      '/remote/repo/.botmux/drops'
     )
     expect(sendInput).toHaveBeenCalledWith(
-      wrapTerminalBracketedPasteText('/remote/repo/.orca_botmux/drops/logo.png')
+      wrapTerminalBracketedPasteText('/remote/repo/.botmux/drops/logo.png')
     )
     expect(focus).toHaveBeenCalled()
     expect(mocks.recordTerminalUserInputForLeaf).toHaveBeenCalledWith('tab-1', 'leaf-1')
@@ -166,7 +166,7 @@ describe('handleTerminalFileDrop', () => {
           {
             sourcePath: '/Users/me/logo.png',
             status: 'imported',
-            destPath: '/remote/repo/.orca_botmux/drops/logo.png',
+            destPath: '/remote/repo/.botmux/drops/logo.png',
             kind: 'file',
             renamed: false
           }
@@ -207,7 +207,7 @@ describe('handleTerminalFileDrop', () => {
         {
           sourcePath: '/Users/me/logo.png',
           status: 'imported',
-          destPath: '//server/share/repo\\.orca_botmux\\drops\\logo.png',
+          destPath: '//server/share/repo\\.botmux\\drops\\logo.png',
           kind: 'file',
           renamed: false
         }
@@ -238,10 +238,10 @@ describe('handleTerminalFileDrop', () => {
         worktreePath: '//server/share/repo'
       },
       ['/Users/me/logo.png'],
-      '\\\\server\\share\\repo\\.orca_botmux\\drops'
+      '\\\\server\\share\\repo\\.botmux\\drops'
     )
     expect(sendInput).toHaveBeenCalledWith(
-      wrapTerminalBracketedPasteText('\\\\server\\share\\repo\\.orca_botmux\\drops\\logo.png')
+      wrapTerminalBracketedPasteText('\\\\server\\share\\repo\\.botmux\\drops\\logo.png')
     )
   })
 
@@ -260,7 +260,7 @@ describe('handleTerminalFileDrop', () => {
         {
           sourcePath: '/Users/me/spec.pdf',
           status: 'imported',
-          destPath: '/remote/repo/.orca_botmux/drops/spec.pdf',
+          destPath: '/remote/repo/.botmux/drops/spec.pdf',
           kind: 'file',
           renamed: false
         }
@@ -291,9 +291,9 @@ describe('handleTerminalFileDrop', () => {
         worktreePath: '/remote/repo'
       },
       ['/Users/me/spec.pdf'],
-      '/remote/repo/.orca_botmux/drops'
+      '/remote/repo/.botmux/drops'
     )
-    expect(sendInput).toHaveBeenCalledWith('/remote/repo/.orca_botmux/drops/spec.pdf ')
+    expect(sendInput).toHaveBeenCalledWith('/remote/repo/.botmux/drops/spec.pdf ')
   })
 
   it('keeps explicit local worktree drops local while a runtime is focused', async () => {

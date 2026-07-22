@@ -1,5 +1,5 @@
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   cleanupDockerSshRelayTarget,
   DOCKER_SSH_RELAY_REMOTE_REPO_PATH,
@@ -10,14 +10,14 @@ import { connectDockerRemote } from './ssh-codex-reconnect-replay-driver'
 import { dockerExec, dockerWriteFile } from './ssh-codex-repro-remote-fixtures'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 
-const RUN_DOCKER_SSH = process.env.ORCA_E2E_SSH_DOCKER === '1'
+const RUN_DOCKER_SSH = process.env.BOTMUX_E2E_SSH_DOCKER === '1'
 
 test.describe('SSH Agent Session History', () => {
-  test.skip(!RUN_DOCKER_SSH, 'Set ORCA_E2E_SSH_DOCKER=1 to run Docker-backed SSH tests.')
+  test.skip(!RUN_DOCKER_SSH, 'Set BOTMUX_E2E_SSH_DOCKER=1 to run Docker-backed SSH tests.')
   test.skip(process.platform === 'win32', 'Docker SSH tests use POSIX ssh tooling.')
 
   test('shows remote session history only for the SSH host and resumes Codex on that worktree', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo: TestInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
@@ -40,12 +40,12 @@ test.describe('SSH Agent Session History', () => {
         claudeTitle
       })
 
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerRemote(orcaBotmuxPage, target)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerRemote(botmuxPage, target)
       const sshScope = `ssh:${encodeURIComponent(remote.targetId)}`
 
-      const scan = await orcaBotmuxPage.evaluate(
+      const scan = await botmuxPage.evaluate(
         async ({ sshScope, defaultTitle, runtimeTitle, claudeTitle }) => {
           const local = await window.api.aiVault.listSessions({
             executionHostScope: 'local',
@@ -85,39 +85,39 @@ test.describe('SSH Agent Session History', () => {
       expect(new Set(scan.remoteHostIds)).toEqual(new Set([sshScope]))
       expect(scan.remoteCommands.join('\n')).toContain("CODEX_HOME='/root/.codex'")
       expect(scan.remoteCommands.join('\n')).toContain(
-        "CODEX_HOME='/root/.local/share/orca_botmux/codex-runtime-home/home'"
+        "CODEX_HOME='/root/.local/share/botmux/codex-runtime-home/home'"
       )
 
-      const defaultSessionTitle = orcaBotmuxPage.getByText(defaultTitle, { exact: true })
-      const runtimeSessionTitle = orcaBotmuxPage.getByText(runtimeTitle, { exact: true })
+      const defaultSessionTitle = botmuxPage.getByText(defaultTitle, { exact: true })
+      const runtimeSessionTitle = botmuxPage.getByText(runtimeTitle, { exact: true })
 
-      await openAiVaultSidebar(orcaBotmuxPage)
+      await openAiVaultSidebar(botmuxPage)
       await expect(defaultSessionTitle.first()).toBeVisible({ timeout: 30_000 })
 
-      const hostButton = orcaBotmuxPage.getByRole('button', { name: /Session History host:/ })
+      const hostButton = botmuxPage.getByRole('button', { name: /Session History host:/ })
       await hostButton.click()
-      await orcaBotmuxPage.getByRole('menuitemradio', { name: /Local/ }).click()
+      await botmuxPage.getByRole('menuitemradio', { name: /Local/ }).click()
       await expect(defaultSessionTitle).toHaveCount(0, { timeout: 30_000 })
 
       await hostButton.click()
-      await orcaBotmuxPage.getByRole('menuitemradio', { name: 'All hosts' }).click()
+      await botmuxPage.getByRole('menuitemradio', { name: 'All hosts' }).click()
       await expect(runtimeSessionTitle.first()).toBeVisible({ timeout: 30_000 })
 
       await hostButton.click()
-      await orcaBotmuxPage
+      await botmuxPage
         .getByRole('menuitemradio')
         .filter({ hasNotText: /Local|All hosts/ })
         .click()
       await expect(defaultSessionTitle.first()).toBeVisible({ timeout: 30_000 })
 
-      await installStartupQueueProbe(orcaBotmuxPage)
+      await installStartupQueueProbe(botmuxPage)
       await defaultSessionTitle.first().click()
-      await orcaBotmuxPage.getByText('Resume in Worktree', { exact: true }).click()
+      await botmuxPage.getByText('Resume in Worktree', { exact: true }).click()
 
       await expect
-        .poll(() => readLastQueuedStartupCommand(orcaBotmuxPage), { timeout: 30_000 })
+        .poll(() => readLastQueuedStartupCommand(botmuxPage), { timeout: 30_000 })
         .toContain(`CODEX_HOME='/root/.codex' codex resume '${defaultSessionId}'`)
-      const queuedWorktreeId = await readLastQueuedStartupWorktreeId(orcaBotmuxPage)
+      const queuedWorktreeId = await readLastQueuedStartupWorktreeId(botmuxPage)
       expect(queuedWorktreeId).toBe(remote.worktreeId)
     } finally {
       cleanupDockerSshRelayTarget(target)
@@ -140,8 +140,8 @@ function seedRemoteAiVaultHistory(
     target,
     [
       'mkdir -p /root/.codex/sessions/2026/07/04',
-      'mkdir -p /root/.local/share/orca_botmux/codex-runtime-home/home/sessions/2026/07/04',
-      'mkdir -p /root/.claude/projects/orca_botmux'
+      'mkdir -p /root/.local/share/botmux/codex-runtime-home/home/sessions/2026/07/04',
+      'mkdir -p /root/.claude/projects/botmux'
     ].join(' && ')
   )
   dockerWriteFile(
@@ -163,7 +163,7 @@ function seedRemoteAiVaultHistory(
   )
   dockerWriteFile(
     target,
-    `/root/.local/share/orca_botmux/codex-runtime-home/home/sessions/2026/07/04/${args.runtimeSessionId}.jsonl`,
+    `/root/.local/share/botmux/codex-runtime-home/home/sessions/2026/07/04/${args.runtimeSessionId}.jsonl`,
     codexTranscript({
       sessionId: args.runtimeSessionId,
       title: args.runtimeTitle,
@@ -174,7 +174,7 @@ function seedRemoteAiVaultHistory(
   )
   dockerWriteFile(
     target,
-    `/root/.claude/projects/orca_botmux/${args.claudeSessionId}.jsonl`,
+    `/root/.claude/projects/botmux/${args.claudeSessionId}.jsonl`,
     claudeTranscript({
       sessionId: args.claudeSessionId,
       title: args.claudeTitle,

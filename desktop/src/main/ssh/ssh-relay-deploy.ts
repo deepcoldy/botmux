@@ -108,7 +108,7 @@ function execHostCommand(
  * 2. Check if correct relay version is already deployed
  * 3. If not, SCP the relay package
  * 4. Launch relay via exec channel
- * 5. Wait for ORCA-RELAY sentinel on stdout
+ * 5. Wait for BOTMUX-RELAY sentinel on stdout
  * 6. Return the transport (relay's stdin/stdout) for multiplexer use
  */
 export async function deployAndLaunchRelay(
@@ -308,7 +308,7 @@ async function deployAndLaunchRelayAttempt(
   const hostPlatform = await detectRemoteHostPlatform(conn, { signal: deploySignal })
   if (!hostPlatform) {
     throw new Error(
-      'Unsupported remote platform. OrcaBotmux relay supports: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64.'
+      'Unsupported remote platform. Botmux relay supports: linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64, win32-arm64.'
     )
   }
   const platform = hostPlatform.relayPlatform
@@ -318,7 +318,7 @@ async function deployAndLaunchRelayAttempt(
   if (!localRelayDir) {
     throw new Error(
       `Relay package for ${platform} not found locally. ` +
-        `This may be a packaging issue — try reinstalling OrcaBotmux.`
+        `This may be a packaging issue — try reinstalling Botmux.`
     )
   }
   // Why: read the content-hashed full version from the local build's .version
@@ -466,7 +466,7 @@ async function uploadRelay(
   if (!localRelayDir || !existsSync(localRelayDir)) {
     throw new Error(
       `Relay package for ${platform} not found. Searched: ${getLocalRelayCandidates(platform).join(', ')}. ` +
-        `This may be a packaging issue — try reinstalling OrcaBotmux.`
+        `This may be a packaging issue — try reinstalling Botmux.`
     )
   }
 
@@ -554,7 +554,7 @@ const RELAY_NATIVE_DEPS = {
 
 type RelayNativeDepName = keyof typeof RELAY_NATIVE_DEPS
 const RELAY_NATIVE_DEP_NAMES = Object.keys(RELAY_NATIVE_DEPS) as RelayNativeDepName[]
-const NATIVE_DEPS_MISSING_PREFIX = 'ORCA-NATIVE-DEPS-MISSING:'
+const NATIVE_DEPS_MISSING_PREFIX = 'BOTMUX-NATIVE-DEPS-MISSING:'
 
 // Why: npm 12 blocks dependency lifecycle scripts unless each exact package
 // version is approved, even when ignore-scripts is explicitly disabled.
@@ -589,7 +589,7 @@ async function probeRequiredNativeDeps(
   signal?: AbortSignal
 ): Promise<{ available: boolean; missing: RelayNativeDepName[] }> {
   const escapedNode = shellEscape(nodePath)
-  const probeJs = nativeDepsProbeJs('ORCA-NATIVE-DEPS-OK')
+  const probeJs = nativeDepsProbeJs('BOTMUX-NATIVE-DEPS-OK')
   try {
     const command = isWindowsRemoteHost(hostPlatform)
       ? commandWithNodePath(
@@ -605,7 +605,7 @@ async function probeRequiredNativeDeps(
           `(${escapedNode} -e ${shellEscape(probeJs)} 2>/dev/null || echo MISSING)`
         )
     const probe = await execHostCommand(conn, hostPlatform, command, { signal })
-    const available = probe.includes('ORCA-NATIVE-DEPS-OK')
+    const available = probe.includes('BOTMUX-NATIVE-DEPS-OK')
     return { available, missing: available ? [] : missingNativeDepsFromProbe(probe) }
   } catch {
     signal?.throwIfAborted()
@@ -758,7 +758,7 @@ async function installNativeDeps(
   // package.json. type:commonjs pins module resolution against Node default
   // flips or a remote ~/.npmrc setting type=module.
   const pkgJson = `${JSON.stringify({
-    name: 'orca-botmux-relay',
+    name: 'botmux-relay',
     version: '1.0.0',
     private: true,
     type: 'commonjs',
@@ -961,7 +961,7 @@ async function probeInstalledNativeDeps(
 }> {
   // require() catches unloadable installs (wrong arch, missing prebuild, or a
   // skipped lifecycle script) that require.resolve() and test -d both miss.
-  const PROBE_OK = 'ORCA-NPTY-PROBE-OK'
+  const PROBE_OK = 'BOTMUX-NPTY-PROBE-OK'
   const stderrFile = joinRemotePath(hostPlatform, remoteDir, '.npty-probe.stderr')
   const escapedStderr = shellEscape(stderrFile)
   const probeJs = nativeDepsProbeJs(PROBE_OK)
@@ -1012,8 +1012,8 @@ function getLocalRelayPath(platform: RelayPlatform): string | null {
 
 export function getLocalRelayCandidates(platform: RelayPlatform): string[] {
   const candidates: string[] = []
-  if (process.env.ORCA_RELAY_PATH) {
-    candidates.push(join(process.env.ORCA_RELAY_PATH, platform))
+  if (process.env.BOTMUX_RELAY_PATH) {
+    candidates.push(join(process.env.BOTMUX_RELAY_PATH, platform))
   }
 
   // Why: electron-builder copies extraResources next to the app bundle, while
@@ -1058,7 +1058,7 @@ async function launchRelay(
         )
   const escapedDir = shellEscape(remoteDir)
   const escapedNode = shellEscape(nodePath)
-  // Why: remoteRelayDir is shared by every OrcaBotmux target for the same remote
+  // Why: remoteRelayDir is shared by every Botmux target for the same remote
   // account. Hashing the target ID into the socket name prevents one target
   // from attaching to another target's live relay.
   const sockName = relaySocketNameForInstanceId(relayInstanceId)

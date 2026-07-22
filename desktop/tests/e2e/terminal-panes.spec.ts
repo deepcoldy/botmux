@@ -10,7 +10,7 @@
  */
 
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   UUID_RE,
   discoverActivePtyId,
@@ -246,16 +246,16 @@ async function readVisiblePaneContents(page: Page): Promise<string[]> {
 // does not try to open multiple visible Electron windows at once.
 test.describe.configure({ mode: 'serial' })
 test.describe('Terminal Panes', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
     // Why: each test launches a fresh Electron instance. The React tree needs
     // to render Terminal → TabGroupPanel → TerminalPane → useTerminalPaneLifecycle
     // before the PaneManager registers on window.__paneManagers. On cold starts
     // this easily exceeds 5s, so allow up to 30s (well within the 120s test budget)
     // to distinguish "slow cold start" from "environment can't mount panes at all."
-    const hasPaneManager = await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    const hasPaneManager = await waitForActiveTerminalManager(botmuxPage, 30_000)
       .then(() => true)
       .catch(() => false)
     test.skip(
@@ -266,20 +266,20 @@ test.describe('Terminal Panes', () => {
     // PaneManager finishes mounting the first xterm/PTY pair. Wait for that
     // initial pane so split and content-retention assertions start from a real
     // terminal surface instead of racing the bootstrapped mount.
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
   })
 
   /**
    * User Prompt:
    * - terminal panes can be split
    */
-  test('can split terminal pane right', async ({ orcaBotmuxPage }) => {
-    const paneCountBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
+  test('can split terminal pane right', async ({ botmuxPage }) => {
+    const paneCountBefore = await countVisibleTerminalPanes(botmuxPage)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, paneCountBefore + 1)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, paneCountBefore + 1)
 
-    const paneCountAfter = await countVisibleTerminalPanes(orcaBotmuxPage)
+    const paneCountAfter = await countVisibleTerminalPanes(botmuxPage)
     expect(paneCountAfter).toBe(paneCountBefore + 1)
   })
 
@@ -287,23 +287,23 @@ test.describe('Terminal Panes', () => {
    * User Prompt:
    * - terminal panes can be split
    */
-  test('can split terminal pane down', async ({ orcaBotmuxPage }) => {
-    const paneCountBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
+  test('can split terminal pane down', async ({ botmuxPage }) => {
+    const paneCountBefore = await countVisibleTerminalPanes(botmuxPage)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, paneCountBefore + 1)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, paneCountBefore + 1)
 
-    const paneCountAfter = await countVisibleTerminalPanes(orcaBotmuxPage)
+    const paneCountAfter = await countVisibleTerminalPanes(botmuxPage)
     expect(paneCountAfter).toBe(paneCountBefore + 1)
   })
 
-  test('split panes persist PTY bindings by stable UUID leaf id', async ({ orcaBotmuxPage }) => {
-    const paneCountBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
+  test('split panes persist PTY bindings by stable UUID leaf id', async ({ botmuxPage }) => {
+    const paneCountBefore = await countVisibleTerminalPanes(botmuxPage)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, paneCountBefore + 1)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, paneCountBefore + 1)
 
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, paneCountBefore + 1)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, paneCountBefore + 1)
     const leafIds = snapshot.panes.map((pane) => pane.leafId)
     const ptyIds = snapshot.panes.map((pane) => pane.ptyId)
 
@@ -319,53 +319,53 @@ test.describe('Terminal Panes', () => {
     ).toBe(false)
   })
 
-  test('terminal process receives ORCA_PANE_KEY with the active UUID leaf id', async ({
-    orcaBotmuxPage
+  test('terminal process receives BOTMUX_PANE_KEY with the active UUID leaf id', async ({
+    botmuxPage
   }) => {
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const activeLeafId = snapshot.activeLeafId ?? snapshot.panes[0]?.leafId
     if (!activeLeafId) {
       throw new Error('No active pane leaf id found')
     }
 
     const expectedPaneKey = `${snapshot.tabId}:${activeLeafId}`
-    const ptyId = await discoverActivePtyId(orcaBotmuxPage)
-    const marker = `ORCA_PANE_KEY_E2E_${Date.now()}`
+    const ptyId = await discoverActivePtyId(botmuxPage)
+    const marker = `BOTMUX_PANE_KEY_E2E_${Date.now()}`
 
-    await execInTerminal(orcaBotmuxPage, ptyId, `printf '${marker}=%s\\n' "$ORCA_PANE_KEY"`)
-    await waitForTerminalOutput(orcaBotmuxPage, `${marker}=${expectedPaneKey}`)
+    await execInTerminal(botmuxPage, ptyId, `printf '${marker}=%s\\n' "$BOTMUX_PANE_KEY"`)
+    await waitForTerminalOutput(botmuxPage, `${marker}=${expectedPaneKey}`)
 
     expect(activeLeafId).toMatch(UUID_RE)
   })
 
-  test('terminal context menu copies the stable pane ID', async ({ orcaBotmuxPage }) => {
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+  test('terminal context menu copies the stable pane ID', async ({ botmuxPage }) => {
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const leafId = snapshot.panes[0]?.leafId
     if (!leafId) {
       throw new Error('No terminal pane leaf id found')
     }
     const expectedPaneKey = `${snapshot.tabId}:${leafId}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Copy Pane ID', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Copy Pane ID', { exact: true }).click()
 
     await expect
-      .poll(() => orcaBotmuxPage.evaluate(() => window.api.ui.readClipboardText()), { timeout: 3_000 })
+      .poll(() => botmuxPage.evaluate(() => window.api.ui.readClipboardText()), { timeout: 3_000 })
       .toBe(expectedPaneKey)
-    await expect(orcaBotmuxPage.getByText('Pane ID copied', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Pane ID copied', { exact: true })).toBeVisible()
     expect(leafId).toMatch(UUID_RE)
   })
 
-  test('first Set Title from terminal context menu stays open for typing', async ({ orcaBotmuxPage }) => {
+  test('first Set Title from terminal context menu stays open for typing', async ({ botmuxPage }) => {
     const title = `First menu title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(250)
+    await botmuxPage.waitForTimeout(250)
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
 
@@ -373,100 +373,100 @@ test.describe('Terminal Panes', () => {
     await titleInput.press('Enter')
 
     await expect(titleInput).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
   })
 
-  test('Set Title editor renders in OrcaBotmux overlay while terminal reserves title space', async ({
-    orcaBotmuxPage
+  test('Set Title editor renders in Botmux overlay while terminal reserves title space', async ({
+    botmuxPage
   }) => {
     const title = `Reserved overlay title ${Date.now()}`
-    const terminalBoxBefore = await readVisibleXtermContainerBox(orcaBotmuxPage)
+    const terminalBoxBefore = await readVisibleXtermContainerBox(botmuxPage)
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-overlay-layer .pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-overlay-layer .pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await expect(orcaBotmuxPage.getByText('Set Title…', { exact: true })).toBeHidden()
-    await expect(orcaBotmuxPage.locator('.pane .pane-title-input')).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane[data-has-title]')).toHaveCount(1)
+    await expect(botmuxPage.getByText('Set Title…', { exact: true })).toBeHidden()
+    await expect(botmuxPage.locator('.pane .pane-title-input')).toHaveCount(0)
+    await expect(botmuxPage.locator('.pane[data-has-title]')).toHaveCount(1)
     await expect
       .poll(() =>
-        orcaBotmuxPage
+        botmuxPage
           .locator('.pane-title-bar')
           .first()
           .evaluate((titleBar) => getComputedStyle(titleBar).backgroundColor)
       )
       .not.toBe('rgba(0, 0, 0, 0)')
-    const terminalBoxEditing = await readVisibleXtermContainerBox(orcaBotmuxPage)
+    const terminalBoxEditing = await readVisibleXtermContainerBox(botmuxPage)
     expectTerminalToReserveTitleSpace(terminalBoxEditing, terminalBoxBefore)
 
     await titleInput.fill(title)
     await titleInput.press('Enter')
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
-    await expect(orcaBotmuxPage.locator('.pane[data-has-title]')).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
+    await expect(botmuxPage.locator('.pane[data-has-title]')).toHaveCount(1)
     expectTerminalToReserveTitleSpace(
-      await readVisibleXtermContainerBox(orcaBotmuxPage),
+      await readVisibleXtermContainerBox(botmuxPage),
       terminalBoxBefore
     )
   })
 
-  test('Set Title context menu opens from the title overlay strip', async ({ orcaBotmuxPage }) => {
+  test('Set Title context menu opens from the title overlay strip', async ({ botmuxPage }) => {
     const title = `Overlay menu title ${Date.now()}`
     const updatedTitle = `Overlay menu updated ${Date.now()}`
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    await openPaneTitleContextMenu(orcaBotmuxPage, title)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    await openPaneTitleContextMenu(botmuxPage, title)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
     await expect(titleInput).toHaveValue(title)
     await titleInput.fill(updatedTitle)
     await titleInput.press('Enter')
 
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: updatedTitle })).toHaveCount(1)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(0)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: updatedTitle })).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(0)
   })
 
-  test('Set Title strip activates its pane and accepts file-path drops', async ({ orcaBotmuxPage }) => {
+  test('Set Title strip activates its pane and accepts file-path drops', async ({ botmuxPage }) => {
     const title = `Drop target title ${Date.now()}`
     const droppedPath = `/tmp/title-drop-${Date.now()}.txt`
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    const initialSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    const initialSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const titledLeafId = initialSnapshot.activeLeafId ?? initialSnapshot.panes[0]?.leafId
     if (!titledLeafId) {
       throw new Error('No titled pane leaf id found before split')
     }
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const splitSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const splitSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const otherPane = splitSnapshot.panes.find((pane) => pane.leafId !== titledLeafId)
     if (!otherPane) {
       throw new Error('No inactive pane found for title-strip drop test')
     }
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ tabId, paneId }) => {
         window.__paneManagers?.get(tabId)?.setActivePane(paneId, { focus: false })
       },
       { tabId: splitSnapshot.tabId, paneId: otherPane.numericPaneId }
     )
     await expect
-      .poll(async () => (await readPaneIdentitySnapshot(orcaBotmuxPage))?.activeLeafId ?? null)
+      .poll(async () => (await readPaneIdentitySnapshot(botmuxPage))?.activeLeafId ?? null)
       .toBe(otherPane.leafId)
 
-    const titleBar = orcaBotmuxPage.locator('.pane-title-bar', { hasText: title }).first()
+    const titleBar = botmuxPage.locator('.pane-title-bar', { hasText: title }).first()
     await expect(titleBar).toHaveAttribute('data-native-file-drop-target', 'terminal')
     await expect(titleBar).toHaveAttribute('data-terminal-tab-id', splitSnapshot.tabId)
 
     await titleBar.evaluate((element, path) => {
       const dataTransfer = new DataTransfer()
-      dataTransfer.setData('text/x-orca-botmux-file-path', path)
+      dataTransfer.setData('text/x-botmux-file-path', path)
       element.dispatchEvent(
         new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer })
       )
@@ -476,67 +476,67 @@ test.describe('Terminal Panes', () => {
     }, droppedPath)
 
     await expect
-      .poll(async () => (await readPaneIdentitySnapshot(orcaBotmuxPage))?.activeLeafId ?? null, {
+      .poll(async () => (await readPaneIdentitySnapshot(botmuxPage))?.activeLeafId ?? null, {
         timeout: 5_000,
         message: 'Title-strip drop did not activate the titled pane'
       })
       .toBe(titledLeafId)
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(droppedPath), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(droppedPath), {
         timeout: 5_000,
         message: 'Title-strip drop did not paste into the titled pane terminal'
       })
       .toBe(true)
   })
 
-  test('Set Title overlay follows its pane after same-count pane move', async ({ orcaBotmuxPage }) => {
+  test('Set Title overlay follows its pane after same-count pane move', async ({ botmuxPage }) => {
     const title = `Moved overlay title ${Date.now()}`
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    const initialSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    const initialSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const titledLeafId = initialSnapshot.activeLeafId ?? initialSnapshot.panes[0]?.leafId
     if (!titledLeafId) {
       throw new Error('No titled pane leaf id found before move')
     }
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const beforeMove = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const beforeMove = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const target = beforeMove.panes.find((pane) => pane.leafId !== titledLeafId)
     if (!target) {
       throw new Error('No target pane found for titled pane move')
     }
-    const beforeOrder = await readTerminalPaneDomLeafOrder(orcaBotmuxPage)
+    const beforeOrder = await readTerminalPaneDomLeafOrder(botmuxPage)
 
-    await expectPaneTitleAttachedToLeaf(orcaBotmuxPage, title, titledLeafId)
-    await moveTerminalPaneByLeafId(orcaBotmuxPage, titledLeafId, target.leafId, 'right')
+    await expectPaneTitleAttachedToLeaf(botmuxPage, title, titledLeafId)
+    await moveTerminalPaneByLeafId(botmuxPage, titledLeafId, target.leafId, 'right')
 
     await expect
-      .poll(async () => readTerminalPaneDomLeafOrder(orcaBotmuxPage), {
+      .poll(async () => readTerminalPaneDomLeafOrder(botmuxPage), {
         timeout: 10_000,
         message: 'Pane move did not update DOM order'
       })
       .not.toEqual(beforeOrder)
-    await expectPaneTitleAttachedToLeaf(orcaBotmuxPage, title, titledLeafId)
+    await expectPaneTitleAttachedToLeaf(botmuxPage, title, titledLeafId)
   })
 
   test('Set Title keeps the pane drag handle available over the title strip', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const title = `Draggable title ${Date.now()}`
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    const initialSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    const initialSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const titledLeafId = initialSnapshot.activeLeafId ?? initialSnapshot.panes[0]?.leafId
     if (!titledLeafId) {
       throw new Error('No titled pane leaf id found before split')
     }
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await expectPaneTitleAttachedToLeaf(orcaBotmuxPage, title, titledLeafId)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await expectPaneTitleAttachedToLeaf(botmuxPage, title, titledLeafId)
 
-    const titleTopHit = await orcaBotmuxPage.evaluate(
+    const titleTopHit = await botmuxPage.evaluate(
       ({ title, titledLeafId }) => {
         const titleBar = Array.from(document.querySelectorAll<HTMLElement>('.pane-title-bar')).find(
           (element) => element.textContent?.includes(title)
@@ -569,37 +569,37 @@ test.describe('Terminal Panes', () => {
     expect(titleTopHit?.pointerEvents).toBe('auto')
     expect(Math.abs((titleTopHit?.handleTop ?? 0) - (titleTopHit?.titleTop ?? 0))).toBeLessThan(1)
 
-    await orcaBotmuxPage.locator('.pane-title-bar', { hasText: title }).click({
+    await botmuxPage.locator('.pane-title-bar', { hasText: title }).click({
       position: { x: 20, y: 18 }
     })
-    await expect(orcaBotmuxPage.locator('.pane-title-input')).toBeVisible()
+    await expect(botmuxPage.locator('.pane-title-input')).toBeVisible()
   })
 
-  test('@headful Set Title pane can be dragged from the title strip', async ({ orcaBotmuxPage }) => {
+  test('@headful Set Title pane can be dragged from the title strip', async ({ botmuxPage }) => {
     const title = `Dragged title ${Date.now()}`
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    const initialSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    const initialSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const titledLeafId = initialSnapshot.activeLeafId ?? initialSnapshot.panes[0]?.leafId
     if (!titledLeafId) {
       throw new Error('No titled pane leaf id found before drag')
     }
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const beforeDrag = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const beforeDrag = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const target = beforeDrag.panes.find((pane) => pane.leafId !== titledLeafId)
     if (!target) {
       throw new Error('No target pane found for titled pane drag')
     }
-    const beforeOrder = await readTerminalPaneDomLeafOrder(orcaBotmuxPage)
+    const beforeOrder = await readTerminalPaneDomLeafOrder(botmuxPage)
 
-    const titleDragHandle = orcaBotmuxPage
+    const titleDragHandle = botmuxPage
       .locator('.pane-title-bar', { hasText: title })
       .locator('.pane-title-drag-handle')
     await expect(titleDragHandle).toBeVisible({ timeout: 3_000 })
     const sourceBox = await titleDragHandle.boundingBox()
-    const targetBox = await orcaBotmuxPage.locator(`.pane[data-leaf-id="${target.leafId}"]`).boundingBox()
+    const targetBox = await botmuxPage.locator(`.pane[data-leaf-id="${target.leafId}"]`).boundingBox()
     expect(sourceBox).not.toBeNull()
     expect(targetBox).not.toBeNull()
     const sourceIndex = beforeOrder.indexOf(titledLeafId)
@@ -607,36 +607,36 @@ test.describe('Terminal Panes', () => {
     const targetDropX =
       sourceIndex < targetIndex ? targetBox!.x + targetBox!.width - 8 : targetBox!.x + 8
 
-    await orcaBotmuxPage.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + 4)
-    await orcaBotmuxPage.mouse.down()
-    await orcaBotmuxPage.mouse.move(targetDropX, targetBox!.y + targetBox!.height / 2, {
+    await botmuxPage.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + 4)
+    await botmuxPage.mouse.down()
+    await botmuxPage.mouse.move(targetDropX, targetBox!.y + targetBox!.height / 2, {
       steps: 20
     })
-    await orcaBotmuxPage.mouse.up()
+    await botmuxPage.mouse.up()
 
     await expect
-      .poll(async () => readTerminalPaneDomLeafOrder(orcaBotmuxPage), {
+      .poll(async () => readTerminalPaneDomLeafOrder(botmuxPage), {
         timeout: 10_000,
         message: 'Title-strip pane drag did not update DOM order'
       })
       .not.toEqual(beforeOrder)
-    const afterDrag = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    const afterDrag = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     expect(afterDrag.panes.map((pane) => pane.leafId).sort()).toEqual(
       beforeDrag.panes.map((pane) => pane.leafId).sort()
     )
-    await expectPaneTitleAttachedToLeaf(orcaBotmuxPage, title, titledLeafId)
+    await expectPaneTitleAttachedToLeaf(botmuxPage, title, titledLeafId)
   })
 
-  test('Set Title input stays open when clicked in a split terminal', async ({ orcaBotmuxPage }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+  test('Set Title input stays open when clicked in a split terminal', async ({ botmuxPage }) => {
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
 
@@ -666,9 +666,9 @@ test.describe('Terminal Panes', () => {
     await expect(titleInput).toBeFocused()
   })
 
-  test('Set Title survives an early blur during first focus handoff', async ({ orcaBotmuxPage }) => {
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(() => {
+  test('Set Title survives an early blur during first focus handoff', async ({ botmuxPage }) => {
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.evaluate(() => {
       const blurOnFirstTitleFocus = (event: FocusEvent): void => {
         const target = event.target
         if (
@@ -682,59 +682,59 @@ test.describe('Terminal Panes', () => {
       }
       document.addEventListener('focusin', blurOnFirstTitleFocus, true)
     })
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(250)
+    await botmuxPage.waitForTimeout(250)
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
   })
 
-  test('Set Title survives delayed terminal focus handoffs', async ({ orcaBotmuxPage }) => {
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await installDelayedTerminalFocusSteals(orcaBotmuxPage, [50, 150, 300])
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+  test('Set Title survives delayed terminal focus handoffs', async ({ botmuxPage }) => {
+    await openTerminalContextMenu(botmuxPage)
+    await installDelayedTerminalFocusSteals(botmuxPage, [50, 150, 300])
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(600)
+    await botmuxPage.waitForTimeout(600)
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
   })
 
   test('Set Title survives delayed terminal focus handoffs in a split pane', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await installDelayedTerminalFocusSteals(orcaBotmuxPage, [50, 150, 300])
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await installDelayedTerminalFocusSteals(botmuxPage, [50, 150, 300])
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(600)
+    await botmuxPage.waitForTimeout(600)
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
   })
 
-  test('Set Title preserves draft text across terminal focus steals', async ({ orcaBotmuxPage }) => {
+  test('Set Title preserves draft text across terminal focus steals', async ({ botmuxPage }) => {
     const draftTitle = `Draft title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
     await titleInput.fill(draftTitle)
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const textarea = document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')
       textarea?.focus()
     })
@@ -744,13 +744,13 @@ test.describe('Terminal Panes', () => {
     await expect(titleInput).toHaveValue(draftTitle)
   })
 
-  test('Set Title does not submit when synthetic focus restore fails', async ({ orcaBotmuxPage }) => {
+  test('Set Title does not submit when synthetic focus restore fails', async ({ botmuxPage }) => {
     const draftTitle = `Blocked focus title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
     await titleInput.fill(draftTitle)
@@ -758,94 +758,94 @@ test.describe('Terminal Panes', () => {
       input.focus = () => {}
     })
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const textarea = document.querySelector<HTMLTextAreaElement>('.xterm-helper-textarea')
       textarea?.focus()
     })
 
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toHaveValue(draftTitle)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: draftTitle })).toHaveCount(0)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: draftTitle })).toHaveCount(0)
   })
 
   test('Set Title still commits by blur after synthetic terminal focus steals', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const title = `Post steal blur title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await installDelayedTerminalFocusSteals(orcaBotmuxPage, [50, 150])
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await installDelayedTerminalFocusSteals(botmuxPage, [50, 150])
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(300)
+    await botmuxPage.waitForTimeout(300)
     await titleInput.fill(title)
-    await orcaBotmuxPage
+    await botmuxPage
       .locator('.xterm:visible')
       .first()
       .click({ position: { x: 40, y: 60 } })
 
     await expect(titleInput).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
   })
 
-  test('Set Title commits when tabbing away from the title input', async ({ orcaBotmuxPage }) => {
+  test('Set Title commits when tabbing away from the title input', async ({ botmuxPage }) => {
     const title = `Tab commit title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
     await titleInput.fill(title)
     await titleInput.press('Tab')
 
     await expect(titleInput).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
   })
 
-  test('Set Title overlay hides with its inactive terminal tab', async ({ orcaBotmuxPage }) => {
+  test('Set Title overlay hides with its inactive terminal tab', async ({ botmuxPage }) => {
     const title = `Hidden tab title ${Date.now()}`
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, title)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
+    await setPaneTitleFromTerminalMenu(botmuxPage, title)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
 
-    await pressShortcut(orcaBotmuxPage, 't')
+    await pressShortcut(botmuxPage, 't')
     await expect
-      .poll(async () => (await getWorktreeTabs(orcaBotmuxPage, worktreeId)).length, { timeout: 5_000 })
+      .poll(async () => (await getWorktreeTabs(botmuxPage, worktreeId)).length, { timeout: 5_000 })
       .toBeGreaterThanOrEqual(2)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toBeHidden()
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toBeHidden()
 
-    await pressShortcut(orcaBotmuxPage, 'BracketLeft', { shift: true })
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
+    await pressShortcut(botmuxPage, 'BracketLeft', { shift: true })
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toBeVisible()
   })
 
-  test('Set Title still commits by blur after focus settles', async ({ orcaBotmuxPage }) => {
+  test('Set Title still commits by blur after focus settles', async ({ botmuxPage }) => {
     const title = `Blur commit title ${Date.now()}`
 
-    await openTerminalContextMenu(orcaBotmuxPage)
-    await orcaBotmuxPage.getByText('Set Title…', { exact: true }).click()
+    await openTerminalContextMenu(botmuxPage)
+    await botmuxPage.getByText('Set Title…', { exact: true }).click()
 
-    const titleInput = orcaBotmuxPage.locator('.pane-title-input').first()
+    const titleInput = botmuxPage.locator('.pane-title-input').first()
     await expect(titleInput).toBeVisible()
     await expect(titleInput).toBeFocused()
-    await orcaBotmuxPage.waitForTimeout(100)
+    await botmuxPage.waitForTimeout(100)
     await titleInput.fill(title)
-    await orcaBotmuxPage
+    await botmuxPage
       .locator('.xterm:visible')
       .first()
       .click({ position: { x: 40, y: 60 } })
 
     await expect(titleInput).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
   })
 
-  test('Always-on pane header split button hover stays transparent', async ({ orcaBotmuxPage }) => {
-    const splitButton = orcaBotmuxPage.getByRole('button', { name: 'Split Terminal Right' })
+  test('Always-on pane header split button hover stays transparent', async ({ botmuxPage }) => {
+    const splitButton = botmuxPage.getByRole('button', { name: 'Split Terminal Right' })
     await expect(splitButton).toBeVisible()
     await splitButton.hover()
 
@@ -861,79 +861,79 @@ test.describe('Terminal Panes', () => {
     expect(Number(hoverStyle.opacity)).toBeGreaterThan(0.9)
   })
 
-  test('Set Title stays pane-local during agent title churn', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    const tabId = (await getActiveTabId(orcaBotmuxPage))!
+  test('Set Title stays pane-local during agent title churn', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    const tabId = (await getActiveTabId(botmuxPage))!
     const paneTitle = `Codex pane ${Date.now()}`
     const removeButtonTitle = `Remove button label ${Date.now()}`
     const splitTitle = `Split label ${Date.now()}`
     const runtimeTitle = '⠋ Codex working'
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, paneTitle)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
-    await expectTabCustomTitle(orcaBotmuxPage, worktreeId, tabId, null)
+    await setPaneTitleFromTerminalMenu(botmuxPage, paneTitle)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
+    await expectTabCustomTitle(botmuxPage, worktreeId, tabId, null)
 
-    await orcaBotmuxPage.getByRole('button', { name: `Edit pane title: ${paneTitle}` }).focus()
-    await orcaBotmuxPage.keyboard.press('Enter')
-    const paneTitleInput = orcaBotmuxPage.getByRole('textbox', { name: 'Pane title' })
+    await botmuxPage.getByRole('button', { name: `Edit pane title: ${paneTitle}` }).focus()
+    await botmuxPage.keyboard.press('Enter')
+    const paneTitleInput = botmuxPage.getByRole('textbox', { name: 'Pane title' })
     await expect(paneTitleInput).toBeVisible()
     await expect(paneTitleInput).toBeFocused()
-    await orcaBotmuxPage.keyboard.press('Escape')
+    await botmuxPage.keyboard.press('Escape')
     await expect(paneTitleInput).toHaveCount(0)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ targetTabId, title }) => {
         window.__store!.getState().updateTabTitle(targetTabId, title)
       },
       { targetTabId: tabId, title: runtimeTitle }
     )
 
-    // Why: active agents continuously write OSC titles. Set Title is OrcaBotmux's
+    // Why: active agents continuously write OSC titles. Set Title is Botmux's
     // pane-local overlay and must remain visible while the tab runtime title
     // continues to follow the active PTY.
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeVisible()
     await expect(
-      orcaBotmuxPage.locator(`[data-testid="sortable-tab"][data-tab-id="${tabId}"]`)
+      botmuxPage.locator(`[data-testid="sortable-tab"][data-tab-id="${tabId}"]`)
     ).toHaveAttribute('data-tab-title', runtimeTitle)
-    await expectTabCustomTitle(orcaBotmuxPage, worktreeId, tabId, null)
+    await expectTabCustomTitle(botmuxPage, worktreeId, tabId, null)
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, '')
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeHidden()
-    await expectSavedLayoutNotToContainTitle(orcaBotmuxPage, tabId, paneTitle)
+    await setPaneTitleFromTerminalMenu(botmuxPage, '')
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: paneTitle })).toBeHidden()
+    await expectSavedLayoutNotToContainTitle(botmuxPage, tabId, paneTitle)
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, removeButtonTitle)
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, '')
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: removeButtonTitle })).toBeHidden()
-    await expectSavedLayoutNotToContainTitle(orcaBotmuxPage, tabId, removeButtonTitle)
+    await setPaneTitleFromTerminalMenu(botmuxPage, removeButtonTitle)
+    await setPaneTitleFromTerminalMenu(botmuxPage, '')
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: removeButtonTitle })).toBeHidden()
+    await expectSavedLayoutNotToContainTitle(botmuxPage, tabId, removeButtonTitle)
 
-    await setPaneTitleFromTerminalMenu(orcaBotmuxPage, splitTitle)
-    await expectTabCustomTitle(orcaBotmuxPage, worktreeId, tabId, null)
+    await setPaneTitleFromTerminalMenu(botmuxPage, splitTitle)
+    await expectTabCustomTitle(botmuxPage, worktreeId, tabId, null)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await expect(orcaBotmuxPage.locator('.pane-title-text', { hasText: splitTitle })).toBeVisible()
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await expect(botmuxPage.locator('.pane-title-text', { hasText: splitTitle })).toBeVisible()
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ targetTabId, title }) => {
         window.__store!.getState().updateTabTitle(targetTabId, title)
       },
       { targetTabId: tabId, title: runtimeTitle }
     )
     await expect(
-      orcaBotmuxPage.locator(`[data-testid="sortable-tab"][data-tab-id="${tabId}"]`)
+      botmuxPage.locator(`[data-testid="sortable-tab"][data-tab-id="${tabId}"]`)
     ).toHaveAttribute('data-tab-title', runtimeTitle)
   })
 
   test('closing a split pane prunes its leaf-keyed PTY binding without remapping siblings', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    const beforeClose = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
+    const beforeClose = await waitForPaneIdentitySnapshot(botmuxPage, 3)
     const closedLeafId = beforeClose.activeLeafId ?? beforeClose.panes.at(-1)?.leafId
     if (!closedLeafId) {
       throw new Error('No active split pane leaf id found before close')
@@ -942,24 +942,24 @@ test.describe('Terminal Panes', () => {
       .map((pane) => pane.leafId)
       .filter((leafId) => leafId !== closedLeafId)
 
-    await closeActiveTerminalPane(orcaBotmuxPage)
-    await waitForPaneCount(orcaBotmuxPage, 2)
+    await closeActiveTerminalPane(botmuxPage)
+    await waitForPaneCount(botmuxPage, 2)
 
-    const afterClose = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    const afterClose = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     expect(afterClose.panes.map((pane) => pane.leafId).sort()).toEqual(survivingLeafIds.sort())
     expect(Object.keys(afterClose.ptyIdsByLeafId).sort()).toEqual(survivingLeafIds.sort())
     expect(afterClose.ptyIdsByLeafId[closedLeafId]).toBeUndefined()
   })
 
   test('closing and remaking right/down splits keeps surviving leaf-keyed bindings stable', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    const beforeClose = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
+    const beforeClose = await waitForPaneIdentitySnapshot(botmuxPage, 3)
     const closedLeafId = beforeClose.activeLeafId ?? beforeClose.panes.at(-1)?.leafId
     if (!closedLeafId) {
       throw new Error('No active split pane leaf id found before close/remake')
@@ -970,10 +970,10 @@ test.describe('Terminal Panes', () => {
         .map((pane) => [pane.leafId, pane.ptyId])
     )
 
-    await closeActiveTerminalPane(orcaBotmuxPage)
-    await waitForPaneCount(orcaBotmuxPage, 2)
+    await closeActiveTerminalPane(botmuxPage)
+    await waitForPaneCount(botmuxPage, 2)
 
-    const afterClose = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    const afterClose = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     expect(Object.keys(afterClose.ptyIdsByLeafId).sort()).toEqual(
       Object.keys(survivingBindings).sort()
     )
@@ -982,10 +982,10 @@ test.describe('Terminal Panes', () => {
     }
     expect(afterClose.ptyIdsByLeafId[closedLeafId]).toBeUndefined()
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    const afterRemake = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
+    const afterRemake = await waitForPaneIdentitySnapshot(botmuxPage, 3)
     const remadeLeafIds = afterRemake.panes.map((pane) => pane.leafId)
     expect(remadeLeafIds).not.toContain(closedLeafId)
     for (const [leafId, ptyId] of Object.entries(survivingBindings)) {
@@ -995,15 +995,15 @@ test.describe('Terminal Panes', () => {
   })
 
   test('moving panes through the drag-drop handler preserves leaf-keyed PTY bindings', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    const beforeMove = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
-    const beforeOrder = await readTerminalPaneDomLeafOrder(orcaBotmuxPage)
+    const beforeMove = await waitForPaneIdentitySnapshot(botmuxPage, 3)
+    const beforeOrder = await readTerminalPaneDomLeafOrder(botmuxPage)
     const source = beforeMove.panes.at(-1)
     const target = beforeMove.panes[0]
     if (!source || !target) {
@@ -1011,16 +1011,16 @@ test.describe('Terminal Panes', () => {
     }
     const bindingsBefore = { ...beforeMove.ptyIdsByLeafId }
 
-    await moveTerminalPaneByLeafId(orcaBotmuxPage, source.leafId, target.leafId, 'left')
+    await moveTerminalPaneByLeafId(botmuxPage, source.leafId, target.leafId, 'left')
 
     await expect
-      .poll(async () => readTerminalPaneDomLeafOrder(orcaBotmuxPage), {
+      .poll(async () => readTerminalPaneDomLeafOrder(botmuxPage), {
         timeout: 10_000,
         message: 'Pane drag-drop move did not update DOM order'
       })
       .not.toEqual(beforeOrder)
 
-    const afterMove = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
+    const afterMove = await waitForPaneIdentitySnapshot(botmuxPage, 3)
     const afterLeafIds = afterMove.panes.map((pane) => pane.leafId).sort()
     expect(afterLeafIds).toEqual(beforeMove.panes.map((pane) => pane.leafId).sort())
     expect(afterMove.ptyIdsByLeafId).toEqual(bindingsBefore)
@@ -1030,63 +1030,63 @@ test.describe('Terminal Panes', () => {
    * User Prompt:
    * - terminal panes retain state when switching tabs and when you make / close a pane / switch worktrees
    */
-  test('terminal pane retains content when switching tabs and back', async ({ orcaBotmuxPage }) => {
+  test('terminal pane retains content when switching tabs and back', async ({ botmuxPage }) => {
     // Write a unique marker to the current terminal
-    const ptyId = await discoverActivePtyId(orcaBotmuxPage)
+    const ptyId = await discoverActivePtyId(botmuxPage)
     const marker = `RETAIN_TEST_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `echo ${marker}`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await execInTerminal(botmuxPage, ptyId, `echo ${marker}`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
     // Create a new terminal tab (Cmd/Ctrl+T) to switch away
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    await pressShortcut(orcaBotmuxPage, 't')
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    await pressShortcut(botmuxPage, 't')
 
     // Wait for the new tab to appear
     await expect
-      .poll(async () => (await getWorktreeTabs(orcaBotmuxPage, worktreeId)).length, { timeout: 5_000 })
+      .poll(async () => (await getWorktreeTabs(botmuxPage, worktreeId)).length, { timeout: 5_000 })
       .toBeGreaterThanOrEqual(2)
 
     // Verify we're still on a terminal tab
-    const activeType = await getActiveTabType(orcaBotmuxPage)
+    const activeType = await getActiveTabType(botmuxPage)
     expect(activeType).toBe('terminal')
 
     // Switch back to the previous tab with Cmd/Ctrl+Shift+[
-    await pressShortcut(orcaBotmuxPage, 'BracketLeft', { shift: true })
+    await pressShortcut(botmuxPage, 'BracketLeft', { shift: true })
 
     // Verify the marker is still present
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), { timeout: 5_000 })
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), { timeout: 5_000 })
       .toBe(true)
 
     // Clean up the extra tab
-    await pressShortcut(orcaBotmuxPage, 'BracketRight', { shift: true })
-    await pressShortcut(orcaBotmuxPage, 'w')
+    await pressShortcut(botmuxPage, 'BracketRight', { shift: true })
+    await pressShortcut(botmuxPage, 'w')
   })
 
   /**
    * User Prompt:
    * - terminal panes retain state when switching tabs and when you make / close a pane / switch worktrees
    */
-  test('terminal pane retains content when splitting and closing a pane', async ({ orcaBotmuxPage }) => {
+  test('terminal pane retains content when splitting and closing a pane', async ({ botmuxPage }) => {
     // Write a unique marker to the current terminal
-    const ptyId = await discoverActivePtyId(orcaBotmuxPage)
+    const ptyId = await discoverActivePtyId(botmuxPage)
     const marker = `SPLIT_RETAIN_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `echo ${marker}`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await execInTerminal(botmuxPage, ptyId, `echo ${marker}`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
-    const panesBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
+    const panesBefore = await countVisibleTerminalPanes(botmuxPage)
 
     // Split the terminal right
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, panesBefore + 1)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, panesBefore + 1)
 
-    await focusLastTerminalPane(orcaBotmuxPage)
-    await closeActiveTerminalPane(orcaBotmuxPage)
-    await waitForPaneCount(orcaBotmuxPage, panesBefore)
+    await focusLastTerminalPane(botmuxPage)
+    await closeActiveTerminalPane(botmuxPage)
+    await waitForPaneCount(botmuxPage, panesBefore)
 
     // The original pane should still have our marker
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), { timeout: 5_000 })
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), { timeout: 5_000 })
       .toBe(true)
   })
 
@@ -1094,30 +1094,30 @@ test.describe('Terminal Panes', () => {
    * User Prompt:
    * - terminal panes retain state when switching tabs and when you make / close a pane / switch worktrees
    */
-  test('terminal pane retains content when switching worktrees and back', async ({ orcaBotmuxPage }) => {
-    const allWorktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test('terminal pane retains content when switching worktrees and back', async ({ botmuxPage }) => {
+    const allWorktreeIds = await getAllWorktreeIds(botmuxPage)
     if (allWorktreeIds.length < 2) {
       test.skip(true, 'Need at least 2 worktrees to test worktree switching')
       return
     }
 
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
     // Write a unique marker to the current terminal
-    const ptyId = await discoverActivePtyId(orcaBotmuxPage)
+    const ptyId = await discoverActivePtyId(botmuxPage)
     const marker = `WT_RETAIN_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `echo ${marker}`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await execInTerminal(botmuxPage, ptyId, `echo ${marker}`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
     // Switch to a different worktree via the store
-    const otherId = await switchToOtherWorktree(orcaBotmuxPage, worktreeId)
+    const otherId = await switchToOtherWorktree(botmuxPage, worktreeId)
     expect(otherId).not.toBeNull()
-    await expect.poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 5_000 }).toBe(otherId)
+    await expect.poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 5_000 }).toBe(otherId)
 
     // Switch back to the original worktree
-    await switchToWorktree(orcaBotmuxPage, worktreeId)
+    await switchToWorktree(botmuxPage, worktreeId)
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 5_000 })
+      .poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 5_000 })
       .toBe(worktreeId)
 
     // Why: after a worktree round-trip, the split-group container transitions
@@ -1126,11 +1126,11 @@ test.describe('Terminal Panes', () => {
     // after the worktree activation cascade. Waiting directly for the retained
     // marker proves the user-visible behavior without failing early on the
     // intermediate manager-remount timing.
-    await ensureTerminalVisible(orcaBotmuxPage)
+    await ensureTerminalVisible(botmuxPage)
 
     // The terminal should still contain our marker
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), { timeout: 20_000 })
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), { timeout: 20_000 })
       .toBe(true)
   })
 
@@ -1138,15 +1138,15 @@ test.describe('Terminal Panes', () => {
    * User Prompt:
    * - resizing terminal panes works
    */
-  test('shows a pane divider after splitting', async ({ orcaBotmuxPage }) => {
+  test('shows a pane divider after splitting', async ({ botmuxPage }) => {
     // Why: headless Playwright cannot exercise the real pointer-capture resize
     // path reliably, so the default suite only verifies the precondition for
     // resizing: splitting creates a visible divider for the active layout.
-    const panesBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, panesBefore + 1)
+    const panesBefore = await countVisibleTerminalPanes(botmuxPage)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, panesBefore + 1)
 
-    await expect(orcaBotmuxPage.locator('.pane-divider.is-vertical').first()).toBeVisible({
+    await expect(botmuxPage.locator('.pane-divider.is-vertical').first()).toBeVisible({
       timeout: 3_000
     })
   })
@@ -1161,16 +1161,16 @@ test.describe('Terminal Panes', () => {
    * mouse API only produces when the Electron window is visible. In headless
    * mode setPointerCapture silently fails, pointermove never fires on the
    * divider, and the resize has no effect. Run with:
-   *   ORCA_E2E_HEADFUL=1 pnpm run test:e2e
+   *   BOTMUX_E2E_HEADFUL=1 pnpm run test:e2e
    */
-  test('@headful can resize terminal panes by real mouse drag', async ({ orcaBotmuxPage }) => {
+  test('@headful can resize terminal panes by real mouse drag', async ({ botmuxPage }) => {
     // Split the terminal to create a resizable divider
-    const panesBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, panesBefore + 1)
+    const panesBefore = await countVisibleTerminalPanes(botmuxPage)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, panesBefore + 1)
 
     // Get the pane widths before resize
-    const paneWidthsBefore = await orcaBotmuxPage.evaluate(() => {
+    const paneWidthsBefore = await botmuxPage.evaluate(() => {
       const xterms = document.querySelectorAll('.xterm')
       return Array.from(xterms)
         .filter((x) => (x as HTMLElement).offsetParent !== null)
@@ -1179,7 +1179,7 @@ test.describe('Terminal Panes', () => {
     expect(paneWidthsBefore.length).toBeGreaterThanOrEqual(2)
 
     // Find the vertical pane divider and drag it
-    const divider = orcaBotmuxPage.locator('.pane-divider.is-vertical').first()
+    const divider = botmuxPage.locator('.pane-divider.is-vertical').first()
     await expect(divider).toBeVisible({ timeout: 3_000 })
     const box = await divider.boundingBox()
     expect(box).not.toBeNull()
@@ -1187,16 +1187,16 @@ test.describe('Terminal Panes', () => {
     // Drag the divider 150px to the right to resize panes
     const startX = box!.x + box!.width / 2
     const startY = box!.y + box!.height / 2
-    await orcaBotmuxPage.mouse.move(startX, startY)
-    await orcaBotmuxPage.mouse.down()
-    await orcaBotmuxPage.mouse.move(startX + 150, startY, { steps: 20 })
-    await orcaBotmuxPage.mouse.up()
+    await botmuxPage.mouse.move(startX, startY)
+    await botmuxPage.mouse.down()
+    await botmuxPage.mouse.move(startX + 150, startY, { steps: 20 })
+    await botmuxPage.mouse.up()
 
     // Verify pane widths changed
     await expect
       .poll(
         async () => {
-          const widthsAfter = await orcaBotmuxPage.evaluate(() => {
+          const widthsAfter = await botmuxPage.evaluate(() => {
             const xterms = document.querySelectorAll('.xterm')
             return Array.from(xterms)
               .filter((x) => (x as HTMLElement).offsetParent !== null)
@@ -1213,16 +1213,16 @@ test.describe('Terminal Panes', () => {
       .toBe(true)
   })
 
-  test('@headful resizing split panes forwards only the settled PTY size', async ({ orcaBotmuxPage }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+  test('@headful resizing split panes forwards only the settled PTY size', async ({ botmuxPage }) => {
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const ptyIds = snapshot.panes
       .map((pane) => pane.ptyId)
       .filter((ptyId): ptyId is string => Boolean(ptyId))
 
     for (const ptyId of ptyIds) {
       await sendToTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         ptyId,
         "export PS1='ISSUE2910_PROMPT$ '; export PROMPT=\"$PS1\"; trap 'printf \"\\nISSUE2910_WINCH\\n\"' WINCH; clear; printf 'ISSUE2910_READY\\n'\r"
       )
@@ -1231,28 +1231,28 @@ test.describe('Terminal Panes', () => {
     await expect
       .poll(
         async () =>
-          (await readVisiblePaneContents(orcaBotmuxPage)).every((content) =>
+          (await readVisiblePaneContents(botmuxPage)).every((content) =>
             content.includes('ISSUE2910_READY')
           ),
         { timeout: 10_000, message: 'Split panes did not receive resize-regression prompt setup' }
       )
       .toBe(true)
 
-    const divider = orcaBotmuxPage.locator('.pane-divider.is-vertical').first()
+    const divider = botmuxPage.locator('.pane-divider.is-vertical').first()
     await expect(divider).toBeVisible({ timeout: 3_000 })
     const box = await divider.boundingBox()
     expect(box).not.toBeNull()
 
     const startX = box!.x + box!.width / 2
     const startY = box!.y + box!.height / 2
-    await orcaBotmuxPage.mouse.move(startX, startY)
-    await orcaBotmuxPage.mouse.down()
-    await orcaBotmuxPage.mouse.move(startX - 350, startY, { steps: 40 })
-    await orcaBotmuxPage.mouse.move(startX + 250, startY, { steps: 40 })
-    await orcaBotmuxPage.mouse.up()
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.mouse.move(startX, startY)
+    await botmuxPage.mouse.down()
+    await botmuxPage.mouse.move(startX - 350, startY, { steps: 40 })
+    await botmuxPage.mouse.move(startX + 250, startY, { steps: 40 })
+    await botmuxPage.mouse.up()
+    await botmuxPage.waitForTimeout(500)
 
-    const paneContents = await readVisiblePaneContents(orcaBotmuxPage)
+    const paneContents = await readVisiblePaneContents(botmuxPage)
     for (const content of paneContents) {
       const promptRedraws = content.match(/ISSUE2910_PROMPT/g)?.length ?? 0
       const winchNotifications = content.match(/ISSUE2910_WINCH/g)?.length ?? 0
@@ -1262,45 +1262,45 @@ test.describe('Terminal Panes', () => {
   })
 
   test('@headful dragging terminal panes around preserves leaf-keyed PTY bindings', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'horizontal')
-    await waitForPaneCount(orcaBotmuxPage, 3)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await splitActiveTerminalPane(botmuxPage, 'horizontal')
+    await waitForPaneCount(botmuxPage, 3)
 
-    const beforeDrag = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
-    const beforeOrder = await readTerminalPaneDomLeafOrder(orcaBotmuxPage)
+    const beforeDrag = await waitForPaneIdentitySnapshot(botmuxPage, 3)
+    const beforeOrder = await readTerminalPaneDomLeafOrder(botmuxPage)
     const source = beforeDrag.panes.at(-1)
     const target = beforeDrag.panes[0]
     if (!source || !target) {
       throw new Error('Need source and target panes for drag test')
     }
 
-    const sourceHandle = orcaBotmuxPage.locator(
+    const sourceHandle = botmuxPage.locator(
       `.pane[data-leaf-id="${source.leafId}"] .pane-drag-handle`
     )
     await expect(sourceHandle).toBeVisible({ timeout: 3_000 })
     const sourceBox = await sourceHandle.boundingBox()
-    const targetBox = await orcaBotmuxPage.locator(`.pane[data-leaf-id="${target.leafId}"]`).boundingBox()
+    const targetBox = await botmuxPage.locator(`.pane[data-leaf-id="${target.leafId}"]`).boundingBox()
     expect(sourceBox).not.toBeNull()
     expect(targetBox).not.toBeNull()
 
-    await orcaBotmuxPage.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + 4)
-    await orcaBotmuxPage.mouse.down()
-    await orcaBotmuxPage.mouse.move(targetBox!.x + 8, targetBox!.y + targetBox!.height / 2, {
+    await botmuxPage.mouse.move(sourceBox!.x + sourceBox!.width / 2, sourceBox!.y + 4)
+    await botmuxPage.mouse.down()
+    await botmuxPage.mouse.move(targetBox!.x + 8, targetBox!.y + targetBox!.height / 2, {
       steps: 20
     })
-    await orcaBotmuxPage.mouse.up()
+    await botmuxPage.mouse.up()
 
     await expect
-      .poll(async () => readTerminalPaneDomLeafOrder(orcaBotmuxPage), {
+      .poll(async () => readTerminalPaneDomLeafOrder(botmuxPage), {
         timeout: 10_000,
         message: 'Real pane drag did not update DOM order'
       })
       .not.toEqual(beforeOrder)
 
-    const afterDrag = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 3)
+    const afterDrag = await waitForPaneIdentitySnapshot(botmuxPage, 3)
     expect(afterDrag.panes.map((pane) => pane.leafId).sort()).toEqual(
       beforeDrag.panes.map((pane) => pane.leafId).sort()
     )
@@ -1311,21 +1311,21 @@ test.describe('Terminal Panes', () => {
    * User Prompt:
    * - closing panes works
    */
-  test('closing a split pane removes it and remaining pane fills space', async ({ orcaBotmuxPage }) => {
-    const panesBefore = await countVisibleTerminalPanes(orcaBotmuxPage)
+  test('closing a split pane removes it and remaining pane fills space', async ({ botmuxPage }) => {
+    const panesBefore = await countVisibleTerminalPanes(botmuxPage)
 
     // Split the terminal
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, panesBefore + 1)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, panesBefore + 1)
 
-    const panesAfterSplit = await countVisibleTerminalPanes(orcaBotmuxPage)
+    const panesAfterSplit = await countVisibleTerminalPanes(botmuxPage)
     expect(panesAfterSplit).toBeGreaterThanOrEqual(2)
 
-    await closeActiveTerminalPane(orcaBotmuxPage)
-    await waitForPaneCount(orcaBotmuxPage, panesAfterSplit - 1)
+    await closeActiveTerminalPane(botmuxPage)
+    await waitForPaneCount(botmuxPage, panesAfterSplit - 1)
 
     // The remaining pane should fill the available space
-    const paneWidth = await orcaBotmuxPage.evaluate(() => {
+    const paneWidth = await botmuxPage.evaluate(() => {
       const xterms = document.querySelectorAll('.xterm')
       const visible = Array.from(xterms).find(
         (x) => (x as HTMLElement).offsetParent !== null

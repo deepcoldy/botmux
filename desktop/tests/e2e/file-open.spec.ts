@@ -6,7 +6,7 @@
  * - you can open .md files and they show up as preview (from the right sidebar)
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   waitForSessionReady,
   waitForActiveWorktree,
@@ -55,39 +55,39 @@ async function switchToEditor(
 }
 
 test.describe('File Open & Markdown Preview', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   /**
    * User Prompt:
    * - you can open files (from the right sidebar)
    */
-  test('opening the right sidebar shows file explorer', async ({ orcaBotmuxPage }) => {
-    await openFileExplorer(orcaBotmuxPage)
+  test('opening the right sidebar shows file explorer', async ({ botmuxPage }) => {
+    await openFileExplorer(botmuxPage)
 
     // Why: the load-bearing check is that `FileExplorer` actually mounted.
-    // `data-orca-botmux-explorer-shell` is the stable marker the component renders
+    // `data-botmux-explorer-shell` is the stable marker the component renders
     // on its root shell div — a store-only `rightSidebarTab === 'explorer'`
     // check would pass even if the explorer crashed on mount and the panel
     // painted empty.
-    await expect(orcaBotmuxPage.locator('[data-orca-botmux-explorer-shell]')).toBeVisible({ timeout: 5_000 })
+    await expect(botmuxPage.locator('[data-botmux-explorer-shell]')).toBeVisible({ timeout: 5_000 })
   })
 
   /**
    * User Prompt:
    * - you can open files (from the right sidebar)
    */
-  test('clicking a file in the file explorer opens it in an editor tab', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    await openFileExplorer(orcaBotmuxPage)
+  test('clicking a file in the file explorer opens it in an editor tab', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    await openFileExplorer(botmuxPage)
 
-    const filesBefore = await getOpenFiles(orcaBotmuxPage, worktreeId)
+    const filesBefore = await getOpenFiles(botmuxPage, worktreeId)
 
     // Click a known non-directory file
-    const clickedFile = await clickFileInExplorer(orcaBotmuxPage, [
+    const clickedFile = await clickFileInExplorer(botmuxPage, [
       'package.json',
       'tsconfig.json',
       '.gitignore',
@@ -96,11 +96,11 @@ test.describe('File Open & Markdown Preview', () => {
     expect(clickedFile).not.toBeNull()
 
     // Wait for the file to be opened in the editor
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('editor')
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('editor')
 
     // There should be a new open file
     await expect
-      .poll(async () => (await getOpenFiles(orcaBotmuxPage, worktreeId)).length, { timeout: 5_000 })
+      .poll(async () => (await getOpenFiles(botmuxPage, worktreeId)).length, { timeout: 5_000 })
       .toBeGreaterThan(filesBefore.length)
 
     // Why: the load-bearing check is that the editor panel actually rendered
@@ -113,7 +113,7 @@ test.describe('File Open & Markdown Preview', () => {
     // routinely take 10s+ to hydrate that chunk plus the inner Monaco/Rich
     // Markdown chunks, during which the outer Suspense shows "Loading
     // editor…" and `.editor-header-path` is not yet in the DOM.
-    await expect(orcaBotmuxPage.locator('.editor-header-path').first()).toContainText(clickedFile!, {
+    await expect(botmuxPage.locator('.editor-header-path').first()).toContainText(clickedFile!, {
       timeout: 20_000
     })
   })
@@ -122,15 +122,15 @@ test.describe('File Open & Markdown Preview', () => {
    * User Prompt:
    * - you can open .md files and they show up as preview (from the right sidebar)
    */
-  test('opening a .md file shows markdown content', async ({ orcaBotmuxPage }) => {
-    await openFileExplorer(orcaBotmuxPage)
-    const clickedFile = await clickFileInExplorer(orcaBotmuxPage, ['README.md', 'CLAUDE.md'])
+  test('opening a .md file shows markdown content', async ({ botmuxPage }) => {
+    await openFileExplorer(botmuxPage)
+    const clickedFile = await clickFileInExplorer(botmuxPage, ['README.md', 'CLAUDE.md'])
     expect(clickedFile).not.toBeNull()
 
     // Wait for the editor tab to become active
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('editor')
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('editor')
 
-    // The seeded README.md starts with `# OrcaBotmux E2E Test Repo`, so the rich
+    // The seeded README.md starts with `# Botmux E2E Test Repo`, so the rich
     // markdown editor should render a real <h1> with that text. Asserting on
     // the rendered heading (not `markdownViewMode` in the store) is the whole
     // point of this spec — a store-only check passes even if
@@ -138,7 +138,7 @@ test.describe('File Open & Markdown Preview', () => {
     // Fall back to CLAUDE.md's first heading when that file was opened
     // instead: the seeded `CLAUDE.md` starts with `# CLAUDE.md`.
     const expectedHeading = clickedFile?.endsWith('README.md')
-      ? /OrcaBotmux E2E Test Repo/i
+      ? /Botmux E2E Test Repo/i
       : /CLAUDE\.md/i
     // Why 25s: first-time markdown open in a headless Electron session waits
     // on two lazy chunks (EditorPanel → RichMarkdownEditor) plus ProseMirror
@@ -147,7 +147,7 @@ test.describe('File Open & Markdown Preview', () => {
     // user-facing guarantee is just "the rich markdown surface eventually
     // paints the file's first heading" — giving it 25s keeps the assertion
     // meaningful without turning every run into a flake risk.
-    await expect(orcaBotmuxPage.getByRole('heading', { name: expectedHeading, level: 1 })).toBeVisible({
+    await expect(botmuxPage.getByRole('heading', { name: expectedHeading, level: 1 })).toBeVisible({
       timeout: 25_000
     })
   })
@@ -157,12 +157,12 @@ test.describe('File Open & Markdown Preview', () => {
    * - you can open files (from the right sidebar)
    * - files retain state when switching tabs
    */
-  test('editor tab retains state when switching to terminal and back', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    await openFileExplorer(orcaBotmuxPage)
+  test('editor tab retains state when switching to terminal and back', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    await openFileExplorer(botmuxPage)
 
     // Click a file to open it
-    const clickedFile = await clickFileInExplorer(orcaBotmuxPage, [
+    const clickedFile = await clickFileInExplorer(botmuxPage, [
       'package.json',
       'tsconfig.json',
       '.gitignore'
@@ -170,24 +170,24 @@ test.describe('File Open & Markdown Preview', () => {
     expect(clickedFile).not.toBeNull()
 
     // Wait for editor to become active
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('editor')
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('editor')
 
     // Record what files are open
-    const openFilesBefore = await getOpenFiles(orcaBotmuxPage, worktreeId)
+    const openFilesBefore = await getOpenFiles(botmuxPage, worktreeId)
     expect(openFilesBefore.length).toBeGreaterThan(0)
 
     const editorFileId = openFilesBefore[0].id
 
     // Switch to a terminal tab
-    await switchToTerminal(orcaBotmuxPage, worktreeId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).not.toBe('editor')
+    await switchToTerminal(botmuxPage, worktreeId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).not.toBe('editor')
 
     // Switch back to the same editor tab
-    await switchToEditor(orcaBotmuxPage, editorFileId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).toBe('editor')
+    await switchToEditor(botmuxPage, editorFileId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).toBe('editor')
 
     // The same files should still be open
-    const openFilesAfter = await getOpenFiles(orcaBotmuxPage, worktreeId)
+    const openFilesAfter = await getOpenFiles(botmuxPage, worktreeId)
     expect(openFilesAfter.length).toBe(openFilesBefore.length)
     expect(openFilesAfter[0].filePath).toBe(openFilesBefore[0].filePath)
   })

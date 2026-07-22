@@ -104,6 +104,10 @@ const mockApi = {
 // @ts-expect-error -- mock
 globalThis.window = { api: mockApi }
 
+import {
+  bindBotmuxHostTabSession,
+  ensureBotmuxAgentWorktree
+} from '../../../../shared/botmux-main-terminal-host'
 import { createTestStore, makeOpenFile, makeTabGroup, makeUnifiedTab } from './store-test-helpers'
 
 const WT = 'repo1::/tmp/feature'
@@ -947,6 +951,90 @@ describe('TabsSlice', () => {
 
       expect(store.getState().unreadTerminalTabs[tabA.entityId]).toBeUndefined()
       expect(store.getState().unreadTerminalTabs[tabB.entityId]).toBeUndefined()
+    })
+
+    it('retargets Botmux host surface when focusing a split terminal group body', () => {
+      // Why: pointerdown on split terminal chrome only calls focusGroup, not
+      // setActiveTab — surface must still follow the focused group's session.
+      const hostWt = ensureBotmuxAgentWorktree({
+        sessionId: 'sess-a',
+        hostId: 'ssh:d2-test',
+        hostLabel: 'd2',
+        title: 'sess-a',
+        cwd: '/root/workspace/a',
+        agentKey: 'claude-code'
+      })
+      const hostId = hostWt.id
+
+      const tabA = store.getState().createUnifiedTab(hostId, 'terminal', {
+        entityId: 'term-a',
+        label: 'sess-a'
+      })
+      const groupAId = store.getState().groupsByWorktree[hostId][0].id
+      const groupBId = store.getState().createEmptySplitGroup(hostId, groupAId, 'right')
+      if (!groupBId) {
+        throw new Error('createEmptySplitGroup returned null')
+      }
+      const tabB = store.getState().createUnifiedTab(hostId, 'terminal', {
+        entityId: 'term-b',
+        label: 'sess-b',
+        targetGroupId: groupBId
+      })
+
+      bindBotmuxHostTabSession(hostId, 'term-a', 'sess-a', '/root/workspace/a')
+      bindBotmuxHostTabSession(hostId, 'term-b', 'sess-b', '/root/workspace/b')
+
+      store.setState({
+        activeWorktreeId: hostId,
+        tabsByWorktree: {
+          [hostId]: [
+            {
+              id: 'term-a',
+              title: 'sess-a',
+              ptyId: 'pty-a',
+              worktreeId: hostId,
+              customTitle: null,
+              color: null,
+              sortOrder: 0,
+              createdAt: Date.now(),
+              botmuxSessionId: 'sess-a'
+            },
+            {
+              id: 'term-b',
+              title: 'sess-b',
+              ptyId: 'pty-b',
+              worktreeId: hostId,
+              customTitle: null,
+              color: null,
+              sortOrder: 1,
+              createdAt: Date.now(),
+              botmuxSessionId: 'sess-b'
+            }
+          ]
+        }
+      })
+
+      // Seed surface on A, then focus B via body path only (focusGroup).
+      store.getState().setBotmuxHostSurface(hostId, {
+        sessionId: 'sess-a',
+        cwd: '/root/workspace/a'
+      })
+      expect(store.getState().botmuxSurfaceByHostId[hostId]?.sessionId).toBe('sess-a')
+
+      store.getState().focusGroup(hostId, groupBId)
+
+      expect(store.getState().activeTabId).toBe(tabB.entityId)
+      expect(store.getState().botmuxSurfaceByHostId[hostId]).toMatchObject({
+        sessionId: 'sess-b',
+        cwd: '/root/workspace/b'
+      })
+      // Focusing A again must restore A surface without tab-chrome activation.
+      store.getState().focusGroup(hostId, groupAId)
+      expect(store.getState().activeTabId).toBe(tabA.entityId)
+      expect(store.getState().botmuxSurfaceByHostId[hostId]).toMatchObject({
+        sessionId: 'sess-a',
+        cwd: '/root/workspace/a'
+      })
     })
   })
 

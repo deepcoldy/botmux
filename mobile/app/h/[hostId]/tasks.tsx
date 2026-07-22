@@ -51,6 +51,7 @@ import { MobileSearchField } from '../../../src/components/MobileSearchField'
 import { MobileSyntaxSegments } from '../../../src/components/MobileSyntaxSegments'
 import { PickerModal, type PickerOption } from '../../../src/components/PickerModal'
 import { TaskProviderLogo } from '../../../src/components/TaskProviderLogo'
+import { useMobileI18n } from '../../../src/i18n/mobile-i18n'
 import {
   buildGitHubPrFileDiffPreview,
   type GitHubPrFileDiffLine
@@ -92,7 +93,7 @@ import { WORKTREE_CREATE_TIMEOUT_MS } from '../../../src/tasks/workspace-create-
 import {
   isSetupHookTrusted,
   normalizeSetupHookTrust,
-  trustedOrcaHooksWithSetupApproval,
+  trustedBotmuxHooksWithSetupApproval,
   wasSetupHookPreviouslyApproved
 } from '../../../src/tasks/setup-hook-trust'
 import { colors, radii, spacing, typography } from '../../../src/theme/mobile-theme'
@@ -130,7 +131,7 @@ import {
 } from '../../../src/tasks/mobile-task-copy-feedback-timer'
 import type {
   BaseRefSearchResult,
-  PersistedTrustedOrcaHooks,
+  PersistedTrustedBotmuxHooks,
   SparsePreset,
   TuiAgent
 } from '../../../../src/shared/types'
@@ -661,7 +662,7 @@ type WorkspaceCreateArgs = {
   sparseCheckoutOverride?: { directories: string[]; presetId?: string }
 }
 
-type OrcaYamlTrustPrompt = WorkspaceCreateArgs & {
+type BotmuxYamlTrustPrompt = WorkspaceCreateArgs & {
   repoId: string
   repoName: string
   scriptContent: string
@@ -689,7 +690,7 @@ function workspaceAgentIconId(agent: WorkspaceAgentChoice): string {
   return agent === 'blank' ? '__blank__' : agent
 }
 
-type ProjectRepoNotInOrcaPrompt = {
+type ProjectRepoNotInBotmuxPrompt = {
   owner: string
   repo: string
   url: string | null
@@ -2140,8 +2141,8 @@ function getRepoBadgeColor(repo: RepoSummary | undefined, fallbackName: string):
 }
 
 function setupSourceLabel(source: string | null): string {
-  if (source === 'orca.yaml') {
-    return 'orca.yaml'
+  if (source === 'botmux.yaml') {
+    return 'botmux.yaml'
   }
   if (source === 'legacy') {
     return 'local hooks'
@@ -2194,6 +2195,7 @@ export default function MobileTasksScreen() {
   const { hostId, taskSource } = useLocalSearchParams<{ hostId: string; taskSource?: string }>()
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   const { client, state: connState } = useHostClient(hostId)
   const reconnectAttempts = useReconnectAttempt(hostId)
   const lastConnectedAt = useLastConnectedAt(hostId)
@@ -2386,8 +2388,10 @@ export default function MobileTasksScreen() {
   const [linearSubIssueTitle, setLinearSubIssueTitle] = useState('')
   const [taskStateHydrated, setTaskStateHydrated] = useState(false)
   const [runtimeTaskSettings, setRuntimeTaskSettings] = useState<RuntimeTaskSettings>({})
-  const [trustedOrcaHooks, setTrustedOrcaHooks] = useState<PersistedTrustedOrcaHooks>({})
-  const [orcaYamlTrustPrompt, setOrcaYamlTrustPrompt] = useState<OrcaYamlTrustPrompt | null>(null)
+  const [trustedBotmuxHooks, setTrustedBotmuxHooks] = useState<PersistedTrustedBotmuxHooks>({})
+  const [botmuxYamlTrustPrompt, setBotmuxYamlTrustPrompt] = useState<BotmuxYamlTrustPrompt | null>(
+    null
+  )
   const [githubProjectSettings, setGithubProjectSettings] = useState<GitHubProjectSettings>(
     EMPTY_GITHUB_PROJECT_SETTINGS
   )
@@ -2443,8 +2447,8 @@ export default function MobileTasksScreen() {
   const [projectIssueTypesLoading, setProjectIssueTypesLoading] = useState(false)
   const [projectIssueTypesError, setProjectIssueTypesError] = useState('')
   const [projectMutating, setProjectMutating] = useState(false)
-  const [projectRepoNotInOrca, setProjectRepoNotInOrca] =
-    useState<ProjectRepoNotInOrcaPrompt | null>(null)
+  const [projectRepoNotInBotmux, setProjectRepoNotInBotmux] =
+    useState<ProjectRepoNotInBotmuxPrompt | null>(null)
   // Why: project detail text inputs rerender this screen while comments stay
   // unchanged; keep grouping out of the typing path.
   const projectDetailCommentGroups = useMemo(
@@ -2833,19 +2837,19 @@ export default function MobileTasksScreen() {
       if (!client) {
         return
       }
-      const next = trustedOrcaHooksWithSetupApproval({
-        trust: trustedOrcaHooks,
+      const next = trustedBotmuxHooksWithSetupApproval({
+        trust: trustedBotmuxHooks,
         repoId,
         contentHash,
         alwaysTrust
       })
-      const response = await client.sendRequest('ui.set', { trustedOrcaHooks: next })
+      const response = await client.sendRequest('ui.set', { trustedBotmuxHooks: next })
       if (!isSuccess(response)) {
         throw new Error(response.error.message)
       }
-      setTrustedOrcaHooks(next)
+      setTrustedBotmuxHooks(next)
     },
-    [client, trustedOrcaHooks]
+    [client, trustedBotmuxHooks]
   )
 
   const resetWorkspaceCreateState = useCallback((): void => {
@@ -2879,7 +2883,7 @@ export default function MobileTasksScreen() {
     setShowWorkspaceBaseBranchPicker(false)
     setShowWorkspaceSparsePicker(false)
     setSetupPrompt(null)
-    setOrcaYamlTrustPrompt(null)
+    setBotmuxYamlTrustPrompt(null)
   }, [])
 
   useEffect(() => {
@@ -2888,8 +2892,8 @@ export default function MobileTasksScreen() {
       defaultRepoSelectionRef.current = null
       repoSelectionHydratedRef.current = false
       setRuntimeTaskSettings({})
-      setTrustedOrcaHooks({})
-      setOrcaYamlTrustPrompt(null)
+      setTrustedBotmuxHooks({})
+      setBotmuxYamlTrustPrompt(null)
       setGithubProjectHiddenFieldIdsByView({})
       setTaskStateHydrated(false)
       setTasksSupportState({ kind: 'unknown', client: null })
@@ -2917,7 +2921,7 @@ export default function MobileTasksScreen() {
       setPendingGitHubProjectViewSelection(null)
       setActionItem(null)
       setProjectRowItem(null)
-      setProjectRepoNotInOrca(null)
+      setProjectRepoNotInBotmux(null)
       setDetailPayload(null)
       setProjectRowDetail(null)
       setShowCreateTask(false)
@@ -2959,7 +2963,7 @@ export default function MobileTasksScreen() {
     setPendingGitHubProjectViewSelection(null)
     setActionItem(null)
     setProjectRowItem(null)
-    setProjectRepoNotInOrca(null)
+    setProjectRepoNotInBotmux(null)
     setDetailPayload(null)
     setProjectRowDetail(null)
     setShowCreateTask(false)
@@ -3012,7 +3016,7 @@ export default function MobileTasksScreen() {
         setPendingGitHubProjectViewSelection(null)
         setActionItem(null)
         setProjectRowItem(null)
-        setProjectRepoNotInOrca(null)
+        setProjectRepoNotInBotmux(null)
         setDetailPayload(null)
         setProjectRowDetail(null)
         setShowCreateTask(false)
@@ -3024,7 +3028,7 @@ export default function MobileTasksScreen() {
         setMergeMethodTaskItem(null)
         setMergeMethodProjectRow(null)
         resetWorkspaceCreateState()
-        setError('Update Orca desktop to use Tasks on mobile.')
+        setError('Update Botmux desktop to use Tasks on mobile.')
         setTaskStateHydrated(false)
         return
       }
@@ -3051,12 +3055,12 @@ export default function MobileTasksScreen() {
             uiResponse.result as {
               ui?: {
                 taskResumeState?: TaskResumeState
-                trustedOrcaHooks?: PersistedTrustedOrcaHooks
+                trustedBotmuxHooks?: PersistedTrustedBotmuxHooks
               }
             }
           ).ui
         : null
-      setTrustedOrcaHooks(uiState?.trustedOrcaHooks ?? {})
+      setTrustedBotmuxHooks(uiState?.trustedBotmuxHooks ?? {})
       const resume = uiState?.taskResumeState ?? {}
       taskResumeRef.current = resume
       setGithubProjectHiddenFieldIdsByView(resume.githubProjectHiddenFieldIdsByView ?? {})
@@ -3891,7 +3895,7 @@ export default function MobileTasksScreen() {
           return
         }
         if (explicitView && explicitView.layout !== 'TABLE_LAYOUT') {
-          throw new Error("Orca doesn't support this GitHub Project layout yet.")
+          throw new Error("Botmux doesn't support this GitHub Project layout yet.")
         }
         if (!explicitView && !rememberedView) {
           // Why: desktop asks which Project view to open the first time a project
@@ -4892,7 +4896,7 @@ export default function MobileTasksScreen() {
     setWorkspaceSparseSaving(false)
     setWorkspaceAgentOverridden(false)
     setWorkspaceAgent(null)
-    setOrcaYamlTrustPrompt(null)
+    setBotmuxYamlTrustPrompt(null)
     setShowWorkspaceAgentPicker(false)
     setShowWorkspaceCreateRepoPicker(false)
     setShowWorkspaceAdvanced(false)
@@ -5481,16 +5485,16 @@ export default function MobileTasksScreen() {
           setupResolution.setupTrust &&
           setupResolution.setupTrust.contentHash !== approvedSetupContentHash &&
           !isSetupHookTrusted(
-            trustedOrcaHooks,
+            trustedBotmuxHooks,
             targetRepo.id,
             setupResolution.setupTrust.contentHash
           )
         ) {
-          // Why: desktop prompts before running repo-owned orca.yaml hooks. Mobile
+          // Why: desktop prompts before running repo-owned botmux.yaml hooks. Mobile
           // stores the same trust hash in persisted UI state so either surface can
           // approve the script version for future workspace creates.
           setSetupPrompt(null)
-          setOrcaYamlTrustPrompt({
+          setBotmuxYamlTrustPrompt({
             item,
             ...(repoIdOverride ? { repoIdOverride } : {}),
             setupOverride: 'run',
@@ -5504,7 +5508,7 @@ export default function MobileTasksScreen() {
             repoName: targetRepo.displayName,
             scriptContent: setupResolution.setupTrust.scriptContent,
             contentHash: setupResolution.setupTrust.contentHash,
-            previouslyApproved: wasSetupHookPreviouslyApproved(trustedOrcaHooks, targetRepo.id)
+            previouslyApproved: wasSetupHookPreviouslyApproved(trustedBotmuxHooks, targetRepo.id)
           })
           return
         }
@@ -5647,7 +5651,7 @@ export default function MobileTasksScreen() {
       runtimeTaskSettings,
       taskStateHydrated,
       tasksSupported,
-      trustedOrcaHooks,
+      trustedBotmuxHooks,
       workspaceDetectedAgentIds
     ]
   )
@@ -5660,12 +5664,12 @@ export default function MobileTasksScreen() {
       const kind = projectRowType(row)
       const repo = findProjectRowRepo(row)
       if (!kind || !row.content.number || !row.content.url) {
-        setError('Add the project item repository to Orca before creating a workspace.')
+        setError('Add the project item repository to Botmux before creating a workspace.')
         return
       }
       if (!repo) {
         const slug = splitRepositorySlug(row.content.repository)
-        setProjectRepoNotInOrca({
+        setProjectRepoNotInBotmux({
           owner: slug?.owner ?? 'Unknown',
           repo: slug?.repo ?? row.content.repository ?? 'repository',
           url: row.content.url ?? null
@@ -8234,7 +8238,7 @@ export default function MobileTasksScreen() {
                 disabled={mutatingStatus || !(itemReplyDrafts[String(comment.id)] ?? '').trim()}
                 onPress={() => void replyToGitHubComment(actionItem, comment)}
               >
-                <Text style={styles.inlineSaveText}>Reply</Text>
+                <Text style={styles.inlineSaveText}>{t('Reply')}</Text>
               </Pressable>
             </>
           ) : null}
@@ -8660,14 +8664,14 @@ export default function MobileTasksScreen() {
   })
   const emptyLabel =
     connState !== 'connected'
-      ? 'Connect to a host to load tasks'
+      ? t('Connect to a host to load tasks')
       : query
-        ? 'No matching tasks'
+        ? t('No matching tasks')
         : provider === 'github'
-          ? 'No GitHub tasks'
+          ? t('No GitHub tasks')
           : provider === 'gitlab'
-            ? 'No GitLab tasks'
-            : 'No Linear tasks'
+            ? t('No GitLab tasks')
+            : t('No Linear tasks')
   const isGithubProjectSearch = provider === 'github' && githubMode === 'project'
 
   return (
@@ -8679,7 +8683,7 @@ export default function MobileTasksScreen() {
           </Pressable>
           <View style={styles.titleWrap}>
             <StatusDot state={connState} verdict={headerVerdict} />
-            <Text style={styles.title}>Tasks</Text>
+            <Text style={styles.title}>{t('Tasks')}</Text>
           </View>
           <Pressable
             style={styles.iconButton}
@@ -8810,7 +8814,7 @@ export default function MobileTasksScreen() {
                       }}
                     >
                       <Text style={styles.segmentSecondaryText}>
-                        Source: {githubIssueSourceLabel}
+                        {t('Source: {{source}}', { source: githubIssueSourceLabel })}
                       </Text>
                     </Pressable>
                   ) : null}
@@ -8857,7 +8861,7 @@ export default function MobileTasksScreen() {
                       }}
                     >
                       <Text style={styles.segmentSecondaryText}>
-                        Sort: {githubProjectSortLabel}
+                        {t('Sort: {{sort}}', { sort: githubProjectSortLabel })}
                       </Text>
                     </Pressable>
                   ) : null}
@@ -8873,7 +8877,7 @@ export default function MobileTasksScreen() {
                       }}
                     >
                       <Text style={styles.segmentSecondaryText}>
-                        Fields: {githubProjectFieldsLabel}
+                        {t('Fields: {{fields}}', { fields: githubProjectFieldsLabel })}
                       </Text>
                     </Pressable>
                   ) : null}
@@ -8887,7 +8891,7 @@ export default function MobileTasksScreen() {
                   {selectedGitHubProjectViewUrl ? (
                     <Pressable
                       accessibilityRole="button"
-                      accessibilityLabel="Open view in GitHub"
+                      accessibilityLabel={t('Open view in GitHub')}
                       style={styles.segmentIconButton}
                       disabled={!taskUiReady}
                       onPress={() => {
@@ -8918,7 +8922,7 @@ export default function MobileTasksScreen() {
                 }}
               >
                 <Text style={styles.segmentSecondaryText}>
-                  {gitlabView === 'project' ? 'Project MRs' : 'My Todos'}
+                  {t(gitlabView === 'project' ? 'Project MRs' : 'My Todos')}
                 </Text>
               </Pressable>
               {gitlabView === 'project' && (
@@ -9000,7 +9004,9 @@ export default function MobileTasksScreen() {
                   setShowLinearGroupPicker(true)
                 }}
               >
-                <Text style={styles.segmentSecondaryText}>Group: {linearGroupLabel}</Text>
+                <Text style={styles.segmentSecondaryText}>
+                  {t('Group: {{group}}', { group: linearGroupLabel })}
+                </Text>
               </Pressable>
               <Pressable
                 style={styles.segmentButton}
@@ -9012,7 +9018,9 @@ export default function MobileTasksScreen() {
                   setShowLinearOrderPicker(true)
                 }}
               >
-                <Text style={styles.segmentSecondaryText}>Order: {linearOrderLabel}</Text>
+                <Text style={styles.segmentSecondaryText}>
+                  {t('Order: {{order}}', { order: linearOrderLabel })}
+                </Text>
               </Pressable>
               <Pressable
                 style={styles.segmentButton}
@@ -9024,7 +9032,7 @@ export default function MobileTasksScreen() {
                   setShowLinearDisplayPicker(true)
                 }}
               >
-                <Text style={styles.segmentSecondaryText}>Display</Text>
+                <Text style={styles.segmentSecondaryText}>{t('Display')}</Text>
               </Pressable>
             </>
           )}
@@ -9041,7 +9049,9 @@ export default function MobileTasksScreen() {
               }}
             >
               <GitBranch size={14} color={colors.textSecondary} />
-              <Text style={styles.segmentSecondaryText}>Sort: {sortLabel}</Text>
+              <Text style={styles.segmentSecondaryText}>
+                {t('Sort: {{sort}}', { sort: sortLabel })}
+              </Text>
             </Pressable>
           ) : null}
         </ScrollView>
@@ -9054,8 +9064,8 @@ export default function MobileTasksScreen() {
               onChangeText={isGithubProjectSearch ? setGithubProjectSearch : setQuery}
               placeholder={
                 isGithubProjectSearch
-                  ? 'Search project view...'
-                  : `Search ${providerLabel} tasks...`
+                  ? t('Search project view...')
+                  : t('Search {{provider}} tasks...', { provider: providerLabel })
               }
               // Why: GitHub items seed the field with a preset query, so a bare
               // value.length check would always show clear. Project mode shows clear
@@ -9143,8 +9153,9 @@ export default function MobileTasksScreen() {
               style={styles.sourceNoticeBanner}
             >
               <Text style={styles.sourceNoticeText}>
-                Preferred issue source upstream is unavailable for {fallback.repoLabel}. Using
-                origin.
+                {t('Preferred issue source upstream is unavailable for {{repo}}. Using origin.', {
+                  repo: fallback.repoLabel
+                })}
               </Text>
             </View>
           ))
@@ -9160,11 +9171,9 @@ export default function MobileTasksScreen() {
               >
                 <View style={styles.sourceErrorCopy}>
                   <Text style={styles.sourceErrorText}>
-                    Couldn't load issues from{' '}
-                    <Text style={styles.sourceErrorSlug}>
-                      {sourceError.source.owner}/{sourceError.source.repo}
-                    </Text>
-                    .
+                    {t("Couldn't load issues from {{source}}.", {
+                      source: `${sourceError.source.owner}/${sourceError.source.repo}`
+                    })}
                   </Text>
                   <Text style={styles.sourceErrorMessage} numberOfLines={2}>
                     {sourceError.message}
@@ -9172,13 +9181,15 @@ export default function MobileTasksScreen() {
                 </View>
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel={`Retry loading issues from ${sourceError.source.owner}/${sourceError.source.repo}`}
+                  accessibilityLabel={t('Retry loading issues from {{source}}', {
+                    source: `${sourceError.source.owner}/${sourceError.source.repo}`
+                  })}
                   style={styles.sourceErrorRetry}
                   disabled={loading || isRetrying}
                   onPress={() => void retryGitHubIssueSourceFetch(sourceError.repoPath)}
                 >
                   <Text style={styles.sourceErrorRetryText}>
-                    {isRetrying ? 'Retrying...' : 'Retry'}
+                    {t(isRetrying ? 'Retrying...' : 'Retry')}
                   </Text>
                 </Pressable>
               </View>
@@ -9193,7 +9204,7 @@ export default function MobileTasksScreen() {
         <View style={styles.projectDataNotice}>
           <AlertTriangle size={15} color={colors.statusAmber} />
           <Text style={styles.projectDataNoticeText}>
-            Sub-issue data is unavailable for your token.
+            {t('Sub-issue data is unavailable for your token.')}
           </Text>
         </View>
       ) : null}
@@ -9201,9 +9212,9 @@ export default function MobileTasksScreen() {
       {!tasksSupported ? (
         tasksUnsupported ? (
           <View style={styles.centered}>
-            <Text style={styles.emptyText}>Update Orca desktop</Text>
+            <Text style={styles.emptyText}>{t('Update Botmux desktop')}</Text>
             <Text style={styles.centeredHint}>
-              This mobile Tasks view needs a newer desktop runtime.
+              {t('This mobile Tasks view needs a newer desktop runtime.')}
             </Text>
           </View>
         ) : (
@@ -9214,9 +9225,9 @@ export default function MobileTasksScreen() {
       ) : provider === 'linear' && !linearConnected ? (
         <View style={styles.centered}>
           <TaskProviderLogo provider="linear" size={32} color={colors.textSecondary} />
-          <Text style={styles.emptyText}>Connect your Linear account</Text>
+          <Text style={styles.emptyText}>{t('Connect your Linear account')}</Text>
           <Text style={styles.centeredHint}>
-            Browse and start work on your assigned Linear issues directly from Tasks.
+            {t('Browse and start work on your assigned Linear issues directly from Tasks.')}
           </Text>
           <Pressable
             style={[styles.targetButton, styles.centerActionButton]}
@@ -9231,7 +9242,7 @@ export default function MobileTasksScreen() {
               setShowLinearConnect(true)
             }}
           >
-            <Text style={styles.targetButtonText}>Connect Linear</Text>
+            <Text style={styles.targetButtonText}>{t('Connect Linear')}</Text>
           </Pressable>
         </View>
       ) : provider === 'github' && githubMode === 'project' ? (
@@ -9241,7 +9252,7 @@ export default function MobileTasksScreen() {
           </View>
         ) : !activeGitHubProject ? (
           <View style={styles.centered}>
-            <Text style={styles.emptyText}>Choose a GitHub project</Text>
+            <Text style={styles.emptyText}>{t('Choose a GitHub project')}</Text>
             <Pressable
               style={[styles.targetButton, styles.centerActionButton]}
               disabled={!taskUiReady}
@@ -9252,7 +9263,7 @@ export default function MobileTasksScreen() {
                 setShowGitHubProjectPicker(true)
               }}
             >
-              <Text style={styles.targetButtonText}>Browse projects</Text>
+              <Text style={styles.targetButtonText}>{t('Browse projects')}</Text>
             </Pressable>
           </View>
         ) : githubProjectError ? (
@@ -9265,7 +9276,7 @@ export default function MobileTasksScreen() {
           </View>
         ) : !githubProjectTable || visibleGitHubProjectRows.length === 0 ? (
           <View style={styles.centered}>
-            <Text style={styles.emptyText}>No project items</Text>
+            <Text style={styles.emptyText}>{t('No project items')}</Text>
           </View>
         ) : (
           <FlatList
@@ -9820,8 +9831,8 @@ export default function MobileTasksScreen() {
         onClose={() => setShowRepoPicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>Repositories</Text>
-          <Text style={styles.sheetSubtitle}>Choose which repositories to query.</Text>
+          <Text style={styles.sheetTitle}>{t('Repositories')}</Text>
+          <Text style={styles.sheetSubtitle}>{t('Choose which repositories to query.')}</Text>
         </View>
 
         <View style={styles.repoPickerGroup}>
@@ -9834,7 +9845,7 @@ export default function MobileTasksScreen() {
             }}
           >
             <View style={styles.repoPickerTextWrap}>
-              <Text style={styles.repoPickerTitle}>All repositories</Text>
+              <Text style={styles.repoPickerTitle}>{t('All repositories')}</Text>
               <Text style={styles.repoPickerSubtitle}>{repositoryCount(hostedRepos.length)}</Text>
             </View>
             {selectedRepoIds.size === 0 ? <Check size={15} color={colors.textPrimary} /> : null}
@@ -9876,7 +9887,7 @@ export default function MobileTasksScreen() {
         onClose={() => setShowGitHubIssueSourcePicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>GitHub Issue Sources</Text>
+          <Text style={styles.sheetTitle}>{t('GitHub Issue Sources')}</Text>
           <Text style={styles.sheetSubtitle}>
             Choose whether each repository queries and creates work from upstream or origin.
           </Text>
@@ -9885,7 +9896,7 @@ export default function MobileTasksScreen() {
         <View style={styles.repoPickerGroup}>
           {githubIssueSourceRows.length === 0 ? (
             <View style={styles.drawerLoadingRow}>
-              <Text style={styles.detailMuted}>No alternate issue sources available.</Text>
+              <Text style={styles.detailMuted}>{t('No alternate issue sources available.')}</Text>
             </View>
           ) : (
             githubIssueSourceRows.map(({ repo, sources }, index) => {
@@ -10002,8 +10013,10 @@ export default function MobileTasksScreen() {
         onClose={() => setShowGitHubPagePicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>GitHub Pages</Text>
-          <Text style={styles.sheetSubtitle}>Jump to a loaded or available result page.</Text>
+          <Text style={styles.sheetTitle}>{t('GitHub Pages')}</Text>
+          <Text style={styles.sheetSubtitle}>
+            {t('Jump to a loaded or available result page.')}
+          </Text>
         </View>
         <ScrollView style={styles.pagePickerList}>
           {githubPagePickerPages.map((index) => {
@@ -10037,8 +10050,8 @@ export default function MobileTasksScreen() {
         onClose={() => setShowGitHubProjectPicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>GitHub Projects</Text>
-          <Text style={styles.sheetSubtitle}>Choose a project view for the Tasks page.</Text>
+          <Text style={styles.sheetTitle}>{t('GitHub Projects')}</Text>
+          <Text style={styles.sheetSubtitle}>{t('Choose a project view for the Tasks page.')}</Text>
         </View>
 
         <View style={styles.projectPickerControls}>
@@ -10046,7 +10059,7 @@ export default function MobileTasksScreen() {
             style={styles.input}
             value={githubProjectPickerSearch}
             onChangeText={setGithubProjectPickerSearch}
-            placeholder="Search projects"
+            placeholder={t('Search projects')}
             placeholderTextColor={colors.textMuted}
             autoCapitalize="none"
             autoCorrect={false}
@@ -10126,15 +10139,15 @@ export default function MobileTasksScreen() {
               }
             >
               <View style={styles.repoPickerTextWrap}>
-                <Text style={styles.repoPickerTitle}>No projects loaded</Text>
-                <Text style={styles.repoPickerSubtitle}>Tap to retry.</Text>
+                <Text style={styles.repoPickerTitle}>{t('No projects loaded')}</Text>
+                <Text style={styles.repoPickerSubtitle}>{t('Tap to retry.')}</Text>
               </View>
             </Pressable>
           ) : (
             <>
               {pinnedGitHubProjects.length > 0 ? (
                 <>
-                  <Text style={styles.linearStatesTitle}>Pinned</Text>
+                  <Text style={styles.linearStatesTitle}>{t('Pinned')}</Text>
                   {pinnedGitHubProjects.map((project, index) => {
                     const key = githubProjectKey(project)
                     const selected =
@@ -10169,7 +10182,7 @@ export default function MobileTasksScreen() {
                               })
                             }}
                           >
-                            <Text style={styles.inlineSaveText}>Remove</Text>
+                            <Text style={styles.inlineSaveText}>{t('Remove')}</Text>
                           </Pressable>
                           {selected ? <Check size={15} color={colors.textPrimary} /> : null}
                         </Pressable>
@@ -10181,7 +10194,7 @@ export default function MobileTasksScreen() {
 
               {recentGitHubProjects.length > 0 ? (
                 <>
-                  <Text style={styles.linearStatesTitle}>Recent</Text>
+                  <Text style={styles.linearStatesTitle}>{t('Recent')}</Text>
                   {recentGitHubProjects.map((project, index) => {
                     const key = githubProjectKey(project)
                     const selected =
@@ -10222,7 +10235,7 @@ export default function MobileTasksScreen() {
                                 })
                               }}
                             >
-                              <Text style={styles.inlineSaveText}>Pin</Text>
+                              <Text style={styles.inlineSaveText}>{t('Pin')}</Text>
                             </Pressable>
                           ) : null}
                           {selected ? <Check size={15} color={colors.textPrimary} /> : null}
@@ -10282,7 +10295,7 @@ export default function MobileTasksScreen() {
         onSelect={(viewId) => {
           const view = githubProjectViews.find((candidate) => candidate.id === viewId)
           if (view && view.layout !== 'TABLE_LAYOUT') {
-            setGithubProjectError("Orca doesn't support this GitHub Project layout yet.")
+            setGithubProjectError("Botmux doesn't support this GitHub Project layout yet.")
             return
           }
           if (pendingGitHubProjectViewSelection) {
@@ -10331,14 +10344,16 @@ export default function MobileTasksScreen() {
         onClose={() => setShowGitHubProjectFieldsPicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>Project Fields</Text>
+          <Text style={styles.sheetTitle}>{t('Project Fields')}</Text>
           <Text style={styles.sheetSubtitle}>
             Choose which Project fields appear on item cards.
           </Text>
         </View>
         <View style={styles.repoPickerGroup}>
           {githubProjectAvailableSummaryFields.length === 0 ? (
-            <Text style={styles.repoPickerSubtitle}>This view has no extra fields to show.</Text>
+            <Text style={styles.repoPickerSubtitle}>
+              {t('This view has no extra fields to show.')}
+            </Text>
           ) : (
             githubProjectAvailableSummaryFields.map((field, index) => {
               const visible = !githubProjectHiddenFieldIds.has(field.id)
@@ -10432,8 +10447,8 @@ export default function MobileTasksScreen() {
         onClose={() => setShowLinearTeamPicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>Linear Teams</Text>
-          <Text style={styles.sheetSubtitle}>Choose which teams appear in Tasks.</Text>
+          <Text style={styles.sheetTitle}>{t('Linear Teams')}</Text>
+          <Text style={styles.sheetSubtitle}>{t('Choose which teams appear in Tasks.')}</Text>
         </View>
         <View style={styles.repoPickerGroup}>
           <Pressable
@@ -10445,7 +10460,7 @@ export default function MobileTasksScreen() {
             }}
           >
             <View style={styles.repoPickerTextWrap}>
-              <Text style={styles.repoPickerTitle}>All teams</Text>
+              <Text style={styles.repoPickerTitle}>{t('All teams')}</Text>
               <Text style={styles.repoPickerSubtitle}>{linearTeams.length} teams</Text>
             </View>
             {selectedLinearTeamIds.size === linearTeams.length ? (
@@ -10496,7 +10511,7 @@ export default function MobileTasksScreen() {
         zIndex={TASK_SECONDARY_DRAWER_Z_INDEX}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>Change Status</Text>
+          <Text style={styles.sheetTitle}>{t('Change Status')}</Text>
           <Text style={styles.sheetSubtitle}>
             {linearStatusPickerItem?.source.identifier ?? 'Linear issue'}
           </Text>
@@ -10505,10 +10520,10 @@ export default function MobileTasksScreen() {
           {linearStatesLoading ? (
             <View style={styles.detailLoadingInline}>
               <ActivityIndicator size="small" color={colors.textSecondary} />
-              <Text style={styles.detailMuted}>Loading states...</Text>
+              <Text style={styles.detailMuted}>{t('Loading states...')}</Text>
             </View>
           ) : linearStates.length === 0 ? (
-            <Text style={styles.emptyInlineText}>No states available</Text>
+            <Text style={styles.emptyInlineText}>{t('No states available')}</Text>
           ) : (
             linearStates.map((state, index) => {
               const selected =
@@ -10584,7 +10599,7 @@ export default function MobileTasksScreen() {
         onClose={() => setShowLinearDisplayPicker(false)}
       >
         <View style={styles.sheetHeader}>
-          <Text style={styles.sheetTitle}>Display Properties</Text>
+          <Text style={styles.sheetTitle}>{t('Display Properties')}</Text>
         </View>
         <View style={styles.repoPickerGroup}>
           {LINEAR_DISPLAY_OPTIONS.map((property, index) => {
@@ -10687,7 +10702,7 @@ export default function MobileTasksScreen() {
           selectedCreateRepo &&
           hasGitHubIssueSourceChoice(selectedCreateGitHubSources) ? (
             <View style={styles.issueSourceBox}>
-              <Text style={styles.fieldLabel}>Issue source</Text>
+              <Text style={styles.fieldLabel}>{t('Issue source')}</Text>
               <Text style={styles.issueSourceHint} numberOfLines={2}>
                 File in{' '}
                 {selectedCreateIssuePreference === 'origin'
@@ -10731,7 +10746,7 @@ export default function MobileTasksScreen() {
             </View>
           ) : null}
 
-          <Text style={styles.fieldLabel}>Title</Text>
+          <Text style={styles.fieldLabel}>{t('Title')}</Text>
           <TextInput
             style={styles.input}
             value={createTitle}
@@ -10742,7 +10757,7 @@ export default function MobileTasksScreen() {
             returnKeyType="next"
           />
 
-          <Text style={styles.fieldLabel}>Description</Text>
+          <Text style={styles.fieldLabel}>{t('Description')}</Text>
           <TextInput
             style={[styles.input, styles.bodyInput]}
             value={createBody}
@@ -10764,7 +10779,7 @@ export default function MobileTasksScreen() {
             {creatingTask ? (
               <ActivityIndicator size="small" color={colors.bgBase} />
             ) : (
-              <Text style={styles.createButtonText}>Create Issue</Text>
+              <Text style={styles.createButtonText}>{t('Create Issue')}</Text>
             )}
           </Pressable>
         </View>
@@ -10800,14 +10815,14 @@ export default function MobileTasksScreen() {
         <View style={styles.sheetHeader}>
           <View style={styles.sheetTitleRow}>
             <TaskProviderLogo provider="linear" size={16} color={colors.textPrimary} />
-            <Text style={styles.sheetTitle}>Connect Linear workspace</Text>
+            <Text style={styles.sheetTitle}>{t('Connect Linear workspace')}</Text>
           </View>
           <Text style={styles.sheetSubtitle}>
             Paste a Personal API key to browse issues from that workspace.
           </Text>
         </View>
         <View style={styles.createForm}>
-          <Text style={styles.fieldLabel}>Personal API key</Text>
+          <Text style={styles.fieldLabel}>{t('Personal API key')}</Text>
           <TextInput
             style={styles.input}
             value={linearApiKeyDraft}
@@ -10854,7 +10869,7 @@ export default function MobileTasksScreen() {
             {linearConnectState === 'connecting' ? (
               <ActivityIndicator size="small" color={colors.bgBase} />
             ) : (
-              <Text style={styles.createButtonText}>Connect</Text>
+              <Text style={styles.createButtonText}>{t('Connect')}</Text>
             )}
           </Pressable>
         </View>
@@ -10883,7 +10898,7 @@ export default function MobileTasksScreen() {
         {workspaceCreateDraft ? (
           <View>
             <View style={styles.sheetHeader}>
-              <Text style={styles.sheetTitle}>Create Workspace</Text>
+              <Text style={styles.sheetTitle}>{t('Create Workspace')}</Text>
               <Text style={styles.sheetSubtitle} numberOfLines={2}>
                 {workspaceCreateDraft.item.title}
               </Text>
@@ -10891,7 +10906,7 @@ export default function MobileTasksScreen() {
 
             <View style={styles.workspaceCreateForm}>
               <View style={styles.workspaceCreateField}>
-                <Text style={styles.workspaceCreateLabel}>Repository</Text>
+                <Text style={styles.workspaceCreateLabel}>{t('Repository')}</Text>
                 <Pressable
                   style={styles.fieldButton}
                   disabled={!workspaceCreateCanPickRepo}
@@ -10927,7 +10942,7 @@ export default function MobileTasksScreen() {
 
               {workspaceCreateTargetConnectionId ? (
                 <View style={styles.workspaceCreateField}>
-                  <Text style={styles.workspaceCreateLabel}>SSH Connection</Text>
+                  <Text style={styles.workspaceCreateLabel}>{t('SSH Connection')}</Text>
                   <View style={styles.sshConnectCard}>
                     <View style={styles.sshStatusRow}>
                       <View
@@ -10974,7 +10989,8 @@ export default function MobileTasksScreen() {
 
               <View style={styles.workspaceCreateField}>
                 <Text style={styles.workspaceCreateLabel}>
-                  Workspace Name <Text style={styles.workspaceCreateLabelHint}>[Optional]</Text>
+                  {t('Workspace Name')}{' '}
+                  <Text style={styles.workspaceCreateLabelHint}>{t('[Optional]')}</Text>
                 </Text>
                 <MobileWorkspaceNameInput
                   style={styles.input}
@@ -10986,7 +11002,7 @@ export default function MobileTasksScreen() {
               </View>
 
               <View style={styles.workspaceCreateField}>
-                <Text style={styles.workspaceCreateLabel}>Agent</Text>
+                <Text style={styles.workspaceCreateLabel}>{t('Agent')}</Text>
                 <Pressable
                   style={[
                     styles.fieldButton,
@@ -11014,7 +11030,7 @@ export default function MobileTasksScreen() {
                 style={styles.workspaceAdvancedToggle}
                 onPress={() => setShowWorkspaceAdvanced((current) => !current)}
               >
-                <Text style={styles.workspaceAdvancedText}>Advanced</Text>
+                <Text style={styles.workspaceAdvancedText}>{t('Advanced')}</Text>
                 {showWorkspaceAdvanced ? (
                   <ChevronUp size={14} color={colors.textSecondary} />
                 ) : (
@@ -11024,7 +11040,7 @@ export default function MobileTasksScreen() {
 
               {showWorkspaceAdvanced ? (
                 <View style={styles.workspaceCreateField}>
-                  <Text style={styles.workspaceCreateLabel}>Start from</Text>
+                  <Text style={styles.workspaceCreateLabel}>{t('Start from')}</Text>
                   <Pressable
                     style={styles.fieldButton}
                     onPress={() => {
@@ -11144,8 +11160,8 @@ export default function MobileTasksScreen() {
       >
         <View>
           <View style={styles.sheetHeader}>
-            <Text style={styles.sheetTitle}>Start From</Text>
-            <Text style={styles.sheetSubtitle}>Pick an existing branch or ref.</Text>
+            <Text style={styles.sheetTitle}>{t('Start From')}</Text>
+            <Text style={styles.sheetSubtitle}>{t('Pick an existing branch or ref.')}</Text>
           </View>
           <View style={styles.detailGroup}>
             <TextInput
@@ -11169,8 +11185,10 @@ export default function MobileTasksScreen() {
                 ) : null}
               </View>
               <View style={styles.pickerContent}>
-                <Text style={styles.pickerLabel}>Default branch</Text>
-                <Text style={styles.pickerSubtitle}>Use this repository's configured base</Text>
+                <Text style={styles.pickerLabel}>{t('Default branch')}</Text>
+                <Text style={styles.pickerSubtitle}>
+                  {t("Use this repository's configured base")}
+                </Text>
               </View>
             </Pressable>
             {workspaceBaseBranchLoading ? (
@@ -11180,7 +11198,7 @@ export default function MobileTasksScreen() {
             ) : workspaceBaseBranchError ? (
               <Text style={styles.detailError}>{workspaceBaseBranchError}</Text>
             ) : workspaceBaseBranchQuery.trim() && workspaceBaseBranchResults.length === 0 ? (
-              <Text style={styles.detailMuted}>No branches match.</Text>
+              <Text style={styles.detailMuted}>{t('No branches match.')}</Text>
             ) : null}
             {workspaceBaseBranchResults.map((branch) => (
               <View key={`${branch.refName}:${branch.localBranchName}`}>
@@ -11220,7 +11238,7 @@ export default function MobileTasksScreen() {
       >
         <View>
           <View style={styles.sheetHeader}>
-            <Text style={styles.sheetTitle}>Sparse Checkout</Text>
+            <Text style={styles.sheetTitle}>{t('Sparse Checkout')}</Text>
           </View>
           <View style={styles.detailGroup}>
             <Pressable
@@ -11236,8 +11254,8 @@ export default function MobileTasksScreen() {
                 ) : null}
               </View>
               <View style={styles.pickerContent}>
-                <Text style={styles.pickerLabel}>Full checkout</Text>
-                <Text style={styles.pickerSubtitle}>Use the whole repository</Text>
+                <Text style={styles.pickerLabel}>{t('Full checkout')}</Text>
+                <Text style={styles.pickerSubtitle}>{t('Use the whole repository')}</Text>
               </View>
             </Pressable>
             {workspaceSparsePresets.map((preset) => (
@@ -11287,7 +11305,7 @@ export default function MobileTasksScreen() {
             disabled={!workspaceSparsePresetsLoaded || workspaceSparsePresetsLoading}
             onPress={startNewWorkspaceSparsePreset}
           >
-            <Text style={styles.inlineSaveText}>New preset</Text>
+            <Text style={styles.inlineSaveText}>{t('New preset')}</Text>
           </Pressable>
         </View>
       </BottomDrawer>
@@ -11310,7 +11328,7 @@ export default function MobileTasksScreen() {
             </View>
             <View style={styles.detailGroup}>
               <View style={styles.detailSection}>
-                <Text style={styles.detailSectionTitle}>Name</Text>
+                <Text style={styles.detailSectionTitle}>{t('Name')}</Text>
                 <TextInput
                   style={styles.input}
                   value={workspaceSparseDraft.name}
@@ -11325,7 +11343,7 @@ export default function MobileTasksScreen() {
                 />
               </View>
               <View style={styles.detailSection}>
-                <Text style={styles.detailSectionTitle}>Directories</Text>
+                <Text style={styles.detailSectionTitle}>{t('Directories')}</Text>
                 <TextInput
                   style={[styles.input, styles.bodyInput, styles.monoInput]}
                   value={workspaceSparseDraft.directoriesText}
@@ -11353,7 +11371,7 @@ export default function MobileTasksScreen() {
                 disabled={workspaceSparseSaving}
                 onPress={() => setWorkspaceSparseDraft(null)}
               >
-                <Text style={styles.secondaryActionText}>Cancel</Text>
+                <Text style={styles.secondaryActionText}>{t('Cancel')}</Text>
               </Pressable>
               <Pressable
                 style={[
@@ -11366,7 +11384,7 @@ export default function MobileTasksScreen() {
                 {workspaceSparseSaving ? (
                   <ActivityIndicator size="small" color={colors.bgBase} />
                 ) : null}
-                <Text style={styles.primaryActionText}>Save</Text>
+                <Text style={styles.primaryActionText}>{t('Save')}</Text>
               </Pressable>
             </View>
           </View>
@@ -11381,7 +11399,7 @@ export default function MobileTasksScreen() {
         {setupPrompt ? (
           <View>
             <View style={styles.sheetHeader}>
-              <Text style={styles.sheetTitle}>Run Setup Script?</Text>
+              <Text style={styles.sheetTitle}>{t('Run Setup Script?')}</Text>
               <Text style={styles.sheetSubtitle}>
                 {setupPrompt.repoName} requires a setup choice before creating this workspace.
               </Text>
@@ -11438,7 +11456,7 @@ export default function MobileTasksScreen() {
                 }
               >
                 <X size={16} color={colors.textPrimary} />
-                <Text style={styles.actionText}>Skip setup and create</Text>
+                <Text style={styles.actionText}>{t('Skip setup and create')}</Text>
               </Pressable>
             </View>
           </View>
@@ -11446,20 +11464,20 @@ export default function MobileTasksScreen() {
       </BottomDrawer>
 
       <BottomDrawer
-        visible={taskUiReady && orcaYamlTrustPrompt != null}
-        onClose={() => setOrcaYamlTrustPrompt(null)}
+        visible={taskUiReady && botmuxYamlTrustPrompt != null}
+        onClose={() => setBotmuxYamlTrustPrompt(null)}
         zIndex={TASK_SECONDARY_DRAWER_Z_INDEX + 1}
       >
-        {orcaYamlTrustPrompt ? (
+        {botmuxYamlTrustPrompt ? (
           <View>
             <View style={styles.sheetHeader}>
               <Text style={styles.sheetTitle}>
-                {orcaYamlTrustPrompt.previouslyApproved
-                  ? `${orcaYamlTrustPrompt.repoName}'s setup script changed`
-                  : `Run setup from ${orcaYamlTrustPrompt.repoName}?`}
+                {botmuxYamlTrustPrompt.previouslyApproved
+                  ? `${botmuxYamlTrustPrompt.repoName}'s setup script changed`
+                  : `Run setup from ${botmuxYamlTrustPrompt.repoName}?`}
               </Text>
               <Text style={styles.sheetSubtitle}>
-                This repository's orca.yaml runs on your machine before the workspace starts. Only
+                This repository's botmux.yaml runs on your machine before the workspace starts. Only
                 run it if you trust this repository.
               </Text>
             </View>
@@ -11467,36 +11485,36 @@ export default function MobileTasksScreen() {
             <View style={styles.setupPromptBox}>
               <View style={styles.detailSectionHeader}>
                 <Text style={styles.detailSectionTitle}>
-                  {orcaYamlTrustPrompt.previouslyApproved ? 'New setup script' : 'Setup script'}
+                  {botmuxYamlTrustPrompt.previouslyApproved ? 'New setup script' : 'Setup script'}
                 </Text>
               </View>
-              <Text style={styles.setupPromptCommand}>{orcaYamlTrustPrompt.scriptContent}</Text>
+              <Text style={styles.setupPromptCommand}>{botmuxYamlTrustPrompt.scriptContent}</Text>
             </View>
 
             <View style={styles.actionGroup}>
               <Pressable
                 style={styles.actionRow}
-                disabled={creatingKey === orcaYamlTrustPrompt.item.key}
+                disabled={creatingKey === botmuxYamlTrustPrompt.item.key}
                 onPress={() =>
                   void (async () => {
                     try {
                       await persistSetupHookTrust(
-                        orcaYamlTrustPrompt.repoId,
-                        orcaYamlTrustPrompt.contentHash,
+                        botmuxYamlTrustPrompt.repoId,
+                        botmuxYamlTrustPrompt.contentHash,
                         false
                       )
-                      setOrcaYamlTrustPrompt(null)
+                      setBotmuxYamlTrustPrompt(null)
                       await createWorkspace(
-                        orcaYamlTrustPrompt.item,
-                        orcaYamlTrustPrompt.repoIdOverride,
+                        botmuxYamlTrustPrompt.item,
+                        botmuxYamlTrustPrompt.repoIdOverride,
                         'run',
-                        orcaYamlTrustPrompt.agentOverride,
-                        orcaYamlTrustPrompt.workspaceNameOverride,
-                        orcaYamlTrustPrompt.noteOverride,
-                        orcaYamlTrustPrompt.baseBranchOverride,
-                        orcaYamlTrustPrompt.branchNameOverride,
-                        orcaYamlTrustPrompt.sparseCheckoutOverride,
-                        orcaYamlTrustPrompt.contentHash
+                        botmuxYamlTrustPrompt.agentOverride,
+                        botmuxYamlTrustPrompt.workspaceNameOverride,
+                        botmuxYamlTrustPrompt.noteOverride,
+                        botmuxYamlTrustPrompt.baseBranchOverride,
+                        botmuxYamlTrustPrompt.branchNameOverride,
+                        botmuxYamlTrustPrompt.sparseCheckoutOverride,
+                        botmuxYamlTrustPrompt.contentHash
                       )
                     } catch (err) {
                       setError(err instanceof Error ? err.message : 'Failed to trust setup script.')
@@ -11505,32 +11523,32 @@ export default function MobileTasksScreen() {
                 }
               >
                 <Check size={16} color={colors.textPrimary} />
-                <Text style={styles.actionText}>Run hooks</Text>
+                <Text style={styles.actionText}>{t('Run hooks')}</Text>
               </Pressable>
               <View style={styles.actionSeparator} />
               <Pressable
                 style={styles.actionRow}
-                disabled={creatingKey === orcaYamlTrustPrompt.item.key}
+                disabled={creatingKey === botmuxYamlTrustPrompt.item.key}
                 onPress={() =>
                   void (async () => {
                     try {
                       await persistSetupHookTrust(
-                        orcaYamlTrustPrompt.repoId,
-                        orcaYamlTrustPrompt.contentHash,
+                        botmuxYamlTrustPrompt.repoId,
+                        botmuxYamlTrustPrompt.contentHash,
                         true
                       )
-                      setOrcaYamlTrustPrompt(null)
+                      setBotmuxYamlTrustPrompt(null)
                       await createWorkspace(
-                        orcaYamlTrustPrompt.item,
-                        orcaYamlTrustPrompt.repoIdOverride,
+                        botmuxYamlTrustPrompt.item,
+                        botmuxYamlTrustPrompt.repoIdOverride,
                         'run',
-                        orcaYamlTrustPrompt.agentOverride,
-                        orcaYamlTrustPrompt.workspaceNameOverride,
-                        orcaYamlTrustPrompt.noteOverride,
-                        orcaYamlTrustPrompt.baseBranchOverride,
-                        orcaYamlTrustPrompt.branchNameOverride,
-                        orcaYamlTrustPrompt.sparseCheckoutOverride,
-                        orcaYamlTrustPrompt.contentHash
+                        botmuxYamlTrustPrompt.agentOverride,
+                        botmuxYamlTrustPrompt.workspaceNameOverride,
+                        botmuxYamlTrustPrompt.noteOverride,
+                        botmuxYamlTrustPrompt.baseBranchOverride,
+                        botmuxYamlTrustPrompt.branchNameOverride,
+                        botmuxYamlTrustPrompt.sparseCheckoutOverride,
+                        botmuxYamlTrustPrompt.contentHash
                       )
                     } catch (err) {
                       setError(err instanceof Error ? err.message : 'Failed to trust setup script.')
@@ -11539,15 +11557,15 @@ export default function MobileTasksScreen() {
                 }
               >
                 <Check size={16} color={colors.textPrimary} />
-                <Text style={styles.actionText}>Always trust and run</Text>
+                <Text style={styles.actionText}>{t('Always trust and run')}</Text>
               </Pressable>
               <View style={styles.actionSeparator} />
               <Pressable
                 style={styles.actionRow}
-                disabled={creatingKey === orcaYamlTrustPrompt.item.key}
+                disabled={creatingKey === botmuxYamlTrustPrompt.item.key}
                 onPress={() => {
-                  const prompt = orcaYamlTrustPrompt
-                  setOrcaYamlTrustPrompt(null)
+                  const prompt = botmuxYamlTrustPrompt
+                  setBotmuxYamlTrustPrompt(null)
                   void createWorkspace(
                     prompt.item,
                     prompt.repoIdOverride,
@@ -11562,7 +11580,7 @@ export default function MobileTasksScreen() {
                 }}
               >
                 <X size={16} color={colors.textPrimary} />
-                <Text style={styles.actionText}>Don't run</Text>
+                <Text style={styles.actionText}>{t("Don't run")}</Text>
               </Pressable>
             </View>
           </View>
@@ -11570,28 +11588,28 @@ export default function MobileTasksScreen() {
       </BottomDrawer>
 
       <BottomDrawer
-        visible={taskUiReady && projectRepoNotInOrca != null}
+        visible={taskUiReady && projectRepoNotInBotmux != null}
         onClose={() => {
-          setProjectRepoNotInOrca(null)
+          setProjectRepoNotInBotmux(null)
         }}
       >
-        {projectRepoNotInOrca ? (
+        {projectRepoNotInBotmux ? (
           <View>
             <View style={styles.sheetHeader}>
-              <Text style={styles.sheetTitle}>Repository not in Orca</Text>
+              <Text style={styles.sheetTitle}>Repository not in Botmux</Text>
               <Text style={styles.sheetSubtitle}>
-                {projectRepoNotInOrca.owner}/{projectRepoNotInOrca.repo} is not added to Orca. Add
-                this repository from the desktop app, then refresh mobile Tasks.
+                {projectRepoNotInBotmux.owner}/{projectRepoNotInBotmux.repo} is not added to Botmux.
+                Add this repository from the desktop app, then refresh mobile Tasks.
               </Text>
             </View>
 
             <View style={styles.actionGroup}>
-              {projectRepoNotInOrca.url ? (
+              {projectRepoNotInBotmux.url ? (
                 <Pressable
                   style={styles.actionRow}
                   onPress={() => {
-                    if (projectRepoNotInOrca.url) {
-                      void Linking.openURL(projectRepoNotInOrca.url)
+                    if (projectRepoNotInBotmux.url) {
+                      void Linking.openURL(projectRepoNotInBotmux.url)
                     }
                   }}
                 >
@@ -11599,20 +11617,20 @@ export default function MobileTasksScreen() {
                   <Text style={styles.actionText}>Open in GitHub</Text>
                 </Pressable>
               ) : null}
-              {projectRepoNotInOrca.url ? <View style={styles.actionSeparator} /> : null}
+              {projectRepoNotInBotmux.url ? <View style={styles.actionSeparator} /> : null}
               <Pressable
                 style={styles.actionRow}
                 onPress={() =>
                   void copyTextToClipboard(
-                    `project-repo:${projectRepoNotInOrca.owner}/${projectRepoNotInOrca.repo}`,
-                    `${projectRepoNotInOrca.owner}/${projectRepoNotInOrca.repo}`
+                    `project-repo:${projectRepoNotInBotmux.owner}/${projectRepoNotInBotmux.repo}`,
+                    `${projectRepoNotInBotmux.owner}/${projectRepoNotInBotmux.repo}`
                   )
                 }
               >
                 <Copy size={16} color={colors.textPrimary} />
                 <Text style={styles.actionText}>
                   {copiedLinkKey ===
-                  `project-repo:${projectRepoNotInOrca.owner}/${projectRepoNotInOrca.repo}`
+                  `project-repo:${projectRepoNotInBotmux.owner}/${projectRepoNotInBotmux.repo}`
                     ? 'Copied'
                     : 'Copy repository'}
                 </Text>
@@ -12648,7 +12666,7 @@ export default function MobileTasksScreen() {
                   </Pressable>
                   {!projectRowHostedRepo ? (
                     <Text style={styles.emptyInlineText}>
-                      Merge requires this repository in Orca.
+                      Merge requires this repository in Botmux.
                     </Text>
                   ) : null}
                 </>

@@ -28,10 +28,10 @@ export function resolveHostedReviewAuthInstruction(provider: HostedReviewProvide
     return 'Run glab auth login'
   }
   if (provider === 'azure-devops') {
-    return 'Set ORCA_AZURE_DEVOPS_TOKEN'
+    return 'Set BOTMUX_AZURE_DEVOPS_TOKEN'
   }
   if (provider === 'gitea') {
-    return 'Set ORCA_GITEA_TOKEN'
+    return 'Set BOTMUX_GITEA_TOKEN'
   }
   return 'Run gh auth login'
 }

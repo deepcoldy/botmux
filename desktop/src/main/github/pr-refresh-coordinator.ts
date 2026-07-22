@@ -445,7 +445,7 @@ function nextVisibleErrorRetryAt(key: string): number {
  * Stamps the auto-retry time onto an error outcome before broadcast so every
  * alias receives identical timing.
  *
- * Why: this only sets `nextAutoRetryAt` (the "OrcaBotmux will retry at {time}" hint).
+ * Why: this only sets `nextAutoRetryAt` (the "Botmux will retry at {time}" hint).
  * It must NOT set `retryDisabledUntil` — that field disables *manual* Retry and
  * is reserved for a real rate-limit gate (the paused/breaker path in
  * `refreshPRNow`, which maps `pausedUntil` into it). Deriving it from ordinary
@@ -984,7 +984,7 @@ export async function refreshPRNow(candidate: GitHubPRRefreshCandidate): Promise
   if (gateUntil > Date.now()) {
     const retryAt = gateUntil
     // Why: the paused broadcast maps `pausedUntil` into the renderer's
-    // `nextAutoRetryAt` ("OrcaBotmux will retry at {time}"), so that auto-retry must be
+    // `nextAutoRetryAt` ("Botmux will retry at {time}"), so that auto-retry must be
     // real. Requeue this candidate at the reset time and wake the drain then —
     // mirroring the background paused path — instead of advertising an automatic
     // retry that was never scheduled (finding 12).

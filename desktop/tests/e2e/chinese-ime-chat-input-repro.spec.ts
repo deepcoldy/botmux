@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { CDPSession, Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   focusActiveTerminalInput,
@@ -106,7 +106,7 @@ function emitState(reason) {
   if (suffixColumns > 0) {
     process.stdout.write('\\x1b[' + suffixColumns + 'D')
   }
-  process.stdout.write('\\x1b]1337;OrcaImeState=' + Buffer.from(JSON.stringify({
+  process.stdout.write('\\x1b]1337;BotmuxImeState=' + Buffer.from(JSON.stringify({
     reason,
     model,
     cursor,
@@ -177,8 +177,8 @@ process.stdin.on('data', handleData)
 
 async function installImeEventProbe(page: Page): Promise<void> {
   await page.evaluate(() => {
-    const targetWindow = window as unknown as { __orcaImeEventLog?: ImeEventLogEntry[] }
-    targetWindow.__orcaImeEventLog = []
+    const targetWindow = window as unknown as { __botmuxImeEventLog?: ImeEventLogEntry[] }
+    targetWindow.__botmuxImeEventLog = []
     const state = window.__store?.getState()
     const worktreeId = state?.activeWorktreeId
     const tabId =
@@ -198,7 +198,7 @@ async function installImeEventProbe(page: Page): Promise<void> {
       const composition = event instanceof CompositionEvent ? event : null
       const keyboard = event instanceof KeyboardEvent ? event : null
       const rect = textarea.getBoundingClientRect()
-      targetWindow.__orcaImeEventLog!.push({
+      targetWindow.__botmuxImeEventLog!.push({
         type: event.type,
         at: performance.now(),
         data: input?.data ?? composition?.data ?? null,
@@ -239,8 +239,8 @@ async function installImeEventProbe(page: Page): Promise<void> {
 
 async function readImeEventLog(page: Page): Promise<ImeEventLogEntry[]> {
   return page.evaluate(() => {
-    const targetWindow = window as unknown as { __orcaImeEventLog?: ImeEventLogEntry[] }
-    return targetWindow.__orcaImeEventLog ?? []
+    const targetWindow = window as unknown as { __botmuxImeEventLog?: ImeEventLogEntry[] }
+    return targetWindow.__botmuxImeEventLog ?? []
   })
 }
 
@@ -381,7 +381,7 @@ async function dispatchOrphanLetterKeyup(session: CDPSession): Promise<void> {
 
 async function dispatchSogouEmptyCompositionUpdate(page: Page): Promise<void> {
   // Why: Sogou/fcitx emits empty compositionupdate data while its candidate
-  // popup is still open (#6765); OrcaBotmux's tracker must not flip inactive on it.
+  // popup is still open (#6765); Botmux's tracker must not flip inactive on it.
   await page.evaluate(() => {
     const active = document.activeElement
     if (!(active instanceof HTMLTextAreaElement)) {
@@ -393,7 +393,7 @@ async function dispatchSogouEmptyCompositionUpdate(page: Page): Promise<void> {
 
 async function dispatchSogouPostCompositionEnd(page: Page, data: string): Promise<void> {
   // Why: some Sogou/fcitx traces deliver the plain selector key after
-  // compositionend; target the terminal element so OrcaBotmux's tracker sees the end
+  // compositionend; target the terminal element so Botmux's tracker sees the end
   // without making xterm finalize a synthetic preedit string.
   await page.evaluate((data) => {
     const active = document.activeElement
@@ -480,67 +480,67 @@ async function launchCodexTui(page: Page, ptyId: string): Promise<void> {
 
 test.describe('Chinese IME terminal chat input repro', () => {
   test('keeps composed Chinese text, cursor movement, and Backspace stable in the agent input surface', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-chinese-ime-harness-${runId}.cjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-chinese-ime-harness-${runId}.cjs`)
     writeFileSync(scriptPath, terminalImeHarnessScript(runId))
-    const session = await orcaBotmuxPage.context().newCDPSession(orcaBotmuxPage)
+    const session = await botmuxPage.context().newCDPSession(botmuxPage)
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, `IME_HARNESS_READY_${runId}`, 10_000, 20_000)
-      await focusActiveTerminalInput(orcaBotmuxPage)
-      await installImeEventProbe(orcaBotmuxPage)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await waitForTerminalOutput(botmuxPage, `IME_HARNESS_READY_${runId}`, 10_000, 20_000)
+      await focusActiveTerminalInput(botmuxPage)
+      await installImeEventProbe(botmuxPage)
 
       await dispatchImeProcessKey(session, 'KeyN')
-      await composeAndCommitChineseText(session, orcaBotmuxPage, ['n', 'ni', '你', '你好'], '你好')
-      await waitForLivePrompt(orcaBotmuxPage, '你好')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'after-compose-hello')
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await composeAndCommitChineseText(session, botmuxPage, ['n', 'ni', '你', '你好'], '你好')
+      await waitForLivePrompt(botmuxPage, '你好')
+      await attachImeEvidence(botmuxPage, testInfo, 'after-compose-hello')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'first submitted prompt did not match the composed Chinese text'
         })
         .toBe('你好')
 
       await commitImeText(session, '一二三四五六七八九十')
-      await waitForLivePrompt(orcaBotmuxPage, '一二三四五六七八九十')
+      await waitForLivePrompt(botmuxPage, '一二三四五六七八九十')
       for (let index = 0; index < 5; index += 1) {
-        await orcaBotmuxPage.keyboard.press('ArrowLeft')
+        await botmuxPage.keyboard.press('ArrowLeft')
       }
       await dispatchImeProcessKey(session, 'KeyZ')
-      await composeAndCommitChineseText(session, orcaBotmuxPage, ['z', 'zh', '中'], '中')
-      await waitForLivePrompt(orcaBotmuxPage, '一二三四五中六七八九十')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'after-middle-insert')
+      await composeAndCommitChineseText(session, botmuxPage, ['z', 'zh', '中'], '中')
+      await waitForLivePrompt(botmuxPage, '一二三四五中六七八九十')
+      await attachImeEvidence(botmuxPage, testInfo, 'after-middle-insert')
 
       await setImeComposition(session, 'x')
-      await orcaBotmuxPage.keyboard.press('Backspace')
-      await waitForLivePrompt(orcaBotmuxPage, '一二三四五中六七八九十')
+      await botmuxPage.keyboard.press('Backspace')
+      await waitForLivePrompt(botmuxPage, '一二三四五中六七八九十')
       await setImeComposition(session, '')
       await commitImeText(session, '')
 
-      await orcaBotmuxPage.keyboard.press('Backspace')
-      await waitForLivePrompt(orcaBotmuxPage, '一二三四五六七八九十')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'after-single-backspace')
+      await botmuxPage.keyboard.press('Backspace')
+      await waitForLivePrompt(botmuxPage, '一二三四五六七八九十')
+      await attachImeEvidence(botmuxPage, testInfo, 'after-single-backspace')
 
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'second submitted prompt did not match the visible Chinese text'
         })
         .toBe('一二三四五六七八九十')
 
-      const log = await readImeEventLog(orcaBotmuxPage)
+      const log = await readImeEventLog(botmuxPage)
       expect(
         log.some((entry) => entry.type === 'compositionstart'),
         'CDP IME path should exercise Chromium/xterm composition events'
@@ -554,26 +554,26 @@ test.describe('Chinese IME terminal chat input repro', () => {
         'Backspace should be observable for both the composition and single-delete assertions'
       ).toBe(2)
     } finally {
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'final-ime-evidence').catch(() => undefined)
+      await attachImeEvidence(botmuxPage, testInfo, 'final-ime-evidence').catch(() => undefined)
       await session.detach().catch(() => undefined)
-      await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+      await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       rmSync(scriptPath, { force: true })
     }
   })
 
   test('keeps Sogou-style candidate selection keys out of the PTY while committing Chinese text', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
-    await reloadWithLinuxImePolicy(orcaBotmuxPage)
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await reloadWithLinuxImePolicy(botmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-sogou-ime-harness-${runId}.cjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-sogou-ime-harness-${runId}.cjs`)
     let session: CDPSession | null = null
     let harnessStarted = false
 
@@ -581,29 +581,29 @@ test.describe('Chinese IME terminal chat input repro', () => {
       // Why: create the session/harness inside the try so a mid-setup throw
       // still hits finally and removes the harness script.
       writeFileSync(scriptPath, terminalImeHarnessScript(runId))
-      session = await orcaBotmuxPage.context().newCDPSession(orcaBotmuxPage)
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      session = await botmuxPage.context().newCDPSession(botmuxPage)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       harnessStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `IME_HARNESS_READY_${runId}`, 10_000, 20_000)
-      await focusActiveTerminalInput(orcaBotmuxPage)
-      await installImeEventProbe(orcaBotmuxPage)
+      await waitForTerminalOutput(botmuxPage, `IME_HARNESS_READY_${runId}`, 10_000, 20_000)
+      await focusActiveTerminalInput(botmuxPage)
+      await installImeEventProbe(botmuxPage)
 
       // Space selects the first candidate. Sogou keeps emitting empty
       // compositionupdate frames while the popup is open, and the plain Space
       // press arrives around the commit rather than as a Process/229 key.
       await setImeComposition(session, 'n')
-      await orcaBotmuxPage.waitForTimeout(80)
+      await botmuxPage.waitForTimeout(80)
       await setImeComposition(session, 'ni')
-      await orcaBotmuxPage.waitForTimeout(80)
-      await dispatchSogouEmptyCompositionUpdate(orcaBotmuxPage)
+      await botmuxPage.waitForTimeout(80)
+      await dispatchSogouEmptyCompositionUpdate(botmuxPage)
       await dispatchCandidateSelectionKey(session, { key: ' ', code: 'Space', keyCode: 32 }, () =>
         commitImeText(session, '你')
       )
-      await waitForLivePrompt(orcaBotmuxPage, '你')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'sogou-after-space-commit')
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await waitForLivePrompt(botmuxPage, '你')
+      await attachImeEvidence(botmuxPage, testInfo, 'sogou-after-space-commit')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'space-selected candidate did not submit the committed Chinese character'
         })
@@ -612,16 +612,16 @@ test.describe('Chinese IME terminal chat input repro', () => {
       // Digit selects a non-first candidate for a word/phrase commit — the
       // #7543 shape where only the number used to reach the TUI.
       await setImeComposition(session, 'nihao')
-      await orcaBotmuxPage.waitForTimeout(80)
-      await dispatchSogouEmptyCompositionUpdate(orcaBotmuxPage)
+      await botmuxPage.waitForTimeout(80)
+      await dispatchSogouEmptyCompositionUpdate(botmuxPage)
       await dispatchCandidateSelectionKey(session, { key: '2', code: 'Digit2', keyCode: 50 }, () =>
         commitImeText(session, '你好')
       )
-      await waitForLivePrompt(orcaBotmuxPage, '你好')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'sogou-after-digit-commit')
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await waitForLivePrompt(botmuxPage, '你好')
+      await attachImeEvidence(botmuxPage, testInfo, 'sogou-after-digit-commit')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'digit-selected candidate did not submit the committed Chinese phrase'
         })
@@ -629,16 +629,16 @@ test.describe('Chinese IME terminal chat input repro', () => {
 
       // Post-composition traces can deliver the selector after compositionend;
       // the short post-end guard must still keep that plain digit out of the PTY.
-      const postCompositionLogStart = (await readImeEventLog(orcaBotmuxPage)).length
+      const postCompositionLogStart = (await readImeEventLog(botmuxPage)).length
       await setImeComposition(session, 'zaijian')
-      await orcaBotmuxPage.waitForTimeout(80)
-      await dispatchSogouEmptyCompositionUpdate(orcaBotmuxPage)
-      await dispatchSogouPostCompositionEnd(orcaBotmuxPage, '再见')
+      await botmuxPage.waitForTimeout(80)
+      await dispatchSogouEmptyCompositionUpdate(botmuxPage)
+      await dispatchSogouPostCompositionEnd(botmuxPage, '再见')
       await dispatchCandidateSelectionKey(session, { key: '3', code: 'Digit3', keyCode: 51 }, () =>
         commitImeText(session, '再见')
       )
-      await waitForLivePrompt(orcaBotmuxPage, '再见')
-      const postCompositionLog = await readImeEventLog(orcaBotmuxPage)
+      await waitForLivePrompt(botmuxPage, '再见')
+      const postCompositionLog = await readImeEventLog(botmuxPage)
       const postCompositionEndIndex = postCompositionLog.findIndex(
         (entry, index) =>
           index >= postCompositionLogStart &&
@@ -657,10 +657,10 @@ test.describe('Chinese IME terminal chat input repro', () => {
         postCompositionSelectorIndex,
         'plain digit selector must arrive after compositionend in the post-composition repro'
       ).toBeGreaterThan(postCompositionEndIndex)
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'sogou-after-post-composition-digit-commit')
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await attachImeEvidence(botmuxPage, testInfo, 'sogou-after-post-composition-digit-commit')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'post-composition digit-selected candidate did not submit cleanly'
         })
@@ -670,81 +670,81 @@ test.describe('Chinese IME terminal chat input repro', () => {
       // expose only an orphaned Latin release before the candidate digit.
       await dispatchOrphanLetterKeyup(session)
       await dispatchCandidateSelectionKey(session, { key: '4', code: 'Digit4', keyCode: 52 })
-      await orcaBotmuxPage.keyboard.press('Enter')
+      await botmuxPage.keyboard.press('Enter')
       await expect
-        .poll(async () => (await readPromptState(orcaBotmuxPage))?.submitted.at(-1) ?? null, {
+        .poll(async () => (await readPromptState(botmuxPage))?.submitted.at(-1) ?? null, {
           timeout: 5_000,
           message: 'orphan-keyup candidate digit leaked into the submitted terminal input'
         })
         .toBe('')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'sogou-after-orphan-keyup-digit-suppression')
+      await attachImeEvidence(botmuxPage, testInfo, 'sogou-after-orphan-keyup-digit-suppression')
 
-      const promptState = await readPromptState(orcaBotmuxPage)
+      const promptState = await readPromptState(botmuxPage)
       expect(
         promptState?.submitted,
         'candidate Space/digit selectors and pinyin preedit must not leak into the PTY'
       ).toEqual(['你', '你好', '再见', ''])
     } finally {
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'sogou-final-ime-evidence').catch(() => undefined)
+      await attachImeEvidence(botmuxPage, testInfo, 'sogou-final-ime-evidence').catch(() => undefined)
       await session?.detach().catch(() => undefined)
       if (harnessStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
   })
 
   test('keeps composed Chinese text stable in the real Codex TUI input @real-codex-ime', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.skip(
-      process.env.ORCA_E2E_REAL_CODEX_IME !== '1',
-      'Set ORCA_E2E_REAL_CODEX_IME=1 to exercise the locally installed Codex TUI'
+      process.env.BOTMUX_E2E_REAL_CODEX_IME !== '1',
+      'Set BOTMUX_E2E_REAL_CODEX_IME=1 to exercise the locally installed Codex TUI'
     )
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    const session = await orcaBotmuxPage.context().newCDPSession(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    const session = await botmuxPage.context().newCDPSession(botmuxPage)
 
     try {
-      await launchCodexTui(orcaBotmuxPage, ptyId)
-      await installImeEventProbe(orcaBotmuxPage)
+      await launchCodexTui(botmuxPage, ptyId)
+      await installImeEventProbe(botmuxPage)
 
       await dispatchImeProcessKey(session, 'KeyN')
-      await composeAndCommitChineseText(session, orcaBotmuxPage, ['n', 'ni', '你', '你好'], '你好')
-      await waitForCleanTerminalText(orcaBotmuxPage, /你好/, 'Codex input did not show composed Chinese')
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'codex-after-compose-hello', {
-        cleanTerminal: stripTerminalControls(await getTerminalContent(orcaBotmuxPage, 20_000))
+      await composeAndCommitChineseText(session, botmuxPage, ['n', 'ni', '你', '你好'], '你好')
+      await waitForCleanTerminalText(botmuxPage, /你好/, 'Codex input did not show composed Chinese')
+      await attachImeEvidence(botmuxPage, testInfo, 'codex-after-compose-hello', {
+        cleanTerminal: stripTerminalControls(await getTerminalContent(botmuxPage, 20_000))
       })
 
       await dispatchImeProcessKey(session, 'KeyZ')
-      await composeAndCommitChineseText(session, orcaBotmuxPage, ['z', 'zh', '中'], '中')
+      await composeAndCommitChineseText(session, botmuxPage, ['z', 'zh', '中'], '中')
       await waitForCleanTerminalText(
-        orcaBotmuxPage,
+        botmuxPage,
         /你好中/,
         'Codex input did not keep previously composed text before middle-edit checks'
       )
 
-      await orcaBotmuxPage.keyboard.press('ArrowLeft')
+      await botmuxPage.keyboard.press('ArrowLeft')
       await setImeComposition(session, 'x')
-      await orcaBotmuxPage.keyboard.press('Backspace')
+      await botmuxPage.keyboard.press('Backspace')
       await waitForCleanTerminalText(
-        orcaBotmuxPage,
+        botmuxPage,
         /你好中/,
         'Backspace during Codex composition removed committed Chinese text'
       )
       await setImeComposition(session, '')
       await commitImeText(session, '')
 
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'codex-after-composition-backspace', {
-        cleanTerminal: stripTerminalControls(await getTerminalContent(orcaBotmuxPage, 20_000))
+      await attachImeEvidence(botmuxPage, testInfo, 'codex-after-composition-backspace', {
+        cleanTerminal: stripTerminalControls(await getTerminalContent(botmuxPage, 20_000))
       })
 
-      const cleanTerminal = stripTerminalControls(await getTerminalContent(orcaBotmuxPage, 20_000))
+      const cleanTerminal = stripTerminalControls(await getTerminalContent(botmuxPage, 20_000))
       expect(
         cleanTerminal,
         'Codex should keep committed Chinese text when Backspace cancels an IME preedit'
@@ -752,11 +752,11 @@ test.describe('Chinese IME terminal chat input repro', () => {
       expect(cleanTerminal).not.toMatch(/\bn(?:i)?你好/)
       expect(cleanTerminal).not.toMatch(/\bz(?:h)?中/)
     } finally {
-      await attachImeEvidence(orcaBotmuxPage, testInfo, 'codex-final-ime-evidence', {
-        cleanTerminal: stripTerminalControls(await getTerminalContent(orcaBotmuxPage, 20_000))
+      await attachImeEvidence(botmuxPage, testInfo, 'codex-final-ime-evidence', {
+        cleanTerminal: stripTerminalControls(await getTerminalContent(botmuxPage, 20_000))
       }).catch(() => undefined)
       await session.detach().catch(() => undefined)
-      await sendToTerminal(orcaBotmuxPage, ptyId, '\x03/quit\r').catch(() => undefined)
+      await sendToTerminal(botmuxPage, ptyId, '\x03/quit\r').catch(() => undefined)
     }
   })
 })

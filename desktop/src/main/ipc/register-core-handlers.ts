@@ -3,7 +3,7 @@ import { registerAppHandlers } from './app'
 import { registerCliHandlers } from './cli'
 import { registerPreflightHandlers } from './preflight'
 import type { Store } from '../persistence'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import type { StatsCollector } from '../stats/collector'
 import { registerFilesystemHandlers } from './filesystem'
 import type { CommitMessageAgentEnvironmentResolvers } from '../text-generation/commit-message-agent-environment'
@@ -51,7 +51,7 @@ import { registerEmulatorFrameStreamHandlers } from './emulator-frame-stream'
 import { registerEmulatorVideoStreamHandlers } from './emulator-video-stream'
 import { registerSpeechHandlers } from './speech'
 import { registerTerminalRenderDesyncEvidenceHandler } from './terminal-render-desync-evidence'
-import { registerOrcaProfileHandlers } from './orca-botmux-profiles'
+import { registerBotmuxProfileHandlers } from './botmux-profiles'
 import { registerCodexAccountHandlers } from './codex-accounts'
 import { registerAgentHookHandlers } from './agent-hooks'
 import { getPtyIdForPaneKey } from './pty'
@@ -83,14 +83,14 @@ let registered = false
 
 type CoreHandlerLifecycleOptions = {
   onBeforeRelaunch?: () => void | Promise<void>
-  onOrcaProfileAuthMutation?: () => void
-  onBeforeOrcaProfileSignOut?: () => void
+  onBotmuxProfileAuthMutation?: () => void
+  onBeforeBotmuxProfileSignOut?: () => void
   getAdditionalAiVaultCodexHomePaths?: () => readonly string[]
 }
 
 export function registerCoreHandlers(
   store: Store,
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   stats: StatsCollector,
   claudeUsage: ClaudeUsageStore,
   codexUsage: CodexUsageStore,
@@ -164,10 +164,10 @@ export function registerCoreHandlers(
     registerKeybindingHandlers(keybindings)
   }
   registerTelemetryHandlers(store)
-  registerOrcaProfileHandlers(store, {
+  registerBotmuxProfileHandlers(store, {
     onBeforeRelaunch: lifecycleOptions.onBeforeRelaunch,
-    onAuthMutation: lifecycleOptions.onOrcaProfileAuthMutation,
-    onBeforeSignOut: lifecycleOptions.onBeforeOrcaProfileSignOut
+    onAuthMutation: lifecycleOptions.onBotmuxProfileAuthMutation,
+    onBeforeSignOut: lifecycleOptions.onBeforeBotmuxProfileSignOut
   })
   registerBrowserHandlers()
   registerShellHandlers()

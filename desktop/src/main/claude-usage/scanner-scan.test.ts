@@ -8,7 +8,7 @@ import type * as FsPromises from 'node:fs/promises'
 const tempRoots: string[] = []
 
 async function makeClaudeProjectsRoot(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'orca-botmux-claude-usage-'))
+  const root = await mkdtemp(join(tmpdir(), 'botmux-claude-usage-'))
   tempRoots.push(root)
   await mkdir(join(root, '.claude', 'projects', 'project-a'), { recursive: true })
   await mkdir(join(root, '.claude', 'transcripts'), { recursive: true })

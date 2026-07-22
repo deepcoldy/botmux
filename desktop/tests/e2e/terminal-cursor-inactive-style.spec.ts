@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   splitActiveTerminalPane,
   waitForActiveTerminalManager,
@@ -100,26 +100,26 @@ async function renderInactiveCursor(
 }
 
 test.describe('Terminal inactive cursor rendering', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
   })
 
-  test('keeps an unfocused prompt cursor rendered as one block outline', async ({ orcaBotmuxPage }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await placeInactiveCursorAtPrompt(orcaBotmuxPage)
+  test('keeps an unfocused prompt cursor rendered as one block outline', async ({ botmuxPage }) => {
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await placeInactiveCursorAtPrompt(botmuxPage)
 
-    const fixedBehavior = await renderInactiveCursor(orcaBotmuxPage)
+    const fixedBehavior = await renderInactiveCursor(botmuxPage)
     expect(fixedBehavior.terminalFocused).toBe(false)
     expect(fixedBehavior.cursorStyle).toBe('block')
     expect(fixedBehavior.cursorInactiveStyle).toBe('outline')
     expect(fixedBehavior.cursorClassName).toMatch(/xterm-cursor-outline|canvas renderer: outline/)
 
-    const oldBehavior = await renderInactiveCursor(orcaBotmuxPage, 'outline')
+    const oldBehavior = await renderInactiveCursor(botmuxPage, 'outline')
     expect(oldBehavior.terminalFocused).toBe(false)
     expect(oldBehavior.cursorStyle).toBe('block')
     expect(oldBehavior.cursorInactiveStyle).toBe('outline')

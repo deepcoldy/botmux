@@ -7,13 +7,13 @@ vi.mock('../runtime-client', () => {
     readonly isRemote: boolean
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
 
     constructor(
       _userDataPath?: string,
       _requestTimeoutMs?: number,
-      remotePairingCode = process.env.ORCA_PAIRING_CODE ?? null,
-      environmentSelector = process.env.ORCA_ENVIRONMENT ?? null
+      remotePairingCode = process.env.BOTMUX_PAIRING_CODE ?? null,
+      environmentSelector = process.env.BOTMUX_ENVIRONMENT ?? null
     ) {
       this.isRemote = Boolean(remotePairingCode || environmentSelector)
     }
@@ -47,20 +47,20 @@ vi.mock('../runtime-client', () => {
 import { main } from '../index'
 import { okFixture, queueFixtures } from '../test-fixtures'
 
-describe('orca_botmux linear CLI handlers', () => {
+describe('botmux linear CLI handlers', () => {
   const originalEnv = { ...process.env }
 
   beforeEach(() => {
     vi.restoreAllMocks()
     callMock.mockReset()
     process.env = { ...originalEnv }
-    // Why: these tests can run inside an OrcaBotmux-managed terminal, which exports
+    // Why: these tests can run inside an Botmux-managed terminal, which exports
     // real worktree/terminal/pairing env hints; clear them so handler context
     // assertions stay deterministic.
-    delete process.env.ORCA_WORKTREE_ID
-    delete process.env.ORCA_TERMINAL_HANDLE
-    delete process.env.ORCA_PAIRING_CODE
-    delete process.env.ORCA_ENVIRONMENT
+    delete process.env.BOTMUX_WORKTREE_ID
+    delete process.env.BOTMUX_TERMINAL_HANDLE
+    delete process.env.BOTMUX_PAIRING_CODE
+    delete process.env.BOTMUX_ENVIRONMENT
     process.exitCode = undefined
     vi.spyOn(console, 'log').mockImplementation(() => {})
     vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -114,9 +114,9 @@ describe('orca_botmux linear CLI handlers', () => {
   })
 
   it('passes verified current-context hints without resolving cwd for remote runtimes', async () => {
-    process.env.ORCA_TERMINAL_HANDLE = 'term_123'
-    process.env.ORCA_WORKTREE_ID = 'repo::/srv/app'
-    process.env.ORCA_PAIRING_CODE = 'orca_botmux://pair?payload=bad'
+    process.env.BOTMUX_TERMINAL_HANDLE = 'term_123'
+    process.env.BOTMUX_WORKTREE_ID = 'repo::/srv/app'
+    process.env.BOTMUX_PAIRING_CODE = 'botmux://pair?payload=bad'
     queueFixtures(callMock, okFixture('req_linear', issueResult()))
 
     await main(['linear', 'issue', '--current', '--comments', '--json'], '/client/repo')

@@ -36,7 +36,7 @@ const activeProvisionControllers = new Map<string, AbortController>()
 export type EphemeralVmProvisionIpcResult =
   | {
       ok: true
-      connectionType: 'orca-botmux-server'
+      connectionType: 'botmux-server'
       runtime: EphemeralVmRuntimeRecord
       environment: PublicKnownRuntimeEnvironment
       stderr: string
@@ -216,7 +216,7 @@ export function registerEphemeralVmHandlers(store: Store): void {
         })
         return {
           ok: true,
-          connectionType: 'orca-botmux-server',
+          connectionType: 'botmux-server',
           runtime,
           environment: redactRuntimeEnvironment(environment),
           stderr: redactEphemeralVmRecipeDiagnosticText(result.start.stderr),

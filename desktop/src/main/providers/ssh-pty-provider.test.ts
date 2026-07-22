@@ -179,7 +179,7 @@ describe('SshPtyProvider', () => {
 
     it('preserves explicit TERM and forwards final env deletions to the relay', async () => {
       mux.request.mockResolvedValue({ id: 'pty-env-precedence' })
-      const envToDelete = ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+      const envToDelete = ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
 
       await provider.spawn({
         cols: 120,
@@ -187,7 +187,7 @@ describe('SshPtyProvider', () => {
         env: {
           TERM: 'screen-256color',
           TERM_PROGRAM: 'stale-terminal',
-          ORCA_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
+          BOTMUX_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
         },
         envToDelete
       })
@@ -204,7 +204,7 @@ describe('SshPtyProvider', () => {
       })
       const spawnCall = mux.request.mock.calls.find((call) => call[0] === 'pty.spawn')
       expect(spawnCall?.[1]?.env).not.toHaveProperty('TERM_PROGRAM')
-      expect(spawnCall?.[1]?.env).not.toHaveProperty('ORCA_ATTRIBUTION_SHIM_DIR')
+      expect(spawnCall?.[1]?.env).not.toHaveProperty('BOTMUX_ATTRIBUTION_SHIM_DIR')
     })
 
     it('forwards provider command delivery to the relay', async () => {
@@ -229,19 +229,19 @@ describe('SshPtyProvider', () => {
       })
     })
 
-    it('injects the relay-backed OrcaBotmux CLI bridge into remote PTY env', async () => {
+    it('injects the relay-backed Botmux CLI bridge into remote PTY env', async () => {
       mux.request.mockResolvedValue({ id: 'pty-bridge' })
       provider = new SshPtyProvider('conn-1', mux as never, {
-        binDir: '/home/user/.orca-botmux-relay/bin',
-        relayDir: '/home/user/.orca-botmux-relay/relay-v1',
+        binDir: '/home/user/.botmux-relay/bin',
+        relayDir: '/home/user/.botmux-relay/relay-v1',
         nodePath: '/usr/bin/node',
-        sockPath: '/home/user/.orca-botmux-relay/relay.sock'
+        sockPath: '/home/user/.botmux-relay/relay.sock'
       })
 
       await provider.spawn({
         cols: 120,
         rows: 40,
-        env: { PATH: '/usr/bin', ORCA_TERMINAL_HANDLE: 'term_ssh' }
+        env: { PATH: '/usr/bin', BOTMUX_TERMINAL_HANDLE: 'term_ssh' }
       })
 
       expect(mux.request).toHaveBeenCalledWith('pty.spawn', {
@@ -249,13 +249,13 @@ describe('SshPtyProvider', () => {
         rows: 40,
         cwd: undefined,
         env: {
-          PATH: '/home/user/.orca-botmux-relay/bin:/usr/bin',
-          ORCA_TERMINAL_HANDLE: 'term_ssh',
+          PATH: '/home/user/.botmux-relay/bin:/usr/bin',
+          BOTMUX_TERMINAL_HANDLE: 'term_ssh',
           [POWERLEVEL10K_WIZARD_DISABLE_ENV]: 'true',
-          ORCA_REMOTE_CLI_BIN_DIR: '/home/user/.orca-botmux-relay/bin',
-          ORCA_RELAY_DIR: '/home/user/.orca-botmux-relay/relay-v1',
-          ORCA_RELAY_NODE_PATH: '/usr/bin/node',
-          ORCA_RELAY_SOCKET_PATH: '/home/user/.orca-botmux-relay/relay.sock'
+          BOTMUX_REMOTE_CLI_BIN_DIR: '/home/user/.botmux-relay/bin',
+          BOTMUX_RELAY_DIR: '/home/user/.botmux-relay/relay-v1',
+          BOTMUX_RELAY_NODE_PATH: '/usr/bin/node',
+          BOTMUX_RELAY_SOCKET_PATH: '/home/user/.botmux-relay/relay.sock'
         }
       })
     })
@@ -263,16 +263,16 @@ describe('SshPtyProvider', () => {
     it('does not clobber the remote relay PATH when caller env has no PATH', async () => {
       mux.request.mockResolvedValue({ id: 'pty-bridge' })
       provider = new SshPtyProvider('conn-1', mux as never, {
-        binDir: '/home/user/.orca-botmux-relay/bin',
-        relayDir: '/home/user/.orca-botmux-relay/relay-v1',
+        binDir: '/home/user/.botmux-relay/bin',
+        relayDir: '/home/user/.botmux-relay/relay-v1',
         nodePath: '/usr/bin/node',
-        sockPath: '/home/user/.orca-botmux-relay/relay.sock'
+        sockPath: '/home/user/.botmux-relay/relay.sock'
       })
 
       await provider.spawn({
         cols: 120,
         rows: 40,
-        env: { ORCA_TERMINAL_HANDLE: 'term_ssh' }
+        env: { BOTMUX_TERMINAL_HANDLE: 'term_ssh' }
       })
 
       expect(mux.request).toHaveBeenCalledWith('pty.spawn', {
@@ -280,12 +280,12 @@ describe('SshPtyProvider', () => {
         rows: 40,
         cwd: undefined,
         env: {
-          ORCA_TERMINAL_HANDLE: 'term_ssh',
+          BOTMUX_TERMINAL_HANDLE: 'term_ssh',
           [POWERLEVEL10K_WIZARD_DISABLE_ENV]: 'true',
-          ORCA_REMOTE_CLI_BIN_DIR: '/home/user/.orca-botmux-relay/bin',
-          ORCA_RELAY_DIR: '/home/user/.orca-botmux-relay/relay-v1',
-          ORCA_RELAY_NODE_PATH: '/usr/bin/node',
-          ORCA_RELAY_SOCKET_PATH: '/home/user/.orca-botmux-relay/relay.sock'
+          BOTMUX_REMOTE_CLI_BIN_DIR: '/home/user/.botmux-relay/bin',
+          BOTMUX_RELAY_DIR: '/home/user/.botmux-relay/relay-v1',
+          BOTMUX_RELAY_NODE_PATH: '/usr/bin/node',
+          BOTMUX_RELAY_SOCKET_PATH: '/home/user/.botmux-relay/relay.sock'
         }
       })
     })
@@ -293,10 +293,10 @@ describe('SshPtyProvider', () => {
     it('uses Windows PATH delimiters for native Windows SSH bridge env', async () => {
       mux.request.mockResolvedValue({ id: 'pty-bridge' })
       provider = new SshPtyProvider('conn-1', mux as never, {
-        binDir: 'C:/Users/me/.orca-botmux-relay/bin',
-        relayDir: 'C:/Users/me/.orca-botmux-remote/relay-v1',
+        binDir: 'C:/Users/me/.botmux-relay/bin',
+        relayDir: 'C:/Users/me/.botmux-remote/relay-v1',
         nodePath: 'C:/Program Files/nodejs/node.exe',
-        sockPath: '\\\\.\\pipe\\orca-botmux-relay-123',
+        sockPath: '\\\\.\\pipe\\botmux-relay-123',
         pathDelimiter: ';'
       })
 
@@ -311,12 +311,12 @@ describe('SshPtyProvider', () => {
         rows: 40,
         cwd: undefined,
         env: {
-          Path: 'C:/Users/me/.orca-botmux-relay/bin;C:/Windows/System32;C:/Tools',
+          Path: 'C:/Users/me/.botmux-relay/bin;C:/Windows/System32;C:/Tools',
           [POWERLEVEL10K_WIZARD_DISABLE_ENV]: 'true',
-          ORCA_REMOTE_CLI_BIN_DIR: 'C:/Users/me/.orca-botmux-relay/bin',
-          ORCA_RELAY_DIR: 'C:/Users/me/.orca-botmux-remote/relay-v1',
-          ORCA_RELAY_NODE_PATH: 'C:/Program Files/nodejs/node.exe',
-          ORCA_RELAY_SOCKET_PATH: '\\\\.\\pipe\\orca-botmux-relay-123'
+          BOTMUX_REMOTE_CLI_BIN_DIR: 'C:/Users/me/.botmux-relay/bin',
+          BOTMUX_RELAY_DIR: 'C:/Users/me/.botmux-remote/relay-v1',
+          BOTMUX_RELAY_NODE_PATH: 'C:/Program Files/nodejs/node.exe',
+          BOTMUX_RELAY_SOCKET_PATH: '\\\\.\\pipe\\botmux-relay-123'
         }
       })
     })

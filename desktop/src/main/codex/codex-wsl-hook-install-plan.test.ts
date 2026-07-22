@@ -44,7 +44,7 @@ describe('canonicalizeWslLinuxPath', () => {
       '--',
       'sh',
       '-c',
-      `if [ ! -d "$1" ]; then printf '%s\\n' '__ORCA_WSL_PATH_MISSING__'; exit 0; fi; readlink -f -- "$1"`,
+      `if [ ! -d "$1" ]; then printf '%s\\n' '__BOTMUX_WSL_PATH_MISSING__'; exit 0; fi; readlink -f -- "$1"`,
       'sh',
       '/home/alias'
     ])
@@ -64,12 +64,12 @@ describe('canonicalizeWslLinuxPath', () => {
   it('resolves a custom automount root and notifies the first launch', () => {
     setPlatform('win32')
     const settled = vi.fn()
-    const windowsPath = 'D:\\orca_botmux\\codex-runtime-home\\home'
+    const windowsPath = 'D:\\botmux\\codex-runtime-home\\home'
 
     expect(
       _internals.canonicalizeWslLinuxPath(
         'Ubuntu',
-        '/mnt/d/orca_botmux/codex-runtime-home/home',
+        '/mnt/d/botmux/codex-runtime-home/home',
         windowsPath,
         settled
       )
@@ -83,16 +83,16 @@ describe('canonicalizeWslLinuxPath', () => {
       '--',
       'sh',
       '-c',
-      `resolved=$(wslpath -a -u "$1") || exit; if [ ! -d "$resolved" ]; then printf '%s\\n' '__ORCA_WSL_PATH_MISSING__'; exit 0; fi; readlink -f -- "$resolved"`,
+      `resolved=$(wslpath -a -u "$1") || exit; if [ ! -d "$resolved" ]; then printf '%s\\n' '__BOTMUX_WSL_PATH_MISSING__'; exit 0; fi; readlink -f -- "$resolved"`,
       'sh',
       windowsPath
     ])
     expect(options).toMatchObject({ timeout: 5000, windowsHide: true })
 
-    callback(null, '/windows/d/orca_botmux/codex-runtime-home/home\n')
+    callback(null, '/windows/d/botmux/codex-runtime-home/home\n')
     expect(settled).toHaveBeenCalledWith({
       status: 'resolved',
-      canonicalPath: '/windows/d/orca_botmux/codex-runtime-home/home'
+      canonicalPath: '/windows/d/botmux/codex-runtime-home/home'
     })
   })
 
@@ -157,7 +157,7 @@ describe('canonicalizeWslLinuxPath', () => {
       error: Error | null,
       stdout: string
     ) => void
-    secondCallback(null, '__ORCA_WSL_PATH_MISSING__\n')
+    secondCallback(null, '__BOTMUX_WSL_PATH_MISSING__\n')
 
     expect(settled).toHaveBeenCalledWith({ status: 'missing' })
     expect(_internals.canonicalizeWslLinuxPath('Ubuntu', '/home/alias')).toBeNull()

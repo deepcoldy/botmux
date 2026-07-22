@@ -4,17 +4,17 @@ import { join } from 'node:path'
 import { createServer, type Socket } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RuntimeClient, RuntimeRpcFailureError } from './runtime-client'
-import { launchOrcaApp } from './runtime/launch'
+import { launchBotmuxApp } from './runtime/launch'
 
 vi.mock('./runtime/launch', () => ({
-  launchOrcaApp: vi.fn()
+  launchBotmuxApp: vi.fn()
 }))
 
 const servers = new Set<ReturnType<typeof createServer>>()
 const sockets = new Set<Socket>()
 
 afterEach(async () => {
-  vi.mocked(launchOrcaApp).mockClear()
+  vi.mocked(launchBotmuxApp).mockClear()
   for (const socket of sockets) {
     socket.destroy()
   }
@@ -37,7 +37,7 @@ function writeMetadata(
   pid = 123
 ): void {
   writeFileSync(
-    join(userDataPath, 'orca-botmux-runtime.json'),
+    join(userDataPath, 'botmux-runtime.json'),
     JSON.stringify({
       runtimeId: 'runtime-1',
       pid,
@@ -75,7 +75,7 @@ function findUnusedPid(seed = 200_000): number {
 // EACCES errors on listen(), so the suite is skipped on that platform.
 describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   it('returns the full RPC envelope for successful calls', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -108,7 +108,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('reports not_running when no runtime metadata exists', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const client = new RuntimeClient(userDataPath, 100)
 
     const status = await client.getCliStatus()
@@ -130,7 +130,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('reports stale_bootstrap when bootstrap artifacts exist but no runtime is reachable', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     writeMetadata(userDataPath, join(userDataPath, 'missing.sock'), 'token', findUnusedPid())
 
     const client = new RuntimeClient(userDataPath, 100)
@@ -141,7 +141,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('reports graph_not_ready when the runtime is reachable but graph is unavailable', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -176,8 +176,8 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
     expect(status.result.graph.state).toBe('unavailable')
   })
 
-  it('openOrca activates the app even when a desktop runtime is already reachable', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+  it('openBotmux activates the app even when a desktop runtime is already reachable', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -206,15 +206,15 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
     writeMetadata(userDataPath, endpoint)
 
     const client = new RuntimeClient(userDataPath, 100)
-    const status = await client.openOrca(100)
+    const status = await client.openBotmux(100)
 
     expect(status.result.runtime.state).toBe('ready')
     expect(status.result.runtime.reachable).toBe(true)
-    expect(launchOrcaApp).toHaveBeenCalledOnce()
+    expect(launchBotmuxApp).toHaveBeenCalledOnce()
   })
 
-  it('openOrca waits for a reachable headless runtime to expose a desktop window', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+  it('openBotmux waits for a reachable headless runtime to expose a desktop window', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     let statusRequests = 0
     const server = createServer((socket) => {
@@ -247,15 +247,15 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
     writeMetadata(userDataPath, endpoint)
 
     const client = new RuntimeClient(userDataPath, 100)
-    const status = await client.openOrca(1_000)
+    const status = await client.openBotmux(1_000)
 
-    expect(launchOrcaApp).toHaveBeenCalledOnce()
+    expect(launchBotmuxApp).toHaveBeenCalledOnce()
     expect(status.result.app.desktopWindowStatus).toBe('available')
     expect(statusRequests).toBeGreaterThan(1)
   })
 
-  it('openOrca fails explicitly when the serve owner cannot promote safely', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+  it('openBotmux fails explicitly when the serve owner cannot promote safely', async () => {
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -286,15 +286,15 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
 
     const client = new RuntimeClient(userDataPath, 100)
 
-    await expect(client.openOrca(100)).rejects.toMatchObject({
+    await expect(client.openBotmux(100)).rejects.toMatchObject({
       code: 'desktop_activation_blocked'
     })
     // A blocked runtime can't promote, so we bail before spawning the app.
-    expect(launchOrcaApp).not.toHaveBeenCalled()
+    expect(launchBotmuxApp).not.toHaveBeenCalled()
   })
 
   it('times out if the runtime never responds', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -314,7 +314,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('allows a per-call timeout override for long runtime requests', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -346,7 +346,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('preserves structured runtime failures', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -379,7 +379,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('rejects invalid runtime response frames', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)
@@ -400,7 +400,7 @@ describe.skipIf(process.platform === 'win32')('RuntimeClient', () => {
   })
 
   it('rejects mismatched response ids from the runtime', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-client-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-client-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)

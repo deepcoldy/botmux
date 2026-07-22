@@ -1,7 +1,7 @@
 import type { Page, TestInfo } from '@stablyai/playwright-test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   createBranchCommit,
@@ -151,12 +151,12 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   test.describe.configure({ mode: 'serial' })
 
   test('keeps checks-panel PR generation running after switching worktrees', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
     const { primaryWorktreeId, prWorktreeId, prWorktreePath, primaryBranch } =
-      await seedCreatePrComposer(orcaBotmuxPage)
+      await seedCreatePrComposer(botmuxPage)
     createBranchCommit(prWorktreePath)
 
     const screenshotDir = path.join(
@@ -171,39 +171,39 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     })
     const generatorScriptPath = path.join(screenshotDir, 'delayed-checks-pr-generator.cjs')
     const callLogPath = path.join(screenshotDir, 'delayed-checks-pr-generator.log')
-    await installDelayedPrGenerator(orcaBotmuxPage, generatorScriptPath, callLogPath, primaryBranch)
+    await installDelayedPrGenerator(botmuxPage, generatorScriptPath, callLogPath, primaryBranch)
 
-    await openChecks(orcaBotmuxPage, prWorktreeId)
-    const generate = orcaBotmuxPage.getByRole('button', {
+    await openChecks(botmuxPage, prWorktreeId)
+    const generate = botmuxPage.getByRole('button', {
       name: 'Generate pull request details with AI'
     })
     await expect(generate).toBeVisible({ timeout: 10_000 })
     await expect(generate).toBeEnabled()
     await generate.click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
+      botmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
     ).toBeVisible()
     await expect.poll(() => readLog(callLogPath)).toContain('start')
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-checks-pr-generation-pending-on-a.png')
     })
 
-    await openChecks(orcaBotmuxPage, primaryWorktreeId)
-    await expect(orcaBotmuxPage.getByText('Generated PR title after switch')).toHaveCount(0)
-    await orcaBotmuxPage.screenshot({
+    await openChecks(botmuxPage, primaryWorktreeId)
+    await expect(botmuxPage.getByText('Generated PR title after switch')).toHaveCount(0)
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '02-checks-switched-to-b-no-generated-fields.png')
     })
 
     await expect.poll(() => readLog(callLogPath), { timeout: 10_000 }).toContain('finish')
-    await openChecks(orcaBotmuxPage, prWorktreeId)
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
+    await openChecks(botmuxPage, prWorktreeId)
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
       'Generated PR title after switch',
       { timeout: 10_000 }
     )
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
       'Generated PR body after switch'
     )
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '03-checks-returned-to-a-generated-fields.png')
     })
     await writeEvidence(testInfo, screenshotDir, 'checks-pr-generation-switch-evidence.json', {
@@ -214,12 +214,12 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('keeps pending PR generation attached to its original worktree', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
     const { primaryWorktreeId, prWorktreeId, prWorktreePath, primaryBranch } =
-      await seedCreatePrComposer(orcaBotmuxPage)
+      await seedCreatePrComposer(botmuxPage)
     createBranchCommit(prWorktreePath)
 
     const screenshotDir = path.join(
@@ -234,37 +234,37 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     })
     const generatorScriptPath = path.join(screenshotDir, 'delayed-pr-generator.cjs')
     const callLogPath = path.join(screenshotDir, 'delayed-pr-generator.log')
-    await installDelayedPrGenerator(orcaBotmuxPage, generatorScriptPath, callLogPath, primaryBranch)
+    await installDelayedPrGenerator(botmuxPage, generatorScriptPath, callLogPath, primaryBranch)
 
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    const generate = orcaBotmuxPage.getByRole('button', {
+    await openSourceControl(botmuxPage, prWorktreeId)
+    const generate = botmuxPage.getByRole('button', {
       name: 'Generate pull request details with AI'
     })
     await expect(generate).toBeVisible({ timeout: 10_000 })
     await expect(generate).toBeEnabled()
     await generate.click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
+      botmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
     ).toBeVisible()
     await expect
       .poll(() => {
         return readLog(callLogPath)
       })
       .toContain('start')
-    const pendingEvidence = await orcaBotmuxPage.evaluate(() => {
+    const pendingEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
         rightSidebarTab: state?.rightSidebarTab
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-pr-generation-pending-on-a.png')
     })
 
-    await openSourceControl(orcaBotmuxPage, primaryWorktreeId)
-    await expect(orcaBotmuxPage.getByText('Generated PR title after switch')).toHaveCount(0)
-    const switchedEvidence = await orcaBotmuxPage.evaluate(() => {
+    await openSourceControl(botmuxPage, primaryWorktreeId)
+    await expect(botmuxPage.getByText('Generated PR title after switch')).toHaveCount(0)
+    const switchedEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -273,24 +273,24 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         )
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '02-switched-to-b-no-generated-fields.png')
     })
 
     await expect
       .poll(() => readFileSync(callLogPath, 'utf8'), { timeout: 10_000 })
       .toContain('finish')
-    await waitForPrGenerationStored(orcaBotmuxPage, prWorktreeId)
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    await waitForPrGenerationHydrated(orcaBotmuxPage, prWorktreeId)
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
+    await waitForPrGenerationStored(botmuxPage, prWorktreeId)
+    await openSourceControl(botmuxPage, prWorktreeId)
+    await waitForPrGenerationHydrated(botmuxPage, prWorktreeId)
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
       'Generated PR title after switch',
       { timeout: 10_000 }
     )
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
       'Generated PR body after switch'
     )
-    const finalEvidence = await orcaBotmuxPage.evaluate(() => {
+    const finalEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -301,7 +301,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         )?.value
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '03-returned-to-a-generated-fields.png')
     })
     await writeEvidence(testInfo, screenshotDir, 'pr-generation-evidence.json', {
@@ -315,12 +315,12 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('keeps Create PR intent running after switching worktrees', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
     const { primaryWorktreeId, prWorktreeId, prWorktreePath, primaryBranch } =
-      await seedCreatePrComposer(orcaBotmuxPage)
+      await seedCreatePrComposer(botmuxPage)
 
     const screenshotDir = path.join(
       process.cwd(),
@@ -333,7 +333,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
       contentType: 'text/plain'
     })
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ prWorktreeId, primaryBranch }) => {
         const store =
           window.__store ??
@@ -411,7 +411,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
             return {
               ok: true as const,
               number: 74,
-              url: 'https://github.com/acme/orca_botmux/pull/74'
+              url: 'https://github.com/acme/botmux/pull/74'
             }
           },
           gitStatusByWorktree: {
@@ -432,8 +432,8 @@ test.describe('Source Control AI PR generation worktree switching', () => {
       { prWorktreeId, primaryBranch }
     )
 
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    const createPr = orcaBotmuxPage.getByRole('button', { name: 'Create PR' }).first()
+    await openSourceControl(botmuxPage, prWorktreeId)
+    const createPr = botmuxPage.getByRole('button', { name: 'Create PR' }).first()
     await expect(createPr).toBeVisible({ timeout: 10_000 })
     await expect(createPr).toBeEnabled()
     await createPr.click()
@@ -441,7 +441,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             () =>
               (window as unknown as { __createPRIntentPushStarted: boolean })
                 .__createPRIntentPushStarted
@@ -449,12 +449,12 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         { timeout: 10_000 }
       )
       .toBe(true)
-    await openSourceControl(orcaBotmuxPage, primaryWorktreeId)
+    await openSourceControl(botmuxPage, primaryWorktreeId)
 
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             () =>
               (window as unknown as { __createPRIntentPayloads: unknown[] })
                 .__createPRIntentPayloads.length
@@ -463,7 +463,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
       )
       .toBe(1)
 
-    const completedWhileSwitchedEvidence = await orcaBotmuxPage.evaluate(() => {
+    const completedWhileSwitchedEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -473,8 +473,8 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     expect(completedWhileSwitchedEvidence.activeWorktreeId).toBe(primaryWorktreeId)
     expect(completedWhileSwitchedEvidence.rightSidebarTab).toBe('source-control')
 
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    const payloads = await orcaBotmuxPage.evaluate(
+    await openSourceControl(botmuxPage, prWorktreeId)
+    const payloads = await botmuxPage.evaluate(
       () =>
         (
           window as unknown as {
@@ -493,7 +493,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         worktreePath: prWorktreePath
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-create-pr-intent-completed-after-switch.png')
     })
     await writeEvidence(testInfo, screenshotDir, 'create-pr-intent-switch-evidence.json', {
@@ -505,11 +505,11 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('hydrates pending PR generation after Source Control remounts', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    const { prWorktreeId, prWorktreePath, primaryBranch } = await seedCreatePrComposer(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    const { prWorktreeId, prWorktreePath, primaryBranch } = await seedCreatePrComposer(botmuxPage)
     createBranchCommit(prWorktreePath)
 
     const screenshotDir = path.join(
@@ -524,41 +524,41 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     })
     const generatorScriptPath = path.join(screenshotDir, 'delayed-pr-generator.cjs')
     const callLogPath = path.join(screenshotDir, 'delayed-pr-generator.log')
-    await installDelayedPrGenerator(orcaBotmuxPage, generatorScriptPath, callLogPath, primaryBranch)
+    await installDelayedPrGenerator(botmuxPage, generatorScriptPath, callLogPath, primaryBranch)
 
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    const generate = orcaBotmuxPage.getByRole('button', {
+    await openSourceControl(botmuxPage, prWorktreeId)
+    const generate = botmuxPage.getByRole('button', {
       name: 'Generate pull request details with AI'
     })
     await expect(generate).toBeVisible({ timeout: 10_000 })
     await expect(generate).toBeEnabled()
     await generate.click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
+      botmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
     ).toBeVisible()
     await expect.poll(() => readLog(callLogPath)).toContain('start')
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.__store?.getState().setRightSidebarTab('explorer')
     })
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
+      botmuxPage.getByRole('button', { name: 'Stop generating pull request details' })
     ).toHaveCount(0)
     await expect
       .poll(() => readFileSync(callLogPath, 'utf8'), { timeout: 10_000 })
       .toContain('finish')
-    await waitForPrGenerationStored(orcaBotmuxPage, prWorktreeId)
+    await waitForPrGenerationStored(botmuxPage, prWorktreeId)
 
-    await openSourceControl(orcaBotmuxPage, prWorktreeId)
-    await waitForPrGenerationHydrated(orcaBotmuxPage, prWorktreeId)
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
+    await openSourceControl(botmuxPage, prWorktreeId)
+    await waitForPrGenerationHydrated(botmuxPage, prWorktreeId)
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request title' })).toHaveValue(
       'Generated PR title after switch',
       { timeout: 10_000 }
     )
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request description' })).toHaveValue(
       'Generated PR body after switch'
     )
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-remounted-source-control-hydrated-pr-fields.png')
     })
     await writeEvidence(testInfo, screenshotDir, 'pr-generation-remount-evidence.json', {
@@ -568,12 +568,12 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('keeps pending commit message generation attached to its original worktree', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
     const { primaryWorktreeId, commitWorktreeId, commitWorktreePath } =
-      await seedCommitMessageComposer(orcaBotmuxPage)
+      await seedCommitMessageComposer(botmuxPage)
     createStagedCommitMessageChange(commitWorktreePath)
 
     const screenshotDir = path.join(
@@ -588,27 +588,27 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     })
     const generatorScriptPath = path.join(screenshotDir, 'delayed-commit-generator.cjs')
     const callLogPath = path.join(screenshotDir, 'delayed-commit-generator.log')
-    await installDelayedCommitMessageGenerator(orcaBotmuxPage, generatorScriptPath, callLogPath)
+    await installDelayedCommitMessageGenerator(botmuxPage, generatorScriptPath, callLogPath)
 
-    await openSourceControl(orcaBotmuxPage, commitWorktreeId)
-    await expect(orcaBotmuxPage.getByText('e2e-commit-message-generation.txt')).toBeVisible({
+    await openSourceControl(botmuxPage, commitWorktreeId)
+    await expect(botmuxPage.getByText('e2e-commit-message-generation.txt')).toBeVisible({
       timeout: 10_000
     })
-    const generate = orcaBotmuxPage.getByRole('button', {
+    const generate = botmuxPage.getByRole('button', {
       name: 'Generate commit message with AI'
     })
     await expect(generate).toBeVisible({ timeout: 10_000 })
     await expect(generate).toBeEnabled()
     await generate.click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating commit message' })
+      botmuxPage.getByRole('button', { name: 'Stop generating commit message' })
     ).toBeVisible()
     await expect
       .poll(() => {
         return readLog(callLogPath)
       })
       .toContain('start')
-    const pendingEvidence = await orcaBotmuxPage.evaluate(() => {
+    const pendingEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -617,16 +617,16 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         )?.value
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-commit-message-generation-pending-on-a.png')
     })
 
-    await openSourceControl(orcaBotmuxPage, primaryWorktreeId)
-    await expect(orcaBotmuxPage.getByText('Generated commit message after switch')).toHaveCount(0)
+    await openSourceControl(botmuxPage, primaryWorktreeId)
+    await expect(botmuxPage.getByText('Generated commit message after switch')).toHaveCount(0)
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating commit message' })
+      botmuxPage.getByRole('button', { name: 'Stop generating commit message' })
     ).toHaveCount(0)
-    const switchedEvidence = await orcaBotmuxPage.evaluate(() => {
+    const switchedEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -635,21 +635,21 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         )
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '02-switched-to-b-no-generated-commit-message.png')
     })
 
     await expect
       .poll(() => readFileSync(callLogPath, 'utf8'), { timeout: 10_000 })
       .toContain('finish')
-    await waitForCommitGenerationStored(orcaBotmuxPage, commitWorktreeId)
-    await openSourceControl(orcaBotmuxPage, commitWorktreeId)
-    await waitForCommitGenerationHydrated(orcaBotmuxPage, commitWorktreeId)
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Commit message' })).toHaveValue(
+    await waitForCommitGenerationStored(botmuxPage, commitWorktreeId)
+    await openSourceControl(botmuxPage, commitWorktreeId)
+    await waitForCommitGenerationHydrated(botmuxPage, commitWorktreeId)
+    await expect(botmuxPage.getByRole('textbox', { name: 'Commit message' })).toHaveValue(
       'Generated commit message after switch\n\nGenerated from staged e2e-commit-message-generation.txt after switching worktrees',
       { timeout: 10_000 }
     )
-    const finalEvidence = await orcaBotmuxPage.evaluate(() => {
+    const finalEvidence = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       return {
         activeWorktreeId: state?.activeWorktreeId,
@@ -658,7 +658,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         )?.value
       }
     })
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '03-returned-to-a-generated-commit-message.png')
     })
     await writeEvidence(testInfo, screenshotDir, 'commit-message-generation-evidence.json', {
@@ -672,11 +672,11 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('hydrates pending commit message generation after Source Control remounts', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    const { commitWorktreeId, commitWorktreePath } = await seedCommitMessageComposer(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    const { commitWorktreeId, commitWorktreePath } = await seedCommitMessageComposer(botmuxPage)
     createStagedCommitMessageChange(commitWorktreePath)
 
     const screenshotDir = path.join(
@@ -691,34 +691,34 @@ test.describe('Source Control AI PR generation worktree switching', () => {
     })
     const generatorScriptPath = path.join(screenshotDir, 'delayed-commit-generator.cjs')
     const callLogPath = path.join(screenshotDir, 'delayed-commit-generator.log')
-    await installDelayedCommitMessageGenerator(orcaBotmuxPage, generatorScriptPath, callLogPath)
+    await installDelayedCommitMessageGenerator(botmuxPage, generatorScriptPath, callLogPath)
 
-    await openSourceControl(orcaBotmuxPage, commitWorktreeId)
-    const generate = orcaBotmuxPage.getByRole('button', {
+    await openSourceControl(botmuxPage, commitWorktreeId)
+    const generate = botmuxPage.getByRole('button', {
       name: 'Generate commit message with AI'
     })
     await expect(generate).toBeVisible({ timeout: 10_000 })
     await expect(generate).toBeEnabled()
     await generate.click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating commit message' })
+      botmuxPage.getByRole('button', { name: 'Stop generating commit message' })
     ).toBeVisible()
     await expect.poll(() => readLog(callLogPath)).toContain('start')
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.__store?.getState().setRightSidebarTab('explorer')
     })
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Stop generating commit message' })
+      botmuxPage.getByRole('button', { name: 'Stop generating commit message' })
     ).toHaveCount(0)
     await expect
       .poll(() => readFileSync(callLogPath, 'utf8'), { timeout: 10_000 })
       .toContain('finish')
-    await waitForCommitGenerationStored(orcaBotmuxPage, commitWorktreeId)
+    await waitForCommitGenerationStored(botmuxPage, commitWorktreeId)
 
-    await openSourceControl(orcaBotmuxPage, commitWorktreeId)
-    await waitForCommitGenerationHydrated(orcaBotmuxPage, commitWorktreeId)
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Commit message' })).toHaveValue(
+    await openSourceControl(botmuxPage, commitWorktreeId)
+    await waitForCommitGenerationHydrated(botmuxPage, commitWorktreeId)
+    await expect(botmuxPage.getByRole('textbox', { name: 'Commit message' })).toHaveValue(
       [
         'Generated commit message after switch',
         '',
@@ -726,7 +726,7 @@ test.describe('Source Control AI PR generation worktree switching', () => {
       ].join('\n'),
       { timeout: 10_000 }
     )
-    await orcaBotmuxPage.screenshot({
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-remounted-source-control-hydrated-message.png')
     })
     await writeEvidence(
@@ -741,11 +741,11 @@ test.describe('Source Control AI PR generation worktree switching', () => {
   })
 
   test('hides the commit AI composer on a clean branch empty state', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    const primaryWorktreeId = await seedCleanBranchEmptyState(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    const primaryWorktreeId = await seedCleanBranchEmptyState(botmuxPage)
 
     const screenshotDir = path.join(
       process.cwd(),
@@ -758,15 +758,15 @@ test.describe('Source Control AI PR generation worktree switching', () => {
       contentType: 'text/plain'
     })
 
-    await openSourceControl(orcaBotmuxPage, primaryWorktreeId)
+    await openSourceControl(botmuxPage, primaryWorktreeId)
     await expect
       .poll(
         async () => {
           // Why: this full-suite spec shares the physical E2E repo with other
           // workers. Keep DOM assertions inside the reseeded poll instead of
           // racing unrelated real git-status refreshes after the poll settles.
-          await seedCleanBranchEmptyState(orcaBotmuxPage, primaryWorktreeId)
-          return orcaBotmuxPage.evaluate(() => {
+          await seedCleanBranchEmptyState(botmuxPage, primaryWorktreeId)
+          return botmuxPage.evaluate(() => {
             const emptyStateVisible =
               document.body.textContent?.includes('No changes on this branch') === true
             const commitMessageInput = document.querySelector('[aria-label="Commit message"]')
@@ -790,8 +790,8 @@ test.describe('Source Control AI PR generation worktree switching', () => {
         hasCommitMessageInput: false,
         hasCommitAiButton: false
       })
-    await seedCleanBranchEmptyState(orcaBotmuxPage, primaryWorktreeId)
-    await orcaBotmuxPage.screenshot({
+    await seedCleanBranchEmptyState(botmuxPage, primaryWorktreeId)
+    await botmuxPage.screenshot({
       path: path.join(screenshotDir, '01-clean-branch-no-commit-ai-composer.png')
     })
   })

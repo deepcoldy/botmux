@@ -402,7 +402,7 @@ export class PaneManager {
     spawnHints?: Parameters<NonNullable<PaneManagerOptions['onPaneCreated']>>[1]
   ): void {
     // Why: onPaneCreated wires PTY/status identity synchronously. After this
-    // point, replacing the leaf id would fork ORCA_PANE_KEY from layout state.
+    // point, replacing the leaf id would fork BOTMUX_PANE_KEY from layout state.
     this.identities.markPublished(pane.id)
     void this.options.onPaneCreated?.(toPublicPane(pane), spawnHints)
   }

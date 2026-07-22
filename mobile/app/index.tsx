@@ -11,7 +11,8 @@ import {
   RefreshCw,
   PowerOff,
   Edit3,
-  ListTodo
+  ListTodo,
+  Radio
 } from 'lucide-react-native'
 import { ClaudeIcon, OpenAIIcon } from '../src/components/AgentIcons'
 import {
@@ -38,21 +39,33 @@ import { classifyConnection } from '../src/transport/connection-health'
 import { subscribeToDesktopNotifications } from '../src/notifications/mobile-notifications'
 import { shouldPresentNotificationOptIn } from '../src/notifications/notification-opt-in-gate'
 import type { ConnectionState, HostProfile } from '../src/transport/types'
-import { triggerMediumImpact } from '../src/platform/haptics'
-import { OrcaLogo } from '../src/components/OrcaLogo'
-import { MobileHostCard } from '../src/components/MobileHostCard'
+import { triggerMediumImpact, triggerSuccess } from '../src/platform/haptics'
+import { BotmuxLogo } from '../src/components/BotmuxLogo'
+import { MobileHostCard, HOST_ROW_SEPARATOR_INSET } from '../src/components/MobileHostCard'
 import { TaskProviderLogo } from '../src/components/TaskProviderLogo'
 import { ActionSheetModal, type ActionSheetAction } from '../src/components/ActionSheetModal'
 import { ConfirmModal } from '../src/components/ConfirmModal'
 import { setCachedWorktrees, getCachedWorktrees } from '../src/cache/worktree-cache'
 import { loadHomeSnapshot, saveHomeSnapshot } from '../src/cache/home-snapshot-cache'
 import { colors, spacing, radii } from '../src/theme/mobile-theme'
+import { appleRadii, appleSurfaces, appleType } from '../src/theme/apple-tokens'
+import { AppleGroup, AppleGroupSeparator } from '../src/components/apple/GroupedList'
+import { AppleEmptyState } from '../src/components/apple/AppleEmptyState'
+import { botmuxBridgeListSessions, type BotmuxBridgeSession } from '../src/botmux/botmux-bridge-rpc'
+import { openBotmuxSessionOnMobile } from '../src/botmux/open-botmux-session-on-mobile'
+import {
+  isBotmuxSessionClosed,
+  sortBotmuxSessionsByActivity
+} from '../src/botmux/botmux-session-presentation'
+import { BotmuxSessionRow } from '../src/components/botmux/BotmuxSessionRow'
+import { formatBotmuxOpenError, getBotmuxMobileCopy } from '../src/botmux/botmux-mobile-copy'
 import {
   filterAvailableTaskProviders,
   normalizeVisibleTaskProviders,
   type TaskProvider
 } from '../src/tasks/mobile-task-providers'
 import { useResponsiveLayout } from '../src/layout/responsive-layout'
+import { useMobileI18n } from '../src/i18n/mobile-i18n'
 
 function endpointLabel(endpoint: string): string {
   try {
@@ -300,6 +313,7 @@ function repoColor(name: string): string {
 export default function HomeScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  const { locale, t } = useMobileI18n()
   // Why: cap and center content on wide/tablet canvases so cards don't stretch
   // edge-to-edge on iPad; on phones isWideLayout is false and layout is unchanged.
   const { isWideLayout, contentMaxWidth } = useResponsiveLayout()
@@ -409,7 +423,7 @@ export default function HomeScreen() {
           router.replace('/notification-opt-in')
         }
       })
-      void AsyncStorage.getItem('orca:last-visited-worktree').then((raw) => {
+      void AsyncStorage.getItem('botmux:last-visited-worktree').then((raw) => {
         if (stale || !raw) {
           return
         }
@@ -626,7 +640,7 @@ export default function HomeScreen() {
         continue
       }
       // Why: also show hosts whose only usage is the system-default login
-      // (no Orca-managed accounts but live rate-limit data for the active
+      // (no Botmux-managed accounts but live rate-limit data for the active
       // target), otherwise system-default users see no usage section at all.
       if (hasRenderableUsage(snap, 'claude') || hasRenderableUsage(snap, 'codex')) {
         items.push({ host, snapshot: snap })
@@ -638,6 +652,64 @@ export default function HomeScreen() {
   const primaryConnectedHost = useMemo(
     () => sortedHosts.find((host) => hostStates[host.id] === 'connected') ?? null,
     [sortedHosts, hostStates]
+  )
+  // Why: Botmux sessions are HOME-LEVEL content (desktop sidebar parity: the
+  // Botmux section sits beside Projects) — peer of Desktops, not a sub-page.
+  const [botmuxSessions, setBotmuxSessions] = useState<BotmuxBridgeSession[]>([])
+  const [botmuxBusyId, setBotmuxBusyId] = useState<string | null>(null)
+  const botmuxCopy = useMemo(() => getBotmuxMobileCopy(locale), [locale])
+  const primaryClient = primaryConnectedHost
+    ? (allClients.find((c) => c.hostId === primaryConnectedHost.id)?.client ?? null)
+    : null
+  const primaryConnected = primaryConnectedHost != null
+
+  const fetchBotmuxSessions = useCallback(async () => {
+    if (!primaryClient || !primaryConnected) return
+    try {
+      const list = await botmuxBridgeListSessions(primaryClient)
+      const open = (list.sessions ?? []).filter((s) => !isBotmuxSessionClosed(s.status))
+      setBotmuxSessions(sortBotmuxSessionsByActivity(open))
+    } catch {
+      setBotmuxSessions([])
+    }
+  }, [primaryClient, primaryConnected])
+
+  useEffect(() => {
+    setBotmuxSessions([])
+    void fetchBotmuxSessions()
+    const timer = setInterval(() => void fetchBotmuxSessions(), 12_000)
+    return () => clearInterval(timer)
+  }, [fetchBotmuxSessions])
+
+  const openBotmuxSession = useCallback(
+    async (session: BotmuxBridgeSession) => {
+      if (!primaryClient || !primaryConnectedHost) return
+      setBotmuxBusyId(session.sessionId)
+      try {
+        const opened = await openBotmuxSessionOnMobile({
+          client: primaryClient,
+          mobileHostId: primaryConnectedHost.id,
+          session
+        })
+        if (!opened.ok) {
+          Alert.alert(
+            botmuxCopy.openFailedTitle,
+            formatBotmuxOpenError(opened.message, locale) || botmuxCopy.openFailedFallback
+          )
+          return
+        }
+        triggerSuccess()
+        router.push(opened.sessionPath as never)
+      } catch (e) {
+        Alert.alert(
+          botmuxCopy.openFailedTitle,
+          formatBotmuxOpenError(e instanceof Error ? e.message : String(e), locale)
+        )
+      } finally {
+        setBotmuxBusyId(null)
+      }
+    },
+    [primaryClient, primaryConnectedHost, botmuxCopy, locale, router]
   )
   const primaryTaskProviders = primaryConnectedHost
     ? (taskProvidersByHost[primaryConnectedHost.id] ?? ['github'])
@@ -668,11 +740,11 @@ export default function HomeScreen() {
         <ListTodo size={18} color={colors.textSecondary} />
       </View>
       <View style={styles.taskHomeMain}>
-        <Text style={styles.taskHomeTitle}>Tasks</Text>
+        <Text style={styles.taskHomeTitle}>{t('Tasks')}</Text>
         <Text style={styles.taskHomeSubtitle} numberOfLines={1}>
           {primaryTaskProviders.length > 0
             ? primaryTaskProviders.map((provider) => TASK_PROVIDER_LABELS[provider]).join(' · ')
-            : 'No task sources connected'}
+            : t('No task sources connected')}
         </Text>
       </View>
       <View style={styles.taskHomeTrailing}>
@@ -686,7 +758,9 @@ export default function HomeScreen() {
             <Pressable
               key={provider}
               accessibilityRole="button"
-              accessibilityLabel={`Open ${TASK_PROVIDER_LABELS[provider]} tasks`}
+              accessibilityLabel={t('Open {{provider}} tasks', {
+                provider: TASK_PROVIDER_LABELS[provider]
+              })}
               hitSlop={8}
               style={({ pressed }) => [
                 styles.taskHomeProviderButton,
@@ -719,7 +793,7 @@ export default function HomeScreen() {
       // Why: ConfirmModal closes on confirm; re-open for retry and surface the
       // failure instead of silently leaving the host listed.
       setConfirmRemove(hostToRemove)
-      Alert.alert('Could not remove host', 'Please try again.')
+      Alert.alert(t('Could not remove host'), t('Please try again.'))
     }
   }
 
@@ -729,9 +803,9 @@ export default function HomeScreen() {
       <View style={styles.topBar}>
         <View style={styles.brandLockup}>
           <View style={styles.logoMark}>
-            <OrcaLogo size={18} />
+            <BotmuxLogo size={18} />
           </View>
-          <Text style={styles.brandName}>Orca</Text>
+          <Text style={styles.brandName}>Botmux</Text>
         </View>
         <Pressable
           style={({ pressed }) => [styles.iconButton, pressed && styles.iconButtonPressed]}
@@ -751,30 +825,35 @@ export default function HomeScreen() {
           ]}
         >
           <View style={styles.emptyHero}>
-            <Text style={styles.emptyTitle}>Connect your desktop</Text>
-            <Text style={styles.emptyBody}>
-              Pair with Orca on your computer to check on your agents, jump into any terminal, and
-              drive work from your phone.
-            </Text>
-            <Pressable style={styles.primaryButton} onPress={() => router.push('/pair-scan')}>
-              <QrCode size={17} color={colors.bgBase} />
-              <Text style={styles.primaryButtonText}>Pair Desktop</Text>
-            </Pressable>
+            <AppleEmptyState
+              icon={<QrCode size={28} color={appleSurfaces.tint} />}
+              title={t('Connect your desktop')}
+              body={t(
+                'Pair with Botmux on your computer to check on your agents, jump into any terminal, and drive work from your phone.'
+              )}
+              actionLabel={t('Pair Desktop')}
+              onAction={() => router.push('/pair-scan')}
+            />
           </View>
 
           <View style={styles.stepsSection}>
-            <Text style={styles.sectionHeading}>How it works</Text>
-            {ONBOARDING_STEPS.map((step, i) => (
-              <View key={step.title} style={[styles.stepRow, i > 0 && styles.stepRowBorder]}>
-                <View style={styles.stepNum}>
-                  <Text style={styles.stepNumText}>{i + 1}</Text>
+            <Text style={styles.sectionHeading}>{t('How it works')}</Text>
+            <AppleGroup>
+              {ONBOARDING_STEPS.map((step, i) => (
+                <View key={step.title}>
+                  {i > 0 ? <AppleGroupSeparator inset={12 + 28 + 14} /> : null}
+                  <View style={styles.stepRow}>
+                    <View style={styles.stepNum}>
+                      <Text style={styles.stepNumText}>{i + 1}</Text>
+                    </View>
+                    <View style={styles.stepText}>
+                      <Text style={styles.stepTitle}>{t(step.title)}</Text>
+                      <Text style={styles.stepDesc}>{t(step.desc)}</Text>
+                    </View>
+                  </View>
                 </View>
-                <View style={styles.stepText}>
-                  <Text style={styles.stepTitle}>{step.title}</Text>
-                  <Text style={styles.stepDesc}>{step.desc}</Text>
-                </View>
-              </View>
-            ))}
+              ))}
+            </AppleGroup>
           </View>
         </View>
       ) : (
@@ -793,33 +872,78 @@ export default function HomeScreen() {
           ListHeaderComponent={
             <View>
               <View style={styles.hero}>
-                <Text style={styles.heroTitle}>Welcome back</Text>
+                <Text style={styles.heroTitle}>{t('Welcome back')}</Text>
               </View>
 
               {stats && (
-                <View style={styles.statsRow}>
+                <AppleGroup style={styles.statsRow}>
                   <View style={styles.statCard}>
                     <Text style={styles.statValue}>
                       {stats.totalAgentsSpawned.toLocaleString()}
                     </Text>
-                    <Text style={styles.statLabel}>Agents spawned</Text>
+                    <Text style={styles.statLabel}>{t('Agents spawned')}</Text>
                   </View>
+                  <View style={styles.statDivider} />
                   <View style={styles.statCard}>
                     <Text style={styles.statValue}>{formatDuration(stats.totalAgentTimeMs)}</Text>
-                    <Text style={styles.statLabel}>Agent time</Text>
+                    <Text style={styles.statLabel}>{t('Agent time')}</Text>
                   </View>
+                  <View style={styles.statDivider} />
                   <View style={styles.statCard}>
                     <Text style={styles.statValue}>{stats.totalPRsCreated.toLocaleString()}</Text>
-                    <Text style={styles.statLabel}>PRs created</Text>
+                    <Text style={styles.statLabel}>{t('PRs created')}</Text>
                   </View>
-                </View>
+                </AppleGroup>
               )}
 
-              <Text style={styles.sectionHeading}>Desktops</Text>
+              {botmuxSessions.length > 0 ? (
+                <View style={styles.botmuxSection}>
+                  <View style={styles.botmuxSectionHeader}>
+                    <Text style={[styles.sectionHeading, styles.botmuxHeadingText]}>
+                      {botmuxCopy.title}
+                    </Text>
+                    <Text style={styles.botmuxSectionCount}>{botmuxSessions.length}</Text>
+                  </View>
+                  <AppleGroup>
+                    {botmuxSessions.slice(0, 5).map((s, i) => (
+                      <View key={`${s.hostId}::${s.sessionId}`}>
+                        {i > 0 ? <AppleGroupSeparator inset={12 + 8 + 20 + 8} /> : null}
+                        <BotmuxSessionRow
+                          session={s}
+                          busy={botmuxBusyId === s.sessionId}
+                          onOpen={(sess) => void openBotmuxSession(sess)}
+                        />
+                      </View>
+                    ))}
+                    {botmuxSessions.length > 5 ? (
+                      <>
+                        <AppleGroupSeparator inset={12} />
+                        <Pressable
+                          style={({ pressed }) => [
+                            styles.botmuxShowAll,
+                            pressed && styles.hostCardPressed
+                          ]}
+                          onPress={() =>
+                            primaryConnectedHost &&
+                            router.push(`/h/${primaryConnectedHost.id}/botmux`)
+                          }
+                          accessibilityRole="button"
+                        >
+                          <Text style={styles.botmuxShowAllText}>
+                            {botmuxCopy.showAll} ({botmuxSessions.length})
+                          </Text>
+                        </Pressable>
+                      </>
+                    ) : null}
+                  </AppleGroup>
+                </View>
+              ) : null}
+
+              <Text style={styles.sectionHeading}>{t('Desktops')}</Text>
             </View>
           }
-          ItemSeparatorComponent={CardGap}
-          renderItem={({ item }) => {
+          ItemSeparatorComponent={() => <AppleGroupSeparator inset={HOST_ROW_SEPARATOR_INSET} />}
+          renderItem={({ item, index }) => {
             const state = hostStates[item.id] ?? 'connecting'
             const attempts = hostAttempts[item.id] ?? 0
             const lastConnectedAt = hostLastConnected[item.id] ?? null
@@ -839,6 +963,8 @@ export default function HomeScreen() {
                 worktreeCounts={
                   info ? { total: info.totalWorktrees, active: info.activeCount } : undefined
                 }
+                groupIndex={index}
+                groupCount={sortedHosts.length}
                 onPress={() => router.push(`/h/${item.id}`)}
                 onLongPress={() => {
                   triggerMediumImpact()
@@ -852,7 +978,9 @@ export default function HomeScreen() {
               {/* ─── Resume card ─── */}
               {resumeWorktree ? (
                 <>
-                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Resume</Text>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>
+                    {t('Resume')}
+                  </Text>
                   <Pressable
                     style={({ pressed }) => [styles.resumeCard, pressed && styles.hostCardPressed]}
                     onPress={() =>
@@ -884,18 +1012,24 @@ export default function HomeScreen() {
                     </View>
                     <ChevronRight size={16} color={colors.textMuted} />
                   </Pressable>
-                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Tasks</Text>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>
+                    {t('Tasks')}
+                  </Text>
                   {renderTaskHomeCard()}
                 </>
               ) : (
                 <>
-                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>Tasks</Text>
+                  <Text style={[styles.sectionHeading, styles.sectionHeadingTightTop]}>
+                    {t('Tasks')}
+                  </Text>
                   {renderTaskHomeCard()}
                 </>
               )}
 
               {/* ─── Quick actions ─── */}
-              <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>Quick Actions</Text>
+              <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>
+                {t('Quick Actions')}
+              </Text>
               <View style={styles.quickActions}>
                 <Pressable
                   style={({ pressed }) => [styles.quickAction, pressed && styles.hostCardPressed]}
@@ -904,7 +1038,7 @@ export default function HomeScreen() {
                   <View style={styles.quickActionIcon}>
                     <QrCode size={16} color={colors.textSecondary} />
                   </View>
-                  <Text style={styles.quickActionLabel}>Pair Desktop</Text>
+                  <Text style={styles.quickActionLabel}>{t('Pair Desktop')}</Text>
                 </Pressable>
                 <Pressable
                   disabled={!primaryConnectedHost}
@@ -922,7 +1056,28 @@ export default function HomeScreen() {
                   <View style={styles.quickActionIcon}>
                     <Plus size={16} color={colors.textSecondary} />
                   </View>
-                  <Text style={styles.quickActionLabel}>New Workspace</Text>
+                  <Text style={styles.quickActionLabel}>{t('New Workspace')}</Text>
+                </Pressable>
+                <Pressable
+                  disabled={!primaryConnectedHost}
+                  style={({ pressed }) => [
+                    styles.quickAction,
+                    !primaryConnectedHost && styles.quickActionDisabled,
+                    pressed && styles.hostCardPressed
+                  ]}
+                  onPress={() => {
+                    // Why: Botmux Feishu sessions live on a host-scoped screen, not
+                    // the Botmux worktree RESUME list — surface a home entry so dogfood
+                    // can find them without hunting the worktree action sheet.
+                    if (primaryConnectedHost) {
+                      router.push(`/h/${primaryConnectedHost.id}/botmux`)
+                    }
+                  }}
+                >
+                  <View style={styles.quickActionIcon}>
+                    <Radio size={16} color={colors.textSecondary} />
+                  </View>
+                  <Text style={styles.quickActionLabel}>Botmux</Text>
                 </Pressable>
               </View>
 
@@ -930,7 +1085,7 @@ export default function HomeScreen() {
               {accountsHosts.length > 0 ? (
                 <>
                   <Text style={[styles.sectionHeading, { marginTop: spacing.xl }]}>
-                    Account usage
+                    {t('Account usage')}
                   </Text>
                   {accountsHosts.map(({ host, snapshot }) => {
                     const claudeActiveId = snapshot.claude.activeAccountId
@@ -981,7 +1136,7 @@ export default function HomeScreen() {
                               </View>
                               <View style={styles.accountsInfo}>
                                 <Text style={styles.accountsEmail} numberOfLines={1}>
-                                  {active?.email ?? 'System default'}
+                                  {active?.email ?? t('System default')}
                                 </Text>
                                 <View style={styles.accountsBars}>
                                   <UsageBar
@@ -1035,7 +1190,7 @@ export default function HomeScreen() {
           const hasEverConnected = (hostLastConnected[host.id] ?? null) != null
           const items: ActionSheetAction[] = []
           items.push({
-            label: hasEverConnected && isLive ? 'Reconnect' : 'Connect',
+            label: t(hasEverConnected && isLive ? 'Reconnect' : 'Connect'),
             icon: RefreshCw,
             onPress: () => {
               setActionTarget(null)
@@ -1044,7 +1199,7 @@ export default function HomeScreen() {
           })
           if (isLive) {
             items.push({
-              label: 'Disconnect',
+              label: t('Disconnect'),
               icon: PowerOff,
               onPress: () => {
                 setActionTarget(null)
@@ -1053,7 +1208,7 @@ export default function HomeScreen() {
             })
           }
           items.push({
-            label: 'Edit host',
+            label: t('Edit host'),
             icon: Edit3,
             closeBeforePress: true,
             onPress: () => {
@@ -1062,7 +1217,7 @@ export default function HomeScreen() {
             }
           })
           items.push({
-            label: 'Remove',
+            label: t('Remove'),
             destructive: true,
             closeBeforePress: true,
             onPress: () => {
@@ -1076,9 +1231,11 @@ export default function HomeScreen() {
 
       <ConfirmModal
         visible={confirmRemove != null}
-        title="Remove Host"
-        message={`Remove "${confirmRemove?.name}"? You can re-pair later.`}
-        confirmLabel="Remove"
+        title={t('Remove Host')}
+        message={t('Remove "{{host}}"? You can re-pair later.', {
+          host: confirmRemove?.name ?? ''
+        })}
+        confirmLabel={t('Remove')}
         destructive
         onConfirm={() => void handleRemove()}
         onCancel={() => setConfirmRemove(null)}
@@ -1087,13 +1244,9 @@ export default function HomeScreen() {
   )
 }
 
-function CardGap() {
-  return <View style={styles.cardGap} />
-}
-
 const ONBOARDING_STEPS = [
   {
-    title: 'Open Orca desktop',
+    title: 'Open Botmux desktop',
     desc: 'Go to Settings → Mobile and generate a pairing QR code.'
   },
   {
@@ -1151,26 +1304,23 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.md
   },
   heroTitle: {
-    color: colors.textPrimary,
-    fontSize: 24,
-    fontWeight: '800',
-    letterSpacing: -0.3
+    ...appleType.largeTitle,
+    color: colors.textPrimary
   },
 
-  /* ─── Stat cards ─── */
+  /* ─── Stat cards (one grouped card, hairline columns) ─── */
   statsRow: {
     flexDirection: 'row',
-    gap: 10,
     marginBottom: spacing.lg
   },
   statCard: {
     flex: 1,
-    backgroundColor: 'rgba(26,26,26,0.6)',
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: 10,
-    paddingVertical: 8,
+    paddingVertical: 10,
     paddingHorizontal: spacing.md
+  },
+  statDivider: {
+    width: 1,
+    backgroundColor: appleSurfaces.separator
   },
   statValue: {
     color: colors.textPrimary,
@@ -1185,18 +1335,42 @@ const styles = StyleSheet.create({
     marginTop: 2
   },
 
-  /* ─── Section heading ─── */
+  /* ─── Section heading (iOS footnote, plain case) ─── */
   sectionHeading: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: colors.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.6,
-    marginBottom: spacing.sm,
+    ...appleType.footnote,
+    color: appleSurfaces.secondaryLabel,
+    marginBottom: 6,
     paddingHorizontal: spacing.xs
   },
   sectionHeadingTightTop: {
     marginTop: spacing.lg
+  },
+
+  /* ─── Botmux peer section (desktop sidebar parity) ─── */
+  botmuxSection: {
+    marginBottom: spacing.lg
+  },
+  botmuxSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    gap: spacing.xs,
+    paddingBottom: 6
+  },
+  botmuxHeadingText: {
+    marginBottom: 0
+  },
+  botmuxSectionCount: {
+    ...appleType.footnote,
+    color: appleSurfaces.tertiaryLabel
+  },
+  botmuxShowAll: {
+    paddingVertical: spacing.sm + 2,
+    paddingHorizontal: spacing.md
+  },
+  botmuxShowAllText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: appleSurfaces.tint
   },
 
   /* ─── List ─── */
@@ -1217,19 +1391,17 @@ const styles = StyleSheet.create({
   resumeCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.card,
+    backgroundColor: appleSurfaces.group,
+    borderRadius: appleRadii.group,
     paddingLeft: spacing.md,
     paddingRight: spacing.md,
     paddingVertical: 12
   },
   resumeIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 13,
-    backgroundColor: colors.bgRaised,
+    width: 40,
+    height: 40,
+    borderRadius: appleRadii.tile,
+    backgroundColor: appleSurfaces.raised,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 14
@@ -1264,20 +1436,18 @@ const styles = StyleSheet.create({
   taskHomeCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.card,
+    backgroundColor: appleSurfaces.group,
+    borderRadius: appleRadii.group,
     minHeight: 72,
     paddingLeft: spacing.md,
     paddingRight: spacing.md,
     paddingVertical: 12
   },
   taskHomeIcon: {
-    width: 46,
-    height: 46,
-    borderRadius: 13,
-    backgroundColor: colors.bgRaised,
+    width: 40,
+    height: 40,
+    borderRadius: appleRadii.tile,
+    backgroundColor: appleSurfaces.raised,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 14
@@ -1321,21 +1491,17 @@ const styles = StyleSheet.create({
 
   /* ─── Account usage ─── */
   accountsCard: {
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.card,
+    backgroundColor: appleSurfaces.group,
+    borderRadius: appleRadii.group,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm + 2,
     gap: spacing.sm,
     marginBottom: spacing.sm
   },
   accountsHostLabel: {
-    fontSize: 11,
+    ...appleType.caption1,
     color: colors.textMuted,
-    fontWeight: '500',
-    textTransform: 'uppercase',
-    letterSpacing: 0.4
+    fontWeight: '500'
   },
   accountsRow: {
     flexDirection: 'row',
@@ -1374,10 +1540,8 @@ const styles = StyleSheet.create({
   quickAction: {
     flex: 1,
     flexDirection: 'row',
-    backgroundColor: colors.bgPanel,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: radii.card,
+    backgroundColor: appleSurfaces.group,
+    borderRadius: appleRadii.card,
     paddingVertical: 10,
     paddingHorizontal: 12,
     alignItems: 'center',
@@ -1389,8 +1553,8 @@ const styles = StyleSheet.create({
   quickActionIcon: {
     width: 28,
     height: 28,
-    borderRadius: 9,
-    backgroundColor: 'rgba(255,255,255,0.04)',
+    borderRadius: appleRadii.tile,
+    backgroundColor: appleSurfaces.raised,
     alignItems: 'center',
     justifyContent: 'center'
   },
@@ -1453,19 +1617,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 14,
-    paddingVertical: spacing.lg
-  },
-  stepRowBorder: {
-    borderTopWidth: 1,
-    borderTopColor: colors.borderSubtle
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md
   },
   stepNum: {
     width: 28,
     height: 28,
-    borderRadius: 8,
-    backgroundColor: 'rgba(255,255,255,0.04)',
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
+    borderRadius: appleRadii.tile,
+    backgroundColor: appleSurfaces.raised,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 1

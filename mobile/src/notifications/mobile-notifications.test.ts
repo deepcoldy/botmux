@@ -577,7 +577,7 @@ describe('subscribeToDesktopNotifications — reconnect catch-up', () => {
     await flushAsync()
 
     expect(AsyncStorageMock.setItem).toHaveBeenCalledWith(
-      'orca:mobileNotificationsLastSeq:host-1',
+      'botmux:mobileNotificationsLastSeq:host-1',
       '5'
     )
   })
@@ -627,7 +627,7 @@ describe('subscribeToDesktopNotifications — reconnect catch-up', () => {
 
     // Watermark advanced to the replayed seq and was persisted.
     expect(AsyncStorageMock.setItem).toHaveBeenCalledWith(
-      'orca:mobileNotificationsLastSeq:host-1',
+      'botmux:mobileNotificationsLastSeq:host-1',
       '8'
     )
 

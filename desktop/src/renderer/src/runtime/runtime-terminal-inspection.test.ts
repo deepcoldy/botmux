@@ -88,7 +88,7 @@ describe('runtime terminal owner routing', () => {
         params: {
           terminal: 'terminal-1',
           text: 'x',
-          client: { id: 'orca-botmux-desktop', type: 'desktop' }
+          client: { id: 'botmux-desktop', type: 'desktop' }
         },
         timeoutMs: 15_000
       })
@@ -221,7 +221,7 @@ describe('runtime terminal owner routing', () => {
       params: {
         terminal: 'terminal-1',
         text: 'x',
-        client: { id: 'orca-botmux-desktop', type: 'desktop' }
+        client: { id: 'botmux-desktop', type: 'desktop' }
       },
       timeoutMs: 15_000
     })

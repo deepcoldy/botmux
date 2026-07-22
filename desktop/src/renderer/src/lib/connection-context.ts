@@ -1,6 +1,6 @@
 import { useAppStore } from '@/store'
 import { parseWorkspaceKey } from '../../../shared/workspace-scope'
-import { isOrcaBotmuxControlPlaneHostId } from '../../../shared/orca-botmux-main-terminal-host'
+import { isBotmuxControlPlaneHostId } from '../../../shared/botmux-main-terminal-host'
 import {
   getConnectionIdForFileFromState,
   getConnectionIdFromState
@@ -13,9 +13,9 @@ export { getConnectionIdFromState } from './connection-owner-resolution'
  * the target ID string for remote repos, or undefined if the worktree/repo
  * cannot be found (e.g., store not yet hydrated).
  *
- * OrcaBotmux control-plane hosts return the **filesystem** SSH target so
+ * Botmux control-plane hosts return the **filesystem** SSH target so
  * FileExplorer can readdir session cwd. Do **not** use this for PTY spawn —
- * use {@link getPtyConnectionId} (always local for orca_botmux).
+ * use {@link getPtyConnectionId} (always local for botmux).
  */
 export function getConnectionId(worktreeId: string | null): string | null | undefined {
   return getConnectionIdFromState(useAppStore.getState(), worktreeId)
@@ -23,11 +23,11 @@ export function getConnectionId(worktreeId: string | null): string | null | unde
 
 /**
  * Connection id for terminal PTY spawn / remote provider routing.
- * OrcaBotmux agent/session hosts always spawn a **local** PTY and run
+ * Botmux agent/session hosts always spawn a **local** PTY and run
  * `ssh -tt … tmux attach` in the shell — never SshPtyProvider.
  */
 export function getPtyConnectionId(worktreeId: string | null): string | null | undefined {
-  if (worktreeId && isOrcaBotmuxControlPlaneHostId(worktreeId)) {
+  if (worktreeId && isBotmuxControlPlaneHostId(worktreeId)) {
     return null
   }
   return getConnectionId(worktreeId)
@@ -44,11 +44,11 @@ export function isWorktreeConnectionResolved(worktreeId: string | null): boolean
   if (!worktreeId) {
     return true
   }
-  // OrcaBotmux control-plane hosts resolve immediately (local PTY; FS may be SSH).
+  // Botmux control-plane hosts resolve immediately (local PTY; FS may be SSH).
   if (
-    worktreeId === 'global-orca-botmux-terminal' ||
-    worktreeId.startsWith('orca_botmux:session:') ||
-    worktreeId.startsWith('orca_botmux:agent:')
+    worktreeId === 'global-botmux-terminal' ||
+    worktreeId.startsWith('botmux:session:') ||
+    worktreeId.startsWith('botmux:agent:')
   ) {
     return true
   }

@@ -163,7 +163,7 @@ describe('setup script prompt inspection', () => {
     expect(settings.scripts.setup).toBe('pnpm install')
   })
 
-  it('detects when shared orca_botmux.yaml setup scripts are ignored by local-only settings', () => {
+  it('detects when shared botmux.yaml setup scripts are ignored by local-only settings', () => {
     expect(
       ignoresSharedSetupScripts(
         makeRepo({

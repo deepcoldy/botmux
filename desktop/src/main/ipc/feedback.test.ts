@@ -18,6 +18,14 @@ vi.mock('electron', () => ({
 
 import { registerFeedbackHandlers, submitFeedback } from './feedback'
 
+const FEEDBACK_PRIMARY = 'https://feedback.example.test/v1/feedback'
+const FEEDBACK_FALLBACK = 'https://feedback-api.example.test/v1/feedback'
+
+function withFeedbackEnv(): void {
+  vi.stubEnv('BOTMUX_FEEDBACK_API_URL', FEEDBACK_PRIMARY)
+  vi.stubEnv('BOTMUX_FEEDBACK_API_FALLBACK_URL', FEEDBACK_FALLBACK)
+}
+
 function okResponse(): Response {
   return { ok: true, status: 200 } as unknown as Response
 }
@@ -54,6 +62,7 @@ function diagnosticSubmitArgs(): Parameters<typeof submitFeedback>[0] {
 
 describe('submitFeedback', () => {
   beforeEach(() => {
+    withFeedbackEnv()
     vi.useRealTimers()
     handlers.clear()
     fetchMock.mockReset()
@@ -173,9 +182,9 @@ describe('submitFeedback', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://www.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(FEEDBACK_PRIMARY)
     expect(requestInit(0).body).toBeInstanceOf(FormData)
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://www.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(FEEDBACK_PRIMARY)
     expect(requestInit(1).headers).toEqual({
       'Content-Type': 'application/json'
     })
@@ -195,7 +204,7 @@ describe('submitFeedback', () => {
       diagnosticBundleFailure: { status: 500, error: 'status 500' }
     })
 
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://api.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(FEEDBACK_FALLBACK)
     expect(requestInit(1).headers).toEqual({ 'Content-Type': 'application/json' })
     expect(postedBody(1)).not.toHaveProperty('diagnosticBundle')
   })
@@ -210,7 +219,7 @@ describe('submitFeedback', () => {
     })
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://api.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(FEEDBACK_FALLBACK)
     expect(requestInit(1).body).not.toBeInstanceOf(FormData)
     expect(postedBody(1)).not.toHaveProperty('diagnosticBundle')
   })
@@ -234,7 +243,7 @@ describe('submitFeedback', () => {
       diagnosticBundleFailure: { status: null, error: 'request timed out after 60 seconds' }
     })
     expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://api.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(FEEDBACK_FALLBACK)
     expect(postedBody(1)).not.toHaveProperty('diagnosticBundle')
   })
 
@@ -245,7 +254,7 @@ describe('submitFeedback', () => {
       ok: true,
       diagnosticBundleFailure: { status: 403, error: 'status 403' }
     })
-    expect(fetchMock.mock.calls[1]?.[0]).toBe('https://www.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(FEEDBACK_PRIMARY)
     expect(requestInit(1).body).not.toBeInstanceOf(FormData)
   })
 
@@ -279,7 +288,7 @@ describe('submitFeedback', () => {
   it('falls back when the primary feedback request stalls', async () => {
     vi.useFakeTimers()
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (url.includes('www.onorca.dev')) {
+      if (url.includes('feedback.example.test')) {
         return new Promise((_resolve, reject) => {
           init?.signal?.addEventListener('abort', () => reject(new Error('request aborted')))
         })
@@ -302,7 +311,7 @@ describe('submitFeedback', () => {
   it('does not retry the fallback when the fallback fails after a primary server error', async () => {
     vi.useFakeTimers()
     fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-      if (url.includes('www.onorca.dev')) {
+      if (url.includes('feedback.example.test')) {
         return Promise.resolve({ ok: false, status: 500 } as Response)
       }
       return new Promise((_resolve, reject) => {
@@ -335,7 +344,24 @@ describe('submitFeedback', () => {
       githubEmail: null
     } as Parameters<typeof submitFeedback>[0])
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://www.onorca.dev/v1/feedback')
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(FEEDBACK_PRIMARY)
+  })
+
+  it('returns not-configured when feedback env is unset', async () => {
+    vi.unstubAllEnvs()
+    await expect(
+      submitFeedback({
+        feedback: 'no host',
+        submitAnonymously: true,
+        githubLogin: null,
+        githubEmail: null
+      })
+    ).resolves.toEqual({
+      ok: false,
+      status: null,
+      error: 'Feedback is not configured. Set BOTMUX_FEEDBACK_API_URL.'
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it('forces renderer IPC submissions onto the feedback lane', async () => {

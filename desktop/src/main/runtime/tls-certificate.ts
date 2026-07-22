@@ -7,8 +7,8 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
 
-const TLS_CERT_FILENAME = 'orca-botmux-tls-cert.pem'
-const TLS_KEY_FILENAME = 'orca-botmux-tls-key.pem'
+const TLS_CERT_FILENAME = 'botmux-tls-cert.pem'
+const TLS_KEY_FILENAME = 'botmux-tls-key.pem'
 
 export type TlsCertificate = {
   cert: string
@@ -51,7 +51,7 @@ export function loadOrCreateTlsCertificate(userDataPath: string): TlsCertificate
       '-days',
       '3650',
       '-subj',
-      '/CN=OrcaBotmux Runtime',
+      '/CN=Botmux Runtime',
       '-keyout',
       keyPath_,
       '-out',

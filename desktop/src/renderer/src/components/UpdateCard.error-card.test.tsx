@@ -59,7 +59,7 @@ afterEach(() => {
 describe('UpdateCard Windows signature failures', () => {
   it('does not offer the rejected version as a manual publisher-check bypass', () => {
     const message =
-      'New version 1.4.200 is not signed by the application owner: publisherNames: OrcaBotmux'
+      'New version 1.4.200 is not signed by the application owner: publisherNames: Botmux'
     renderAfterAvailableStatus()
 
     act(() => useAppStore.getState().setUpdateStatus({ state: 'error', message }))
@@ -68,9 +68,10 @@ describe('UpdateCard Windows signature failures', () => {
     expect(screen.getByText(/Don't install this download/)).toBeTruthy()
     expect(screen.queryByText(message)).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Check official releases' }))
-    expect(openUrl).toHaveBeenCalledWith('https://github.com/stablyai/orca_botmux/releases')
-    expect(openUrl).not.toHaveBeenCalledWith(expect.stringContaining('/tag/'))
+    // Why: release-notes / official-releases URL is intentionally empty until
+    // Botmux hosts its own releases page; do not deep-link a rejected version.
+    expect(screen.queryByRole('button', { name: 'Check official releases' })).toBeNull()
+    expect(openUrl).not.toHaveBeenCalled()
   })
 
   it('keeps the blocked-check error collapsed while preserving retry and details', () => {

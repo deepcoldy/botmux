@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { homedir } from 'node:os'
 import type { GitWorktreeInfo } from '../shared/types'
 import {
-  canCleanupUnregisteredOrcaLeftoverDirectory,
+  canCleanupUnregisteredBotmuxLeftoverDirectory,
   canSafelyRemoveOrphanedWorktreeDirectory,
   getRegisteredDeletableWorktree
 } from './worktree-removal-safety'
@@ -316,13 +316,13 @@ describe('canSafelyRemoveOrphanedWorktreeDirectory', () => {
   })
 })
 
-describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
+describe('canCleanupUnregisteredBotmuxLeftoverDirectory', () => {
   const repo = { path: '/repos/main' }
-  const ownedMeta = { orcaCreatedAt: 1, orcaCreationSource: 'runtime' as const }
+  const ownedMeta = { botmuxCreatedAt: 1, botmuxCreationSource: 'runtime' as const }
   const baseArgs = {
     meta: ownedMeta,
-    worktreePath: '/workspaces/orca-botmux-owned',
-    runtimeWorktreePath: '/workspaces/orca-botmux-owned',
+    worktreePath: '/workspaces/botmux-owned',
+    runtimeWorktreePath: '/workspaces/botmux-owned',
     repo,
     runtimeRepoPath: repo.path,
     registeredWorktrees: [makeGitWorktree(repo.path, true)]
@@ -332,17 +332,17 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
-        statPath: makeStatPath(['/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath(['/workspaces/botmux-owned']),
         isGitRepository
       })
     ).resolves.toBe(false)
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
         statPath: async (path) => {
-          if (path === '/workspaces/orca-botmux-owned') {
+          if (path === '/workspaces/botmux-owned') {
             return { type: 'symlink' }
           }
           throw missingPath(path)
@@ -358,9 +358,9 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
-        statPath: makeStatPath(['/workspaces/orca-botmux-owned/.git'], ['/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath(['/workspaces/botmux-owned/.git'], ['/workspaces/botmux-owned']),
         isGitRepository
       })
     ).resolves.toBe(false)
@@ -368,14 +368,14 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     expect(isGitRepository).not.toHaveBeenCalled()
   })
 
-  it('rejects no-marker cleanup when only the OrcaBotmux path shape matches', async () => {
+  it('rejects no-marker cleanup when only the Botmux path shape matches', async () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
         meta: undefined,
-        statPath: makeStatPath([], ['/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath([], ['/workspaces/botmux-owned']),
         isGitRepository
       })
     ).resolves.toBe(false)
@@ -391,7 +391,7 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
         worktreePath: homePath,
         runtimeWorktreePath: runtimeHomePath,
@@ -410,7 +410,7 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
         worktreePath: '/home/dev',
         runtimeWorktreePath: '/home/dev',
@@ -429,35 +429,35 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(true)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
-        statPath: makeStatPath([], ['/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath([], ['/workspaces/botmux-owned']),
         isGitRepository
       })
     ).resolves.toBe(false)
 
-    expect(isGitRepository).toHaveBeenCalledWith('/workspaces/orca-botmux-owned')
+    expect(isGitRepository).toHaveBeenCalledWith('/workspaces/botmux-owned')
   })
 
   it('rejects unregistered leftover directories that contain a registered child worktree', async () => {
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
         registeredWorktrees: [
           makeGitWorktree(repo.path, true),
-          makeGitWorktree('/workspaces/orca-botmux-owned/child')
+          makeGitWorktree('/workspaces/botmux-owned/child')
         ],
-        statPath: makeStatPath([], ['/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath([], ['/workspaces/botmux-owned']),
         isGitRepository: vi.fn().mockResolvedValue(false)
       })
     ).rejects.toThrow(
-      'Refusing to delete worktree because it contains another registered worktree: /workspaces/orca-botmux-owned/child'
+      'Refusing to delete worktree because it contains another registered worktree: /workspaces/botmux-owned/child'
     )
   })
 
   it('uses runtime paths for filesystem proof and original paths for nested worktree checks', async () => {
     const statPath = vi.fn(async (path: string) => {
-      if (path === '/mnt/c/workspaces/orca-botmux-owned') {
+      if (path === '/mnt/c/workspaces/botmux-owned') {
         return { type: 'directory' }
       }
       throw missingPath(path)
@@ -465,44 +465,44 @@ describe('canCleanupUnregisteredOrcaLeftoverDirectory', () => {
     const isGitRepository = vi.fn().mockResolvedValue(false)
 
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
-        worktreePath: 'C:\\workspaces\\orca-botmux-owned',
-        runtimeWorktreePath: '/mnt/c/workspaces/orca-botmux-owned',
+        worktreePath: 'C:\\workspaces\\botmux-owned',
+        runtimeWorktreePath: '/mnt/c/workspaces/botmux-owned',
         repo: { path: 'C:\\repos\\main' },
         runtimeRepoPath: '/mnt/c/repos/main',
         registeredWorktrees: [
           makeGitWorktree('C:\\repos\\main', true),
-          makeGitWorktree('C:\\workspaces\\orca-botmux-owned-sibling')
+          makeGitWorktree('C:\\workspaces\\botmux-owned-sibling')
         ],
         statPath,
         isGitRepository
       })
     ).resolves.toBe(true)
 
-    expect(statPath).toHaveBeenCalledWith('/mnt/c/workspaces/orca-botmux-owned')
-    expect(statPath).toHaveBeenCalledWith('/mnt/c/workspaces/orca-botmux-owned/.git')
-    expect(statPath).not.toHaveBeenCalledWith('C:\\workspaces\\orca-botmux-owned')
-    expect(isGitRepository).toHaveBeenCalledWith('/mnt/c/workspaces/orca-botmux-owned')
+    expect(statPath).toHaveBeenCalledWith('/mnt/c/workspaces/botmux-owned')
+    expect(statPath).toHaveBeenCalledWith('/mnt/c/workspaces/botmux-owned/.git')
+    expect(statPath).not.toHaveBeenCalledWith('C:\\workspaces\\botmux-owned')
+    expect(isGitRepository).toHaveBeenCalledWith('/mnt/c/workspaces/botmux-owned')
   })
 
   it('rejects translated-runtime cleanup when original path contains a registered child', async () => {
     await expect(
-      canCleanupUnregisteredOrcaLeftoverDirectory({
+      canCleanupUnregisteredBotmuxLeftoverDirectory({
         ...baseArgs,
-        worktreePath: 'C:\\workspaces\\orca-botmux-owned',
-        runtimeWorktreePath: '/mnt/c/workspaces/orca-botmux-owned',
+        worktreePath: 'C:\\workspaces\\botmux-owned',
+        runtimeWorktreePath: '/mnt/c/workspaces/botmux-owned',
         repo: { path: 'C:\\repos\\main' },
         runtimeRepoPath: '/mnt/c/repos/main',
         registeredWorktrees: [
           makeGitWorktree('C:\\repos\\main', true),
-          makeGitWorktree('C:\\workspaces\\orca-botmux-owned\\child')
+          makeGitWorktree('C:\\workspaces\\botmux-owned\\child')
         ],
-        statPath: makeStatPath([], ['/mnt/c/workspaces/orca-botmux-owned']),
+        statPath: makeStatPath([], ['/mnt/c/workspaces/botmux-owned']),
         isGitRepository: vi.fn().mockResolvedValue(false)
       })
     ).rejects.toThrow(
-      'Refusing to delete worktree because it contains another registered worktree: C:\\workspaces\\orca-botmux-owned\\child'
+      'Refusing to delete worktree because it contains another registered worktree: C:\\workspaces\\botmux-owned\\child'
     )
   })
 })

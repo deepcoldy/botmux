@@ -389,10 +389,10 @@ describe('automation target availability', () => {
           sourceContext: {
             kind: 'task-source',
             provider: 'github',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'local',
             repoId: 'repo-1',
-            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
           }
         }),
         repo: makeRepo(),
@@ -415,15 +415,15 @@ describe('automation target availability', () => {
           sourceContext: {
             kind: 'task-source',
             provider: 'gitlab',
-            projectId: 'gitlab:stablyai/orca_botmux',
+            projectId: 'gitlab:stablyai/botmux',
             hostId: 'runtime:old-server',
             repoId: 'repo-1',
             providerIdentity: {
               provider: 'gitlab',
-              projectId: 'stablyai/orca_botmux',
+              projectId: 'stablyai/botmux',
               namespace: 'stablyai',
-              project: 'orca_botmux',
-              webUrl: 'https://gitlab.com/stablyai/orca_botmux'
+              project: 'botmux',
+              webUrl: 'https://gitlab.com/stablyai/botmux'
             }
           }
         }),

@@ -248,7 +248,7 @@ describe('remote runtime terminal data subscriptions', () => {
       vi.fn()
     )
 
-    await expect(subscriptionPromise).rejects.toThrow('Remote OrcaBotmux runtime closed the connection.')
+    await expect(subscriptionPromise).rejects.toThrow('Remote Botmux runtime closed the connection.')
     expect(_getRemoteRuntimeTerminalMultiplexerCountForTest()).toBe(0)
     expect(unsubscribe).not.toHaveBeenCalled()
 

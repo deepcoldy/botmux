@@ -53,7 +53,7 @@ export function SourceControlEntryContextMenu({
     void window.api.ui.writeClipboardText(absolutePath)
   }, [absolutePath])
 
-  const handleRevealInOrcaExplorer = useCallback(() => {
+  const handleRevealInBotmuxExplorer = useCallback(() => {
     if (!absolutePath) {
       return
     }
@@ -124,7 +124,7 @@ export function SourceControlEntryContextMenu({
           </ContextMenuSubContent>
         </ContextMenuSub>
         <ContextMenuSeparator />
-        <ContextMenuItem onSelect={handleRevealInOrcaExplorer} disabled={!absolutePath}>
+        <ContextMenuItem onSelect={handleRevealInBotmuxExplorer} disabled={!absolutePath}>
           <FolderOpen className="size-3.5" />
           {translate(
             'auto.components.right.sidebar.SourceControl.cc05b2d088',

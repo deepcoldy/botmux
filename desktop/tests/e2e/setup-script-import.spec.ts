@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Locator, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 
 function runGit(repoPath: string, args: string[]): void {
@@ -147,28 +147,28 @@ async function expectSettingsCommandValue(
 }
 
 test.describe('Setup script import prompt', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('imports Superset local overlays through the prompt UI', async ({ orcaBotmuxPage }, testInfo) => {
+  test('imports Superset local overlays through the prompt UI', async ({ botmuxPage }, testInfo) => {
     const repoPath = createSupersetSetupRepo(testInfo.outputPath('superset-setup-repo'))
-    const repoId = await addAndActivateRepo(orcaBotmuxPage, repoPath)
+    const repoId = await addAndActivateRepo(botmuxPage, repoPath)
 
     await expect(
-      orcaBotmuxPage.getByText(
+      botmuxPage.getByText(
         /Found a setup command in\s*Superset \(\.superset\/config\.json \+1\)\. Save it to run for new worktrees\./
       )
     ).toBeVisible({ timeout: 15_000 })
 
-    await orcaBotmuxPage.getByRole('button', { name: 'Save local setup' }).click()
+    await botmuxPage.getByRole('button', { name: 'Save local setup' }).click()
 
     await expect(
-      orcaBotmuxPage.getByText('2 unsupported fields skipped. Saved the setup command.')
+      botmuxPage.getByText('2 unsupported fields skipped. Saved the setup command.')
     ).toBeVisible()
 
-    const localCommands = await openImportedSetupSettingsFromToast(orcaBotmuxPage, repoId)
+    const localCommands = await openImportedSetupSettingsFromToast(botmuxPage, repoId)
     await expectSettingsCommandValue(
       localCommands,
       'Setup Script',
@@ -181,23 +181,23 @@ test.describe('Setup script import prompt', () => {
     )
   })
 
-  test('imports cmux setup commands through the prompt UI', async ({ orcaBotmuxPage }, testInfo) => {
+  test('imports cmux setup commands through the prompt UI', async ({ botmuxPage }, testInfo) => {
     const repoPath = createCmuxSetupRepo(testInfo.outputPath('cmux-setup-repo'))
-    const repoId = await addAndActivateRepo(orcaBotmuxPage, repoPath)
+    const repoId = await addAndActivateRepo(botmuxPage, repoPath)
 
     await expect(
-      orcaBotmuxPage.getByText(
+      botmuxPage.getByText(
         /Found a setup command in\s*cmux \(\.cmux\/cmux\.json\)\. Save it to run for new worktrees\./
       )
     ).toBeVisible({ timeout: 15_000 })
 
-    await orcaBotmuxPage.getByRole('button', { name: 'Save local setup' }).click()
+    await botmuxPage.getByRole('button', { name: 'Save local setup' }).click()
 
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: "project's settings", exact: true })
+      botmuxPage.getByRole('button', { name: "project's settings", exact: true })
     ).toBeVisible()
 
-    const repoSettings = await openRepoSettings(orcaBotmuxPage, repoId)
+    const repoSettings = await openRepoSettings(botmuxPage, repoId)
     await expectSettingsCommandValue(repoSettings, 'Setup Script', './scripts/setup.sh')
     await expectSettingsCommandValue(repoSettings, 'Archive Script', '')
   })

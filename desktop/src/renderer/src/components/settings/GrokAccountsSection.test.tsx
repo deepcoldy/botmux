@@ -61,7 +61,7 @@ describe('GrokAccountsSection', () => {
 
     expect(
       await screen.findByText(
-        'Session expired — run grok on the computer running OrcaBotmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed.'
+        'Session expired — run grok on the computer running Botmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed.'
       )
     ).toBeInTheDocument()
     expect(screen.queryByText(/grok login/i)).not.toBeInTheDocument()

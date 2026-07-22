@@ -16,8 +16,8 @@ vi.mock('./AgentSkillSetupPanel', () => ({
 describe('BrowserUseSkillStep', () => {
   it('forwards a single-skill installed command even when setup installs a bundle', () => {
     const bundleInstallCommand =
-      'npx skills add https://github.com/stablyai/orca_botmux --skill orca-botmux-cli orchestration --global'
-    const updateCommand = 'npx skills update orca-botmux-cli --global'
+      'npx skills add https://github.com/stablyai/botmux --skill botmux-cli orchestration --global'
+    const updateCommand = 'npx skills update botmux-cli --global'
 
     renderToStaticMarkup(
       <BrowserUseSkillStep

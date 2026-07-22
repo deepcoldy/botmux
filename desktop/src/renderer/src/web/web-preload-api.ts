@@ -47,9 +47,9 @@ import {
   ONBOARDING_FLOW_VERSION
 } from '../../../shared/constants'
 import {
-  createDefaultLocalOrcaProfile,
-  DEFAULT_LOCAL_ORCA_PROFILE_ID
-} from '../../../shared/orca-botmux-profiles'
+  createDefaultLocalBotmuxProfile,
+  DEFAULT_LOCAL_BOTMUX_PROFILE_ID
+} from '../../../shared/botmux-profiles'
 import { legacyBaseRefSearchResult } from '../../../shared/base-ref-search-result'
 import { EMPTY_PTY_MAIN_DELIVERY_DIAGNOSTICS } from '../../../shared/pty-delivery-diagnostics'
 import { createE2EConfig } from '../../../shared/e2e-config'
@@ -131,12 +131,12 @@ import {
   parseRuntimeNativeChatTurnLifecycle
 } from '@/components/native-chat/native-chat-runtime-contract'
 
-const SETTINGS_STORAGE_KEY = 'orca_botmux.web.settings.v1'
-const UI_STORAGE_KEY = 'orca_botmux.web.ui.v1'
-const SESSION_STORAGE_KEY = 'orca_botmux.web.workspaceSession.v1'
-const ONBOARDING_STORAGE_KEY = 'orca_botmux.web.onboarding.v1'
-const GITHUB_CACHE_STORAGE_KEY = 'orca_botmux.web.githubCache.v1'
-const KEYBINDINGS_STORAGE_KEY = 'orca_botmux.web.keybindings.v1'
+const SETTINGS_STORAGE_KEY = 'botmux.web.settings.v1'
+const UI_STORAGE_KEY = 'botmux.web.ui.v1'
+const SESSION_STORAGE_KEY = 'botmux.web.workspaceSession.v1'
+const ONBOARDING_STORAGE_KEY = 'botmux.web.onboarding.v1'
+const GITHUB_CACHE_STORAGE_KEY = 'botmux.web.githubCache.v1'
+const KEYBINDINGS_STORAGE_KEY = 'botmux.web.keybindings.v1'
 // Why: browser-paired clients need desktop parity for large dev sessions; the
 // runtime's no-limit default remains capped for lower-level RPC callers.
 const WEB_RUNTIME_WORKTREE_LIST_LIMIT = 10_000
@@ -463,27 +463,27 @@ const webKeybindingListeners = new Set<(snapshot: KeybindingFileSnapshot) => voi
 
 export function installWebPreloadApi(): void {
   activeEnvironment = readStoredWebRuntimeEnvironment()
-  const webWindow = window as unknown as { __ORCA_WEB_CLIENT__?: boolean }
-  webWindow.__ORCA_WEB_CLIENT__ = true
+  const webWindow = window as unknown as { __BOTMUX_WEB_CLIENT__?: boolean }
+  webWindow.__BOTMUX_WEB_CLIENT__ = true
   window.electron = createFallbackProxy(['electron']) as Window['electron']
   window.api = withFallback(createWebPreloadApi(), []) as PreloadApi
 }
 
 function createWebPreloadApi(): Partial<PreloadApi> {
-  const webOrcaProfileAuthStatus = () =>
+  const webBotmuxProfileAuthStatus = () =>
     Promise.resolve({
-      activeProfileId: DEFAULT_LOCAL_ORCA_PROFILE_ID,
+      activeProfileId: DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
       configured: false,
       state: 'unconfigured' as const,
       persistence: 'none' as const,
-      setupMessage: 'OrcaBotmux Cloud sign-in is not available in the browser fallback.'
+      setupMessage: 'Botmux Cloud sign-in is not available in the browser fallback.'
     })
 
   return {
     app: {
       getIdentity: () =>
         Promise.resolve({
-          name: 'orca_botmux',
+          name: 'botmux',
           isDev: false,
           devLabel: null,
           devBranch: null,
@@ -518,7 +518,7 @@ function createWebPreloadApi(): Partial<PreloadApi> {
       complete: () => Promise.resolve(),
       disable: () => Promise.resolve(),
       openWeb: () => Promise.resolve(),
-      starOrca: () => Promise.resolve(false),
+      starBotmux: () => Promise.resolve(false),
       forceShow: () => Promise.resolve(),
       agentValueMoment: () => Promise.resolve({ status: 'skipped' }),
       showAgentValueMoment: () => Promise.resolve(),
@@ -531,23 +531,23 @@ function createWebPreloadApi(): Partial<PreloadApi> {
         displayServer: null
       })
     },
-    orcaBotmuxProfiles: {
+    botmuxProfiles: {
       list: () =>
         Promise.resolve({
-          activeProfileId: DEFAULT_LOCAL_ORCA_PROFILE_ID,
-          profiles: [createDefaultLocalOrcaProfile(0)],
+          activeProfileId: DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
+          profiles: [createDefaultLocalBotmuxProfile(0)],
           multiProfileUi: false
         }),
-      authStatus: webOrcaProfileAuthStatus,
+      authStatus: webBotmuxProfileAuthStatus,
       createLocal: () =>
         Promise.resolve({
-          activeProfileId: DEFAULT_LOCAL_ORCA_PROFILE_ID,
-          profiles: [createDefaultLocalOrcaProfile(0)],
-          profile: createDefaultLocalOrcaProfile(0)
+          activeProfileId: DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
+          profiles: [createDefaultLocalBotmuxProfile(0)],
+          profile: createDefaultLocalBotmuxProfile(0)
         }),
       createCloudLinked: async () => ({
         status: 'unconfigured',
-        auth: await webOrcaProfileAuthStatus()
+        auth: await webBotmuxProfileAuthStatus()
       }),
       switchProfile: () => Promise.resolve({ status: 'already-active' }),
       transferProject: (args) =>
@@ -561,21 +561,21 @@ function createWebPreloadApi(): Partial<PreloadApi> {
       findProjectProfiles: async () => ({ projects: [] }),
       connectCurrent: async () => ({
         status: 'unconfigured',
-        auth: await webOrcaProfileAuthStatus()
+        auth: await webBotmuxProfileAuthStatus()
       }),
       refreshAuth: async () => ({
         status: 'unconfigured',
-        auth: await webOrcaProfileAuthStatus()
+        auth: await webBotmuxProfileAuthStatus()
       }),
       signOutCurrent: async () => ({
         status: 'signed-out',
-        auth: await webOrcaProfileAuthStatus(),
-        activeProfileId: DEFAULT_LOCAL_ORCA_PROFILE_ID,
-        profiles: [createDefaultLocalOrcaProfile(0)]
+        auth: await webBotmuxProfileAuthStatus(),
+        activeProfileId: DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
+        profiles: [createDefaultLocalBotmuxProfile(0)]
       }),
       selectOrg: async () => ({
         status: 'unconfigured',
-        auth: await webOrcaProfileAuthStatus()
+        auth: await webBotmuxProfileAuthStatus()
       }),
       orgMembersList: async () => ({ status: 'unconfigured' }),
       orgMemberInvite: async () => ({ status: 'unconfigured' }),
@@ -1273,7 +1273,7 @@ function createRuntimeEnvironmentsApi(): NonNullable<Partial<PreloadApi>['runtim
     addFromPairingCode: async ({ name, pairingCode }) => {
       const offer = parseWebPairingInput(pairingCode)
       if (!offer) {
-        throw new Error('Invalid OrcaBotmux pairing code.')
+        throw new Error('Invalid Botmux pairing code.')
       }
       closeActiveRuntimeClients()
       activeEnvironment = createStoredWebRuntimeEnvironment({ name, offer })
@@ -1366,7 +1366,7 @@ function createReposApi(): NonNullable<Partial<PreloadApi>['repos']> {
       invalidateRuntimeWorktreeCaches()
     },
     // Why: host-scoped forget targets a disconnected/removed SSH host owned by
-    // the desktop app. A paired web client talks to a single OrcaBotmux runtime and
+    // the desktop app. A paired web client talks to a single Botmux runtime and
     // has no ghost-host state to reconcile.
     removeForHost: () => {
       throw new Error('Forgetting a host is unavailable in paired web clients.')
@@ -2035,7 +2035,7 @@ function createBrowserApi(): NonNullable<Partial<PreloadApi>['browser']> {
     onNavigationUpdate: () => noopUnsubscribe,
     onActivateView: () => noopUnsubscribe,
     onPaneFocus: () => noopUnsubscribe,
-    onOpenLinkInOrcaTab: () => noopUnsubscribe,
+    onOpenLinkInBotmuxTab: () => noopUnsubscribe,
     cancelDownload: () => Promise.resolve(false),
     setGrabMode: () =>
       Promise.resolve({
@@ -2206,8 +2206,6 @@ function createGitHubApi(): WebGitHubApi {
         args
       ),
     onWorkItemMutated: () => noopUnsubscribe,
-    checkOrcaStarred: () => Promise.resolve(null),
-    starOrca: () => Promise.resolve(false),
     rateLimit: (args) =>
       route<WebGitHubResult<'rateLimit'>>(GITHUB_WEB_RPC_METHODS.rateLimit, args),
     diagnoseAuth: () =>
@@ -2659,7 +2657,7 @@ function createPreflightApi(): NonNullable<Partial<PreloadApi>['preflight']> {
 function createCliApi(): NonNullable<Partial<PreloadApi>['cli']> {
   const status = {
     platform: getBrowserPlatform(),
-    commandName: getBrowserPlatform() === 'linux' ? 'orca-botmux-ide' : 'orca_botmux',
+    commandName: getBrowserPlatform() === 'linux' ? 'botmux-ide' : 'botmux',
     commandPath: null,
     pathDirectory: null,
     pathConfigured: false,
@@ -2669,7 +2667,7 @@ function createCliApi(): NonNullable<Partial<PreloadApi>['cli']> {
     state: 'unsupported',
     currentTarget: null,
     unsupportedReason: 'launch_mode_unavailable',
-    detail: 'CLI registration is managed on the OrcaBotmux server, not in the web browser.'
+    detail: 'CLI registration is managed on the Botmux server, not in the web browser.'
   } as const
   return {
     getInstallStatus: () => Promise.resolve(status),
@@ -2703,7 +2701,7 @@ function createAgentHooksApi(): NonNullable<Partial<PreloadApi>['agentHooks']> {
       state: 'not_installed',
       configPath: '',
       managedHooksPresent: false,
-      detail: 'Agent hook status is only available on the OrcaBotmux server.'
+      detail: 'Agent hook status is only available on the Botmux server.'
     } as const)
   return {
     claudeStatus: () => status('claude'),
@@ -2751,7 +2749,7 @@ function createComputerUsePermissionsApi(): NonNullable<
         helperAppPath: null,
         openedSettings: false,
         launchedHelper: false,
-        nextStep: 'Computer-use permissions are managed on the OrcaBotmux server.'
+        nextStep: 'Computer-use permissions are managed on the Botmux server.'
       })),
     reset: () =>
       Promise.resolve({
@@ -3208,13 +3206,13 @@ function resolveEnvironment(selector: string): StoredWebRuntimeEnvironment {
     // a fresh web-* environment id even when it points at the same active server.
     return environment
   }
-  throw new Error(`Unknown OrcaBotmux runtime environment: ${selector}`)
+  throw new Error(`Unknown Botmux runtime environment: ${selector}`)
 }
 
 function requireActiveEnvironment(): StoredWebRuntimeEnvironment {
   activeEnvironment = activeEnvironment ?? readStoredWebRuntimeEnvironment()
   if (!activeEnvironment) {
-    throw new Error('Pair this web client with an OrcaBotmux server first.')
+    throw new Error('Pair this web client with an Botmux server first.')
   }
   return activeEnvironment
 }
@@ -3399,7 +3397,7 @@ function getStoredOnboarding(): OnboardingState {
     return closed
   }
   const closed = closeWebOnboarding(getDefaultOnboardingState())
-  // Why: pairing already means the user has an OrcaBotmux server. Desktop first-run
+  // Why: pairing already means the user has an Botmux server. Desktop first-run
   // onboarding would incorrectly probe browser-local tools and block the client.
   writeJson(ONBOARDING_STORAGE_KEY, closed)
   return closed
@@ -3635,7 +3633,7 @@ function toLegacyDetectedWorktreeResult(
     source: 'session-fallback',
     worktrees: worktrees.map((worktree) => ({
       ...worktree,
-      ownership: 'orca-botmux-managed',
+      ownership: 'botmux-managed',
       selectedCheckout: false,
       visible: true
     }))
@@ -3711,7 +3709,7 @@ function mapRepoPathArg(args: unknown): unknown {
     ...record,
     // Why: runtime repo selectors accept loose path/name forms, but duplicate
     // checked-out repos can make those ambiguous. The renderer already passes
-    // OrcaBotmux's repo id on task calls, so prefer the explicit selector.
+    // Botmux's repo id on task calls, so prefer the explicit selector.
     repo: repoId ? `id:${repoId}` : record.repoPath
   }
 }

@@ -51,8 +51,8 @@ const readyOption: ProjectHostSetupOption = {
   hostId: 'local',
   repoId: 'local-repo',
   label: 'Local Mac',
-  detail: 'orca_botmux',
-  path: '/Users/alice/orca_botmux'
+  detail: 'botmux',
+  path: '/Users/alice/botmux'
 }
 
 const needsSetupOption: NeedsSetupProjectHostOption = {
@@ -71,7 +71,7 @@ const unavailableOption: NeedsSetupProjectHostOption = {
   projectId: 'project-1',
   hostId: 'runtime:old',
   label: 'Old server',
-  detail: 'Update OrcaBotmux on this host to set up projects',
+  detail: 'Update Botmux on this host to set up projects',
   isAvailable: false
 }
 
@@ -148,7 +148,7 @@ describe('ProjectHostSetupCombobox', () => {
       '[data-command-value="needs-setup:runtime:old"]'
     )
     expect(unavailableButton).toBeNull()
-    expect(container.textContent).not.toContain('Update OrcaBotmux on this host')
+    expect(container.textContent).not.toContain('Update Botmux on this host')
 
     expect(onValueChange).not.toHaveBeenCalled()
   })

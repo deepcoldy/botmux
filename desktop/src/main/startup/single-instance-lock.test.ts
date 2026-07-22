@@ -86,7 +86,7 @@ describe('shouldSkipSingleInstanceLock', () => {
       shouldSkipSingleInstanceLock({
         isDev: true,
         isServeMode: false,
-        env: { ORCA_E2E_ENFORCE_SINGLE_INSTANCE_LOCK: '1' }
+        env: { BOTMUX_E2E_ENFORCE_SINGLE_INSTANCE_LOCK: '1' }
       })
     ).toBe(false)
   })
@@ -107,7 +107,7 @@ describe('shouldBypassSingleInstanceLock', () => {
   it('allows the hidden diagnostic bypass only for packaged macOS app launches', () => {
     expect(
       shouldBypassSingleInstanceLock({
-        env: { ORCA_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
+        env: { BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
         isDev: false,
         isServeMode: false,
         platform: 'darwin'
@@ -115,7 +115,7 @@ describe('shouldBypassSingleInstanceLock', () => {
     ).toBe(true)
     expect(
       shouldBypassSingleInstanceLock({
-        env: { ORCA_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
+        env: { BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
         isDev: true,
         isServeMode: false,
         platform: 'darwin'
@@ -123,7 +123,7 @@ describe('shouldBypassSingleInstanceLock', () => {
     ).toBe(false)
     expect(
       shouldBypassSingleInstanceLock({
-        env: { ORCA_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
+        env: { BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK: '1' },
         isDev: false,
         isServeMode: false,
         platform: 'linux'

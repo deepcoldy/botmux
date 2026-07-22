@@ -12,19 +12,19 @@ const specs: CommandSpec[] = [
     ],
     destructive: true,
     summary: 'Remove a worktree',
-    usage: 'orca_botmux worktree rm',
+    usage: 'botmux worktree rm',
     allowedFlags: []
   },
   {
     path: ['worktree', 'list'],
     summary: 'List worktrees',
-    usage: 'orca_botmux worktree list',
+    usage: 'botmux worktree list',
     allowedFlags: []
   },
   {
     path: ['terminal', 'send'],
     summary: 'Send input',
-    usage: 'orca_botmux terminal send',
+    usage: 'botmux terminal send',
     allowedFlags: []
   },
   {
@@ -33,7 +33,7 @@ const specs: CommandSpec[] = [
     path: ['emulator', 'kill'],
     destructive: true,
     summary: 'Kill the emulator',
-    usage: 'orca_botmux emulator kill',
+    usage: 'botmux emulator kill',
     allowedFlags: []
   }
 ]
@@ -118,7 +118,7 @@ describe('unknownCommandData', () => {
     const data = unknownCommandData(specs, ['worktree', 'remov'])
     expect(data.suggestions).toContain('worktree rm')
     expect(data.nextSteps[0]).toContain('Did you mean')
-    expect(data.nextSteps[0]).toContain('orca_botmux worktree rm')
+    expect(data.nextSteps[0]).toContain('botmux worktree rm')
   })
 
   it('produces empty nextSteps when nothing is close', () => {

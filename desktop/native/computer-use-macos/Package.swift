@@ -3,34 +3,34 @@
 import PackageDescription
 
 let package = Package(
-    name: "OrcaComputerUseMacOS",
+    name: "BotmuxComputerUseMacOS",
     platforms: [
         .macOS(.v14)
     ],
     products: [
         .library(
-            name: "OrcaComputerUseMacOSCore",
-            targets: ["OrcaComputerUseMacOSCore"]
+            name: "BotmuxComputerUseMacOSCore",
+            targets: ["BotmuxComputerUseMacOSCore"]
         ),
         .executable(
-            name: "orca-computer-use-macos",
-            targets: ["OrcaComputerUseMacOS"]
+            name: "botmux-computer-use-macos",
+            targets: ["BotmuxComputerUseMacOS"]
         )
     ],
     targets: [
         .target(
-            name: "OrcaComputerUseMacOSCore",
-            path: "Sources/OrcaComputerUseMacOSCore"
+            name: "BotmuxComputerUseMacOSCore",
+            path: "Sources/BotmuxComputerUseMacOSCore"
         ),
         .executableTarget(
-            name: "OrcaComputerUseMacOS",
-            dependencies: ["OrcaComputerUseMacOSCore"],
-            path: "Sources/OrcaComputerUseMacOS"
+            name: "BotmuxComputerUseMacOS",
+            dependencies: ["BotmuxComputerUseMacOSCore"],
+            path: "Sources/BotmuxComputerUseMacOS"
         ),
         .testTarget(
-            name: "OrcaComputerUseMacOSTests",
-            dependencies: ["OrcaComputerUseMacOSCore"],
-            path: "Tests/OrcaComputerUseMacOSTests"
+            name: "BotmuxComputerUseMacOSTests",
+            dependencies: ["BotmuxComputerUseMacOSCore"],
+            path: "Tests/BotmuxComputerUseMacOSTests"
         )
     ]
 )

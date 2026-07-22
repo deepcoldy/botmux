@@ -51,12 +51,12 @@ describe('readShellStartupEnvVar', () => {
     })
   }
 
-  // Issue #1534 / PR description: GUI-launched OrcaBotmux does not inherit
+  // Issue #1534 / PR description: GUI-launched Botmux does not inherit
   // OPENCODE_CONFIG_DIR; the user's .zshrc exports it. The fallback must
   // pick up that export so the overlay mirrors the user's real config.
   // Scope: this intentionally covers direct static exports; sourced files,
   // conditionals, and full shell evaluation remain out of scope.
-  it('mirrors the user scenario: GUI-launched OrcaBotmux discovers .zshrc-only export', () => {
+  it('mirrors the user scenario: GUI-launched Botmux discovers .zshrc-only export', () => {
     mockStartupFiles({
       '.zshrc': 'export OPENCODE_CONFIG_DIR="$HOME/.config/opencode"\n'
     })
@@ -232,9 +232,9 @@ describe('readShellStartupEnvVar', () => {
   })
 
   it('does not scan .bashrc for bash shells', () => {
-    // Why: OrcaBotmux launches bash as a login shell and the shell-ready wrappers
+    // Why: Botmux launches bash as a login shell and the shell-ready wrappers
     // intentionally do NOT source .bashrc, so a value present only in .bashrc
-    // would never be set in the live OrcaBotmux bash shell.
+    // would never be set in the live Botmux bash shell.
     process.env.SHELL = '/bin/bash'
     mockStartupFiles({ '.bashrc': 'export OPENCODE_CONFIG_DIR=/from/bashrc\n' })
     expect(readShellStartupEnvVar('OPENCODE_CONFIG_DIR', '/home/alice')).toBeUndefined()
@@ -252,7 +252,7 @@ describe('readShellStartupEnvVar', () => {
 
   it('honors an explicit shell argument over process.env.SHELL', () => {
     // Why: callers (pty.ts) may know the per-spawn SHELL from baseEnv that
-    // differs from the OrcaBotmux process's own $SHELL.
+    // differs from the Botmux process's own $SHELL.
     process.env.SHELL = '/bin/zsh'
     mockStartupFiles({
       '.zshrc': 'export OPENCODE_CONFIG_DIR=/from/zshrc\n',

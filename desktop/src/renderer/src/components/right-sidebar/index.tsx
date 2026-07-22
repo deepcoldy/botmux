@@ -48,7 +48,7 @@ import {
   shouldRenderDesktopWindowChrome
 } from '@/lib/desktop-window-chrome'
 import { getRendererAppPlatform } from '@/lib/renderer-app-platform'
-import { resolveOrcaBotmuxToolingContext } from '@/lib/orca-botmux-tooling-context'
+import { resolveBotmuxToolingContext } from '@/lib/botmux-tooling-context'
 
 const ACTIVITY_BAR_SIDE_WIDTH = 40
 
@@ -80,22 +80,22 @@ function RightSidebarInner(): React.JSX.Element {
   // On botmux session hosts, use the matched project worktree (session cwd)
   // so git/ports tabs appear when the session is inside a known project.
   //
-  // Select only primitives — resolveOrcaBotmuxToolingContext() allocates a new
+  // Select only primitives — resolveBotmuxToolingContext() allocates a new
   // object each call; returning it from useAppStore breaks useSyncExternalStore
   // equality and loops ("Maximum update depth exceeded", crash right-sidebar).
   const toolingWorktreeId = useAppStore((s) =>
-    rightSidebarOpen ? resolveOrcaBotmuxToolingContext(s).toolingWorktreeId : null
+    rightSidebarOpen ? resolveBotmuxToolingContext(s).toolingWorktreeId : null
   )
   const isBotmuxHost = useAppStore((s) =>
-    rightSidebarOpen ? resolveOrcaBotmuxToolingContext(s).isBotmuxHost : false
+    rightSidebarOpen ? resolveBotmuxToolingContext(s).isBotmuxHost : false
   )
   const filesystemConnectionId = useAppStore((s) =>
-    rightSidebarOpen ? resolveOrcaBotmuxToolingContext(s).filesystemConnectionId : null
+    rightSidebarOpen ? resolveBotmuxToolingContext(s).filesystemConnectionId : null
   )
   const activeWorktree = useAppStore((s) => {
     if (!rightSidebarOpen) return null
     // Prefer matched project worktree; fall back to host surface (stable cache).
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const activeRepo = useRepoById(activeWorktree?.repoId ?? null)
@@ -162,11 +162,11 @@ function RightSidebarInner(): React.JSX.Element {
         sshOnly: true
       },
       {
-        id: 'orca_botmux',
+        id: 'botmux',
         icon: Radio,
         // Why: product name alone is opaque; this tab is connection management,
         // not "another session list" (that lives in the left sidebar).
-        title: translate('settings.orcaBotmuxBridge.sidebarTitle', 'Botmux 连接'),
+        title: translate('settings.botmuxBridge.sidebarTitle', 'Botmux 连接'),
         shortcut: ''
       }
     ],

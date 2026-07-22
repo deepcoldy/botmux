@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   cleanupMarkdownFixture,
@@ -9,15 +9,15 @@ import {
 } from './helpers/markdown-ordered-list-exit'
 
 test.describe('Markdown add-review-note shortcut', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   test('opens the review-note composer for the current selection in the rich editor', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    const context = await getActiveWorktreeContext(orcaBotmuxPage)
+    const context = await getActiveWorktreeContext(botmuxPage)
     let filePath: string | null = null
 
     try {
@@ -27,14 +27,14 @@ test.describe('Markdown add-review-note shortcut', () => {
         testInfo.workerIndex,
         'A paragraph to annotate with a review note.\n'
       )
-      await openMarkdownFixture(orcaBotmuxPage, context, filePath)
-      const editor = await waitForRichMarkdownEditor(orcaBotmuxPage)
+      await openMarkdownFixture(botmuxPage, context, filePath)
+      const editor = await waitForRichMarkdownEditor(botmuxPage)
       await editor.click()
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+A')
 
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+Shift+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+Shift+A')
 
-      await expect(orcaBotmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
+      await expect(botmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
         timeout: 5_000
       })
     } finally {
@@ -43,9 +43,9 @@ test.describe('Markdown add-review-note shortcut', () => {
   })
 
   test('opens the composer for the current selection in the Monaco source editor', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    const context = await getActiveWorktreeContext(orcaBotmuxPage)
+    const context = await getActiveWorktreeContext(botmuxPage)
     let filePath: string | null = null
 
     try {
@@ -55,9 +55,9 @@ test.describe('Markdown add-review-note shortcut', () => {
         testInfo.workerIndex,
         'A paragraph to annotate from the source editor.\n'
       )
-      await openMarkdownFixture(orcaBotmuxPage, context, filePath)
-      await waitForRichMarkdownEditor(orcaBotmuxPage)
-      await orcaBotmuxPage.evaluate(() => {
+      await openMarkdownFixture(botmuxPage, context, filePath)
+      await waitForRichMarkdownEditor(botmuxPage)
+      await botmuxPage.evaluate(() => {
         // Why: switch to source mode through the store — the toolbar toggle is
         // an icon menu that is brittle to locate; the store action is what it
         // dispatches anyway, and the shortcut under test is mode-independent.
@@ -71,14 +71,14 @@ test.describe('Markdown add-review-note shortcut', () => {
         }
         state.setMarkdownViewMode(state.activeFileId, 'source')
       })
-      const monaco = orcaBotmuxPage.locator('.monaco-editor').first()
+      const monaco = botmuxPage.locator('.monaco-editor').first()
       await expect(monaco).toBeVisible({ timeout: 25_000 })
       await monaco.click()
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+A')
 
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+Shift+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+Shift+A')
 
-      await expect(orcaBotmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
+      await expect(botmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
         timeout: 5_000
       })
     } finally {
@@ -87,9 +87,9 @@ test.describe('Markdown add-review-note shortcut', () => {
   })
 
   test('opens the inline composer for the selected block in the markdown preview', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    const context = await getActiveWorktreeContext(orcaBotmuxPage)
+    const context = await getActiveWorktreeContext(botmuxPage)
     let filePath: string | null = null
 
     try {
@@ -99,9 +99,9 @@ test.describe('Markdown add-review-note shortcut', () => {
         testInfo.workerIndex,
         'A paragraph to annotate from the preview.\n'
       )
-      await openMarkdownFixture(orcaBotmuxPage, context, filePath)
-      await waitForRichMarkdownEditor(orcaBotmuxPage)
-      await orcaBotmuxPage.evaluate(() => {
+      await openMarkdownFixture(botmuxPage, context, filePath)
+      await waitForRichMarkdownEditor(botmuxPage)
+      await botmuxPage.evaluate(() => {
         // Why: open the real markdown-preview tab through the store — preview
         // is a separate file mode, not a view mode of the edit tab, and the
         // toolbar entry point is an icon menu that is brittle to locate.
@@ -125,11 +125,11 @@ test.describe('Markdown add-review-note shortcut', () => {
           { sourceFileId: file.id }
         )
       })
-      await expect(orcaBotmuxPage.locator('[data-annotation-block-key]').first()).toBeVisible({
+      await expect(botmuxPage.locator('[data-annotation-block-key]').first()).toBeVisible({
         timeout: 25_000
       })
 
-      await orcaBotmuxPage.evaluate(() => {
+      await botmuxPage.evaluate(() => {
         // Why: mirror a reader selecting rendered text — focus lands on the
         // preview's tabIndex=0 root and the DOM selection covers the block.
         const block = document.querySelector<HTMLElement>('[data-annotation-block-key]')
@@ -149,9 +149,9 @@ test.describe('Markdown add-review-note shortcut', () => {
         selection?.addRange(range)
       })
 
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+Shift+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+Shift+A')
 
-      await expect(orcaBotmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
+      await expect(botmuxPage.getByPlaceholder('Add note for the AI')).toBeVisible({
         timeout: 5_000
       })
     } finally {
@@ -159,8 +159,8 @@ test.describe('Markdown add-review-note shortcut', () => {
     }
   })
 
-  test('does not open the composer without a text selection', async ({ orcaBotmuxPage }, testInfo) => {
-    const context = await getActiveWorktreeContext(orcaBotmuxPage)
+  test('does not open the composer without a text selection', async ({ botmuxPage }, testInfo) => {
+    const context = await getActiveWorktreeContext(botmuxPage)
     let filePath: string | null = null
 
     try {
@@ -170,13 +170,13 @@ test.describe('Markdown add-review-note shortcut', () => {
         testInfo.workerIndex,
         'A paragraph without any selection.\n'
       )
-      await openMarkdownFixture(orcaBotmuxPage, context, filePath)
-      const editor = await waitForRichMarkdownEditor(orcaBotmuxPage)
+      await openMarkdownFixture(botmuxPage, context, filePath)
+      const editor = await waitForRichMarkdownEditor(botmuxPage)
       await editor.click()
 
-      await orcaBotmuxPage.keyboard.press('ControlOrMeta+Shift+A')
+      await botmuxPage.keyboard.press('ControlOrMeta+Shift+A')
 
-      await expect(orcaBotmuxPage.getByPlaceholder('Add note for the AI')).toHaveCount(0)
+      await expect(botmuxPage.getByPlaceholder('Add note for the AI')).toHaveCount(0)
     } finally {
       await cleanupMarkdownFixture(filePath)
     }

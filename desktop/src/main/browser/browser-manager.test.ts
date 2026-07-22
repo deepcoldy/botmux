@@ -206,7 +206,7 @@ describe('browserManager', () => {
       }
     })
     // Why: the custom createWindow is what swaps the chrome-less native child
-    // for OrcaBotmux's origin-bar window without losing the popup contents.
+    // for Botmux's origin-bar window without losing the popup contents.
     expect(typeof response.createWindow).toBe('function')
 
     expect(shellOpenExternalMock).not.toHaveBeenCalled()
@@ -251,7 +251,7 @@ describe('browserManager', () => {
     expect(shellOpenExternalMock).not.toHaveBeenCalled()
   })
 
-  it('keeps plain links current and routes explicit new-tab gestures to OrcaBotmux tabs', async () => {
+  it('keeps plain links current and routes explicit new-tab gestures to Botmux tabs', async () => {
     const rendererSendMock = vi.fn()
     const executeJavaScriptInIsolatedWorldMock = vi.fn().mockResolvedValue(undefined)
     const guest = {
@@ -295,7 +295,7 @@ describe('browserManager', () => {
     if (!clickedLinkFrameName) {
       throw new Error('Expected a private clicked-link frame name')
     }
-    expect(clickedLinkFrameName).toMatch(/^__orca_clicked_link_foreground_/)
+    expect(clickedLinkFrameName).toMatch(/^__botmux_clicked_link_foreground_/)
     expect(executeJavaScriptInIsolatedWorldMock).toHaveBeenCalledWith(
       expect.any(Number),
       [
@@ -319,14 +319,14 @@ describe('browserManager', () => {
       })
     ).toEqual({ action: 'deny' })
 
-    expect(rendererSendMock).toHaveBeenCalledWith('browser:open-link-in-orca-botmux-tab', {
+    expect(rendererSendMock).toHaveBeenCalledWith('browser:open-link-in-botmux-tab', {
       browserPageId: 'browser-1',
       url: 'https://docs.example.com/guide'
     })
     expect(rendererSendMock).toHaveBeenCalledWith('browser:popup', {
       browserPageId: 'browser-1',
       origin: 'https://docs.example.com',
-      action: 'opened-in-orca_botmux'
+      action: 'opened-in-botmux'
     })
     expect(openPopupWithOriginBarMock).not.toHaveBeenCalled()
     expect(shellOpenExternalMock).not.toHaveBeenCalled()
@@ -382,7 +382,7 @@ describe('browserManager', () => {
     await vi.waitFor(() => expect(executeJavaScriptMock).toHaveBeenCalledTimes(1))
     const firstScript = executeJavaScriptMock.mock.calls[0][0] as string
     const foregroundFrameName = firstScript.match(
-      /__orca_clicked_link_iframe_foreground_[0-9a-f-]+/
+      /__botmux_clicked_link_iframe_foreground_[0-9a-f-]+/
     )?.[0]
     if (!foregroundFrameName) {
       throw new Error('Expected a private child-frame routing token')
@@ -400,7 +400,7 @@ describe('browserManager', () => {
         frameName: foregroundFrameName
       })
     ).toEqual({ action: 'deny' })
-    expect(rendererSendMock).toHaveBeenCalledWith('browser:open-link-in-orca-botmux-tab', {
+    expect(rendererSendMock).toHaveBeenCalledWith('browser:open-link-in-botmux-tab', {
       browserPageId: 'browser-frame',
       url: 'https://docs.example.com/from-frame'
     })
@@ -485,7 +485,7 @@ describe('browserManager', () => {
     expect(rendererSendMock).toHaveBeenCalledWith('browser:popup', {
       browserPageId: 'browser-1',
       origin: 'https://sso.example.com',
-      action: 'opened-in-orca_botmux'
+      action: 'opened-in-botmux'
     })
 
     // Opener-lifecycle parity: destroying the owning guest closes the popup.
@@ -548,7 +548,7 @@ describe('browserManager', () => {
 
     expect(shellOpenExternalMock).not.toHaveBeenCalled()
     expect(rendererSendMock).not.toHaveBeenCalledWith(
-      'browser:open-link-in-orca-botmux-tab',
+      'browser:open-link-in-botmux-tab',
       expect.anything()
     )
     expect(rendererSendMock).toHaveBeenCalledWith('browser:popup', {
@@ -750,7 +750,7 @@ describe('browserManager', () => {
 
     const restore = await browserManager.acquireAutomationVisibility(guest.id)
     const acquireScript = rendererExecuteJavaScriptMock.mock.calls[0]?.[0]
-    expect(acquireScript).toContain('__orcaBrowserAutomationVisibility')
+    expect(acquireScript).toContain('__botmuxBrowserAutomationVisibility')
     expect(acquireScript).toContain('bridge.acquire("page-automation")')
     expect(acquireScript).not.toContain('setActiveBrowserTab')
     expect(acquireScript).not.toContain('setActiveTabType')
@@ -1045,7 +1045,7 @@ describe('browserManager', () => {
     expect(restoreScript).toContain('state.setActiveTabType("terminal");')
   })
 
-  it('does not focus the OrcaBotmux window while preparing a screenshot', async () => {
+  it('does not focus the Botmux window while preparing a screenshot', async () => {
     const rendererExecuteJavaScriptMock = vi.fn().mockResolvedValueOnce({
       prevTabType: 'terminal',
       prevActiveWorktreeId: 'wt-1',
@@ -1095,7 +1095,7 @@ describe('browserManager', () => {
     expect(browserWindowFromWebContentsMock).not.toHaveBeenCalled()
   })
 
-  it('offers opening a link in another OrcaBotmux browser tab from the guest context menu', () => {
+  it('offers opening a link in another Botmux browser tab from the guest context menu', () => {
     const rendererSendMock = vi.fn()
     const guest = {
       id: 104,
@@ -2788,7 +2788,7 @@ describe('browserManager', () => {
         getType: vi.fn(() => 'webview'),
         getUserAgent: vi.fn(
           () =>
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) orca_botmux/1.0.0 Chrome/134.0.0.0 Electron/30.0.0 Safari/537.36'
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) botmux/1.0.0 Chrome/134.0.0.0 Electron/30.0.0 Safari/537.36'
         ),
         setBackgroundThrottling: guestSetBackgroundThrottlingMock,
         setWindowOpenHandler: guestSetWindowOpenHandlerMock,
@@ -2957,7 +2957,7 @@ describe('browserManager', () => {
         expect.any(Number),
         [
           expect.objectContaining({
-            code: expect.stringContaining('__orcaBrowserAnnotationViewportBridge')
+            code: expect.stringContaining('__botmuxBrowserAnnotationViewportBridge')
           })
         ],
         false

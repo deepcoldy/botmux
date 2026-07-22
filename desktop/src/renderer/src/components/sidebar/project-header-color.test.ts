@@ -43,7 +43,7 @@ describe('resolveProjectGroupHeaderColor', () => {
     expect(
       resolveProjectGroupHeaderColor({
         groupBy: 'repo',
-        headerKey: 'project:github:stablyai/orca_botmux',
+        headerKey: 'project:github:stablyai/botmux',
         badgeColor: REPO_COLORS[6]
       })
     ).toBe(REPO_COLORS[6])

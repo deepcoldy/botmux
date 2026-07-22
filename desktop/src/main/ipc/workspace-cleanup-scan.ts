@@ -147,7 +147,7 @@ async function scanRepoWorkspaces(
     candidateWorktrees,
     WORKTREE_SCAN_CONCURRENCY,
     async (worktree) => {
-      // Why: externally-created worktrees can miss OrcaBotmux activity stamps; local
+      // Why: externally-created worktrees can miss Botmux activity stamps; local
       // filesystem metadata is a conservative guard before suggesting deletion.
       const worktreeWithActivity = activityStatsUnavailable
         ? resolvePersistedWorkspaceCleanupActivityWorktree(worktree)
@@ -225,7 +225,7 @@ async function listCleanupGitWorktrees(
   if (repo.connectionId) {
     const provider = getSshGitProvider(repo.connectionId) ?? null
     if (!provider) {
-      // Why: cleanup should reflect only workspaces OrcaBotmux can currently inspect.
+      // Why: cleanup should reflect only workspaces Botmux can currently inspect.
       return { provider: null, gitWorktrees: [] }
     }
     return {
@@ -257,7 +257,7 @@ function handleRepoWorktreeListError(args: {
   const { repo, targetWorktreeId, scannedAt, error, onErrors } = args
   console.error('Workspace cleanup repo scan failed', error)
   if (repo.connectionId && !targetWorktreeId) {
-    // Why: broad cleanup only shows remote workspaces OrcaBotmux can inspect now.
+    // Why: broad cleanup only shows remote workspaces Botmux can inspect now.
     // A connected SSH repo that fails mid-scan is omitted, not bannered.
     return { scannedAt, candidates: [], errors: [] }
   }

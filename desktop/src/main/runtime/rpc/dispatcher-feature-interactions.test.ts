@@ -3,18 +3,18 @@ import { z } from 'zod'
 import type { PersistedUIState } from '../../../shared/types'
 import { getDefaultUIState } from '../../../shared/constants'
 import {
-  ORCA_RUNTIME_RPC_BROWSER_UI_SOURCE,
-  ORCA_RUNTIME_RPC_FEATURE_INTERACTION_SOURCE_KEY
+  BOTMUX_RUNTIME_RPC_BROWSER_UI_SOURCE,
+  BOTMUX_RUNTIME_RPC_FEATURE_INTERACTION_SOURCE_KEY
 } from '../../../shared/runtime-rpc-feature-interaction-source'
 import { RpcDispatcher } from './dispatcher'
 import { defineMethod, defineStreamingMethod, type RpcRequest } from './core'
-import type { OrcaRuntimeService } from '../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../botmux-runtime'
 
 function makeRequest(method: string, params: unknown = {}): RpcRequest {
   return { id: 'req-1', authToken: 'tok', method, params }
 }
 
-function makeRuntime(ui: PersistedUIState = getDefaultUIState()): OrcaRuntimeService {
+function makeRuntime(ui: PersistedUIState = getDefaultUIState()): BotmuxRuntimeService {
   let currentUI = ui
   return {
     getRuntimeId: () => 'test-runtime',
@@ -38,7 +38,7 @@ function makeRuntime(ui: PersistedUIState = getDefaultUIState()): OrcaRuntimeSer
       currentUI = { ...currentUI, ...updates }
       return currentUI
     })
-  } as unknown as OrcaRuntimeService
+  } as unknown as BotmuxRuntimeService
 }
 
 const METHODS = [
@@ -206,7 +206,7 @@ describe('RpcDispatcher feature interactions', () => {
     const runtime = makeRuntime()
     const dispatcher = new RpcDispatcher({ runtime, methods: METHODS })
     const browserPaneUiParams = {
-      [ORCA_RUNTIME_RPC_FEATURE_INTERACTION_SOURCE_KEY]: ORCA_RUNTIME_RPC_BROWSER_UI_SOURCE
+      [BOTMUX_RUNTIME_RPC_FEATURE_INTERACTION_SOURCE_KEY]: BOTMUX_RUNTIME_RPC_BROWSER_UI_SOURCE
     }
 
     await dispatcher.dispatch(makeRequest('browser.viewport', browserPaneUiParams))

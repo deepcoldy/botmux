@@ -10,7 +10,7 @@ export const getNotificationsPaneSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.notifications.search.0534c76311',
-      'Master switch for OrcaBotmux desktop notifications.'
+      'Master switch for Botmux desktop notifications.'
     ),
     keywords: [
       ...translateSearchKeyword(
@@ -86,7 +86,7 @@ export const getNotificationsPaneSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.notifications.search.7247b97a31',
-      'Avoid notifying when OrcaBotmux is focused on the active worktree.'
+      'Avoid notifying when Botmux is focused on the active worktree.'
     ),
     keywords: [
       ...translateSearchKeyword(
@@ -114,7 +114,7 @@ export const getNotificationsPaneSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.notifications.search.c718793e95',
-      'Choose the built-in, system, or local audio file OrcaBotmux plays for desktop notifications.'
+      'Choose the built-in, system, or local audio file Botmux plays for desktop notifications.'
     ),
     keywords: [
       ...translateSearchKeyword(

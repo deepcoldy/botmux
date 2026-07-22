@@ -45,7 +45,7 @@ export function resolveAutomationRunTarget(
     return {
       ok: false,
       error:
-        'Remote-server automation scheduling is not available from this OrcaBotmux client yet. Run this automation on the remote server or update OrcaBotmux when durable remote scheduling is available.'
+        'Remote-server automation scheduling is not available from this Botmux client yet. Run this automation on the remote server or update Botmux when durable remote scheduling is available.'
     }
   }
 

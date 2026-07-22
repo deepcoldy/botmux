@@ -67,7 +67,7 @@ function makeSnapshot(): RuntimeMobileSessionTabsResult {
 
 describe('activateWebRuntimeSessionWorktree', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
     mocks.getState.mockReturnValue({
       settings: {
         activeRuntimeEnvironmentId: ENVIRONMENT_ID
@@ -116,7 +116,7 @@ describe('activateWebRuntimeSessionWorktree', () => {
 
 describe('createWebRuntimeSessionBrowserTab', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
     mocks.getState.mockReturnValue({
       settings: {
         activeRuntimeEnvironmentId: ENVIRONMENT_ID
@@ -404,7 +404,7 @@ describe('createWebRuntimeSessionBrowserTab', () => {
 
 describe('createWebRuntimeSessionTerminal', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
     mocks.getState.mockReturnValue({
       settings: {
         activeRuntimeEnvironmentId: ENVIRONMENT_ID
@@ -588,7 +588,7 @@ describe('createWebRuntimeSessionTerminal', () => {
 
 describe('moveWebRuntimeSessionTab', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
     mocks.getState.mockReturnValue({
       settings: {
         activeRuntimeEnvironmentId: ENVIRONMENT_ID
@@ -788,7 +788,7 @@ describe('moveWebRuntimeSessionTab', () => {
 
 describe('web runtime session tab actions', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
     mocks.getState.mockReturnValue({
       settings: {
         activeRuntimeEnvironmentId: ENVIRONMENT_ID
@@ -878,7 +878,7 @@ describe('web runtime session tab actions', () => {
 
 describe('splitWebRuntimeTerminal', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
   })
 
   afterEach(() => {
@@ -974,7 +974,7 @@ describe('splitWebRuntimeTerminal', () => {
     })
 
     expect(splitWebRuntimeTerminal('pty-local-1', 'horizontal', 'keyboard')).toBe(false)
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
     expect(splitWebRuntimeTerminal('remote:web-env-1@@terminal-1', 'horizontal', 'keyboard')).toBe(
       true
     )
@@ -985,7 +985,7 @@ describe('splitWebRuntimeTerminal', () => {
 
 describe('closeWebRuntimeTerminal', () => {
   beforeEach(() => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', true)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', true)
   })
 
   afterEach(() => {
@@ -1047,14 +1047,14 @@ describe('closeWebRuntimeTerminal', () => {
     })
 
     expect(closeWebRuntimeTerminal('pty-local-1')).toBe(false)
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
     expect(closeWebRuntimeTerminal('remote:web-env-1@@terminal-1')).toBe(true)
 
     await vi.waitFor(() => expect(runtimeCall).toHaveBeenCalledTimes(1))
   })
 
   it('treats any configured remote runtime environment as a shared session', () => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
 
     expect(isWebRuntimeSessionActive('env-1')).toBe(true)
     expect(isWebRuntimeSessionActive('   ')).toBe(false)
@@ -1069,7 +1069,7 @@ describe('setWebRuntimeTabProps', () => {
   })
 
   it('pushes pin to the host via session.tabs.setTabProps for a remote tab', async () => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
     mocks.getRuntimeEnvironmentIdForWorktree.mockReturnValue(ENVIRONMENT_ID)
     mocks.getState.mockReturnValue({})
     const runtimeCall = vi.fn().mockResolvedValue({ id: 'p', ok: true, result: { updated: true } })
@@ -1097,7 +1097,7 @@ describe('setWebRuntimeTabProps', () => {
   })
 
   it('maps mirrored browser/editor unified ids before setting host tab props', async () => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
     mocks.getRuntimeEnvironmentIdForWorktree.mockReturnValue(ENVIRONMENT_ID)
     mocks.getState.mockReturnValue({})
     mocks.resolveHostSessionTabIdForWebSessionTab.mockImplementation(
@@ -1129,7 +1129,7 @@ describe('setWebRuntimeTabProps', () => {
   })
 
   it('no-ops for a worktree with no runtime environment (local tab)', () => {
-    vi.stubGlobal('__ORCA_WEB_CLIENT__', false)
+    vi.stubGlobal('__BOTMUX_WEB_CLIENT__', false)
     mocks.getRuntimeEnvironmentIdForWorktree.mockReturnValue(null)
     mocks.getState.mockReturnValue({})
     const runtimeCall = vi.fn()

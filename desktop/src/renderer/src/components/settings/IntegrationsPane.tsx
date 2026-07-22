@@ -23,7 +23,7 @@ export function IntegrationsPane(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.IntegrationsPane.1683acbac4',
-              'Connect the source hosts OrcaBotmux can use for pull requests, merge requests, checks, and review status.'
+              'Connect the source hosts Botmux can use for pull requests, merge requests, checks, and review status.'
             )}
           </p>
         </div>
@@ -44,7 +44,7 @@ export function IntegrationsPane(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.IntegrationsPane.3ba07f933b',
-              'Connect issue trackers OrcaBotmux can use to browse tasks and start workspaces with linked context.'
+              'Connect issue trackers Botmux can use to browse tasks and start workspaces with linked context.'
             )}
           </p>
         </div>

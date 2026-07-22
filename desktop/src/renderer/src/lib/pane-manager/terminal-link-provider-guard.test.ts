@@ -57,7 +57,7 @@ describe('guardLinkProvider', () => {
     const provider: ILinkProvider = {
       provideLinks: (_lineNumber, callback) => callback(links)
     }
-    const guarded = guardLinkProvider(provider, 'orca-botmux-handle')
+    const guarded = guardLinkProvider(provider, 'botmux-handle')
 
     expect(collectLinks(guarded)).toBe(links)
     expect(mocks.recordRendererCrashBreadcrumb).not.toHaveBeenCalled()
@@ -71,7 +71,7 @@ describe('guardLinkProvider', () => {
         throw new RangeError('Invalid array length')
       }
     }
-    const guarded = guardLinkProvider(provider, 'orca-botmux-file')
+    const guarded = guardLinkProvider(provider, 'botmux-file')
 
     const callback = vi.fn()
     expect(() => guarded.provideLinks(1, callback)).not.toThrow()

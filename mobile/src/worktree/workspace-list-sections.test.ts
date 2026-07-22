@@ -11,12 +11,12 @@ import {
 import { DEFAULT_MOBILE_WORKSPACE_STATUSES } from './mobile-workspace-statuses'
 
 function worktree(overrides: Partial<Worktree> = {}): Worktree {
-  const worktreePath = join('/tmp', 'orca', 'worktrees', 'feature')
+  const worktreePath = join('/tmp', 'botmux-app', 'worktrees', 'feature')
   return {
     workspaceKind: 'git',
     worktreeId: `repo-1::${worktreePath}`,
     repoId: 'repo-1',
-    repo: 'orca',
+    repo: 'botmux-app',
     branch: 'feature/mobile-parity',
     displayName: 'feature',
     path: worktreePath,
@@ -376,14 +376,14 @@ describe('buildSections', () => {
     const parent = worktree({
       worktreeId: 'parent',
       displayName: 'Add agents to mobile',
-      repo: 'orca',
+      repo: 'botmux-app',
       sortOrder: 30,
       status: 'inactive'
     })
     const child = worktree({
       worktreeId: 'child',
       displayName: 'Agent Session History resume (PR2)',
-      repo: 'orca',
+      repo: 'botmux-app',
       parentWorktreeId: 'parent',
       sortOrder: 20,
       status: 'inactive'
@@ -391,7 +391,7 @@ describe('buildSections', () => {
     const unrelatedActive = worktree({
       worktreeId: 'active',
       displayName: 'Overlapping tui output',
-      repo: 'orca',
+      repo: 'botmux-app',
       sortOrder: 10,
       status: 'working',
       unread: true,
@@ -405,7 +405,7 @@ describe('buildSections', () => {
       '',
       'repo',
       new Set(),
-      new Map([['orca', 'repo-1']]),
+      new Map([['botmux-app', 'repo-1']]),
       DEFAULT_MOBILE_WORKSPACE_STATUSES
     )
 
@@ -417,14 +417,14 @@ describe('buildSections', () => {
     const child = worktree({
       worktreeId: 'child',
       displayName: 'Child',
-      repo: 'orca',
+      repo: 'botmux-app',
       sortOrder: 30,
       isMainWorktree: false
     })
     const main = worktree({
       worktreeId: 'main',
       displayName: 'Main',
-      repo: 'orca',
+      repo: 'botmux-app',
       sortOrder: 10,
       isMainWorktree: true
     })
@@ -436,7 +436,7 @@ describe('buildSections', () => {
       '',
       'repo',
       new Set(),
-      new Map([['orca', 'repo-1']])
+      new Map([['botmux-app', 'repo-1']])
     )
 
     expect(sections[0]?.data.map((item) => item.worktreeId)).toEqual(['main', 'child'])
@@ -444,14 +444,14 @@ describe('buildSections', () => {
 
   it('renders empty repo sections from repo placeholders in repo grouping', () => {
     const sections = buildSections(
-      [worktree({ repoId: 'repo-1', repo: 'orca' })],
+      [worktree({ repoId: 'repo-1', repo: 'botmux-app' })],
       'manual',
       { filterRepoIds: new Set(), hideSleeping: false, hideDefaultBranch: false },
       '',
       'repo',
       new Set(),
       new Map([
-        ['orca', 'repo-1'],
+        ['botmux-app', 'repo-1'],
         ['zoom-img', 'repo-missing']
       ])
     )
@@ -459,8 +459,8 @@ describe('buildSections', () => {
     expect(withoutSectionListKeys(sections)).toEqual([
       {
         key: 'repo:repo-1',
-        title: 'orca',
-        data: [worktree({ repoId: 'repo-1', repo: 'orca' })]
+        title: 'botmux-app',
+        data: [worktree({ repoId: 'repo-1', repo: 'botmux-app' })]
       },
       { key: 'repo:repo-missing', title: 'zoom-img', data: [] }
     ])

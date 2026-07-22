@@ -7,8 +7,8 @@ import type {
 } from '../../shared/windows-mobile-firewall'
 import { hasSufficientWindowsFirewallRemoteScope } from './windows-firewall-remote-scope'
 
-const FIREWALL_RULE_NAME = 'OrcaBotmux.MobilePairing'
-const FIREWALL_RULE_DISPLAY_NAME = 'OrcaBotmux Mobile Pairing'
+const FIREWALL_RULE_NAME = 'Botmux.MobilePairing'
+const FIREWALL_RULE_DISPLAY_NAME = 'Botmux Mobile Pairing'
 const POWERSHELL_TIMEOUT_MS = 10_000
 const ELEVATION_TIMEOUT_MS = 5 * 60_000
 
@@ -226,7 +226,7 @@ foreach ($rule in $blockingRules) {
   }
 }
 Get-NetFirewallRule -Name ${quotePowerShell(FIREWALL_RULE_NAME)} -ErrorAction SilentlyContinue | Remove-NetFirewallRule
-New-NetFirewallRule -Name ${quotePowerShell(FIREWALL_RULE_NAME)} -DisplayName ${quotePowerShell(FIREWALL_RULE_DISPLAY_NAME)} -Description 'Allows OrcaBotmux Mobile to connect to this OrcaBotmux desktop on private networks.' -Direction Inbound -Action Allow -Enabled True -Profile Private -Protocol TCP -LocalPort ${port} -Program ${quotePowerShell(executablePath)} -EdgeTraversalPolicy Block | Out-Null`
+New-NetFirewallRule -Name ${quotePowerShell(FIREWALL_RULE_NAME)} -DisplayName ${quotePowerShell(FIREWALL_RULE_DISPLAY_NAME)} -Description 'Allows Botmux Mobile to connect to this Botmux desktop on private networks.' -Direction Inbound -Action Allow -Enabled True -Profile Private -Protocol TCP -LocalPort ${port} -Program ${quotePowerShell(executablePath)} -EdgeTraversalPolicy Block | Out-Null`
 }
 
 function buildElevationScript(powershellPath: string, encodedRepairScript: string): string {

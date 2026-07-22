@@ -27,6 +27,6 @@ export function folderRelativePathToIncludeGlob(relativePath: string): string {
 }
 
 export function selectedExplorerFolderRelativePath(activeElement: Element | null): string | null {
-  const explorerShell = activeElement?.closest('[data-orca-botmux-explorer-shell]')
+  const explorerShell = activeElement?.closest('[data-botmux-explorer-shell]')
   return explorerShell?.getAttribute('data-selected-folder-relative-path') ?? null
 }

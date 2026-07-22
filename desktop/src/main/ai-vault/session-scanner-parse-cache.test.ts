@@ -22,7 +22,7 @@ afterEach(async () => {
 })
 
 async function makeTempDir(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'orca-botmux-parse-cache-'))
+  const root = await mkdtemp(join(tmpdir(), 'botmux-parse-cache-'))
   tempRoots.push(root)
   return root
 }

@@ -27,8 +27,8 @@ export const getLinearAgentSkillPaneSearchEntries = createLocalizedCatalog(() =>
         'skill'
       ),
       ...translateSearchKeyword(
-        'auto.components.settings.linear.agent.skill.search.orcaLinear',
-        'orca-botmux-linear'
+        'auto.components.settings.linear.agent.skill.search.botmuxLinear',
+        'botmux-linear'
       )
     ]
   }

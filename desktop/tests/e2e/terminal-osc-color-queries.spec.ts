@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   waitForActivePaneHookDescriptor,
   waitForActivePanePtyId,
@@ -56,24 +56,24 @@ async function injectPtyOutput(page: Page, paneKey: string, data: string): Promi
 
 test('answers OSC foreground and background color queries from the active terminal theme', async ({
   electronApp,
-  orcaBotmuxPage
+  botmuxPage
 }) => {
   await installTerminalPtyWriteSpy(electronApp)
-  await waitForSessionReady(orcaBotmuxPage)
-  await waitForActiveWorktree(orcaBotmuxPage)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  await waitForSessionReady(botmuxPage)
+  await waitForActiveWorktree(botmuxPage)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-  const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-  const { paneKey } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
-  await waitForTerminalPtyDataInjector(orcaBotmuxPage, paneKey)
-  await setActiveTerminalTheme(orcaBotmuxPage, {
+  const ptyId = await waitForActivePanePtyId(botmuxPage)
+  const { paneKey } = await waitForActivePaneHookDescriptor(botmuxPage)
+  await waitForTerminalPtyDataInjector(botmuxPage, paneKey)
+  await setActiveTerminalTheme(botmuxPage, {
     foreground: '#2e3434',
     background: 'rgba(255, 255, 255, 1)'
   })
   await clearTerminalPtyWriteLog(electronApp)
 
-  const injected = await injectPtyOutput(orcaBotmuxPage, paneKey, '\x1b]10;?\x1b\\\x1b]11;?\x1b\\')
+  const injected = await injectPtyOutput(botmuxPage, paneKey, '\x1b]10;?\x1b\\\x1b]11;?\x1b\\')
 
   expect(injected).toBe(true)
   await expect

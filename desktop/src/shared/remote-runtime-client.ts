@@ -47,8 +47,8 @@ function formatRemoteRuntimeCloseMessage(code: number, reason: Buffer): string {
     suffixParts.push(reasonText)
   }
   return suffixParts.length > 0
-    ? `Remote OrcaBotmux runtime closed the connection (${suffixParts.join(': ')}).`
-    : 'Remote OrcaBotmux runtime closed the connection.'
+    ? `Remote Botmux runtime closed the connection (${suffixParts.join(': ')}).`
+    : 'Remote Botmux runtime closed the connection.'
 }
 
 export type RemoteRuntimeSubscription = {
@@ -88,7 +88,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
       socket.off('error', onError)
       socket.off('close', onClose)
       socket.off('message', onMessage)
-      // Why: the settled one-shot no longer needs OrcaBotmux callbacks, but a ws
+      // Why: the settled one-shot no longer needs Botmux callbacks, but a ws
       // can still report a late transport error after close is requested.
       if (socket.readyState !== WebSocket.CLOSED) {
         socket.on('error', ignoreSettledRemoteRuntimeSocketError)
@@ -102,7 +102,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
         ok: false,
         error: new RemoteRuntimeClientError(
           'runtime_timeout',
-          'Timed out waiting for the remote OrcaBotmux runtime to respond.'
+          'Timed out waiting for the remote Botmux runtime to respond.'
         )
       })
     }
@@ -168,7 +168,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
         ok: false,
         error: new RemoteRuntimeClientError(
           'remote_runtime_unavailable',
-          'Could not connect to the remote OrcaBotmux runtime.'
+          'Could not connect to the remote Botmux runtime.'
         )
       })
     }
@@ -194,7 +194,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an unexpected binary frame.'
+            'Remote Botmux runtime returned an unexpected binary frame.'
           )
         })
         return
@@ -212,7 +212,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an undecryptable frame.'
+            'Remote Botmux runtime returned an undecryptable frame.'
           )
         })
         return
@@ -240,7 +240,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid E2EE handshake frame.'
+            'Remote Botmux runtime returned an invalid E2EE handshake frame.'
           )
         })
         return
@@ -254,7 +254,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an unexpected E2EE handshake frame.'
+            'Remote Botmux runtime returned an unexpected E2EE handshake frame.'
           )
         })
         return
@@ -274,7 +274,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid E2EE auth frame.'
+            'Remote Botmux runtime returned an invalid E2EE auth frame.'
           )
         })
         return
@@ -291,7 +291,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             code,
-            'Remote OrcaBotmux runtime rejected the pairing token.'
+            'Remote Botmux runtime rejected the pairing token.'
           )
         })
         return
@@ -319,7 +319,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid response frame.'
+            'Remote Botmux runtime returned an invalid response frame.'
           )
         })
         return
@@ -334,7 +334,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid response frame.'
+            'Remote Botmux runtime returned an invalid response frame.'
           )
         })
         return
@@ -345,7 +345,7 @@ export async function sendRemoteRuntimeRequest<TResult>(
           ok: false,
           error: new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned a mismatched response id.'
+            'Remote Botmux runtime returned a mismatched response id.'
           )
         })
         return
@@ -389,7 +389,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
       socket.off('pong', onLivenessSignal)
       socket.off('ping', onLivenessSignal)
       ws = null
-      // Why: startup failures detach OrcaBotmux callbacks before closing the ws,
+      // Why: startup failures detach Botmux callbacks before closing the ws,
       // but ws can still emit a late transport error while close is in flight.
       if (socket.readyState !== WebSocket.CLOSED) {
         socket.on('error', ignoreSettledRemoteRuntimeSocketError)
@@ -410,7 +410,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
       fail(
         new RemoteRuntimeClientError(
           'runtime_timeout',
-          'Timed out waiting for the remote OrcaBotmux runtime subscription to start.'
+          'Timed out waiting for the remote Botmux runtime subscription to start.'
         )
       )
     }, timeoutMs)
@@ -441,7 +441,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
             fail(
               new RemoteRuntimeClientError(
                 'remote_runtime_unavailable',
-                'Remote OrcaBotmux runtime send buffer overflow; reconnecting.'
+                'Remote Botmux runtime send buffer overflow; reconnecting.'
               )
             )
         })
@@ -503,7 +503,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
       fail(
         new RemoteRuntimeClientError(
           'remote_runtime_unavailable',
-          'Could not connect to the remote OrcaBotmux runtime.'
+          'Could not connect to the remote Botmux runtime.'
         )
       )
     }
@@ -542,7 +542,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an undecryptable frame.'
+            'Remote Botmux runtime returned an undecryptable frame.'
           )
         )
         return
@@ -584,7 +584,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'remote_runtime_unavailable',
-            'Remote OrcaBotmux runtime stopped responding; the stream connection was reset.'
+            'Remote Botmux runtime stopped responding; the stream connection was reset.'
           )
         )
         try {
@@ -605,7 +605,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid E2EE handshake frame.'
+            'Remote Botmux runtime returned an invalid E2EE handshake frame.'
           )
         )
         return
@@ -618,7 +618,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an unexpected E2EE handshake frame.'
+            'Remote Botmux runtime returned an unexpected E2EE handshake frame.'
           )
         )
         return
@@ -637,7 +637,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid E2EE auth frame.'
+            'Remote Botmux runtime returned an invalid E2EE auth frame.'
           )
         )
         return
@@ -650,7 +650,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
           (authenticated as { error?: { code?: unknown } }).error?.code === 'unauthorized'
             ? 'unauthorized'
             : 'invalid_runtime_response'
-        fail(new RemoteRuntimeClientError(code, 'Remote OrcaBotmux runtime rejected the pairing token.'))
+        fail(new RemoteRuntimeClientError(code, 'Remote Botmux runtime rejected the pairing token.'))
         return
       }
       state = 'ready'
@@ -676,7 +676,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an invalid response frame.'
+            'Remote Botmux runtime returned an invalid response frame.'
           )
         )
         return
@@ -690,7 +690,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned a mismatched response id.'
+            'Remote Botmux runtime returned a mismatched response id.'
           )
         )
         return
@@ -703,7 +703,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned binary data before authentication.'
+            'Remote Botmux runtime returned binary data before authentication.'
           )
         )
         return
@@ -713,7 +713,7 @@ export async function subscribeRemoteRuntimeRequest<TResult>(
         fail(
           new RemoteRuntimeClientError(
             'invalid_runtime_response',
-            'Remote OrcaBotmux runtime returned an undecryptable binary frame.'
+            'Remote Botmux runtime returned an undecryptable binary frame.'
           )
         )
         return

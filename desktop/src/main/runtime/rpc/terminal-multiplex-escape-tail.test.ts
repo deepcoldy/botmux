@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from './dispatcher'
 import type { RpcRequest } from './core'
-import type { OrcaRuntimeService } from '../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../botmux-runtime'
 import { TERMINAL_METHODS } from './methods/terminal'
 import type { RuntimeTerminalWait } from '../../../shared/runtime-types'
 import {
@@ -18,11 +18,11 @@ import {
 // SnapshotStart JSON frame, the tail is lost and the next live chunk renders
 // literally ("colors/garbage around what I type").
 
-function stubRuntime(overrides: Partial<OrcaRuntimeService> = {}): OrcaRuntimeService {
+function stubRuntime(overrides: Partial<BotmuxRuntimeService> = {}): BotmuxRuntimeService {
   return {
     getRuntimeId: () => 'test-runtime',
     ...overrides
-  } as OrcaRuntimeService
+  } as BotmuxRuntimeService
 }
 
 function makeRequest(method: string, params?: unknown): RpcRequest {

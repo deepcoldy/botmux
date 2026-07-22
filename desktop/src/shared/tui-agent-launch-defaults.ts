@@ -29,7 +29,7 @@ function sanitizeTuiAgentLaunchArgs(agent: TuiAgent, args: string): string {
     return args.trim()
   }
   // Why: a few agents have removed, relocated, or never exposed Claude-style
-  // skip-permission flags on the interactive TUI command OrcaBotmux launches.
+  // skip-permission flags on the interactive TUI command Botmux launches.
   return unsupportedArgs.reduce((next, arg) => next.replace(argPattern(arg), ' '), args).trim()
 }
 

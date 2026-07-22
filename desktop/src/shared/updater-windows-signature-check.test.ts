@@ -10,7 +10,7 @@ describe('isWindowsSignatureCheckUnavailableFailure', () => {
       isWindowsSignatureCheckUnavailableFailure(
         'Command failed: set "PSModulePath=" & chcp 65001 >NUL & powershell.exe -NoProfile ' +
           '-NonInteractive -InputFormat None -Command "Get-AuthenticodeSignature -LiteralPath ' +
-          "'C:\\Users\\u\\AppData\\Local\\orca-botmux-updater\\pending\\orca-botmux-windows-setup.exe' | " +
+          "'C:\\Users\\u\\AppData\\Local\\botmux-updater\\pending\\botmux-windows-setup.exe' | " +
           'ConvertTo-Json -Compress"'
       )
     ).toBe(true)

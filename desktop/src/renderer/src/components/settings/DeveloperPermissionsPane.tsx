@@ -255,7 +255,7 @@ export function DeveloperPermissionsPane(): React.JSX.Element {
   }, [refresh])
 
   // Why: after the user flips a permission in System Settings and switches
-  // back to OrcaBotmux, the chip should reflect the new status without a manual
+  // back to Botmux, the chip should reflect the new status without a manual
   // Refresh click. Tied to window focus rather than a polling interval so
   // we don't keep hammering `systemPreferences` while the pane is idle.
   useEffect(() => {
@@ -323,13 +323,13 @@ export function DeveloperPermissionsPane(): React.JSX.Element {
             <ShieldCheck className="size-4" />
             {translate(
               'auto.components.settings.DeveloperPermissionsPane.6f011b9bf6',
-              "Terminal tools inherit OrcaBotmux's macOS privacy envelope."
+              "Terminal tools inherit Botmux's macOS privacy envelope."
             )}
           </div>
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.DeveloperPermissionsPane.6326a4c5cc',
-              'Use these controls when a CLI, local app, or automation tool needs macOS privacy access. OrcaBotmux does not ask at startup.'
+              'Use these controls when a CLI, local app, or automation tool needs macOS privacy access. Botmux does not ask at startup.'
             )}
           </p>
         </div>

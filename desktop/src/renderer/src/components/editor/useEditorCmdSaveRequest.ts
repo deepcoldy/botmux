@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { useAppStore } from '@/store'
 import type { OpenFile } from '@/store/slices/editor'
-import { ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT } from './editor-autosave'
+import { BOTMUX_EDITOR_REQUEST_CMD_SAVE_EVENT } from './editor-autosave'
 import type { FileContent } from './editor-panel-content-types'
 
 type UseEditorCmdSaveRequestParams = {
@@ -44,7 +44,7 @@ export function useEditorCmdSaveRequest({
         (activeFile.mode === 'markdown-preview' ? fileContents[activeFile.id]?.content : '')
       void handleSave(fallbackContent ?? '')
     }
-    window.addEventListener(ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT, handler)
-    return () => window.removeEventListener(ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT, handler)
+    window.addEventListener(BOTMUX_EDITOR_REQUEST_CMD_SAVE_EVENT, handler)
+    return () => window.removeEventListener(BOTMUX_EDITOR_REQUEST_CMD_SAVE_EVENT, handler)
   }, [activeFile, fileContents, handleSave, openFiles])
 }

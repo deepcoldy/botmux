@@ -249,16 +249,16 @@ describe('fs:importExternalPaths — SSH routing & connection', () => {
 
     await invoke({
       sourcePaths: ['/tmp/dropped/file.txt'],
-      destDir: '/home/user/project/.orca_botmux/drops',
+      destDir: '/home/user/project/.botmux/drops',
       connectionId: connId,
       ensureDir: true
     })
 
-    expect(provider.createDir).toHaveBeenCalledWith('/home/user/project/.orca_botmux')
+    expect(provider.createDir).toHaveBeenCalledWith('/home/user/project/.botmux')
     expect(provider.writeFile).toHaveBeenCalledWith(
-      '/home/user/project/.orca_botmux/.gitignore',
+      '/home/user/project/.botmux/.gitignore',
       '*\n!.gitignore\n'
     )
-    expect(provider.createDir).toHaveBeenCalledWith('/home/user/project/.orca_botmux/drops')
+    expect(provider.createDir).toHaveBeenCalledWith('/home/user/project/.botmux/drops')
   })
 })

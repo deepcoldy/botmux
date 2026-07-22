@@ -25,7 +25,7 @@ export default function WebConnect({
   onConnected
 }: WebConnectProps): React.JSX.Element {
   const existingEnvironment = readStoredWebRuntimeEnvironment()
-  const [name, setName] = useState(existingEnvironment?.name ?? 'OrcaBotmux Server')
+  const [name, setName] = useState(existingEnvironment?.name ?? 'Botmux Server')
   const [pairingCode, setPairingCode] = useState(initialPairingInput ?? '')
   const [error, setError] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
@@ -35,21 +35,21 @@ export default function WebConnect({
   const connect = async (): Promise<void> => {
     setError(null)
     if (!parsedOffer) {
-      setError('Enter a valid OrcaBotmux pairing URL or pairing code.')
+      setError('Enter a valid Botmux pairing URL or pairing code.')
       return
     }
     if (parsedOffer.scope === 'mobile') {
       setError(
         translate(
           'auto.web.WebConnect.mobileScopeRejected',
-          'This QR code grants limited (mobile) access. To use the full web app, open the browser access link from Settings → Runtime Environments → Share this OrcaBotmux server → New Link.'
+          'This QR code grants limited (mobile) access. To use the full web app, open the browser access link from Settings → Runtime Environments → Share this Botmux server → New Link.'
         )
       )
       return
     }
     if (isMixedContentWebSocket(parsedOffer.endpoint)) {
       setError(
-        'This HTTPS page cannot connect to a plain ws:// OrcaBotmux server. Open the web client over HTTP or pair with a wss:// endpoint.'
+        'This HTTPS page cannot connect to a plain ws:// Botmux server. Open the web client over HTTP or pair with a wss:// endpoint.'
       )
       return
     }
@@ -67,7 +67,7 @@ export default function WebConnect({
         setError(
           translate(
             'auto.web.WebConnect.mobileScopeRejected',
-            'This QR code grants limited (mobile) access. To use the full web app, open the browser access link from Settings → Runtime Environments → Share this OrcaBotmux server → New Link.'
+            'This QR code grants limited (mobile) access. To use the full web app, open the browser access link from Settings → Runtime Environments → Share this Botmux server → New Link.'
           )
         )
         return
@@ -113,12 +113,12 @@ export default function WebConnect({
           </div>
           <div className="min-w-0">
             <h1 className="text-base font-semibold leading-6">
-              {translate('auto.web.WebConnect.e3bcd082ac', 'Connect to OrcaBotmux')}
+              {translate('auto.web.WebConnect.e3bcd082ac', 'Connect to Botmux')}
             </h1>
             <p className="mt-1 text-sm leading-5 text-muted-foreground">
               {translate(
                 'auto.web.WebConnect.3affe7de3a',
-                'Paste a pairing URL from an OrcaBotmux server that this browser can reach.'
+                'Paste a pairing URL from an Botmux server that this browser can reach.'
               )}
             </p>
           </div>
@@ -144,7 +144,7 @@ export default function WebConnect({
             id="web-runtime-pairing-code"
             value={pairingCode}
             onChange={(event) => setPairingCode(event.target.value)}
-            placeholder={translate('auto.web.WebConnect.27393856e4', 'orca_botmux://pair?code=...')}
+            placeholder={translate('auto.web.WebConnect.27393856e4', 'botmux://pair?code=...')}
             autoComplete="off"
             spellCheck={false}
           />

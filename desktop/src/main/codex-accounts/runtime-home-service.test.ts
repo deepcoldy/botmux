@@ -67,10 +67,10 @@ function createSettings(overrides: Partial<GlobalSettings> = {}): GlobalSettings
     terminalLigatures: 'auto',
     terminalCursorStyle: 'block',
     terminalCursorBlink: false,
-    terminalThemeDark: 'orca-botmux-dark',
+    terminalThemeDark: 'botmux-dark',
     terminalDividerColorDark: '#000000',
     terminalUseSeparateLightTheme: false,
-    terminalThemeLight: 'orca-botmux-light',
+    terminalThemeLight: 'botmux-light',
     terminalDividerColorLight: '#ffffff',
     terminalInactivePaneOpacity: 0.5,
     terminalActivePaneOpacity: 1,
@@ -210,7 +210,7 @@ function createStore(settings: GlobalSettings) {
 function createManagedAuth(rootDir: string, accountId: string, auth: string): string {
   const managedHomePath = join(rootDir, 'codex-accounts', accountId, 'home')
   mkdirSync(managedHomePath, { recursive: true })
-  writeFileSync(join(managedHomePath, '.orca-botmux-managed-home'), `${accountId}\n`, 'utf-8')
+  writeFileSync(join(managedHomePath, '.botmux-managed-home'), `${accountId}\n`, 'utf-8')
   writeFileSync(join(managedHomePath, 'auth.json'), auth, 'utf-8')
   return managedHomePath
 }
@@ -252,10 +252,10 @@ describe('CodexRuntimeHomeService', () => {
   beforeEach(() => {
     vi.resetModules()
     vi.clearAllMocks()
-    testState.userDataDir = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-home-'))
-    testState.fakeHomeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-home-'))
-    testState.previousUserDataPath = process.env.ORCA_USER_DATA_PATH
-    process.env.ORCA_USER_DATA_PATH = testState.userDataDir
+    testState.userDataDir = mkdtempSync(join(tmpdir(), 'botmux-runtime-home-'))
+    testState.fakeHomeDir = mkdtempSync(join(tmpdir(), 'botmux-codex-home-'))
+    testState.previousUserDataPath = process.env.BOTMUX_USER_DATA_PATH
+    process.env.BOTMUX_USER_DATA_PATH = testState.userDataDir
     mkdirSync(getSystemCodexHomePath(), { recursive: true })
     mkdirSync(getRuntimeCodexHomePath(), { recursive: true })
   })
@@ -264,9 +264,9 @@ describe('CodexRuntimeHomeService', () => {
     rmSync(testState.userDataDir, { recursive: true, force: true })
     rmSync(testState.fakeHomeDir, { recursive: true, force: true })
     if (testState.previousUserDataPath === undefined) {
-      delete process.env.ORCA_USER_DATA_PATH
+      delete process.env.BOTMUX_USER_DATA_PATH
     } else {
-      process.env.ORCA_USER_DATA_PATH = testState.previousUserDataPath
+      process.env.BOTMUX_USER_DATA_PATH = testState.previousUserDataPath
     }
   })
 
@@ -378,11 +378,11 @@ describe('CodexRuntimeHomeService', () => {
   })
 
   it('uses the canonical Electron userData for legacy active host migration', async () => {
-    const staleUserDataDir = mkdtempSync(join(tmpdir(), 'orca-botmux-stale-runtime-home-'))
+    const staleUserDataDir = mkdtempSync(join(tmpdir(), 'botmux-stale-runtime-home-'))
     const staleRuntimeHomePath = join(staleUserDataDir, 'codex-runtime-home', 'home')
     try {
       mkdirSync(staleRuntimeHomePath, { recursive: true })
-      process.env.ORCA_USER_DATA_PATH = staleUserDataDir
+      process.env.BOTMUX_USER_DATA_PATH = staleUserDataDir
       const legacyLaunchHomePath = join(
         testState.userDataDir,
         'codex-runtime-home',
@@ -402,12 +402,12 @@ describe('CodexRuntimeHomeService', () => {
       writeFileSync(getSystemCodexAuthPath(), '{"account":"system"}\n', 'utf-8')
       const store = createStore(createSettings())
 
-      const { configureOrcaUserDataPathEnv } = await import('../startup/configure-process')
-      configureOrcaUserDataPathEnv()
+      const { configureBotmuxUserDataPathEnv } = await import('../startup/configure-process')
+      configureBotmuxUserDataPathEnv()
       const { CodexRuntimeHomeService } = await import('./runtime-home-service')
       new CodexRuntimeHomeService(store as never)
 
-      expect(process.env.ORCA_USER_DATA_PATH).toBe(testState.userDataDir)
+      expect(process.env.BOTMUX_USER_DATA_PATH).toBe(testState.userDataDir)
       expect(normalizeLinkTarget(readlinkSync(legacyActiveHomePath))).toBe(
         normalizeLinkTarget(getRuntimeCodexHomePath())
       )
@@ -443,7 +443,7 @@ describe('CodexRuntimeHomeService', () => {
 
       service.migrateLegacyWslActiveHomePointer(
         'Ubuntu',
-        '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\orca_botmux\\codex-runtime-home\\home'
+        '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\botmux\\codex-runtime-home\\home'
       )
 
       expect(execFileSyncMock).toHaveBeenCalledTimes(1)
@@ -456,22 +456,22 @@ describe('CodexRuntimeHomeService', () => {
 
       const shellCommand = args[5]
       expect(shellCommand).toContain(
-        "if [ ! -e '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home' ] && [ ! -L '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home' ]; then :"
+        "if [ ! -e '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home' ] && [ ! -L '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home' ]; then :"
       )
       expect(shellCommand).toContain(
-        "elif [ -e '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home' ] && [ ! -L '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home' ]; then :"
+        "elif [ -e '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home' ] && [ ! -L '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home' ]; then :"
       )
       expect(shellCommand).toContain(
-        "mkdir -p '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl'"
+        "mkdir -p '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl'"
       )
       expect(shellCommand).toContain(
-        "ln -s -- '/home/alice/.local/share/orca_botmux/codex-runtime-home/home' '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home.next-"
+        "ln -s -- '/home/alice/.local/share/botmux/codex-runtime-home/home' '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home.next-"
       )
       expect(shellCommand).toContain(
-        "mv -Tf -- '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home.next-"
+        "mv -Tf -- '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home.next-"
       )
       expect(shellCommand).toContain(
-        "' '/home/alice/.local/share/orca_botmux/codex-runtime-home/active/wsl/home'"
+        "' '/home/alice/.local/share/botmux/codex-runtime-home/active/wsl/home'"
       )
       expect(shellCommand).not.toContain('[! -L')
       expect(shellCommand).not.toContain('mv -Tf--')
@@ -513,7 +513,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -567,7 +567,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -576,18 +576,18 @@ describe('CodexRuntimeHomeService', () => {
       expect(service.prepareForCodexLaunch({ runtime: 'wsl', wslDistro: 'Ubuntu' })).toBe(
         wslRuntimeHomePath
       )
-      const baselinePath = join(wslRuntimeHomePath, '.orca-botmux-config-settings-baseline.json')
+      const baselinePath = join(wslRuntimeHomePath, '.botmux-config-settings-baseline.json')
       expect(existsSync(baselinePath)).toBe(true)
 
-      // A direct WSL Codex edit wins and is mirrored into OrcaBotmux's runtime before
-      // the baseline advances, so later in-OrcaBotmux changes remain promotable.
+      // A direct WSL Codex edit wins and is mirrored into Botmux's runtime before
+      // the baseline advances, so later in-Botmux changes remain promotable.
       const runtimeConfigPath = join(wslRuntimeHomePath, 'config.toml')
       writeFileSync(wslSystemConfigPath, 'model = "outside-edit"\n', 'utf-8')
       service.prepareForCodexLaunch({ runtime: 'wsl', wslDistro: 'Ubuntu' })
       expect(readFileSync(runtimeConfigPath, 'utf-8')).toBe('model = "outside-edit"\n')
       expect(readFileSync(baselinePath, 'utf-8')).toContain('"model": "\\"outside-edit\\""')
 
-      // Codex now persists a /model change inside OrcaBotmux's reconciled runtime.
+      // Codex now persists a /model change inside Botmux's reconciled runtime.
       writeFileSync(
         runtimeConfigPath,
         readFileSync(runtimeConfigPath, 'utf-8').replace('model = "outside-edit"', 'model = "o4"'),
@@ -635,7 +635,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -669,7 +669,7 @@ describe('CodexRuntimeHomeService', () => {
       wslHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home'
     )
@@ -682,7 +682,7 @@ describe('CodexRuntimeHomeService', () => {
         candidate === wslRuntimeHomePath
           ? {
               distro: 'Debian',
-              linuxPath: '/home/alice/.local/share/orca_botmux/codex-runtime-home/home'
+              linuxPath: '/home/alice/.local/share/botmux/codex-runtime-home/home'
             }
           : null
     }))
@@ -700,7 +700,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Debian',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/debian/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/debian/home',
             providerAccountId: null,
             workspaceLabel: null,
             workspaceAccountId: null,
@@ -981,7 +981,7 @@ describe('CodexRuntimeHomeService', () => {
     expect(existsSync(runtimeAuthPath)).toBe(false)
   })
 
-  it('returns the OrcaBotmux-managed runtime home for Codex launch and rate-limit preparation', async () => {
+  it('returns the Botmux-managed runtime home for Codex launch and rate-limit preparation', async () => {
     const store = createStore(createSettings())
     const { CodexRuntimeHomeService } = await import('./runtime-home-service')
     const service = new CodexRuntimeHomeService(store as never)
@@ -1465,7 +1465,7 @@ describe('CodexRuntimeHomeService', () => {
           managedHomePath: wslManagedHomePath,
           managedHomeRuntime: 'wsl',
           wslDistro: 'Ubuntu',
-          wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-1/home',
+          wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-1/home',
           providerAccountId: null,
           workspaceLabel: null,
           workspaceAccountId: null,
@@ -1486,7 +1486,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -1537,7 +1537,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-1/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-1/home',
             providerAccountId: 'acct-wsl',
             workspaceLabel: null,
             workspaceAccountId: 'acct-wsl',
@@ -1558,7 +1558,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -1611,7 +1611,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -1679,7 +1679,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath: firstManagedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-1/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-1/home',
             providerAccountId: 'acct-first',
             workspaceLabel: null,
             workspaceAccountId: 'acct-first',
@@ -1693,7 +1693,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath: secondManagedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-2/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-2/home',
             providerAccountId: 'acct-second',
             workspaceLabel: null,
             workspaceAccountId: 'acct-second',
@@ -1715,7 +1715,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -1768,7 +1768,7 @@ describe('CodexRuntimeHomeService', () => {
       wslHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home'
     )
@@ -1794,7 +1794,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath: wslManagedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/wsl-account/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/wsl-account/home',
             providerAccountId: 'acct-wsl',
             workspaceLabel: null,
             workspaceAccountId: 'acct-wsl',
@@ -1846,7 +1846,7 @@ describe('CodexRuntimeHomeService', () => {
       wslHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home'
     )
@@ -1860,7 +1860,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-1/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-1/home',
             providerAccountId: 'acct-wsl',
             workspaceLabel: null,
             workspaceAccountId: 'acct-wsl',
@@ -1922,7 +1922,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: null,
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/account-1/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/account-1/home',
             providerAccountId: 'acct-wsl',
             workspaceLabel: null,
             workspaceAccountId: 'acct-wsl',
@@ -1946,7 +1946,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -2022,7 +2022,7 @@ describe('CodexRuntimeHomeService', () => {
       wslHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home',
       'auth.json'
@@ -2036,7 +2036,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath: ubuntuHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/ubuntu/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/ubuntu/home',
             providerAccountId: 'acct-ubuntu',
             workspaceLabel: null,
             workspaceAccountId: 'acct-ubuntu',
@@ -2050,7 +2050,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath: debianHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Debian',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/debian/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/debian/home',
             providerAccountId: 'acct-debian',
             workspaceLabel: null,
             workspaceAccountId: 'acct-debian',
@@ -2071,7 +2071,7 @@ describe('CodexRuntimeHomeService', () => {
       const service = new CodexRuntimeHomeService(store as never)
 
       expect(service.prepareForRateLimitFetch({ runtime: 'wsl', wslDistro: null })).toBe(
-        join(wslHome, '.local', 'share', 'orca_botmux', 'codex-runtime-home', 'home')
+        join(wslHome, '.local', 'share', 'botmux', 'codex-runtime-home', 'home')
       )
       expect(readFileSync(runtimeAuthPath, 'utf-8')).toBe(ubuntuAuth)
     } finally {
@@ -2109,7 +2109,7 @@ describe('CodexRuntimeHomeService', () => {
             managedHomePath,
             managedHomeRuntime: 'wsl',
             wslDistro: 'Ubuntu',
-            wslLinuxHomePath: '/home/alice/.local/share/orca_botmux/codex-accounts/wsl-account/home',
+            wslLinuxHomePath: '/home/alice/.local/share/botmux/codex-accounts/wsl-account/home',
             providerAccountId: 'acct-wsl',
             workspaceLabel: null,
             workspaceAccountId: 'acct-wsl',
@@ -2183,7 +2183,7 @@ describe('CodexRuntimeHomeService', () => {
         wslHome,
         '.local',
         'share',
-        'orca_botmux',
+        'botmux',
         'codex-runtime-home',
         'home'
       )
@@ -2221,7 +2221,7 @@ describe('CodexRuntimeHomeService', () => {
       wslHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home'
     )
@@ -2500,7 +2500,7 @@ describe('CodexRuntimeHomeService', () => {
     service.syncForCurrentSelection()
     expect(readFileSync(runtimeAuthPath, 'utf-8')).toBe(systemAuth)
 
-    // Codex used to refresh tokens directly in ~/.codex. With an OrcaBotmux-owned
+    // Codex used to refresh tokens directly in ~/.codex. With an Botmux-owned
     // runtime home, the same refresh must be read back to the system default.
     writeFileSync(runtimeAuthPath, refreshedAuth, 'utf-8')
     service.syncForCurrentSelection()
@@ -2826,7 +2826,7 @@ describe('CodexRuntimeHomeService', () => {
     const service = new CodexRuntimeHomeService(store as never)
 
     // Simulate an old live Codex PTY from another account refreshing the
-    // shared runtime auth after OrcaBotmux has already selected account-1.
+    // shared runtime auth after Botmux has already selected account-1.
     writeFileSync(runtimeAuthPath, staleLivePtyAuth, 'utf-8')
     service.syncForCurrentSelection()
 
@@ -2881,7 +2881,7 @@ describe('CodexRuntimeHomeService', () => {
     const service = new CodexRuntimeHomeService(store as never)
 
     // An older account-1 Codex process refreshed the shared runtime file after
-    // OrcaBotmux selected account-2. Persist the refresh to account-1, then restore
+    // Botmux selected account-2. Persist the refresh to account-1, then restore
     // the selected account in runtime CODEX_HOME.
     writeFileSync(runtimeAuthPath, account1RefreshedAuth, 'utf-8')
     service.syncForCurrentSelection()
@@ -3397,7 +3397,7 @@ describe('CodexRuntimeHomeService', () => {
     settings.activeCodexManagedAccountId = 'account-1'
     service.syncForCurrentSelection()
 
-    // A stale or external process overwrites runtime with auth OrcaBotmux cannot
+    // A stale or external process overwrites runtime with auth Botmux cannot
     // verify against the outgoing managed account.
     writeFileSync(runtimeAuthPath, '{"account":"external-login"}\n', 'utf-8')
 
@@ -3713,11 +3713,11 @@ describe('CodexRuntimeHomeService', () => {
 
     expect(readFileSync(join(runtimeSessionsDir, 'session.json'), 'utf-8')).toBe('{"turns":[1]}')
     expect(
-      readFileSync(join(runtimeSessionsDir, 'session.orca-botmux-legacy-account-1.json'), 'utf-8')
+      readFileSync(join(runtimeSessionsDir, 'session.botmux-legacy-account-1.json'), 'utf-8')
     ).toBe('{"turns":[1,2]}')
     expect(
       readFileSync(
-        join(runtimeSessionsDir, 'nested', 'session.orca-botmux-legacy-account-1.json'),
+        join(runtimeSessionsDir, 'nested', 'session.botmux-legacy-account-1.json'),
         'utf-8'
       )
     ).toBe('{"turns":[2,3]}')

@@ -39,7 +39,7 @@ export function BrowserUseSkillStep({
       )}
       description={translate(
         'auto.components.settings.BrowserUseSkillStep.0871b6998d',
-        "Enables agents to navigate and verify pages in OrcaBotmux's browser."
+        "Enables agents to navigate and verify pages in Botmux's browser."
       )}
       command={command}
       installedCommand={installedCommand}

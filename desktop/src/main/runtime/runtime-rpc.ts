@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { RuntimeMetadata, RuntimeTransportMetadata } from '../../shared/runtime-bootstrap'
-import type { OrcaRuntimeService } from './orca-botmux-runtime'
+import type { BotmuxRuntimeService } from './botmux-runtime'
 import { writeRuntimeMetadata } from './runtime-metadata'
 import { RpcDispatcher } from './rpc/dispatcher'
 import type { RpcRequest, RpcResponse } from './rpc/core'
@@ -46,14 +46,14 @@ import {
 
 const DEFAULT_WS_PORT = 6768
 
-type OrcaRuntimeRpcServerOptions = {
-  runtime: OrcaRuntimeService
+type BotmuxRuntimeRpcServerOptions = {
+  runtime: BotmuxRuntimeService
   userDataPath: string
   pid?: number
   platform?: NodeJS.Platform
   enableWebSocket?: boolean
   wsPort?: number
-  // Why: true when the caller set an explicit port (e.g. `orca-botmux-desktop serve --port`).
+  // Why: true when the caller set an explicit port (e.g. `botmux-desktop serve --port`).
   // Distinguishes that pin from the DEFAULT_WS_PORT default so transport bind
   // order can prefer the pin over a stale STA-1511 fallback (issue #8535).
   preferPinnedWsPort?: boolean
@@ -455,8 +455,8 @@ function injectDeviceScope(response: string, scope: DeviceScope): string {
   }
 }
 
-export class OrcaRuntimeRpcServer {
-  private readonly runtime: OrcaRuntimeService
+export class BotmuxRuntimeRpcServer {
+  private readonly runtime: BotmuxRuntimeService
   private readonly dispatcher: RpcDispatcher
   private readonly userDataPath: string
   private readonly pid: number
@@ -500,7 +500,7 @@ export class OrcaRuntimeRpcServer {
     webClientRoot,
     keepaliveIntervalMs = KEEPALIVE_INTERVAL_MS,
     longPollCap = LONG_POLL_CAP
-  }: OrcaRuntimeRpcServerOptions) {
+  }: BotmuxRuntimeRpcServerOptions) {
     this.runtime = runtime
     this.dispatcher = new RpcDispatcher({ runtime })
     this.userDataPath = userDataPath
@@ -965,7 +965,7 @@ export class OrcaRuntimeRpcServer {
       this.writeMetadata()
     } catch (error) {
       // Why: a runtime that cannot publish bootstrap metadata is invisible to
-      // the `orca_botmux` CLI. Close all transports immediately instead of leaving
+      // the `botmux` CLI. Close all transports immediately instead of leaving
       // behind a live but undiscoverable control plane.
       this.activeTransports = []
       this.transports = []
@@ -985,7 +985,7 @@ export class OrcaRuntimeRpcServer {
     await Promise.all(transports.map((t) => t.stop()))
     // Why: we intentionally leave the last metadata file behind instead of
     // deleting it on shutdown. Shared userData paths can briefly host multiple
-    // OrcaBotmux processes during restarts, updates, or development, and stale
+    // Botmux processes during restarts, updates, or development, and stale
     // metadata is safer than letting one process erase another live runtime's
     // bootstrap file.
   }
@@ -1287,7 +1287,7 @@ export function createRuntimeTransportMetadata(
       // Why: Windows named pipes do not get the same chmod hardening path as
       // Unix sockets, so include a per-runtime suffix to avoid exposing a
       // stable, guessable control endpoint name across launches.
-      endpoint: `\\\\.\\pipe\\orca-botmux-${pid}-${endpointSuffix}`
+      endpoint: `\\\\.\\pipe\\botmux-${pid}-${endpointSuffix}`
     }
   }
   return {

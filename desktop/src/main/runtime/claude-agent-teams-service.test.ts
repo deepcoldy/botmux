@@ -13,10 +13,10 @@ function createServiceWithLeader(): {
   const launch = service.createLaunchEnv({
     leaderHandle: 'leader-handle',
     baseEnv: { PATH: '/usr/bin' },
-    shimDir: '/tmp/orca-botmux-shim',
-    shimBin: '/usr/bin/orca_botmux'
+    shimDir: '/tmp/botmux-shim',
+    shimBin: '/usr/bin/botmux'
   })
-  expect(launch.env.ORCA_AGENT_TEAMS_SHIM_DIR).toBe('/tmp/orca-botmux-shim')
+  expect(launch.env.BOTMUX_AGENT_TEAMS_SHIM_DIR).toBe('/tmp/botmux-shim')
   const splitCalls: { handle: string; direction?: string; command?: string; envPane?: string }[] =
     []
   let splitCount = 0
@@ -80,17 +80,17 @@ describe('ClaudeAgentTeamsService', () => {
 
     await expect(
       request(['display-message', '-t', leaderPane, '-p', '#{session_name}:#{window_index}'])
-    ).resolves.toMatchObject({ stdout: 'orca_botmux:0\n', exitCode: 0 })
+    ).resolves.toMatchObject({ stdout: 'botmux:0\n', exitCode: 0 })
 
     await expect(
       request(['split-window', '-t', leaderPane, '-h', '-l', '70%', '-P', '-F', '#{pane_id}'])
     ).resolves.toMatchObject({ stdout: '%2\n', exitCode: 0 })
 
-    await request(['select-layout', '-t', 'orca_botmux:0', 'main-vertical'])
+    await request(['select-layout', '-t', 'botmux:0', 'main-vertical'])
     await request(['resize-pane', '-t', leaderPane, '-x', '30%'])
 
     await expect(
-      request(['list-panes', '-t', 'orca_botmux:0', '-F', '#{pane_id}'])
+      request(['list-panes', '-t', 'botmux:0', '-F', '#{pane_id}'])
     ).resolves.toMatchObject({
       stdout: '%1\n%2\n'
     })
@@ -105,7 +105,7 @@ describe('ClaudeAgentTeamsService', () => {
       service.handleTmuxCompat({ teamId, token, envPane: leaderPane, argv }, api)
 
     await request(['split-window', '-t', leaderPane, '-h', '-l', '70%', '-P', '-F', '#{pane_id}'])
-    await request(['select-layout', '-t', 'orca_botmux:0', 'main-vertical'])
+    await request(['select-layout', '-t', 'botmux:0', 'main-vertical'])
     await request(['split-window', '-t', leaderPane, '-h', '-l', '70%', '-P', '-F', '#{pane_id}'])
     await request(['split-window', '-t', leaderPane, '-h', '-l', '70%', '-P', '-F', '#{pane_id}'])
 
@@ -122,7 +122,7 @@ describe('ClaudeAgentTeamsService', () => {
       service.handleTmuxCompat({ teamId, token, envPane, argv }, api)
 
     await request(['split-window', '-t', leaderPane, '-h', '-P', '-F', '#{pane_id}'])
-    await request(['select-layout', '-t', 'orca_botmux:0', 'main-vertical'])
+    await request(['select-layout', '-t', 'botmux:0', 'main-vertical'])
     await request(['split-window', '-t', leaderPane, '-h', '-P', '-F', '#{pane_id}'])
     await request(['kill-pane', '-t', '%3'])
 
@@ -130,7 +130,7 @@ describe('ClaudeAgentTeamsService', () => {
       request(['split-window', '-t', leaderPane, '-h', '-P', '-F', '#{pane_id}'])
     ).resolves.toMatchObject({ stdout: '%4\n', exitCode: 0 })
     await expect(
-      request(['list-panes', '-t', 'orca_botmux:0', '-F', '#{pane_id}'])
+      request(['list-panes', '-t', 'botmux:0', '-F', '#{pane_id}'])
     ).resolves.toMatchObject({
       stdout: '%1\n%2\n%4\n'
     })
@@ -182,7 +182,7 @@ describe('ClaudeAgentTeamsService', () => {
 
     // the fake pane id is preserved and now backed by the relaunched terminal.
     await expect(
-      request(['list-panes', '-t', 'orca_botmux:0', '-F', '#{pane_id}'])
+      request(['list-panes', '-t', 'botmux:0', '-F', '#{pane_id}'])
     ).resolves.toMatchObject({ stdout: '%1\n%2\n' })
 
     await request(['kill-pane', '-t', '%2'])

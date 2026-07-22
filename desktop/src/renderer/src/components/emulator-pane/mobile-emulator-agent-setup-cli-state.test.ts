@@ -9,11 +9,11 @@ import {
 function cliStatus(overrides: Partial<CliInstallStatus> = {}): CliInstallStatus {
   return {
     platform: 'darwin',
-    commandName: 'orca_botmux',
-    commandPath: '/usr/local/bin/orca_botmux',
+    commandName: 'botmux',
+    commandPath: '/usr/local/bin/botmux',
     pathDirectory: '/usr/local/bin',
     pathConfigured: true,
-    launcherPath: '/Applications/OrcaBotmux.app/Contents/MacOS/orca_botmux',
+    launcherPath: '/Applications/Botmux.app/Contents/MacOS/botmux',
     installMethod: 'symlink',
     supported: true,
     state: 'installed',

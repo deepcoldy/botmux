@@ -15,11 +15,11 @@ import type {
 } from '../../../../shared/types'
 import { GRAB_BUDGET, type BrowserPageAnnotation } from '../../../../shared/browser-grab-types'
 import {
-  ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
+  BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
   FLOATING_TERMINAL_WORKTREE_ID,
-  ORCA_BROWSER_BLANK_URL
+  BOTMUX_BROWSER_BLANK_URL
 } from '../../../../shared/constants'
-import { isOrcaBotmuxControlPlaneHostId } from '../../../../shared/orca-botmux-main-terminal-host'
+import { isBotmuxControlPlaneHostId } from '../../../../shared/botmux-main-terminal-host'
 import { folderWorkspaceKey } from '../../../../shared/workspace-scope'
 import { redactKagiSessionToken } from '../../../../shared/browser-url'
 import {
@@ -246,12 +246,12 @@ function normalizeUrl(url: string): string {
 function normalizeBrowserTitle(title: string | null | undefined, url: string): string {
   if (
     url === 'about:blank' ||
-    url === ORCA_BROWSER_BLANK_URL ||
+    url === BOTMUX_BROWSER_BLANK_URL ||
     title === 'about:blank' ||
-    title === ORCA_BROWSER_BLANK_URL ||
+    title === BOTMUX_BROWSER_BLANK_URL ||
     !title
   ) {
-    // Why: blank pages render through OrcaBotmux's inert data: URL guest. Persisting
+    // Why: blank pages render through Botmux's inert data: URL guest. Persisting
     // that internal bootstrap URL as the page/workspace title leaks an
     // implementation detail into the tab strip and makes every blank page look
     // broken. Keep the user-facing label stable as "New Tab" instead.
@@ -332,7 +332,7 @@ function buildBrowserPage(
     // Why: blank pages mount an inert guest first. Treating them as loading
     // would make an empty workspace flash the global loading affordance even
     // though no real navigation happened yet.
-    loading: normalizedUrl !== 'about:blank' && normalizedUrl !== ORCA_BROWSER_BLANK_URL,
+    loading: normalizedUrl !== 'about:blank' && normalizedUrl !== BOTMUX_BROWSER_BLANK_URL,
     faviconUrl: null,
     canGoBack: false,
     canGoForward: false,
@@ -565,7 +565,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       const shouldFocusAddressBar =
         (shouldUpdateGlobalActiveSurface || shouldFocusFloatingTab) &&
         (options?.focusAddressBar ??
-          (page.url === 'about:blank' || page.url === ORCA_BROWSER_BLANK_URL))
+          (page.url === 'about:blank' || page.url === BOTMUX_BROWSER_BLANK_URL))
 
       return {
         browserTabsByWorktree: {
@@ -979,7 +979,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         s.activeBrowserTabIdByWorktree[workspace.worktreeId] === workspaceId
       const shouldFocusAddressBar =
         shouldUpdateGlobalActiveSurface &&
-        (page.url === 'about:blank' || page.url === ORCA_BROWSER_BLANK_URL)
+        (page.url === 'about:blank' || page.url === BOTMUX_BROWSER_BLANK_URL)
 
       return {
         browserPagesByWorkspace: {
@@ -1421,7 +1421,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
 
   setBrowserPageUrl: (pageId, url) => {
     const nextUrl = normalizeUrl(url)
-    if (nextUrl !== 'about:blank' && nextUrl !== ORCA_BROWSER_BLANK_URL) {
+    if (nextUrl !== 'about:blank' && nextUrl !== BOTMUX_BROWSER_BLANK_URL) {
       const currentPage = findPage(get().browserPagesByWorkspace, pageId)
       if (currentPage) {
         get().recordFeatureInteraction?.('browser')
@@ -1576,7 +1576,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         .map((worktree) => worktree.id)
     )
     validWorktreeIdsForCleanup.add(FLOATING_TERMINAL_WORKTREE_ID)
-    validWorktreeIdsForCleanup.add(ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
+    validWorktreeIdsForCleanup.add(BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
     for (const workspace of currentState.folderWorkspaces) {
       validWorktreeIdsForCleanup.add(folderWorkspaceKey(workspace.id))
     }
@@ -1610,13 +1610,13 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
           .map((worktree) => worktree.id)
       )
       validWorktreeIds.add(FLOATING_TERMINAL_WORKTREE_ID)
-      validWorktreeIds.add(ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
+      validWorktreeIds.add(BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
       for (const workspace of s.folderWorkspaces) {
         validWorktreeIds.add(folderWorkspaceKey(workspace.id))
       }
       addAdditionalValidWorkspaceKeys(validWorktreeIds, options)
       for (const worktreeId of Object.keys(persistedPagesByWorkspace)) {
-        if (isOrcaBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
+        if (isBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
       }
 
       const browserTabsByWorktree: Record<string, BrowserWorkspace[]> = {}
@@ -2141,7 +2141,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
 
   addBrowserHistoryEntry: (url, title) => {
     const safeUrl = redactKagiSessionToken(url)
-    if (safeUrl === ORCA_BROWSER_BLANK_URL || safeUrl === 'about:blank' || !safeUrl) {
+    if (safeUrl === BOTMUX_BROWSER_BLANK_URL || safeUrl === 'about:blank' || !safeUrl) {
       return
     }
     const normalized = normalizeBrowserHistoryUrl(safeUrl)

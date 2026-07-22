@@ -41,7 +41,7 @@ vi.mock('fs', () => ({
 
 vi.mock('electron', () => ({
   app: {
-    getPath: vi.fn(() => '/tmp/orca-botmux-user-data')
+    getPath: vi.fn(() => '/tmp/botmux-user-data')
   }
 }))
 
@@ -459,7 +459,7 @@ describe('LocalPtyProvider', () => {
         expect(mockProc.write).not.toHaveBeenCalled()
 
         const dataCallback = mockProc.onData.mock.calls[0]?.[0] as (data: string) => void
-        dataCallback('\x1b]777;orca-botmux-shell-ready\x07user@host % ')
+        dataCallback('\x1b]777;botmux-shell-ready\x07user@host % ')
         await Promise.resolve()
         vi.advanceTimersByTime(29)
         await Promise.resolve()
@@ -481,7 +481,7 @@ describe('LocalPtyProvider', () => {
         await provider.spawn({ cols: 80, rows: 24, command: 'printf ready' })
         const dataCallback = mockProc.onData.mock.calls[0]?.[0] as (data: string) => void
 
-        dataCallback('\x1b]777;orca-botmux-shell-ready')
+        dataCallback('\x1b]777;botmux-shell-ready')
         expect(onData).not.toHaveBeenCalled()
 
         vi.advanceTimersByTime(1500)
@@ -489,7 +489,7 @@ describe('LocalPtyProvider', () => {
 
         expect(onData).toHaveBeenCalledWith(
           expect.any(String),
-          '\x1b]777;orca-botmux-shell-ready',
+          '\x1b]777;botmux-shell-ready',
           expect.any(Number)
         )
         expect(mockProc.write).not.toHaveBeenCalled()
@@ -509,14 +509,14 @@ describe('LocalPtyProvider', () => {
       await provider.spawn({ cols: 80, rows: 24, command: 'printf ready' })
       const dataCallback = mockProc.onData.mock.calls[0]?.[0] as (data: string) => void
 
-      dataCallback('\x1b]777;orca-botmux-shell-ready')
+      dataCallback('\x1b]777;botmux-shell-ready')
       expect(onData).not.toHaveBeenCalled()
 
       exitCb?.({ exitCode: 0 })
 
       expect(onData).toHaveBeenCalledWith(
         expect.any(String),
-        '\x1b]777;orca-botmux-shell-ready',
+        '\x1b]777;botmux-shell-ready',
         expect.any(Number)
       )
     })
@@ -524,9 +524,9 @@ describe('LocalPtyProvider', () => {
     it('honors explicit terminal env overrides after deleting requested defaults', async () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
-          env.TERM_PROGRAM = 'orca_botmux'
-          env.ORCA_ATTRIBUTION_SHIM_DIR = '/tmp/orca-botmux-attribution'
-          env.PATH = `/tmp/orca-botmux-attribution:${env.PATH ?? ''}`
+          env.TERM_PROGRAM = 'botmux'
+          env.BOTMUX_ATTRIBUTION_SHIM_DIR = '/tmp/botmux-attribution'
+          env.PATH = `/tmp/botmux-attribution:${env.PATH ?? ''}`
           return env
         }
       })
@@ -536,18 +536,18 @@ describe('LocalPtyProvider', () => {
         rows: 24,
         env: {
           TERM: 'screen-256color',
-          PATH: '/tmp/orca-botmux-agent-teams-bin:/usr/bin',
-          ORCA_AGENT_TEAMS_TEAM_ID: 'team-test'
+          PATH: '/tmp/botmux-agent-teams-bin:/usr/bin',
+          BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-test'
         },
-        envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+        envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
       })
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[2].name).toBe('screen-256color')
       expect(spawnCall[2].env.TERM).toBe('screen-256color')
-      expect(spawnCall[2].env.PATH.split(':')[0]).toBe('/tmp/orca-botmux-agent-teams-bin')
+      expect(spawnCall[2].env.PATH.split(':')[0]).toBe('/tmp/botmux-agent-teams-bin')
       expect(spawnCall[2].env.TERM_PROGRAM).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_ATTRIBUTION_SHIM_DIR).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_ATTRIBUTION_SHIM_DIR).toBeUndefined()
     })
 
     it('drops stale inherited Git config indices behind a smaller explicit count', async () => {
@@ -602,15 +602,15 @@ describe('LocalPtyProvider', () => {
         PATH: process.env.PATH,
         LD_LIBRARY_PATH: process.env.LD_LIBRARY_PATH
       }
-      process.env.APPIMAGE = '/data/apps/orca_botmux.appimage'
-      process.env.APPDIR = '/tmp/.mount_orca123'
-      process.env.ARGV0 = '/data/apps/orca_botmux.appimage'
+      process.env.APPIMAGE = '/data/apps/botmux.appimage'
+      process.env.APPDIR = '/tmp/.mount_botmux123'
+      process.env.ARGV0 = '/data/apps/botmux.appimage'
       process.env.OWD = '/home/user/project'
-      process.env.APPIMAGE_LIBRARY_PATH = '/tmp/.mount_orca123/usr/lib'
-      process.env.PATH = ['/tmp/.mount_orca123', '/tmp/.mount_orca123/usr/sbin', '/usr/bin'].join(
+      process.env.APPIMAGE_LIBRARY_PATH = '/tmp/.mount_botmux123/usr/lib'
+      process.env.PATH = ['/tmp/.mount_botmux123', '/tmp/.mount_botmux123/usr/sbin', '/usr/bin'].join(
         delimiter
       )
-      process.env.LD_LIBRARY_PATH = ['/tmp/.mount_orca123/usr/lib', '/opt/audio/lib'].join(
+      process.env.LD_LIBRARY_PATH = ['/tmp/.mount_botmux123/usr/lib', '/opt/audio/lib'].join(
         delimiter
       )
 
@@ -639,8 +639,8 @@ describe('LocalPtyProvider', () => {
     it('uses shell wrapper when MiMo home must survive shell startup', async () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
-          env.MIMOCODE_HOME = '/tmp/orca-botmux-mimocode-overlay'
-          env.ORCA_MIMOCODE_HOME = '/tmp/orca-botmux-mimocode-overlay'
+          env.MIMOCODE_HOME = '/tmp/botmux-mimocode-overlay'
+          env.BOTMUX_MIMOCODE_HOME = '/tmp/botmux-mimocode-overlay'
           return env
         }
       })
@@ -650,7 +650,7 @@ describe('LocalPtyProvider', () => {
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[1]).toEqual(['-l'])
       expect(spawnCall[2].env.ZDOTDIR).toMatch(/shell-ready[\\/]zsh/)
-      expect(spawnCall[2].env.ORCA_SHELL_READY_MARKER).toBe('0')
+      expect(spawnCall[2].env.BOTMUX_SHELL_READY_MARKER).toBe('0')
     })
 
     it('does not pass a Windows Codex home into WSL terminals', async () => {
@@ -658,7 +658,7 @@ describe('LocalPtyProvider', () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
           env.CODEX_HOME = 'C:\\Users\\jin\\.codex'
-          env.ORCA_CODEX_HOME = 'C:\\Users\\jin\\.codex'
+          env.BOTMUX_CODEX_HOME = 'C:\\Users\\jin\\.codex'
           return env
         }
       })
@@ -672,7 +672,7 @@ describe('LocalPtyProvider', () => {
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[0]).toBe('wsl.exe')
       expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_CODEX_HOME).toBeUndefined()
     })
 
     it('does not pass a WSL managed Codex home into Windows terminals', async () => {
@@ -680,9 +680,9 @@ describe('LocalPtyProvider', () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
           env.CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
-          env.ORCA_CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
+          env.BOTMUX_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
           return env
         }
       })
@@ -695,7 +695,7 @@ describe('LocalPtyProvider', () => {
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_CODEX_HOME).toBeUndefined()
     })
 
     it('preserves an explicit Linux Codex home for WSL terminals', async () => {
@@ -724,9 +724,9 @@ describe('LocalPtyProvider', () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
           env.CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
-          env.ORCA_CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
+          env.BOTMUX_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
           return env
         }
       })
@@ -739,12 +739,12 @@ describe('LocalPtyProvider', () => {
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[0]).toBe('wsl.exe')
-      expect(spawnCall[2].env.CODEX_HOME).toBe('/home/jin/.local/share/orca_botmux/codex-accounts/a/home')
-      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBe(
-        '/home/jin/.local/share/orca_botmux/codex-accounts/a/home'
+      expect(spawnCall[2].env.CODEX_HOME).toBe('/home/jin/.local/share/botmux/codex-accounts/a/home')
+      expect(spawnCall[2].env.BOTMUX_CODEX_HOME).toBe(
+        '/home/jin/.local/share/botmux/codex-accounts/a/home'
       )
       expect(spawnCall[2].env.WSLENV).toContain('CODEX_HOME')
-      expect(spawnCall[2].env.WSLENV).toContain('ORCA_CODEX_HOME')
+      expect(spawnCall[2].env.WSLENV).toContain('BOTMUX_CODEX_HOME')
     })
 
     it('does not pass a WSL managed Codex home into a different WSL distro', async () => {
@@ -752,9 +752,9 @@ describe('LocalPtyProvider', () => {
       provider.configure({
         buildSpawnEnv: (_id, env) => {
           env.CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
-          env.ORCA_CODEX_HOME =
-            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca_botmux\\codex-accounts\\a\\home'
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
+          env.BOTMUX_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\botmux\\codex-accounts\\a\\home'
           return env
         }
       })
@@ -768,7 +768,7 @@ describe('LocalPtyProvider', () => {
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[0]).toBe('wsl.exe')
       expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_CODEX_HOME).toBeUndefined()
     })
 
     it('uses the preferred WSL distro for Windows cwd WSL terminals', async () => {
@@ -793,7 +793,7 @@ describe('LocalPtyProvider', () => {
         '-c',
         expect.stringContaining("cd '/mnt/c/Users/jin/repo'")
       ])
-      expect(spawnCall[1][5]).toContain('exec "\\$_orca_wsl_shell" -l')
+      expect(spawnCall[1][5]).toContain('exec "\\$_botmux_wsl_shell" -l')
       expect(spawnCall[2].env.HISTFILE).toContain('terminal-history-wsl/Debian')
     })
 
@@ -818,17 +818,17 @@ describe('LocalPtyProvider', () => {
       expect(pwshAvailable).not.toHaveBeenCalled()
     })
 
-    it('marks OrcaBotmux terminal handle for WSL import when buildSpawnEnv opts in', async () => {
+    it('marks Botmux terminal handle for WSL import when buildSpawnEnv opts in', async () => {
       Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
       const savedCodexHome = process.env.CODEX_HOME
-      const savedOrcaCodexHome = process.env.ORCA_CODEX_HOME
+      const savedBotmuxCodexHome = process.env.BOTMUX_CODEX_HOME
       delete process.env.CODEX_HOME
-      delete process.env.ORCA_CODEX_HOME
+      delete process.env.BOTMUX_CODEX_HOME
       provider.configure({
         buildSpawnEnv: (_id, env, ctx) => {
-          env.ORCA_TERMINAL_HANDLE = 'term_wsl'
+          env.BOTMUX_TERMINAL_HANDLE = 'term_wsl'
           if (ctx?.isWsl) {
-            env.WSLENV = 'ORCA_TERMINAL_HANDLE/u'
+            env.WSLENV = 'BOTMUX_TERMINAL_HANDLE/u'
           }
           return env
         }
@@ -839,7 +839,7 @@ describe('LocalPtyProvider', () => {
           cols: 80,
           rows: 24,
           cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo',
-          env: { ORCA_HERMES_STARTUP_QUERY: 'line one\nline two' }
+          env: { BOTMUX_HERMES_STARTUP_QUERY: 'line one\nline two' }
         })
       } finally {
         if (savedCodexHome === undefined) {
@@ -847,20 +847,20 @@ describe('LocalPtyProvider', () => {
         } else {
           process.env.CODEX_HOME = savedCodexHome
         }
-        if (savedOrcaCodexHome === undefined) {
-          delete process.env.ORCA_CODEX_HOME
+        if (savedBotmuxCodexHome === undefined) {
+          delete process.env.BOTMUX_CODEX_HOME
         } else {
-          process.env.ORCA_CODEX_HOME = savedOrcaCodexHome
+          process.env.BOTMUX_CODEX_HOME = savedBotmuxCodexHome
         }
       }
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[0]).toBe('wsl.exe')
-      expect(spawnCall[2].env.ORCA_TERMINAL_HANDLE).toBe('term_wsl')
+      expect(spawnCall[2].env.BOTMUX_TERMINAL_HANDLE).toBe('term_wsl')
       expect(spawnCall[2].env.WSLENV?.split(':')).toEqual(
         expect.arrayContaining([
-          'ORCA_TERMINAL_HANDLE/u',
-          'ORCA_HERMES_STARTUP_QUERY',
+          'BOTMUX_TERMINAL_HANDLE/u',
+          'BOTMUX_HERMES_STARTUP_QUERY',
           POWERLEVEL10K_WIZARD_DISABLE_ENV
         ])
       )
@@ -882,15 +882,15 @@ describe('LocalPtyProvider', () => {
       expect(spawnCall[2].env.WSLENV ?? '').not.toContain(POWERLEVEL10K_WIZARD_DISABLE_ENV)
     })
 
-    it('does not inherit parent OrcaBotmux pane identity when caller omits pane env', async () => {
+    it('does not inherit parent Botmux pane identity when caller omits pane env', async () => {
       const saved = {
-        ORCA_PANE_KEY: process.env.ORCA_PANE_KEY,
-        ORCA_TAB_ID: process.env.ORCA_TAB_ID,
-        ORCA_WORKTREE_ID: process.env.ORCA_WORKTREE_ID
+        BOTMUX_PANE_KEY: process.env.BOTMUX_PANE_KEY,
+        BOTMUX_TAB_ID: process.env.BOTMUX_TAB_ID,
+        BOTMUX_WORKTREE_ID: process.env.BOTMUX_WORKTREE_ID
       }
-      process.env.ORCA_PANE_KEY = 'parent-tab:parent-leaf'
-      process.env.ORCA_TAB_ID = 'parent-tab'
-      process.env.ORCA_WORKTREE_ID = 'parent-worktree'
+      process.env.BOTMUX_PANE_KEY = 'parent-tab:parent-leaf'
+      process.env.BOTMUX_TAB_ID = 'parent-tab'
+      process.env.BOTMUX_WORKTREE_ID = 'parent-worktree'
 
       try {
         await provider.spawn({ cols: 80, rows: 24 })
@@ -905,29 +905,29 @@ describe('LocalPtyProvider', () => {
       }
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
-      expect(spawnCall[2].env.ORCA_PANE_KEY).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_TAB_ID).toBeUndefined()
-      expect(spawnCall[2].env.ORCA_WORKTREE_ID).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_PANE_KEY).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_TAB_ID).toBeUndefined()
+      expect(spawnCall[2].env.BOTMUX_WORKTREE_ID).toBeUndefined()
     })
 
-    it('preserves explicit child OrcaBotmux pane identity over parent env', async () => {
+    it('preserves explicit child Botmux pane identity over parent env', async () => {
       const saved = {
-        ORCA_PANE_KEY: process.env.ORCA_PANE_KEY,
-        ORCA_TAB_ID: process.env.ORCA_TAB_ID,
-        ORCA_WORKTREE_ID: process.env.ORCA_WORKTREE_ID
+        BOTMUX_PANE_KEY: process.env.BOTMUX_PANE_KEY,
+        BOTMUX_TAB_ID: process.env.BOTMUX_TAB_ID,
+        BOTMUX_WORKTREE_ID: process.env.BOTMUX_WORKTREE_ID
       }
-      process.env.ORCA_PANE_KEY = 'parent-tab:parent-leaf'
-      process.env.ORCA_TAB_ID = 'parent-tab'
-      process.env.ORCA_WORKTREE_ID = 'parent-worktree'
+      process.env.BOTMUX_PANE_KEY = 'parent-tab:parent-leaf'
+      process.env.BOTMUX_TAB_ID = 'parent-tab'
+      process.env.BOTMUX_WORKTREE_ID = 'parent-worktree'
 
       try {
         await provider.spawn({
           cols: 80,
           rows: 24,
           env: {
-            ORCA_PANE_KEY: 'child-tab:child-leaf',
-            ORCA_TAB_ID: 'child-tab',
-            ORCA_WORKTREE_ID: 'child-worktree'
+            BOTMUX_PANE_KEY: 'child-tab:child-leaf',
+            BOTMUX_TAB_ID: 'child-tab',
+            BOTMUX_WORKTREE_ID: 'child-worktree'
           }
         })
       } finally {
@@ -941,9 +941,9 @@ describe('LocalPtyProvider', () => {
       }
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
-      expect(spawnCall[2].env.ORCA_PANE_KEY).toBe('child-tab:child-leaf')
-      expect(spawnCall[2].env.ORCA_TAB_ID).toBe('child-tab')
-      expect(spawnCall[2].env.ORCA_WORKTREE_ID).toBe('child-worktree')
+      expect(spawnCall[2].env.BOTMUX_PANE_KEY).toBe('child-tab:child-leaf')
+      expect(spawnCall[2].env.BOTMUX_TAB_ID).toBe('child-tab')
+      expect(spawnCall[2].env.BOTMUX_WORKTREE_ID).toBe('child-worktree')
     })
 
     it('combines HOMEDRIVE and HOMEPATH for Windows default cwd', async () => {
@@ -955,7 +955,7 @@ describe('LocalPtyProvider', () => {
       Object.defineProperty(process, 'platform', { value: 'win32' })
       delete process.env.USERPROFILE
       process.env.HOMEDRIVE = 'D:'
-      process.env.HOMEPATH = '\\Users\\orca_botmux'
+      process.env.HOMEPATH = '\\Users\\botmux'
 
       try {
         await provider.spawn({ cols: 80, rows: 24 })
@@ -983,7 +983,7 @@ describe('LocalPtyProvider', () => {
       expect(spawnMock).toHaveBeenCalledWith(
         expect.any(String),
         expect.any(Array),
-        expect.objectContaining({ cwd: 'D:\\Users\\orca_botmux' })
+        expect.objectContaining({ cwd: 'D:\\Users\\botmux' })
       )
     })
 

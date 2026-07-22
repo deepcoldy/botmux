@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import type {
-  OrcaHooks,
+  BotmuxHooks,
   Project,
   ProjectUpdateArgs,
   Repo,
@@ -44,7 +44,7 @@ const EMPTY_WSL_DISTROS: string[] = []
 
 type RepositoryPaneProps = {
   repo: Repo
-  yamlHooks: OrcaHooks | null
+  yamlHooks: BotmuxHooks | null
   hasHooksFile: boolean
   hooksInspectionReady: boolean
   mayNeedUpdate: boolean
@@ -140,7 +140,7 @@ export function RepositoryPane({
   }
 
   const handleCopyTemplate = async () => {
-    // Why: the missing-`orca_botmux.yaml` state is a migration aid, so copying the shared-template
+    // Why: the missing-`botmux.yaml` state is a migration aid, so copying the shared-template
     // snippet should be one click rather than forcing users to reconstruct the expected shape.
     await window.api.ui.writeClipboardText(`scripts:
   setup: |
@@ -245,7 +245,7 @@ export function RepositoryPane({
             )}
             description={translate(
               'auto.components.settings.RepositoryPane.removeProjectAllHosts',
-              'Remove this project from OrcaBotmux on all configured hosts.'
+              'Remove this project from Botmux on all configured hosts.'
             )}
             keywords={[repo.displayName, 'delete', 'project', 'repository']}
             className="absolute top-0 right-0 z-10 w-auto max-w-none"

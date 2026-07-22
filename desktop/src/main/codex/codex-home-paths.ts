@@ -32,30 +32,30 @@ export function getSystemCodexHomePath(): string {
   return join(homedir(), '.codex')
 }
 
-export function getOrcaManagedCodexHomePath(): string {
-  const managedHomePath = join(getOrcaUserDataPath(), 'codex-runtime-home', 'home')
+export function getBotmuxManagedCodexHomePath(): string {
+  const managedHomePath = join(getBotmuxUserDataPath(), 'codex-runtime-home', 'home')
   mkdirSync(managedHomePath, { recursive: true })
   return managedHomePath
 }
 
-function getOrcaUserDataPath(): string {
-  if (process.env.ORCA_USER_DATA_PATH) {
-    return process.env.ORCA_USER_DATA_PATH
+function getBotmuxUserDataPath(): string {
+  if (process.env.BOTMUX_USER_DATA_PATH) {
+    return process.env.BOTMUX_USER_DATA_PATH
   }
   // Why: CLI hook commands import this module outside Electron. Mirror the CLI
   // runtime metadata path so offline hook status/on/off uses the same userData.
   if (process.platform === 'darwin') {
-    return join(homedir(), 'Library', 'Application Support', 'orca_botmux')
+    return join(homedir(), 'Library', 'Application Support', 'botmux')
   }
   if (process.platform === 'win32') {
-    return join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'orca_botmux')
+    return join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), 'botmux')
   }
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'orca_botmux')
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'botmux')
 }
 
 export function syncSystemCodexResourcesIntoManagedHome(): void {
   const systemHomePath = getSystemCodexHomePath()
-  const managedHomePath = getOrcaManagedCodexHomePath()
+  const managedHomePath = getBotmuxManagedCodexHomePath()
   for (const entryName of CODEX_SYSTEM_RESOURCE_ENTRIES) {
     linkSystemCodexResource(systemHomePath, managedHomePath, entryName)
   }
@@ -241,7 +241,7 @@ function normalizeWindowsLinkTarget(linkTarget: string): string {
 }
 
 function getResourceCopyMarkerPath(managedHomePath: string, entryName: string): string {
-  return join(managedHomePath, '.orca-botmux-resource-copies', `${entryName}.json`)
+  return join(managedHomePath, '.botmux-resource-copies', `${entryName}.json`)
 }
 
 function markCopiedResource(managedHomePath: string, entryName: string, sourcePath: string): void {

@@ -4,12 +4,12 @@ import { useMountedRef } from '@/hooks/useMountedRef'
 import type { GlobalSettings } from '../../../../shared/types'
 import type { TelemetryConsentState } from '../../../../shared/telemetry-consent-types'
 import { Label } from '../ui/label'
-import { PRIVACY_URL, getConsentState, setOptIn as telemetrySetOptIn } from '../../lib/telemetry'
+import { getConsentState, setOptIn as telemetrySetOptIn } from '../../lib/telemetry'
 import { useAppStore } from '../../store'
 import { PrivacyDiagnosticsSection } from './PrivacyDiagnosticsSection'
 import { translate } from '@/i18n/i18n'
 
-export type EnvBlockedReason = 'do_not_track' | 'orca_botmux_disabled' | 'ci'
+export type EnvBlockedReason = 'do_not_track' | 'botmux_disabled' | 'ci'
 export type BlockedReason = { kind: 'env'; reason: EnvBlockedReason }
 
 type PrivacyPaneProps = {
@@ -25,7 +25,7 @@ export function isEnvBlocked(consent: TelemetryConsentState | null): consent is 
   return (
     consent?.effective === 'disabled' &&
     (consent.reason === 'do_not_track' ||
-      consent.reason === 'orca_botmux_disabled' ||
+      consent.reason === 'botmux_disabled' ||
       consent.reason === 'ci')
   )
 }
@@ -34,8 +34,8 @@ export function envVarNameForReason(reason: EnvBlockedReason): string {
   if (reason === 'do_not_track') {
     return 'DO_NOT_TRACK'
   }
-  if (reason === 'orca_botmux_disabled') {
-    return 'ORCA_TELEMETRY_DISABLED'
+  if (reason === 'botmux_disabled') {
+    return 'BOTMUX_TELEMETRY_DISABLED'
   }
   return 'CI'
 }
@@ -99,16 +99,8 @@ export function PrivacyPane({ settings }: PrivacyPaneProps): React.JSX.Element {
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.PrivacyPane.8bfdd23a88',
-              'Help us figure out what to build next. OrcaBotmux sends anonymous counts of which features you use and where things break.'
-            )}{' '}
-            <button
-              type="button"
-              className="underline underline-offset-2 hover:text-foreground"
-              onClick={() => void window.api.shell.openUrl(PRIVACY_URL)}
-            >
-              {translate('auto.components.settings.PrivacyPane.77410e0566', 'Privacy policy')}
-            </button>
-            .
+              'Help us figure out what to build next. Botmux sends anonymous counts of which features you use and where things break.'
+            )}
           </p>
         </div>
         <button

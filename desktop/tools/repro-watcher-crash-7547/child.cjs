@@ -2,7 +2,7 @@
 // @parcel/watcher (watcher.node, 0xc0000409 fail-fast).
 //
 // Runs ONE scenario in THIS process (the parent runner spawns us in a loop and
-// watches our exit code). Each scenario mimics a real OrcaBotmux usage pattern:
+// watches our exit code). Each scenario mimics a real Botmux usage pattern:
 //
 //   delete-root  — subscribe to worktree-like dirs, churn files, delete the
 //                  watched root mid-churn (worktree deletion during agent
@@ -180,7 +180,7 @@ async function scenarioDeleteRoot(watcher, baseDir, durationMs, lane) {
           if (err) {
             recordError(err)
             errored = true
-            // OrcaBotmux's createWatcher error path: unsubscribe from inside the
+            // Botmux's createWatcher error path: unsubscribe from inside the
             // error callback.
             if (sub) {
               stats.unsubscribes++
@@ -429,9 +429,9 @@ const SCENARIOS = {
 async function main() {
   const scenarioName = process.argv[2] || 'mixed'
   const durationMs = Number(process.argv[3] || 15000)
-  // Outside the repo worktree: a live OrcaBotmux instance may be watching the repo,
+  // Outside the repo worktree: a live Botmux instance may be watching the repo,
   // and this churn must not feed the production watcher.
-  const baseDir = path.join(os.tmpdir(), 'orca-botmux-7547-harness', `run-${process.pid}`)
+  const baseDir = path.join(os.tmpdir(), 'botmux-7547-harness', `run-${process.pid}`)
   fs.mkdirSync(baseDir, { recursive: true })
 
   const watcher = require(watcherPath)

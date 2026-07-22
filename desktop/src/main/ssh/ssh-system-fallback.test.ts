@@ -77,15 +77,15 @@ function createResolvedConfig(
   }
 }
 
-function expectNoOrcaControlMasterArgs(args: string[]): void {
+function expectNoBotmuxControlMasterArgs(args: string[]): void {
   expect(args).not.toContain('ControlMaster=auto')
   expect(args.some((arg) => arg.startsWith('ControlPath='))).toBe(false)
   expect(args).not.toContain('ControlPersist=300')
 }
 
-function expectOrcaControlMasterArgs(args: string[]): void {
+function expectBotmuxControlMasterArgs(args: string[]): void {
   if (process.platform === 'win32') {
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
     return
   }
   expect(args).toContain('ControlMaster=auto')
@@ -291,12 +291,12 @@ describe('spawnSystemSsh', () => {
         configHost: '127.0.0.1',
         host: '127.0.0.1',
         port: 2222,
-        identityFile: '/tmp/orca-botmux-docker-key',
+        identityFile: '/tmp/botmux-docker-key',
         identitiesOnly: true
       })
     )
 
-    expect(args).toEqual(expect.arrayContaining(['-p', '2222', '-i', '/tmp/orca-botmux-docker-key']))
+    expect(args).toEqual(expect.arrayContaining(['-p', '2222', '-i', '/tmp/botmux-docker-key']))
     expect(args).toContain('IdentitiesOnly=yes')
     expect(args).toContain('deploy@127.0.0.1')
   })
@@ -348,7 +348,7 @@ describe('spawnSystemSsh', () => {
     expect(args).toContain('deploy@krb-host')
   })
 
-  it('does not inject OrcaBotmux ControlMaster flags when ssh config already owns muxing', () => {
+  it('does not inject Botmux ControlMaster flags when ssh config already owns muxing', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }), {
       resolvedConfig: createResolvedConfig({
         controlMaster: 'auto',
@@ -357,12 +357,12 @@ describe('spawnSystemSsh', () => {
       })
     })
 
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
     expect(args).toContain('deploy@workbox')
   })
 
-  it('injects OrcaBotmux ControlMaster flags when ssh config only sets ControlPersist', () => {
+  it('injects Botmux ControlMaster flags when ssh config only sets ControlPersist', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }), {
       resolvedConfig: createResolvedConfig({
         controlMaster: 'no',
@@ -370,11 +370,11 @@ describe('spawnSystemSsh', () => {
       })
     })
 
-    expectOrcaControlMasterArgs(args)
+    expectBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
   })
 
-  it('injects OrcaBotmux ControlMaster flags when ssh config only sets ControlPath', () => {
+  it('injects Botmux ControlMaster flags when ssh config only sets ControlPath', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }), {
       resolvedConfig: createResolvedConfig({
         controlMaster: 'no',
@@ -382,43 +382,43 @@ describe('spawnSystemSsh', () => {
       })
     })
 
-    expectOrcaControlMasterArgs(args)
+    expectBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
   })
 
-  it('injects OrcaBotmux ControlMaster flags when ssh config omits ControlPath', () => {
+  it('injects Botmux ControlMaster flags when ssh config omits ControlPath', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }), {
       resolvedConfig: createResolvedConfig({
         controlMaster: 'auto'
       })
     })
 
-    expectOrcaControlMasterArgs(args)
+    expectBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
   })
 
-  it('does not inject OrcaBotmux ControlMaster flags for unresolved ssh-config targets', () => {
+  it('does not inject Botmux ControlMaster flags for unresolved ssh-config targets', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }))
 
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
     expect(args).toContain('deploy@workbox')
   })
 
-  it('does not inject OrcaBotmux ControlMaster flags for unresolved legacy config aliases', () => {
+  it('does not inject Botmux ControlMaster flags for unresolved legacy config aliases', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', host: 'resolved.example.com' }))
 
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
     expect(args).toContain('deploy@workbox')
   })
 
-  it('can inject OrcaBotmux ControlMaster flags for ssh-config targets with resolved config', () => {
+  it('can inject Botmux ControlMaster flags for ssh-config targets with resolved config', () => {
     const args = buildSshArgs(createTarget({ configHost: 'workbox', source: 'ssh-config' }), {
       resolvedConfig: createResolvedConfig()
     })
 
-    expectOrcaControlMasterArgs(args)
+    expectBotmuxControlMasterArgs(args)
     expect(args).not.toContain('-S')
   })
 
@@ -428,13 +428,13 @@ describe('spawnSystemSsh', () => {
 
     expect(standaloneControlIdx).toBeGreaterThan(-1)
     expect(args[standaloneControlIdx + 1]).toBe('none')
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
   })
 
-  it('adds keepalive options to OrcaBotmux-owned ControlMaster connections', () => {
+  it('adds keepalive options to Botmux-owned ControlMaster connections', () => {
     const args = buildSshArgs(createTarget(), { resolvedConfig: createResolvedConfig() })
 
-    expectOrcaControlMasterArgs(args)
+    expectBotmuxControlMasterArgs(args)
     if (process.platform !== 'win32') {
       expect(args).toContain('ServerAliveInterval=15')
       expect(args).toContain('ServerAliveCountMax=3')
@@ -480,7 +480,7 @@ describe('spawnSystemSsh', () => {
     expect(args[exitOnForwardFailureIdx - 1]).toBe('-o')
     expect(exitOnForwardFailureIdx).toBeLessThan(terminatorIdx)
     expect(standaloneControlIdx).toBe(-1)
-    expectNoOrcaControlMasterArgs(args)
+    expectNoBotmuxControlMasterArgs(args)
     expect(args).toContain('127.0.0.1:5173:127.0.0.1:3000')
     expect(args[terminatorIdx + 1]).toBe('deploy@fdpass-host')
     expect(spawnMock).toHaveBeenCalledWith(
@@ -588,7 +588,7 @@ describe('spawnSystemSsh', () => {
     const received: Buffer[] = []
     proc.stdin.on('data', (chunk: Buffer) => received.push(chunk))
     spawnMock.mockReturnValue(proc)
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-system-ssh-upload-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-system-ssh-upload-'))
     const source = join(dir, 'payload.bin')
     writeFileSync(source, Buffer.from('payload'))
 
@@ -628,7 +628,7 @@ describe('spawnSystemSsh', () => {
   it('downloads files from POSIX system SSH targets', async () => {
     const proc = createEventedProcess()
     spawnMock.mockReturnValue(proc)
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-system-ssh-download-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-system-ssh-download-'))
     const dest = join(dir, 'payload.bin')
 
     try {
@@ -670,7 +670,7 @@ describe('spawnSystemSsh', () => {
 
     const promise = writeFileViaSystemSsh(
       createTarget(),
-      'C:/Users/me/.orca-botmux-remote/relay/.version',
+      'C:/Users/me/.botmux-remote/relay/.version',
       '0.1.0',
       { hostPlatform }
     )
@@ -710,7 +710,7 @@ describe('spawnSystemSsh', () => {
     const proc = createEventedProcess()
     spawnMock.mockReturnValue(proc)
     const hostPlatform = getRemoteHostPlatform('win32-x64')
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-system-ssh-download-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-system-ssh-download-'))
     const dest = join(dir, 'payload.bin')
 
     try {
@@ -741,7 +741,7 @@ describe('spawnSystemSsh', () => {
 
     const promise = writeFileViaSystemSsh(
       createTarget(),
-      'C:/Users/me/.orca-botmux-remote/relay/.version',
+      'C:/Users/me/.botmux-remote/relay/.version',
       '0.1.0',
       { hostPlatform, disableControlMaster: true }
     )
@@ -755,7 +755,7 @@ describe('spawnSystemSsh', () => {
   })
 
   it('uploads directories to Windows system SSH targets in one PowerShell batch', async () => {
-    const localDir = mkdtempSync(join(tmpdir(), 'orca-botmux-system-ssh-upload-'))
+    const localDir = mkdtempSync(join(tmpdir(), 'botmux-system-ssh-upload-'))
     writeFileSync(join(localDir, 'relay.js'), 'console.log("relay")')
     const spawned: EventedProcess[] = []
     spawnMock.mockImplementation(() => {
@@ -769,7 +769,7 @@ describe('spawnSystemSsh', () => {
       await uploadDirectoryViaSystemSsh(
         createTarget(),
         localDir,
-        'C:/Users/me/.orca-botmux-remote/relay',
+        'C:/Users/me/.botmux-remote/relay',
         { hostPlatform: getRemoteHostPlatform('win32-x64') }
       )
     } finally {
@@ -788,10 +788,10 @@ describe('spawnSystemSsh', () => {
     }[]
     expect(payload).toEqual(
       expect.arrayContaining([
-        { kind: 'directory', path: 'C:/Users/me/.orca-botmux-remote/relay' },
+        { kind: 'directory', path: 'C:/Users/me/.botmux-remote/relay' },
         {
           kind: 'file',
-          path: 'C:/Users/me/.orca-botmux-remote/relay/relay.js',
+          path: 'C:/Users/me/.botmux-remote/relay/relay.js',
           contentsBase64: Buffer.from('console.log("relay")').toString('base64')
         }
       ])
@@ -799,7 +799,7 @@ describe('spawnSystemSsh', () => {
   })
 
   it('forces standalone SSH for Windows upload packages when requested', async () => {
-    const localDir = mkdtempSync(join(tmpdir(), 'orca-botmux-system-ssh-upload-'))
+    const localDir = mkdtempSync(join(tmpdir(), 'botmux-system-ssh-upload-'))
     writeFileSync(join(localDir, 'relay.js'), 'console.log("relay")')
     spawnMock.mockImplementation(() => {
       const proc = createEventedProcess()
@@ -811,7 +811,7 @@ describe('spawnSystemSsh', () => {
       await uploadDirectoryViaSystemSsh(
         createTarget(),
         localDir,
-        'C:/Users/me/.orca-botmux-remote/relay',
+        'C:/Users/me/.botmux-remote/relay',
         { hostPlatform: getRemoteHostPlatform('win32-x64'), disableControlMaster: true }
       )
     } finally {

@@ -122,8 +122,8 @@ export class WslHookRelayManager {
       }
     }
     const coords = this.deps.hookCoordsEnv()
-    const port = Number(coords.ORCA_AGENT_HOOK_PORT ?? '')
-    if (!Number.isInteger(port) || port <= 0 || !coords.ORCA_AGENT_HOOK_TOKEN) {
+    const port = Number(coords.BOTMUX_AGENT_HOOK_PORT ?? '')
+    if (!Number.isInteger(port) || port <= 0 || !coords.BOTMUX_AGENT_HOOK_TOKEN) {
       return
     }
     const bundle = this.deps.resolveBundle()

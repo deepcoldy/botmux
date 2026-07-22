@@ -358,7 +358,7 @@ export function RemoteFileBrowser({
   // Called on every user edit to the input. Filter-mode edits stay local;
   // path-mode edits trigger a debounced resolve. Partial trailing-segment
   // changes that don't change committed segments only update the preview
-  // filter, so typing `Documents/orc` → `Documents/orca_botmux` is free.
+  // filter, so typing `Documents/orc` → `Documents/botmux` is free.
   const handleInputChange = useCallback(
     (raw: string) => {
       clearFileHint()
@@ -398,7 +398,7 @@ export function RemoteFileBrowser({
       // Partial trailing-segment edits: if the committed-path portion of the
       // input is unchanged from what the preview already resolved, update
       // only the local filter. This is the fast path that guarantees typing
-      // `Documents/orc` → `Documents/orca_botmux` issues no `browseDir` call.
+      // `Documents/orc` → `Documents/botmux` issues no `browseDir` call.
       if (
         parsed.mode === 'path' &&
         preview &&

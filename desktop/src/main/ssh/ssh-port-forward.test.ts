@@ -331,6 +331,27 @@ describe('SshPortForwardManager', () => {
     expect(socket.destroy).toHaveBeenCalled()
   })
 
+  it('destroys the local socket when forwardOut throws Not connected synchronously', async () => {
+    // Why: ssh2 throws (does not call the callback) when the SSH socket is
+    // already closed. Without a try/catch this becomes an uncaught exception
+    // on the local TCP accept path.
+    const mockClient = {
+      forwardOut: vi.fn().mockImplementation(() => {
+        throw new Error('Not connected')
+      })
+    }
+    const conn = {
+      getClient: vi.fn().mockReturnValue(mockClient),
+      usesSystemSshTransport: vi.fn().mockReturnValue(false)
+    }
+    await manager.addForward('conn-1', conn as never, 3000, 'localhost', 8080)
+    const server = getLastMockServer()
+    const socket = createFakeSocket()
+
+    expect(() => server?._connectionHandler(socket)).not.toThrow()
+    expect(socket.destroy).toHaveBeenCalled()
+  })
+
   it('closes late ssh2 channels after the forward was removed', async () => {
     const mockChannel = {
       pipe: vi.fn().mockReturnThis(),

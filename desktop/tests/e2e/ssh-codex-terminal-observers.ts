@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { expect } from './helpers/orca-botmux-app'
+import { expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, switchToWorktree } from './helpers/store'
 import {
   execInTerminal,

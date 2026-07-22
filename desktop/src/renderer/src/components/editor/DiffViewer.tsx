@@ -384,7 +384,7 @@ export default function DiffViewer({
 
   // Why: VS Code snapshots diff view state on deactivation, not on scroll events.
   // The useLayoutEffect cleanup fires synchronously before React unmounts the
-  // component on tab switch, which is OrcaBotmux's equivalent of VS Code's clearInput().
+  // component on tab switch, which is Botmux's equivalent of VS Code's clearInput().
   useLayoutEffect(() => {
     return () => {
       const de = diffEditorRef.current

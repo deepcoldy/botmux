@@ -38,7 +38,7 @@ export type HooksConfig = {
   [key: string]: unknown
 }
 
-// Why: host-level backstop (seconds) for OrcaBotmux-managed status hooks. The shell
+// Why: host-level backstop (seconds) for Botmux-managed status hooks. The shell
 // wrapper's curl `--max-time 1.5` is the normal dead-endpoint bound; this caps a
 // hook the agent host itself runs in case that transport budget is bypassed.
 // Intentionally independent of Copilot's `timeoutSec: 5` — both managed budgets
@@ -89,7 +89,7 @@ export function createManagedCommandMatcher(
 ): (command: string | undefined) => boolean {
   const scriptStem = scriptFileName.replace(/\.(?:cmd|ps1|sh)$/, '')
   // Why: local Windows installs use .cmd or Copilot's .ps1, while SSH/POSIX
-  // installs use .sh. A platform switch must still sweep stale OrcaBotmux hooks.
+  // installs use .sh. A platform switch must still sweep stale Botmux hooks.
   const needles = [
     `agent-hooks/${scriptFileName}`,
     `agent-hooks/${scriptStem}.cmd`,
@@ -119,10 +119,10 @@ function decodePowerShellEncodedCommand(command: string): string | null {
   }
 }
 
-// Why: prod, dev, and parallel OrcaBotmux instances must write the same managed
+// Why: prod, dev, and parallel Botmux instances must write the same managed
 // settings entry instead of racing between per-userData script paths.
 export function getSharedManagedScriptPath(scriptFileName: string): string {
-  return join(homedir(), '.orca_botmux', 'agent-hooks', scriptFileName)
+  return join(homedir(), '.botmux', 'agent-hooks', scriptFileName)
 }
 
 function quotePosixShellString(value: string): string {
@@ -203,16 +203,16 @@ export function buildWindowsAgentHookPostCommand(source: AgentHookSource): strin
   // makes trusted Windows hooks visibly slow, so mirror the POSIX curl path.
   // Qualify curl so a repo-local curl.exe cannot hijack hook payloads.
   return [
-    `"%SystemRoot%\\System32\\curl.exe" -sS -X POST "http://127.0.0.1:%ORCA_AGENT_HOOK_PORT%/hook/${source}" ^`,
+    `"%SystemRoot%\\System32\\curl.exe" -sS -X POST "http://127.0.0.1:%BOTMUX_AGENT_HOOK_PORT%/hook/${source}" ^`,
     '  --connect-timeout 0.5 --max-time 1.5 ^',
     '  -H "Content-Type: application/x-www-form-urlencoded" ^',
-    '  -H "X-OrcaBotmux-Agent-Hook-Token: %ORCA_AGENT_HOOK_TOKEN%" ^',
-    '  --data-urlencode "paneKey=%ORCA_PANE_KEY%" ^',
-    '  --data-urlencode "tabId=%ORCA_TAB_ID%" ^',
-    '  --data-urlencode "launchToken=%ORCA_AGENT_LAUNCH_TOKEN%" ^',
-    '  --data-urlencode "worktreeId=%ORCA_WORKTREE_ID%" ^',
-    '  --data-urlencode "env=%ORCA_AGENT_HOOK_ENV%" ^',
-    '  --data-urlencode "version=%ORCA_AGENT_HOOK_VERSION%" ^',
+    '  -H "X-Botmux-Agent-Hook-Token: %BOTMUX_AGENT_HOOK_TOKEN%" ^',
+    '  --data-urlencode "paneKey=%BOTMUX_PANE_KEY%" ^',
+    '  --data-urlencode "tabId=%BOTMUX_TAB_ID%" ^',
+    '  --data-urlencode "launchToken=%BOTMUX_AGENT_LAUNCH_TOKEN%" ^',
+    '  --data-urlencode "worktreeId=%BOTMUX_WORKTREE_ID%" ^',
+    '  --data-urlencode "env=%BOTMUX_AGENT_HOOK_ENV%" ^',
+    '  --data-urlencode "version=%BOTMUX_AGENT_HOOK_VERSION%" ^',
     '  --data-urlencode "payload@-" >nul 2>nul'
   ].join('\r\n')
 }
@@ -226,16 +226,16 @@ export function buildWindowsAgentHookPostCommand(source: AgentHookSource): strin
 export function buildWindowsAgentHookCurlPostCommand(source: AgentHookSource): string {
   return [
     '"%SystemRoot%\\System32\\curl.exe" -sS -X POST',
-    `"http://127.0.0.1:%ORCA_AGENT_HOOK_PORT%/hook/${source}"`,
+    `"http://127.0.0.1:%BOTMUX_AGENT_HOOK_PORT%/hook/${source}"`,
     '--connect-timeout 0.5 --max-time 1.5',
     '-H "Content-Type: application/x-www-form-urlencoded"',
-    '-H "X-OrcaBotmux-Agent-Hook-Token: %ORCA_AGENT_HOOK_TOKEN%"',
-    '--data-urlencode "paneKey=%ORCA_PANE_KEY%"',
-    '--data-urlencode "tabId=%ORCA_TAB_ID%"',
-    '--data-urlencode "launchToken=%ORCA_AGENT_LAUNCH_TOKEN%"',
-    '--data-urlencode "worktreeId=%ORCA_WORKTREE_ID%"',
-    '--data-urlencode "env=%ORCA_AGENT_HOOK_ENV%"',
-    '--data-urlencode "version=%ORCA_AGENT_HOOK_VERSION%"',
+    '-H "X-Botmux-Agent-Hook-Token: %BOTMUX_AGENT_HOOK_TOKEN%"',
+    '--data-urlencode "paneKey=%BOTMUX_PANE_KEY%"',
+    '--data-urlencode "tabId=%BOTMUX_TAB_ID%"',
+    '--data-urlencode "launchToken=%BOTMUX_AGENT_LAUNCH_TOKEN%"',
+    '--data-urlencode "worktreeId=%BOTMUX_WORKTREE_ID%"',
+    '--data-urlencode "env=%BOTMUX_AGENT_HOOK_ENV%"',
+    '--data-urlencode "version=%BOTMUX_AGENT_HOOK_VERSION%"',
     '--data-urlencode "payload@-"',
     '>nul 2>&1'
   ].join(' ')
@@ -294,7 +294,7 @@ export function hookDefinitionHasManagedCommand(
   )
 }
 
-// Why: temp+rename so concurrent OrcaBotmux instances writing this shared path can't
+// Why: temp+rename so concurrent Botmux instances writing this shared path can't
 // produce a torn script that an in-flight `/bin/sh <scriptPath>` would source.
 export function writeManagedScript(scriptPath: string, content: string): void {
   const dir = dirname(scriptPath)

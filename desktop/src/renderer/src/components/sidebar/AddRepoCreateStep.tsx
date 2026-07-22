@@ -1,4 +1,4 @@
-// Step for AddRepoDialog (orca_botmux#763), split out so create-project state stays scoped.
+// Step for AddRepoDialog (botmux#763), split out so create-project state stays scoped.
 import React, { useMemo, useState } from 'react'
 import { ChevronDown, GitBranch, Loader2 } from 'lucide-react'
 import { DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
@@ -135,7 +135,7 @@ export function CreateStep({
         <DialogDescription>
           {translate(
             'auto.components.sidebar.AddRepoCreateStep.b100311784',
-            'Name it and OrcaBotmux will create a real project with sensible defaults.'
+            'Name it and Botmux will create a real project with sensible defaults.'
           )}
         </DialogDescription>
       </DialogHeader>

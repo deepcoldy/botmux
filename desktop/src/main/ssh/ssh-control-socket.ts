@@ -90,9 +90,9 @@ function getControlSocketDirectoryCandidates(uid: number): string[] {
   const candidates: string[] = []
   const xdgRuntimeDir = process.env.XDG_RUNTIME_DIR
   if (xdgRuntimeDir && isAbsolute(xdgRuntimeDir)) {
-    candidates.push(pathJoin(xdgRuntimeDir, 'orca-botmux-ssh'))
+    candidates.push(pathJoin(xdgRuntimeDir, 'botmux-ssh'))
   }
-  candidates.push(pathJoin(tmpdir(), `orca-botmux-ssh-${uid}`))
+  candidates.push(pathJoin(tmpdir(), `botmux-ssh-${uid}`))
   return candidates
 }
 

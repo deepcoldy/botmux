@@ -40,8 +40,8 @@ export function planSourceControlAgentActionLaunch(args: {
   sessionOptions?: Record<string, SessionOptionValue>
   platform?: NodeJS.Platform
   terminalWindowsShell?: string | null
-  /** Why: SSH remotes deploy the CLI shim as plain `orca_botmux`, so the Linux-only
-   * `orca-botmux-ide` rename must not be applied for remote launches. */
+  /** Why: SSH remotes deploy the CLI shim as plain `botmux`, so the Linux-only
+   * `botmux-ide` rename must not be applied for remote launches. */
   isRemote?: boolean
 }): SourceControlLaunchPlanResult {
   const agent = args.agent
@@ -194,11 +194,11 @@ export function planSourceControlAgentActionLaunch(args: {
 
   const summary =
     delivery === 'paste-submit'
-      ? 'The agent starts with no prompt, then OrcaBotmux pastes and submits the command input after the TUI is ready.'
+      ? 'The agent starts with no prompt, then Botmux pastes and submits the command input after the TUI is ready.'
       : delivery === 'draft-native'
         ? 'The command input is prefilled as an editable draft by the agent launch command.'
         : delivery === 'draft-paste'
-          ? 'The agent starts with no prompt, then OrcaBotmux pastes the command input as an editable draft after the TUI is ready.'
+          ? 'The agent starts with no prompt, then Botmux pastes the command input as an editable draft after the TUI is ready.'
           : 'The command input is included in the launch command and submitted as the first turn.'
 
   return {
@@ -208,6 +208,6 @@ export function planSourceControlAgentActionLaunch(args: {
     commandLabel: startupPlan.launchCommand,
     summary,
     caveat:
-      'This check builds OrcaBotmux’s launch plan only. PATH, binary availability, account setup, and terminal startup failures are still caught by the real launch watchdog.'
+      'This check builds Botmux’s launch plan only. PATH, binary availability, account setup, and terminal startup failures are still caught by the real launch watchdog.'
   }
 }

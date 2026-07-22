@@ -165,7 +165,7 @@ describe('hosted review cache revalidation', () => {
       provider: 'github',
       number: 42,
       title: 'Exact linked PR',
-      url: 'https://github.com/acme/orca_botmux/pull/42'
+      url: 'https://github.com/acme/botmux/pull/42'
     }
     mockApi.hostedReview.forBranch.mockResolvedValueOnce(review).mockResolvedValueOnce(linkedReview)
     const store = makeStore()

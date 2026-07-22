@@ -2,7 +2,7 @@
  * Boot-time hydration of `pty-registry` from the live daemon.
  *
  * Why: the registry is normally populated by the `pty:spawn` IPC
- * handler. On warm reattach (a fresh OrcaBotmux process bound to a
+ * handler. On warm reattach (a fresh Botmux process bound to a
  * still-running daemon), the renderer hasn't re-mounted every pane
  * yet, so `pty:spawn` hasn't fired for those sessions and the memory
  * collector's snapshot omits them. The renderer then unions in

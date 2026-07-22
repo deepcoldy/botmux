@@ -27,10 +27,12 @@ import {
   hasActiveProviderUsage,
   UsageBar
 } from '../../../src/components/AccountUsage'
+import { useMobileI18n } from '../../../src/i18n/mobile-i18n'
 
 export default function AccountsScreen() {
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   const { hostId } = useLocalSearchParams<{ hostId: string }>()
 
   // Why: shared client per host. See docs/mobile-shared-client-per-host.md.
@@ -60,7 +62,7 @@ export default function AccountsScreen() {
       }
       const host = hosts.find((h) => h.id === hostId)
       if (!host) {
-        setError('Host not found')
+        setError(t('Host not found'))
         return
       }
       setHostName(host.name)
@@ -68,7 +70,7 @@ export default function AccountsScreen() {
     return () => {
       stale = true
     }
-  }, [hostId])
+  }, [hostId, t])
 
   // Why: subscribe to streaming snapshot updates so usage bars refresh in
   // place when the desktop's rate-limit poll completes (every 5 min) or
@@ -121,7 +123,7 @@ export default function AccountsScreen() {
       try {
         const res = await client.sendRequest(method, { accountId })
         if (!res.ok) {
-          Alert.alert('Could not switch account', res.error.message)
+          Alert.alert(t('Could not switch account'), res.error.message)
         } else {
           // Why: optimistic refresh — the streaming subscription will also
           // emit, but a one-shot keeps the UI responsive even if the stream
@@ -129,12 +131,12 @@ export default function AccountsScreen() {
           await refresh()
         }
       } catch (e) {
-        Alert.alert('Could not switch account', e instanceof Error ? e.message : String(e))
+        Alert.alert(t('Could not switch account'), e instanceof Error ? e.message : String(e))
       } finally {
         setBusyAccountId(null)
       }
     },
-    [client, refresh]
+    [client, refresh, t]
   )
 
   const renderProviderSection = (provider: ProviderKey, title: string) => {
@@ -160,8 +162,8 @@ export default function AccountsScreen() {
             disabled={busyAccountId !== null || connState !== 'connected'}
           >
             <View style={styles.rowMain}>
-              <Text style={styles.rowTitle}>System default</Text>
-              <Text style={styles.rowSubtitle}>Use the agent's own login</Text>
+              <Text style={styles.rowTitle}>{t('System default')}</Text>
+              <Text style={styles.rowSubtitle}>{t("Use the agent's own login")}</Text>
               {/* Why: when system default is the active selection, activeUsage
                   holds the system-default login's rate limits — surface them
                   here so non-managed users still see their usage. */}
@@ -261,7 +263,7 @@ export default function AccountsScreen() {
           <ChevronLeft size={22} color={colors.textPrimary} />
         </Pressable>
         <View style={styles.titleWrap}>
-          <Text style={styles.heading}>Accounts</Text>
+          <Text style={styles.heading}>{t('Accounts')}</Text>
           {hostName ? (
             <Text style={styles.subheading} numberOfLines={1}>
               {hostName}
@@ -294,7 +296,9 @@ export default function AccountsScreen() {
         {connState !== 'connected' && !snapshot ? (
           <View style={styles.placeholder}>
             <ActivityIndicator color={colors.textSecondary} />
-            <Text style={styles.placeholderText}>Connecting to {hostName || 'host'}…</Text>
+            <Text style={styles.placeholderText}>
+              {t('Connecting to {{host}}…', { host: hostName || t('Host') })}
+            </Text>
           </View>
         ) : error && !snapshot ? (
           <View style={styles.placeholder}>
@@ -303,7 +307,7 @@ export default function AccountsScreen() {
         ) : !snapshot ? (
           <View style={styles.placeholder}>
             <ActivityIndicator color={colors.textSecondary} />
-            <Text style={styles.placeholderText}>Loading accounts…</Text>
+            <Text style={styles.placeholderText}>{t('Loading accounts…')}</Text>
           </View>
         ) : (
           <>
@@ -312,7 +316,7 @@ export default function AccountsScreen() {
             <View style={styles.footerHint}>
               <User size={14} color={colors.textMuted} />
               <Text style={styles.footerHintText}>
-                Add or re-authenticate accounts from desktop Settings → Accounts.
+                {t('Add or re-authenticate accounts from desktop Settings → Accounts.')}
               </Text>
             </View>
           </>

@@ -11,7 +11,7 @@ vi.mock('child_process', () => ({
   spawn: spawnMock
 }))
 
-import { launchOrcaApp, serveOrcaApp } from './launch'
+import { launchBotmuxApp, serveBotmuxApp } from './launch'
 
 class FakeChildProcess extends EventEmitter {
   stdout = new EventEmitter()
@@ -29,7 +29,7 @@ const RECIPE_JSON = JSON.stringify({
   }),
   projectRoot: '/workspace/repo'
 })
-const SERVE_INSTALL_STATUS = '[serve] orca_botmux CLI install: installed'
+const SERVE_INSTALL_STATUS = '[serve] botmux CLI install: installed'
 const SSH_PRIVATE_KEY = 'TOP-SECRET-PRIVATE-KEY'
 const SSH_AUTHORIZATION = 'Bearer TOP-SECRET-AUTHORIZATION'
 const SSH_PASSPHRASE = 'TOP-SECRET-PASSPHRASE'
@@ -63,23 +63,23 @@ function startRecipeJsonServer() {
   spawnMock.mockReturnValue(child)
   const stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
   const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
-  const result = serveOrcaApp({
+  const result = serveBotmuxApp({
     recipeJson: true,
     projectRoot: '/workspace/repo'
   })
   return { child, result, stdoutSpy, stderrSpy }
 }
 
-describe('serveOrcaApp', () => {
+describe('serveBotmuxApp', () => {
   beforeEach(() => {
     spawnMock.mockReset()
-    process.env.ORCA_APP_EXECUTABLE = '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux'
+    process.env.BOTMUX_APP_EXECUTABLE = '/Applications/Botmux.app/Contents/MacOS/Botmux'
   })
 
   afterEach(() => {
     vi.restoreAllMocks()
-    delete process.env.ORCA_APP_EXECUTABLE
-    delete process.env.ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT
+    delete process.env.BOTMUX_APP_EXECUTABLE
+    delete process.env.BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT
   })
 
   it('pins the Electron child cwd to the app root instead of the caller cwd', async () => {
@@ -96,10 +96,10 @@ describe('serveOrcaApp', () => {
     }
     spawnMock.mockReturnValue(child)
 
-    await expect(serveOrcaApp({ json: true })).resolves.toBe(0)
+    await expect(serveBotmuxApp({ json: true })).resolves.toBe(0)
 
     expect(spawnMock).toHaveBeenCalledWith(
-      '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+      '/Applications/Botmux.app/Contents/MacOS/Botmux',
       ['--serve', '--serve-json'],
       expect.objectContaining({
         cwd: resolve(__dirname, '../../..')
@@ -122,7 +122,7 @@ describe('serveOrcaApp', () => {
     spawnMock.mockReturnValue(child)
 
     await expect(
-      serveOrcaApp({
+      serveBotmuxApp({
         json: true,
         port: '6768',
         pairingAddress: '100.64.1.20',
@@ -131,7 +131,7 @@ describe('serveOrcaApp', () => {
     ).resolves.toBe(0)
 
     expect(spawnMock).toHaveBeenCalledWith(
-      '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+      '/Applications/Botmux.app/Contents/MacOS/Botmux',
       [
         '--serve',
         '--serve-json',
@@ -148,8 +148,8 @@ describe('serveOrcaApp', () => {
   })
 
   it('passes the app root before serve flags for dev Electron executables', async () => {
-    process.env.ORCA_APP_EXECUTABLE = '/repo/node_modules/.bin/electron'
-    process.env.ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT = '1'
+    process.env.BOTMUX_APP_EXECUTABLE = '/repo/node_modules/.bin/electron'
+    process.env.BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT = '1'
     const child = {
       kill: vi.fn(),
       once: vi.fn(
@@ -163,7 +163,7 @@ describe('serveOrcaApp', () => {
     }
     spawnMock.mockReturnValue(child)
 
-    await expect(serveOrcaApp({ json: true, port: '6768' })).resolves.toBe(0)
+    await expect(serveBotmuxApp({ json: true, port: '6768' })).resolves.toBe(0)
 
     expect(spawnMock).toHaveBeenCalledWith(
       '/repo/node_modules/.bin/electron',
@@ -179,7 +179,7 @@ describe('serveOrcaApp', () => {
     spawnMock.mockReturnValue(child)
     const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
 
-    const result = serveOrcaApp({
+    const result = serveBotmuxApp({
       pairingAddress: 'wss://sandbox.example.com',
       recipeJson: true,
       projectRoot: '/workspace/repo'
@@ -191,7 +191,7 @@ describe('serveOrcaApp', () => {
     await expect(result).resolves.toBe(0)
 
     expect(spawnMock).toHaveBeenCalledWith(
-      '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+      '/Applications/Botmux.app/Contents/MacOS/Botmux',
       [
         '--serve',
         '--serve-pairing-address',
@@ -253,9 +253,9 @@ describe('serveOrcaApp', () => {
     const { child, result, stdoutSpy, stderrSpy } = startRecipeJsonServer()
     const secrets = ['UPPER-SECRET', 'SLASH-SECRET', 'LEGACY-SECRET', 'PRIVATE-SECRET']
     const untrustedLines = [
-      'ORCA://pair?code=UPPER-SECRET',
-      'orca_botmux://pair/?code=SLASH-SECRET',
-      'orca_botmux://pair#LEGACY-SECRET',
+      'https://example.test/pair?code=UPPER-SECRET',
+      'botmux://pair/?code=SLASH-SECRET',
+      'botmux://pair#LEGACY-SECRET',
       '"embedded privateKey PRIVATE-SECRET"',
       '{privateKey:"PRIVATE-SECRET"}'
     ].join('\n')
@@ -267,7 +267,7 @@ describe('serveOrcaApp', () => {
 
     await expect(result).rejects.toMatchObject({
       code: 'runtime_serve_failed',
-      message: 'OrcaBotmux serve exited before printing valid recipe JSON with code 0.'
+      message: 'Botmux serve exited before printing valid recipe JSON with code 0.'
     })
     expect(stdoutSpy).not.toHaveBeenCalled()
     expect(stderrSpy).toHaveBeenCalledTimes(5)
@@ -295,7 +295,7 @@ describe('serveOrcaApp', () => {
   it('uses a shell when a Windows npm command shim is the Electron executable', async () => {
     const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform')
     Object.defineProperty(process, 'platform', { value: 'win32' })
-    process.env.ORCA_APP_EXECUTABLE = 'C:\\repo\\node_modules\\.bin\\electron.cmd'
+    process.env.BOTMUX_APP_EXECUTABLE = 'C:\\repo\\node_modules\\.bin\\electron.cmd'
     const child = {
       kill: vi.fn(),
       once: vi.fn(
@@ -310,7 +310,7 @@ describe('serveOrcaApp', () => {
     spawnMock.mockReturnValue(child)
 
     try {
-      await expect(serveOrcaApp({ json: true })).resolves.toBe(0)
+      await expect(serveBotmuxApp({ json: true })).resolves.toBe(0)
       expect(spawnMock).toHaveBeenCalledWith(
         'C:\\repo\\node_modules\\.bin\\electron.cmd',
         ['--serve', '--serve-json'],
@@ -326,23 +326,23 @@ describe('serveOrcaApp', () => {
   })
 })
 
-describe('launchOrcaApp', () => {
+describe('launchBotmuxApp', () => {
   beforeEach(() => {
     spawnMock.mockReset()
   })
 
   afterEach(() => {
-    delete process.env.ORCA_OPEN_COMMAND
-    delete process.env.ORCA_APP_EXECUTABLE
-    delete process.env.ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT
+    delete process.env.BOTMUX_OPEN_COMMAND
+    delete process.env.BOTMUX_APP_EXECUTABLE
+    delete process.env.BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT
   })
 
   it('handles asynchronous detached spawn errors without throwing', async () => {
-    process.env.ORCA_APP_EXECUTABLE = '/missing/OrcaBotmux'
+    process.env.BOTMUX_APP_EXECUTABLE = '/missing/Botmux'
     const child = new FakeChildProcess()
     spawnMock.mockReturnValue(child)
 
-    launchOrcaApp()
+    launchBotmuxApp()
     child.emit('error', new Error('ENOENT'))
     await Promise.resolve()
 

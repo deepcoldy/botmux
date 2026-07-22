@@ -25,7 +25,7 @@ import {
   escapeInjectedJavaScriptString
 } from './mobile-rich-markdown-editor-html'
 
-const EDITOR_DOCUMENT_ORIGIN = 'https://orca-mobile-editor.invalid'
+const EDITOR_DOCUMENT_ORIGIN = 'https://botmux-mobile-editor.invalid'
 const EDITOR_DOCUMENT_URL = `${EDITOR_DOCUMENT_ORIGIN}/rich-markdown-editor`
 
 function normalizeExternalEditorUrl(value: string): string | null {
@@ -128,7 +128,7 @@ function MobileRichMarkdownEditorInner({
       documentGenerationRef.current += 1
       currentWebViewContentRef.current = nextContent
       inject(
-        `window.__orcaRichMarkdown && window.__orcaRichMarkdown.setMarkdown(${escapeInjectedJavaScriptString(nextContent)}, ${documentGenerationRef.current});`
+        `window.__botmuxRichMarkdown && window.__botmuxRichMarkdown.setMarkdown(${escapeInjectedJavaScriptString(nextContent)}, ${documentGenerationRef.current});`
       )
     },
     [inject]
@@ -137,7 +137,7 @@ function MobileRichMarkdownEditorInner({
   const applyEditable = useCallback(
     (nextEditable: boolean) => {
       inject(
-        `window.__orcaRichMarkdown && window.__orcaRichMarkdown.setEditable(${nextEditable ? 'true' : 'false'});`
+        `window.__botmuxRichMarkdown && window.__botmuxRichMarkdown.setEditable(${nextEditable ? 'true' : 'false'});`
       )
     },
     [inject]
@@ -221,7 +221,7 @@ function MobileRichMarkdownEditorInner({
   const runCommand = useCallback(
     (command: RichMarkdownCommand) => {
       inject(
-        `window.__orcaRichMarkdown && window.__orcaRichMarkdown.runCommand(${escapeInjectedJavaScriptString(command)});`
+        `window.__botmuxRichMarkdown && window.__botmuxRichMarkdown.runCommand(${escapeInjectedJavaScriptString(command)});`
       )
     },
     [inject]

@@ -8,7 +8,7 @@
  */
 
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveTabId,
@@ -177,39 +177,39 @@ async function mainSnapshotContains(page: Page, ptyId: string, text: string): Pr
 
 test.describe('Terminal output scheduler', () => {
   test('background tab output bursts use the shared drain while the active tab renders', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const firstTabId = await getActiveTabId(orcaBotmuxPage)
+    const firstTabId = await getActiveTabId(botmuxPage)
     if (!firstTabId) {
       throw new Error('Expected an initial terminal tab')
     }
 
     const tabIds = [firstTabId]
     const ptyIdsByTabId: Record<string, string> = {
-      [firstTabId]: await waitForTabPtyId(orcaBotmuxPage, firstTabId)
+      [firstTabId]: await waitForTabPtyId(botmuxPage, firstTabId)
     }
 
     while (tabIds.length < TAB_COUNT) {
-      const tabId = await createTerminalTab(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      const tabId = await createTerminalTab(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
       tabIds.push(tabId)
-      ptyIdsByTabId[tabId] = await waitForTabPtyId(orcaBotmuxPage, tabId)
+      ptyIdsByTabId[tabId] = await waitForTabPtyId(botmuxPage, tabId)
     }
 
-    await tabLocator(orcaBotmuxPage, firstTabId).click()
+    await tabLocator(botmuxPage, firstTabId).click()
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'First terminal tab did not become active before the burst repro'
       })
       .toBe(firstTabId)
 
-    await resetSchedulerDebug(orcaBotmuxPage)
+    await resetSchedulerDebug(botmuxPage)
 
     const runId = Date.now()
     const foregroundMarker = `FG_SCHED_${runId}`
@@ -223,10 +223,10 @@ test.describe('Terminal output scheduler', () => {
     }))
 
     await sendPtyCommands(
-      orcaBotmuxPage,
+      botmuxPage,
       backgroundCommands.map(({ ptyId, command }) => ({ ptyId, command }))
     )
-    await sendPtyCommands(orcaBotmuxPage, [
+    await sendPtyCommands(botmuxPage, [
       {
         ptyId: ptyIdsByTabId[firstTabId],
         command: nodeConsoleCommand(`'${foregroundMarker}'`)
@@ -234,7 +234,7 @@ test.describe('Terminal output scheduler', () => {
     ])
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(foregroundMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(foregroundMarker), {
         timeout: 5_000,
         message: 'Active terminal did not render foreground output during background bursts'
       })
@@ -243,13 +243,13 @@ test.describe('Terminal output scheduler', () => {
     await expect
       .poll(
         async () => {
-          const debug = await getSchedulerDebug(orcaBotmuxPage)
+          const debug = await getSchedulerDebug(botmuxPage)
           if (debug.backgroundEnqueueCount >= backgroundCommands.length) {
             return true
           }
           const snapshots = await Promise.all(
             backgroundCommands.map(({ ptyId, marker }) =>
-              mainSnapshotContains(orcaBotmuxPage, ptyId, marker)
+              mainSnapshotContains(botmuxPage, ptyId, marker)
             )
           )
           return snapshots.every(Boolean)
@@ -264,7 +264,7 @@ test.describe('Terminal output scheduler', () => {
     await expect
       .poll(
         async () => {
-          const debug = await getSchedulerDebug(orcaBotmuxPage)
+          const debug = await getSchedulerDebug(botmuxPage)
           return debug.backgroundEnqueueCount > 0
             ? debug.backgroundWriteCount >= backgroundCommands.length
             : true
@@ -276,7 +276,7 @@ test.describe('Terminal output scheduler', () => {
       )
       .toBe(true)
 
-    const debug = await getSchedulerDebug(orcaBotmuxPage)
+    const debug = await getSchedulerDebug(botmuxPage)
     expect(debug.foregroundWriteCount).toBeGreaterThan(0)
     if (debug.drainWrites.length > 0) {
       expect(Math.max(...debug.drainWrites)).toBeLessThanOrEqual(2)
@@ -284,15 +284,15 @@ test.describe('Terminal output scheduler', () => {
 
     const firstBackground = backgroundCommands[0]
     const firstBackgroundTabId = tabIds[1]
-    await tabLocator(orcaBotmuxPage, firstBackgroundTabId).click()
+    await tabLocator(botmuxPage, firstBackgroundTabId).click()
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'Background terminal tab did not become active for content verification'
       })
       .toBe(firstBackgroundTabId)
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(firstBackground.marker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(firstBackground.marker), {
         timeout: 5_000,
         message: 'Background terminal output was not preserved after scheduler drain'
       })
@@ -300,19 +300,19 @@ test.describe('Terminal output scheduler', () => {
   })
 
   test('visible bulk output uses the high-priority drain instead of synchronous xterm writes', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const activeTabId = await createTerminalTab(orcaBotmuxPage)
+    const activeTabId = await createTerminalTab(botmuxPage)
     if (!activeTabId) {
       throw new Error('Expected a fresh terminal tab')
     }
-    const ptyId = await waitForTabPtyId(orcaBotmuxPage, activeTabId)
-    await resetSchedulerDebug(orcaBotmuxPage)
+    const ptyId = await waitForTabPtyId(botmuxPage, activeTabId)
+    await resetSchedulerDebug(botmuxPage)
 
     const runId = Date.now()
     const marker = `VISIBLE_THROUGHPUT_${runId}`
@@ -320,16 +320,16 @@ test.describe('Terminal output scheduler', () => {
       `const marker='VISIBLE' + '_THROUGHPUT_' + '${runId}'; process.stdout.write('VISIBLE_FILL_${runId}\\n' + 'x'.repeat(700000) + '\\n' + marker + '\\n')`
     )
 
-    await sendPtyCommands(orcaBotmuxPage, [{ ptyId, command: floodCommand }])
+    await sendPtyCommands(botmuxPage, [{ ptyId, command: floodCommand }])
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage, 12_000)).includes(marker), {
+      .poll(async () => (await getTerminalContent(botmuxPage, 12_000)).includes(marker), {
         timeout: 30_000,
         message: 'Active terminal did not render the visible throughput marker'
       })
       .toBe(true)
 
-    const debug = await getSchedulerDebug(orcaBotmuxPage)
+    const debug = await getSchedulerDebug(botmuxPage)
     await testInfo.attach('terminal-visible-throughput-proof', {
       body: JSON.stringify(debug, null, 2),
       contentType: 'application/json'
@@ -343,24 +343,24 @@ test.describe('Terminal output scheduler', () => {
   })
 
   test('hidden overflow restores from main-owned terminal state when the tab becomes visible', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const foregroundTabId = await getActiveTabId(orcaBotmuxPage)
+    const foregroundTabId = await getActiveTabId(botmuxPage)
     if (!foregroundTabId) {
       throw new Error('Expected an initial terminal tab')
     }
-    const hiddenTabId = await createTerminalTab(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const hiddenPtyId = await waitForTabPtyId(orcaBotmuxPage, hiddenTabId)
+    const hiddenTabId = await createTerminalTab(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const hiddenPtyId = await waitForTabPtyId(botmuxPage, hiddenTabId)
 
-    await tabLocator(orcaBotmuxPage, foregroundTabId).click()
+    await tabLocator(botmuxPage, foregroundTabId).click()
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'Foreground terminal tab did not become active before hidden flood'
       })
@@ -371,30 +371,30 @@ test.describe('Terminal output scheduler', () => {
       `for (let i = 0; i < 55000; i++) console.log('RECOVER_FILL_' + i + '_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'); console.log('${marker}')`
     )
 
-    await sendPtyCommands(orcaBotmuxPage, [{ ptyId: hiddenPtyId, command: floodCommand }])
+    await sendPtyCommands(botmuxPage, [{ ptyId: hiddenPtyId, command: floodCommand }])
 
     await expect
-      .poll(async () => mainSnapshotContains(orcaBotmuxPage, hiddenPtyId, marker), {
+      .poll(async () => mainSnapshotContains(botmuxPage, hiddenPtyId, marker), {
         timeout: 30_000,
         message: 'Main-owned terminal snapshot did not capture the hidden flood marker'
       })
       .toBe(true)
 
-    await tabLocator(orcaBotmuxPage, hiddenTabId).click()
+    await tabLocator(botmuxPage, hiddenTabId).click()
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'Hidden terminal tab did not become visible for recovery verification'
       })
       .toBe(hiddenTabId)
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), {
         timeout: 10_000,
         message: 'Hidden terminal did not restore the marker from main-owned state'
       })
       .toBe(true)
 
-    expect(await getTerminalContent(orcaBotmuxPage)).not.toContain('OrcaBotmux skipped hidden terminal output')
+    expect(await getTerminalContent(botmuxPage)).not.toContain('Botmux skipped hidden terminal output')
   })
 })

@@ -4,10 +4,10 @@ import { computerProviderUnavailableMessage } from './computer-provider-unavaila
 describe('computerProviderUnavailableMessage', () => {
   it('gives macOS developers the helper build and restart step', () => {
     expect(computerProviderUnavailableMessage('darwin')).toContain(
-      'run pnpm build:computer-macos and restart OrcaBotmux from this worktree'
+      'run pnpm build:computer-macos and restart Botmux from this worktree'
     )
     expect(computerProviderUnavailableMessage('darwin')).toContain(
-      'OrcaBotmux Computer Use.app was not found or this macOS version is unsupported'
+      'Botmux Computer Use.app was not found or this macOS version is unsupported'
     )
   })
 

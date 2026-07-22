@@ -31,7 +31,7 @@ export function migrationUnsupportedToAgentStatusEntry(
         terminalTitle: 'Migration unsupported',
         stateHistory: [],
         lastAssistantMessage:
-          'Restart this terminal so OrcaBotmux can attach a stable UUID pane key to agent hooks.'
+          'Restart this terminal so Botmux can attach a stable UUID pane key to agent hooks.'
       }
 
   cachedMigrationUnsupportedEntries.set(entry, converted)

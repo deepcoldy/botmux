@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 
 function isProcessAlive(pid: number): boolean {
@@ -19,10 +19,10 @@ function isProcessAlive(pid: number): boolean {
 // token is literally `claude` so PTY spawn recognition marks the session as an
 // agent; tab close → pty.kill routing is already covered by
 // terminal-parked-close-retirement.spec.ts, so this spec drives pty.kill.
-test('killing an agent PTY terminates its detached-pgid descendants', async ({ orcaBotmuxPage }) => {
+test('killing an agent PTY terminates its detached-pgid descendants', async ({ botmuxPage }) => {
   test.skip(process.platform === 'win32', 'descendant tree-kill is POSIX-only for now')
 
-  const stage = mkdtempSync(join(tmpdir(), 'orca-botmux-agent-descendant-'))
+  const stage = mkdtempSync(join(tmpdir(), 'botmux-agent-descendant-'))
   const markerPath = join(stage, 'detached-child.pid')
   const spawnerPath = join(stage, 'spawn-detached.cjs')
   writeFileSync(
@@ -47,10 +47,10 @@ test('killing an agent PTY terminates its detached-pgid descendants', async ({ o
 
   let detachedChildPid = 0
   try {
-    await waitForSessionReady(orcaBotmuxPage)
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
 
-    const ptyId = await orcaBotmuxPage.evaluate(
+    const ptyId = await botmuxPage.evaluate(
       async ({ command, cwd, worktreeId: wt }) => {
         const result = await window.api.pty.spawn({
           cols: 120,
@@ -76,7 +76,7 @@ test('killing an agent PTY terminates its detached-pgid descendants', async ({ o
     expect(detachedChildPid).toBeGreaterThan(0)
     expect(isProcessAlive(detachedChildPid)).toBe(true)
 
-    await orcaBotmuxPage.evaluate((id) => window.api.pty.kill(id), ptyId)
+    await botmuxPage.evaluate((id) => window.api.pty.kill(id), ptyId)
 
     await expect
       .poll(() => isProcessAlive(detachedChildPid), {

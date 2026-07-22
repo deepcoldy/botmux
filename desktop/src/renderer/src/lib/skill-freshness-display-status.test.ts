@@ -6,7 +6,7 @@ import type {
 } from '../../../shared/skill-freshness'
 import { getSkillFreshnessDisplayStatus } from './skill-freshness-display-status'
 
-const SKILL_NAME = 'orca-botmux-cli'
+const SKILL_NAME = 'botmux-cli'
 
 function placement(status: SkillFreshnessStatus, index = 0): SkillFreshnessInstallation {
   return {

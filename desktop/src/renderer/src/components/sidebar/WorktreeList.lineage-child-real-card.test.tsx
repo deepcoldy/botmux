@@ -78,7 +78,7 @@ vi.mock('@tanstack/react-virtual', () => ({
 }))
 
 vi.mock('@/hooks/useVirtualizedScrollAnchor', () => ({
-  VIRTUALIZED_SCROLL_ANCHOR_RECORD_EVENT: 'orca_botmux:test-record-scroll-anchor',
+  VIRTUALIZED_SCROLL_ANCHOR_RECORD_EVENT: 'botmux:test-record-scroll-anchor',
   useVirtualizedScrollAnchor: vi.fn()
 }))
 
@@ -139,7 +139,7 @@ vi.mock('./WorktreeCardAgents', () => ({
   default: ({ worktreeId }: { worktreeId: string }) => (
     <div data-agent-worktree-id={worktreeId}>Agent row</div>
   ),
-  SUPPRESS_WORKTREE_LIST_SCROLL_ADJUSTMENT_EVENT: 'orca_botmux:test-suppress-scroll-adjustment'
+  SUPPRESS_WORKTREE_LIST_SCROLL_ADJUSTMENT_EVENT: 'botmux:test-suppress-scroll-adjustment'
 }))
 
 vi.mock('./SshDisconnectedDialog', () => ({
@@ -148,8 +148,8 @@ vi.mock('./SshDisconnectedDialog', () => ({
 
 vi.mock('./WorktreeContextMenu', () => ({
   default: ({ children }: { children: ReactNode }) => <>{children}</>,
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca_botmux:test-close-context-menus',
-  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-orca-botmux-context-menu-scope',
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux:test-close-context-menus',
+  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-botmux-context-menu-scope',
   WORKTREE_NATIVE_CONTEXT_MENU_ATTR: 'data-worktree-native-context-menu'
 }))
 
@@ -212,7 +212,7 @@ function makeHostedReview(overrides: Partial<HostedReviewInfo> = {}): HostedRevi
     number: 42,
     title: 'Child GitLab MR',
     state: 'open',
-    url: 'https://gitlab.com/acme/orca_botmux/-/merge_requests/42',
+    url: 'https://gitlab.com/acme/botmux/-/merge_requests/42',
     status: 'success',
     updatedAt: '2026-06-09T00:00:00.000Z',
     mergeable: 'MERGEABLE',

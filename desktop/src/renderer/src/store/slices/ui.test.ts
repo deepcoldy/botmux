@@ -135,14 +135,14 @@ function makeLinearIssue(overrides: Partial<LinearIssue> = {}): LinearIssue {
     id: 'lin-1',
     identifier: 'ORC-1',
     title: 'Fix task flow',
-    url: 'https://linear.app/orca_botmux/issue/ORC-1/fix-task-flow',
+    url: 'https://linear.app/botmux/issue/ORC-1/fix-task-flow',
     state: { name: 'Todo', type: 'unstarted', color: '#999' },
     priority: 0,
     estimate: null,
     assignee: null,
     labels: [],
     labelIds: [],
-    team: { id: 'team-1', name: 'orca_botmux', key: 'ORC' },
+    team: { id: 'team-1', name: 'botmux', key: 'ORC' },
     workspaceId: 'workspace-1',
     updatedAt: '2026-05-30T00:00:00.000Z',
     createdAt: '2026-05-30T00:00:00.000Z',
@@ -174,7 +174,7 @@ function makeJiraIssue(overrides: Partial<JiraIssue> = {}): JiraIssue {
     url: 'https://example.atlassian.net/browse/ORC-1',
     siteId: 'site-1',
     siteName: 'Example Jira',
-    project: { id: '10000', key: 'ORC', name: 'orca_botmux', siteId: 'site-1' },
+    project: { id: '10000', key: 'ORC', name: 'botmux', siteId: 'site-1' },
     issueType: { id: '10001', name: 'Bug' },
     status: { id: '1', name: 'Todo', categoryKey: 'new', categoryName: 'To Do' },
     labels: [],
@@ -864,7 +864,7 @@ describe('createUISlice hydratePersistedUI', () => {
     store.getState().hydratePersistedUI(
       makePersistedUI({
         filterRepoIds: ['remote-repo', 12 as never, 'stale-repo'],
-        trustedOrcaHooks: {
+        trustedBotmuxHooks: {
           'remote-repo': { all: { approvedAt: 1 } },
           'bad-shape': 'yes' as never
         },
@@ -873,7 +873,7 @@ describe('createUISlice hydratePersistedUI', () => {
     )
 
     expect(store.getState().filterRepoIds).toEqual(['remote-repo', 'stale-repo'])
-    expect(store.getState().trustedOrcaHooks).toEqual({
+    expect(store.getState().trustedBotmuxHooks).toEqual({
       'remote-repo': { all: { approvedAt: 1 } }
     })
     expect(store.getState().setupScriptPromptDismissedRepoIds).toEqual([remoteDismissalKey])
@@ -892,7 +892,7 @@ describe('createUISlice hydratePersistedUI', () => {
     store.getState().hydratePersistedUI(
       makePersistedUI({
         filterRepoIds: ['local-repo', 'stale-repo'],
-        trustedOrcaHooks: {
+        trustedBotmuxHooks: {
           'local-repo': { all: { approvedAt: 1 } },
           'stale-repo': { all: { approvedAt: 2 } }
         },
@@ -901,7 +901,7 @@ describe('createUISlice hydratePersistedUI', () => {
     )
 
     expect(store.getState().filterRepoIds).toEqual(['local-repo'])
-    expect(store.getState().trustedOrcaHooks).toEqual({
+    expect(store.getState().trustedBotmuxHooks).toEqual({
       'local-repo': { all: { approvedAt: 1 } }
     })
     expect(store.getState().setupScriptPromptDismissedRepoIds).toEqual([localDismissalKey])
@@ -2164,7 +2164,7 @@ describe('createUISlice page navigation history', () => {
       hostId: 'ssh:devbox',
       projectHostSetupId: 'setup-1',
       repoId: 'repo-remote',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     }
 
     store.getState().openTaskPage({

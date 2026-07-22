@@ -35,10 +35,10 @@ const STREAM_DATA_BATCH_INTERVAL_MS = 2
 // is then bounded by the shallow depth, not by how much bulk is in flight.
 // 128KB must stay above the socket's ~16KB highWaterMark so a held state
 // implies a false write() and therefore a guaranteed 'drain' wake-up.
-// Kill switch: ORCA_DAEMON_SHALLOW_SOCKET_GATE=0 restores pre-gate unbounded
+// Kill switch: BOTMUX_DAEMON_SHALLOW_SOCKET_GATE=0 restores pre-gate unbounded
 // socket writes for field debugging and true fix-off A/B benches.
 const SHALLOW_SOCKET_WRITE_GATE_BYTES =
-  process.env.ORCA_DAEMON_SHALLOW_SOCKET_GATE === '0' ? Number.POSITIVE_INFINITY : 128 * 1024
+  process.env.BOTMUX_DAEMON_SHALLOW_SOCKET_GATE === '0' ? Number.POSITIVE_INFINITY : 128 * 1024
 // Why sliced writes: enqueue coalesces per-session entries, so a held entry
 // can grow to megabytes; writing it whole would re-deepen the socket past the
 // gate in one call.

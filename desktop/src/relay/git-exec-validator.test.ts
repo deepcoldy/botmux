@@ -209,18 +209,18 @@ describe('validateGitExecArgs', () => {
 
   describe('git clone', () => {
     it('allows only the project setup clone shape', () => {
-      expectAllowed(['clone', '--', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux'])
-      expectAllowed(['clone', '--progress', '--', 'git@github.com:stablyai/orca_botmux.git', 'orca_botmux'])
+      expectAllowed(['clone', '--', 'https://github.com/stablyai/botmux.git', 'botmux'])
+      expectAllowed(['clone', '--progress', '--', 'git@github.com:stablyai/botmux.git', 'botmux'])
     })
 
     it.each([
-      [['clone', 'https://github.com/stablyai/orca_botmux.git']],
-      [['clone', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux']],
-      [['clone', '--depth=1', '--', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux']],
-      [['clone', '--', 'https://github.com/stablyai/orca_botmux.git', '.']],
-      [['clone', '--', 'https://github.com/stablyai/orca_botmux.git', '..']],
-      [['clone', '--', 'https://github.com/stablyai/orca_botmux.git', 'nested/orca_botmux']],
-      [['clone', '--', 'https://github.com/stablyai/orca_botmux.git', 'nested\\orca_botmux']]
+      [['clone', 'https://github.com/stablyai/botmux.git']],
+      [['clone', 'https://github.com/stablyai/botmux.git', 'botmux']],
+      [['clone', '--depth=1', '--', 'https://github.com/stablyai/botmux.git', 'botmux']],
+      [['clone', '--', 'https://github.com/stablyai/botmux.git', '.']],
+      [['clone', '--', 'https://github.com/stablyai/botmux.git', '..']],
+      [['clone', '--', 'https://github.com/stablyai/botmux.git', 'nested/botmux']],
+      [['clone', '--', 'https://github.com/stablyai/botmux.git', 'nested\\botmux']]
     ])('rejects unsafe clone args %j', (args) => {
       expectBlocked(args, 'git clone')
     })

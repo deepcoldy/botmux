@@ -18,7 +18,7 @@
  * a deliberate prod constant) — so recovery lands at ~11-13s and the polls
  * below allow 30s.
  */
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree, ensureTerminalVisible } from './helpers/store'
 import {
   waitForActiveTerminalManager,
@@ -45,31 +45,31 @@ type DeliveryWatchdogWindow = Window & {
 }
 
 test.describe('terminal push-delivery loss recovery', () => {
-  test.afterEach(async ({ orcaBotmuxPage }) => {
-    await orcaBotmuxPage.evaluate(() => {
+  test.afterEach(async ({ botmuxPage }) => {
+    await botmuxPage.evaluate(() => {
       ;(window as DeliveryWatchdogWindow).__terminalDeliveryWatchdog?.blackhole(false)
     })
   })
 
   test('watchdog repaints wedged terminals from the main buffer without push delivery or reload', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     test.setTimeout(120_000)
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
 
     // Live baseline: push delivery works. The $((…)) arithmetic keeps the
     // asserted string out of the typed command's local echo.
-    await execInTerminal(orcaBotmuxPage, ptyId, 'echo live-before-$((41+1))')
+    await execInTerminal(botmuxPage, ptyId, 'echo live-before-$((41+1))')
     await expect
-      .poll(async () => getTerminalContent(orcaBotmuxPage), { timeout: 15_000 })
+      .poll(async () => getTerminalContent(botmuxPage), { timeout: 15_000 })
       .toContain('live-before-42')
 
     // Engage the field wedge and speed the watchdog up for CI.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const watchdog = (window as DeliveryWatchdogWindow).__terminalDeliveryWatchdog
       if (!watchdog) {
         throw new Error('delivery watchdog e2e hook missing — exposeStore build?')
@@ -78,11 +78,11 @@ test.describe('terminal push-delivery loss recovery', () => {
       watchdog.blackhole(true)
     })
 
-    await execInTerminal(orcaBotmuxPage, ptyId, 'echo wedged-$((100+23))')
+    await execInTerminal(botmuxPage, ptyId, 'echo wedged-$((100+23))')
 
     // The wedge repro itself: output is swallowed, pane stays stale.
-    await orcaBotmuxPage.waitForTimeout(1_500)
-    expect(await getTerminalContent(orcaBotmuxPage)).not.toContain('wedged-123')
+    await botmuxPage.waitForTimeout(1_500)
+    expect(await getTerminalContent(botmuxPage)).not.toContain('wedged-123')
 
     // Recovery proof: the watchdog confirms the wedge over invoke and heals
     // (write-off + snapshot-restore request) without push or reload. We assert
@@ -93,7 +93,7 @@ test.describe('terminal push-delivery loss recovery', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             () =>
               (window as DeliveryWatchdogWindow).__terminalDeliveryWatchdog?.snapshot()
                 ?.healCount ?? 0
@@ -103,12 +103,12 @@ test.describe('terminal push-delivery loss recovery', () => {
       .toBeGreaterThan(0)
 
     // Channel restored: live output flows again with no reload in between.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       ;(window as DeliveryWatchdogWindow).__terminalDeliveryWatchdog?.blackhole(false)
     })
-    await execInTerminal(orcaBotmuxPage, ptyId, 'echo live-after-$((200+56))')
+    await execInTerminal(botmuxPage, ptyId, 'echo live-after-$((200+56))')
     await expect
-      .poll(async () => getTerminalContent(orcaBotmuxPage), { timeout: 15_000 })
+      .poll(async () => getTerminalContent(botmuxPage), { timeout: 15_000 })
       .toContain('live-after-256')
   })
 })

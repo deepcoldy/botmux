@@ -7,7 +7,7 @@ import { annotatePrunableWorktreesByExistence } from './git-handler-worktree-lis
 const tempRoots: string[] = []
 
 async function createTempDir(): Promise<string> {
-  const root = await mkdtemp(path.join(tmpdir(), 'orca-botmux-relay-prunable-'))
+  const root = await mkdtemp(path.join(tmpdir(), 'botmux-relay-prunable-'))
   tempRoots.push(root)
   return root
 }

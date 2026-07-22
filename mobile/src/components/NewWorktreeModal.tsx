@@ -32,7 +32,7 @@ import {
   isMobileTuiAgentEnabled,
   MOBILE_TUI_AGENT_LAUNCH_COMMANDS
 } from '../tasks/mobile-tui-agents'
-import type { PersistedTrustedOrcaHooks, TuiAgent } from '../../../src/shared/types'
+import type { PersistedTrustedBotmuxHooks, TuiAgent } from '../../../src/shared/types'
 import type { SshConnectionState } from '../../../src/shared/ssh-types'
 import {
   NEW_WORKTREE_AGENT_OPTIONS as AGENT_OPTIONS,
@@ -216,7 +216,7 @@ function NewWorktreeModalContent({
   )
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [setupHookDetails, setSetupHookDetails] = useState<SetupHookDetails | null>(null)
-  const [trustedOrcaHooks, setTrustedOrcaHooks] = useState<PersistedTrustedOrcaHooks>({})
+  const [trustedBotmuxHooks, setTrustedBotmuxHooks] = useState<PersistedTrustedBotmuxHooks>({})
   const [setupTrustPrompt, setSetupTrustPrompt] = useState<SetupTrustPrompt | null>(null)
   const [setupDecisionChoice, setSetupDecisionChoice] = useState<Exclude<
     SetupDecision,
@@ -405,8 +405,8 @@ function NewWorktreeModalContent({
       }
       const uiResult = okResult(uiRes)
       if (uiResult) {
-        const ui = (uiResult.result as { ui?: { trustedOrcaHooks?: PersistedTrustedOrcaHooks } }).ui
-        setTrustedOrcaHooks(ui?.trustedOrcaHooks ?? {})
+        const ui = (uiResult.result as { ui?: { trustedBotmuxHooks?: PersistedTrustedBotmuxHooks } }).ui
+        setTrustedBotmuxHooks(ui?.trustedBotmuxHooks ?? {})
       }
 
       const [preflightRes, linearRes] = await probes
@@ -664,16 +664,16 @@ function NewWorktreeModalContent({
         setupDecision === 'run' &&
         setupTrust &&
         setupTrust.contentHash !== options.approvedSetupContentHash &&
-        !isSetupHookTrusted(trustedOrcaHooks, selectedRepo.id, setupTrust.contentHash)
+        !isSetupHookTrusted(trustedBotmuxHooks, selectedRepo.id, setupTrust.contentHash)
       ) {
-        // Why: desktop prompts before running repo-owned orca.yaml setup hooks.
+        // Why: desktop prompts before running repo-owned botmux.yaml setup hooks.
         // Mobile stores the same trust hash so approvals carry across surfaces.
         setSetupTrustPrompt({
           repoId: selectedRepo.id,
           repoName: selectedRepo.displayName,
           scriptContent: setupTrust.scriptContent,
           contentHash: setupTrust.contentHash,
-          previouslyApproved: wasSetupHookPreviouslyApproved(trustedOrcaHooks, selectedRepo.id)
+          previouslyApproved: wasSetupHookPreviouslyApproved(trustedBotmuxHooks, selectedRepo.id)
         })
         transitionDrawer('trust')
         return
@@ -776,12 +776,12 @@ function NewWorktreeModalContent({
     try {
       const nextTrust = await persistSetupHookTrustApproval({
         client,
-        trust: trustedOrcaHooks,
+        trust: trustedBotmuxHooks,
         repoId: setupTrustPrompt.repoId,
         contentHash: setupTrustPrompt.contentHash,
         alwaysTrust
       })
-      setTrustedOrcaHooks(nextTrust)
+      setTrustedBotmuxHooks(nextTrust)
       const approvedHash = setupTrustPrompt.contentHash
       setSetupTrustPrompt(null)
       transitionDrawer('form')
@@ -981,7 +981,7 @@ function NewWorktreeModalContent({
                       {setupSource && (
                         <View style={styles.sourceBadge}>
                           <Text style={styles.sourceBadgeText}>
-                            {setupSource === 'orca.yaml' ? 'ORCA.YAML' : 'HOOKS'}
+                            {setupSource === 'botmux.yaml' ? 'BOTMUX.YAML' : 'HOOKS'}
                           </Text>
                         </View>
                       )}

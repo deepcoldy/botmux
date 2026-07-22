@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentSkillSetupPanel } from './AgentSkillSetupPanel'
 import { TooltipProvider } from '../ui/tooltip'
 
-const INSTALL_COMMAND = 'npx skills add https://github.com/stablyai/orca_botmux --skill orca-botmux-cli --global'
-const UPDATE_COMMAND = 'npx skills update orca-botmux-cli --global'
+const INSTALL_COMMAND = 'npx skills add https://github.com/stablyai/botmux --skill botmux-cli --global'
+const UPDATE_COMMAND = 'npx skills update botmux-cli --global'
 
 const mocks = vi.hoisted(() => ({
   clipboardWrite: vi.fn(),
@@ -44,7 +44,7 @@ function panelProps(
 ): ComponentProps<typeof AgentSkillSetupPanel> {
   return {
     title: 'CLI skill',
-    description: 'Enables agents to use OrcaBotmux workflows.',
+    description: 'Enables agents to use Botmux workflows.',
     command: INSTALL_COMMAND,
     terminalTitle: 'CLI skill setup',
     terminalAriaLabel: 'CLI skill install terminal',
@@ -169,7 +169,7 @@ describe('AgentSkillSetupPanel', () => {
     const html = renderPanel({
       installed: true,
       installLabel: 'Install CLI & Skill',
-      preInstallNotice: 'Install the OrcaBotmux CLI before running agent skill setup.'
+      preInstallNotice: 'Install the Botmux CLI before running agent skill setup.'
     })
 
     expect(html).toContain('Installed')
@@ -182,7 +182,7 @@ describe('AgentSkillSetupPanel', () => {
       installed: true,
       installedCommand: UPDATE_COMMAND,
       installLabel: 'Install CLI & Skill',
-      preInstallNotice: 'Install the OrcaBotmux CLI before running agent skill setup.',
+      preInstallNotice: 'Install the Botmux CLI before running agent skill setup.',
       getPrerequisiteStatus: vi.fn(
         async () =>
           ({

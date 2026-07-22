@@ -4,7 +4,7 @@ import type { ComponentType } from 'react'
 
 import { isLazyChunkLoadError, loadLazyWithRetry } from './lazy-with-retry'
 
-const RELOAD_GUARD_KEY = 'orca_botmux:lazy-chunk-reload-attempted'
+const RELOAD_GUARD_KEY = 'botmux:lazy-chunk-reload-attempted'
 const Comp: ComponentType = () => null
 const chunkParseError = (): SyntaxError => new SyntaxError("Unexpected token ']'")
 const chunkFetchError = (): TypeError =>

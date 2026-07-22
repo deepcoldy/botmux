@@ -6,13 +6,13 @@ import {
 } from './tui-agent-startup-shell'
 
 const QUERY_ENV_LIMIT = 24_000
-const QUERY_PLACEHOLDER = '__ORCA_HERMES_STARTUP_QUERY__'
+const QUERY_PLACEHOLDER = '__BOTMUX_HERMES_STARTUP_QUERY__'
 const QUERY_ARG_PLACEHOLDER = `--query=${QUERY_PLACEHOLDER}`
-const POSIX_QUERY_VARIABLE = '__orca_hermes_startup_query'
-const POWERSHELL_QUERY_VARIABLE = 'orcaHermesStartupQuery'
-const POWERSHELL_NATIVE_QUERY_VARIABLE = 'orcaHermesNativeQuery'
+const POSIX_QUERY_VARIABLE = '__botmux_hermes_startup_query'
+const POWERSHELL_QUERY_VARIABLE = 'botmuxHermesStartupQuery'
+const POWERSHELL_NATIVE_QUERY_VARIABLE = 'botmuxHermesNativeQuery'
 
-export const ORCA_HERMES_STARTUP_QUERY_ENV = 'ORCA_HERMES_STARTUP_QUERY'
+export const BOTMUX_HERMES_STARTUP_QUERY_ENV = 'BOTMUX_HERMES_STARTUP_QUERY'
 
 function encodePowerShellCommand(command: string): string {
   let bytes = ''
@@ -72,7 +72,7 @@ function findChatSubcommand(args: readonly string[]): number {
   return -1
 }
 
-function stripOrcaOwnedHermesArgs(args: readonly string[]): string[] {
+function stripBotmuxOwnedHermesArgs(args: readonly string[]): string[] {
   const normalized: string[] = []
   for (let index = 0; index < args.length; index += 1) {
     const token = args[index]
@@ -140,8 +140,8 @@ function normalizeHermesArgv(
     ...commandPrefix,
     'chat',
     QUERY_ARG_PLACEHOLDER,
-    ...stripOrcaOwnedHermesArgs(baseArgsWithoutChat),
-    ...stripOrcaOwnedHermesArgs(configuredArgsWithoutChat),
+    ...stripBotmuxOwnedHermesArgs(baseArgsWithoutChat),
+    ...stripBotmuxOwnedHermesArgs(configuredArgsWithoutChat),
     '--tui'
   ]
 }
@@ -155,7 +155,7 @@ function buildQueryCommand(argv: string[], shell: AgentStartupShell): string {
     // Why: startup prompts must not remain exported to Hermes tools; the
     // long-lived parent shell retains the transport env for compatibility.
     // PowerShell 5 needs Windows-native quote escaping before building child argv.
-    const script = `$${POWERSHELL_QUERY_VARIABLE} = $env:${ORCA_HERMES_STARTUP_QUERY_ENV}; $${POWERSHELL_NATIVE_QUERY_VARIABLE} = $${POWERSHELL_QUERY_VARIABLE} -replace '(\\\\*)"', '$1$1\\"'; Remove-Item Env:${ORCA_HERMES_STARTUP_QUERY_ENV} -ErrorAction SilentlyContinue; ${invocation}`
+    const script = `$${POWERSHELL_QUERY_VARIABLE} = $env:${BOTMUX_HERMES_STARTUP_QUERY_ENV}; $${POWERSHELL_NATIVE_QUERY_VARIABLE} = $${POWERSHELL_QUERY_VARIABLE} -replace '(\\\\*)"', '$1$1\\"'; Remove-Item Env:${BOTMUX_HERMES_STARTUP_QUERY_ENV} -ErrorAction SilentlyContinue; ${invocation}`
     return `powershell.exe -NoProfile -EncodedCommand ${encodePowerShellCommand(script)}`
   }
   const invocation = buildShellCommandFromArgv(argv, 'posix').replace(
@@ -165,7 +165,7 @@ function buildQueryCommand(argv: string[], shell: AgentStartupShell): string {
   const encodedInvocation = encodePosixEvalScript(invocation)
   // Why: a fixed single-quote-safe wrapper parses in POSIX shells and pwsh;
   // the dynamic argv is decoded only after entering the known `sh` grammar.
-  const script = `${POSIX_QUERY_VARIABLE}="\${${ORCA_HERMES_STARTUP_QUERY_ENV}}"; unset ${ORCA_HERMES_STARTUP_QUERY_ENV}; eval "$(printf %b "${encodedInvocation}")"`
+  const script = `${POSIX_QUERY_VARIABLE}="\${${BOTMUX_HERMES_STARTUP_QUERY_ENV}}"; unset ${BOTMUX_HERMES_STARTUP_QUERY_ENV}; eval "$(printf %b "${encodedInvocation}")"`
   return `sh -c ${quoteStartupArg(script, 'posix')}`
 }
 
@@ -188,7 +188,7 @@ export function planHermesStartupQuery(args: {
     return null
   }
   const command = buildQueryCommand(argv, args.shell)
-  const env = { ...args.agentEnv, [ORCA_HERMES_STARTUP_QUERY_ENV]: args.prompt }
+  const env = { ...args.agentEnv, [BOTMUX_HERMES_STARTUP_QUERY_ENV]: args.prompt }
   const envSize = Object.entries(env).reduce((total, [key, value]) => {
     if (args.platform === 'win32') {
       return total + key.length + value.length + 2

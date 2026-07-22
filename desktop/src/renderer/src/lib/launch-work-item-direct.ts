@@ -276,7 +276,7 @@ export async function launchWorkItemDirect(args: LaunchWorkItemDirectArgs): Prom
         promptDelivery,
         settings,
         launchPlatform,
-        // Why: SSH hosts run the plain `orca_botmux` shim, so the Linux-only `orca-botmux-ide`
+        // Why: SSH hosts run the plain `botmux` shim, so the Linux-only `botmux-ide`
         // rename must not be applied for remote launches.
         isRemote: typeof launchConnectionId === 'string'
       }))

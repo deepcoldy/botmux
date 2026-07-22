@@ -23,7 +23,7 @@ import { SettingsRow, SettingsSegmentedControl } from './SettingsFormControls'
 export { getGitPaneSearchEntries }
 
 const KEEP_LOCAL_MAIN_UP_TO_DATE_DESCRIPTION =
-  'When you create a workspace, OrcaBotmux refreshes the remote base and safely fast-forwards your matching local branch, such as main or master. This keeps commands like git diff main...HEAD from comparing against stale history. OrcaBotmux skips the update if that branch has uncommitted changes or local-only commits.'
+  'When you create a workspace, Botmux refreshes the remote base and safely fast-forwards your matching local branch, such as main or master. This keeps commands like git diff main...HEAD from comparing against stale history. Botmux skips the update if that branch has uncommitted changes or local-only commits.'
 const KEEP_LOCAL_MAIN_UP_TO_DATE_KEYWORDS = [
   'main',
   'master',
@@ -235,7 +235,7 @@ export function GitPane({
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.GitPane.976afc6b3e',
-              'When you create a workspace, OrcaBotmux refreshes the remote base and safely fast-forwards your matching local branch, such as'
+              'When you create a workspace, Botmux refreshes the remote base and safely fast-forwards your matching local branch, such as'
             )}{' '}
             <code>{translate('auto.components.settings.GitPane.ffba483bae', 'main')}</code>{' '}
             {translate('auto.components.settings.GitPane.5bf885be48', 'or')}{' '}
@@ -249,7 +249,7 @@ export function GitPane({
             </code>{' '}
             {translate(
               'auto.components.settings.GitPane.36e3de3619',
-              'from comparing against stale history. OrcaBotmux skips the update if that branch has uncommitted changes or local-only commits.'
+              'from comparing against stale history. Botmux skips the update if that branch has uncommitted changes or local-only commits.'
             )}
           </p>
         </div>
@@ -312,10 +312,10 @@ export function GitPane({
       />
     ) : null,
     matchesSettingsSearch(searchQuery, {
-      title: translate('auto.components.settings.GitPane.e02ea23a32', 'OrcaBotmux Attribution'),
+      title: translate('auto.components.settings.GitPane.e02ea23a32', 'Botmux Attribution'),
       description: translate(
         'auto.components.settings.GitPane.d2eede4c54',
-        'Add OrcaBotmux attribution to commits, PRs, and issues.'
+        'Add Botmux attribution to commits, PRs, and issues.'
       ),
       keywords: [
         translate('auto.components.settings.GitPane.32dca11189', 'github'),
@@ -325,27 +325,27 @@ export function GitPane({
         translate('auto.components.settings.GitPane.9838c921ed', 'co-author'),
         translate('auto.components.settings.GitPane.b5f534717a', 'coauthored'),
         translate('auto.components.settings.GitPane.b9b5771bb1', 'attribution'),
-        translate('auto.components.settings.GitPane.e71ce09c42', 'orca_botmux')
+        translate('auto.components.settings.GitPane.e71ce09c42', 'botmux')
       ]
     }) ? (
       <SearchableSetting
         key="github-attribution"
-        title={translate('auto.components.settings.GitPane.e02ea23a32', 'OrcaBotmux Attribution')}
+        title={translate('auto.components.settings.GitPane.e02ea23a32', 'Botmux Attribution')}
         description={translate(
           'auto.components.settings.GitPane.d2eede4c54',
-          'Add OrcaBotmux attribution to commits, PRs, and issues.'
+          'Add Botmux attribution to commits, PRs, and issues.'
         )}
-        keywords={['github', 'gh', 'pr', 'issue', 'co-author', 'coauthored', 'attribution', 'orca_botmux']}
+        keywords={['github', 'gh', 'pr', 'issue', 'co-author', 'coauthored', 'attribution', 'botmux']}
         className="flex items-center justify-between gap-4 py-2"
       >
         <div className="space-y-0.5">
           <Label>
-            {translate('auto.components.settings.GitPane.e02ea23a32', 'OrcaBotmux Attribution')}
+            {translate('auto.components.settings.GitPane.e02ea23a32', 'Botmux Attribution')}
           </Label>
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.GitPane.d2eede4c54',
-              'Add OrcaBotmux attribution to commits, PRs, and issues.'
+              'Add Botmux attribution to commits, PRs, and issues.'
             )}
           </p>
         </div>

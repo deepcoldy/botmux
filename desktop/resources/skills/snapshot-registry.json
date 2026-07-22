@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "skills": {
-    "orca-botmux-cli": [
+    "botmux-cli": [
       {
         "releaseRevision": 1,
         "packageDigest": "a3831a8a5561b24f085cb3c185c23ccc368970898119d90723aa3406778aecb6",
@@ -1017,7 +1017,7 @@
         ]
       }
     ],
-    "orca-botmux-emulator": [
+    "botmux-emulator": [
       {
         "releaseRevision": 1,
         "packageDigest": "fdecfa3957c5502ec5f4933504f7112ab98c2c3b7b8902aad34db6cb1b7dc28a",
@@ -1149,7 +1149,7 @@
         ]
       }
     ],
-    "orca-botmux-linear": [
+    "botmux-linear": [
       {
         "releaseRevision": 1,
         "packageDigest": "9015e708218fe86620eee39041d3e4f9ddd4b67ff2c6d049beca9ffe3783e03d",
@@ -1183,7 +1183,7 @@
         ]
       }
     ],
-    "orca-botmux-emulator-android": [
+    "botmux-emulator-android": [
       {
         "releaseRevision": 1,
         "packageDigest": "cf86dd085b981febd8e4e11b7796c90d69a60bd9c1dfaab5a16b99f77841aaa4",
@@ -1217,7 +1217,7 @@
         ]
       }
     ],
-    "orca-botmux-per-workspace-env": [
+    "botmux-per-workspace-env": [
       {
         "releaseRevision": 1,
         "packageDigest": "dc7f471327f55b27a40cd9575ca476fea7a79c2aba74881af00ce4e468cbf714",

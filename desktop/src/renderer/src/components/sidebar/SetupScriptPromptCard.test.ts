@@ -20,8 +20,8 @@ describe('getRenderedSetupScriptPromptState', () => {
       getRenderedSetupScriptPromptState({
         promptState: current,
         activeRepoId: 'repo-local',
-        activeProjectId: 'github:stablyai/orca_botmux',
-        lastVisiblePrompt: { state: prompt('repo-ssh'), projectId: 'github:stablyai/orca_botmux' }
+        activeProjectId: 'github:stablyai/botmux',
+        lastVisiblePrompt: { state: prompt('repo-ssh'), projectId: 'github:stablyai/botmux' }
       })
     ).toBe(current)
   })
@@ -33,8 +33,8 @@ describe('getRenderedSetupScriptPromptState', () => {
       getRenderedSetupScriptPromptState({
         promptState: null,
         activeRepoId: 'repo-ssh',
-        activeProjectId: 'github:stablyai/orca_botmux',
-        lastVisiblePrompt: { state: previous, projectId: 'github:stablyai/orca_botmux' }
+        activeProjectId: 'github:stablyai/botmux',
+        lastVisiblePrompt: { state: previous, projectId: 'github:stablyai/botmux' }
       })
     ).toBe(previous)
   })
@@ -45,7 +45,7 @@ describe('getRenderedSetupScriptPromptState', () => {
         promptState: null,
         activeRepoId: 'repo-other',
         activeProjectId: 'github:stablyai/other',
-        lastVisiblePrompt: { state: prompt('repo-local'), projectId: 'github:stablyai/orca_botmux' }
+        lastVisiblePrompt: { state: prompt('repo-local'), projectId: 'github:stablyai/botmux' }
       })
     ).toBeNull()
   })

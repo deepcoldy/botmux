@@ -18,7 +18,7 @@ import {
 const temporaryDirectories = []
 
 async function createPackage() {
-  const directory = await mkdtemp(path.join(tmpdir(), 'orca-botmux-skill-manifest-'))
+  const directory = await mkdtemp(path.join(tmpdir(), 'botmux-skill-manifest-'))
   temporaryDirectories.push(directory)
   return directory
 }
@@ -81,16 +81,16 @@ describe('skill bundle manifest generator', () => {
   it('rejects rewrites of released snapshots and allows floating-tail replacement', () => {
     const snapshot = (releaseRevision, packageDigest) => ({ releaseRevision, packageDigest })
     const artifacts = {
-      releasedSnapshotCounts: { 'orca-botmux-cli': 2 },
+      releasedSnapshotCounts: { 'botmux-cli': 2 },
       snapshotRegistry: {
         schemaVersion: 1,
-        skills: { 'orca-botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'ccc')] }
+        skills: { 'botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'ccc')] }
       }
     }
 
     expect(() =>
       assertReleasedHistoryPreserved(
-        { schemaVersion: 1, skills: { 'orca-botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb')] } },
+        { schemaVersion: 1, skills: { 'botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb')] } },
         artifacts
       )
     ).not.toThrow()
@@ -98,7 +98,7 @@ describe('skill bundle manifest generator', () => {
       assertReleasedHistoryPreserved(
         {
           schemaVersion: 1,
-          skills: { 'orca-botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'stale')] }
+          skills: { 'botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'stale')] }
         },
         artifacts
       )
@@ -107,44 +107,44 @@ describe('skill bundle manifest generator', () => {
       assertReleasedHistoryPreserved(
         {
           schemaVersion: 1,
-          skills: { 'orca-botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'rewritten')] }
+          skills: { 'botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'rewritten')] }
         },
         artifacts
       )
-    ).toThrow('Released snapshot history changed for orca-botmux-cli at revision 2')
+    ).toThrow('Released snapshot history changed for botmux-cli at revision 2')
     expect(() =>
       assertReleasedHistoryPreserved(
         {
           schemaVersion: 1,
           skills: {
-            'orca-botmux-cli': [snapshot(1, 'aaa'), { ...snapshot(2, 'bbb'), gitTreeSha: 'rewritten' }]
+            'botmux-cli': [snapshot(1, 'aaa'), { ...snapshot(2, 'bbb'), gitTreeSha: 'rewritten' }]
           }
         },
         artifacts
       )
-    ).toThrow('Released snapshot history changed for orca-botmux-cli at revision 2')
+    ).toThrow('Released snapshot history changed for botmux-cli at revision 2')
     expect(() =>
       assertReleasedHistoryPreserved(
         {
           schemaVersion: 1,
           skills: {
-            'orca-botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'stale')]
+            'botmux-cli': [snapshot(1, 'aaa'), snapshot(2, 'bbb'), snapshot(3, 'stale')]
           }
         },
-        { ...artifacts, releasedSnapshotCounts: { 'orca-botmux-cli': 1 } }
+        { ...artifacts, releasedSnapshotCounts: { 'botmux-cli': 1 } }
       )
-    ).toThrow('Released snapshot history is incomplete for orca-botmux-cli')
+    ).toThrow('Released snapshot history is incomplete for botmux-cli')
     expect(() => assertReleasedHistoryPreserved(null, artifacts)).not.toThrow()
   })
 
   it('tolerates only redundant trailing release-mapping rows', () => {
     const serialized = (value) => `${JSON.stringify(value, null, 2)}\n`
     const rows = [
-      { appVersion: '1.0.0', skills: { 'orca-botmux-cli': 1 } },
-      { appVersion: '1.1.0', skills: { 'orca-botmux-cli': 2 } }
+      { appVersion: '1.0.0', skills: { 'botmux-cli': 1 } },
+      { appVersion: '1.1.0', skills: { 'botmux-cli': 2 } }
     ]
     const artifacts = {
-      currentManifest: { skills: [{ name: 'orca-botmux-cli', releaseRevision: 2 }] },
+      currentManifest: { skills: [{ name: 'botmux-cli', releaseRevision: 2 }] },
       releaseMapping: { schemaVersion: 1, releases: rows }
     }
     const committedPrefix = serialized({ schemaVersion: 1, releases: [rows[0]] })
@@ -159,7 +159,7 @@ describe('skill bundle manifest generator', () => {
     expect(
       isToleratedReleaseMappingPrefix(committedPrefix, {
         ...artifacts,
-        currentManifest: { skills: [{ name: 'orca-botmux-cli', releaseRevision: 3 }] }
+        currentManifest: { skills: [{ name: 'botmux-cli', releaseRevision: 3 }] }
       })
     ).toBe(false)
     expect(
@@ -167,8 +167,8 @@ describe('skill bundle manifest generator', () => {
         ...artifacts,
         currentManifest: {
           skills: [
-            { name: 'orca-botmux-cli', releaseRevision: 2 },
-            { name: 'orca-botmux-linear', releaseRevision: 1 }
+            { name: 'botmux-cli', releaseRevision: 2 },
+            { name: 'botmux-linear', releaseRevision: 1 }
           ]
         }
       })
@@ -178,7 +178,7 @@ describe('skill bundle manifest generator', () => {
       isToleratedReleaseMappingPrefix(
         serialized({
           schemaVersion: 1,
-          releases: [{ appVersion: '0.9.0', skills: { 'orca-botmux-cli': 1 } }]
+          releases: [{ appVersion: '0.9.0', skills: { 'botmux-cli': 1 } }]
         }),
         artifacts
       )
@@ -221,9 +221,9 @@ describe('skill bundle manifest generator', () => {
   })
 
   it('computes the same Git tree identity as Git', async () => {
-    const packageRoot = path.resolve('skills', 'orca-botmux-cli')
+    const packageRoot = path.resolve('skills', 'botmux-cli')
     const files = await collectPackageFiles(packageRoot)
-    const expected = execFileSync('git', ['ls-tree', 'HEAD:skills', 'orca-botmux-cli'], {
+    const expected = execFileSync('git', ['ls-tree', 'HEAD:skills', 'botmux-cli'], {
       encoding: 'utf8'
     })
       .trim()

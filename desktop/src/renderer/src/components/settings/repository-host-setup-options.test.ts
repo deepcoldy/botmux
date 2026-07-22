@@ -21,8 +21,8 @@ function runtimeHost(
   return {
     id: 'runtime:env-1',
     kind: 'runtime',
-    label: 'Remote OrcaBotmux',
-    detail: 'OrcaBotmux server',
+    label: 'Remote Botmux',
+    detail: 'Botmux server',
     health: 'available',
     ...overrides
   } as ExecutionHostRegistryEntry
@@ -53,7 +53,7 @@ describe('buildSetupHostOptions', () => {
       })[0]
     ).toMatchObject({
       isAvailable: true,
-      detail: 'OrcaBotmux server'
+      detail: 'Botmux server'
     })
   })
 
@@ -69,7 +69,7 @@ describe('buildSetupHostOptions', () => {
       })[0]
     ).toMatchObject({
       isAvailable: false,
-      detail: 'Update OrcaBotmux on this host to set up projects'
+      detail: 'Update Botmux on this host to set up projects'
     })
   })
 })

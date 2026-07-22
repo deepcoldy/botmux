@@ -34,8 +34,8 @@ const LOCAL_HOST_LABEL = getExecutionHostLabel('local')
 
 const repo: Repo = {
   id: 'repo-1',
-  path: '/tmp/orca_botmux',
-  displayName: 'orca_botmux',
+  path: '/tmp/botmux',
+  displayName: 'botmux',
   badgeColor: '#000000',
   addedAt: 0
 }
@@ -43,7 +43,7 @@ const repo: Repo = {
 const worktree: Worktree = {
   id: 'wt-1',
   repoId: repo.id,
-  path: '/tmp/orca-botmux-feature',
+  path: '/tmp/botmux-feature',
   branch: 'refs/heads/feature/super-critical',
   head: 'abc123',
   isBare: false,
@@ -68,8 +68,8 @@ function readWorktreeListSource(): string {
 
 const remoteRepo: Repo = {
   id: 'repo-remote',
-  path: '/home/alice/orca_botmux',
-  displayName: 'orca_botmux',
+  path: '/home/alice/botmux',
+  displayName: 'botmux',
   badgeColor: '#111111',
   addedAt: 1,
   connectionId: 'gpu-vm'
@@ -79,13 +79,13 @@ const remoteWorktree: Worktree = {
   ...worktree,
   id: 'wt-remote',
   repoId: remoteRepo.id,
-  path: '/home/alice/orca-botmux-feature',
+  path: '/home/alice/botmux-feature',
   displayName: 'remote feature'
 }
 
 const project: Project = {
-  id: 'github:stablyai/orca_botmux',
-  displayName: 'orca_botmux',
+  id: 'github:stablyai/botmux',
+  displayName: 'botmux',
   badgeColor: '#737373',
   sourceRepoIds: [repo.id, remoteRepo.id],
   createdAt: 1,
@@ -145,7 +145,7 @@ describe('getPRGroupKey', () => {
 
   it('prefers repo-scoped PR status over stale legacy path-scoped status', () => {
     const prCache = {
-      '/tmp/orca_botmux::feature/super-critical': {
+      '/tmp/botmux::feature/super-critical': {
         data: { state: 'closed' }
       },
       'repo-1::feature/super-critical': {
@@ -158,7 +158,7 @@ describe('getPRGroupKey', () => {
 
   it('falls back to legacy path-scoped PR status when no repo-scoped entry exists', () => {
     const prCache = {
-      '/tmp/orca_botmux::feature/super-critical': {
+      '/tmp/botmux::feature/super-critical': {
         data: { state: 'closed' }
       }
     }
@@ -430,7 +430,7 @@ describe('buildRows with pinned worktrees', () => {
     )
 
     expect(rows).toMatchObject([
-      { type: 'header', key: 'project:github:stablyai/orca_botmux', label: 'orca_botmux', count: 2 },
+      { type: 'header', key: 'project:github:stablyai/botmux', label: 'botmux', count: 2 },
       { type: 'item', worktree: { id: worktree.id }, hostContextLabel: LOCAL_HOST_LABEL },
       { type: 'item', worktree: { id: remoteWorktree.id }, hostContextLabel: 'gpu-vm' }
     ])
@@ -693,22 +693,22 @@ describe('buildRows with pinned worktrees', () => {
 
     const headers = rows.filter((row) => row.type === 'header')
     expect(headers.map((row) => row.key)).toEqual([
-      'project:github:stablyai/orca_botmux',
+      'project:github:stablyai/botmux',
       'project:github:stablyai/analytics'
     ])
     expect(headers[0]).toMatchObject({
-      key: 'project:github:stablyai/orca_botmux',
+      key: 'project:github:stablyai/botmux',
       repo: { id: repo.id, badgeColor: repo.badgeColor }
     })
   })
 
   it('splits same-host checkouts of one project into separate per-setup groups', () => {
-    const repoB: Repo = { ...repo, id: 'repo-2', path: '/tmp/orca-botmux-2', displayName: 'orca-botmux-2' }
+    const repoB: Repo = { ...repo, id: 'repo-2', path: '/tmp/botmux-2', displayName: 'botmux-2' }
     const worktreeB: Worktree = {
       ...worktree,
       id: 'wt-2',
       repoId: repoB.id,
-      path: '/tmp/orca-botmux-2-feature',
+      path: '/tmp/botmux-2-feature',
       displayName: 'feature-b'
     }
     const localSetupB: ProjectHostSetup = {
@@ -753,12 +753,12 @@ describe('buildRows with pinned worktrees', () => {
     expect(headers).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          key: 'project:github:stablyai/orca_botmux::setup:repo-1',
-          label: 'orca_botmux'
+          key: 'project:github:stablyai/botmux::setup:repo-1',
+          label: 'botmux'
         }),
         expect.objectContaining({
-          key: 'project:github:stablyai/orca_botmux::setup:repo-2',
-          label: 'orca-botmux-2'
+          key: 'project:github:stablyai/botmux::setup:repo-2',
+          label: 'botmux-2'
         })
       ])
     )
@@ -768,14 +768,14 @@ describe('buildRows with pinned worktrees', () => {
     const localRepoB: Repo = {
       ...repo,
       id: 'repo-local-b',
-      path: '/tmp/orca-botmux-b',
-      displayName: 'orca-botmux-b'
+      path: '/tmp/botmux-b',
+      displayName: 'botmux-b'
     }
     const localWorktreeB: Worktree = {
       ...worktree,
       id: 'wt-local-b',
       repoId: localRepoB.id,
-      path: '/tmp/orca-botmux-b-feature',
+      path: '/tmp/botmux-b-feature',
       displayName: 'feature-b'
     }
     const localSetupB: ProjectHostSetup = {
@@ -819,9 +819,9 @@ describe('buildRows with pinned worktrees', () => {
 
     const headers = rows.filter((row) => row.type === 'header')
     expect(headers.map((row) => row.key)).toEqual([
-      'project:github:stablyai/orca_botmux::setup:repo-1',
-      'project:github:stablyai/orca_botmux::setup:repo-local-b',
-      'project:github:stablyai/orca_botmux::setup:repo-remote'
+      'project:github:stablyai/botmux::setup:repo-1',
+      'project:github:stablyai/botmux::setup:repo-local-b',
+      'project:github:stablyai/botmux::setup:repo-remote'
     ])
   })
 
@@ -829,14 +829,14 @@ describe('buildRows with pinned worktrees', () => {
     const runtimeRepoB: Repo = {
       ...repo,
       id: 'repo-runtime-b',
-      path: '/tmp/orca-botmux-runtime-b',
-      displayName: 'orca-botmux-runtime-b'
+      path: '/tmp/botmux-runtime-b',
+      displayName: 'botmux-runtime-b'
     }
     const runtimeWorktreeB: Worktree = {
       ...worktree,
       id: 'wt-runtime-b',
       repoId: runtimeRepoB.id,
-      path: '/tmp/orca-botmux-runtime-b-feature',
+      path: '/tmp/botmux-runtime-b-feature',
       displayName: 'feature-runtime-b'
     }
     // Why: a `provisioned` (recipe-created ephemeral) copy shares the project's
@@ -883,8 +883,8 @@ describe('buildRows with pinned worktrees', () => {
     const headers = rows.filter((row) => row.type === 'header')
     expect(headers).toHaveLength(1)
     expect(headers[0]).toMatchObject({
-      key: 'project:github:stablyai/orca_botmux',
-      label: 'orca_botmux',
+      key: 'project:github:stablyai/botmux',
+      label: 'botmux',
       count: 2
     })
   })
@@ -897,14 +897,14 @@ describe('buildRows with pinned worktrees', () => {
     const localRepoB: Repo = {
       ...repo,
       id: 'repo-local-b',
-      path: '/tmp/orca-botmux-b',
-      displayName: 'orca-botmux-b'
+      path: '/tmp/botmux-b',
+      displayName: 'botmux-b'
     }
     const localWorktreeB: Worktree = {
       ...worktree,
       id: 'wt-local-b',
       repoId: localRepoB.id,
-      path: '/tmp/orca-botmux-b-feature',
+      path: '/tmp/botmux-b-feature',
       displayName: 'feature-b'
     }
     const localSetupB: ProjectHostSetup = {
@@ -917,14 +917,14 @@ describe('buildRows with pinned worktrees', () => {
     const runtimeRepoB: Repo = {
       ...repo,
       id: 'repo-runtime-b',
-      path: '/tmp/orca-botmux-runtime-b',
-      displayName: 'orca-botmux-runtime-b'
+      path: '/tmp/botmux-runtime-b',
+      displayName: 'botmux-runtime-b'
     }
     const runtimeWorktreeB: Worktree = {
       ...worktree,
       id: 'wt-runtime-b',
       repoId: runtimeRepoB.id,
-      path: '/tmp/orca-botmux-runtime-b-feature',
+      path: '/tmp/botmux-runtime-b-feature',
       displayName: 'feature-runtime-b'
     }
     const runtimeSetupB: ProjectHostSetup = {
@@ -969,17 +969,17 @@ describe('buildRows with pinned worktrees', () => {
 
     const headers = rows.filter((row) => row.type === 'header')
     expect(headers.map((row) => row.key).sort()).toEqual([
-      'project:github:stablyai/orca_botmux',
-      'project:github:stablyai/orca_botmux::setup:repo-1',
-      'project:github:stablyai/orca_botmux::setup:repo-local-b'
+      'project:github:stablyai/botmux',
+      'project:github:stablyai/botmux::setup:repo-1',
+      'project:github:stablyai/botmux::setup:repo-local-b'
     ])
     // The provisioned copy nests under the plain project key with only its own
     // worktree; it never gets a path-scoped `::setup:` header like the real
     // checkouts do. (buildRows disambiguates its visible label to the repo name.)
     expect(
-      headers.some((row) => row.key === 'project:github:stablyai/orca_botmux::setup:repo-runtime-b')
+      headers.some((row) => row.key === 'project:github:stablyai/botmux::setup:repo-runtime-b')
     ).toBe(false)
-    expect(headers.find((row) => row.key === 'project:github:stablyai/orca_botmux')).toMatchObject({
+    expect(headers.find((row) => row.key === 'project:github:stablyai/botmux')).toMatchObject({
       count: 1
     })
   })
@@ -989,28 +989,28 @@ describe('buildRows with pinned worktrees', () => {
     const windowsRepo: Repo = {
       ...repo,
       id: 'repo-windows',
-      path: String.raw`C:\Users\alice\git\orca_botmux`,
-      displayName: 'orca_botmux',
+      path: String.raw`C:\Users\alice\git\botmux`,
+      displayName: 'botmux',
       executionHostId: runtimeHostId
     }
     const wslRepo: Repo = {
       ...repo,
       id: 'repo-wsl',
-      path: String.raw`\\wsl.localhost\Ubuntu\home\alice\git\orca_botmux`,
-      displayName: 'orca_botmux',
+      path: String.raw`\\wsl.localhost\Ubuntu\home\alice\git\botmux`,
+      displayName: 'botmux',
       executionHostId: runtimeHostId
     }
     const windowsWorktree: Worktree = {
       ...worktree,
       id: 'wt-windows',
       repoId: windowsRepo.id,
-      path: String.raw`C:\Users\alice\git\orca_botmux\feature`
+      path: String.raw`C:\Users\alice\git\botmux\feature`
     }
     const wslWorktree: Worktree = {
       ...worktree,
       id: 'wt-wsl',
       repoId: wslRepo.id,
-      path: String.raw`\\wsl.localhost\Ubuntu\home\alice\git\orca_botmux\feature`
+      path: String.raw`\\wsl.localhost\Ubuntu\home\alice\git\botmux\feature`
     }
     const windowsSetup: ProjectHostSetup = {
       ...projectHostSetups[0]!,
@@ -1058,8 +1058,8 @@ describe('buildRows with pinned worktrees', () => {
 
     expect(rows.filter((row) => row.type === 'header')).toMatchObject([
       {
-        key: 'project:github:stablyai/orca_botmux',
-        label: 'orca_botmux',
+        key: 'project:github:stablyai/botmux',
+        label: 'botmux',
         count: 2
       }
     ])
@@ -1069,7 +1069,7 @@ describe('buildRows with pinned worktrees', () => {
     const runtimeRepo: Repo = {
       ...remoteRepo,
       id: 'repo-runtime',
-      path: '/Users/alice/runtime-orca_botmux',
+      path: '/Users/alice/runtime-botmux',
       connectionId: null,
       executionHostId: 'runtime:03ef704c-b180-4b10-998d-e28fbd5de9a3'
     }
@@ -1118,7 +1118,7 @@ describe('buildRows with pinned worktrees', () => {
     )
 
     expect(rows).toMatchObject([
-      { type: 'header', key: 'project:github:stablyai/orca_botmux', label: 'orca_botmux', count: 2 },
+      { type: 'header', key: 'project:github:stablyai/botmux', label: 'botmux', count: 2 },
       { type: 'item', worktree: { id: worktree.id }, hostContextLabel: LOCAL_HOST_LABEL },
       { type: 'item', worktree: { id: runtimeWorktree.id }, hostContextLabel: 'dev box' }
     ])
@@ -1158,7 +1158,7 @@ describe('buildRows with pinned worktrees', () => {
     )
 
     expect(rows).toMatchObject([
-      { type: 'header', key: 'project:github:stablyai/orca_botmux', label: 'orca_botmux', count: 2 },
+      { type: 'header', key: 'project:github:stablyai/botmux', label: 'botmux', count: 2 },
       { type: 'item', worktree: { id: worktree.id } },
       { type: 'item', worktree: { id: secondLocalWorktree.id } }
     ])
@@ -1174,8 +1174,8 @@ describe('buildRows with pinned worktrees', () => {
       'repo',
       [worktree, remoteWorktree],
       new Map([
-        [repo.id, { ...repo, displayName: 'orca_botmux' }],
-        [remoteRepo.id, { ...remoteRepo, displayName: 'orca_botmux' }]
+        [repo.id, { ...repo, displayName: 'botmux' }],
+        [remoteRepo.id, { ...remoteRepo, displayName: 'botmux' }]
       ]),
       null,
       new Set()
@@ -1201,7 +1201,7 @@ describe('buildRows with pinned worktrees', () => {
           projectHostSetups
         }
       )
-    ).toBe('project:github:stablyai/orca_botmux')
+    ).toBe('project:github:stablyai/botmux')
   })
 
   it('emits an imported worktrees card at the top of repo-group rows', () => {
@@ -1312,7 +1312,7 @@ describe('buildRows with pinned worktrees', () => {
     )
 
     expect(rows).toMatchObject([
-      { type: 'header', key: 'repo:repo-1', label: 'orca_botmux' },
+      { type: 'header', key: 'repo:repo-1', label: 'botmux' },
       {
         type: 'imported-worktrees-card',
         key: 'imported-worktrees-card:repo-group:repo-1',

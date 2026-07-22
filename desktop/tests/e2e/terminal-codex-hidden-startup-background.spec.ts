@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer'
 import { PNG } from 'pngjs'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { stageNodeScriptForTerminal } from './helpers/run-node-script-in-terminal'
 import {
   ensureTerminalVisible,
@@ -57,7 +57,7 @@ function codexLikeStartupCommand(marker: string): string {
     'setInterval(() => {}, 1000);'
   ].join('')
   // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-  return stageNodeScriptForTerminal(script, { prefix: 'orca-botmux-codex-startup-bg' }).command
+  return stageNodeScriptForTerminal(script, { prefix: 'botmux-codex-startup-bg' }).command
 }
 
 async function waitForHiddenTabPtyId(page: Page, tabId: string): Promise<string> {
@@ -227,14 +227,14 @@ async function countVisibleBackgroundPixels(
 
 test.describe('Codex hidden startup composer background', () => {
   test('restores the input background when a Codex worktree first becomes visible', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'Codex hidden startup background repro needs a second worktree')
@@ -244,7 +244,7 @@ test.describe('Codex hidden startup composer background', () => {
 
     const marker = `CODEX_STARTUP_BG_${Date.now()}`
     const command = codexLikeStartupCommand(marker)
-    const hiddenTabId = await orcaBotmuxPage.evaluate(
+    const hiddenTabId = await botmuxPage.evaluate(
       ({ worktreeId, command, eventName }) => {
         const store = window.__store
         if (!store) {
@@ -282,9 +282,9 @@ test.describe('Codex hidden startup composer background', () => {
       }
     )
 
-    const hiddenPtyId = await waitForHiddenTabPtyId(orcaBotmuxPage, hiddenTabId)
+    const hiddenPtyId = await waitForHiddenTabPtyId(botmuxPage, hiddenTabId)
     await expect
-      .poll(() => mainSnapshotContains(orcaBotmuxPage, hiddenPtyId, marker), {
+      .poll(() => mainSnapshotContains(botmuxPage, hiddenPtyId, marker), {
         timeout: 20_000,
         message: 'Hidden Codex startup background never reached the main buffer snapshot'
       })
@@ -294,14 +294,14 @@ test.describe('Codex hidden startup composer background', () => {
     // The main-buffer snapshot above proves the hidden output was handled; the
     // reveal restore below proves it repaints when the worktree first shows.
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'Hidden Codex worktree did not become active'
       })
       .toBe(secondWorktreeId)
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       const store = window.__store
       if (!store) {
         throw new Error('Store unavailable')
@@ -310,10 +310,10 @@ test.describe('Codex hidden startup composer background', () => {
       state.setActiveTab(tabId)
       state.setActiveTabType('terminal')
     }, hiddenTabId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 8_000), {
+      .poll(() => getTerminalContent(botmuxPage, 8_000), {
         timeout: 10_000,
         message: 'First visible mount did not restore hidden Codex startup content'
       })
@@ -324,7 +324,7 @@ test.describe('Codex hidden startup composer background', () => {
       .poll(
         async () => {
           try {
-            const nextTarget = await readCodexStartupBackgroundTarget(orcaBotmuxPage, marker)
+            const nextTarget = await readCodexStartupBackgroundTarget(botmuxPage, marker)
             target = nextTarget
             return nextTarget.modelBackgroundCells >= Math.min(40, nextTarget.cols)
           } catch {
@@ -341,7 +341,7 @@ test.describe('Codex hidden startup composer background', () => {
     if (!target) {
       throw new Error('Codex startup background target was not captured')
     }
-    const visibleBackgroundPixels = await countVisibleBackgroundPixels(orcaBotmuxPage, target)
+    const visibleBackgroundPixels = await countVisibleBackgroundPixels(botmuxPage, target)
     const minimumVisiblePixels = Math.round(
       target.modelBackgroundCells * target.cellWidth * target.cellHeight * 0.2
     )

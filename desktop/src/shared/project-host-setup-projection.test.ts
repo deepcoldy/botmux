@@ -19,14 +19,14 @@ function repo(overrides: Partial<Repo> & Pick<Repo, 'id' | 'path' | 'displayName
 describe('project host setup projection', () => {
   it('projects a legacy local repo into one project and one ready local setup', () => {
     const projection = projectHostSetupProjectionFromRepos(
-      [repo({ id: 'repo-1', path: '/Users/alice/orca_botmux', displayName: 'orca_botmux' })],
+      [repo({ id: 'repo-1', path: '/Users/alice/botmux', displayName: 'botmux' })],
       500
     )
 
     expect(projection.projects).toEqual([
       {
         id: 'repo:repo-1',
-        displayName: 'orca_botmux',
+        displayName: 'botmux',
         badgeColor: '#737373',
         kind: 'git',
         sourceRepoIds: ['repo-1'],
@@ -40,8 +40,8 @@ describe('project host setup projection', () => {
         projectId: 'repo:repo-1',
         hostId: 'local',
         repoId: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
         kind: 'git',
         setupState: 'ready',
         setupMethod: 'legacy-repo',
@@ -55,8 +55,8 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'remote-repo',
-        path: '/home/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/home/alice/botmux',
+        displayName: 'botmux',
         connectionId: 'openclaw 2',
         worktreeBasePath: '../worktrees',
         gitUsername: 'alice'
@@ -76,8 +76,8 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
         projectHostSetupMethod: 'cloned'
       })
     ])
@@ -89,26 +89,26 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'local-repo',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
-        upstream: { owner: 'StablyAI', repo: 'orca_botmux' }
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
+        upstream: { owner: 'StablyAI', repo: 'botmux' }
       }),
       repo({
         id: 'remote-repo',
-        path: '/home/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/home/alice/botmux',
+        displayName: 'botmux',
         connectionId: 'gpu-vm',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       })
     ])
 
     expect(projection.projects).toHaveLength(1)
     expect(projection.projects[0]).toMatchObject({
-      id: 'github:stablyai/orca_botmux',
+      id: 'github:stablyai/botmux',
       sourceRepoIds: ['local-repo', 'remote-repo'],
-      providerIdentity: { provider: 'github', owner: 'StablyAI', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'StablyAI', repo: 'botmux' }
     })
-    expect(getProjectHostSetupsForProject(projection.setups, 'github:stablyai/orca_botmux')).toHaveLength(
+    expect(getProjectHostSetupsForProject(projection.setups, 'github:stablyai/botmux')).toHaveLength(
       2
     )
   })
@@ -117,36 +117,36 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'local-repo',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
         repoIcon: {
           type: 'image',
           src: 'https://github.com/stablyai.png?size=64',
           source: 'github',
-          label: 'stablyai/orca_botmux'
+          label: 'stablyai/botmux'
         }
       }),
       repo({
         id: 'remote-repo',
-        path: '/home/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/home/alice/botmux',
+        displayName: 'botmux',
         connectionId: 'gpu-vm',
         repoIcon: {
           type: 'image',
           src: 'https://github.com/stablyai.png?size=64',
           source: 'github',
-          label: 'StablyAI/OrcaBotmux'
+          label: 'StablyAI/Botmux'
         }
       })
     ])
 
     expect(projection.projects).toHaveLength(1)
     expect(projection.projects[0]).toMatchObject({
-      id: 'github:stablyai/orca_botmux',
+      id: 'github:stablyai/botmux',
       sourceRepoIds: ['local-repo', 'remote-repo'],
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
-    expect(getProjectHostSetupsForProject(projection.setups, 'github:stablyai/orca_botmux')).toHaveLength(
+    expect(getProjectHostSetupsForProject(projection.setups, 'github:stablyai/botmux')).toHaveLength(
       2
     )
   })
@@ -155,33 +155,33 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'canonical-local-repo',
-        path: '/Users/alice/stably/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/stably/botmux',
+        displayName: 'botmux',
         gitRemoteIdentity: {
-          canonicalKey: 'github.com/stablyai/orca_botmux',
+          canonicalKey: 'github.com/stablyai/botmux',
           remoteName: 'origin',
-          remoteUrl: 'git@github.com:stablyai/orca_botmux.git'
+          remoteUrl: 'git@github.com:stablyai/botmux.git'
         }
       }),
       repo({
         id: 'old-branch-checkout',
-        path: '/Users/alice/orca_botmux/workspaces/orca_botmux/re-enable-webgl-for-remote-runtime-terminals',
+        path: '/Users/alice/botmux/workspaces/botmux/re-enable-webgl-for-remote-runtime-terminals',
         displayName: 're-enable-webgl-for-remote-runtime-terminals',
         repoIcon: {
           type: 'image',
           src: 'https://github.com/stablyai.png?size=64',
           source: 'github',
-          label: 'stablyai/orca_botmux'
+          label: 'stablyai/botmux'
         }
       })
     ])
 
     expect(projection.projects).toHaveLength(1)
     expect(projection.projects[0]).toMatchObject({
-      id: 'github:stablyai/orca_botmux',
-      displayName: 'orca_botmux',
+      id: 'github:stablyai/botmux',
+      displayName: 'botmux',
       sourceRepoIds: ['canonical-local-repo', 'old-branch-checkout'],
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
   })
 
@@ -319,8 +319,8 @@ describe('project host setup projection', () => {
     const projection = projectHostSetupProjectionFromRepos([
       repo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
         upstream: { owner: 'stablyai', repo: 42 } as never
       })
     ])
@@ -332,15 +332,15 @@ describe('project host setup projection', () => {
   it('derives workspace ownership metadata from the repo setup', () => {
     const targetRepo = repo({
       id: 'remote-repo',
-      path: '/home/alice/orca_botmux',
-      displayName: 'orca_botmux',
+      path: '/home/alice/botmux',
+      displayName: 'botmux',
       connectionId: 'openclaw 2',
-      upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+      upstream: { owner: 'stablyai', repo: 'botmux' }
     })
     const projection = projectHostSetupProjectionFromRepos([targetRepo])
 
     expect(getProjectHostSetupWorktreeMeta(projection.setups, targetRepo)).toEqual({
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'ssh:openclaw%202',
       projectHostSetupId: 'remote-repo'
     })
@@ -353,7 +353,7 @@ describe('isGitHubBackedRepo', () => {
       id: 'r',
       path: '/r',
       displayName: 'r',
-      upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+      upstream: { owner: 'stablyai', repo: 'botmux' }
     })
     expect(isGitHubBackedRepo(target)).toBe(true)
   })
@@ -367,7 +367,7 @@ describe('isGitHubBackedRepo', () => {
         type: 'image',
         src: 'https://github.com/stablyai.png?size=64',
         source: 'github',
-        label: 'stablyai/orca_botmux'
+        label: 'stablyai/botmux'
       }
     })
     expect(isGitHubBackedRepo(target)).toBe(true)

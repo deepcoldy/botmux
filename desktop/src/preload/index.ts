@@ -159,7 +159,6 @@ import type {
 import type { TelemetryConsentState } from '../shared/telemetry-consent-types'
 import type { PreflightRuntimeContext, RefreshAgentsResult } from './api-types'
 import type { AgentKind, LaunchSource, RequestKind } from '../shared/telemetry-events'
-import type { AppStarSource } from '../shared/gh-star-source'
 import type { ExecutionHostId } from '../shared/execution-host'
 import type {
   Automation,
@@ -185,17 +184,17 @@ import type {
   NativeChatSubscriptionFrame
 } from './api-types'
 import {
-  ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT,
+  BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT,
   type EditorPrepareHotExitDetail
 } from '../shared/editor-save-events'
 import {
-  ORCA_APP_RESTART_ABORTED_EVENT,
-  ORCA_APP_RESTART_STARTED_EVENT,
-  ORCA_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT,
-  ORCA_UPDATER_QUIT_AND_INSTALL_STARTED_EVENT
+  BOTMUX_APP_RESTART_ABORTED_EVENT,
+  BOTMUX_APP_RESTART_STARTED_EVENT,
+  BOTMUX_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT,
+  BOTMUX_UPDATER_QUIT_AND_INSTALL_STARTED_EVENT
 } from '../shared/updater-renderer-events'
 import {
-  ORCA_INTERNAL_FILE_DRAG_TYPE,
+  BOTMUX_INTERNAL_FILE_DRAG_TYPE,
   createNativeFileDropPayload,
   createRejectedNativeFileDropPayload,
   hasNativeFileDragTypes,
@@ -257,7 +256,7 @@ function requestEditorHotExitBackup(): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let claimed = false
     window.dispatchEvent(
-      new CustomEvent<EditorPrepareHotExitDetail>(ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT, {
+      new CustomEvent<EditorPrepareHotExitDetail>(BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT, {
         detail: {
           claim: () => {
             claimed = true
@@ -405,7 +404,7 @@ document.addEventListener(
   'drop',
   (e) => {
     // Let in-app drags (e.g. file explorer → terminal) through to React handlers
-    if (e.dataTransfer?.types.includes(ORCA_INTERNAL_FILE_DRAG_TYPE)) {
+    if (e.dataTransfer?.types.includes(BOTMUX_INTERNAL_FILE_DRAG_TYPE)) {
       return
     }
 
@@ -464,7 +463,7 @@ document.addEventListener(
   true
 )
 
-const startupDiagnosticsEnabled = process.env.ORCA_STARTUP_DIAGNOSTICS === '1'
+const startupDiagnosticsEnabled = process.env.BOTMUX_STARTUP_DIAGNOSTICS === '1'
 
 // Custom APIs for renderer
 const api = {
@@ -475,13 +474,13 @@ const api = {
     relaunch: (): Promise<void> => ipcRenderer.invoke('app:relaunch'),
     restart: async (): Promise<void> => {
       await prepareRendererForAppRestart({
-        startedEventName: ORCA_APP_RESTART_STARTED_EVENT,
-        abortedEventName: ORCA_APP_RESTART_ABORTED_EVENT
+        startedEventName: BOTMUX_APP_RESTART_STARTED_EVENT,
+        abortedEventName: BOTMUX_APP_RESTART_ABORTED_EVENT
       })
       try {
         return await ipcRenderer.invoke('app:restart')
       } catch (error) {
-        window.dispatchEvent(new Event(ORCA_APP_RESTART_ABORTED_EVENT))
+        window.dispatchEvent(new Event(BOTMUX_APP_RESTART_ABORTED_EVENT))
         throw error
       }
     },
@@ -512,24 +511,24 @@ const api = {
       ipcRenderer.invoke('terminal:writeRenderDesyncEvidence', args)
   },
 
-  orcaBotmuxProfiles: {
-    list: () => ipcRenderer.invoke('orcaBotmuxProfiles:list'),
-    authStatus: () => ipcRenderer.invoke('orcaBotmuxProfiles:authStatus'),
-    createLocal: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:createLocal', args),
-    createCloudLinked: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:createCloudLinked', args),
-    switchProfile: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:switch', args),
-    transferProject: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:transferProject', args),
-    findProjectProfiles: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:findProjectProfiles', args),
-    connectCurrent: () => ipcRenderer.invoke('orcaBotmuxProfiles:connectCurrent'),
-    refreshAuth: () => ipcRenderer.invoke('orcaBotmuxProfiles:refreshAuth'),
-    signOutCurrent: () => ipcRenderer.invoke('orcaBotmuxProfiles:signOutCurrent'),
-    selectOrg: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:selectOrg', args),
-    orgMembersList: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:orgMembersList', args),
-    orgMemberInvite: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:orgMemberInvite', args),
-    orgInviteRevoke: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:orgInviteRevoke', args),
-    orgMemberChangeRole: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:orgMemberChangeRole', args),
-    orgMemberRemove: (args) => ipcRenderer.invoke('orcaBotmuxProfiles:orgMemberRemove', args)
-  } satisfies PreloadApi['orcaBotmuxProfiles'],
+  botmuxProfiles: {
+    list: () => ipcRenderer.invoke('botmuxProfiles:list'),
+    authStatus: () => ipcRenderer.invoke('botmuxProfiles:authStatus'),
+    createLocal: (args) => ipcRenderer.invoke('botmuxProfiles:createLocal', args),
+    createCloudLinked: (args) => ipcRenderer.invoke('botmuxProfiles:createCloudLinked', args),
+    switchProfile: (args) => ipcRenderer.invoke('botmuxProfiles:switch', args),
+    transferProject: (args) => ipcRenderer.invoke('botmuxProfiles:transferProject', args),
+    findProjectProfiles: (args) => ipcRenderer.invoke('botmuxProfiles:findProjectProfiles', args),
+    connectCurrent: () => ipcRenderer.invoke('botmuxProfiles:connectCurrent'),
+    refreshAuth: () => ipcRenderer.invoke('botmuxProfiles:refreshAuth'),
+    signOutCurrent: () => ipcRenderer.invoke('botmuxProfiles:signOutCurrent'),
+    selectOrg: (args) => ipcRenderer.invoke('botmuxProfiles:selectOrg', args),
+    orgMembersList: (args) => ipcRenderer.invoke('botmuxProfiles:orgMembersList', args),
+    orgMemberInvite: (args) => ipcRenderer.invoke('botmuxProfiles:orgMemberInvite', args),
+    orgInviteRevoke: (args) => ipcRenderer.invoke('botmuxProfiles:orgInviteRevoke', args),
+    orgMemberChangeRole: (args) => ipcRenderer.invoke('botmuxProfiles:orgMemberChangeRole', args),
+    orgMemberRemove: (args) => ipcRenderer.invoke('botmuxProfiles:orgMemberRemove', args)
+  } satisfies PreloadApi['botmuxProfiles'],
 
   platform: {
     get: () => ({
@@ -1530,10 +1529,6 @@ const api = {
       return () => ipcRenderer.removeListener('gh:workItemMutated', listener)
     },
 
-    checkOrcaStarred: (): Promise<boolean | null> => ipcRenderer.invoke('gh:checkOrcaStarred'),
-    starOrca: (source: AppStarSource): Promise<boolean> =>
-      ipcRenderer.invoke('gh:starOrca', source),
-
     // Why: rate_limit is exempt from rate-limit accounting, but we still pass
     // `force` through so callers can bust the 30s in-process cache after a
     // known-expensive op (e.g. after ProjectPicker discovery).
@@ -1839,33 +1834,19 @@ const api = {
   },
 
   starNag: {
-    onShow: (
-      callback: (payload?: { mode?: 'gh' | 'web'; surface?: 'card' | 'toast' }) => void
-    ): (() => void) => {
-      const listener = (
-        _event: Electron.IpcRendererEvent,
-        payload?: { mode?: 'gh' | 'web'; surface?: 'card' | 'toast' }
-      ): void => callback(payload)
-      ipcRenderer.on('star-nag:show', listener)
-      return () => ipcRenderer.removeListener('star-nag:show', listener)
-    },
-    onHide: (callback: () => void): (() => void) => {
-      const listener = (): void => callback()
-      ipcRenderer.on('star-nag:hide', listener)
-      return () => ipcRenderer.removeListener('star-nag:hide', listener)
-    },
-    dismiss: (): Promise<void> => ipcRenderer.invoke('star-nag:dismiss'),
-    later: (): Promise<void> => ipcRenderer.invoke('star-nag:later'),
-    complete: (): Promise<void> => ipcRenderer.invoke('star-nag:complete'),
-    disable: (): Promise<void> => ipcRenderer.invoke('star-nag:disable'),
-    openWeb: (): Promise<void> => ipcRenderer.invoke('star-nag:openWeb'),
-    starOrca: (): Promise<boolean> => ipcRenderer.invoke('star-nag:starOrca'),
-    forceShow: (): Promise<void> => ipcRenderer.invoke('star-nag:forceShow'),
-    agentValueMoment: (): Promise<
-      { status: 'ready'; mode: 'gh' | 'web' } | { status: 'skipped' }
-    > => ipcRenderer.invoke('star-nag:agentValueMoment'),
-    showAgentValueMoment: (): Promise<void> => ipcRenderer.invoke('star-nag:showAgentValueMoment'),
-    onboardingCompleted: (): Promise<void> => ipcRenderer.invoke('star-nag:onboardingCompleted')
+    // Why: product-growth star-nag UG removed; keep no-op surface for residual callers.
+    onShow: (): (() => void) => () => {},
+    onHide: (): (() => void) => () => {},
+    dismiss: (): Promise<void> => Promise.resolve(),
+    later: (): Promise<void> => Promise.resolve(),
+    complete: (): Promise<void> => Promise.resolve(),
+    disable: (): Promise<void> => Promise.resolve(),
+    openWeb: (): Promise<void> => Promise.resolve(),
+    starBotmux: (): Promise<boolean> => Promise.resolve(false),
+    forceShow: (): Promise<void> => Promise.resolve(),
+    agentValueMoment: (): Promise<{ shouldShow: boolean }> => Promise.resolve({ shouldShow: false }),
+    showAgentValueMoment: (): Promise<void> => Promise.resolve(),
+    onboardingCompleted: (): Promise<void> => Promise.resolve()
   },
 
   // Why: telemetry uses a loose untyped surface at the preload boundary on
@@ -2304,7 +2285,7 @@ const api = {
       callback: (event: {
         browserPageId: string
         origin: string
-        action: 'opened-in-orca_botmux' | 'opened-external' | 'blocked'
+        action: 'opened-in-botmux' | 'opened-external' | 'blocked'
       }) => void
     ): (() => void) => {
       const listener = (
@@ -2312,7 +2293,7 @@ const api = {
         data: {
           browserPageId: string
           origin: string
-          action: 'opened-in-orca_botmux' | 'opened-external' | 'blocked'
+          action: 'opened-in-botmux' | 'opened-external' | 'blocked'
         }
       ) => callback(data)
       ipcRenderer.on('browser:popup', listener)
@@ -2469,15 +2450,15 @@ const api = {
       return () => ipcRenderer.removeListener('browser:pane-focus', listener)
     },
 
-    onOpenLinkInOrcaTab: (
+    onOpenLinkInBotmuxTab: (
       callback: (event: { browserPageId: string; url: string }) => void
     ): (() => void) => {
       const listener = (
         _event: Electron.IpcRendererEvent,
         data: { browserPageId: string; url: string }
       ) => callback(data)
-      ipcRenderer.on('browser:open-link-in-orca-botmux-tab', listener)
-      return () => ipcRenderer.removeListener('browser:open-link-in-orca-botmux-tab', listener)
+      ipcRenderer.on('browser:open-link-in-botmux-tab', listener)
+      return () => ipcRenderer.removeListener('browser:open-link-in-botmux-tab', listener)
     },
 
     cancelDownload: (args: { downloadId: string }): Promise<boolean> =>
@@ -2767,13 +2748,13 @@ const api = {
     dismissNudge: () => ipcRenderer.invoke('updater:dismissNudge'),
     quitAndInstall: async (): Promise<void> => {
       await prepareRendererForAppRestart({
-        startedEventName: ORCA_UPDATER_QUIT_AND_INSTALL_STARTED_EVENT,
-        abortedEventName: ORCA_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT
+        startedEventName: BOTMUX_UPDATER_QUIT_AND_INSTALL_STARTED_EVENT,
+        abortedEventName: BOTMUX_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT
       })
       try {
         return await ipcRenderer.invoke('updater:quitAndInstall')
       } catch (error) {
-        window.dispatchEvent(new Event(ORCA_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT))
+        window.dispatchEvent(new Event(BOTMUX_UPDATER_QUIT_AND_INSTALL_ABORTED_EVENT))
         throw error
       }
     },
@@ -3830,7 +3811,7 @@ const api = {
     },
     /**
      * Raise/focus the main BrowserWindow (restore if minimized). Used when the
-     * user intentionally opens a orca_botmux session so attach output is not left
+     * user intentionally opens a botmux session so attach output is not left
      * under the hidden-delivery gate for a backgrounded window.
      */
     focus: (): void => {
@@ -4404,9 +4385,9 @@ const api = {
     }
   },
 
-  /** Bridge to orca_botmux daemon/dashboard — multi-endpoint (local + N SSH remotes). */
-  orcaBotmuxBridge: {
-    listEndpoints: () => ipcRenderer.invoke('orcaBotmuxBridge:listEndpoints'),
+  /** Bridge to botmux daemon/dashboard — multi-endpoint (local + N SSH remotes). */
+  botmuxBridge: {
+    listEndpoints: () => ipcRenderer.invoke('botmuxBridge:listEndpoints'),
     connectEndpoint: (transport: {
       kind: 'local' | 'ssh'
       target?: string
@@ -4414,11 +4395,11 @@ const api = {
       remoteBotmuxHome?: string
       remoteDashboardPort?: number
       label?: string
-    }) => ipcRenderer.invoke('orcaBotmuxBridge:connectEndpoint', transport),
+    }) => ipcRenderer.invoke('botmuxBridge:connectEndpoint', transport),
     disconnectEndpoint: (endpointId: string) =>
-      ipcRenderer.invoke('orcaBotmuxBridge:disconnectEndpoint', endpointId),
-    disconnectAll: () => ipcRenderer.invoke('orcaBotmuxBridge:disconnectAll'),
-    getTransport: () => ipcRenderer.invoke('orcaBotmuxBridge:getTransport'),
+      ipcRenderer.invoke('botmuxBridge:disconnectEndpoint', endpointId),
+    disconnectAll: () => ipcRenderer.invoke('botmuxBridge:disconnectAll'),
+    getTransport: () => ipcRenderer.invoke('botmuxBridge:getTransport'),
     setTransport: (transport: {
       kind: 'local' | 'ssh'
       target?: string
@@ -4426,20 +4407,52 @@ const api = {
       remoteBotmuxHome?: string
       remoteDashboardPort?: number
       label?: string
-    }) => ipcRenderer.invoke('orcaBotmuxBridge:setTransport', transport),
-    getStatus: () => ipcRenderer.invoke('orcaBotmuxBridge:getStatus'),
-    listSessions: () => ipcRenderer.invoke('orcaBotmuxBridge:listSessions'),
+    }) => ipcRenderer.invoke('botmuxBridge:setTransport', transport),
+    getStatus: () => ipcRenderer.invoke('botmuxBridge:getStatus'),
+    listSessions: () => ipcRenderer.invoke('botmuxBridge:listSessions'),
     getWriteLink: (args: string | { sessionId: string; hostId?: string }) =>
-      ipcRenderer.invoke('orcaBotmuxBridge:getWriteLink', args),
+      ipcRenderer.invoke('botmuxBridge:getWriteLink', args),
     openTerminal: (
       args: { sessionId: string; hostId?: string; external?: boolean; title?: string } | string
-    ) => ipcRenderer.invoke('orcaBotmuxBridge:openTerminal', args),
+    ) => ipcRenderer.invoke('botmuxBridge:openTerminal', args),
+    /**
+     * Main → renderer: open a Botmux session as a main-workspace attach tab
+     * (preferred over write-link webview). Used when mobile/RPC triggers open.
+     */
+    onOpenSession: (
+      callback: (payload: {
+        sessionId: string
+        hostId: string
+        hostLabel: string
+        title?: string
+        cwd?: string
+        botName?: string
+        cliType?: string
+        mode: 'attach' | 'web'
+      }) => void
+    ): (() => void) => {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: {
+          sessionId: string
+          hostId: string
+          hostLabel: string
+          title?: string
+          cwd?: string
+          botName?: string
+          cliType?: string
+          mode: 'attach' | 'web'
+        }
+      ) => callback(payload)
+      ipcRenderer.on('botmuxBridge:openSession', listener)
+      return () => ipcRenderer.removeListener('botmuxBridge:openSession', listener)
+    },
     sendMessage: (args: {
       sessionId: string
       botId?: string
       text: string
       hostId?: string
-    }) => ipcRenderer.invoke('orcaBotmuxBridge:sendMessage', args),
+    }) => ipcRenderer.invoke('botmuxBridge:sendMessage', args),
     listSshTargets: (): Promise<{
       localConnected: boolean
       targets: Array<{
@@ -4452,22 +4465,22 @@ const api = {
         port: number
         connected: boolean
       }>
-    }> => ipcRenderer.invoke('orcaBotmuxBridge:listSshTargets'),
-    reconnectPersisted: () => ipcRenderer.invoke('orcaBotmuxBridge:reconnectPersisted'),
-    listPendingAsks: () => ipcRenderer.invoke('orcaBotmuxBridge:listPendingAsks'),
+    }> => ipcRenderer.invoke('botmuxBridge:listSshTargets'),
+    reconnectPersisted: () => ipcRenderer.invoke('botmuxBridge:reconnectPersisted'),
+    listPendingAsks: () => ipcRenderer.invoke('botmuxBridge:listPendingAsks'),
     answerAsk: (args: {
       askId: string
       selections: string[][]
       hostId?: string
       larkAppId?: string
-    }) => ipcRenderer.invoke('orcaBotmuxBridge:answerAsk', args),
+    }) => ipcRenderer.invoke('botmuxBridge:answerAsk', args),
     nativeTerminalSpec: (args: { sessionId: string; hostId?: string }) =>
-      ipcRenderer.invoke('orcaBotmuxBridge:nativeTerminalSpec', args),
+      ipcRenderer.invoke('botmuxBridge:nativeTerminalSpec', args),
     tmuxAttachSpec: (args: { sessionId: string; hostId?: string }) =>
-      ipcRenderer.invoke('orcaBotmuxBridge:tmuxAttachSpec', args),
-    localReadiness: () => ipcRenderer.invoke('orcaBotmuxBridge:localReadiness'),
+      ipcRenderer.invoke('botmuxBridge:tmuxAttachSpec', args),
+    localReadiness: () => ipcRenderer.invoke('botmuxBridge:localReadiness'),
     ensureWorkspaceDir: (): Promise<{ path: string; created: boolean }> =>
-      ipcRenderer.invoke('orcaBotmuxBridge:ensureWorkspaceDir')
+      ipcRenderer.invoke('botmuxBridge:ensureWorkspaceDir')
   },
 
   agentStatus: {

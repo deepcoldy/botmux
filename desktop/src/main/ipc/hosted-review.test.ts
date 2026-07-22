@@ -140,7 +140,7 @@ describe('registerHostedReviewHandlers', () => {
     createHostedReviewMock.mockResolvedValueOnce({
       ok: true,
       number: 42,
-      url: 'https://github.com/acme/orca_botmux/pull/42'
+      url: 'https://github.com/acme/botmux/pull/42'
     })
 
     registerHostedReviewHandlers(store as never, stats as never)
@@ -197,7 +197,7 @@ describe('registerHostedReviewHandlers', () => {
       number: 42,
       title: 'Feature PR',
       state: 'open',
-      url: 'https://github.com/acme/orca_botmux/pull/42',
+      url: 'https://github.com/acme/botmux/pull/42',
       status: 'success',
       updatedAt: '2026-06-16T00:00:00.000Z',
       mergeable: 'MERGEABLE'
@@ -261,7 +261,7 @@ describe('registerHostedReviewHandlers', () => {
     createHostedReviewMock.mockResolvedValueOnce({
       ok: true,
       number: 42,
-      url: 'https://github.com/acme/orca_botmux/pull/42'
+      url: 'https://github.com/acme/botmux/pull/42'
     })
 
     registerHostedReviewHandlers(store as never, stats as never)
@@ -295,7 +295,7 @@ describe('registerHostedReviewHandlers', () => {
       expect.objectContaining({
         type: 'pr_created',
         repoId: 'repo-1',
-        meta: { prNumber: 42, prUrl: 'https://github.com/acme/orca_botmux/pull/42' }
+        meta: { prNumber: 42, prUrl: 'https://github.com/acme/botmux/pull/42' }
       })
     )
   })

@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   cleanupMarkdownFixture,
@@ -152,18 +152,18 @@ async function placeCaretAtHeadingStart(
 }
 
 test.describe('Markdown prose reflow', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await orcaBotmuxPage.setViewportSize({ width: 1440, height: 900 })
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await botmuxPage.setViewportSize({ width: 1440, height: 900 })
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('hard-wrapped prose reflows as one document paragraph', async ({ orcaBotmuxPage }, testInfo) => {
+  test('hard-wrapped prose reflows as one document paragraph', async ({ botmuxPage }, testInfo) => {
     let filePath: string | null = null
 
     try {
-      filePath = await openHardWrappedFixture(orcaBotmuxPage, testInfo)
-      const metrics = await getGoalParagraphMetrics(orcaBotmuxPage)
+      filePath = await openHardWrappedFixture(botmuxPage, testInfo)
+      const metrics = await getGoalParagraphMetrics(botmuxPage)
 
       expect(metrics.paragraphCount).toBe(1)
       expect(metrics.sourceLineCount).toBe(4)
@@ -175,17 +175,17 @@ test.describe('Markdown prose reflow', () => {
   })
 
   test('deleting an inserted empty paragraph keeps hard-wrapped prose reflowing', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     let filePath: string | null = null
 
     try {
-      filePath = await openHardWrappedFixture(orcaBotmuxPage, testInfo)
-      await placeCaretAtGoalParagraphEnd(orcaBotmuxPage)
-      await orcaBotmuxPage.keyboard.press('Enter')
-      await orcaBotmuxPage.keyboard.press('Backspace')
+      filePath = await openHardWrappedFixture(botmuxPage, testInfo)
+      await placeCaretAtGoalParagraphEnd(botmuxPage)
+      await botmuxPage.keyboard.press('Enter')
+      await botmuxPage.keyboard.press('Backspace')
 
-      const metrics = await getGoalParagraphMetrics(orcaBotmuxPage)
+      const metrics = await getGoalParagraphMetrics(botmuxPage)
 
       expect(metrics.hardBreakCount).toBe(0)
       expect(metrics.paragraphCount).toBe(1)
@@ -198,19 +198,19 @@ test.describe('Markdown prose reflow', () => {
   })
 
   test('deleting slash text then the empty paragraph keeps hard-wrapped prose reflowing', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     let filePath: string | null = null
 
     try {
-      filePath = await openHardWrappedFixture(orcaBotmuxPage, testInfo)
-      await placeCaretAtGoalParagraphEnd(orcaBotmuxPage)
-      await orcaBotmuxPage.keyboard.press('Enter')
-      await orcaBotmuxPage.keyboard.type('/')
-      await orcaBotmuxPage.keyboard.press('Backspace')
-      await orcaBotmuxPage.keyboard.press('Backspace')
+      filePath = await openHardWrappedFixture(botmuxPage, testInfo)
+      await placeCaretAtGoalParagraphEnd(botmuxPage)
+      await botmuxPage.keyboard.press('Enter')
+      await botmuxPage.keyboard.type('/')
+      await botmuxPage.keyboard.press('Backspace')
+      await botmuxPage.keyboard.press('Backspace')
 
-      const metrics = await getGoalParagraphMetrics(orcaBotmuxPage)
+      const metrics = await getGoalParagraphMetrics(botmuxPage)
 
       expect(metrics.hardBreakCount).toBe(0)
       expect(metrics.paragraphCount).toBe(1)
@@ -223,16 +223,16 @@ test.describe('Markdown prose reflow', () => {
   })
 
   test('deleting the block boundary before a heading keeps hard-wrapped prose reflowing', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     let filePath: string | null = null
 
     try {
-      filePath = await openHardWrappedFixture(orcaBotmuxPage, testInfo)
-      await placeCaretAtHeadingStart(orcaBotmuxPage)
-      await orcaBotmuxPage.keyboard.press('Backspace')
+      filePath = await openHardWrappedFixture(botmuxPage, testInfo)
+      await placeCaretAtHeadingStart(botmuxPage)
+      await botmuxPage.keyboard.press('Backspace')
 
-      const metrics = await getGoalParagraphMetrics(orcaBotmuxPage)
+      const metrics = await getGoalParagraphMetrics(botmuxPage)
 
       expect(metrics.hardBreakCount).toBe(0)
       expect(metrics.paragraphCount).toBe(1)

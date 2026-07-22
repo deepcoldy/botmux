@@ -114,7 +114,7 @@ export function getUsableLinearBranchName(
   branchName: string | null | undefined
 ): string | undefined {
   // Why: only a non-blank normalized value can safely enter the exact git-ref
-  // override path; missing values must keep OrcaBotmux's generated-name fallback.
+  // override path; missing values must keep Botmux's generated-name fallback.
   return branchName?.trim() || undefined
 }
 

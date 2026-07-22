@@ -1,5 +1,5 @@
 /**
- * Unit tests for repos:create (orca_botmux#763).
+ * Unit tests for repos:create (botmux#763).
  *
  * Pins the invariants that matter here:
  *   - Name validation catches empty/slash/./.. before any fs I/O.
@@ -106,7 +106,7 @@ describe('repos:create', () => {
     webContents: { send: vi.fn() }
   }
   const tmpPath = (...segments: string[]): string => join('/tmp', ...segments)
-  const defaultProjectParent = join('/Users/alice', 'orca_botmux', 'projects')
+  const defaultProjectParent = join('/Users/alice', 'botmux', 'projects')
 
   const callCreate = (args: CreateArgs): Promise<CreateResult> => {
     const handler = handlers.get('repos:create')

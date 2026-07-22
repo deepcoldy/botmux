@@ -1,0 +1,252 @@
+/**
+ * Two-launch Electron helper for restart-persistence tests.
+ *
+ * Why: the default `botmuxPage` fixture creates a fresh `userDataDir` per test
+ * and deletes it on close, which is incompatible with a test that needs to
+ * quit the app and relaunch against the *same* on-disk state. This helper
+ * owns the shared userDataDir and gives each caller an `app`+`page` pair
+ * wired to it.
+ */
+
+import {
+  _electron as electron,
+  expect,
+  type ElectronApplication,
+  type Page,
+  type TestInfo
+} from '@stablyai/playwright-test'
+import { execSync } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { getE2ECompletedOnboardingProfile } from './e2e-completed-onboarding-profile'
+import { getBotmuxElectronLaunchArgs } from './electron-launch-args'
+import { cleanupE2EDaemons, closeElectronAppForE2E } from './electron-process-shutdown'
+
+type LaunchedBotmux = {
+  app: ElectronApplication
+  page: Page
+}
+
+type RestartSession = {
+  userDataDir: string
+  launch: () => Promise<LaunchedBotmux>
+  /** Gracefully close a launch, letting beforeunload flush session state. */
+  close: (app: ElectronApplication) => Promise<void>
+  /** Remove the shared userDataDir after the test is done. */
+  dispose: () => Promise<void>
+}
+
+async function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(resolve, ms)
+    timeout.unref?.()
+  })
+}
+
+async function removeProfileDir(userDataDir: string): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(userDataDir, { recursive: true, force: true })
+      return
+    } catch (error) {
+      if (attempt === 4) {
+        throw error
+      }
+      // Why: on Windows, taskkill can return before Electron/PTY handles are
+      // fully released, making immediate temp-profile deletion flaky.
+      await delay(250)
+    }
+  }
+}
+
+function shouldLaunchHeadful(testInfo: TestInfo): boolean {
+  return testInfo.project.metadata.botmuxHeadful === true
+}
+
+function launchEnv(userDataDir: string, headful: boolean): NodeJS.ProcessEnv {
+  const { ELECTRON_RUN_AS_NODE: _unused, ...cleanEnv } = process.env
+  void _unused
+  return {
+    ...cleanEnv,
+    NODE_ENV: 'development',
+    BOTMUX_E2E_USER_DATA_DIR: userDataDir,
+    ...(headful ? { BOTMUX_E2E_HEADFUL: '1' } : { BOTMUX_E2E_HEADLESS: '1' })
+  }
+}
+
+/**
+ * Create a restart session tied to a persistent userDataDir.
+ *
+ * Why: keep the launch wiring identical to the shared fixture (mainPath,
+ * env stripping, headful toggle) so behavior differences between fixtures
+ * don't leak in as false positives for persistence bugs.
+ */
+export function createRestartSession(testInfo: TestInfo): RestartSession {
+  const mainPath = path.join(process.cwd(), 'out', 'main', 'index.js')
+  const userDataDir = mkdtempSync(path.join(os.tmpdir(), 'botmux-e2e-restart-'))
+  const headful = shouldLaunchHeadful(testInfo)
+
+  // Why: this helper bypasses the shared `electronApp` fixture, so it must
+  // seed the same completed onboarding profile or first-run overlays cover
+  // both launches and obscure restart failures.
+  writeFileSync(
+    path.join(userDataDir, 'botmux-data.json'),
+    `${JSON.stringify(getE2ECompletedOnboardingProfile(), null, 2)}\n`
+  )
+
+  const launch = async (): Promise<LaunchedBotmux> => {
+    const app = await electron.launch({
+      args: getBotmuxElectronLaunchArgs(mainPath, headful),
+      env: launchEnv(userDataDir, headful)
+    })
+    const page = await app.firstWindow({ timeout: 120_000 })
+    await page.waitForLoadState('domcontentloaded')
+    await page.waitForFunction(() => Boolean(window.__store), null, { timeout: 30_000 })
+    return { app, page }
+  }
+
+  const close = async (app: ElectronApplication): Promise<void> => {
+    await closeElectronAppForE2E(app)
+  }
+
+  const dispose = async (): Promise<void> => {
+    await cleanupE2EDaemons(userDataDir)
+    if (existsSync(userDataDir)) {
+      await removeProfileDir(userDataDir)
+    }
+  }
+
+  return { userDataDir, launch, close, dispose }
+}
+
+/**
+ * Attach a repo to the running renderer and wait until a terminal tab is
+ * active on its worktree. Matches the shared fixture's setup path so the
+ * first-launch state lines up with what real users persist.
+ */
+export async function attachRepoAndOpenTerminal(page: Page, repoPath: string): Promise<string> {
+  if (!isValidGitRepo(repoPath)) {
+    throw new Error(`attachRepoAndOpenTerminal: ${repoPath} is not a git repo`)
+  }
+
+  const repoId = await page.evaluate(async (repoPath) => {
+    const result = await window.api.repos.add({ path: repoPath })
+    if ('error' in result) {
+      throw new Error(result.error)
+    }
+    return result.repo.id
+  }, repoPath)
+
+  await expect
+    .poll(
+      () =>
+        readRestartRendererState(() =>
+          page.evaluate(async (repoId) => {
+            const store = window.__store
+            if (!store) {
+              return false
+            }
+            // Why: repos.add emits a concurrent refresh whose generation can
+            // supersede this fetch; poll until either refresh publishes the repo.
+            await store.getState().fetchRepos()
+            const repo = store.getState().repos.find((candidate) => candidate.id === repoId)
+            if (!repo) {
+              return false
+            }
+            // Why: this restart fixture uses the global e2e repo, whose seeded Git
+            // worktree is external to Botmux's workspace root after the visibility rollout.
+            await store.getState().updateRepo(repo.id, { externalWorktreeVisibility: 'show' })
+            return true
+          }, repoId)
+        ),
+      {
+        timeout: 30_000,
+        message: `attachRepoAndOpenTerminal: expected e2e repo to be loaded: ${repoPath}`
+      }
+    )
+    .toBe(true)
+
+  await page.waitForFunction(
+    () => window.__store?.getState().workspaceSessionReady === true,
+    null,
+    { timeout: 30_000 }
+  )
+
+  // Why: fetchWorktrees() is async. Awaiting the outer page.evaluate returns
+  // before the Zustand worktree slice has observed the hydrated state, so a
+  // single evaluate() that reads worktreesByRepo can see an empty map. Poll
+  // the store until the seeded repo's worktree shows up.
+  await expect
+    .poll(
+      async () =>
+        readRestartRendererState(() =>
+          page.evaluate(async (repoId) => {
+            const store = window.__store
+            if (!store) {
+              return false
+            }
+            await store.getState().fetchWorktrees(repoId)
+            return (store.getState().worktreesByRepo[repoId]?.length ?? 0) > 0
+          }, repoId)
+        ),
+      {
+        timeout: 15_000,
+        message: 'attachRepoAndOpenTerminal: seeded worktree never surfaced in the store'
+      }
+    )
+    .toBe(true)
+
+  const worktreeId = await page.evaluate((repoId: string) => {
+    const store = window.__store
+    if (!store) {
+      return null
+    }
+    const state = store.getState()
+    // Why: repo identity remains stable when Windows canonicalizes path casing
+    // or separators between the IPC and renderer layers.
+    const repoWorktrees = state.worktreesByRepo[repoId] ?? []
+    const primary = repoWorktrees.find((worktree) => worktree.isMainWorktree) ?? repoWorktrees[0]
+    if (!primary) {
+      return null
+    }
+    state.setActiveWorktree(primary.id)
+    return primary.id
+  }, repoId)
+
+  if (!worktreeId) {
+    throw new Error('attachRepoAndOpenTerminal: test repo did not surface in the store')
+  }
+
+  return worktreeId
+}
+
+export async function readRestartRendererState<T>(read: () => Promise<T>): Promise<T | null> {
+  try {
+    return await read()
+  } catch (error) {
+    // Why: initial hydration can replace the renderer document; the enclosing
+    // state poll must retry that transition without hiding other failures.
+    if (error instanceof Error && error.message.includes('Execution context was destroyed')) {
+      return null
+    }
+    throw error
+  }
+}
+
+function isValidGitRepo(repoPath: string): boolean {
+  if (!repoPath || !existsSync(repoPath)) {
+    return false
+  }
+  try {
+    return (
+      execSync('git rev-parse --is-inside-work-tree', {
+        cwd: repoPath,
+        stdio: 'pipe',
+        encoding: 'utf8'
+      }).trim() === 'true'
+    )
+  } catch {
+    return false
+  }
+}

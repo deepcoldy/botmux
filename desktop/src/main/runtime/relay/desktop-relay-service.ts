@@ -1,5 +1,5 @@
-import type { OrcaCloudAuthConfig } from '../../orca-botmux-profiles/profile-cloud-auth-config'
-import type { MobilePairingConnectionContext, OrcaRuntimeRpcServer } from '../runtime-rpc'
+import type { BotmuxCloudAuthConfig } from '../../botmux-profiles/profile-cloud-auth-config'
+import type { MobilePairingConnectionContext, BotmuxRuntimeRpcServer } from '../runtime-rpc'
 import type {
   DeviceCredentialInstalled,
   PairingGetEndpointsParams,
@@ -20,10 +20,10 @@ import { deriveRelayHostId } from './relay-http-client'
 import { RelayDemandLedger } from './relay-demand-ledger'
 
 type DesktopRelayServiceOptions = {
-  authConfig: OrcaCloudAuthConfig
+  authConfig: BotmuxCloudAuthConfig
   userDataPath: string
   appVersion: string
-  runtimeRpc: OrcaRuntimeRpcServer
+  runtimeRpc: BotmuxRuntimeRpcServer
   onStatus: (status: RelayBrokerStatus) => void
 }
 
@@ -45,7 +45,7 @@ export function pairingAuthorizationForContext(
 export class DesktopRelayService {
   private readonly coordinator: RelayAuthCoordinator
   private readonly revokeOutbox: RelayRevokeOutbox
-  private readonly runtimeRpc: OrcaRuntimeRpcServer
+  private readonly runtimeRpc: BotmuxRuntimeRpcServer
   private readonly demandLedger: RelayDemandLedger
   private demandExpiryTimer: ReturnType<typeof setTimeout> | null = null
   private stopped = false

@@ -29,7 +29,7 @@ async function spawnExitingPty(index: number): Promise<void> {
     cols: 80,
     rows: 24,
     cwd: process.cwd(),
-    env: { ...process.env, ORCA_FD_LEAK_TEST_INDEX: String(index) }
+    env: { ...process.env, BOTMUX_FD_LEAK_TEST_INDEX: String(index) }
   })
 
   await new Promise<void>((resolve) => {
@@ -56,7 +56,7 @@ describeOnDarwin('node-pty macOS spawn fd handling', () => {
 
   it('does not leak fds when native posix_spawn setup fails', async () => {
     const helperPath = getExistingSpawnHelper()
-    const hiddenHelperPath = `${helperPath}.orca-botmux-test-hidden`
+    const hiddenHelperPath = `${helperPath}.botmux-test-hidden`
     expect(existsSync(hiddenHelperPath)).toBe(false)
 
     const before = currentOpenFdCount()
@@ -75,7 +75,7 @@ describeOnDarwin('node-pty macOS spawn fd handling', () => {
             cols: 80,
             rows: 24,
             cwd: process.cwd(),
-            env: { ...process.env, ORCA_FD_LEAK_TEST_INDEX: String(i) }
+            env: { ...process.env, BOTMUX_FD_LEAK_TEST_INDEX: String(i) }
           })
         ).toThrow(/node-pty: posix_spawn failed: ENOENT/)
       }

@@ -67,15 +67,15 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('includes browser-only workspaces in their repo', () => {
     const worktree = {
-      id: 'orca_botmux::/Users/me/browser-only',
-      repoId: 'orca_botmux',
+      id: 'botmux::/Users/me/browser-only',
+      repoId: 'botmux',
       displayName: 'browser-only'
     } as Worktree
     const browser = {
       id: 'browser-1',
       worktreeId: worktree.id,
-      title: 'OrcaBotmux docs',
-      url: 'https://docs.orca_botmux.dev',
+      title: 'Botmux docs',
+      url: 'https://docs.botmux.dev',
       loading: false,
       faviconUrl: null,
       canGoBack: false,
@@ -87,15 +87,15 @@ describe('mergeSnapshotAndSessions', () => {
       null,
       [],
       baseCtx({
-        repoDisplayNameById: new Map([['orca_botmux', 'ORCA']]),
+        repoDisplayNameById: new Map([['botmux', 'Botmux']]),
         worktreeById: new Map([[worktree.id, worktree]]),
         browserTabsByWorktree: { [worktree.id]: [browser] }
       })
     )
 
     expect(out[0]).toMatchObject({
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       worktrees: [
         {
           worktreeId: worktree.id,
@@ -109,10 +109,10 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('passes through snapshot worktrees with numeric metrics and hasLocalSamples', () => {
     const wt: WorktreeMemory = {
-      worktreeId: 'orca_botmux::/Users/me/Triton',
+      worktreeId: 'botmux::/Users/me/Triton',
       worktreeName: 'Triton',
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 1.5,
       memory: 100_000_000,
       history: [1, 2, 3],
@@ -121,8 +121,8 @@ describe('mergeSnapshotAndSessions', () => {
     const out = mergeSnapshotAndSessions(makeSnapshot([wt]), [], baseCtx())
     expect(out).toHaveLength(1)
     expect(out[0]).toMatchObject({
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 1.5,
       memory: 100_000_000,
       hasRemoteChildren: false
@@ -143,10 +143,10 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('dedups: a session present in both snapshot and daemon list renders once with numeric metrics', () => {
     const wt: WorktreeMemory = {
-      worktreeId: 'orca_botmux::/Users/me/Triton',
+      worktreeId: 'botmux::/Users/me/Triton',
       worktreeName: 'Triton',
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 0.1,
       memory: 50_000_000,
       history: [],
@@ -165,21 +165,21 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('@@ parse: an SSH-style session id resolves to its worktree group', () => {
     const ds: DaemonSession[] = [
-      { id: 'orca_botmux::/remote/Stingray@@abcd1234', cwd: '', title: 'orca_botmux/Stingray' }
+      { id: 'botmux::/remote/Stingray@@abcd1234', cwd: '', title: 'botmux/Stingray' }
     ]
     const ctx = baseCtx({
-      repoConnectionIdById: new Map([['orca_botmux', 'ssh-conn-1']])
+      repoConnectionIdById: new Map([['botmux', 'ssh-conn-1']])
     })
     const out = mergeSnapshotAndSessions(null, ds, ctx)
     expect(out).toHaveLength(1)
     expect(out[0]).toMatchObject({
-      repoId: 'orca_botmux',
+      repoId: 'botmux',
       hasRemoteChildren: true,
       cpu: null,
       memory: null
     })
     expect(out[0].worktrees[0]).toMatchObject({
-      worktreeId: 'orca_botmux::/remote/Stingray',
+      worktreeId: 'botmux::/remote/Stingray',
       worktreeName: 'Stingray',
       hasLocalSamples: false,
       isRemote: true,
@@ -187,7 +187,7 @@ describe('mergeSnapshotAndSessions', () => {
       memory: null
     })
     expect(out[0].worktrees[0].sessions[0]).toMatchObject({
-      sessionId: 'orca_botmux::/remote/Stingray@@abcd1234',
+      sessionId: 'botmux::/remote/Stingray@@abcd1234',
       hasLocalSamples: false,
       cpu: null,
       memory: null,
@@ -201,14 +201,14 @@ describe('mergeSnapshotAndSessions', () => {
     // re-spawned yet must NOT be flagged as remote. Under the old
     // predicate (`!hasLocalSamples`) it was — that was the bug.
     const ds: DaemonSession[] = [
-      { id: 'orca_botmux::/local/Triton@@deadbeef', cwd: '/local/Triton', title: 'orca_botmux/Triton' }
+      { id: 'botmux::/local/Triton@@deadbeef', cwd: '/local/Triton', title: 'botmux/Triton' }
     ]
     const ctx = baseCtx({
-      repoConnectionIdById: new Map([['orca_botmux', null]])
+      repoConnectionIdById: new Map([['botmux', null]])
     })
     const out = mergeSnapshotAndSessions(null, ds, ctx)
     expect(out[0]).toMatchObject({
-      repoId: 'orca_botmux',
+      repoId: 'botmux',
       hasRemoteChildren: false
     })
     expect(out[0].worktrees[0]).toMatchObject({
@@ -219,27 +219,27 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('tab walk wins over @@ parse when they disagree', () => {
     const tabId = 'tab-xyz'
-    const ds: DaemonSession[] = [{ id: 'orca_botmux::/wrong/path@@feedface', cwd: '', title: 'orca_botmux' }]
+    const ds: DaemonSession[] = [{ id: 'botmux::/wrong/path@@feedface', cwd: '', title: 'botmux' }]
     const ctx = baseCtx({
       tabsByWorktree: {
-        'orca_botmux::/correct/path': [makeTab(tabId, 'My Tab')]
+        'botmux::/correct/path': [makeTab(tabId, 'My Tab')]
       },
-      ptyIdsByTabId: { [tabId]: ['orca_botmux::/wrong/path@@feedface'] }
+      ptyIdsByTabId: { [tabId]: ['botmux::/wrong/path@@feedface'] }
     })
     const out = mergeSnapshotAndSessions(null, ds, ctx)
-    expect(out[0].worktrees[0].worktreeId).toBe('orca_botmux::/correct/path')
+    expect(out[0].worktrees[0].worktreeId).toBe('botmux::/correct/path')
     expect(out[0].worktrees[0].sessions[0].tabId).toBe(tabId)
     expect(out[0].worktrees[0].sessions[0].bound).toBe(true)
   })
 
   it('treats startup deferred reattach tab ptyId wake hints as bound sessions', () => {
     const tabId = 'tab-restored'
-    const sessionId = 'orca_botmux::/Users/me/Triton@@deferred'
-    const ds: DaemonSession[] = [{ id: sessionId, cwd: '/Users/me/Triton', title: 'orca_botmux/Triton' }]
+    const sessionId = 'botmux::/Users/me/Triton@@deferred'
+    const ds: DaemonSession[] = [{ id: sessionId, cwd: '/Users/me/Triton', title: 'botmux/Triton' }]
     const restoredTab = { ...makeTab(tabId, 'Restored'), ptyId: sessionId }
     const ctx = baseCtx({
       tabsByWorktree: {
-        'orca_botmux::/Users/me/Triton': [restoredTab]
+        'botmux::/Users/me/Triton': [restoredTab]
       },
       ptyIdsByTabId: { [tabId]: [] }
     })
@@ -365,17 +365,17 @@ describe('mergeSnapshotAndSessions', () => {
   it('local-bound interaction state: numeric metrics + bound=true + tabId set', () => {
     const tabId = 'tab-1'
     const wt: WorktreeMemory = {
-      worktreeId: 'orca_botmux::/Users/me/Triton',
+      worktreeId: 'botmux::/Users/me/Triton',
       worktreeName: 'Triton',
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 0.1,
       memory: 1_000,
       history: [],
       sessions: [{ sessionId: 'pty-bound', paneKey: null, pid: 1, cpu: 0.1, memory: 1_000 }]
     }
     const ctx = baseCtx({
-      tabsByWorktree: { 'orca_botmux::/Users/me/Triton': [makeTab(tabId)] },
+      tabsByWorktree: { 'botmux::/Users/me/Triton': [makeTab(tabId)] },
       ptyIdsByTabId: { [tabId]: ['pty-bound'] }
     })
     const out = mergeSnapshotAndSessions(makeSnapshot([wt]), [], ctx)
@@ -389,10 +389,10 @@ describe('mergeSnapshotAndSessions', () => {
 
   it('local-orphan interaction state: numeric metrics + bound=false + tabId null', () => {
     const wt: WorktreeMemory = {
-      worktreeId: 'orca_botmux::/Users/me/Triton',
+      worktreeId: 'botmux::/Users/me/Triton',
       worktreeName: 'Triton',
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 0,
       memory: 0,
       history: [],
@@ -406,7 +406,7 @@ describe('mergeSnapshotAndSessions', () => {
   })
 
   it('remote-orphan interaction state: null metrics + bound=false', () => {
-    const ds: DaemonSession[] = [{ id: 'orca_botmux::/remote/Wt@@deadbeef', cwd: '', title: 'orca_botmux/Wt' }]
+    const ds: DaemonSession[] = [{ id: 'botmux::/remote/Wt@@deadbeef', cwd: '', title: 'botmux/Wt' }]
     const out = mergeSnapshotAndSessions(null, ds, baseCtx())
     const session = out[0].worktrees[0].sessions[0]
     expect(session).toMatchObject({
@@ -419,21 +419,21 @@ describe('mergeSnapshotAndSessions', () => {
   })
 
   it('uses repoDisplayNameById to humanize new project groups when available', () => {
-    const ds: DaemonSession[] = [{ id: 'stably-ai/orca_botmux::/remote/Wt@@1', cwd: '', title: '' }]
+    const ds: DaemonSession[] = [{ id: 'stably-ai/botmux::/remote/Wt@@1', cwd: '', title: '' }]
     const ctx = baseCtx({
-      repoDisplayNameById: new Map([['stably-ai/orca_botmux', 'ORCA']])
+      repoDisplayNameById: new Map([['stably-ai/botmux', 'Botmux']])
     })
     const out = mergeSnapshotAndSessions(null, ds, ctx)
-    expect(out[0].repoName).toBe('ORCA')
+    expect(out[0].repoName).toBe('Botmux')
   })
 
   it('workspaceSessionReady=false suppresses bound flags so nothing looks bound prematurely', () => {
     const tabId = 'tab-1'
     const wt: WorktreeMemory = {
-      worktreeId: 'orca_botmux::/Users/me/Triton',
+      worktreeId: 'botmux::/Users/me/Triton',
       worktreeName: 'Triton',
-      repoId: 'orca_botmux',
-      repoName: 'ORCA',
+      repoId: 'botmux',
+      repoName: 'Botmux',
       cpu: 0,
       memory: 0,
       history: [],
@@ -441,7 +441,7 @@ describe('mergeSnapshotAndSessions', () => {
     }
     const ctx = baseCtx({
       workspaceSessionReady: false,
-      tabsByWorktree: { 'orca_botmux::/Users/me/Triton': [makeTab(tabId)] },
+      tabsByWorktree: { 'botmux::/Users/me/Triton': [makeTab(tabId)] },
       ptyIdsByTabId: { [tabId]: ['pty-1'] }
     })
     const out = mergeSnapshotAndSessions(makeSnapshot([wt]), [], ctx)

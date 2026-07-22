@@ -29,12 +29,12 @@ vi.mock('./browser-manager', () => ({
 
 import { browserSessionRegistry } from './browser-session-registry'
 import { setupClientHintsOverride } from './browser-session-ua'
-import { ORCA_BROWSER_PARTITION } from '../../shared/constants'
+import { BOTMUX_BROWSER_PARTITION } from '../../shared/constants'
 import {
-  DEFAULT_LOCAL_ORCA_PROFILE_ID,
-  getOrcaProfileBrowserDefaultPartition,
-  getOrcaProfileBrowserSessionPartition
-} from '../../shared/orca-botmux-profiles'
+  DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
+  getBotmuxProfileBrowserDefaultPartition,
+  getBotmuxProfileBrowserSessionPartition
+} from '../../shared/botmux-profiles'
 
 describe('BrowserSessionRegistry', () => {
   beforeEach(() => {
@@ -59,11 +59,11 @@ describe('BrowserSessionRegistry', () => {
     const defaultProfile = browserSessionRegistry.getDefaultProfile()
     expect(defaultProfile.id).toBe('default')
     expect(defaultProfile.scope).toBe('default')
-    expect(defaultProfile.partition).toBe(ORCA_BROWSER_PARTITION)
+    expect(defaultProfile.partition).toBe(BOTMUX_BROWSER_PARTITION)
   })
 
   it('allows the default partition', () => {
-    expect(browserSessionRegistry.isAllowedPartition(ORCA_BROWSER_PARTITION)).toBe(true)
+    expect(browserSessionRegistry.isAllowedPartition(BOTMUX_BROWSER_PARTITION)).toBe(true)
   })
 
   it('rejects unknown partitions', () => {
@@ -74,8 +74,8 @@ describe('BrowserSessionRegistry', () => {
     const profile = browserSessionRegistry.createProfile('isolated', 'Test Isolated')
     expect(profile).not.toBeNull()
     expect(profile!.scope).toBe('isolated')
-    expect(profile!.partition).toMatch(/^persist:orca-botmux-browser-session-/)
-    expect(profile!.partition).not.toBe(ORCA_BROWSER_PARTITION)
+    expect(profile!.partition).toMatch(/^persist:botmux-browser-session-/)
+    expect(profile!.partition).not.toBe(BOTMUX_BROWSER_PARTITION)
     expect(profile!.label).toBe('Test Isolated')
     expect(profile!.source).toBeNull()
   })
@@ -95,7 +95,7 @@ describe('BrowserSessionRegistry', () => {
     const profile = browserSessionRegistry.createProfile('imported', 'My Import')
     expect(profile).not.toBeNull()
     expect(profile!.scope).toBe('imported')
-    expect(profile!.partition).toMatch(/^persist:orca-botmux-browser-session-/)
+    expect(profile!.partition).toMatch(/^persist:botmux-browser-session-/)
   })
 
   it('resolves partition for a known profile', () => {
@@ -105,21 +105,21 @@ describe('BrowserSessionRegistry', () => {
   })
 
   it('resolves default partition for null/undefined profileId', () => {
-    expect(browserSessionRegistry.resolvePartition(null)).toBe(ORCA_BROWSER_PARTITION)
-    expect(browserSessionRegistry.resolvePartition(undefined)).toBe(ORCA_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolvePartition(null)).toBe(BOTMUX_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolvePartition(undefined)).toBe(BOTMUX_BROWSER_PARTITION)
   })
 
   it('resolves default partition for unknown profileId', () => {
-    expect(browserSessionRegistry.resolvePartition('nonexistent')).toBe(ORCA_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolvePartition('nonexistent')).toBe(BOTMUX_BROWSER_PARTITION)
   })
 
   it('strictly resolves known profile partitions without downgrading unknown profiles', () => {
     const profile = browserSessionRegistry.createProfile('isolated', 'Strict Resolve')
     expect(profile).not.toBeNull()
 
-    expect(browserSessionRegistry.resolveKnownPartition(null)).toBe(ORCA_BROWSER_PARTITION)
-    expect(browserSessionRegistry.resolveKnownPartition(undefined)).toBe(ORCA_BROWSER_PARTITION)
-    expect(browserSessionRegistry.resolveKnownPartition('default')).toBe(ORCA_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolveKnownPartition(null)).toBe(BOTMUX_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolveKnownPartition(undefined)).toBe(BOTMUX_BROWSER_PARTITION)
+    expect(browserSessionRegistry.resolveKnownPartition('default')).toBe(BOTMUX_BROWSER_PARTITION)
     expect(browserSessionRegistry.resolveKnownPartition(profile!.id)).toBe(profile!.partition)
     expect(browserSessionRegistry.resolveKnownPartition('missing-profile')).toBeNull()
   })
@@ -190,7 +190,7 @@ describe('BrowserSessionRegistry', () => {
     const fakeProfile = {
       id: '00000000-0000-0000-0000-000000000001',
       scope: 'imported' as const,
-      partition: 'persist:orca-botmux-browser-session-00000000-0000-0000-0000-000000000001',
+      partition: 'persist:botmux-browser-session-00000000-0000-0000-0000-000000000001',
       label: 'Hydrated',
       source: { browserFamily: 'manual' as const, importedAt: 1000 }
     }
@@ -226,7 +226,7 @@ describe('BrowserSessionRegistry', () => {
     // Why: verify the parallel fix to the default partition — isolated/imported
     // profiles must also defer media permission checks to macOS instead of
     // denying outright, otherwise pages inside them still hit NotAllowedError
-    // after the user grants Camera/Microphone to OrcaBotmux.
+    // after the user grants Camera/Microphone to Botmux.
     browserSessionRegistry.createProfile('isolated', 'Media Test')
     const mockSession = sessionFromPartitionMock.mock.results[0]?.value
     const requestHandler = mockSession.setPermissionRequestHandler.mock.calls[0][0]
@@ -301,26 +301,26 @@ describe('BrowserSessionRegistry', () => {
     expect(webAuthnCallback).toHaveBeenCalledWith('credential-1')
   })
 
-  it('uses profile-owned partitions for non-default OrcaBotmux profiles', () => {
-    const orcaProfileId = 'local-work'
-    browserSessionRegistry.configureForOrcaProfile({
-      orcaProfileId,
+  it('uses profile-owned partitions for non-default Botmux profiles', () => {
+    const botmuxProfileId = 'local-work'
+    browserSessionRegistry.configureForBotmuxProfile({
+      botmuxProfileId,
       profileDirectory: '/profiles/local-work'
     })
 
     expect(browserSessionRegistry.getDefaultProfile().partition).toBe(
-      getOrcaProfileBrowserDefaultPartition(orcaProfileId)
+      getBotmuxProfileBrowserDefaultPartition(botmuxProfileId)
     )
-    expect(browserSessionRegistry.isAllowedPartition(ORCA_BROWSER_PARTITION)).toBe(false)
+    expect(browserSessionRegistry.isAllowedPartition(BOTMUX_BROWSER_PARTITION)).toBe(false)
 
     const profile = browserSessionRegistry.createProfile('isolated', 'Work Browser')
     expect(profile).not.toBeNull()
     expect(profile!.partition).toBe(
-      getOrcaProfileBrowserSessionPartition(orcaProfileId, profile!.id)
+      getBotmuxProfileBrowserSessionPartition(botmuxProfileId, profile!.id)
     )
 
-    browserSessionRegistry.configureForOrcaProfile({
-      orcaProfileId: DEFAULT_LOCAL_ORCA_PROFILE_ID,
+    browserSessionRegistry.configureForBotmuxProfile({
+      botmuxProfileId: DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
       profileDirectory: '/profiles/local-default'
     })
   })

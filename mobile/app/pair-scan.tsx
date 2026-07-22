@@ -23,6 +23,7 @@ import { colors, spacing, radii, typography } from '../src/theme/mobile-theme'
 import { TextInputModal } from '../src/components/TextInputModal'
 import { ConnectionLog } from '../src/components/ConnectionLog'
 import { shouldPresentNotificationOptIn } from '../src/notifications/notification-opt-in-gate'
+import { useMobileI18n } from '../src/i18n/mobile-i18n'
 
 // Why: see pair-confirm.tsx — cap initial-pair "Connecting…" so a broken
 // route surfaces as a real error with the log visible instead of a
@@ -46,6 +47,7 @@ export default function PairScanScreen() {
   const router = useRouter()
   const closeHost = useCloseHost()
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   const [permission, requestPermission] = useCameraPermissions()
   const [status, setStatus] = useState<'scanning' | 'connecting' | 'error'>('scanning')
   const [errorMessage, setErrorMessage] = useState('')
@@ -79,33 +81,36 @@ export default function PairScanScreen() {
       const offer = decodePairingUrl(data)
       if (!offer) {
         setStatus('error')
-        setErrorMessage('Not a valid Orca QR code')
+        setErrorMessage(t('Not a valid Botmux QR code'))
         processingRef.current = false
         return
       }
 
       void testAndSave(offer)
     },
-    [router]
+    [router, t]
   )
 
-  const handlePasteSubmit = useCallback((input: string) => {
-    setPasteVisible(false)
-    if (processingRef.current) {
-      return
-    }
-    processingRef.current = true
+  const handlePasteSubmit = useCallback(
+    (input: string) => {
+      setPasteVisible(false)
+      if (processingRef.current) {
+        return
+      }
+      processingRef.current = true
 
-    const offer = parsePairingCode(input)
-    if (!offer) {
-      setStatus('error')
-      setErrorMessage('Not a valid pairing code — copy it from your computer and paste again')
-      processingRef.current = false
-      return
-    }
+      const offer = parsePairingCode(input)
+      if (!offer) {
+        setStatus('error')
+        setErrorMessage(t('Not a valid pairing code — copy it from your computer and paste again'))
+        processingRef.current = false
+        return
+      }
 
-    void testAndSave(offer)
-  }, [])
+      void testAndSave(offer)
+    },
+    [t]
+  )
 
   const handleCameraLayout = useCallback((event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout
@@ -180,8 +185,12 @@ export default function PairScanScreen() {
       setStatus('error')
       setErrorMessage(
         timedOut
-          ? `Couldn't connect within ${PAIRING_OVERALL_TIMEOUT_MS / 1000}s — see log below for where it stalled`
-          : `Pairing failed: ${err instanceof Error ? err.message : String(err)}`
+          ? t("Couldn't connect within {{seconds}}s — see log below for where it stalled", {
+              seconds: PAIRING_OVERALL_TIMEOUT_MS / 1000
+            })
+          : t('Pairing failed: {{error}}', {
+              error: err instanceof Error ? err.message : String(err)
+            })
       )
       processingRef.current = false
     }
@@ -226,12 +235,14 @@ export default function PairScanScreen() {
         </Pressable>
         <View style={styles.centered}>
           <Text style={styles.title}>
-            {canAskAgain ? 'Pair with desktop' : 'Camera Access Disabled'}
+            {t(canAskAgain ? 'Pair with desktop' : 'Camera Access Disabled')}
           </Text>
           <Text style={styles.subtitle}>
-            {canAskAgain
-              ? 'Scan the QR code from Orca on your desktop, or paste the pairing code instead.'
-              : 'Enable camera access in Settings, or paste the pairing code instead.'}
+            {t(
+              canAskAgain
+                ? 'Scan the QR code from Botmux on your desktop, or paste the pairing code instead.'
+                : 'Enable camera access in Settings, or paste the pairing code instead.'
+            )}
           </Text>
           <Pressable
             style={styles.primaryButton}
@@ -239,7 +250,7 @@ export default function PairScanScreen() {
           >
             {canAskAgain && <QrCode size={16} color={colors.bgBase} />}
             <Text style={styles.primaryButtonText}>
-              {canAskAgain ? 'Continue' : 'Open Settings'}
+              {t(canAskAgain ? 'Continue' : 'Open Settings')}
             </Text>
           </Pressable>
           <Pressable
@@ -247,14 +258,14 @@ export default function PairScanScreen() {
             onPress={() => setPasteVisible(true)}
           >
             <ClipboardIcon size={16} color={colors.textSecondary} />
-            <Text style={styles.pasteButtonText}>Paste code instead</Text>
+            <Text style={styles.pasteButtonText}>{t('Paste code instead')}</Text>
           </Pressable>
         </View>
         <TextInputModal
           visible={pasteVisible}
-          title="Paste pairing code"
-          message="Copy the code shown under the QR on your computer."
-          placeholder="orca://pair?code=... or paste the code"
+          title={t('Paste pairing code')}
+          message={t('Copy the code shown under the QR on your computer.')}
+          placeholder="botmux://pair?code=... or paste the code"
           onSubmit={handlePasteSubmit}
           onCancel={() => setPasteVisible(false)}
         />
@@ -269,9 +280,9 @@ export default function PairScanScreen() {
       </Pressable>
 
       <View style={styles.steps}>
-        <Step number={1} text="Open Orca on your computer" />
-        <Step number={2} text="Go to Settings → Mobile" />
-        <Step number={3} text="Scan the QR code" />
+        <Step number={1} text={t('Open Botmux on your computer')} />
+        <Step number={2} text={t('Go to Settings → Mobile')} />
+        <Step number={3} text={t('Scan the QR code')} />
       </View>
 
       {status === 'scanning' && (
@@ -305,7 +316,7 @@ export default function PairScanScreen() {
             onPress={() => setPasteVisible(true)}
           >
             <ClipboardIcon size={16} color={colors.textSecondary} />
-            <Text style={styles.pasteButtonText}>Or paste pairing code</Text>
+            <Text style={styles.pasteButtonText}>{t('Or paste pairing code')}</Text>
           </Pressable>
         </>
       )}
@@ -313,9 +324,9 @@ export default function PairScanScreen() {
       {status === 'connecting' && (
         <View style={styles.centered}>
           <ActivityIndicator size="large" color={colors.textSecondary} />
-          <Text style={styles.connectingText}>Connecting…</Text>
+          <Text style={styles.connectingText}>{t('Connecting…')}</Text>
           <View style={styles.logSlot}>
-            <ConnectionLog entries={logs} title="Pairing log" />
+            <ConnectionLog entries={logs} title={t('Pairing log')} />
           </View>
         </View>
       )}
@@ -325,12 +336,12 @@ export default function PairScanScreen() {
           <Text style={styles.errorText}>{errorMessage}</Text>
           {logs.length > 0 && (
             <View style={styles.logSlot}>
-              <ConnectionLog entries={logs} title="Pairing log" />
+              <ConnectionLog entries={logs} title={t('Pairing log')} />
             </View>
           )}
           <View style={styles.errorActions}>
             <Pressable style={styles.primaryButton} onPress={retry}>
-              <Text style={styles.primaryButtonText}>Try Again</Text>
+              <Text style={styles.primaryButtonText}>{t('Try Again')}</Text>
             </Pressable>
             <Pressable
               style={({ pressed }) => [
@@ -342,7 +353,7 @@ export default function PairScanScreen() {
                 setPasteVisible(true)
               }}
             >
-              <Text style={styles.secondaryButtonText}>Paste code instead</Text>
+              <Text style={styles.secondaryButtonText}>{t('Paste code instead')}</Text>
             </Pressable>
           </View>
         </View>
@@ -350,9 +361,9 @@ export default function PairScanScreen() {
 
       <TextInputModal
         visible={pasteVisible}
-        title="Paste pairing code"
-        message="Copy the code shown under the QR on your computer."
-        placeholder="orca://pair?code=... or paste the code"
+        title={t('Paste pairing code')}
+        message={t('Copy the code shown under the QR on your computer.')}
+        placeholder="botmux://pair?code=... or paste the code"
         onSubmit={handlePasteSubmit}
         onCancel={() => setPasteVisible(false)}
       />

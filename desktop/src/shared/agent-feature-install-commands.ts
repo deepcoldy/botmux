@@ -1,18 +1,18 @@
-export const ORCA_SKILLS_REPOSITORY_URL = 'https://github.com/stablyai/orca_botmux'
+export const BOTMUX_SKILLS_REPOSITORY_URL = 'https://github.com/stablyai/botmux'
 
-export const ORCA_CLI_SKILL_NAME = 'orca-botmux-cli'
+export const BOTMUX_CLI_SKILL_NAME = 'botmux-cli'
 export const COMPUTER_USE_SKILL_NAME = 'computer-use'
 export const ORCHESTRATION_SKILL_NAME = 'orchestration'
-export const EPHEMERAL_VMS_SKILL_NAME = 'orca-botmux-per-workspace-env'
-export const ORCA_LINEAR_SKILL_NAME = 'orca-botmux-linear'
+export const EPHEMERAL_VMS_SKILL_NAME = 'botmux-per-workspace-env'
+export const BOTMUX_LINEAR_SKILL_NAME = 'botmux-linear'
 export const LINEAR_TICKETS_SKILL_NAME = 'linear-tickets'
-export const LINEAR_AGENT_SKILL_NAMES = [ORCA_LINEAR_SKILL_NAME, LINEAR_TICKETS_SKILL_NAME] as const
+export const LINEAR_AGENT_SKILL_NAMES = [BOTMUX_LINEAR_SKILL_NAME, LINEAR_TICKETS_SKILL_NAME] as const
 
 export function buildAgentFeatureSkillInstallCommand(skillNames: readonly string[]): string {
   if (skillNames.length === 0) {
     throw new Error('At least one skill name is required.')
   }
-  return `npx skills add ${ORCA_SKILLS_REPOSITORY_URL} --skill ${skillNames.join(' ')} --global`
+  return `npx skills add ${BOTMUX_SKILLS_REPOSITORY_URL} --skill ${skillNames.join(' ')} --global`
 }
 
 export function buildAgentFeatureSkillUpdateCommand(skillName: string): string {
@@ -23,12 +23,12 @@ export function buildAgentFeatureSkillUpdateCommand(skillName: string): string {
   return `npx skills update ${trimmedSkillName} --global`
 }
 
-export const ORCA_CLI_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
-  ORCA_CLI_SKILL_NAME
+export const BOTMUX_CLI_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
+  BOTMUX_CLI_SKILL_NAME
 ])
 
-export const ORCA_CLI_SKILL_UPDATE_COMMAND =
-  buildAgentFeatureSkillUpdateCommand(ORCA_CLI_SKILL_NAME)
+export const BOTMUX_CLI_SKILL_UPDATE_COMMAND =
+  buildAgentFeatureSkillUpdateCommand(BOTMUX_CLI_SKILL_NAME)
 
 export const COMPUTER_USE_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
   COMPUTER_USE_SKILL_NAME
@@ -51,17 +51,17 @@ export const EPHEMERAL_VMS_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstall
 export const EPHEMERAL_VMS_SKILL_UPDATE_COMMAND =
   buildAgentFeatureSkillUpdateCommand(EPHEMERAL_VMS_SKILL_NAME)
 
-export const ORCA_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
-  ORCA_CLI_SKILL_NAME,
+export const BOTMUX_CLI_ORCHESTRATION_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
+  BOTMUX_CLI_SKILL_NAME,
   ORCHESTRATION_SKILL_NAME
 ])
 
-export const ORCA_LINEAR_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
-  ORCA_LINEAR_SKILL_NAME
+export const BOTMUX_LINEAR_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
+  BOTMUX_LINEAR_SKILL_NAME
 ])
 
-export const ORCA_LINEAR_SKILL_UPDATE_COMMAND =
-  buildAgentFeatureSkillUpdateCommand(ORCA_LINEAR_SKILL_NAME)
+export const BOTMUX_LINEAR_SKILL_UPDATE_COMMAND =
+  buildAgentFeatureSkillUpdateCommand(BOTMUX_LINEAR_SKILL_NAME)
 
 export const LINEAR_TICKETS_SKILL_INSTALL_COMMAND = buildAgentFeatureSkillInstallCommand([
   LINEAR_TICKETS_SKILL_NAME

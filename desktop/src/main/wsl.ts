@@ -73,7 +73,7 @@ export function wslUncDirectoryExists(uncPath: string): boolean | null {
  * Why: WSL hook/setup environments may need both the worktree UNC path
  * (\\wsl.localhost\...) and regular Windows install paths (C:\Users\...)
  * translated before passing them to bash. Leaving drive paths untouched
- * breaks scripts that read ORCA_ROOT_PATH or similar env vars inside WSL.
+ * breaks scripts that read BOTMUX_ROOT_PATH or similar env vars inside WSL.
  */
 export function toLinuxPath(windowsPath: string): string {
   const info = parseWslPath(windowsPath)
@@ -184,7 +184,7 @@ export function getDefaultWslDistro(): string | null {
  * Get the home directory for a WSL distro, returned as a Windows UNC path.
  * Result is cached per distro for the process lifetime.
  *
- * Why: worktrees for WSL repos are created under ~/orca_botmux/workspaces inside
+ * Why: worktrees for WSL repos are created under ~/botmux/workspaces inside
  * the WSL filesystem, mirroring the Windows workspace layout. We need the
  * WSL user's $HOME to compute that path.
  */

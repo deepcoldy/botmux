@@ -27,7 +27,7 @@ function fetchThroughProxy(
 ): Promise<{ status: number; body: string; headers: http.IncomingHttpHeaders }> {
   const url = new URL(labeledUrl)
   return new Promise((resolve, reject) => {
-    // Why: *.orca_botmux.localhost is not resolvable DNS; connect to the proxy on
+    // Why: *.botmux.localhost is not resolvable DNS; connect to the proxy on
     // loopback and carry the label through the Host header instead.
     const request = http.request(
       {
@@ -108,7 +108,7 @@ describe('localhost worktree label proxy', () => {
     expect(result.body).toBe('ok')
   })
 
-  it('returns 404 for unregistered orca_botmux.localhost labels', async () => {
+  it('returns 404 for unregistered botmux.localhost labels', async () => {
     const port = await startUpstream((_request, response) => {
       response.end('ok')
     })
@@ -120,7 +120,7 @@ describe('localhost worktree label proxy', () => {
     })
     const proxyPort = new URL(url).port
 
-    const result = await fetchThroughProxy(`http://unknown-label.orca_botmux.localhost:${proxyPort}/`)
+    const result = await fetchThroughProxy(`http://unknown-label.botmux.localhost:${proxyPort}/`)
 
     expect(result.status).toBe(404)
   })

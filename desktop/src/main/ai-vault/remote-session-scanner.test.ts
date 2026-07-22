@@ -101,7 +101,7 @@ function jsonLines(records: unknown[]): string {
 }
 
 describe('scanRemoteAiVaultSessions', () => {
-  it('parses remote default and OrcaBotmux-managed Codex homes with SSH host ids', async () => {
+  it('parses remote default and Botmux-managed Codex homes with SSH host ids', async () => {
     const provider = new MemoryRemoteProvider()
     provider.addFile(
       '/home/ada/.codex/session_index.jsonl',
@@ -129,7 +129,7 @@ describe('scanRemoteAiVaultSessions', () => {
       10
     )
     provider.addFile(
-      '/home/ada/.local/share/orca_botmux/codex-runtime-home/home/sessions/runtime.jsonl',
+      '/home/ada/.local/share/botmux/codex-runtime-home/home/sessions/runtime.jsonl',
       jsonLines([
         {
           timestamp: '2026-07-04T02:00:00.000Z',
@@ -174,9 +174,9 @@ describe('scanRemoteAiVaultSessions', () => {
     expect(
       result.sessions.find((session) => session.sessionId === 'runtime-session')
     ).toMatchObject({
-      codexHome: '/home/ada/.local/share/orca_botmux/codex-runtime-home/home',
+      codexHome: '/home/ada/.local/share/botmux/codex-runtime-home/home',
       resumeCommand:
-        "cd '/home/ada/runtime-repo' && CODEX_HOME='/home/ada/.local/share/orca_botmux/codex-runtime-home/home' codex resume 'runtime-session'"
+        "cd '/home/ada/runtime-repo' && CODEX_HOME='/home/ada/.local/share/botmux/codex-runtime-home/home' codex resume 'runtime-session'"
     })
   })
 

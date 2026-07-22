@@ -135,7 +135,7 @@ export const LOCALE_PHRASE_FIXES = {
     { pattern: /会议/g, replacement: '会话', whenEnIncludes: 'session' },
     { pattern: /港口/g, replacement: '端口', whenEnIncludes: 'ort' },
     { pattern: /公关/g, replacement: 'PR', whenEnIncludes: 'PR' },
-    { pattern: /虎鲸:\/\//g, replacement: 'orca_botmux://', whenEnIncludes: 'orca_botmux://' },
+    { pattern: /虎鲸:\/\//g, replacement: 'botmux://', whenEnIncludes: 'botmux://' },
     { pattern: /代理商/g, replacement: '代理', whenEnIncludes: 'agent' },
     { pattern: /智能体/g, replacement: '代理', whenEnIncludes: 'agent' },
     { pattern: /分支机构/g, replacement: '分支', whenEnIncludes: 'ranch' },
@@ -169,11 +169,11 @@ export const LOCALE_PHRASE_FIXES = {
       whenEnIncludes: 'Listening for shortcut'
     },
     { pattern: /寻找捷径/g, replacement: '搜索快捷键', whenEnIncludes: 'Find shortcuts' },
-    { pattern: /连接到OrcaBotmux/g, replacement: '连接到 OrcaBotmux', whenEnIncludes: 'Connect to OrcaBotmux' },
+    { pattern: /连接到Botmux/g, replacement: '连接到 Botmux', whenEnIncludes: 'Connect to Botmux' },
     {
-      pattern: /开始使用OrcaBotmux/g,
-      replacement: '开始使用 OrcaBotmux',
-      whenEnIncludes: 'get started with OrcaBotmux'
+      pattern: /开始使用Botmux/g,
+      replacement: '开始使用 Botmux',
+      whenEnIncludes: 'get started with Botmux'
     },
     { pattern: /本机桌面/g, replacement: '原生桌面', whenEnIncludes: 'Native desktop' },
     { pattern: /当前的/g, replacement: '当前', whenEnIncludes: 'Current' },

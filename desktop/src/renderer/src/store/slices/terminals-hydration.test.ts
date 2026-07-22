@@ -694,7 +694,7 @@ describe('hydrateWorkspaceSession', () => {
 describe('hydrationSucceeded flag (issue #1158)', () => {
   it('defaults to false so the session writer is gated off at startup', () => {
     // Why: App.tsx only flips hydrationSucceeded=true after a clean load from
-    // orca-botmux-data.json. If a startup error prevents that call, the flag stays
+    // botmux-data.json. If a startup error prevents that call, the flag stays
     // false and the debounced writer never fires — protecting the user's good
     // on-disk state from being overwritten with an empty in-memory snapshot.
     const store = createTestStore()

@@ -86,7 +86,7 @@ export function searchWorktrees(
   const numericQuery = q.startsWith('#') ? q.slice(1) : q
   const results: PaletteSearchResult[] = []
 
-  // Support "repo/worktree" composite queries (e.g. "orca_botmux/main") so users can
+  // Support "repo/worktree" composite queries (e.g. "botmux/main") so users can
   // narrow by repo and worktree in a single token. Worktrees are identified by
   // their branch name here, so the right-hand side is matched against the
   // branch. We split on the FIRST slash only — branch names themselves contain

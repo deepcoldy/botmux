@@ -1,6 +1,6 @@
 import { measureClipboardTextByteLength } from '../../../shared/clipboard-text'
 
-export const LINEAR_BOARD_DRAG_ISSUE_MIME = 'application/x-orca-botmux-linear-issue-id'
+export const LINEAR_BOARD_DRAG_ISSUE_MIME = 'application/x-botmux-linear-issue-id'
 export const LINEAR_BOARD_DRAG_ISSUE_ID_MAX_BYTES = 1024
 
 export type LinearBoardIssueDragReadResult =

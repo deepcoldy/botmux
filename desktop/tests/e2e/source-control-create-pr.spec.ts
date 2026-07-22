@@ -1,5 +1,5 @@
 import type { Locator, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import type { CreateHostedReviewResult } from '../../src/shared/hosted-review'
 
@@ -119,7 +119,7 @@ async function seedCreatePREligibleBranch(
       number: 73,
       title: 'Create PR from E2E',
       state: 'open' as const,
-      url: 'https://github.com/acme/orca_botmux/pull/73',
+      url: 'https://github.com/acme/botmux/pull/73',
       checksStatus: 'pending' as const,
       updatedAt: '2026-05-15T00:00:00.000Z',
       mergeable: 'UNKNOWN' as const
@@ -185,7 +185,7 @@ async function seedCreatePREligibleBranch(
         return {
           ok: true as const,
           number: 73,
-          url: 'https://github.com/acme/orca_botmux/pull/73'
+          url: 'https://github.com/acme/botmux/pull/73'
         }
       }
     }))
@@ -197,25 +197,25 @@ async function seedCreatePREligibleBranch(
 }
 
 test.describe('Source Control create pull request', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('creates the pull request from the Source Control primary action', async ({ orcaBotmuxPage }) => {
-    const { branch, worktreeId } = await seedCreatePREligibleBranch(orcaBotmuxPage)
-    await openSourceControl(orcaBotmuxPage, worktreeId)
-    await forceCreatePREligibleStatus(orcaBotmuxPage, worktreeId, branch)
+  test('creates the pull request from the Source Control primary action', async ({ botmuxPage }) => {
+    const { branch, worktreeId } = await seedCreatePREligibleBranch(botmuxPage)
+    await openSourceControl(botmuxPage, worktreeId)
+    await forceCreatePREligibleStatus(botmuxPage, worktreeId, branch)
 
-    const titleInput = orcaBotmuxPage.getByRole('textbox', { name: 'Pull request title' })
-    const descriptionInput = orcaBotmuxPage.getByRole('textbox', {
+    const titleInput = botmuxPage.getByRole('textbox', { name: 'Pull request title' })
+    const descriptionInput = botmuxPage.getByRole('textbox', {
       name: 'Pull request description'
     })
-    const createButton = getCreatePRComposerSubmitButton(orcaBotmuxPage)
+    const createButton = getCreatePRComposerSubmitButton(botmuxPage)
     await expect(createButton).toBeVisible({ timeout: 10_000 })
     await expect(createButton).toBeEnabled()
     await expect(titleInput).toHaveValue('E2e secondary')
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
       'main'
     )
     await expect(descriptionInput).toHaveValue('')
@@ -226,7 +226,7 @@ test.describe('Source Control create pull request', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             () =>
               (window as unknown as { __createPRPayloads: CreatePRPayload[] }).__createPRPayloads
                 .length
@@ -235,7 +235,7 @@ test.describe('Source Control create pull request', () => {
       )
       .toBe(1)
 
-    const payloads = await orcaBotmuxPage.evaluate(
+    const payloads = await botmuxPage.evaluate(
       () => (window as unknown as { __createPRPayloads: CreatePRPayload[] }).__createPRPayloads
     )
     expect(payloads).toHaveLength(1)
@@ -250,34 +250,34 @@ test.describe('Source Control create pull request', () => {
   })
 
   test('surfaces create failures without clearing the pull request composer', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const failureMessage = 'Create PR failed: GitHub API rate limit exceeded'
-    const { branch, worktreeId } = await seedCreatePREligibleBranch(orcaBotmuxPage, {
+    const { branch, worktreeId } = await seedCreatePREligibleBranch(botmuxPage, {
       createResult: {
         ok: false,
         code: 'unknown',
         error: failureMessage
       }
     })
-    await openSourceControl(orcaBotmuxPage, worktreeId)
-    await forceCreatePREligibleStatus(orcaBotmuxPage, worktreeId, branch)
+    await openSourceControl(botmuxPage, worktreeId)
+    await forceCreatePREligibleStatus(botmuxPage, worktreeId, branch)
 
-    const titleInput = orcaBotmuxPage.getByRole('textbox', { name: 'Pull request title' })
-    const descriptionInput = orcaBotmuxPage.getByRole('textbox', {
+    const titleInput = botmuxPage.getByRole('textbox', { name: 'Pull request title' })
+    const descriptionInput = botmuxPage.getByRole('textbox', {
       name: 'Pull request description'
     })
-    const createButton = getCreatePRComposerSubmitButton(orcaBotmuxPage)
+    const createButton = getCreatePRComposerSubmitButton(botmuxPage)
     await expect(createButton).toBeVisible({ timeout: 10_000 })
     await titleInput.fill('Failing PR from E2E')
     await descriptionInput.fill('This draft should survive a failed create attempt.')
     await expect(createButton).toBeEnabled()
     await createButton.click()
 
-    await expect(orcaBotmuxPage.getByText(failureMessage)).toBeVisible()
+    await expect(botmuxPage.getByText(failureMessage)).toBeVisible()
     await expect(titleInput).toHaveValue('Failing PR from E2E')
     await expect(descriptionInput).toHaveValue('This draft should survive a failed create attempt.')
-    await expect(orcaBotmuxPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
+    await expect(botmuxPage.getByRole('textbox', { name: 'Pull request base branch' })).toHaveValue(
       'main'
     )
     await expect(createButton).toBeEnabled()

@@ -46,7 +46,8 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
   const {
     onOpenSettings,
     onOpenSetupGuide,
-    onOpenFeatureTour,
+    // Why: feature-wall / Explore product tour is UG surface — disabled for botmux.
+    // Keep the option on the type so callers can still pass a no-op handler.
     onOpenCrashReport,
     onCheckForUpdates,
     onBeforeReload,
@@ -112,9 +113,9 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
     click: () => onOpenSettings()
   }
 
-  // Why: feature-wall / Explore product tour is UG surface — disabled for orca_botmux.
+  // Why: feature-wall / Explore product tour is UG surface — disabled for botmux.
   const setupGuideItem: Electron.MenuItemConstructorOptions = {
-    label: translateMain('menu.gettingStarted', 'Getting Started with orca_botmux'),
+    label: translateMain('menu.gettingStarted', 'Getting Started with botmux'),
     click: (_menuItem, window) => onOpenSetupGuide(window)
   }
 
@@ -126,7 +127,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
   // Why: the macOS app-menu (named after the app) is mandatory on darwin and
   // owns hide/hideOthers/unhide/services/quit roles that only make sense in
   // the system menu bar. On Windows/Linux that menu would render as a
-  // redundant "orca_botmux" entry with roles that don't apply, so we omit it there
+  // redundant "botmux" entry with roles that don't apply, so we omit it there
   // and distribute its items across File / Help instead.
   const macAppMenu: Electron.MenuItemConstructorOptions = {
     label: options.appMenuLabel ?? app.name,
@@ -170,7 +171,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
         accelerator: 'CmdOrCtrl+V',
         click: () => {
           // Why: a focused terminal/native-chat pane is not a native editable
-          // control, so raw Electron paste cannot know which OrcaBotmux surface owns it.
+          // control, so raw Electron paste cannot know which Botmux surface owns it.
           BrowserWindow.getFocusedWindow()?.webContents.send('ui:appMenuPaste')
         }
       },
@@ -223,7 +224,7 @@ function buildAndApplyMenu(options: RegisterAppMenuOptions): void {
         click: () => onToggleAppearance('showAutomationsButton')
       },
       {
-        label: translateMain('menu.showMobileButton', 'Show OrcaBotmux Mobile Button'),
+        label: translateMain('menu.showMobileButton', 'Show Botmux Mobile Button'),
         type: 'checkbox',
         checked: appearance.showMobileButton,
         click: () => onToggleAppearance('showMobileButton')

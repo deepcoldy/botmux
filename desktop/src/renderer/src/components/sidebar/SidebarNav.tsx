@@ -38,7 +38,7 @@ export function shouldShowAutomationsButton(
 
 const SidebarNav = React.memo(function SidebarNav() {
   // Why: this memo boundary needs its own language subscription, while
-  // translate() preserves OrcaBotmux's pseudo-localization behavior.
+  // translate() preserves Botmux's pseudo-localization behavior.
   useTranslation()
   const worktreePaletteShortcutCombos = useShortcutKeyComboDetails('worktree.palette')
   const openAutomationsPage = useAppStore((s) => s.openAutomationsPage)
@@ -155,7 +155,7 @@ const SidebarNav = React.memo(function SidebarNav() {
                   strokeWidth={mobileActive ? 2.25 : 1.75}
                 />
                 <span className="min-w-0 flex-1 truncate">
-                  {translate('auto.components.sidebar.SidebarNav.1b5c41caee', 'OrcaBotmux Mobile')}
+                  {translate('auto.components.sidebar.SidebarNav.1b5c41caee', 'Botmux Mobile')}
                 </span>
                 {mobileOnboardingBadge.visible ? (
                   <span className="shrink-0 rounded-full bg-primary px-1.5 py-px text-[10px] font-semibold text-primary-foreground">

@@ -179,8 +179,8 @@ export async function submitFolderWorkspaceCreate({
       ? linkedName
       : name.trim() || linkedName || `${projectGroup.name} workspace`
   const launchPlatform = getFolderWorkspaceAgentLaunchPlatform(projectGroup)
-  // Why: an SSH folder group runs the plain `orca_botmux` relay shim, so the Linux-only
-  // `orca-botmux-ide` rename must not be applied for remote launches.
+  // Why: an SSH folder group runs the plain `botmux` relay shim, so the Linux-only
+  // `botmux-ide` rename must not be applied for remote launches.
   const launchIsRemote = Boolean(projectGroup.connectionId)
   const launchShell = resolveLocalWindowsAgentStartupShell({
     platform: launchPlatform,

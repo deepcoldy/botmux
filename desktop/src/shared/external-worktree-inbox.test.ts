@@ -14,7 +14,7 @@ import {
   shouldOfferNewExternalWorktreeInbox
 } from './external-worktree-inbox'
 import {
-  buildKnownOrcaWorkspaceLayouts,
+  buildKnownBotmuxWorkspaceLayouts,
   EXTERNAL_WORKTREE_VISIBILITY_ROLLOUT_AT,
   toDetectedWorktree
 } from './worktree-ownership'
@@ -22,7 +22,7 @@ import {
 const repo: Repo = {
   id: 'repo-1',
   path: '/repo',
-  displayName: 'orca_botmux',
+  displayName: 'botmux',
   badgeColor: '#000000',
   addedAt: Date.UTC(2026, 4, 24),
   externalWorktreeVisibility: 'hide',
@@ -66,7 +66,7 @@ function detectedResult(worktrees: DetectedWorktree[]): DetectedWorktreeListResu
 
 function makeSettings(): GlobalSettings {
   return {
-    workspaceDir: '/orca_botmux/workspaces',
+    workspaceDir: '/botmux/workspaces',
     nestWorkspaces: true,
     workspaceDirHistory: [],
     refreshLocalBaseRefOnWorktreeCreate: false,
@@ -150,7 +150,7 @@ describe('external worktree inbox', () => {
       hidden,
       baselined,
       detectedWorktree({ id: 'visible', visible: true }),
-      detectedWorktree({ id: 'orca-botmux-managed', ownership: 'orca-botmux-managed' })
+      detectedWorktree({ id: 'botmux-managed', ownership: 'botmux-managed' })
     ])
 
     expect(getHiddenExternalWorktrees(detected)).toEqual([hidden, baselined])
@@ -162,18 +162,18 @@ describe('external worktree inbox', () => {
     ).toEqual([hidden])
   })
 
-  it('offers metadata-free nested OrcaBotmux workspace worktrees through the inbox', () => {
+  it('offers metadata-free nested Botmux workspace worktrees through the inbox', () => {
     const settings = makeSettings()
     const manual = toDetectedWorktree({
       repo,
       settings,
       worktree: makeGitWorktree({
-        path: '/orca_botmux/workspaces/orca_botmux/manual-from-git',
+        path: '/botmux/workspaces/botmux/manual-from-git',
         displayName: 'manual-from-git',
         branch: 'refs/heads/manual-from-git',
         isMainWorktree: false
       }),
-      knownOrcaLayouts: buildKnownOrcaWorkspaceLayouts(settings, repo)
+      knownBotmuxLayouts: buildKnownBotmuxWorkspaceLayouts(settings, repo)
     })
 
     expect(manual.ownership).toBe('external')

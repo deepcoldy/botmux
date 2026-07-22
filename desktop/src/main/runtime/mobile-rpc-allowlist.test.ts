@@ -5,7 +5,7 @@ import { ALL_RPC_METHODS } from './rpc/methods'
 
 const MOBILE_DYNAMIC_RPC_METHODS = [
   // Botmux Feishu bridge (mobile session list / attach). Literals live under
-  // orca/mobile when developed as a sibling app; keep authorized even if the
+  // botmux/mobile when developed as a sibling app; keep authorized even if the
   // desktop package has no local mobile/ tree for source scanning.
   'botmuxBridge.getStatus',
   'botmuxBridge.listEndpoints',
@@ -76,13 +76,13 @@ function listSourceFiles(root: string): string[] {
 }
 
 function mobileSourceRoots(): string[] {
-  // Why: botmux/desktop may not vendor mobile/; orca monorepo keeps mobile as
+  // Why: botmux/desktop may not vendor mobile/; botmux monorepo keeps mobile as
   // a sibling. Prefer existing roots so allowlist audits still scan app code.
   const candidates = [
     join(process.cwd(), 'mobile/app'),
     join(process.cwd(), 'mobile/src'),
-    join(process.cwd(), '../../orca/mobile/app'),
-    join(process.cwd(), '../../orca/mobile/src')
+    join(process.cwd(), '../../botmux/mobile/app'),
+    join(process.cwd(), '../../botmux/mobile/src')
   ]
   return candidates.filter((root) => existsSync(root))
 }

@@ -131,7 +131,7 @@ describe('DashboardAgentRow', () => {
       makeAgent(
         {},
         {
-          prompt: 'You are working inside OrcaBotmux, a multi-agent IDE.',
+          prompt: 'You are working inside Botmux, a multi-agent IDE.',
           orchestration: {
             taskId: 'task-1',
             dispatchId: 'ctx-1',
@@ -143,7 +143,7 @@ describe('DashboardAgentRow', () => {
     )
 
     expect(markup).toContain('Fix checkout race')
-    expect(markup).not.toContain('You are working inside OrcaBotmux')
+    expect(markup).not.toContain('You are working inside Botmux')
   })
 
   it('uses the hover background as the focused-pane row highlight', () => {
@@ -319,7 +319,7 @@ describe('DashboardAgentRow', () => {
   it('reserves a real working tool line before tool metadata arrives', () => {
     const emptyToolMarkup = renderRow(makeAgent())
     const activeToolMarkup = renderRow(
-      makeAgent({}, { toolName: 'ListDir', toolInput: '/Users/nwparker/orca_botmux' })
+      makeAgent({}, { toolName: 'ListDir', toolInput: '/Users/nwparker/botmux' })
     )
 
     // Why: Antigravity emits working hooks without tool metadata between

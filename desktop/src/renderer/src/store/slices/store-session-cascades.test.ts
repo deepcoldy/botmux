@@ -121,7 +121,7 @@ function makeDetectedWorktreeResult(
     source: authoritative ? 'git' : 'metadata-fallback',
     worktrees: worktrees.map((worktree) => ({
       ...worktree,
-      ownership: 'orca-botmux-managed',
+      ownership: 'botmux-managed',
       selectedCheckout: false,
       visible: true
     }))
@@ -2095,7 +2095,7 @@ describe('hydrateEditorSession', () => {
 
   it('restores floating workspace markdown files without a repo worktree', () => {
     const store = createTestStore()
-    const filePath = '/orca_botmux/userData/floating-workspace/note.md'
+    const filePath = '/botmux/userData/floating-workspace/note.md'
     const fileId = ownedEditorFileId(filePath, FLOATING_TERMINAL_WORKTREE_ID, null)
 
     store.setState({ activeWorktreeId: FLOATING_TERMINAL_WORKTREE_ID })
@@ -2119,7 +2119,7 @@ describe('hydrateEditorSession', () => {
         ]
       },
       activeFileIdByWorktree: {
-        [FLOATING_TERMINAL_WORKTREE_ID]: '/orca_botmux/userData/floating-workspace/note.md'
+        [FLOATING_TERMINAL_WORKTREE_ID]: '/botmux/userData/floating-workspace/note.md'
       },
       activeTabTypeByWorktree: { [FLOATING_TERMINAL_WORKTREE_ID]: 'editor' }
     })
@@ -2141,7 +2141,7 @@ describe('hydrateEditorSession', () => {
 
   it('migrates hydrated front-matter visibility to owner-qualified editor file ids', () => {
     const store = createTestStore()
-    const filePath = '/orca_botmux/userData/floating-workspace/note.md'
+    const filePath = '/botmux/userData/floating-workspace/note.md'
     const fileId = ownedEditorFileId(filePath, FLOATING_TERMINAL_WORKTREE_ID, null)
 
     store.setState({ activeWorktreeId: FLOATING_TERMINAL_WORKTREE_ID })
@@ -2175,7 +2175,7 @@ describe('hydrateEditorSession', () => {
 
   it('drops legacy visible=true front-matter entries so upgraded sessions fall back to the visible default', () => {
     const store = createTestStore()
-    const filePath = '/orca_botmux/userData/floating-workspace/note.md'
+    const filePath = '/botmux/userData/floating-workspace/note.md'
     const fileId = ownedEditorFileId(filePath, FLOATING_TERMINAL_WORKTREE_ID, null)
 
     store.setState({ activeWorktreeId: FLOATING_TERMINAL_WORKTREE_ID })
@@ -2478,7 +2478,7 @@ describe('hydrateEditorSession', () => {
 
   it('migrates legacy floating unified tab file-path references to the hydrated owner id', () => {
     const store = createTestStore()
-    const filePath = '/orca_botmux/userData/floating-workspace/README.md'
+    const filePath = '/botmux/userData/floating-workspace/README.md'
     const fileId = ownedEditorFileId(filePath, FLOATING_TERMINAL_WORKTREE_ID, null)
     const groupId = 'floating-group-legacy'
 

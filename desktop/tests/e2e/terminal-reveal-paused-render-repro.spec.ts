@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { getActiveTabId, waitForSessionReady } from './helpers/store'
 import {
   execInTerminal,
@@ -183,10 +183,10 @@ async function forceWebglOn(page: Page, tabId: string): Promise<void> {
 }
 
 test.describe('terminal reveal paused-render recovery', () => {
-  test("reveal repaint forces a render through xterm's paused gate", async ({ orcaBotmuxPage }) => {
-    // Why: __store / __paneManagers live on the main OrcaBotmux renderer window
-    // (orcaBotmuxPage), not Playwright's default first page.
-    const page = orcaBotmuxPage
+  test("reveal repaint forces a render through xterm's paused gate", async ({ botmuxPage }) => {
+    // Why: __store / __paneManagers live on the main Botmux renderer window
+    // (botmuxPage), not Playwright's default first page.
+    const page = botmuxPage
     await waitForSessionReady(page)
     await waitForActiveTerminalManager(page)
     const tabId = (await getActiveTabId(page))!

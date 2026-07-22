@@ -111,7 +111,7 @@ export function isCursorNativeAgentTitle(title: string): boolean {
 
 // Why: `cursor` is also an ordinary editor noun that other agents type into their own
 // task-summary titles, so a name token is not identity. Cursor's identifying titles are
-// a closed set (the native literal plus the labels OrcaBotmux synthesizes from Cursor hooks),
+// a closed set (the native literal plus the labels Botmux synthesizes from Cursor hooks),
 // so match that vocabulary instead.
 export function isCursorAgentTitle(title: string | null | undefined): boolean {
   if (typeof title !== 'string') {

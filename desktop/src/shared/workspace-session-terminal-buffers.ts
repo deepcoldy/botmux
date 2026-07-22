@@ -1,6 +1,6 @@
 import type { Repo, WorkspaceSessionState } from './types'
 import {
-  ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
+  BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
   FLOATING_TERMINAL_WORKTREE_ID
 } from './constants'
 import { getRepoIdFromWorktreeId } from './worktree-id'
@@ -27,7 +27,7 @@ function shouldPreserveTerminalScrollbackBuffersForRepoMap(
   if (
     worktreeId === undefined ||
     worktreeId === FLOATING_TERMINAL_WORKTREE_ID ||
-    worktreeId === ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID
+    worktreeId === BOTMUX_MAIN_TERMINAL_WORKTREE_ID
   ) {
     return false
   }

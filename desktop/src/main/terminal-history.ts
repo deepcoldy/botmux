@@ -319,7 +319,7 @@ function gcScanRoot(
 }
 
 /** Run background GC to prune history directories for worktrees that are no
- *  longer in OrcaBotmux's known live-worktree set. */
+ *  longer in Botmux's known live-worktree set. */
 export function runHistoryGc(liveWorktreeIds: Set<string>): void {
   try {
     const main = gcScanRoot(getHistoryRoot(), liveWorktreeIds)

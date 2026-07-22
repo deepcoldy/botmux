@@ -104,7 +104,7 @@ export const SOURCE_CONTROL_ACTION_VARIABLE_INFO: Record<string, SourceControlAc
   {
     basePrompt: {
       description:
-        'OrcaBotmux’s built-in prompt for this action, including the context OrcaBotmux knows how to gather safely.',
+        'Botmux’s built-in prompt for this action, including the context Botmux knows how to gather safely.',
       example:
         'Commit messages include staged diff guidance; PR details include branch comparison guidance; fix actions include the failure summary.'
     },
@@ -146,11 +146,11 @@ export const SOURCE_CONTROL_ACTION_VARIABLE_INFO: Record<string, SourceControlAc
       example: 'diff --git a/src/app.ts b/src/app.ts\n+renderSourceControlActionCommandTemplate()'
     },
     firstPrompt: {
-      description: 'The first user request that created the OrcaBotmux workspace.',
+      description: 'The first user request that created the Botmux workspace.',
       example: 'Fix CI and commit the result'
     },
     assistantMessage: {
-      description: 'The initial agent response, when OrcaBotmux has one available.',
+      description: 'The initial agent response, when Botmux has one available.',
       example: 'I will inspect the failing check, patch the issue, and run tests.'
     }
   }

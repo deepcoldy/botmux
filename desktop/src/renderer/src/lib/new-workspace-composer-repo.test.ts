@@ -99,32 +99,32 @@ describe('new-workspace-composer-repo', () => {
   })
 
   describe('resolveComposerActiveRepoId', () => {
-    const localOrca = makeRepo('local-orca_botmux', { upstream: { owner: 'stablyai', repo: 'orca_botmux' } })
-    const runtimeOrca = makeRepo('runtime-orca_botmux', {
-      connectionId: 'runtime-ssh-orca-botmux-1',
-      upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+    const localBotmux = makeRepo('local-botmux', { upstream: { owner: 'stablyai', repo: 'botmux' } })
+    const runtimeBotmux = makeRepo('runtime-botmux', {
+      connectionId: 'runtime-ssh-botmux-1',
+      upstream: { owner: 'stablyai', repo: 'botmux' }
     })
     const otherProject = makeRepo('noqa', { upstream: { owner: 'stablyai', repo: 'noqa' } })
-    const repos = [otherProject, localOrca, runtimeOrca]
+    const repos = [otherProject, localBotmux, runtimeBotmux]
     const eligibleRepos = getComposerEligibleRepos(repos)
 
     it('maps an active runtime-owned SSH repo to its local same-project sibling', () => {
-      expect(resolveComposerActiveRepoId(repos, eligibleRepos, 'runtime-orca_botmux')).toBe('local-orca_botmux')
+      expect(resolveComposerActiveRepoId(repos, eligibleRepos, 'runtime-botmux')).toBe('local-botmux')
     })
 
     it('leaves a normal active repo unchanged', () => {
-      expect(resolveComposerActiveRepoId(repos, eligibleRepos, 'local-orca_botmux')).toBe('local-orca_botmux')
+      expect(resolveComposerActiveRepoId(repos, eligibleRepos, 'local-botmux')).toBe('local-botmux')
     })
 
     it('keeps the runtime repo id when no same-project sibling is eligible', () => {
-      const onlyRuntime = [runtimeOrca]
+      const onlyRuntime = [runtimeBotmux]
       expect(
         resolveComposerActiveRepoId(
           onlyRuntime,
           getComposerEligibleRepos(onlyRuntime),
-          'runtime-orca_botmux'
+          'runtime-botmux'
         )
-      ).toBe('runtime-orca_botmux')
+      ).toBe('runtime-botmux')
     })
 
     it('passes through null/undefined active repo', () => {

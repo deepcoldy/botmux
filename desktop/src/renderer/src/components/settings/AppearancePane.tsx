@@ -217,7 +217,7 @@ export function AppearancePane({
         </AppearanceSection>
       ) : null}
 
-      {/* Why: Code & Markdown is intentionally omitted. OrcaBotmux has no Appearance-level
+      {/* Why: Code & Markdown is intentionally omitted. Botmux has no Appearance-level
           code/markdown settings — the Monaco editor reuses the terminal font and
           there is no markdown-style or line-number setting — so a fourth row would
           be empty. We surface only the three sections that hold real controls

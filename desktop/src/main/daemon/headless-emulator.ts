@@ -2,7 +2,7 @@ import './xterm-env-polyfill'
 import { Terminal } from '@xterm/headless'
 import { SerializeAddon } from '@xterm/addon-serialize'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
-import { activateOrcaTerminalUnicodeProvider } from '../../shared/terminal-unicode-provider'
+import { activateBotmuxTerminalUnicodeProvider } from '../../shared/terminal-unicode-provider'
 import {
   readSavedCursorRegister,
   serializeWithAbsoluteCursor
@@ -119,7 +119,7 @@ export class HeadlessEmulator {
     // differently here than on screen, so the mirrored buffer accumulates
     // cell-shifted tears that snapshot restores then paint back as garbage.
     this.terminal.loadAddon(new Unicode11Addon())
-    activateOrcaTerminalUnicodeProvider(this.terminal)
+    activateBotmuxTerminalUnicodeProvider(this.terminal)
 
     // Why onData is gated behind onQueryReply: by default this emulator is
     // pure state tracking and MUST NOT respond to terminal query sequences

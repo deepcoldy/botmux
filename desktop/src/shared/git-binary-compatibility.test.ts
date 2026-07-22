@@ -16,9 +16,9 @@ import {
 import { gitCredentialPromptGuardEnv } from './git-credential-prompt-env'
 
 const execFileAsync = promisify(execFile)
-const image = process.env.ORCA_GIT_COMPAT_IMAGE
-const binary = process.env.ORCA_GIT_COMPAT_BINARY
-const expectedVersion = process.env.ORCA_GIT_COMPAT_VERSION
+const image = process.env.BOTMUX_GIT_COMPAT_IMAGE
+const binary = process.env.BOTMUX_GIT_COMPAT_BINARY
+const expectedVersion = process.env.BOTMUX_GIT_COMPAT_VERSION
 const describeBinaryCompatibility = image || binary ? describe : describe.skip
 
 type GitResult = { stdout: string; stderr: string }
@@ -81,7 +81,7 @@ describeBinaryCompatibility('real Git binary compatibility', () => {
   }
 
   beforeAll(async () => {
-    repoPath = await mkdtemp(join(tmpdir(), 'orca-botmux-git-binary-compat-'))
+    repoPath = await mkdtemp(join(tmpdir(), 'botmux-git-binary-compat-'))
     const versionOutput = await runGit(['--version'])
     expect(versionOutput.stdout).toContain(`git version ${expectedVersion}`)
     const match = versionOutput.stdout.match(/git version (\d+)\.(\d+)/)
@@ -114,7 +114,7 @@ describeBinaryCompatibility('real Git binary compatibility', () => {
 
     // Why: the `prunable` porcelain annotation landed in Git 2.31 — five
     // releases before `-z` (2.36) — so only Git <2.31 emits neither and needs
-    // OrcaBotmux's path-existence fallback (issue #8389).
+    // Botmux's path-existence fallback (issue #8389).
     await runGit(['worktree', 'add', '-b', 'compat-stale', 'stale-wt'])
     await rm(join(repoPath, 'stale-wt'), { recursive: true, force: true })
     const staleList = await runGit(['worktree', 'list', '--porcelain'])

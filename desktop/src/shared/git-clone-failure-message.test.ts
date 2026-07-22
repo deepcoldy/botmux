@@ -10,33 +10,33 @@ describe('getGitCloneFailureMessage', () => {
     expect(
       getGitCloneFailureMessage(
         [
-          'Cloning into \u001b[32morca\u001b[0m...\r',
-          "fatal: destination path 'orca_botmux' already exists and is not an empty directory.\n"
+          'Cloning into \u001b[32mbotmux\u001b[0m...\r',
+          "fatal: destination path 'botmux' already exists and is not an empty directory.\n"
         ].join(''),
-        { clonePath: '/work/orca_botmux' }
+        { clonePath: '/work/botmux' }
       )
     ).toBe(
-      'Destination already exists and is not empty: /work/orca_botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
+      'Destination already exists and is not empty: /work/botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
     )
   })
 
   it('prefers the last fatal line over a trailing fragment', () => {
     expect(
       getGitCloneFailureMessage(
-        "fatal: destination path 'orca_botmux' already exists and is not an empty directory.\r\nand the repository exists.\n"
+        "fatal: destination path 'botmux' already exists and is not an empty directory.\r\nand the repository exists.\n"
       )
     ).toBe(
-      'Destination already exists and is not empty: orca_botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
+      'Destination already exists and is not empty: botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
     )
   })
 
   it('uses the known clone path for relay destination fragments', () => {
     expect(
       getGitCloneFailureMessage('Clone failed: and the repository exists.', {
-        clonePath: '/srv/orca_botmux'
+        clonePath: '/srv/botmux'
       })
     ).toBe(
-      'Destination already exists and is not empty: /srv/orca_botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
+      'Destination already exists and is not empty: /srv/botmux. Choose a different parent folder, delete the existing folder, or add the existing repository instead.'
     )
   })
 

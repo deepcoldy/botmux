@@ -25,7 +25,7 @@ export const EphemeralVmCleanupStatusSchema = z.enum([
 
 export type EphemeralVmCleanupStatus = z.infer<typeof EphemeralVmCleanupStatusSchema>
 
-export const EphemeralVmRuntimeConnectionModeSchema = z.enum(['orca-botmux-server', 'ssh'])
+export const EphemeralVmRuntimeConnectionModeSchema = z.enum(['botmux-server', 'ssh'])
 
 export type EphemeralVmRuntimeConnectionMode = z.infer<
   typeof EphemeralVmRuntimeConnectionModeSchema

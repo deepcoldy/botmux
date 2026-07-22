@@ -118,7 +118,7 @@ describe('simulator-palette-search', () => {
       {
         tab: makeTab({ label: 'Phone Preview' }),
         worktree: makeWorktree({ displayName: 'Checkout Flow' }),
-        repoName: 'orca_botmux/mobile-client',
+        repoName: 'botmux/mobile-client',
         worktreeSortIndex: 1,
         isCurrentTab: false,
         isCurrentWorktree: false

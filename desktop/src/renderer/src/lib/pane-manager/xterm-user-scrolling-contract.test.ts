@@ -2,7 +2,7 @@
  * Contract test for xterm's native user-scrolling ownership (vendored
  * 6.1.0-beta.287; @xterm/headless shares BufferService with @xterm/xterm).
  *
- * OrcaBotmux's live PTY write path performs NO scroll-intent enforcement — it
+ * Botmux's live PTY write path performs NO scroll-intent enforcement — it
  * relies on xterm core keeping a scrolled-up viewport stable and following
  * output at the bottom (BufferService.isUserScrolling, consumed atomically
  * inside scroll()). App-side enforcement is scoped to structural operations
@@ -100,7 +100,7 @@ describe('xterm native user-scrolling contract (vendored 6.1.0-beta.287)', () =>
 
     term.input('a', true)
 
-    // Why: OrcaBotmux resyncs typing intent synchronously from onData, so this
+    // Why: Botmux resyncs typing intent synchronously from onData, so this
     // xterm ordering is part of the pinned-version contract.
     expect(viewportSeenByOnData).toBe(buffer.baseY)
     subscription.dispose()
@@ -151,7 +151,7 @@ describe('xterm native user-scrolling contract (vendored 6.1.0-beta.287)', () =>
     const bufferService = term._core?._bufferService
     expect(typeof bufferService?.isUserScrolling).toBe('boolean')
 
-    // scrollLines/scrollToBottom self-manage the flag, so OrcaBotmux's programmatic
+    // scrollLines/scrollToBottom self-manage the flag, so Botmux's programmatic
     // scroll restores inherit xterm's native live-output ownership.
     expect(bufferService?.isUserScrolling).toBe(false)
     term.scrollLines(-5)

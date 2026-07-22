@@ -40,11 +40,11 @@ if (
   )
 }
 
-const sandbox = await mkdtemp(path.join(tmpdir(), 'orca-botmux-skill-update-roundtrip-'))
+const sandbox = await mkdtemp(path.join(tmpdir(), 'botmux-skill-update-roundtrip-'))
 const home = path.join(sandbox, 'home')
 const stateHome = path.join(home, '.state')
 const fakeBin = path.join(sandbox, 'bin')
-const targetName = 'orca-botmux-cli'
+const targetName = 'botmux-cli'
 const controlName = 'orchestration'
 const manifest = JSON.parse(await readFile('resources/skills/current-manifest.json', 'utf8'))
 const registry = JSON.parse(await readFile('resources/skills/snapshot-registry.json', 'utf8'))

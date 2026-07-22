@@ -8,9 +8,9 @@ import {
 
 describe('getDefaultSettings', () => {
   it('uses platform-consistent separators for the default workspace directory', () => {
-    expect(getDefaultSettings('/Users/alice').workspaceDir).toBe('/Users/alice/orca_botmux/workspaces')
+    expect(getDefaultSettings('/Users/alice').workspaceDir).toBe('/Users/alice/botmux/workspaces')
     expect(getDefaultSettings('C:\\Users\\alice').workspaceDir).toBe(
-      'C:\\Users\\alice\\orca_botmux\\workspaces'
+      'C:\\Users\\alice\\botmux\\workspaces'
     )
   })
 

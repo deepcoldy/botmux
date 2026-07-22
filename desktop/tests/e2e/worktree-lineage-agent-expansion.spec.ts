@@ -1,14 +1,14 @@
 import type { Page } from '@stablyai/playwright-test'
 import { mkdirSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { seedLineageScenario } from './worktree-lineage-state'
 import { worktreeRow } from './worktree-row-locators'
 
-// Set ORCA_CAPTURE_EVIDENCE=1 to also write before/after screenshots to
+// Set BOTMUX_CAPTURE_EVIDENCE=1 to also write before/after screenshots to
 // pr-evidence/. Off by default so CI just runs the behavioral assertions.
-const CAPTURE_EVIDENCE = process.env.ORCA_CAPTURE_EVIDENCE === '1'
+const CAPTURE_EVIDENCE = process.env.BOTMUX_CAPTURE_EVIDENCE === '1'
 const SHOT_DIR = resolve(process.cwd(), 'pr-evidence')
 
 async function captureSidebar(page: Page, name: string): Promise<void> {
@@ -72,41 +72,41 @@ function childWorkspacesChip(page: Page, parentId: string) {
 test.describe('Worktree lineage agent-list expansion independence', () => {
   test.describe.configure({ mode: 'serial' })
 
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   test('toggling child worktrees does not collapse the expanded agent summary', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const { parentId, childId } = await seedLineageScenario(orcaBotmuxPage)
-    const parentRow = worktreeRow(orcaBotmuxPage, parentId)
-    const childRow = worktreeRow(orcaBotmuxPage, childId)
+    const { parentId, childId } = await seedLineageScenario(botmuxPage)
+    const parentRow = worktreeRow(botmuxPage, parentId)
+    const childRow = worktreeRow(botmuxPage, childId)
 
     await parentRow.click()
     await expect(parentRow).toHaveAttribute('aria-current', 'page')
 
-    await seedTwoParentAgents(orcaBotmuxPage, parentId)
+    await seedTwoParentAgents(botmuxPage, parentId)
 
     // Both sections present: the "2 agents" summary and the child-workspaces chip.
-    await expect(compactSummary(orcaBotmuxPage, parentId)).toBeVisible({ timeout: 10_000 })
-    await expect(childWorkspacesChip(orcaBotmuxPage, parentId)).toBeVisible()
+    await expect(compactSummary(botmuxPage, parentId)).toBeVisible({ timeout: 10_000 })
+    await expect(childWorkspacesChip(botmuxPage, parentId)).toBeVisible()
     await expect(childRow).toBeVisible()
-    await expect(compactSummary(orcaBotmuxPage, parentId)).toHaveAttribute('aria-expanded', 'false')
-    await captureSidebar(orcaBotmuxPage, '1-before-both-collapsed.png')
+    await expect(compactSummary(botmuxPage, parentId)).toHaveAttribute('aria-expanded', 'false')
+    await captureSidebar(botmuxPage, '1-before-both-collapsed.png')
 
     // Expand the agent summary.
-    await compactSummary(orcaBotmuxPage, parentId).click()
-    await expect(compactSummary(orcaBotmuxPage, parentId)).toHaveAttribute('aria-expanded', 'true')
-    await captureSidebar(orcaBotmuxPage, '2-agents-expanded.png')
+    await compactSummary(botmuxPage, parentId).click()
+    await expect(compactSummary(botmuxPage, parentId)).toHaveAttribute('aria-expanded', 'true')
+    await captureSidebar(botmuxPage, '2-agents-expanded.png')
 
     // Collapse the child worktrees via the chip. This remounts the parent card.
-    await childWorkspacesChip(orcaBotmuxPage, parentId).click()
+    await childWorkspacesChip(botmuxPage, parentId).click()
     await expect(childRow).toBeHidden()
 
     // FIXED: the agent summary stays expanded despite the card remount.
-    await expect(compactSummary(orcaBotmuxPage, parentId)).toHaveAttribute('aria-expanded', 'true')
-    await captureSidebar(orcaBotmuxPage, '3-after-children-toggle-agents-still-expanded.png')
+    await expect(compactSummary(botmuxPage, parentId)).toHaveAttribute('aria-expanded', 'true')
+    await captureSidebar(botmuxPage, '3-after-children-toggle-agents-still-expanded.png')
   })
 })

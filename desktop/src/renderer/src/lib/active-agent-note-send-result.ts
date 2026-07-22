@@ -39,8 +39,8 @@ export function activeAgentNotesSendFailureMessage(
       return `The ${target} terminal did not accept the notes.`
     case 'partial-submit-failed':
       return options.explicitTarget
-        ? 'The notes may already be pasted in the selected terminal, but OrcaBotmux could not submit them.'
-        : 'The notes may already be pasted in the active terminal, but OrcaBotmux could not submit them.'
+        ? 'The notes may already be pasted in the selected terminal, but Botmux could not submit them.'
+        : 'The notes may already be pasted in the active terminal, but Botmux could not submit them.'
     case 'sent':
       return ''
   }

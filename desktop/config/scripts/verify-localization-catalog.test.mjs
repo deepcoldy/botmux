@@ -15,7 +15,7 @@ function readJson(filePath) {
 }
 
 function makeProject({ sourceText, enCatalog = {}, esCatalog = {} }) {
-  const root = mkdtempSync(path.join(tmpdir(), 'orca-botmux-localization-catalog-'))
+  const root = mkdtempSync(path.join(tmpdir(), 'botmux-localization-catalog-'))
   const rendererDir = path.join(root, 'src', 'renderer', 'src', 'components')
   const mainDir = path.join(root, 'src', 'main')
   const localesDir = path.join(root, 'src', 'renderer', 'src', 'i18n', 'locales')
@@ -36,7 +36,7 @@ describe('verify-localization-catalog', () => {
   it('bootstraps missing catalog entries from string fallbacks', async () => {
     const { root, localesDir } = makeProject({
       sourceText:
-        "import { translate } from '@/i18n/i18n'\nexport const label = translate('auto.example.greeting', 'Hello {{name}}', { name: 'orca_botmux' })\n"
+        "import { translate } from '@/i18n/i18n'\nexport const label = translate('auto.example.greeting', 'Hello {{name}}', { name: 'botmux' })\n"
     })
 
     await expect(verifyLocalizationCatalog(root, { fix: false })).resolves.toBe(1)
@@ -53,7 +53,7 @@ describe('verify-localization-catalog', () => {
   it('repairs stale locale keys and interpolation mismatches', async () => {
     const { root, localesDir } = makeProject({
       sourceText:
-        "import { translate } from '@/i18n/i18n'\nexport const label = translate('auto.example.greeting', 'Hello {{name}}', { name: 'orca_botmux' })\n",
+        "import { translate } from '@/i18n/i18n'\nexport const label = translate('auto.example.greeting', 'Hello {{name}}', { name: 'botmux' })\n",
       enCatalog: { auto: { example: { greeting: 'Hello {{name}}' } } },
       esCatalog: {
         auto: {

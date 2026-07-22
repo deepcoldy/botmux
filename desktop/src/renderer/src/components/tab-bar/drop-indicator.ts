@@ -29,9 +29,12 @@ export const ACTIVE_TAB_INDICATOR_CLASSES =
   'pointer-events-none absolute inset-x-0 bottom-0 h-[2px] bg-[color-mix(in_srgb,var(--foreground)_60%,var(--card))] z-10'
 
 export function getTabRootStateClasses(isActive: boolean): string {
+  // Why: Apple "kill latency" — inactive tabs get a whisper hover wash and a
+  // slightly deeper press wash, with a spring-curve color transition.
+  const motion = 'transition-colors duration-150 ease-[cubic-bezier(0.32,0.72,0,1)]'
   return isActive
-    ? 'bg-[color-mix(in_srgb,var(--foreground)_6%,var(--card))] text-foreground'
-    : 'bg-card text-muted-foreground hover:text-foreground'
+    ? `bg-[color-mix(in_srgb,var(--foreground)_6%,var(--card))] text-foreground ${motion}`
+    : `bg-card text-muted-foreground hover:bg-[color-mix(in_srgb,var(--foreground)_3%,var(--card))] hover:text-foreground active:bg-[color-mix(in_srgb,var(--foreground)_5%,var(--card))] ${motion}`
 }
 
 export function getTabStripBorderClasses(

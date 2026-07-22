@@ -1,7 +1,7 @@
 import type { Page } from '@stablyai/playwright-test'
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   getTerminalContent,
@@ -168,41 +168,41 @@ function median(values: number[]): number {
 }
 
 test.describe('local Codex terminal typing latency', () => {
-  test('keeps Codex prompt typing responsive @local-real-codex', async ({ orcaBotmuxPage }, testInfo) => {
+  test('keeps Codex prompt typing responsive @local-real-codex', async ({ botmuxPage }, testInfo) => {
     test.skip(
-      process.env.ORCA_E2E_REAL_CODEX !== '1',
-      'Set ORCA_E2E_REAL_CODEX=1 to exercise the locally installed Codex TUI'
+      process.env.BOTMUX_E2E_REAL_CODEX !== '1',
+      'Set BOTMUX_E2E_REAL_CODEX=1 to exercise the locally installed Codex TUI'
     )
     test.skip(process.platform === 'win32', 'local Codex command is POSIX-shell oriented')
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const codexSource = path.join(process.env.HOME ?? '', 'projects', 'codex')
     const launchCommand =
       `cd ${JSON.stringify(codexSource)} && ` +
       'codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust\r'
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, launchCommand)
-      await dismissCodexPromptsIfPresent(orcaBotmuxPage)
-      await waitForCodexReady(orcaBotmuxPage)
-      await focusActiveTerminalInput(orcaBotmuxPage)
-      await forceCursorProbeTheme(orcaBotmuxPage)
-      const blinkSamples = await sampleCursorBlink(orcaBotmuxPage)
+      await sendToTerminal(botmuxPage, ptyId, launchCommand)
+      await dismissCodexPromptsIfPresent(botmuxPage)
+      await waitForCodexReady(botmuxPage)
+      await focusActiveTerminalInput(botmuxPage)
+      await forceCursorProbeTheme(botmuxPage)
+      const blinkSamples = await sampleCursorBlink(botmuxPage)
 
       const runId = randomUUID().replaceAll('-', '').slice(0, 8)
-      const prompt = `orca_botmux_codex_latency_${runId}`
+      const prompt = `botmux_codex_latency_${runId}`
       const latencies: number[] = []
       let typed = ''
       for (const char of prompt) {
         typed += char
         const start = performance.now()
-        await orcaBotmuxPage.keyboard.type(char)
-        await waitForPromptText(orcaBotmuxPage, typed)
+        await botmuxPage.keyboard.type(char)
+        await waitForPromptText(botmuxPage, typed)
         latencies.push(performance.now() - start)
       }
 
@@ -226,7 +226,7 @@ test.describe('local Codex terminal typing latency', () => {
       expect(medianLatency).toBeLessThan(MAX_MEDIAN_KEY_LATENCY_MS)
       expect(worstLatency).toBeLessThan(MAX_WORST_KEY_LATENCY_MS)
     } finally {
-      await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+      await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
     }
   })
 })

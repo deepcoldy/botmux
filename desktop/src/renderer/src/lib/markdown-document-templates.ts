@@ -7,7 +7,7 @@ import {
 } from '@/runtime/runtime-file-client'
 import { basename, joinPath, normalizeRelativePath } from './path'
 
-const MARKDOWN_TEMPLATE_ROOT = '.orca_botmux/templates'
+const MARKDOWN_TEMPLATE_ROOT = '.botmux/templates'
 const MARKDOWN_TEMPLATE_MAX_DEPTH = 8
 const MARKDOWN_TEMPLATE_MAX_COUNT = 100
 

@@ -44,7 +44,7 @@ export const KO_VALUE_OVERRIDES = {
   'Issue #{{value0}}': '이슈 #{{value0}}',
   'Linked issue #{{value0}}': '연결된 이슈 #{{value0}}',
   'Issue # or GitHub URL': '이슈 # 또는 GitHub URL',
-  'Add OrcaBotmux attribution to commits, PRs, and issues.': '커밋, PR 및 이슈에 OrcaBotmux 속성을 추가합니다.',
+  'Add Botmux attribution to commits, PRs, and issues.': '커밋, PR 및 이슈에 Botmux 속성을 추가합니다.',
   'Paste an issue URL, or enter a number. Leave blank to remove the link.':
     '이슈 URL을 붙여넣거나 숫자를 입력하세요. 링크를 제거하려면 비워두세요.',
   'Connect Linear in Settings to search issues.': '이슈를 검색하려면 설정에서 Linear를 연결하세요.',
@@ -61,8 +61,8 @@ export const KO_VALUE_OVERRIDES = {
   'Pull requests, issues, and checks via the': 'PR, 이슈 및 검사는 다음을 통해 이루어집니다.',
   'Merge requests, issues, todos, and pipelines via the':
     '다음을 통해 MR, 이슈, 할 일, 파이프라인을 병합합니다.',
-  'OrcaBotmux uses the GitHub CLI (gh) to show pull requests, issues, and checks.':
-    'OrcaBotmux는 GitHub CLI(gh)를 사용하여 PR, 이슈 및 검사를 표시합니다.',
+  'Botmux uses the GitHub CLI (gh) to show pull requests, issues, and checks.':
+    'Botmux는 GitHub CLI(gh)를 사용하여 PR, 이슈 및 검사를 표시합니다.',
   'Shared hook and issue-automation defaults are defined in the repo and available to everyone who uses it.':
     '공유 후크 및 이슈 자동화 기본값은 저장소에 정의되어 있으며 이를 사용하는 모든 사람이 사용할 수 있습니다.',
   DRAFT_ISSUE: 'DRAFT_ISSUE',
@@ -136,7 +136,7 @@ export const KO_VALUE_OVERRIDES = {
   'Browser Use skill': 'Browser Use 스킬',
   'Computer Use skill': 'Computer Use 스킬',
   'CLI skill': 'CLI 스킬',
-  'OrcaBotmux CLI skill': 'OrcaBotmux CLI 스킬',
+  'Botmux CLI skill': 'Botmux CLI 스킬',
   'No checks reported yet': '아직 보고된 체크가 없습니다.',
   'This pull request has no reported checks yet': '이 PR에는 아직 보고된 체크가 없습니다.',
   'Keyboard shortcuts for common actions.': '일반 작업에 대한 키보드 단축키입니다.',
@@ -173,8 +173,8 @@ export const KO_VALUE_OVERRIDES = {
     '로컬 또는 호스팅 PR 병합 충돌에 대한 에이전트를 시작합니다.',
   'Review the workspace error below, then refresh.':
     '아래 워크스페이스 오류를 확인한 후 새로고침하세요.',
-  'Review inactive workspaces before deleting their local files and OrcaBotmux state.':
-    '로컬 파일과 OrcaBotmux 상태를 삭제하기 전에 비활성 워크스페이스를 확인하세요.',
+  'Review inactive workspaces before deleting their local files and Botmux state.':
+    '로컬 파일과 Botmux 상태를 삭제하기 전에 비활성 워크스페이스를 확인하세요.',
   'Review inactive workspaces (': '비활성 워크스페이스 확인(',
   'Review the settings that will be imported from your Ghostty config.':
     'Ghostty 구성에서 가져올 설정을 확인하세요.',
@@ -206,8 +206,8 @@ export const KO_VALUE_OVERRIDES = {
   Keep: '유지',
   'check #': '체크 #',
   'to submit.': '제출.',
-  'Install the OrcaBotmux skill so agents know to use the OrcaBotmux CLI.':
-    '에이전트가 OrcaBotmux CLI를 사용하도록 OrcaBotmux 스킬을 설치하세요.',
+  'Install the Botmux skill so agents know to use the Botmux CLI.':
+    '에이전트가 Botmux CLI를 사용하도록 Botmux 스킬을 설치하세요.',
   'Local project, Git repo, or folder with many repos':
     '로컬 프로젝트, Git repo 또는 repos가 많은 폴더',
   'Linear, GitLab, Bitbucket, Azure DevOps, Gitea, and Jira live in Settings > Integrations.':
@@ -218,8 +218,8 @@ export const KO_VALUE_OVERRIDES = {
     '에이전트를 시작하기 전에 전체 명령 입력을 리뷰하고 편집하세요.',
   'Create a {{value0}} to start checks and review.':
     '체크와 리뷰를 시작하려면 {{value0}}을(를) 만드세요.',
-  "Control OrcaBotmux from your phone. Check on agents, review changes, and kick off tasks while you're away from your desk.":
-    '휴대폰에서 OrcaBotmux를 제어하세요. 자리를 비운 동안 에이전트를 확인하고, 변경 사항을 리뷰하고, 작업을 시작하세요.',
+  "Control Botmux from your phone. Check on agents, review changes, and kick off tasks while you're away from your desk.":
+    '휴대폰에서 Botmux를 제어하세요. 자리를 비운 동안 에이전트를 확인하고, 변경 사항을 리뷰하고, 작업을 시작하세요.',
   'Skill command copied and inserted below for review.':
     '리뷰를 위해 스킬 명령을 아래에 복사하여 삽입했습니다.',
   'X finishes, send it the review task.”': 'X가 끝나면 리뷰 작업을 보냅니다.”',

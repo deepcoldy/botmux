@@ -10,7 +10,7 @@ type RepoOwnerState = {
 /** Resolve the runtime settings to route a GitHub Project row mutation through.
  *  When the row's `owner/repo` slug matches a known repo, route by that repo's
  *  owner host; otherwise fall back to the focused settings (the row may belong
- *  to a repo OrcaBotmux doesn't track). */
+ *  to a repo Botmux doesn't track). */
 export function settingsForProjectRowOwner(
   state: RepoOwnerState,
   owner: string,

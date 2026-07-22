@@ -1,4 +1,4 @@
-// Why: declares the OrcaBotmux runtime RPC compatibility contract. Desktop,
+// Why: declares the Botmux runtime RPC compatibility contract. Desktop,
 // headless server, CLI, and mobile builds may drift in app version, but
 // they must agree on this protocol range before runtime RPCs are allowed.
 //

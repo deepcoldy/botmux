@@ -1,6 +1,6 @@
 // Diagnostic bundle collection + upload (Mode 3 from
 // telemetry-error-tracking.md). The single user-initiated network path from
-// the error-tracking lane to OrcaBotmux infrastructure. Every step here implements
+// the error-tracking lane to Botmux infrastructure. Every step here implements
 // a hardening requirement from §Endpoint contract — the comments name the
 // requirement number when they apply.
 //
@@ -48,7 +48,7 @@ export type CollectBundleOptions = {
   readonly platform: string
   readonly arch: string
   readonly osRelease: string
-  readonly orcaChannel: 'stable' | 'rc' | 'dev'
+  readonly botmuxChannel: 'stable' | 'rc' | 'dev'
 }
 
 export type CollectedBundle = {
@@ -69,7 +69,7 @@ type BundleHeader = {
   readonly platform: string
   readonly arch: string
   readonly os_release: string
-  readonly orca_botmux_channel: 'stable' | 'rc' | 'dev'
+  readonly botmux_channel: 'stable' | 'rc' | 'dev'
   readonly collected_at: string
   readonly schema_version: 1
 }
@@ -108,7 +108,7 @@ export function collectBundle(opts: CollectBundleOptions): CollectedBundle {
     platform: opts.platform,
     arch: opts.arch,
     os_release: opts.osRelease,
-    orca_botmux_channel: opts.orcaChannel,
+    botmux_channel: opts.botmuxChannel,
     collected_at: new Date().toISOString(),
     schema_version: 1
   }

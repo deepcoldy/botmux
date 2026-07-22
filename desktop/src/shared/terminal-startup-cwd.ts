@@ -1,13 +1,13 @@
-import { FLOATING_TERMINAL_WORKTREE_ID, ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID } from './constants'
+import { FLOATING_TERMINAL_WORKTREE_ID, BOTMUX_MAIN_TERMINAL_WORKTREE_ID } from './constants'
 import { resolveRuntimePath } from './cross-platform-path'
 import { parseWorkspaceKey } from './workspace-scope'
 import { splitWorktreeIdForFilesystem } from './worktree-id'
 
-function isOrcaBotmuxSyntheticWorkspaceId(workspaceId: string): boolean {
+function isBotmuxSyntheticWorkspaceId(workspaceId: string): boolean {
   return (
-    workspaceId === ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID ||
-    workspaceId.startsWith('orca_botmux:agent:') ||
-    workspaceId.startsWith('orca_botmux:session:')
+    workspaceId === BOTMUX_MAIN_TERMINAL_WORKTREE_ID ||
+    workspaceId.startsWith('botmux:agent:') ||
+    workspaceId.startsWith('botmux:session:')
   )
 }
 
@@ -62,10 +62,10 @@ export function resolveTerminalStartupCwdForWorkspace(args: {
     // resolved against the trusted-directory grants in resolveFloatingTerminalCwd.
     return args.requestedCwd
   }
-  // Why: orca_botmux agent/session hosts are not repoId::path worktrees. Their
+  // Why: botmux agent/session hosts are not repoId::path worktrees. Their
   // ids may contain `::` (legacy) or encoded agent keys; never treat those
   // segments as a local workspace root (DaemonProtocolError on fake paths).
-  if (args.workspaceId && isOrcaBotmuxSyntheticWorkspaceId(args.workspaceId)) {
+  if (args.workspaceId && isBotmuxSyntheticWorkspaceId(args.workspaceId)) {
     return args.requestedCwd
   }
   const workspacePath = resolveTerminalWorkspacePath(
@@ -87,7 +87,7 @@ function resolveTerminalWorkspacePath(
   if (!workspaceId) {
     return null
   }
-  if (isOrcaBotmuxSyntheticWorkspaceId(workspaceId)) {
+  if (isBotmuxSyntheticWorkspaceId(workspaceId)) {
     return null
   }
   const scope = parseWorkspaceKey(workspaceId)

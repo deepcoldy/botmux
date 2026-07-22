@@ -95,7 +95,7 @@ export async function runRendererBackpressureRevisitScenario<
   maxWorstKeyLatencyMs,
   mainRendererPressureTargetChars,
   pressureOutputChars,
-  orcaBotmuxPage,
+  botmuxPage,
   testInfo,
   testRepoPath
 }: {
@@ -108,13 +108,13 @@ export async function runRendererBackpressureRevisitScenario<
   maxWorstKeyLatencyMs: number
   mainRendererPressureTargetChars: number
   pressureOutputChars: number
-  orcaBotmuxPage: Page
+  botmuxPage: Page
   testInfo: TestInfo
   testRepoPath: string
 }): Promise<void> {
-  await waitForSessionReady(orcaBotmuxPage)
-  const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-  const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find((id) => id !== firstWorktreeId)
+  await waitForSessionReady(botmuxPage)
+  const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+  const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find((id) => id !== firstWorktreeId)
   expect(Boolean(secondWorktreeId), 'renderer backpressure revisit needs a second worktree').toBe(
     true
   )
@@ -124,53 +124,53 @@ export async function runRendererBackpressureRevisitScenario<
 
   const runId = randomUUID()
   const typingPtyReadyMarker = `OPENCODE_REVISIT_TYPING_PTY_READY_${runId}`
-  await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-  const typingPtyId = await waitForActivePanePtyId(orcaBotmuxPage)
-  await sendToTerminal(orcaBotmuxPage, typingPtyId, `printf '\\n${typingPtyReadyMarker}\\n'\r`)
-  await waitForMarkerLatency(orcaBotmuxPage, typingPtyReadyMarker, 10_000)
+  await switchToWorktree(botmuxPage, secondWorktreeId)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage, 30_000)
+  const typingPtyId = await waitForActivePanePtyId(botmuxPage)
+  await sendToTerminal(botmuxPage, typingPtyId, `printf '\\n${typingPtyReadyMarker}\\n'\r`)
+  await waitForMarkerLatency(botmuxPage, typingPtyReadyMarker, 10_000)
 
-  await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-  await ensureTerminalVisible(orcaBotmuxPage)
-  await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-  const panes = await deps.ensureActiveWorktreePaneLoad(orcaBotmuxPage, backgroundPaneCount + 1)
+  await switchToWorktree(botmuxPage, firstWorktreeId)
+  await ensureTerminalVisible(botmuxPage)
+  await waitForActiveTerminalManager(botmuxPage, 30_000)
+  const panes = await deps.ensureActiveWorktreePaneLoad(botmuxPage, backgroundPaneCount + 1)
   const [revisitPane, ...loadPanes] = panes
-  await deps.focusPane(orcaBotmuxPage, revisitPane.paneKey)
+  await deps.focusPane(botmuxPage, revisitPane.paneKey)
 
-  const typingScriptPath = path.join(testRepoPath, `.orca-botmux-revisit-typing-${runId}.mjs`)
-  const pressureScriptPath = path.join(testRepoPath, `.orca-botmux-revisit-pressure-${runId}.mjs`)
+  const typingScriptPath = path.join(testRepoPath, `.botmux-revisit-typing-${runId}.mjs`)
+  const pressureScriptPath = path.join(testRepoPath, `.botmux-revisit-pressure-${runId}.mjs`)
   const revisitMarker = `OPENCODE_REVISIT_READY_${runId}`
   const pressureDoneMarker = `OPENCODE_PRESSURE_DONE_${runId}_0`
   deps.writeInteractivePromptScript(typingScriptPath, runId)
   writePressureOutputScript(pressureScriptPath, runId, 'tui')
-  await deps.resetTerminalPtyOutputDebug(orcaBotmuxPage)
+  await deps.resetTerminalPtyOutputDebug(botmuxPage)
   await deps.holdTerminalAckGate(
-    orcaBotmuxPage,
+    botmuxPage,
     loadPanes.map((pane) => pane.ptyId)
   )
   try {
     await startRealPtyPressureCommands({
       loadPanes,
-      orcaBotmuxPage,
+      botmuxPage,
       pressureOutputChars,
       pressureScriptPath
     })
-    const pressureBeforeSwitch = await deps.waitForMainPtyPressureBacklog(orcaBotmuxPage)
+    const pressureBeforeSwitch = await deps.waitForMainPtyPressureBacklog(botmuxPage)
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     const measurement = await deps.measureTypingDuringLoad(
-      orcaBotmuxPage,
+      botmuxPage,
       typingScriptPath,
       typingPtyId,
       runId
     )
-    const duringPressure = await deps.readMainPtyPressureDebug(orcaBotmuxPage)
-    const ackGate = await deps.readTerminalAckGateDebug(orcaBotmuxPage)
-    const scheduler = await deps.readTerminalOutputSchedulerDebug(orcaBotmuxPage)
-    const hiddenDebug = await deps.readTerminalPtyOutputDebug(orcaBotmuxPage)
+    const duringPressure = await deps.readMainPtyPressureDebug(botmuxPage)
+    const ackGate = await deps.readTerminalAckGateDebug(botmuxPage)
+    const scheduler = await deps.readTerminalOutputSchedulerDebug(botmuxPage)
+    const hiddenDebug = await deps.readTerminalPtyOutputDebug(botmuxPage)
     deps.annotateTypingMeasurement(
       testInfo,
       'opencode-main-pressure-worktree-revisit-typing',
@@ -195,12 +195,12 @@ export async function runRendererBackpressureRevisitScenario<
       duringPressure
     })
 
-    await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await deps.focusPane(orcaBotmuxPage, revisitPane.paneKey)
-    await sendToTerminal(orcaBotmuxPage, revisitPane.ptyId, `printf '\\n${revisitMarker}\\n'\r`)
-    const revisitLatencyMs = await waitForMarkerLatency(orcaBotmuxPage, revisitMarker, 10_000)
+    await switchToWorktree(botmuxPage, firstWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await deps.focusPane(botmuxPage, revisitPane.paneKey)
+    await sendToTerminal(botmuxPage, revisitPane.ptyId, `printf '\\n${revisitMarker}\\n'\r`)
+    const revisitLatencyMs = await waitForMarkerLatency(botmuxPage, revisitMarker, 10_000)
     testInfo.annotations.push({
       type: 'opencode-main-pressure-worktree-revisit-marker',
       description: `panes=${panes.length + 1} revisit=${revisitLatencyMs.toFixed(
@@ -212,10 +212,10 @@ export async function runRendererBackpressureRevisitScenario<
     // bound rather than the unloaded worst-key budget.
     expect(revisitLatencyMs).toBeLessThan(maxRevisitLatencyMs)
 
-    await deps.releaseTerminalAckGate(orcaBotmuxPage)
-    await deps.focusPane(orcaBotmuxPage, loadPanes[0]?.paneKey ?? revisitPane.paneKey)
-    const pressureDrainLatencyMs = await waitForMarkerLatency(orcaBotmuxPage, pressureDoneMarker, 20_000)
-    const finalScheduler = await deps.readTerminalOutputSchedulerDebug(orcaBotmuxPage)
+    await deps.releaseTerminalAckGate(botmuxPage)
+    await deps.focusPane(botmuxPage, loadPanes[0]?.paneKey ?? revisitPane.paneKey)
+    const pressureDrainLatencyMs = await waitForMarkerLatency(botmuxPage, pressureDoneMarker, 20_000)
+    const finalScheduler = await deps.readTerminalOutputSchedulerDebug(botmuxPage)
     testInfo.annotations.push({
       type: 'opencode-main-pressure-worktree-revisit-drain',
       description: `panes=${panes.length + 1} drain=${pressureDrainLatencyMs.toFixed(
@@ -229,11 +229,11 @@ export async function runRendererBackpressureRevisitScenario<
       maxRendererSchedulerQueuedChars
     )
   } finally {
-    await deps.releaseTerminalAckGate(orcaBotmuxPage)
-    await sendToTerminal(orcaBotmuxPage, typingPtyId, '\x03').catch(() => undefined)
-    await sendToTerminal(orcaBotmuxPage, revisitPane.ptyId, '\x03').catch(() => undefined)
+    await deps.releaseTerminalAckGate(botmuxPage)
+    await sendToTerminal(botmuxPage, typingPtyId, '\x03').catch(() => undefined)
+    await sendToTerminal(botmuxPage, revisitPane.ptyId, '\x03').catch(() => undefined)
     await Promise.all(
-      loadPanes.map((pane) => sendToTerminal(orcaBotmuxPage, pane.ptyId, '\x03').catch(() => undefined))
+      loadPanes.map((pane) => sendToTerminal(botmuxPage, pane.ptyId, '\x03').catch(() => undefined))
     )
     rmSync(typingScriptPath, { force: true })
     rmSync(pressureScriptPath, { force: true })
@@ -242,19 +242,19 @@ export async function runRendererBackpressureRevisitScenario<
 
 async function startRealPtyPressureCommands({
   loadPanes,
-  orcaBotmuxPage,
+  botmuxPage,
   pressureOutputChars,
   pressureScriptPath
 }: {
   loadPanes: RevisitPressurePane[]
-  orcaBotmuxPage: Page
+  botmuxPage: Page
   pressureOutputChars: number
   pressureScriptPath: string
 }): Promise<void> {
   await Promise.all(
     loadPanes.map((pane, paneIndex) =>
       sendToTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         pane.ptyId,
         `node ${JSON.stringify(pressureScriptPath)} ${paneIndex} ${pressureOutputChars}\r`
       )

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import { BotmuxRuntimeService } from '../../botmux-runtime'
 import { LinearWriteFailure } from '../../../linear/issues'
 import { sanitizeLinearErrorMessage } from '../../../linear/issue-context-errors'
 import { LINEAR_AGENT_ACCESS_METHODS } from './linear-agent-access'
@@ -25,7 +25,7 @@ describe('Linear agent access RPC methods', () => {
       linearIssueAddComment: vi.fn().mockResolvedValue({ ok: true }),
       linearIssueAttachLink: vi.fn().mockResolvedValue({ ok: true }),
       linearIssueCreate: vi.fn().mockResolvedValue({ ok: true })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: LINEAR_AGENT_ACCESS_METHODS })
 
     const setStateResponse = await dispatcher.dispatch(
@@ -177,7 +177,7 @@ describe('Linear agent access RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       linearIssueAddComment: vi.fn()
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: LINEAR_AGENT_ACCESS_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -197,7 +197,7 @@ describe('Linear agent access RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       linearIssueSetState: vi.fn()
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: LINEAR_AGENT_ACCESS_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -219,7 +219,7 @@ describe('Linear agent access RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       linearTeamMembersForAgents: vi.fn()
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: LINEAR_AGENT_ACCESS_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -241,7 +241,7 @@ describe('Linear agent access RPC methods', () => {
       getRuntimeId: () => 'test-runtime',
       linearIssueUpdateTask: vi.fn(),
       linearIssueCreate: vi.fn()
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: LINEAR_AGENT_ACCESS_METHODS })
 
     const updateResponse = await dispatcher.dispatch(
@@ -327,7 +327,7 @@ type LinearRetryLookupTester = {
 
 describe('Linear agent write recovery helpers', () => {
   it('keeps stable write failure codes while preserving the Linear provider message', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const runner = runtime as unknown as LinearWriteRunner
 
     await expect(
@@ -347,7 +347,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('keeps pinned retry guidance for unconfirmed writes while adding sanitized cause text', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const runner = runtime as unknown as LinearWriteRunner
     const builder = runtime as unknown as LinearUnconfirmedBuilder
     const writeId = '11111111-1111-4111-8111-111111111111'
@@ -396,7 +396,7 @@ describe('Linear agent write recovery helpers', () => {
   it('returns unconfirmed at the write deadline even when the request ignores abort', async () => {
     vi.useFakeTimers()
     try {
-      const runtime = new OrcaRuntimeService()
+      const runtime = new BotmuxRuntimeService()
       const write = vi.fn((_signal: AbortSignal) => new Promise<string>(() => undefined))
       const unconfirmed = vi.fn(() =>
         Object.assign(new Error('unconfirmed'), { code: 'linear_write_unconfirmed' })
@@ -420,7 +420,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('keeps payload and destination details in pinned retries', () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const builder = runtime as unknown as LinearUnconfirmedBuilder
     const writeId = '11111111-1111-4111-8111-111111111111'
     const target = {
@@ -472,7 +472,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('requires created issue readback to match enriched field intent', () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const builder = runtime as unknown as LinearUnconfirmedBuilder
     const issue = {
       id: 'issue-2',
@@ -511,7 +511,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('resolves workflow states by UUID or case-insensitive exact name', () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const states = [
       { id: 'state-review', name: 'In Review', type: 'started' },
       { id: 'state-done', name: 'Done', type: 'completed' }
@@ -525,7 +525,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('deduplicates write-id lookups by relationship target without comparing payloads', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const tester = runtime as unknown as LinearRetryLookupTester
 
     tester.readLinearWriteLookup = vi.fn(async () => ({
@@ -595,7 +595,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('keeps the unconfirmed retry envelope when duplicate recovery lookup fails', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const tester = runtime as unknown as LinearRetryLookupTester
     const unconfirmed = Object.assign(new Error('try pinned retry again'), {
       code: 'linear_write_unconfirmed',
@@ -620,7 +620,7 @@ describe('Linear agent write recovery helpers', () => {
   })
 
   it('emits linked issue refresh events for matching workspace links', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const builder = runtime as unknown as LinearUnconfirmedBuilder
     const events: unknown[] = []
     runtime.onClientEvent((event) => events.push(event))

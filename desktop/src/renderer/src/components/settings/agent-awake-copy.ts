@@ -21,7 +21,7 @@ export function getAgentAwakeDescription(
 
   return translate(
     AGENT_AWAKE_DESCRIPTION_DEFAULT_KEY,
-    'Keeps this computer and display awake while agents are working. OrcaBotmux also asks this device to stay awake when the lid is closed, subject to its power policy.'
+    'Keeps this computer and display awake while agents are working. Botmux also asks this device to stay awake when the lid is closed, subject to its power policy.'
   )
 }
 

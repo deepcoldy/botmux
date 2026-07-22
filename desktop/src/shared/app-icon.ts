@@ -1,7 +1,7 @@
 export const APP_ICON_OPTIONS = [
-  { id: 'classic', label: 'Classic OrcaBotmux' },
-  { id: 'watercolor', label: 'Watercolor OrcaBotmux' },
-  { id: 'blue', label: 'Blue OrcaBotmux' }
+  { id: 'classic', label: 'Classic Botmux' },
+  { id: 'watercolor', label: 'Watercolor Botmux' },
+  { id: 'blue', label: 'Blue Botmux' }
 ] as const
 
 export type AppIconId = (typeof APP_ICON_OPTIONS)[number]['id']

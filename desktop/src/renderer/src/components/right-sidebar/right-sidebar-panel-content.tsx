@@ -9,7 +9,7 @@ const PortsPanel = lazy(() => import('./PortsPanel'))
 const AiVaultPanel = lazy(() => import('./AiVaultPanel'))
 const FolderWorkspaceWorktreesPanel = lazy(() => import('./FolderWorkspaceWorktreesPanel'))
 const FolderWorkspacePrChecksPanel = lazy(() => import('./FolderWorkspacePrChecksPanel'))
-const OrcaBotmuxSessionsPanel = lazy(() => import('./OrcaBotmuxSessionsPanel'))
+const BotmuxSessionsPanel = lazy(() => import('./BotmuxSessionsPanel'))
 
 type RightSidebarPanelContentProps = {
   effectiveTab: ActiveRightSidebarTab
@@ -39,7 +39,7 @@ export function RightSidebarPanelContent({
             isVisible={rightSidebarOpen && effectiveTab === 'pr-checks'}
           />
         )}
-        {effectiveTab === 'orca_botmux' && <OrcaBotmuxSessionsPanel />}
+        {effectiveTab === 'botmux' && <BotmuxSessionsPanel />}
       </Suspense>
     </div>
   )

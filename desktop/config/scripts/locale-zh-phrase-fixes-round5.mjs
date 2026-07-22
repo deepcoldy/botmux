@@ -1,21 +1,21 @@
 // Chinese phrase fixes from high-visibility UI audit round 5.
 export const ZH_PHRASE_FIXES_ROUND5 = [
-  { pattern: /OrcaBotmux集成开发环境/g, replacement: 'OrcaBotmux IDE', whenEnIncludes: 'OrcaBotmux IDE' },
-  { pattern: /OrcaBotmux第一/g, replacement: 'OrcaBotmux 优先', whenEnIncludes: 'OrcaBotmux first' },
-  { pattern: /OrcaBotmux移动/g, replacement: 'OrcaBotmux Mobile', whenEnIncludes: 'OrcaBotmux Mobile' },
-  { pattern: /OrcaBotmux归属/g, replacement: 'OrcaBotmux 归因', whenEnIncludes: 'OrcaBotmux Attribution' },
-  { pattern: /OrcaBotmux标志/g, replacement: 'OrcaBotmux 标志', whenEnIncludes: 'OrcaBotmux logo' },
-  { pattern: /喜欢OrcaBotmux/g, replacement: '喜欢 OrcaBotmux', whenEnIncludes: 'Enjoying OrcaBotmux' },
-  { pattern: /认识OrcaBotmux/g, replacement: '了解 OrcaBotmux', whenEnIncludes: 'Get to know OrcaBotmux' },
-  { pattern: /支持OrcaBotmux/g, replacement: '支持 OrcaBotmux', whenEnIncludes: 'Support OrcaBotmux' },
-  { pattern: /展开OrcaBotmux/g, replacement: '展开 OrcaBotmux', whenEnIncludes: 'Expand OrcaBotmux' },
-  { pattern: /来自OrcaBotmux/g, replacement: '来自 OrcaBotmux', whenEnIncludes: 'from OrcaBotmux' },
+  { pattern: /Botmux集成开发环境/g, replacement: 'Botmux IDE', whenEnIncludes: 'Botmux IDE' },
+  { pattern: /Botmux第一/g, replacement: 'Botmux 优先', whenEnIncludes: 'Botmux first' },
+  { pattern: /Botmux移动/g, replacement: 'Botmux Mobile', whenEnIncludes: 'Botmux Mobile' },
+  { pattern: /Botmux归属/g, replacement: 'Botmux 归因', whenEnIncludes: 'Botmux Attribution' },
+  { pattern: /Botmux标志/g, replacement: 'Botmux 标志', whenEnIncludes: 'Botmux logo' },
+  { pattern: /喜欢Botmux/g, replacement: '喜欢 Botmux', whenEnIncludes: 'Enjoying Botmux' },
+  { pattern: /认识Botmux/g, replacement: '了解 Botmux', whenEnIncludes: 'Get to know Botmux' },
+  { pattern: /支持Botmux/g, replacement: '支持 Botmux', whenEnIncludes: 'Support Botmux' },
+  { pattern: /展开Botmux/g, replacement: '展开 Botmux', whenEnIncludes: 'Expand Botmux' },
+  { pattern: /来自Botmux/g, replacement: '来自 Botmux', whenEnIncludes: 'from Botmux' },
   {
-    pattern: /正在重新启动OrcaBotmux/g,
-    replacement: '正在重启 OrcaBotmux',
-    whenEnIncludes: 'Restarting OrcaBotmux'
+    pattern: /正在重新启动Botmux/g,
+    replacement: '正在重启 Botmux',
+    whenEnIncludes: 'Restarting Botmux'
   },
-  { pattern: /OrcaBotmux([\u4e00-\u9fff])/g, replacement: 'OrcaBotmux $1', whenEnIncludes: 'orca_botmux' },
+  { pattern: /Botmux([\u4e00-\u9fff])/g, replacement: 'Botmux $1', whenEnIncludes: 'botmux' },
   { pattern: /Linear([\u4e00-\u9fff])/g, replacement: 'Linear $1', whenEnIncludes: 'Linear' },
   { pattern: /Codex([\u4e00-\u9fff])/g, replacement: 'Codex $1', whenEnIncludes: 'Codex' },
   { pattern: /Claude([\u4e00-\u9fff])/g, replacement: 'Claude $1', whenEnIncludes: 'Claude' },
@@ -50,8 +50,8 @@ export const ZH_PHRASE_FIXES_ROUND5 = [
     whenEnIncludes: 'actionable issues'
   },
   {
-    pattern: /显示 OrcaBotmux 移动按钮/g,
-    replacement: '显示 OrcaBotmux Mobile 按钮',
-    whenEnIncludes: 'Show OrcaBotmux Mobile Button'
+    pattern: /显示 Botmux 移动按钮/g,
+    replacement: '显示 Botmux Mobile 按钮',
+    whenEnIncludes: 'Show Botmux Mobile Button'
   }
 ]

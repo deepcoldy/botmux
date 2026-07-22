@@ -451,7 +451,7 @@ export function EditorContent({
               {richModeUnsupportedMessage}
             </div>
           ) : null}
-          {/* Why: before rich editing shipped, OrcaBotmux already had a stable markdown
+          {/* Why: before rich editing shipped, Botmux already had a stable markdown
           preview surface. If Tiptap cannot safely own a document, falling back
           to that renderer preserves readable preview mode instead of forcing the
           user out of preview entirely. Source mode remains available for edits. */}

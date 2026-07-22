@@ -13,11 +13,11 @@ type MonacoDiffEditorNamespace = {
 }
 
 type GuardedDiffEditor = editor.IStandaloneDiffEditor & {
-  __orcaDiffEditorDisposeGuardInstalled?: true
+  __botmuxDiffEditorDisposeGuardInstalled?: true
 }
 
 type GuardedEditorNamespace = MonacoDiffEditorNamespace['editor'] & {
-  __orcaDiffEditorFactoryGuardInstalled?: true
+  __botmuxDiffEditorFactoryGuardInstalled?: true
 }
 
 type DisposeErrorReporter = (error: unknown) => void
@@ -31,7 +31,7 @@ export function guardMonacoDiffEditorDispose(
   reportError: DisposeErrorReporter = reportMonacoDiffDisposeError
 ): editor.IStandaloneDiffEditor {
   const guardedDiffEditor = diffEditor as GuardedDiffEditor
-  if (guardedDiffEditor.__orcaDiffEditorDisposeGuardInstalled) {
+  if (guardedDiffEditor.__botmuxDiffEditorDisposeGuardInstalled) {
     return diffEditor
   }
 
@@ -52,7 +52,7 @@ export function guardMonacoDiffEditorDispose(
       reportError(error)
     }
   }
-  guardedDiffEditor.__orcaDiffEditorDisposeGuardInstalled = true
+  guardedDiffEditor.__botmuxDiffEditorDisposeGuardInstalled = true
 
   return diffEditor
 }
@@ -62,12 +62,12 @@ export function installMonacoDiffEditorDisposalGuard(
   reportError?: DisposeErrorReporter
 ): void {
   const editorNamespace = monaco.editor as GuardedEditorNamespace
-  if (editorNamespace.__orcaDiffEditorFactoryGuardInstalled) {
+  if (editorNamespace.__botmuxDiffEditorFactoryGuardInstalled) {
     return
   }
 
   const createDiffEditor = editorNamespace.createDiffEditor.bind(editorNamespace)
   editorNamespace.createDiffEditor = ((...args: Parameters<CreateDiffEditor>) =>
     guardMonacoDiffEditorDispose(createDiffEditor(...args), reportError)) as CreateDiffEditor
-  editorNamespace.__orcaDiffEditorFactoryGuardInstalled = true
+  editorNamespace.__botmuxDiffEditorFactoryGuardInstalled = true
 }

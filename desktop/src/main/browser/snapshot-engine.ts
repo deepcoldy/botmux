@@ -400,7 +400,7 @@ async function findCursorInteractiveElements(
           } catch {}
         });
 
-        window.__orcaCursorInteractive = matchedElements;
+        window.__botmuxCursorInteractive = matchedElements;
         return JSON.stringify(found);
       })()`,
       returnByValue: true
@@ -411,7 +411,7 @@ async function findCursorInteractiveElements(
     for (let i = 0; i < elements.length; i++) {
       try {
         const { result: objResult } = (await sendCommand('Runtime.evaluate', {
-          expression: `window.__orcaCursorInteractive[${i}]`
+          expression: `window.__botmuxCursorInteractive[${i}]`
         })) as { result: { objectId?: string } }
 
         if (!objResult.objectId) {
@@ -440,7 +440,7 @@ async function findCursorInteractiveElements(
 
     // Clean up
     await sendCommand('Runtime.evaluate', {
-      expression: 'delete window.__orcaCursorInteractive',
+      expression: 'delete window.__botmuxCursorInteractive',
       returnByValue: true
     })
   } catch {

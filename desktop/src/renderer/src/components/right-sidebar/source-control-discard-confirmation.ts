@@ -15,7 +15,7 @@ export function getDiscardEntryConfirmationCopy(
   const name = basename(entry.path)
 
   // Why: untracked and newly-added paths have no HEAD version to restore.
-  // OrcaBotmux's discard path removes the working-tree file in those cases.
+  // Botmux's discard path removes the working-tree file in those cases.
   if (entry.area === 'untracked' || entry.status === 'untracked' || entry.status === 'added') {
     return {
       title: translate(

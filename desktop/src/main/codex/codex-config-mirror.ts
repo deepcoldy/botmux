@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { writeFileAtomically } from '../codex-accounts/fs-utils'
-import { getOrcaManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
+import { getBotmuxManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
 import { rewriteRelativePathConfigValues } from './codex-config-path-reference-rewrite'
 import { parseWslUncPath } from '../../shared/wsl-paths'
 import {
@@ -23,12 +23,12 @@ import {
 
 export function syncSystemConfigIntoManagedCodexHome(
   homes: CodexSettingsPromotionHomes = {
-    runtimeHomePath: getOrcaManagedCodexHomePath(),
+    runtimeHomePath: getBotmuxManagedCodexHomePath(),
     systemHomePath: getSystemCodexHomePath()
   }
 ): void {
   // Why: the mirror overwrites runtime settings from ~/.codex, so changes the
-  // user made inside OrcaBotmux-launched Codex (/model, /approvals) must be written
+  // user made inside Botmux-launched Codex (/model, /approvals) must be written
   // back to ~/.codex first or this very pass silently reverts them.
   if (!promoteCodexRuntimeSettingsToSystem(homes)) {
     // Why: mirroring after a failed write-back would erase the runtime change;
@@ -42,7 +42,7 @@ export function syncSystemConfigIntoManagedCodexHome(
     return
   }
   // Why: the baseline advances only after a successful mirror; recording an
-  // unpromoted runtime change as OrcaBotmux-written would strand it forever.
+  // unpromoted runtime change as Botmux-written would strand it forever.
   snapshotCodexRuntimeSettingsBaseline(homes.runtimeHomePath)
 }
 
@@ -150,7 +150,7 @@ function normalizeFeatureSectionLines(lines: string[], start: number, end: numbe
   if (!hasHooksKey) {
     const firstDeprecatedIndex = deprecatedIndexes.shift()
     if (firstDeprecatedIndex !== undefined) {
-      // Why: Codex 0.133 warns on the old key. Mirror into OrcaBotmux's runtime
+      // Why: Codex 0.133 warns on the old key. Mirror into Botmux's runtime
       // config using the new key without rewriting the user's real config.
       lines[firstDeprecatedIndex] = lines[firstDeprecatedIndex]!.replace(
         /^([ \t]*)codex_hooks([ \t]*=)/,
@@ -188,7 +188,7 @@ function mergeSystemCodexConfigIntoRuntime(runtimeConfig: string, systemConfig: 
       .map((section) => getTomlSectionHeaderKey(section.header))
   )
   // Why: ordinary Codex settings should mirror ~/.codex exactly; runtime hook
-  // trust and project trust are written under OrcaBotmux's managed CODEX_HOME and
+  // trust and project trust are written under Botmux's managed CODEX_HOME and
   // must survive the copy unless the user explicitly revoked project trust in
   // the system config.
   return joinTomlBlocks([

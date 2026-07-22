@@ -31,7 +31,7 @@ import { createUntitledMarkdownFileWithTemplateSelection } from '@/lib/create-un
 import { detectLanguage } from '@/lib/language-detect'
 import { buildDuplicatedBrowserTabOptions } from '@/lib/duplicate-browser-tab-options'
 import { focusTerminalTabSurface } from '@/lib/focus-terminal-tab-surface'
-import { isOrcaCliAvailableOnPath } from '@/lib/agent-skill-cli-prerequisite'
+import { isBotmuxCliAvailableOnPath } from '@/lib/agent-skill-cli-prerequisite'
 import {
   isFloatingWorkspacePanelShortcut,
   isFloatingWorkspaceTerminalInputTarget,
@@ -611,7 +611,7 @@ export function FloatingTerminalPanel({
     try {
       const status = await window.api.cli.getInstallStatus()
       if (mountedRef.current) {
-        setShowOrchestrationSetup(!isOrcaCliAvailableOnPath(status))
+        setShowOrchestrationSetup(!isBotmuxCliAvailableOnPath(status))
       }
     } catch {
       if (mountedRef.current) {
@@ -1668,7 +1668,7 @@ export function FloatingTerminalPanel({
               <p className="text-xs leading-5 text-muted-foreground">
                 {translate(
                   'auto.components.floating.terminal.FloatingTerminalPanel.8cf80db43b',
-                  'Set up the OrcaBotmux CLI and agent skill so agents can coordinate through OrcaBotmux.'
+                  'Set up the Botmux CLI and agent skill so agents can coordinate through Botmux.'
                 )}
               </p>
             </div>

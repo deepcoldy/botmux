@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Terminal E2E helpers for agent-browser + CDP testing against a running OrcaBotmux
+ * Terminal E2E helpers for agent-browser + CDP testing against a running Botmux
  * dev build. Encapsulates patterns discovered during manual terminal testing:
  *
  *   - CDP key events do NOT work with xterm.js (canvas-based renderer)
@@ -10,9 +10,9 @@
  *   - The visible terminal's PTY ID must be discovered (not guessed)
  *
  * Usage:
- *   import { OrcaTerminal } from './terminal-e2e-helpers.mjs'
+ *   import { BotmuxTerminal } from './terminal-e2e-helpers.mjs'
  *
- *   const term = new OrcaTerminal(9444)       // CDP port
+ *   const term = new BotmuxTerminal(9444)       // CDP port
  *   await term.connect()
  *   const ptyId = await term.discoverActivePtyId()
  *   await term.send(ptyId, 'echo hello\r')
@@ -52,8 +52,8 @@ function evalInRenderer(port, js) {
   return ab(port, ['eval', js])
 }
 
-export class OrcaTerminal {
-  /** @param {number} cdpPort — the --remote-debugging-port used when launching OrcaBotmux */
+export class BotmuxTerminal {
+  /** @param {number} cdpPort — the --remote-debugging-port used when launching Botmux */
   constructor(cdpPort) {
     this.port = cdpPort
   }
@@ -140,7 +140,7 @@ export class OrcaTerminal {
    * @param {number} maxId — highest PTY ID to probe
    * @param {string} screenshotPath — where to save the screenshot
    */
-  probePtyIdWithScreenshot(maxId = 10, screenshotPath = tempScreenshotPath('orca-botmux-pty-probe.png')) {
+  probePtyIdWithScreenshot(maxId = 10, screenshotPath = tempScreenshotPath('botmux-pty-probe.png')) {
     for (let i = 1; i <= maxId; i++) {
       evalInRenderer(this.port, `window.api.pty.write('${i}', '\\x03\\x15echo PTY_ID_${i}\\r')`)
     }
@@ -182,18 +182,18 @@ export class OrcaTerminal {
   }
 
   /**
-   * Take a screenshot of the OrcaBotmux window.
+   * Take a screenshot of the Botmux window.
    *
    * @param {string} path — output file path
    * @returns {string} the screenshot path
    */
-  screenshot(path = tempScreenshotPath('orca-botmux-terminal.png')) {
+  screenshot(path = tempScreenshotPath('botmux-terminal.png')) {
     ab(this.port, ['screenshot', path])
     return path
   }
 
   /**
-   * Open a new terminal tab in OrcaBotmux.
+   * Open a new terminal tab in Botmux.
    * @returns {void}
    */
   newTerminal() {
@@ -211,7 +211,7 @@ export class OrcaTerminal {
     this.exec(ptyId, 'echo __LANG__=$LANG')
     sleep(1_000)
     // Screenshot and return for inspection
-    return this.screenshot(tempScreenshotPath('orca-botmux-lang-check.png'))
+    return this.screenshot(tempScreenshotPath('botmux-lang-check.png'))
   }
 }
 
@@ -225,8 +225,8 @@ if (process.argv[1]?.endsWith('terminal-e2e-helpers.mjs')) {
   const port = portIdx >= 0 ? Number(args[portIdx + 1]) : 9444
   const command = cmdIdx >= 0 ? args[cmdIdx + 1] : null
 
-  const term = new OrcaTerminal(port)
-  console.log('Connecting to OrcaBotmux on CDP port', port, '...')
+  const term = new BotmuxTerminal(port)
+  console.log('Connecting to Botmux on CDP port', port, '...')
   term.connect()
   console.log('Connected.')
 

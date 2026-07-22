@@ -13,7 +13,7 @@ import type {
   JiraIssue,
   LinearIssue,
   ManualRepoOrderEntry,
-  PersistedTrustedOrcaHooks,
+  PersistedTrustedBotmuxHooks,
   PersistedUIState,
   StatusBarItem,
   TaskProvider,
@@ -96,7 +96,7 @@ import {
 } from '../../../../shared/workspace-statuses'
 import { clampMarkdownTocPanelWidth } from '../../../../shared/markdown-toc-panel-width'
 import { normalizeKagiSessionLink } from '../../../../shared/browser-url'
-import type { OrcaHookScriptKind } from '../../lib/orca-botmux-hook-trust'
+import type { BotmuxHookScriptKind } from '../../lib/botmux-hook-trust'
 import type { SettingsNavTarget } from '@/lib/settings-navigation-types'
 import {
   filterSetupScriptPromptDismissalsToValidRepos,
@@ -374,26 +374,26 @@ function sanitizePersistedRepoIds(value: unknown): string[] {
   return value.filter((repoId): repoId is string => typeof repoId === 'string')
 }
 
-function sanitizeTrustedOrcaHooks(trust: unknown): PersistedTrustedOrcaHooks {
+function sanitizeTrustedBotmuxHooks(trust: unknown): PersistedTrustedBotmuxHooks {
   if (!isPlainPersistedRecord(trust)) {
     return {}
   }
-  const next: PersistedTrustedOrcaHooks = {}
+  const next: PersistedTrustedBotmuxHooks = {}
   for (const [repoId, entry] of Object.entries(trust)) {
     if (!isSafePersistedRecordKey(repoId) || !isPlainPersistedRecord(entry)) {
       continue
     }
-    next[repoId] = entry as PersistedTrustedOrcaHooks[string]
+    next[repoId] = entry as PersistedTrustedBotmuxHooks[string]
   }
   return next
 }
 
-function filterTrustedOrcaHooksToValidRepos(
+function filterTrustedBotmuxHooksToValidRepos(
   trust: unknown,
   validRepoIds: Set<string>
-): PersistedTrustedOrcaHooks {
-  const sanitized = sanitizeTrustedOrcaHooks(trust)
-  const next: PersistedTrustedOrcaHooks = {}
+): PersistedTrustedBotmuxHooks {
+  const sanitized = sanitizeTrustedBotmuxHooks(trust)
+  const next: PersistedTrustedBotmuxHooks = {}
   for (const [repoId, entry] of Object.entries(sanitized)) {
     if (validRepoIds.has(repoId)) {
       next[repoId] = entry
@@ -402,15 +402,15 @@ function filterTrustedOrcaHooksToValidRepos(
   return next
 }
 
-function hydrateTrustedOrcaHooks(
+function hydrateTrustedBotmuxHooks(
   trust: unknown,
   validRepoIds: Set<string>
-): PersistedTrustedOrcaHooks {
-  const sanitized = sanitizeTrustedOrcaHooks(trust)
+): PersistedTrustedBotmuxHooks {
+  const sanitized = sanitizeTrustedBotmuxHooks(trust)
   if (validRepoIds.size === 0) {
     return sanitized
   }
-  return filterTrustedOrcaHooksToValidRepos(sanitized, validRepoIds)
+  return filterTrustedBotmuxHooksToValidRepos(sanitized, validRepoIds)
 }
 
 function isSafePersistedRecordKey(key: string): boolean {
@@ -814,7 +814,7 @@ export type UISlice = {
     | 'feature-wall'
     | 'feature-tips'
     | 'new-workspace-composer'
-    | 'confirm-orca-botmux-yaml-hooks'
+    | 'confirm-botmux-yaml-hooks'
   modalData: Record<string, unknown>
   openModal: (modal: UISlice['activeModal'], data?: Record<string, unknown>) => void
   closeModal: () => void
@@ -852,14 +852,14 @@ export type UISlice = {
   completeContextualTour: (id?: ContextualTourId) => void
   cancelContextualTour: (id?: ContextualTourId) => void
   markContextualToursSeen: (ids: ContextualTourId[]) => void
-  trustedOrcaHooks: PersistedTrustedOrcaHooks
-  markOrcaHookScriptConfirmed: (
+  trustedBotmuxHooks: PersistedTrustedBotmuxHooks
+  markBotmuxHookScriptConfirmed: (
     repoId: string,
-    kind: OrcaHookScriptKind,
+    kind: BotmuxHookScriptKind,
     contentHash: string
   ) => void
-  markOrcaHookRepoAlwaysTrusted: (repoId: string) => void
-  clearOrcaHookTrustForRepo: (repoId: string) => void
+  markBotmuxHookRepoAlwaysTrusted: (repoId: string) => void
+  clearBotmuxHookTrustForRepo: (repoId: string) => void
   setupScriptPromptDismissedRepoIds: string[]
   dismissSetupScriptPrompt: (repoId: string) => void
   setupGuideSidebarDismissed: boolean
@@ -1875,10 +1875,10 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
       }
       return { contextualToursSeenIds: next }
     }),
-  trustedOrcaHooks: {},
-  markOrcaHookScriptConfirmed: (repoId, kind, contentHash) =>
+  trustedBotmuxHooks: {},
+  markBotmuxHookScriptConfirmed: (repoId, kind, contentHash) =>
     set((s) => {
-      const existing = s.trustedOrcaHooks[repoId]
+      const existing = s.trustedBotmuxHooks[repoId]
       const currentEntry = existing?.[kind]
       if (currentEntry?.contentHash === contentHash) {
         return s
@@ -1887,35 +1887,35 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
         ...existing,
         [kind]: { contentHash, approvedAt: Date.now() }
       }
-      const next = { ...s.trustedOrcaHooks, [repoId]: nextRepo }
-      window.api.ui.set({ trustedOrcaHooks: next }).catch(console.error)
-      return { trustedOrcaHooks: next }
+      const next = { ...s.trustedBotmuxHooks, [repoId]: nextRepo }
+      window.api.ui.set({ trustedBotmuxHooks: next }).catch(console.error)
+      return { trustedBotmuxHooks: next }
     }),
-  markOrcaHookRepoAlwaysTrusted: (repoId) =>
+  markBotmuxHookRepoAlwaysTrusted: (repoId) =>
     set((s) => {
-      const existing = s.trustedOrcaHooks[repoId]
+      const existing = s.trustedBotmuxHooks[repoId]
       if (existing?.all) {
         return s
       }
       const next = {
-        ...s.trustedOrcaHooks,
+        ...s.trustedBotmuxHooks,
         [repoId]: {
           ...existing,
           all: { approvedAt: Date.now() }
         }
       }
-      window.api.ui.set({ trustedOrcaHooks: next }).catch(console.error)
-      return { trustedOrcaHooks: next }
+      window.api.ui.set({ trustedBotmuxHooks: next }).catch(console.error)
+      return { trustedBotmuxHooks: next }
     }),
-  clearOrcaHookTrustForRepo: (repoId) =>
+  clearBotmuxHookTrustForRepo: (repoId) =>
     set((s) => {
-      if (!(repoId in s.trustedOrcaHooks)) {
+      if (!(repoId in s.trustedBotmuxHooks)) {
         return s
       }
-      const next = { ...s.trustedOrcaHooks }
+      const next = { ...s.trustedBotmuxHooks }
       delete next[repoId]
-      window.api.ui.set({ trustedOrcaHooks: next }).catch(console.error)
-      return { trustedOrcaHooks: next }
+      window.api.ui.set({ trustedBotmuxHooks: next }).catch(console.error)
+      return { trustedBotmuxHooks: next }
     }),
   setupScriptPromptDismissedRepoIds: [],
   dismissSetupScriptPrompt: (repoId) =>
@@ -2546,7 +2546,7 @@ export const createUISlice: StateCreator<AppState, [], [], UISlice> = (set, get)
           typeof ui.contextualToursAutoEligible === 'boolean'
             ? ui.contextualToursAutoEligible
             : null,
-        trustedOrcaHooks: hydrateTrustedOrcaHooks(ui.trustedOrcaHooks, validRepoIds),
+        trustedBotmuxHooks: hydrateTrustedBotmuxHooks(ui.trustedBotmuxHooks, validRepoIds),
         setupScriptPromptDismissedRepoIds:
           validRepoIds.size === 0
             ? sanitizeSetupScriptPromptDismissals(ui.setupScriptPromptDismissedRepoIds)

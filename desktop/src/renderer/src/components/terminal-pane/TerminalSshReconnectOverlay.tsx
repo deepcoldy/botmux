@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Loader2, Server, ServerOff } from 'lucide-react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -11,6 +11,10 @@ import {
   connectRuntimeEnvironmentSshTarget,
   resyncRuntimeEnvironmentSshTargets
 } from '@/runtime/runtime-environment-ssh-state'
+import {
+  ensureSshTargetConnected,
+  isTransientSshStatus
+} from '@/lib/ensure-ssh-target-connected'
 
 type TerminalSshReconnectOverlayProps = {
   targetId: string
@@ -20,7 +24,7 @@ type TerminalSshReconnectOverlayProps = {
   // remove the workspace instead of a Connect button that can only fail.
   targetRemoved?: boolean
   worktreeId?: string
-  // Set when the SSH target belongs to a remote OrcaBotmux server (runtime
+  // Set when the SSH target belongs to a remote Botmux server (runtime
   // environment): Connect and the failed-connect resync then route to that
   // environment's runtime RPC and bucket instead of the local ssh.* API.
   sshOwnerEnvironmentId?: string | null
@@ -88,54 +92,88 @@ export function TerminalSshReconnectOverlay({
   // Why: a removed target can never reconnect, so never offer Connect for it.
   const showConnect = !targetRemoved && canConnectStatus(status)
 
-  const handleConnect = useCallback(async () => {
+  const runEnsure = useCallback(
+    async (opts?: { force?: boolean }) => {
+      // Why: skip when a local click is already in flight, unless auto-ensure
+      // needs to run while store status is already transient (isConnecting true).
+      if (connecting && !opts?.force) {
+        return
+      }
+      setConnecting(true)
+      try {
+        if (sshOwnerEnvironmentId) {
+          // Bucket state is written inside the helper, mirroring the local path.
+          await connectRuntimeEnvironmentSshTarget(sshOwnerEnvironmentId, targetId)
+        } else {
+          // Why: reconcile main↔renderer first. A missed `connected` push after
+          // deploying-relay leaves this overlay spinning while SSH is already live.
+          await ensureSshTargetConnected(targetId, {
+            getState: (args) => window.api.ssh.getState(args),
+            connect: (args) => window.api.ssh.connect(args),
+            publishState: setSshConnectionState
+          })
+        }
+      } catch (err) {
+        toast.error(
+          err instanceof Error
+            ? err.message
+            : translate(
+                'auto.components.terminal.pane.TerminalSshReconnectOverlay.connectFailed',
+                'SSH connection failed'
+              )
+        )
+        // Why: a failed connect usually means the renderer's target metadata is
+        // stale (target removed, or re-added under a new id). Resync it so the
+        // overlay converges to the ghost/re-adopted state instead of offering
+        // the same failing Connect forever (STA-1468). Apply the target list
+        // first — a removed-labels failure must not discard it.
+        if (sshOwnerEnvironmentId) {
+          void resyncRuntimeEnvironmentSshTargets(sshOwnerEnvironmentId).catch(() => {})
+        } else {
+          void (async () => {
+            const targets = await window.api.ssh.listTargets()
+            useAppStore.getState().setSshTargetsMetadata(targets)
+            const removedLabels = await window.api.ssh.listRemovedTargetLabels()
+            useAppStore.getState().setRemovedSshTargetLabels(removedLabels)
+          })().catch(() => {})
+        }
+      } finally {
+        if (mountedRef.current) {
+          setConnecting(false)
+        }
+      }
+    },
+    [connecting, mountedRef, setSshConnectionState, sshOwnerEnvironmentId, targetId]
+  )
+
+  const handleConnect = useCallback(() => {
     if (isConnecting) {
       return
     }
-    setConnecting(true)
-    try {
-      if (sshOwnerEnvironmentId) {
-        // Bucket state is written inside the helper, mirroring the local path.
-        await connectRuntimeEnvironmentSshTarget(sshOwnerEnvironmentId, targetId)
-      } else {
-        const connectState = await window.api.ssh.connect({ targetId })
-        if (connectState) {
-          // Why: ssh.connect can resolve before the global state-change IPC lands;
-          // the waiting deferred PTY reattach path keys off this renderer store.
-          setSshConnectionState(targetId, connectState)
-        }
-      }
-    } catch (err) {
-      toast.error(
-        err instanceof Error
-          ? err.message
-          : translate(
-              'auto.components.terminal.pane.TerminalSshReconnectOverlay.connectFailed',
-              'SSH connection failed'
-            )
-      )
-      // Why: a failed connect usually means the renderer's target metadata is
-      // stale (target removed, or re-added under a new id). Resync it so the
-      // overlay converges to the ghost/re-adopted state instead of offering
-      // the same failing Connect forever (STA-1468). Apply the target list
-      // first — a removed-labels failure must not discard it.
-      if (sshOwnerEnvironmentId) {
-        void resyncRuntimeEnvironmentSshTargets(sshOwnerEnvironmentId).catch(() => {})
-      } else {
-        void (async () => {
-          const targets = await window.api.ssh.listTargets()
-          useAppStore.getState().setSshTargetsMetadata(targets)
-          const removedLabels = await window.api.ssh.listRemovedTargetLabels()
-          useAppStore.getState().setRemovedSshTargetLabels(removedLabels)
-        })().catch(() => {})
-      }
-    } finally {
-      if (mountedRef.current) {
-        setConnecting(false)
-      }
-    }
-  }, [isConnecting, mountedRef, setSshConnectionState, sshOwnerEnvironmentId, targetId])
+    void runEnsure()
+  }, [isConnecting, runEnsure])
 
+  // Why: auto-ensure SSH when the overlay mounts for a bound remote worktree
+  // (botmux session on d2, etc.) so users do not sit on "Connecting..." forever
+  // after a missed state push, and so disconnect→open-session reconnects without
+  // an extra click when possible.
+  useEffect(() => {
+    if (targetRemoved || sshOwnerEnvironmentId) {
+      return
+    }
+    if (
+      !isTransientSshStatus(status) &&
+      status !== 'disconnected' &&
+      status !== 'error' &&
+      status !== 'auth-failed' &&
+      status !== 'reconnection-failed'
+    ) {
+      return
+    }
+    void runEnsure({ force: true })
+    // Only re-run when the host/status identity changes — not on every connect flip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- runEnsure identity changes each render
+  }, [sshOwnerEnvironmentId, status, targetId, targetRemoved])
   return (
     <div
       className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-background/75 px-6 py-8 backdrop-blur-[1px]"

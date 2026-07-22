@@ -213,8 +213,8 @@ describe('redactor — attribute-key blocklist', () => {
     expect(out).toHaveProperty('method')
   })
   it('preserves filesystem paths verbatim — they are diagnostic data', () => {
-    const out = redactAttributes({ cwd: '/Users/brennanb/projects/orca_botmux' })
-    expect(out.cwd).toBe('/Users/brennanb/projects/orca_botmux')
+    const out = redactAttributes({ cwd: '/Users/brennanb/projects/botmux' })
+    expect(out.cwd).toBe('/Users/brennanb/projects/botmux')
   })
   it('drops nested blocked keys while recursively redacting values', () => {
     const out = redactValue({

@@ -15,7 +15,7 @@ import { mirrorOmpPersistentSqliteFiles } from './omp-sqlite-overlay'
 const tempDirs: string[] = []
 
 function makeTempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-omp-sqlite-overlay-'))
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-omp-sqlite-overlay-'))
   tempDirs.push(dir)
   return dir
 }

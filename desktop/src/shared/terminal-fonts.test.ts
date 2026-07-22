@@ -6,7 +6,7 @@ import {
 } from './terminal-fonts'
 
 describe('terminal font weights', () => {
-  it('falls back to the OrcaBotmux default when the value is missing', () => {
+  it('falls back to the Botmux default when the value is missing', () => {
     expect(normalizeTerminalFontWeight(undefined)).toBe(DEFAULT_TERMINAL_FONT_WEIGHT)
   })
 

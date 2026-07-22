@@ -84,11 +84,11 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'native-chat-does-not-auto-open',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@github.com:stablyai/orca_botmux.git',
+        repoRemoteUrl: 'git@github.com:stablyai/botmux.git',
         upstreamName: 'origin/native-chat-does-not-auto-open'
       })
     ).toBe(
-      'https://github.com/stablyai/orca_botmux/compare/main...native-chat-does-not-auto-open?expand=1'
+      'https://github.com/stablyai/botmux/compare/main...native-chat-does-not-auto-open?expand=1'
     )
   })
 
@@ -98,14 +98,14 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/upstream/main',
         branchName: 'feature/fork-head',
         repoRemoteName: 'upstream',
-        repoRemoteUrl: 'https://github.com/stablyai/orca_botmux.git',
+        repoRemoteUrl: 'https://github.com/stablyai/botmux.git',
         pushTarget: {
           remoteName: 'fork',
           branchName: 'feature/fork-head',
-          remoteUrl: 'git@github.com:contributor/orca_botmux.git'
+          remoteUrl: 'git@github.com:contributor/botmux.git'
         }
       })
-    ).toBe('https://github.com/stablyai/orca_botmux/compare/main...contributor:feature/fork-head?expand=1')
+    ).toBe('https://github.com/stablyai/botmux/compare/main...contributor:feature/fork-head?expand=1')
   })
 
   it('keeps slashes literal in a GitHub compare URL for a slash-containing branch name', () => {
@@ -114,11 +114,11 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'slashdevcorpse/identifying-pwsh.exe-error',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@github.com:stablyai/orca_botmux.git',
+        repoRemoteUrl: 'git@github.com:stablyai/botmux.git',
         upstreamName: 'origin/slashdevcorpse/identifying-pwsh.exe-error'
       })
     ).toBe(
-      'https://github.com/stablyai/orca_botmux/compare/main...slashdevcorpse/identifying-pwsh.exe-error?expand=1'
+      'https://github.com/stablyai/botmux/compare/main...slashdevcorpse/identifying-pwsh.exe-error?expand=1'
     )
   })
 
@@ -128,12 +128,12 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/release/next',
         branchName: 'feature/gitlab',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@gitlab.company.test:group/sub/orca_botmux.git',
+        repoRemoteUrl: 'git@gitlab.company.test:group/sub/botmux.git',
         provider: 'gitlab',
         upstreamName: 'origin/feature/gitlab'
       })
     ).toBe(
-      'https://gitlab.company.test/group/sub/orca_botmux/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fgitlab&merge_request%5Btarget_branch%5D=release%2Fnext'
+      'https://gitlab.company.test/group/sub/botmux/-/merge_requests/new?merge_request%5Bsource_branch%5D=feature%2Fgitlab&merge_request%5Btarget_branch%5D=release%2Fnext'
     )
   })
 
@@ -171,11 +171,11 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'feature/gitea',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'ssh://git@gitea.company.test/team/orca_botmux.git',
+        repoRemoteUrl: 'ssh://git@gitea.company.test/team/botmux.git',
         provider: 'gitea',
         upstreamName: 'origin/feature/gitea'
       })
-    ).toBe('https://gitea.company.test/team/orca_botmux/compare/main...feature/gitea')
+    ).toBe('https://gitea.company.test/team/botmux/compare/main...feature/gitea')
   })
 
   it('suppresses the link when the branch tracks a fork remote with no resolvable push URL', () => {
@@ -186,8 +186,8 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'quick-commands',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'https://github.com/stablyai/orca_botmux.git',
-        upstreamName: 'pr-devajmeireles-orca_botmux/quick-commands'
+        repoRemoteUrl: 'https://github.com/stablyai/botmux.git',
+        upstreamName: 'pr-devajmeireles-botmux/quick-commands'
       })
     ).toBeNull()
   })
@@ -198,27 +198,27 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'local-wip-name',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@github.com:stablyai/orca_botmux.git',
+        repoRemoteUrl: 'git@github.com:stablyai/botmux.git',
         upstreamName: 'origin/feature/pushed-name'
       })
-    ).toBe('https://github.com/stablyai/orca_botmux/compare/main...feature/pushed-name?expand=1')
+    ).toBe('https://github.com/stablyai/botmux/compare/main...feature/pushed-name?expand=1')
   })
 
-  it('still qualifies the fork head when OrcaBotmux resolved the fork push URL', () => {
+  it('still qualifies the fork head when Botmux resolved the fork push URL', () => {
     expect(
       buildSourceControlManualReviewUrl({
         baseRef: 'refs/remotes/origin/main',
         branchName: 'quick-commands',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'https://github.com/stablyai/orca_botmux.git',
-        upstreamName: 'pr-devajmeireles-orca_botmux/quick-commands',
+        repoRemoteUrl: 'https://github.com/stablyai/botmux.git',
+        upstreamName: 'pr-devajmeireles-botmux/quick-commands',
         pushTarget: {
-          remoteName: 'pr-devajmeireles-orca_botmux',
+          remoteName: 'pr-devajmeireles-botmux',
           branchName: 'quick-commands',
-          remoteUrl: 'git@github.com:devajmeireles/orca_botmux.git'
+          remoteUrl: 'git@github.com:devajmeireles/botmux.git'
         }
       })
-    ).toBe('https://github.com/stablyai/orca_botmux/compare/main...devajmeireles:quick-commands?expand=1')
+    ).toBe('https://github.com/stablyai/botmux/compare/main...devajmeireles:quick-commands?expand=1')
   })
 
   it('does not guess a provider for unknown hosts without a provider hint', () => {
@@ -227,7 +227,7 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'feature/unknown',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@git.company.test:team/orca_botmux.git',
+        repoRemoteUrl: 'git@git.company.test:team/botmux.git',
         upstreamName: 'origin/feature/unknown'
       })
     ).toBeNull()
@@ -241,7 +241,7 @@ describe('buildSourceControlManualReviewUrl', () => {
         baseRef: 'refs/remotes/origin/main',
         branchName: 'codex-runtime-home-refactor-design',
         repoRemoteName: 'origin',
-        repoRemoteUrl: 'git@github.com:stablyai/orca_botmux.git',
+        repoRemoteUrl: 'git@github.com:stablyai/botmux.git',
         upstreamName: null
       })
     ).toBeNull()

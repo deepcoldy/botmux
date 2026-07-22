@@ -40,14 +40,14 @@ afterEach(() => {
 })
 
 function createTestPlan(): CodexWslRuntimeHookInstallPlan {
-  const root = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-wsl-hooks-'))
+  const root = mkdtempSync(join(tmpdir(), 'botmux-codex-wsl-hooks-'))
   tempRoots.push(root)
-  const linuxHome = '/home/alice/.local/share/orca_botmux/codex-runtime-home/home'
+  const linuxHome = '/home/alice/.local/share/botmux/codex-runtime-home/home'
   return {
     configPath: join(root, 'hooks.json'),
     tomlPath: join(root, 'config.toml'),
-    scriptPath: join(root, '.orca_botmux', 'agent-hooks', 'codex-hook.sh'),
-    commandScriptPath: `${linuxHome}/.orca_botmux/agent-hooks/codex-hook.sh`,
+    scriptPath: join(root, '.botmux', 'agent-hooks', 'codex-hook.sh'),
+    commandScriptPath: `${linuxHome}/.botmux/agent-hooks/codex-hook.sh`,
     trustConfigPath: `${linuxHome}/hooks.json`
   }
 }
@@ -73,22 +73,22 @@ function expectedManagedCommand(scriptPath: string): string {
 describe('Codex WSL runtime hook install', () => {
   it('plans WSL hook files with Linux command and trust paths', () => {
     const runtimeHome =
-      '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\orca_botmux\\codex-runtime-home\\home'
+      '\\\\wsl.localhost\\Ubuntu\\home\\alice\\.local\\share\\botmux\\codex-runtime-home\\home'
 
     expect(
       createCodexWslRuntimeHookInstallPlan(runtimeHome, undefined, (_distro, path) => path)
     ).toEqual({
       configPath: pathWin32.join(runtimeHome, 'hooks.json'),
       tomlPath: pathWin32.join(runtimeHome, 'config.toml'),
-      scriptPath: pathWin32.join(runtimeHome, '.orca_botmux', 'agent-hooks', 'codex-hook.sh'),
+      scriptPath: pathWin32.join(runtimeHome, '.botmux', 'agent-hooks', 'codex-hook.sh'),
       commandScriptPath:
-        '/home/alice/.local/share/orca_botmux/codex-runtime-home/home/.orca_botmux/agent-hooks/codex-hook.sh',
-      trustConfigPath: '/home/alice/.local/share/orca_botmux/codex-runtime-home/home/hooks.json'
+        '/home/alice/.local/share/botmux/codex-runtime-home/home/.botmux/agent-hooks/codex-hook.sh',
+      trustConfigPath: '/home/alice/.local/share/botmux/codex-runtime-home/home/hooks.json'
     })
   })
 
   it('plans WSL hooks when the distro home is mounted on a Windows drive', () => {
-    const runtimeHome = 'D:\\wsl-home\\.local\\share\\orca_botmux\\codex-runtime-home\\home'
+    const runtimeHome = 'D:\\wsl-home\\.local\\share\\botmux\\codex-runtime-home\\home'
 
     expect(
       createCodexWslRuntimeHookInstallPlan(
@@ -99,29 +99,29 @@ describe('Codex WSL runtime hook install', () => {
     ).toEqual({
       configPath: pathWin32.join(runtimeHome, 'hooks.json'),
       tomlPath: pathWin32.join(runtimeHome, 'config.toml'),
-      scriptPath: pathWin32.join(runtimeHome, '.orca_botmux', 'agent-hooks', 'codex-hook.sh'),
+      scriptPath: pathWin32.join(runtimeHome, '.botmux', 'agent-hooks', 'codex-hook.sh'),
       commandScriptPath:
-        '/mnt/d/wsl-home/.local/share/orca_botmux/codex-runtime-home/home/.orca_botmux/agent-hooks/codex-hook.sh',
-      trustConfigPath: '/mnt/d/wsl-home/.local/share/orca_botmux/codex-runtime-home/home/hooks.json'
+        '/mnt/d/wsl-home/.local/share/botmux/codex-runtime-home/home/.botmux/agent-hooks/codex-hook.sh',
+      trustConfigPath: '/mnt/d/wsl-home/.local/share/botmux/codex-runtime-home/home/hooks.json'
     })
   })
 
   it('uses WSL-canonical paths for hook commands and trust keys', () => {
     const runtimeHome =
-      '\\\\wsl.localhost\\Ubuntu\\home\\alias\\.local\\share\\orca_botmux\\codex-runtime-home\\home'
-    const canonicalHome = '/home/alice/.local/share/orca_botmux/codex-runtime-home/home'
+      '\\\\wsl.localhost\\Ubuntu\\home\\alias\\.local\\share\\botmux\\codex-runtime-home\\home'
+    const canonicalHome = '/home/alice/.local/share/botmux/codex-runtime-home/home'
 
     const plan = createCodexWslRuntimeHookInstallPlan(
       runtimeHome,
       { runtime: 'wsl', wslDistro: 'Ubuntu' },
       (distro, linuxPath) => {
         expect(distro).toBe('Ubuntu')
-        expect(linuxPath).toBe('/home/alias/.local/share/orca_botmux/codex-runtime-home/home')
+        expect(linuxPath).toBe('/home/alias/.local/share/botmux/codex-runtime-home/home')
         return canonicalHome
       }
     )
 
-    expect(plan?.commandScriptPath).toBe(`${canonicalHome}/.orca_botmux/agent-hooks/codex-hook.sh`)
+    expect(plan?.commandScriptPath).toBe(`${canonicalHome}/.botmux/agent-hooks/codex-hook.sh`)
     expect(plan?.trustConfigPath).toBe(`${canonicalHome}/hooks.json`)
     expect(plan?.configPath).toBe(pathWin32.join(runtimeHome, 'hooks.json'))
   })
@@ -133,7 +133,7 @@ describe('Codex WSL runtime hook install', () => {
 
     const oldPlan = {
       ...plan,
-      commandScriptPath: '/old/home/.orca_botmux/agent-hooks/codex-hook.sh',
+      commandScriptPath: '/old/home/.botmux/agent-hooks/codex-hook.sh',
       trustConfigPath: '/old/home/hooks.json'
     }
     expect(_internals.installManagedHooksIntoWslRuntime(oldPlan).state).toBe('installed')
@@ -142,7 +142,7 @@ describe('Codex WSL runtime hook install', () => {
 
     const newPlan = {
       ...plan,
-      commandScriptPath: '/new/home/.orca_botmux/agent-hooks/codex-hook.sh',
+      commandScriptPath: '/new/home/.botmux/agent-hooks/codex-hook.sh',
       trustConfigPath: '/new/home/hooks.json'
     }
     expect(_internals.installManagedHooksIntoWslRuntime(newPlan).state).toBe('installed')
@@ -241,7 +241,7 @@ describe('Codex WSL runtime hook install', () => {
   it('generates a POSIX hook that bridges WSL loopback failures through Windows curl', () => {
     const script = _internals.getManagedScript('posix')
     expect(script).toContain('load_hook_endpoint()')
-    expect(script).toContain('"set ORCA_AGENT_HOOK_TOKEN="*)')
+    expect(script).toContain('"set BOTMUX_AGENT_HOOK_TOKEN="*)')
     expect(script).toContain('post_codex_hook()')
     expect(script).toContain('is_wsl_runtime()')
     expect(script).toContain('WSL_DISTRO_NAME')
@@ -264,17 +264,17 @@ describe('Codex WSL runtime hook install', () => {
       writeFileSync(
         endpointPath,
         [
-          'set ORCA_AGENT_HOOK_PORT=43210',
-          'set ORCA_AGENT_HOOK_TOKEN=fresh-token',
-          'set ORCA_AGENT_HOOK_ENV=development',
-          'set ORCA_AGENT_HOOK_VERSION=1',
+          'set BOTMUX_AGENT_HOOK_PORT=43210',
+          'set BOTMUX_AGENT_HOOK_TOKEN=fresh-token',
+          'set BOTMUX_AGENT_HOOK_ENV=development',
+          'set BOTMUX_AGENT_HOOK_VERSION=1',
           ''
         ].join('\r\n'),
         'utf-8'
       )
       writeFileSync(
         curlPath,
-        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ORCA_TEST_CAPTURE"\ncat >> "$ORCA_TEST_CAPTURE"\n',
+        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BOTMUX_TEST_CAPTURE"\ncat >> "$BOTMUX_TEST_CAPTURE"\n',
         'utf-8'
       )
       chmodSync(curlPath, 0o755)
@@ -287,18 +287,18 @@ describe('Codex WSL runtime hook install', () => {
         env: {
           ...process.env,
           PATH: `${binDir}:${process.env.PATH ?? ''}`,
-          ORCA_AGENT_HOOK_ENDPOINT: endpointPath,
-          ORCA_AGENT_HOOK_PORT: '1',
-          ORCA_AGENT_HOOK_TOKEN: 'stale-token',
-          ORCA_PANE_KEY: 'pane-1',
-          ORCA_TEST_CAPTURE: capturePath
+          BOTMUX_AGENT_HOOK_ENDPOINT: endpointPath,
+          BOTMUX_AGENT_HOOK_PORT: '1',
+          BOTMUX_AGENT_HOOK_TOKEN: 'stale-token',
+          BOTMUX_PANE_KEY: 'pane-1',
+          BOTMUX_TEST_CAPTURE: capturePath
         }
       })
 
       expect(result.status).toBe(0)
       const posted = readFileSync(capturePath, 'utf-8')
       expect(posted).toContain('http://127.0.0.1:43210/hook/codex')
-      expect(posted).toContain('X-OrcaBotmux-Agent-Hook-Token: fresh-token')
+      expect(posted).toContain('X-Botmux-Agent-Hook-Token: fresh-token')
       expect(posted).not.toContain('stale-token')
     }
   )
@@ -314,7 +314,7 @@ describe('Codex WSL runtime hook install', () => {
       writeFileSync(join(binDir, 'curl'), '#!/bin/sh\nexit 7\n', 'utf-8')
       writeFileSync(
         join(binDir, 'curl.exe'),
-        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$ORCA_TEST_CAPTURE"\ncat >> "$ORCA_TEST_CAPTURE"\n',
+        '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BOTMUX_TEST_CAPTURE"\ncat >> "$BOTMUX_TEST_CAPTURE"\n',
         'utf-8'
       )
       chmodSync(join(binDir, 'curl'), 0o755)
@@ -329,22 +329,22 @@ describe('Codex WSL runtime hook install', () => {
           ...process.env,
           PATH: `${binDir}:${process.env.PATH ?? ''}`,
           WSL_DISTRO_NAME: 'Ubuntu',
-          ORCA_AGENT_HOOK_ENDPOINT: '',
-          ORCA_AGENT_HOOK_PORT: '43210',
-          ORCA_AGENT_HOOK_TOKEN: 'token',
-          ORCA_PANE_KEY: 'pane-1',
-          ORCA_TEST_CAPTURE: capturePath
+          BOTMUX_AGENT_HOOK_ENDPOINT: '',
+          BOTMUX_AGENT_HOOK_PORT: '43210',
+          BOTMUX_AGENT_HOOK_TOKEN: 'token',
+          BOTMUX_PANE_KEY: 'pane-1',
+          BOTMUX_TEST_CAPTURE: capturePath
         }
       })
 
       expect(result.status).toBe(0)
       const posted = readFileSync(capturePath, 'utf-8')
       expect(posted).toContain('http://127.0.0.1:43210/hook/codex')
-      expect(posted).toContain('X-OrcaBotmux-Agent-Hook-Token: token')
+      expect(posted).toContain('X-Botmux-Agent-Hook-Token: token')
     }
   )
 
-  it('installs trusted WSL hooks and removes only OrcaBotmux entries when disabled', () => {
+  it('installs trusted WSL hooks and removes only Botmux entries when disabled', () => {
     const plan = createTestPlan()
     const userCommand = '/bin/sh /home/alice/user-hook.sh'
     writeFileSync(
@@ -358,7 +358,7 @@ describe('Codex WSL runtime hook install', () => {
                 {
                   type: 'command',
                   command:
-                    "if [ -x '/old/.orca_botmux/agent-hooks/codex-hook.sh' ]; then /bin/sh '/old/.orca_botmux/agent-hooks/codex-hook.sh'; fi"
+                    "if [ -x '/old/.botmux/agent-hooks/codex-hook.sh' ]; then /bin/sh '/old/.botmux/agent-hooks/codex-hook.sh'; fi"
                 }
               ]
             }

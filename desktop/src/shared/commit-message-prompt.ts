@@ -9,7 +9,7 @@ Rules:
 - First line: imperative mood, <= 72 chars, no trailing period.
 - Optional body: blank line, then wrapped at 72 chars explaining WHY.
 - Output ONLY the commit message - no preamble, no code fences, no quotes.
-- Do not include "Co-authored-by" trailers - OrcaBotmux appends them after generation when configured.
+- Do not include "Co-authored-by" trailers - Botmux appends them after generation when configured.
 
 Staged diff:
 \`\`\`diff

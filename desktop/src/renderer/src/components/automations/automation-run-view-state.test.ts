@@ -194,7 +194,7 @@ describe('canRerunAutomationRun', () => {
     ).toBe(false)
   })
 
-  it('hides rerun when the automation no longer exists in the OrcaBotmux list', () => {
+  it('hides rerun when the automation no longer exists in the Botmux list', () => {
     expect(
       canRerunAutomationRun({
         automation: null,

@@ -32,7 +32,7 @@ describe('materializeServeSimRuntime', () => {
   })
 
   async function createRoot(): Promise<string> {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-simcam-materializer-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-simcam-materializer-'))
     cleanupPaths.push(root)
     return root
   }

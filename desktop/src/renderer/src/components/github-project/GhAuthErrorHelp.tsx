@@ -26,7 +26,7 @@ const LOGIN_CMD = 'gh auth login'
 // macOS/Linux vs PowerShell on Windows.
 const IS_WINDOWS = typeof navigator !== 'undefined' && /Win(dows|32|64)/i.test(navigator.userAgent)
 
-function reloadOrcaRenderer(): void {
+function reloadBotmuxRenderer(): void {
   const reload = window.api.app.reload
   if (typeof reload !== 'function') {
     window.location.reload()
@@ -59,7 +59,7 @@ function findEnvVarCommand(varName: string): { label: string; command: string } 
 function unsetEnvVarCommand(varName: string): { label: string; command: string } {
   if (IS_WINDOWS) {
     // Persistent removal at the user scope; the user still needs a fresh
-    // shell/OrcaBotmux relaunch for the change to take effect.
+    // shell/Botmux relaunch for the change to take effect.
     return {
       label: translate(
         'auto.components.github.project.GhAuthErrorHelp.fd17b3019f',
@@ -134,7 +134,7 @@ function buildRemediation(
     return {
       summary: 'GitHub CLI (`gh`) is not installed or not on PATH.',
       detail:
-        'OrcaBotmux uses `gh` to talk to GitHub Projects. Install it from cli.github.com, then sign in.',
+        'Botmux uses `gh` to talk to GitHub Projects. Install it from cli.github.com, then sign in.',
       commands: [
         {
           label: translate(
@@ -160,8 +160,8 @@ function buildRemediation(
     return {
       summary: `\`${varName}\` is set in your environment, so \`gh\` is using that token instead of your keyring login. \`gh auth refresh\` cannot modify env-supplied tokens — that's why running it didn't help.`,
       detail: IS_WINDOWS
-        ? `Find where \`${varName}\` is set (System or User environment variables, or your PowerShell profile), remove it, then restart OrcaBotmux so the new environment is picked up.${fallback}`
-        : `Find where \`${varName}\` is exported (commonly \`~/.zshrc\`, \`~/.zshenv\`, \`~/.bashrc\`, \`~/.profile\`, or your shell's secrets manager), remove it, then restart OrcaBotmux so the new environment is picked up.${fallback}`,
+        ? `Find where \`${varName}\` is set (System or User environment variables, or your PowerShell profile), remove it, then restart Botmux so the new environment is picked up.${fallback}`
+        : `Find where \`${varName}\` is exported (commonly \`~/.zshrc\`, \`~/.zshenv\`, \`~/.bashrc\`, \`~/.profile\`, or your shell's secrets manager), remove it, then restart Botmux so the new environment is picked up.${fallback}`,
       commands: [findEnvVarCommand(varName), unsetEnvVarCommand(varName)],
       docsUrl: 'https://cli.github.com/manual/gh_help_environment'
     }
@@ -169,14 +169,14 @@ function buildRemediation(
 
   // gh is not the problem, but the Electron process inherited GITHUB_TOKEN
   // from the parent shell. Even after the user runs `gh auth refresh` in a
-  // separate terminal, OrcaBotmux's gh subprocess sees the env var and uses it.
+  // separate terminal, Botmux's gh subprocess sees the env var and uses it.
   if (diag.envTokenInProcess && (!active || diag.missingScopes.length > 0)) {
     const varName = diag.envTokenInProcess
     return {
-      summary: `OrcaBotmux inherited \`${varName}\` from your shell, and \`gh\` is using that token. \`gh auth refresh\` doesn't apply to env-supplied tokens.`,
-      detail: `Unset \`${varName}\` in the shell that launches OrcaBotmux${
+      summary: `Botmux inherited \`${varName}\` from your shell, and \`gh\` is using that token. \`gh auth refresh\` doesn't apply to env-supplied tokens.`,
+      detail: `Unset \`${varName}\` in the shell that launches Botmux${
         IS_WINDOWS ? ' (or in your user environment variables)' : ' (or in your shell rc file)'
-      }, then restart OrcaBotmux.`,
+      }, then restart Botmux.`,
       commands: [findEnvVarCommand(varName), unsetEnvVarCommand(varName)],
       docsUrl: 'https://cli.github.com/manual/gh_help_environment'
     }
@@ -298,7 +298,7 @@ export function GhAuthErrorHelp({
               reload the renderer to pick up the new gh token state. */}
           <button
             type="button"
-            onClick={reloadOrcaRenderer}
+            onClick={reloadBotmuxRenderer}
             className="inline-flex items-center gap-1 rounded border border-amber-500/30 px-1.5 py-0.5 text-[11px] hover:bg-amber-500/20"
           >
             <RotateCw className="size-3" />{' '}
@@ -333,7 +333,7 @@ export function GhAuthErrorHelp({
         ) : null}
         {/* Why: after running the refresh command in a terminal, users need to
             reload the renderer to pick up the new gh token state. */}
-        <Button size="sm" variant="outline" onClick={reloadOrcaRenderer}>
+        <Button size="sm" variant="outline" onClick={reloadBotmuxRenderer}>
           <RotateCw className="mr-1 size-3.5" />{' '}
           {translate('auto.components.github.project.GhAuthErrorHelp.7e800068d8', 'Reload')}
         </Button>

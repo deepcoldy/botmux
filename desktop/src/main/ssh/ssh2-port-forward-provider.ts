@@ -26,27 +26,40 @@ export class Ssh2PortForwardProvider implements SshPortForwardProvider {
       socket.on('close', () => activeSockets.delete(socket))
       socket.on('error', () => socket.destroy())
 
-      client.forwardOut(
-        options.localHost,
-        options.localPort,
-        options.remoteHost,
-        options.remotePort,
-        (err, channel) => {
-          if (err) {
-            socket.destroy()
-            return
+      if (closed || socket.destroyed) {
+        socket.destroy()
+        return
+      }
+
+      // Why: ssh2.forwardOut throws synchronously ("Not connected") when the
+      // underlying socket is already gone — e.g. race after disconnect while
+      // the local listen port is still accepting. Catch so accept handlers
+      // never become uncaught main-process exceptions.
+      try {
+        client.forwardOut(
+          options.localHost,
+          options.localPort,
+          options.remoteHost,
+          options.remotePort,
+          (err, channel) => {
+            if (err) {
+              socket.destroy()
+              return
+            }
+            if (closed || socket.destroyed) {
+              closeChannel(channel)
+              socket.destroy()
+              return
+            }
+            socket.pipe(channel).pipe(socket)
+            channel.on('close', () => socket.destroy())
+            channel.on('error', () => socket.destroy())
+            socket.on('close', () => channel.close())
           }
-          if (closed || socket.destroyed) {
-            closeChannel(channel)
-            socket.destroy()
-            return
-          }
-          socket.pipe(channel).pipe(socket)
-          channel.on('close', () => socket.destroy())
-          channel.on('error', () => socket.destroy())
-          socket.on('close', () => channel.close())
-        }
-      )
+        )
+      } catch {
+        socket.destroy()
+      }
     })
 
     await listen(server, options.localHost, options.localPort)

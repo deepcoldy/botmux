@@ -41,7 +41,7 @@ describe('createChromiumCookieSnapshot', () => {
   let writer: DatabaseSync | null
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'orca-botmux-chromium-snapshot-test-'))
+    root = mkdtempSync(join(tmpdir(), 'botmux-chromium-snapshot-test-'))
     writer = null
     beforeCopyMock.mockReset()
   })

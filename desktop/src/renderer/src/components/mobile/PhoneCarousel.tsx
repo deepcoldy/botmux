@@ -119,7 +119,7 @@ export function PhoneCarousel(): React.JSX.Element {
           role="img"
           aria-label={translate(
             'auto.components.mobile.PhoneCarousel.89c7713645',
-            'OrcaBotmux Mobile home screen'
+            'Botmux Mobile home screen'
           )}
         >
           <HomeSlide tapping={tappingSlide === 0} />

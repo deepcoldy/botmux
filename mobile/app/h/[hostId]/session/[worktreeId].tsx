@@ -262,6 +262,7 @@ import type {
   TerminalGestureInputBucket,
   TerminalGestureInputQueue
 } from './mobile-session-route-types'
+import { useMobileI18n } from '../../../../src/i18n/mobile-i18n'
 
 const TERMINAL_KEYBOARD_DISMISS_ACTION_SHEET_FALLBACK_MS = 450
 
@@ -284,6 +285,7 @@ function MarkdownReader({
   onDiscard: () => void
   keyboardLift: number
 }) {
+  const { t } = useMobileI18n()
   // The editor lives in a WebView; native Keyboard events under-report its
   // covered area, so prefer the inset measured inside the WebView when larger.
   const [webviewKeyboardInset, setWebviewKeyboardInset] = useState(0)
@@ -301,7 +303,7 @@ function MarkdownReader({
         <Text style={styles.markdownError}>{doc.message}</Text>
         <Pressable style={styles.markdownRefreshButton} onPress={onRefresh}>
           <RefreshCw size={14} color={colors.textPrimary} />
-          <Text style={styles.markdownRefreshText}>Retry</Text>
+          <Text style={styles.markdownRefreshText}>{t('Retry')}</Text>
         </Pressable>
       </View>
     )
@@ -310,9 +312,9 @@ function MarkdownReader({
   const statusText = doc.saveError
     ? doc.saveError
     : doc.readOnlyReason
-      ? 'Read only'
+      ? t('Read only')
       : doc.stale
-        ? 'Changed on desktop'
+        ? t('Changed on desktop')
         : null
   const showRefresh = (doc.stale && !doc.isDirty) || !doc.editable
   const showCopy = doc.saveError || !doc.editable
@@ -355,18 +357,18 @@ function MarkdownReader({
           <View style={styles.markdownFloatingActions}>
             {showCopy ? (
               <Pressable style={styles.markdownFloatingButton} onPress={onCopy}>
-                <Text style={styles.markdownFloatingButtonText}>Copy</Text>
+                <Text style={styles.markdownFloatingButtonText}>{t('Copy')}</Text>
               </Pressable>
             ) : null}
             {showRefresh ? (
               <Pressable style={styles.markdownFloatingButton} onPress={onRefresh}>
                 <RefreshCw size={13} color={colors.textPrimary} />
-                <Text style={styles.markdownFloatingButtonText}>Refresh</Text>
+                <Text style={styles.markdownFloatingButtonText}>{t('Refresh')}</Text>
               </Pressable>
             ) : null}
             {doc.isDirty ? (
               <Pressable style={styles.markdownFloatingButton} onPress={onDiscard}>
-                <Text style={styles.markdownFloatingButtonText}>Discard</Text>
+                <Text style={styles.markdownFloatingButtonText}>{t('Discard')}</Text>
               </Pressable>
             ) : null}
             {showSave ? (
@@ -382,7 +384,7 @@ function MarkdownReader({
                 {doc.saving ? (
                   <ActivityIndicator size="small" color={colors.textPrimary} />
                 ) : (
-                  <Text style={styles.markdownFloatingButtonText}>Save</Text>
+                  <Text style={styles.markdownFloatingButtonText}>{t('Save')}</Text>
                 )}
               </Pressable>
             ) : null}
@@ -420,6 +422,7 @@ function DiffLineRow({
   onSubmitComment: (lineNumber: number) => void
   onDeleteComment: (commentId: string) => void
 }) {
+  const { t } = useMobileI18n()
   const commentLine = line.newLineNumber
   const isCommenting = commentLine !== undefined && activeCommentLine === commentLine
   const canComment = commentLine !== undefined
@@ -465,7 +468,7 @@ function DiffLineRow({
                 onStartComment(commentLine)
               }
             }}
-            accessibilityLabel={`Add note on line ${commentLine}`}
+            accessibilityLabel={t('Add note on line {{line}}', { line: commentLine ?? '' })}
           >
             <Plus size={12} color={colors.textSecondary} strokeWidth={2.3} />
           </Pressable>
@@ -477,12 +480,16 @@ function DiffLineRow({
             <View key={comment.id} style={styles.diffCommentCard}>
               <View style={styles.diffCommentHeader}>
                 <MessageSquare size={12} color={colors.textMuted} strokeWidth={2.2} />
-                <Text style={styles.diffCommentMeta}>Line {comment.lineNumber}</Text>
+                <Text style={styles.diffCommentMeta}>
+                  {t('Line {{line}}', { line: comment.lineNumber })}
+                </Text>
                 <Pressable
                   style={styles.diffCommentDeleteButton}
                   disabled={commentsBusy}
                   onPress={() => onDeleteComment(comment.id)}
-                  accessibilityLabel={`Delete note on line ${comment.lineNumber}`}
+                  accessibilityLabel={t('Delete note on line {{line}}', {
+                    line: comment.lineNumber
+                  })}
                 >
                   <X size={12} color={colors.textMuted} strokeWidth={2.2} />
                 </Pressable>
@@ -498,7 +505,7 @@ function DiffLineRow({
             style={[styles.textInput, styles.diffCommentInput]}
             value={commentDraft}
             onChangeText={onDraftChange}
-            placeholder="Add review note"
+            placeholder={t('Add review note')}
             placeholderTextColor={colors.textMuted}
             editable={!commentsBusy}
             multiline
@@ -511,7 +518,7 @@ function DiffLineRow({
               disabled={commentsBusy}
               onPress={onCancelComment}
             >
-              <Text style={styles.diffCommentSecondaryText}>Cancel</Text>
+              <Text style={styles.diffCommentSecondaryText}>{t('Cancel')}</Text>
             </Pressable>
             <Pressable
               style={[
@@ -525,7 +532,7 @@ function DiffLineRow({
                 }
               }}
             >
-              <Text style={styles.diffCommentPrimaryText}>Save note</Text>
+              <Text style={styles.diffCommentPrimaryText}>{t('Save note')}</Text>
             </Pressable>
           </View>
         </View>
@@ -547,6 +554,7 @@ function FileReader({
   language?: string
   diffCommentActions?: DiffCommentActions
 }) {
+  const { t } = useMobileI18n()
   const syntaxLanguage = useMemo(
     () => resolveMobileSyntaxLanguage(relativePath || title, language),
     [language, relativePath, title]
@@ -704,8 +712,10 @@ function FileReader({
               <MessageSquare size={14} color={colors.textSecondary} strokeWidth={2.2} />
               <Text style={styles.diffNotesTitle}>
                 {commentCount === 0
-                  ? 'No review notes'
-                  : `${commentCount} review ${commentCount === 1 ? 'note' : 'notes'}`}
+                  ? t('No review notes')
+                  : t(commentCount === 1 ? '{{count}} review note' : '{{count}} review notes', {
+                      count: commentCount
+                    })}
               </Text>
             </View>
             <View style={styles.diffNotesActions}>
@@ -716,10 +726,10 @@ function FileReader({
                 ]}
                 disabled={!canCopyNotes}
                 onPress={() => void diffCommentActions.onCopyAll()}
-                accessibilityLabel="Copy review notes"
+                accessibilityLabel={t('Copy review notes')}
               >
                 <Copy size={13} color={colors.textSecondary} strokeWidth={2.2} />
-                <Text style={styles.diffNotesActionText}>Copy</Text>
+                <Text style={styles.diffNotesActionText}>{t('Copy')}</Text>
               </Pressable>
               <Pressable
                 style={[
@@ -728,10 +738,10 @@ function FileReader({
                 ]}
                 disabled={!canSendNotes}
                 onPress={diffCommentActions.onSendAll}
-                accessibilityLabel="Send review notes to AI"
+                accessibilityLabel={t('Send review notes to AI')}
               >
                 <Send size={13} color={colors.textSecondary} strokeWidth={2.2} />
-                <Text style={styles.diffNotesActionText}>Send</Text>
+                <Text style={styles.diffNotesActionText}>{t('Send')}</Text>
               </Pressable>
             </View>
           </View>
@@ -811,17 +821,24 @@ export default function SessionScreen() {
     worktreeId,
     name: routeWorktreeName,
     created,
-    warning: createdWarning
+    warning: createdWarning,
+    tabId: routeTabId,
+    botmuxOpen: routeBotmuxOpen
   } = useLocalSearchParams<{
     hostId: string
     worktreeId: string
     name?: string
     created?: string
     warning?: string
+    /** Prefer selecting this session tab when opening from Botmux sessions. */
+    tabId?: string
+    /** Set by openBotmuxSessionOnMobile — skip empty bare auto-create this visit. */
+    botmuxOpen?: string
   }>()
   const isFolderWorkspaceRoute = worktreeId.startsWith('folder:') // Synthetic ids have no repo scope.
   const router = useRouter()
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   // Why: shared client per host owned by RpcClientProvider. See
   // docs/mobile-shared-client-per-host.md.
   const { client, state: connState } = useHostClient(hostId)
@@ -891,7 +908,7 @@ export default function SessionScreen() {
   // command bar; reloaded on focus so a Settings → Terminal toggle takes effect on return.
   const [autocompleteEnabled, setAutocompleteEnabled] = useState(false)
   const [terminalLinkOpenMode, setTerminalLinkOpenMode] =
-    useState<MobileTerminalLinkOpenMode>('orca-browser')
+    useState<MobileTerminalLinkOpenMode>('botmux-browser')
   const [liveInputCapture, setLiveInputCapture] = useState('')
   const {
     clearTerminalLiveInputDefault,
@@ -1033,7 +1050,7 @@ export default function SessionScreen() {
   const pendingActiveSessionTabIdRef = useRef<string | null>(null)
   const pendingActiveTerminalHandleRef = useRef<string | null>(null)
   // Why: a browser tab opened from a terminal-tapped HTML must be focused as an
-  // Orca session tab (bridge auto-activate only flags the live webContents, not
+  // Botmux session tab (bridge auto-activate only flags the live webContents, not
   // the app-level active tab). We remember the page id and, once its session tab
   // syncs, activate it through the normal switchSessionTab path (which also makes
   // switching back to the terminal work). A ref breaks the callback dep cycle.
@@ -1848,7 +1865,10 @@ export default function SessionScreen() {
         if (draftTab) {
           // Why: save-only mobile edits live only on the phone until Save. If the
           // desktop tab disappears, keep every local draft reachable for copy/discard.
-          orphanedDraftTabs.push({ ...draftTab, isActive: tabId === activeSessionTabIdRef.current })
+          orphanedDraftTabs.push({
+            ...draftTab,
+            isActive: tabId === activeSessionTabIdRef.current
+          })
         }
       }
       if (orphanedDraftTabs.length > 0) {
@@ -2690,7 +2710,7 @@ export default function SessionScreen() {
   useEffect(() => {
     if (hostId && worktreeId) {
       void AsyncStorage.setItem(
-        'orca:last-visited-worktree',
+        'botmux:last-visited-worktree',
         JSON.stringify({ hostId, worktreeId })
       )
     }
@@ -2720,7 +2740,8 @@ export default function SessionScreen() {
     clearTerminalCache()
     activeHandleRef.current = null
     activeSessionTabTypeRef.current = null
-    pendingActiveSessionTabIdRef.current = null
+    pendingActiveSessionTabIdRef.current =
+      typeof routeTabId === 'string' && routeTabId.trim() ? routeTabId.trim() : null
     pendingActiveTerminalHandleRef.current = null
     pendingBrowserFocusPageIdRef.current = null
     pendingTerminalActivationAttemptRef.current = null
@@ -2755,6 +2776,7 @@ export default function SessionScreen() {
     clearPendingLiveInputCommit,
     clearTerminalCache,
     hostId,
+    routeTabId,
     worktreeId
   ])
 
@@ -2786,7 +2808,7 @@ export default function SessionScreen() {
     void (async () => {
       const reportActivationOutcome = (response: RpcSuccess | null): void => {
         if (!disposed && response && headlessActivationNeedsHostRenderer(response.result)) {
-          showToast('Open Orca on the host to wake sleeping agents.', 3000)
+          showToast('Open Botmux on the host to wake sleeping agents.', 3000)
         }
       }
       if (client && created !== '1') {
@@ -4439,12 +4461,31 @@ export default function SessionScreen() {
     ) {
       return
     }
+    // Why: Botmux open navigates with botmuxOpen=1 (and agent worktrees always
+    // use attach). Auto-creating a bare shell races attach and is the "普通终端"
+    // users see. Ordinary worktree entry keeps the generic empty-session create.
+    const openedFromBotmux =
+      routeBotmuxOpen === '1' ||
+      routeBotmuxOpen === 'true' ||
+      worktreeId.startsWith('botmux:agent:')
+    if (openedFromBotmux) {
+      initialEmptySessionAutoCreateRef.current = worktreeId
+      return
+    }
     // Why: a sleeping/new workspace can hydrate with zero session tabs. Create
     // the first terminal once on initial load instead of leaving mobile blank.
     initialEmptySessionAutoCreateRef.current = worktreeId
     setCreateError('')
     void handleCreateTerminal()
-  }, [client, creating, creatingBrowser, creatingMarkdown, showEmptyState, worktreeId])
+  }, [
+    client,
+    creating,
+    creatingBrowser,
+    creatingMarkdown,
+    routeBotmuxOpen,
+    showEmptyState,
+    worktreeId
+  ])
 
   // Why: the reconnect loop slows to a 90s trickle at its give-up cap;
   // surface tap-to-retry once the verdict escalates so recovery doesn't
@@ -4643,7 +4684,7 @@ export default function SessionScreen() {
               style={({ pressed }) => [styles.backButton, pressed && styles.backButtonPressed]}
               onPress={requestLeaveSession}
               hitSlop={8}
-              accessibilityLabel="Back to worktrees"
+              accessibilityLabel={t('Back to worktrees')}
             >
               <ChevronLeft size={22} color={colors.textSecondary} strokeWidth={2.2} />
             </Pressable>
@@ -4671,14 +4712,14 @@ export default function SessionScreen() {
             </View>
             <MobileSessionHeaderIconButton
               active={activePanel === 'files'}
-              accessibilityLabel="Open file explorer"
+              accessibilityLabel={t('Open file explorer')}
               icon={Folder}
               onPress={() => handlePanelTap('files')}
             />
             {!isFolderWorkspaceRoute && (
               <MobileSessionHeaderIconButton
                 active={activePanel === 'sourceControl'}
-                accessibilityLabel="Open source control"
+                accessibilityLabel={t('Open source control')}
                 icon={GitBranch}
                 onPress={() => handlePanelTap('sourceControl')}
               />
@@ -4686,7 +4727,7 @@ export default function SessionScreen() {
             {showHeaderMoreButton ? (
               <MobileSessionHeaderIconButton
                 active={activePanel === 'pr'}
-                accessibilityLabel="More session actions"
+                accessibilityLabel={t('More session actions')}
                 icon={MoreHorizontal}
                 onPress={() => setShowHeaderMoreActions(true)}
               />
@@ -4719,48 +4760,72 @@ export default function SessionScreen() {
                   scrollActiveTabIntoView(activeSessionTabIdRef.current, false)
                 }}
               >
-                {visibleTabs.map((t) => (
+                {visibleTabs.map((tab) => (
                   <Pressable
-                    key={t.id}
-                    style={[styles.tab, t.id === activeSessionTabId && styles.tabActive]}
+                    key={tab.id}
+                    style={[styles.tab, tab.id === activeSessionTabId && styles.tabActive]}
                     onLayout={(e) => {
                       const { x, width } = e.nativeEvent.layout
-                      tabLayoutsRef.current.set(t.id, { x, width })
-                      if (t.id === activeSessionTabIdRef.current) {
-                        scrollActiveTabIntoView(t.id, false)
+                      tabLayoutsRef.current.set(tab.id, { x, width })
+                      if (tab.id === activeSessionTabIdRef.current) {
+                        scrollActiveTabIntoView(tab.id, false)
                       }
                     }}
-                    onPress={() => switchSessionTab(t)}
+                    onPress={() => switchSessionTab(tab)}
                     onLongPress={() => {
                       triggerMediumImpact()
-                      openSessionTabActionSheetAfterKeyboardDismiss(t)
+                      openSessionTabActionSheetAfterKeyboardDismiss(tab)
                     }}
                     delayLongPress={400}
                   >
                     <View style={styles.tabLabelRow}>
-                      {t.type === 'browser' && (
+                      {tab.type === 'browser' && (
                         <Globe size={13} color={colors.textSecondary} strokeWidth={2.1} />
                       )}
-                      {t.type === 'markdown' && (
+                      {tab.type === 'markdown' && (
                         <FileText size={13} color={colors.textSecondary} strokeWidth={2.1} />
                       )}
-                      {t.type === 'file' && (
+                      {tab.type === 'file' && (
                         <File size={13} color={colors.textSecondary} strokeWidth={2.1} />
                       )}
-                      {t.type === 'terminal' &&
+                      {tab.type === 'terminal' &&
                         (() => {
-                          const agentId = resolveMobileTerminalTabAgentId(t)
+                          const agentId = resolveMobileTerminalTabAgentId(tab)
                           return agentId ? <MobileAgentIcon agentId={agentId} size={13} /> : null
                         })()}
                       <Text
                         style={[
                           styles.tabText,
-                          t.id === activeSessionTabId && styles.tabTextActive
+                          tab.id === activeSessionTabId && styles.tabTextActive
                         ]}
                         numberOfLines={1}
                       >
-                        {getMobileSessionTabTitle(t)}
+                        {getMobileSessionTabTitle(tab)}
                       </Text>
+                      <Pressable
+                        style={({ pressed }) => [
+                          styles.tabCloseButton,
+                          pressed && styles.tabCloseButtonPressed
+                        ]}
+                        hitSlop={8}
+                        accessibilityLabel={t('Close tab')}
+                        onPress={(e) => {
+                          // Why: stop parent tab Pressable from re-selecting before close.
+                          e.stopPropagation?.()
+                          triggerMediumImpact()
+                          void handleCloseSessionTab(tab)
+                        }}
+                      >
+                        <X
+                          size={12}
+                          color={
+                            tab.id === activeSessionTabId
+                              ? colors.textSecondary
+                              : colors.textMuted
+                          }
+                          strokeWidth={2.2}
+                        />
+                      </Pressable>
                     </View>
                   </Pressable>
                 ))}
@@ -4781,7 +4846,7 @@ export default function SessionScreen() {
                   setCreateError('')
                   setShowCreateTabDrawer(true)
                 }}
-                accessibilityLabel="New tab"
+                accessibilityLabel={t('New tab')}
               >
                 <Plus size={16} color={colors.textSecondary} strokeWidth={2.2} />
               </Pressable>
@@ -4810,7 +4875,7 @@ export default function SessionScreen() {
                 <Pressable
                   style={styles.createWarningDismiss}
                   onPress={() => setCreateWarningState(dismissMobileSessionCreateWarningState)}
-                  accessibilityLabel="Dismiss workspace creation warning"
+                  accessibilityLabel={t('Dismiss workspace creation warning')}
                   hitSlop={8}
                 >
                   <X size={16} color={colors.textMuted} strokeWidth={2.2} />
@@ -4824,7 +4889,7 @@ export default function SessionScreen() {
               </View>
             ) : showEmptyState ? (
               <View style={styles.emptyState}>
-                <Text style={styles.emptyText}>No tabs in this session</Text>
+                <Text style={styles.emptyText}>{t('No tabs in this session')}</Text>
                 {createError ? <Text style={styles.createError}>{createError}</Text> : null}
                 <View style={styles.emptyActions}>
                   <Pressable
@@ -5010,7 +5075,7 @@ export default function SessionScreen() {
                       onPress={dismissSoftwareKeyboard}
                       hitSlop={8}
                       accessibilityRole="button"
-                      accessibilityLabel="Dismiss keyboard"
+                      accessibilityLabel={t('Dismiss keyboard')}
                       accessibilityHint="Hides the software keyboard and keeps the current terminal session open."
                     >
                       <View style={styles.keyboardDismissGlyph}>
@@ -5099,7 +5164,7 @@ export default function SessionScreen() {
                         ]}
                         disabled={!canSend}
                         onPress={() => void handlePaste()}
-                        accessibilityLabel="Paste from clipboard"
+                        accessibilityLabel={t('Paste from clipboard')}
                       >
                         <Text
                           style={[
@@ -5185,7 +5250,7 @@ export default function SessionScreen() {
                         pressed && styles.accessoryKeyPressed
                       ]}
                       onPress={() => setShowCustomKeyModal(true)}
-                      accessibilityLabel="Add custom shortcut"
+                      accessibilityLabel={t('Add custom shortcut')}
                     >
                       <Plus size={14} color={colors.textSecondary} strokeWidth={2.2} />
                     </Pressable>
@@ -5204,7 +5269,7 @@ export default function SessionScreen() {
                       disabled={!canSend}
                       onPress={focusLiveInput}
                       accessibilityRole="button"
-                      accessibilityLabel="Show keyboard for live terminal input"
+                      accessibilityLabel={t('Show keyboard for live terminal input')}
                       accessibilityHint="Typed text is sent directly to the active terminal"
                     >
                       <KeyboardIcon size={16} color={colors.textSecondary} strokeWidth={2} />
@@ -5270,7 +5335,7 @@ export default function SessionScreen() {
                       // writes a value that differs from the native field text;
                       // store the raw field text and normalize at send time.
                       onChangeText={setInput}
-                      placeholder="Type a command…"
+                      placeholder={t('Type a command…')}
                       placeholderTextColor={colors.textMuted}
                       autoCapitalize="none"
                       autoCorrect={autocompleteEnabled}
@@ -5306,7 +5371,7 @@ export default function SessionScreen() {
                       style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
                       disabled={!canSend}
                       onPress={() => void handleSend()}
-                      accessibilityLabel="Send command"
+                      accessibilityLabel={t('Send command')}
                     >
                       <ArrowUp size={18} color={colors.textSecondary} strokeWidth={2.5} />
                     </Pressable>
@@ -5557,7 +5622,7 @@ export default function SessionScreen() {
         visible={renameTarget != null}
         title="Rename Terminal"
         defaultValue={renameTarget?.title || 'Terminal'}
-        placeholder="Terminal name"
+        placeholder={t('Terminal name')}
         onSubmit={(value) => void handleRenameTerminal(value)}
         onCancel={() => setRenameTarget(null)}
       />

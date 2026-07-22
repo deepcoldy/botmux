@@ -6,7 +6,7 @@ import type { ShellHydrationFailureReason } from '../../shared/types'
 // that does not include dirs appended by the user's shell rc files (~/.zshrc,
 // ~/.bashrc). Tools installed into ~/.opencode/bin, ~/.cargo/bin, pyenv/volta
 // shims, and countless other user-local locations end up invisible to our
-// `which` probe even though they work fine from Terminal (see stablyai/orca_botmux#829).
+// `which` probe even though they work fine from Terminal (see stablyai/botmux#829).
 //
 // Rather than play whack-a-mole adding every agent's install dir to a hardcoded
 // list, we spawn the user's login shell once per app session and read the PATH
@@ -14,7 +14,7 @@ import type { ShellHydrationFailureReason } from '../../shared/types'
 // handles this problem (Hyper, VS Code, Cursor, etc. via shell-env/fix-path) —
 // we implement it inline to avoid adding a dependency.
 
-const DELIMITER = '__ORCA_SHELL_PATH__'
+const DELIMITER = '__BOTMUX_SHELL_PATH__'
 const SPAWN_TIMEOUT_MS = 5000
 
 // ANSI escape sequences can leak into the captured output when the user's rc
@@ -92,7 +92,7 @@ function spawnShellAndReadPath(shell: string): Promise<HydrationResult> {
       // Why: inherit current env so the shell sees the same baseline, then let
       // it layer its own rc files on top. Do NOT forward stdio — some shells
       // (oh-my-zsh setups, powerlevel10k) print a lot to stderr on startup,
-      // and we don't want that in OrcaBotmux's console.
+      // and we don't want that in Botmux's console.
       env: process.env,
       stdio: ['ignore', 'pipe', 'ignore'],
       detached: false

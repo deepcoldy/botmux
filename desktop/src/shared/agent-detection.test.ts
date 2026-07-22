@@ -121,7 +121,7 @@ describe('Pi-compatible title detection', () => {
     ['\u280b π: tmp', 'omp', '\u280b OMP'],
     ['\u280b π - tmp', 'omp', '\u280b OMP'],
     ['\u280b OMP', 'pi', '\u280b Pi'],
-    ['lucky-echidna | \u283c π - Diagnose OrcaBotmux terminal title flicker - test', 'omp', '\u280b OMP'],
+    ['lucky-echidna | \u283c π - Diagnose Botmux terminal title flicker - test', 'omp', '\u280b OMP'],
     ['lucky-echidna | Pi ready', 'omp', 'OMP ready'],
     ['Codex | Pi ready', 'omp', 'OMP ready'],
     // Why: the wrapped whole reads as a braille Claude title, but the re-ownable
@@ -181,10 +181,10 @@ describe('Pi-compatible title detection', () => {
 })
 
 describe('Cursor agent title identity', () => {
-  // Why: the accepted vocabulary is the set of labels OrcaBotmux actually synthesizes for Cursor.
+  // Why: the accepted vocabulary is the set of labels Botmux actually synthesizes for Cursor.
   // Pin it to that profile so renaming a label there cannot silently drop @cursor to zero
   // recipients (and desync the auto-Enter suppression that shares this predicate).
-  it('accepts every label OrcaBotmux synthesizes for Cursor', () => {
+  it('accepts every label Botmux synthesizes for Cursor', () => {
     const profile = SYNTHETIC_AGENT_TITLE_PROFILES.cursor
 
     for (const label of [
@@ -204,7 +204,7 @@ describe('Cursor agent title identity', () => {
     '⣿ Cursor Agent',
     'Cursor ready',
     'Cursor - action required'
-  ])('accepts the native or OrcaBotmux-synthesized Cursor title %j', (title) => {
+  ])('accepts the native or Botmux-synthesized Cursor title %j', (title) => {
     expect(isCursorAgentTitle(title)).toBe(true)
   })
 
@@ -215,7 +215,7 @@ describe('Cursor agent title identity', () => {
     '✳ Fix the text cursor blink',
     '. fix cursor position',
     '* cursor rendering done',
-    'Terminal Cursor and OrcaBotmux slows down',
+    'Terminal Cursor and Botmux slows down',
     'cursor-agent',
     'cursor.exe',
     '~/cursor-rules',

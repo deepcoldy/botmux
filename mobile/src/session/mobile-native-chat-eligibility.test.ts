@@ -43,6 +43,22 @@ describe('resolveMobileNativeChat', () => {
       } as never)
     ).toBeNull()
   })
+
+  it('falls back to launchAgent when live status is missing or unknown', () => {
+    expect(
+      resolveMobileNativeChat({
+        type: 'terminal',
+        launchAgent: 'claude',
+        agentStatus: { agentType: 'unknown' }
+      } as never)
+    ).toEqual({ agent: 'claude', sessionId: null, transcriptPath: null })
+    expect(resolveMobileNativeChat({ type: 'terminal', launchAgent: 'claude' })).toEqual({
+      agent: 'claude',
+      sessionId: null,
+      transcriptPath: null
+    })
+  })
+
   it('resolves agent + sessionId from launchAgent and provider session', () => {
     expect(
       resolveMobileNativeChat({

@@ -127,7 +127,7 @@ export async function filesFromAutoDirectories(
 
   // Why: Warp's preloaded themes live inside the Warp app binary, not on disk,
   // so an absent or empty themes folder is a genuine empty result — the
-  // renderer explains this and points at OrcaBotmux's built-in equivalents.
+  // renderer explains this and points at Botmux's built-in equivalents.
   return {
     canceled: false,
     sourceLabel: 'Warp themes',

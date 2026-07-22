@@ -7,8 +7,8 @@ import {
 export { PAIRING_OFFER_VERSION, PairingOfferSchema }
 export type { PairingOffer }
 
-// orca_botmux:// is canonical; orca_botmux:// kept for vendor-import / printed QR continuity.
-const PAIRING_SCHEMES = new Set(['orca_botmux:', 'orca_botmux:'])
+// Canonical pairing scheme for Botmux Desktop ↔ Mobile.
+const PAIRING_SCHEMES = new Set(['botmux:'])
 
 export function encodePairingOffer(offer: PairingOffer): string {
   const json = JSON.stringify(offer)
@@ -19,14 +19,14 @@ export function encodePairingOffer(offer: PairingOffer): string {
     .replace(/=+$/, '')
   // Why: Android camera intents and Expo Router preserve query params more
   // reliably than URL fragments when launching a custom-scheme app.
-  return `orca_botmux://pair?code=${base64url}`
+  return `botmux://pair?code=${base64url}`
 }
 
 export function decodePairingOffer(url: string): PairingOffer {
   const code = extractPairingCodeFromUrl(url)
   if (!code) {
     throw new Error(
-      'Invalid pairing URL: must start with orca_botmux://pair (or legacy orca_botmux://pair) and include a pairing code'
+      'Invalid pairing URL: must start with botmux://pair and include a pairing code'
     )
   }
   return decodePairingBase64(code)
@@ -53,7 +53,7 @@ function extractPairingCodeFromUrl(url: string): string | null {
   return parsed.hash ? parsed.hash.slice(1) || null : null
 }
 
-// Why: accept either an `orca_botmux://pair?...` URL or the bare base64
+// Why: accept either an `botmux://pair?...` URL or the bare base64
 // string so the mobile paste-pair flow can take whichever the user
 // actually copied from desktop.
 export function parsePairingCode(input: string): PairingOffer | null {
@@ -62,7 +62,7 @@ export function parsePairingCode(input: string): PairingOffer | null {
     return null
   }
   try {
-    if (trimmed.toLowerCase().startsWith('orca_botmux://')) {
+    if (trimmed.toLowerCase().startsWith('botmux://')) {
       return decodePairingOffer(trimmed)
     }
     return decodePairingBase64(trimmed)

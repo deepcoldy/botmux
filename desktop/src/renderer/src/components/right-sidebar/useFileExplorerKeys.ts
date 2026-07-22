@@ -121,7 +121,7 @@ export function useFileExplorerKeys(opts: {
       // Fallback: Radix portaled nodes or timing quirks — shell is marked explicitly.
       return (
         el instanceof Element &&
-        el.closest('[data-orca-botmux-explorer-shell]') === opts.containerRef.current
+        el.closest('[data-botmux-explorer-shell]') === opts.containerRef.current
       )
     }
 

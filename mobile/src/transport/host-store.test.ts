@@ -46,8 +46,8 @@ import {
 } from './host-store'
 import { resetMobileRelayHostOverlayStoreForTests } from './mobile-relay-host-overlay-store'
 
-const HOSTS_STORAGE_KEY = 'orca:hosts'
-const OVERLAY_STORAGE_KEY = 'orca:mobile-relay:host-overlays:v2'
+const HOSTS_STORAGE_KEY = 'botmux:hosts'
+const OVERLAY_STORAGE_KEY = 'botmux:mobile-relay:host-overlays:v2'
 const HOST_ONE = {
   id: 'host-1',
   name: 'Host 1',
@@ -144,14 +144,14 @@ describe('host-store list mutations', () => {
         {
           id: 'relay-primary',
           kind: 'relay',
-          url: 'wss://relay-c1.onorca.dev/v1/connect/AbCdEf0123_-xyZ9'
+          url: 'wss://relay-c1.example.test/v1/connect/AbCdEf0123_-xyZ9'
         }
       ],
       relayHostId: 'AbCdEf0123_-xyZ9',
       relay: {
         v: 1,
-        directorUrl: 'https://relay.onorca.dev',
-        cellUrl: 'https://relay-c1.onorca.dev',
+        directorUrl: 'https://relay.example.test',
+        cellUrl: 'https://relay-c1.example.test',
         assignmentEpoch: 7,
         relayHostId: 'AbCdEf0123_-xyZ9',
         e2eeFraming: 2
@@ -197,14 +197,14 @@ describe('host-store list mutations', () => {
         {
           id: 'relay-primary',
           kind: 'relay',
-          url: 'wss://relay-c1.onorca.dev/v1/connect/AbCdEf0123_-xyZ9'
+          url: 'wss://relay-c1.example.test/v1/connect/AbCdEf0123_-xyZ9'
         }
       ],
       relayHostId: 'AbCdEf0123_-xyZ9',
       relay: {
         v: 1,
-        directorUrl: 'https://relay.onorca.dev',
-        cellUrl: 'https://relay-c1.onorca.dev',
+        directorUrl: 'https://relay.example.test',
+        cellUrl: 'https://relay-c1.example.test',
         assignmentEpoch: 7,
         relayHostId: 'AbCdEf0123_-xyZ9',
         e2eeFraming: 2

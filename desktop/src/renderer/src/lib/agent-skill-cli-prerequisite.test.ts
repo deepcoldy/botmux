@@ -4,8 +4,8 @@ import type { CliInstallStatus } from '../../../shared/cli-install-types'
 import {
   CLI_PREREQUISITE_REGISTRATION_TOAST,
   CLI_PREREQUISITE_REGISTRATION_TOAST_DESCRIPTION,
-  ensureOrcaCliAvailableForAgentSkillTerminal,
-  isOrcaCliAvailableOnPath
+  ensureBotmuxCliAvailableForAgentSkillTerminal,
+  isBotmuxCliAvailableOnPath
 } from './agent-skill-cli-prerequisite'
 
 vi.mock('sonner', () => ({
@@ -19,11 +19,11 @@ vi.mock('sonner', () => ({
 function cliStatus(overrides: Partial<CliInstallStatus> = {}): CliInstallStatus {
   return {
     platform: 'darwin',
-    commandName: 'orca_botmux',
-    commandPath: '/usr/local/bin/orca_botmux',
+    commandName: 'botmux',
+    commandPath: '/usr/local/bin/botmux',
     pathDirectory: '/usr/local/bin',
     pathConfigured: true,
-    launcherPath: '/Applications/OrcaBotmux.app/Contents/MacOS/orca_botmux',
+    launcherPath: '/Applications/Botmux.app/Contents/MacOS/botmux',
     installMethod: 'symlink',
     supported: true,
     state: 'installed',
@@ -34,15 +34,15 @@ function cliStatus(overrides: Partial<CliInstallStatus> = {}): CliInstallStatus 
   }
 }
 
-describe('isOrcaCliAvailableOnPath', () => {
+describe('isBotmuxCliAvailableOnPath', () => {
   it('requires the installed CLI command to be visible on PATH', () => {
-    expect(isOrcaCliAvailableOnPath(cliStatus())).toBe(true)
-    expect(isOrcaCliAvailableOnPath(cliStatus({ pathConfigured: false }))).toBe(false)
-    expect(isOrcaCliAvailableOnPath(cliStatus({ state: 'not_installed' }))).toBe(false)
+    expect(isBotmuxCliAvailableOnPath(cliStatus())).toBe(true)
+    expect(isBotmuxCliAvailableOnPath(cliStatus({ pathConfigured: false }))).toBe(false)
+    expect(isBotmuxCliAvailableOnPath(cliStatus({ state: 'not_installed' }))).toBe(false)
   })
 })
 
-describe('ensureOrcaCliAvailableForAgentSkillTerminal', () => {
+describe('ensureBotmuxCliAvailableForAgentSkillTerminal', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.unstubAllGlobals()
@@ -69,7 +69,7 @@ describe('ensureOrcaCliAvailableForAgentSkillTerminal', () => {
     })
 
     await expect(
-      ensureOrcaCliAvailableForAgentSkillTerminal({
+      ensureBotmuxCliAvailableForAgentSkillTerminal({
         onStatusChange,
         registrationPromptDelayMs: 0
       })
@@ -87,7 +87,7 @@ describe('ensureOrcaCliAvailableForAgentSkillTerminal', () => {
     const initial = cliStatus({
       platform: 'win32',
       pathConfigured: null,
-      detail: 'OrcaBotmux could not read the Windows user PATH registry value.'
+      detail: 'Botmux could not read the Windows user PATH registry value.'
     })
     const install = vi.fn()
     vi.stubGlobal('window', {
@@ -95,7 +95,7 @@ describe('ensureOrcaCliAvailableForAgentSkillTerminal', () => {
     })
 
     await expect(
-      ensureOrcaCliAvailableForAgentSkillTerminal({ registrationPromptDelayMs: 0 })
+      ensureBotmuxCliAvailableForAgentSkillTerminal({ registrationPromptDelayMs: 0 })
     ).resolves.toBe(initial)
 
     expect(install).not.toHaveBeenCalled()
@@ -122,7 +122,7 @@ describe('ensureOrcaCliAvailableForAgentSkillTerminal', () => {
       }
     })
 
-    const pending = ensureOrcaCliAvailableForAgentSkillTerminal({ registrationPromptDelayMs: 700 })
+    const pending = ensureBotmuxCliAvailableForAgentSkillTerminal({ registrationPromptDelayMs: 700 })
     await vi.waitFor(() => {
       expect(toast.message).toHaveBeenCalledWith(CLI_PREREQUISITE_REGISTRATION_TOAST, {
         description: CLI_PREREQUISITE_REGISTRATION_TOAST_DESCRIPTION

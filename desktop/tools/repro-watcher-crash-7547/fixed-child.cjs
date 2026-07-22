@@ -136,7 +136,7 @@ if (!isMainThread && workerData && workerData.role === 'churn') {
   process.exit(0)
 }
 
-function subscribeLikeOrca(dir) {
+function subscribeLikeBotmux(dir) {
   let subRef = { current: null }
   stats.subscribes++
   return client
@@ -145,7 +145,7 @@ function subscribeLikeOrca(dir) {
       (err, events) => {
         if (err) {
           stats.watchErrors++
-          // OrcaBotmux's error path: unsubscribe from inside the error callback.
+          // Botmux's error path: unsubscribe from inside the error callback.
           if (subRef.current) {
             stats.unsubscribes++
             subRef.current.unsubscribe().catch(() => {})
@@ -174,7 +174,7 @@ async function deleteRootLane(baseDir, durationMs, lane) {
     makeTree(dir, 120, 4)
     let subRef
     try {
-      subRef = await subscribeLikeOrca(dir)
+      subRef = await subscribeLikeBotmux(dir)
     } catch {
       rmrf(dir)
       round++
@@ -211,7 +211,7 @@ async function unsubChurnLane(baseDir, durationMs, lane) {
   while (Date.now() < end) {
     let subRef
     try {
-      subRef = await subscribeLikeOrca(dir)
+      subRef = await subscribeLikeBotmux(dir)
     } catch {
       await sleep(20)
       continue
@@ -274,7 +274,7 @@ let completed = false
 
 async function main() {
   const durationMs = Number(process.argv[2] || 15000)
-  const baseDir = path.join(os.tmpdir(), 'orca-botmux-7547-harness-fixed', `run-${process.pid}`)
+  const baseDir = path.join(os.tmpdir(), 'botmux-7547-harness-fixed', `run-${process.pid}`)
   fs.mkdirSync(baseDir, { recursive: true })
 
   // Watchdog: a stuck lane must fail loudly, and a premature natural exit

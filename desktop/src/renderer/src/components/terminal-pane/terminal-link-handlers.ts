@@ -30,7 +30,7 @@ import {
 } from './terminal-path-exists-cache'
 import {
   getTerminalHtmlFileOpenHint,
-  getTerminalOrcaFileOpenHint,
+  getTerminalBotmuxFileOpenHint,
   getTerminalWorktreePathOpenHint,
   getTerminalFileOpenHint,
   getTerminalUrlOpenHint
@@ -202,7 +202,7 @@ export function createFilePathLinkProvider(
                         ? isHtmlFilePath(resolved.absolutePath)
                           ? getTerminalHtmlFileOpenHint()
                           : openLinkHint
-                        : getTerminalOrcaFileOpenHint()
+                        : getTerminalBotmuxFileOpenHint()
                     linkTooltip.textContent = `${resolved.absolutePath} (${hint})`
                     linkTooltip.style.display = ''
                   },

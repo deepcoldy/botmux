@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   execInTerminal,
@@ -8,29 +8,29 @@ import {
 } from './helpers/terminal'
 
 test.describe('Windows terminal env and shell identity', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
-  test('dev terminal preserves parent PATH so PATH commands resolve', async ({ orcaBotmuxPage }) => {
-    await waitForActiveTerminalManager(orcaBotmuxPage)
+  test('dev terminal preserves parent PATH so PATH commands resolve', async ({ botmuxPage }) => {
+    await waitForActiveTerminalManager(botmuxPage)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    const marker = `__ORCA_E2E_NODE_PATH_${Date.now()}__`
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    const marker = `__BOTMUX_E2E_NODE_PATH_${Date.now()}__`
 
     // Why: before the dev PATH fallback, daemon-spawned PTYs could get PATH set
-    // to only OrcaBotmux's dev CLI bin. A real terminal command catches that failure.
-    await execInTerminal(orcaBotmuxPage, ptyId, `node -e "console.log('${marker}')"`)
+    // to only Botmux's dev CLI bin. A real terminal command catches that failure.
+    await execInTerminal(botmuxPage, ptyId, `node -e "console.log('${marker}')"`)
 
-    await waitForTerminalOutput(orcaBotmuxPage, marker, 15_000)
+    await waitForTerminalOutput(botmuxPage, marker, 15_000)
   })
 
-  test('Windows tab icons stay pinned to the shell used at tab creation', async ({ orcaBotmuxPage }) => {
+  test('Windows tab icons stay pinned to the shell used at tab creation', async ({ botmuxPage }) => {
     test.skip(process.platform !== 'win32', 'Windows shell icons only render on Windows')
 
-    const tabIds = await orcaBotmuxPage.evaluate(() => {
+    const tabIds = await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('Store unavailable')
@@ -58,7 +58,7 @@ test.describe('Windows terminal env and shell identity', () => {
       return { wslTabId: wslTab.id, cmdTabId: cmdTab.id }
     })
 
-    const tabSnapshot = await orcaBotmuxPage.evaluate(({ wslTabId, cmdTabId }) => {
+    const tabSnapshot = await botmuxPage.evaluate(({ wslTabId, cmdTabId }) => {
       const state = window.__store!.getState()
       const tabs = Object.values(state.tabsByWorktree).flat()
       return {
@@ -72,10 +72,10 @@ test.describe('Windows terminal env and shell identity', () => {
       cmdShell: 'cmd.exe'
     })
 
-    const wslTab = orcaBotmuxPage.locator(
+    const wslTab = botmuxPage.locator(
       `[data-testid="sortable-tab"][data-tab-id="${tabIds.wslTabId}"]`
     )
-    const cmdTab = orcaBotmuxPage.locator(
+    const cmdTab = botmuxPage.locator(
       `[data-testid="sortable-tab"][data-tab-id="${tabIds.cmdTabId}"]`
     )
     await expect(wslTab).toBeVisible()

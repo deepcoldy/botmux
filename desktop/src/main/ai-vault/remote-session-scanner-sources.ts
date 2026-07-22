@@ -178,7 +178,7 @@ function remoteCodexSources(
       remoteHome,
       '.local',
       'share',
-      'orca_botmux',
+      'botmux',
       'codex-runtime-home',
       'home'
     )

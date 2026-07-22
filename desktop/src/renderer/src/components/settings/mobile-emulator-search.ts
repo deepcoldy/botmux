@@ -10,7 +10,7 @@ export const getMobileEmulatorSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.mobile.emulator.search.9595354cff',
-      'Configure mobile emulator support for OrcaBotmux and coding agents.'
+      'Configure mobile emulator support for Botmux and coding agents.'
     ),
     keywords: [
       ...translateSearchKeyword(
@@ -47,11 +47,11 @@ export const getMobileEmulatorSearchEntries = createLocalizedCatalog(() => [
       ),
       ...translateSearchKeyword(
         'auto.components.settings.mobile.emulator.search.d4b7833894',
-        'orca_botmux cli'
+        'botmux cli'
       ),
       ...translateSearchKeyword(
         'auto.components.settings.mobile.emulator.search.9353854ff3',
-        'orca_botmux emulator'
+        'botmux emulator'
       ),
       ...translateSearchKeyword(
         'auto.components.settings.mobile.emulator.search.ac0a985873',
@@ -74,7 +74,7 @@ export const getMobileEmulatorSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.mobile.emulator.search.2348045036',
-      'Choose which emulator device OrcaBotmux opens by default.'
+      'Choose which emulator device Botmux opens by default.'
     ),
     keywords: [
       ...translateSearchKeyword(
@@ -138,7 +138,7 @@ export const getMobileEmulatorSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.mobile.emulator.search.2e0b45b2ba',
-      'Use OrcaBotmux CLI commands to list, attach, tap, and type into a mobile emulator.'
+      'Use Botmux CLI commands to list, attach, tap, and type into a mobile emulator.'
     ),
     keywords: [
       ...translateSearchKeyword(

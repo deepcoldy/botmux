@@ -1,7 +1,7 @@
 /**
  * Shared per-PTY terminal title side-effect tracking — the parser core behind
  * both the renderer transport (`createPtyOutputProcessor`) and main's
- * per-PTY tracker in `OrcaRuntimeService.onPtyData`.
+ * per-PTY tracker in `BotmuxRuntimeService.onPtyData`.
  *
  * Why shared: main is the side-effect parser for every PTY whose bytes transit
  * local main. Title
@@ -172,7 +172,7 @@ export function createTerminalTitleTracker(
 
   function applyObservedTitle(rawTitle: string): void {
     // Why: cursor-agent re-emits its bare native title many times per turn
-    // while still working; letting it through would stomp OrcaBotmux's synthesized
+    // while still working; letting it through would stomp Botmux's synthesized
     // "⠋ Cursor Agent" spinner state back to agentless within a second.
     if (isCursorNativeAgentTitle(rawTitle)) {
       return

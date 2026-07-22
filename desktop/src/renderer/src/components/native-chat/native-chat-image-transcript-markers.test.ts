@@ -15,12 +15,12 @@ function userText(id: string, text: string): NativeChatMessage {
 describe('normalizeImageTranscriptMessages', () => {
   it('merges the paired [Image: source]/[Image #1] turns into one image-ref turn', () => {
     const out = normalizeImageTranscriptMessages([
-      userText('a', '[Image: source: /tmp/orca-botmux-paste-1-2.png]'),
+      userText('a', '[Image: source: /tmp/botmux-paste-1-2.png]'),
       userText('b', '[Image #1] describe this')
     ])
     expect(out).toHaveLength(1)
     expect(out[0]!.blocks).toEqual([
-      { type: 'image-ref', path: '/tmp/orca-botmux-paste-1-2.png' },
+      { type: 'image-ref', path: '/tmp/botmux-paste-1-2.png' },
       { type: 'text', text: 'describe this' }
     ])
   })

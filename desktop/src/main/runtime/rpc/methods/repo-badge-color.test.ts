@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import { REPO_METHODS } from './repo'
 
 function makeRequest(method: string, params?: unknown): RpcRequest {
@@ -17,7 +17,7 @@ describe('repo badge color RPC updates', () => {
         path: '/srv/repo',
         badgeColor: '#abcdef'
       })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: REPO_METHODS })
 
     const response = await dispatcher.dispatch(

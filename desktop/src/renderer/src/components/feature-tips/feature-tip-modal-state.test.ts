@@ -34,7 +34,7 @@ describe('feature tip modal state', () => {
       settings: makeSettings()
     })
 
-    expect(tip?.id).toBe('orca-botmux-cli')
+    expect(tip?.id).toBe('botmux-cli')
   })
 
   it('falls back to the CLI tip when voice was already seen and the CLI is not installed', () => {
@@ -46,14 +46,14 @@ describe('feature tip modal state', () => {
       settings: makeSettings()
     })
 
-    expect(tip?.id).toBe('orca-botmux-cli')
+    expect(tip?.id).toBe('botmux-cli')
   })
 
   it('falls back to the command palette tip after the CLI tip is handled', () => {
     const tip = getFeatureTipForModal({
       cliInstalled: true,
       modalData: {},
-      seenTipIds: ['orca-botmux-cli'],
+      seenTipIds: ['botmux-cli'],
       featureInteractions: {},
       settings: makeSettings()
     })
@@ -65,7 +65,7 @@ describe('feature tip modal state', () => {
     const tip = getFeatureTipForModal({
       cliInstalled: false,
       modalData: {},
-      seenTipIds: ['voice-dictation', 'orca-botmux-cli', 'cmd-j-palette'],
+      seenTipIds: ['voice-dictation', 'botmux-cli', 'cmd-j-palette'],
       featureInteractions: {},
       settings: makeSettings()
     })

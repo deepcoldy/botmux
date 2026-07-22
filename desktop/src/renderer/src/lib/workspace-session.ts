@@ -17,7 +17,7 @@ import { buildActiveConnectionIdsAtShutdown } from './workspace-session-reconnec
 export { buildActiveConnectionIdsAtShutdown }
 
 /** Why (issue #1158): the debounced + shutdown session writers share this
- *  gate so a hydration failure cannot overwrite orca-botmux-data.json with the
+ *  gate so a hydration failure cannot overwrite botmux-data.json with the
  *  empty in-memory state the error path leaves behind.
  *
  *  - workspaceSessionReady gates the UI mount; it flips true even in the

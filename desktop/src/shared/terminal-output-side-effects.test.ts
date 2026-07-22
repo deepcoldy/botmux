@@ -82,24 +82,24 @@ describe('createTerminalTitleTracker pr-link facts', () => {
     const { events, tracker } = createRecordingTracker()
 
     tracker.handleChunk(
-      'see https://github.com/acme/orca_botmux/pull/42 and https://github.com/acme/orca_botmux/pull/43 \r\n'
+      'see https://github.com/acme/botmux/pull/42 and https://github.com/acme/botmux/pull/43 \r\n'
     )
 
     expect(events).toEqual([
-      ['pr', 'https://github.com/acme/orca_botmux/pull/42', 42],
-      ['pr', 'https://github.com/acme/orca_botmux/pull/43', 43]
+      ['pr', 'https://github.com/acme/botmux/pull/42', 42],
+      ['pr', 'https://github.com/acme/botmux/pull/43', 43]
     ])
   })
 
   it('waits for a boundary when a URL splits across chunks and dedupes repeats', () => {
     const { events, tracker } = createRecordingTracker()
 
-    tracker.handleChunk('PR: https://github.com/acme/orca_botmux/pull/4')
+    tracker.handleChunk('PR: https://github.com/acme/botmux/pull/4')
     expect(events).toEqual([])
     tracker.handleChunk('2\r\n')
-    tracker.handleChunk('again https://github.com/acme/orca_botmux/pull/42\r\n')
+    tracker.handleChunk('again https://github.com/acme/botmux/pull/42\r\n')
 
-    expect(events).toEqual([['pr', 'https://github.com/acme/orca_botmux/pull/42', 42]])
+    expect(events).toEqual([['pr', 'https://github.com/acme/botmux/pull/42', 42]])
   })
 
   it('skips the 133/URL scans entirely when no consumer is registered', () => {
@@ -110,7 +110,7 @@ describe('createTerminalTitleTracker pr-link facts', () => {
       onTitle: (normalized) => titles.push(normalized)
     })
 
-    tracker.handleChunk(`${ESC}]133;D;0${BEL}https://github.com/acme/orca_botmux/pull/42\r\n`)
+    tracker.handleChunk(`${ESC}]133;D;0${BEL}https://github.com/acme/botmux/pull/42\r\n`)
 
     expect(titles).toEqual([])
   })
@@ -156,7 +156,7 @@ describe('createTerminalTitleTracker synthetic-frame isolation', () => {
     const { events, tracker } = createRecordingTracker()
 
     tracker.applySyntheticTitleFrame(
-      `${ESC}]0;⠋ Cursor Agent${BEL}${ESC}]133;D;0${BEL}https://github.com/acme/orca_botmux/pull/42\r\n`
+      `${ESC}]0;⠋ Cursor Agent${BEL}${ESC}]133;D;0${BEL}https://github.com/acme/botmux/pull/42\r\n`
     )
 
     expect(events).toEqual([['title', '⠋ Cursor Agent']])
@@ -183,7 +183,7 @@ describe('createTerminalTitleTracker transient-fact scanning suppression', () =>
 
     tracker.setTransientFactScanningSuppressed(true)
     tracker.handleChunk(
-      `${ESC}]0;zsh${BEL}${ESC}]133;D;0${BEL}ding${BEL}https://github.com/acme/orca_botmux/pull/42\r\n${ESC}[?2031h`
+      `${ESC}]0;zsh${BEL}${ESC}]133;D;0${BEL}ding${BEL}https://github.com/acme/botmux/pull/42\r\n${ESC}[?2031h`
     )
 
     expect(events).toEqual([['title', 'zsh']])

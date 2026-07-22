@@ -17,8 +17,8 @@ describe('normalizeRightSidebarRoute', () => {
   })
 
   it('preserves the botmux connection panel route', () => {
-    expect(normalizeRightSidebarRoute('orca_botmux')).toEqual({
-      rightSidebarTab: 'orca_botmux',
+    expect(normalizeRightSidebarRoute('botmux')).toEqual({
+      rightSidebarTab: 'botmux',
       rightSidebarExplorerView: 'files'
     })
   })

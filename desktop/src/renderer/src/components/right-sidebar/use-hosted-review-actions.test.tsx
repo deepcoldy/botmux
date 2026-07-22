@@ -22,7 +22,7 @@ vi.mock('@/runtime/runtime-rpc-client', () => ({
   callRuntimeRpc: runtimeRpcMocks.callRuntimeRpc
 }))
 
-const prRepo = { host: 'github.com', owner: 'stablyai', repo: 'orca-botmux-sta1015-sandbox' }
+const prRepo = { host: 'github.com', owner: 'stablyai', repo: 'botmux-sta1015-sandbox' }
 const review: HostedReviewActionInfo = {
   provider: 'github',
   number: 1015,

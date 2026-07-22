@@ -34,7 +34,7 @@
 | `desktop/` | Electron IDE（worktree / 终端 / git / browser / 配对 mobile RPC 等） |
 | `mobile/` | Expo 移动端（配对桌面控制 + Botmux Feishu bridge 会话列表） |
 
-与飞书 daemon 并存、独立 userData。**上游 Orca 已独立；PC/移动端改动请在 botmux 内维护，勿再依赖推送 stablyai/orca。**
+与飞书 daemon 并存、独立 userData。**上游 Orca 已独立；PC/移动端改动请在 botmux 内维护，勿再依赖推送 deepcoldy/botmux。**
 
 ```bash
 # Desktop IDE

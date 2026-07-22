@@ -13,6 +13,7 @@ import { useCloseHost } from '../src/transport/client-context'
 import { colors, spacing, radii, typography } from '../src/theme/mobile-theme'
 import { ConnectionLog } from '../src/components/ConnectionLog'
 import { shouldPresentNotificationOptIn } from '../src/notifications/notification-opt-in-gate'
+import { useMobileI18n } from '../src/i18n/mobile-i18n'
 
 type Status = 'awaiting-confirm' | 'connecting' | 'error'
 
@@ -27,6 +28,7 @@ export default function PairConfirmScreen() {
   const router = useRouter()
   const closeHost = useCloseHost()
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   const params = useLocalSearchParams<{ code?: string }>()
   const [status, setStatus] = useState<Status>('awaiting-confirm')
   const [errorMessage, setErrorMessage] = useState('')
@@ -44,7 +46,7 @@ export default function PairConfirmScreen() {
     status === 'awaiting-confirm' && routeState.kind === 'error' ? 'error' : status
   const resolvedErrorMessage =
     status === 'awaiting-confirm' && routeState.kind === 'error'
-      ? routeState.errorMessage
+      ? t(routeState.errorMessage)
       : errorMessage
 
   const cancel = useCallback(() => {
@@ -136,8 +138,12 @@ export default function PairConfirmScreen() {
       setStatus('error')
       setErrorMessage(
         timedOut
-          ? `Couldn't connect within ${PAIRING_OVERALL_TIMEOUT_MS / 1000}s — see log below for where it stalled`
-          : `Pairing failed: ${err instanceof Error ? err.message : String(err)}`
+          ? t("Couldn't connect within {{seconds}}s — see log below for where it stalled", {
+              seconds: PAIRING_OVERALL_TIMEOUT_MS / 1000
+            })
+          : t('Pairing failed: {{error}}', {
+              error: err instanceof Error ? err.message : String(err)
+            })
       )
     }
   }
@@ -153,16 +159,16 @@ export default function PairConfirmScreen() {
       <View style={styles.content}>
         {offer && resolvedStatus === 'awaiting-confirm' && (
           <>
-            <Text style={styles.title}>Pair with this desktop?</Text>
+            <Text style={styles.title}>{t('Pair with this desktop?')}</Text>
             <Text style={styles.subtitle}>
-              You opened a pairing link from your desktop. Confirm to add it to your hosts.
+              {t('You opened a pairing link from your desktop. Confirm to add it to your hosts.')}
             </Text>
             <View style={styles.actionStack}>
               <Pressable style={styles.primaryButton} onPress={() => void confirm()}>
-                <Text style={styles.primaryButtonText}>Pair</Text>
+                <Text style={styles.primaryButtonText}>{t('Pair')}</Text>
               </Pressable>
               <Pressable style={styles.secondaryButton} onPress={cancel}>
-                <Text style={styles.secondaryButtonText}>Cancel</Text>
+                <Text style={styles.secondaryButtonText}>{t('Cancel')}</Text>
               </Pressable>
             </View>
           </>
@@ -171,9 +177,9 @@ export default function PairConfirmScreen() {
         {resolvedStatus === 'connecting' && (
           <>
             <ActivityIndicator size="large" color={colors.textSecondary} />
-            <Text style={styles.connectingText}>Connecting…</Text>
+            <Text style={styles.connectingText}>{t('Connecting…')}</Text>
             <View style={styles.logSlot}>
-              <ConnectionLog entries={logs} title="Pairing log" />
+              <ConnectionLog entries={logs} title={t('Pairing log')} />
             </View>
           </>
         )}
@@ -183,12 +189,12 @@ export default function PairConfirmScreen() {
             <Text style={styles.errorText}>{resolvedErrorMessage}</Text>
             {logs.length > 0 && (
               <View style={styles.logSlot}>
-                <ConnectionLog entries={logs} title="Pairing log" />
+                <ConnectionLog entries={logs} title={t('Pairing log')} />
               </View>
             )}
             <View style={styles.actionStack}>
               <Pressable style={styles.primaryButton} onPress={cancel}>
-                <Text style={styles.primaryButtonText}>Back to home</Text>
+                <Text style={styles.primaryButtonText}>{t('Back to home')}</Text>
               </Pressable>
             </View>
           </>

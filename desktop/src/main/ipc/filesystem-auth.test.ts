@@ -142,7 +142,7 @@ describe('filesystem auth worktree roots', () => {
 
 describe('filesystem-auth path containment', () => {
   it('authorizes missing nested descendants under an allowed repo', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-missing-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-missing-'))
     try {
       const repoPath = join(tempRoot, 'repo')
       await mkdir(repoPath)
@@ -158,7 +158,7 @@ describe('filesystem-auth path containment', () => {
   })
 
   it('authorizes local folder workspace roots outside child repo roots', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-folder-workspace-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-folder-workspace-'))
     try {
       const folderPath = join(tempRoot, 'platform')
       const repoPath = join(folderPath, 'web')
@@ -182,7 +182,7 @@ describe('filesystem-auth path containment', () => {
   })
 
   it('authorizes local folder-backed project group roots outside child repo roots', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-project-group-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-project-group-'))
     try {
       const folderPath = join(tempRoot, 'platform')
       const repoPath = join(folderPath, 'web')
@@ -201,7 +201,7 @@ describe('filesystem-auth path containment', () => {
   })
 
   it('does not authorize SSH-only folder workspace roots as local paths', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-remote-folder-workspace-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-remote-folder-workspace-'))
     try {
       const folderPath = join(tempRoot, 'remote-platform')
       const repoPath = join(folderPath, 'web')
@@ -223,7 +223,7 @@ describe('filesystem-auth path containment', () => {
   })
 
   it('does not authorize repo-less SSH-provenance folder roots as local paths', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-remote-folder-provenance-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-remote-folder-provenance-'))
     try {
       const folderPath = join(tempRoot, 'remote-platform')
       await mkdir(folderPath, { recursive: true })
@@ -245,7 +245,7 @@ describe('filesystem-auth path containment', () => {
   })
 
   it('does not authorize SSH-only folder-backed project group roots as local paths', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-remote-project-group-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-remote-project-group-'))
     try {
       const folderPath = join(tempRoot, 'remote-platform')
       const repoPath = join(folderPath, 'web')
@@ -267,7 +267,7 @@ describe('filesystem-auth path containment', () => {
   it.skipIf(process.platform === 'win32')(
     'rejects missing descendants under a symlinked ancestor outside the repo',
     async () => {
-      const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-auth-symlink-'))
+      const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-auth-symlink-'))
       try {
         const repoPath = join(tempRoot, 'repo')
         const outsidePath = join(tempRoot, 'outside')

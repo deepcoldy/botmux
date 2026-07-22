@@ -58,7 +58,7 @@ function detected(
 ): DetectedWorktreeListResult['worktrees'][number] {
   return {
     ...makeWorktree({ id, repoId, hostId }),
-    ownership: 'orca-botmux-managed',
+    ownership: 'botmux-managed',
     selectedCheckout: true,
     visible: true
   } as DetectedWorktreeListResult['worktrees'][number]

@@ -4,12 +4,12 @@ import type { EphemeralVmRecipeDoctorResult } from '../../shared/ephemeral-vm-re
 import { listEphemeralVmRuntimes } from '../../shared/ephemeral-vm-runtime-store'
 import type { EphemeralVmRuntimeRecord } from '../../shared/ephemeral-vm-runtimes'
 import { isFolderRepo, isGitRepoKind } from '../../shared/repo-kind'
-import type { OrcaVmRecipe } from '../../shared/types'
+import type { BotmuxVmRecipe } from '../../shared/types'
 
 export type EphemeralVmRecipeListResult = {
   status: 'ok' | 'error'
   repoPath: string | null
-  recipes: OrcaVmRecipe[]
+  recipes: BotmuxVmRecipe[]
   diagnostics: NonNullable<ReturnType<typeof loadHooks>>['environmentRecipeDiagnostics']
   message?: string
 }
@@ -18,7 +18,7 @@ export type EphemeralVmRecipeCatalogEntry = {
   repoId: string
   repoName: string
   repoPath: string
-  recipes: OrcaVmRecipe[]
+  recipes: BotmuxVmRecipe[]
   diagnostics: NonNullable<ReturnType<typeof loadHooks>>['environmentRecipeDiagnostics']
 }
 
@@ -90,7 +90,7 @@ export function getRuntimeRecipeContext(
 ): {
   runtime: EphemeralVmRuntimeRecord
   repo: Extract<RecipeRepoResult, { ok: true }>
-  recipe: OrcaVmRecipe
+  recipe: BotmuxVmRecipe
 } {
   const runtime = listEphemeralVmRuntimes(userDataPath).find((entry) => entry.id === runtimeId)
   if (!runtime) {

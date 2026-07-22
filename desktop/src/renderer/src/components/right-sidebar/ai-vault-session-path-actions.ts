@@ -17,17 +17,17 @@ export function isSyntheticAiVaultSessionPath(filePath: string): boolean {
   // Why: newer OpenCode sessions use a synthetic `<database>#<sessionId>`
   // scanner identity backed by SQLite — not a real filesystem path. A '#'
   // session marker never appears in a genuine local transcript path, so it is
-  // a reliable v1 signal that there is no single file to open in OrcaBotmux.
+  // a reliable v1 signal that there is no single file to open in Botmux.
   return filePath.includes('#')
 }
 
 /**
  * Whether AI Vault `View Log` / `Open Log` can open this session's log inside
- * OrcaBotmux as a read-only tab: a non-blank, local, single-file (non-synthetic)
+ * Botmux as a read-only tab: a non-blank, local, single-file (non-synthetic)
  * path. Remote/runtime and synthetic identities are withheld until AI Vault has
  * a provider-owned log-resource contract.
  */
-export function canOpenAiVaultSessionLogInOrca(
+export function canOpenAiVaultSessionLogInBotmux(
   session: Pick<AiVaultSession, 'filePath' | 'executionHostId'>
 ): boolean {
   const filePath = session.filePath?.trim()

@@ -8,8 +8,10 @@ function getManualSortRank(worktree: Worktree): number | null {
   return typeof rank === 'number' && Number.isFinite(rank) ? rank : null
 }
 
+// Why: pin English collation so repo/name sort matches desktop-style ordering
+// across developer machines whose default locale (e.g. zh-CN) reorders accents.
 function compareDisplayName(a: Worktree, b: Worktree): number {
-  return a.displayName.localeCompare(b.displayName)
+  return a.displayName.localeCompare(b.displayName, 'en')
 }
 
 function getRecentActivity(worktree: Worktree): number {
@@ -81,7 +83,7 @@ export function sortWorktrees(
       return compareByRecent(a, b, now)
     }
     if (mode === 'repo') {
-      const repoComparison = a.repo.localeCompare(b.repo)
+      const repoComparison = a.repo.localeCompare(b.repo, 'en')
       return repoComparison || compareDisplayName(a, b)
     }
     const aRank = typeof a.sortOrder === 'number' && Number.isFinite(a.sortOrder) ? a.sortOrder : 0

@@ -37,7 +37,7 @@ export {
 } from './active-agent-note-send-result'
 
 const ACTIVE_AGENT_SEND_TIMEOUT_MS = 8000
-const ORCA_DESKTOP_TERMINAL_CLIENT = { id: 'orca-botmux-desktop', type: 'desktop' as const }
+const BOTMUX_DESKTOP_TERMINAL_CLIENT = { id: 'botmux-desktop', type: 'desktop' as const }
 
 export async function sendNotesToActiveAgentSession({
   worktreeId,
@@ -149,7 +149,7 @@ async function sendPromptWithLegacyCombinedSend(
         terminal: terminalHandle,
         text: prompt,
         enter: true,
-        client: ORCA_DESKTOP_TERMINAL_CLIENT
+        client: BOTMUX_DESKTOP_TERMINAL_CLIENT
       },
       { timeoutMs: ACTIVE_AGENT_SEND_RPC_TIMEOUT_MS }
     )
@@ -192,7 +192,7 @@ async function sendPromptWithGuardedPasteAndEnter(
         terminal: terminalHandle,
         text: pastePayload,
         requireAgentStatus: 'sendable',
-        client: ORCA_DESKTOP_TERMINAL_CLIENT
+        client: BOTMUX_DESKTOP_TERMINAL_CLIENT
       },
       { timeoutMs: ACTIVE_AGENT_SEND_RPC_TIMEOUT_MS }
     )
@@ -242,7 +242,7 @@ async function sendPromptWithGuardedPasteAndEnter(
         terminal: terminalHandle,
         enter: true,
         requireAgentStatus: 'sendable',
-        client: ORCA_DESKTOP_TERMINAL_CLIENT
+        client: BOTMUX_DESKTOP_TERMINAL_CLIENT
       },
       { timeoutMs: ACTIVE_AGENT_SEND_RPC_TIMEOUT_MS }
     )

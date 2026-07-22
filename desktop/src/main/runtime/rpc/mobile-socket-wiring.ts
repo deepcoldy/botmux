@@ -136,7 +136,7 @@ export class MobileSocketWiring {
           if (!device) {
             return null
           }
-          // Why: outer relay authorization cannot choose the local OrcaBotmux
+          // Why: outer relay authorization cannot choose the local Botmux
           // identity; E2EE must resolve the same device before readiness.
           if (metadata.transport === 'relay' && metadata.relayDeviceId !== device.deviceId) {
             return null

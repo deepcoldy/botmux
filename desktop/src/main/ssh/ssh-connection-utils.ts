@@ -147,7 +147,7 @@ export function wrapRemoteCommandForPosixShell(command: string): string {
     'decoded=$(printf %b "$@" && printf _) || exit $?; ' +
     'decoded=${decoded%_}; exec /bin/sh -c "$decoded"'
   const chunkArguments = encodedChunks.map(shellEscape).join(' ')
-  return `exec /bin/sh -c ${shellEscape(decodeAndRun)} orca-botmux-command ${chunkArguments}`
+  return `exec /bin/sh -c ${shellEscape(decodeAndRun)} botmux-command ${chunkArguments}`
 }
 
 export type SshExecOptions = {

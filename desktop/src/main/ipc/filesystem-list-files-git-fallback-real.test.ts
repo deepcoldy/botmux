@@ -43,8 +43,8 @@ async function writeRel(root: string, relPath: string, content = 'x'): Promise<v
 async function initRepo(repoPath: string): Promise<void> {
   await mkdir(repoPath, { recursive: true })
   await execFile('git', ['init', '-q', repoPath])
-  await execFile('git', ['config', 'user.email', 'orca_botmux@example.invalid'], { cwd: repoPath })
-  await execFile('git', ['config', 'user.name', 'OrcaBotmux Test'], { cwd: repoPath })
+  await execFile('git', ['config', 'user.email', 'botmux@example.invalid'], { cwd: repoPath })
+  await execFile('git', ['config', 'user.name', 'Botmux Test'], { cwd: repoPath })
 }
 
 describe('filesystem-list-files real git fallback', () => {
@@ -60,7 +60,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('returns real paths for UTF-8 filenames from the git fallback', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-git-fallback-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-git-fallback-'))
     const repoPath = join(tempDir, 'repo')
     await execFile('git', ['init', '-q', repoPath])
     const utf8FileName = '日本語-file.txt'
@@ -72,7 +72,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('fills nested git repos from gitlink and untracked embedded-repo entries', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-monorepo-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-monorepo-'))
     const repoPath = join(tempDir, 'parent')
     const appPath = join(repoPath, 'packages', 'app')
     const libPath = join(repoPath, 'packages', 'lib')
@@ -118,7 +118,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('walks a non-git root instead of returning an empty git fallback result', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-non-git-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-non-git-'))
     await writeRel(tempDir, 'folder/file.ts')
 
     await expect(listQuickOpenFiles(tempDir, makeStore(tempDir))).resolves.toEqual([
@@ -128,7 +128,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('bounds a non-git readdir fallback without treating the limit as an error', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-bounded-non-git-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-bounded-non-git-'))
     await writeRel(tempDir, 'a.ts')
     await writeRel(tempDir, 'b.ts')
 
@@ -140,7 +140,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('rejects abnormal git ls-files failures instead of resolving an empty list', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-bad-index-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-bad-index-'))
     const repoPath = join(tempDir, 'repo')
     await initRepo(repoPath)
     await writeFile(join(repoPath, '.git', 'index'), 'not a git index')
@@ -152,7 +152,7 @@ describe('filesystem-list-files real git fallback', () => {
 
   it('resolves an empty repo as an empty list', async () => {
     checkRgAvailableMock.mockResolvedValue(false)
-    tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-quick-open-empty-repo-'))
+    tempDir = await mkdtemp(join(tmpdir(), 'botmux-quick-open-empty-repo-'))
     const repoPath = join(tempDir, 'repo')
     await initRepo(repoPath)
 

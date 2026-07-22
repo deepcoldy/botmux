@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { sendToTerminal } from './helpers/terminal'
 
@@ -11,7 +11,7 @@ const PANEL_SELECTOR = '[data-floating-terminal-panel]'
 // Why: the floating panel toggles via this window event
 // (src/renderer/src/lib/floating-terminal.ts); dispatching it exercises the
 // same code path as the status bar button and the keyboard shortcut.
-const TOGGLE_EVENT = 'orca-botmux-toggle-floating-terminal'
+const TOGGLE_EVENT = 'botmux-toggle-floating-terminal'
 
 // Why: a silent foreground command blocks the shell so no prompt framework
 // (e.g. async p10k segments) repaints while screenshots are compared.
@@ -366,24 +366,24 @@ async function setUpCorruptedFloatingTerminal(
 
 test.describe('floating workspace reopen WebGL recovery @headful', () => {
   test('reopening the floating workspace recovers a corrupted glyph atlas', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     // Why: the floating panel hides via CSS visibility only. Gating the
     // terminal's isVisible on `open` suspends its WebGL renderer while
     // hidden, so a glyph atlas corrupted with no context-loss event is
     // discarded with the context and the resume on reopen repaints clean.
-    const shots = await setUpCorruptedFloatingTerminal(orcaBotmuxPage, 'REOPEN')
+    const shots = await setUpCorruptedFloatingTerminal(botmuxPage, 'REOPEN')
     test.skip(!shots, 'WebGL was not active or atlas corruption could not be injected')
     const { baseline, corrupted } = shots!
     expect(corrupted.equals(baseline)).toBe(false)
 
-    expect(await instrumentRecoveryCounters(orcaBotmuxPage)).toBe(true)
+    expect(await instrumentRecoveryCounters(botmuxPage)).toBe(true)
 
-    await toggleFloatingPanel(orcaBotmuxPage, false)
+    await toggleFloatingPanel(botmuxPage, false)
     // Why: the prevention invariant — closing the panel suspends rendering,
     // so no live WebGL context (or corruptible glyph atlas) exists while the
     // floating terminal is hidden.
-    const webglAttachedWhileClosed = await orcaBotmuxPage.evaluate((worktreeId) => {
+    const webglAttachedWhileClosed = await botmuxPage.evaluate((worktreeId) => {
       const state = window.__store?.getState()
       const tab = (state?.tabsByWorktree?.[worktreeId] ?? [])[0]
       const manager = tab ? window.__paneManagers?.get(tab.id) : null
@@ -392,11 +392,11 @@ test.describe('floating workspace reopen WebGL recovery @headful', () => {
     }, FLOATING_WORKTREE_ID)
     expect(webglAttachedWhileClosed, 'closing the panel should suspend WebGL rendering').toBe(false)
 
-    await toggleFloatingPanel(orcaBotmuxPage, true)
-    await settleRecoveryWindows(orcaBotmuxPage)
+    await toggleFloatingPanel(botmuxPage, true)
+    await settleRecoveryWindows(botmuxPage)
 
-    const counters = await readRecoveryCounters(orcaBotmuxPage)
-    const afterReopen = await screenshotFloatingTerminal(orcaBotmuxPage)
+    const counters = await readRecoveryCounters(botmuxPage)
+    const afterReopen = await screenshotFloatingTerminal(botmuxPage)
     await testInfo.attach('baseline', {
       body: baseline,
       contentType: 'image/png'
@@ -421,22 +421,22 @@ test.describe('floating workspace reopen WebGL recovery @headful', () => {
   })
 
   test('window focus regain recovers the corrupted atlas (harness control)', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     // Why: control proving the injected corruption is exactly the class the
     // existing recovery machinery heals — isolating the reopen gap above as a
     // missing trigger rather than a broken harness or unrecoverable state.
-    const shots = await setUpCorruptedFloatingTerminal(orcaBotmuxPage, 'CONTROL')
+    const shots = await setUpCorruptedFloatingTerminal(botmuxPage, 'CONTROL')
     test.skip(!shots, 'WebGL was not active or atlas corruption could not be injected')
     const { baseline, corrupted } = shots!
     expect(corrupted.equals(baseline)).toBe(false)
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       window.dispatchEvent(new Event('focus'))
     })
-    await settleRecoveryWindows(orcaBotmuxPage)
+    await settleRecoveryWindows(botmuxPage)
 
-    const afterFocus = await screenshotFloatingTerminal(orcaBotmuxPage)
+    const afterFocus = await screenshotFloatingTerminal(botmuxPage)
     console.log(`[floating-control] healedByFocus=${afterFocus.equals(baseline)}`)
     expect(afterFocus.equals(baseline), 'window focus should heal the atlas').toBe(true)
   })

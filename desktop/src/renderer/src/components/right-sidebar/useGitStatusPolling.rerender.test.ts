@@ -7,7 +7,7 @@ import type { Repo, Worktree } from '../../../../shared/types'
 import { useAppStore } from '@/store'
 import type { AppState } from '@/store/types'
 import { makeOpenFile, makeWorktree, TEST_REPO } from '@/store/slices/store-test-helpers'
-import { ORCA_WORKTREE_FILE_CHANGE_EVENT } from '@/hooks/worktree-file-change-event'
+import { BOTMUX_WORKTREE_FILE_CHANGE_EVENT } from '@/hooks/worktree-file-change-event'
 import { useGitStatusPolling } from './useGitStatusPolling'
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -125,11 +125,11 @@ describe('useGitStatusPolling rerender stability', () => {
 
     // Guard: the file-watch listener must be registered, or the event below
     // is a no-op and the test cannot distinguish fix from bug.
-    expect(addSpy).toHaveBeenCalledWith(ORCA_WORKTREE_FILE_CHANGE_EVENT, expect.any(Function))
+    expect(addSpy).toHaveBeenCalledWith(BOTMUX_WORKTREE_FILE_CHANGE_EVENT, expect.any(Function))
 
     // Fire a file-watch event to drive fetchStatus during the cooldown.
     window.dispatchEvent(
-      new CustomEvent(ORCA_WORKTREE_FILE_CHANGE_EVENT, {
+      new CustomEvent(BOTMUX_WORKTREE_FILE_CHANGE_EVENT, {
         detail: {
           payload: {
             worktreePath: WORKTREE_PATH,

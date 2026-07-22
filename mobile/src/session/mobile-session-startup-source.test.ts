@@ -15,16 +15,21 @@ function sliceBetween(startPattern: string, endPattern: string): string {
 }
 
 describe('mobile session startup', () => {
-  it('auto-creates one terminal for an initially empty connected session', () => {
+  it('auto-creates one terminal for an initially empty connected session, except botmux open', () => {
     expect(source).toContain('const initialEmptySessionAutoCreateRef = useRef<string | null>(null)')
     expect(source).toContain('initialEmptySessionAutoCreateRef.current = null')
 
     const autoCreateEffect = sliceBetween(
       'if (\n      !client ||\n      !showEmptyState',
-      'const terminalSummary ='
+      'const connectionVerdict = classifyConnection'
     )
     expect(autoCreateEffect).toContain('initialEmptySessionAutoCreateRef.current === worktreeId')
     expect(autoCreateEffect).toContain('initialEmptySessionAutoCreateRef.current = worktreeId')
+    // Why: Botmux open path sets botmuxOpen=1; agent worktrees also skip.
+    // Ordinary worktree entry keeps generic empty-session create.
+    expect(autoCreateEffect).toContain('openedFromBotmux')
+    expect(autoCreateEffect).toContain("routeBotmuxOpen === '1'")
+    expect(autoCreateEffect).toContain("worktreeId.startsWith('botmux:agent:')")
     expect(autoCreateEffect).toContain("setCreateError('')")
     expect(autoCreateEffect).toContain('void handleCreateTerminal()')
   })
@@ -42,7 +47,7 @@ describe('mobile session startup', () => {
       startupEffect.indexOf('await fetchSessionTabs()')
     )
     expect(startupEffect).toContain('headlessActivationNeedsHostRenderer(response.result)')
-    expect(startupEffect).toContain("showToast('Open Orca on the host to wake sleeping agents.'")
+    expect(startupEffect).toContain("showToast('Open Botmux on the host to wake sleeping agents.'")
   })
 
   it('activates an already-selected pending terminal tab after hydration', () => {

@@ -17,17 +17,17 @@ describe('task source context summary', () => {
         {
           kind: 'task-source',
           provider: 'github',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'ssh:devbox',
           projectHostSetupId: 'setup-1',
           repoId: 'repo-1',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
         }
       ]
     })
 
-    expect(summary.label).toBe('GitHub · devbox · stablyai/orca_botmux')
-    expect(summary.title).toBe('GitHub · Host: devbox · Source: stablyai/orca_botmux')
+    expect(summary.label).toBe('GitHub · devbox · stablyai/botmux')
+    expect(summary.title).toBe('GitHub · Host: devbox · Source: stablyai/botmux')
   })
 
   it('shows repo-backed provider account labels when accounts can differ by host', () => {
@@ -39,21 +39,21 @@ describe('task source context summary', () => {
         {
           kind: 'task-source',
           provider: 'github',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'local',
           projectHostSetupId: 'setup-local',
           repoId: 'repo-local',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' },
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' },
           accountLabel: 'personal-gh'
         },
         {
           kind: 'task-source',
           provider: 'github',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'ssh:builder',
           projectHostSetupId: 'setup-builder',
           repoId: 'repo-builder',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' },
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' },
           accountLabel: 'work-gh'
         }
       ]
@@ -61,7 +61,7 @@ describe('task source context summary', () => {
 
     expect(summary.label).toBe(`GitHub · ${LOCAL_HOST_LABEL}, builder · personal-gh, work-gh`)
     expect(summary.title).toBe(
-      `GitHub · Host: ${LOCAL_HOST_LABEL}, builder · Account: personal-gh, work-gh · Source: stablyai/orca_botmux · 2 selected projects`
+      `GitHub · Host: ${LOCAL_HOST_LABEL}, builder · Account: personal-gh, work-gh · Source: stablyai/botmux · 2 selected projects`
     )
   })
 
@@ -74,18 +74,18 @@ describe('task source context summary', () => {
         {
           kind: 'task-source',
           provider: 'github',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'ssh:devbox',
           repoId: 'repo-1',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
         }
       ],
       hostAvailability: [{ hostId: 'ssh:devbox', status: 'disconnected' }]
     })
 
-    expect(summary.label).toBe('GitHub · devbox · disconnected · stablyai/orca_botmux')
+    expect(summary.label).toBe('GitHub · devbox · disconnected · stablyai/botmux')
     expect(summary.title).toBe(
-      'GitHub · Host: devbox · Availability: devbox disconnected · Source: stablyai/orca_botmux'
+      'GitHub · Host: devbox · Availability: devbox disconnected · Source: stablyai/botmux'
     )
   })
 
@@ -170,15 +170,15 @@ describe('task source context summary', () => {
           projectId: 'project-a',
           hostId: 'runtime:old-server',
           repoId: 'repo-a',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
         }
       ],
       hostAvailability: [{ hostId: 'runtime:old-server', health: 'blocked' }]
     })
 
-    expect(summary.label).toBe('GitHub · old-server · server update needed · stablyai/orca_botmux')
+    expect(summary.label).toBe('GitHub · old-server · server update needed · stablyai/botmux')
     expect(summary.title).toBe(
-      'GitHub · Host: old-server · Availability: old-server server update needed · Source: stablyai/orca_botmux'
+      'GitHub · Host: old-server · Availability: old-server server update needed · Source: stablyai/botmux'
     )
   })
 
@@ -194,7 +194,7 @@ describe('task source context summary', () => {
           projectId: 'project-a',
           hostId: 'runtime:old-server',
           repoId: 'repo-a',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
         }
       ],
       hostAvailability: [
@@ -202,9 +202,9 @@ describe('task source context summary', () => {
       ]
     })
 
-    expect(summary.label).toBe('GitHub · old-server · checking server capabilities · stablyai/orca_botmux')
+    expect(summary.label).toBe('GitHub · old-server · checking server capabilities · stablyai/botmux')
     expect(summary.title).toBe(
-      'GitHub · Host: old-server · Availability: old-server checking server capabilities · Source: stablyai/orca_botmux'
+      'GitHub · Host: old-server · Availability: old-server checking server capabilities · Source: stablyai/botmux'
     )
   })
 
@@ -221,10 +221,10 @@ describe('task source context summary', () => {
           {
             kind: 'task-source',
             provider: 'github',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'runtime:03ef704c-b180-4b10-998d-e28fbd5de9a3',
             repoId: 'repo-runtime',
-            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
           }
         ],
         hostAvailability: [
@@ -235,9 +235,9 @@ describe('task source context summary', () => {
         ]
       })
     ).toEqual({
-      label: 'GitHub · dev box · server update needed · stablyai/orca_botmux',
+      label: 'GitHub · dev box · server update needed · stablyai/botmux',
       title:
-        'GitHub · Host: dev box · Availability: dev box server update needed · Source: stablyai/orca_botmux'
+        'GitHub · Host: dev box · Availability: dev box server update needed · Source: stablyai/botmux'
     })
 
     expect(
@@ -341,18 +341,18 @@ describe('task source context summary', () => {
           {
             kind: 'task-source',
             provider: 'github',
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             hostId: 'ssh:devbox',
             repoId: 'repo-1',
-            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+            providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
           }
         ],
         hostAvailability: [{ hostId: 'ssh:devbox', reason: 'missing-provider-auth' }]
       })
     ).toEqual({
-      label: 'GitHub · devbox · provider auth needed · stablyai/orca_botmux',
+      label: 'GitHub · devbox · provider auth needed · stablyai/botmux',
       title:
-        'GitHub · Host: devbox · Availability: devbox provider auth needed · Source: stablyai/orca_botmux'
+        'GitHub · Host: devbox · Availability: devbox provider auth needed · Source: stablyai/botmux'
     })
 
     expect(

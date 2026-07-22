@@ -16,7 +16,7 @@ describe('isHostCodexHomeForWsl', () => {
   })
 
   it('matches Linux paths that host Codex cannot use on Windows', () => {
-    expect(isWslCodexHomeForHost('/home/jin/.local/share/orca_botmux/codex-accounts/a/home')).toBe(true)
+    expect(isWslCodexHomeForHost('/home/jin/.local/share/botmux/codex-accounts/a/home')).toBe(true)
     expect(isWslCodexHomeForHost('C:\\Users\\jin\\.codex')).toBe(false)
     expect(isWslCodexHomeForHost(undefined)).toBe(false)
   })

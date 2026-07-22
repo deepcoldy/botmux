@@ -18,7 +18,7 @@ export function BrowserLocalhostWorktreeLabelsSetting({
   )
   const description = translate(
     'auto.components.settings.BrowserLocalhostWorktreeLabelsSetting.1db3c8b983',
-    'Open workspace ports as worktree-specific OrcaBotmux localhost URLs so browser tabs are easier to tell apart.'
+    'Open workspace ports as worktree-specific Botmux localhost URLs so browser tabs are easier to tell apart.'
   )
 
   return (

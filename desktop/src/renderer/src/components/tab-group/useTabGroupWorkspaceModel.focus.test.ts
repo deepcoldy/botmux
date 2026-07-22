@@ -448,7 +448,7 @@ describe('useTabGroupWorkspaceModel terminal activation focus', () => {
             id: 'browser-workspace-1',
             worktreeId: 'wt-1',
             sessionProfileId: 'profile-1',
-            sessionPartition: 'persist:orca-botmux-browser-session-profile-1',
+            sessionPartition: 'persist:botmux-browser-session-profile-1',
             activePageId: 'browser-page-1',
             pageIds: ['browser-page-1'],
             url: 'https://example.com',
@@ -471,7 +471,7 @@ describe('useTabGroupWorkspaceModel terminal activation focus', () => {
     expect(mocks.createBrowserTab).toHaveBeenCalledWith('wt-1', 'https://example.com', {
       title: 'Example',
       sessionProfileId: 'profile-1',
-      sessionPartition: 'persist:orca-botmux-browser-session-profile-1',
+      sessionPartition: 'persist:botmux-browser-session-profile-1',
       targetGroupId: 'group-1'
     })
   })

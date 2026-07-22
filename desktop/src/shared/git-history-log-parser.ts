@@ -20,7 +20,7 @@ function parseGitDecorationRefs(raw: string, revision: string): GitHistoryItemRe
   }
 
   const refs: GitHistoryItemRef[] = []
-  // Why: Git permits commas in ref names, so OrcaBotmux's git log format uses a
+  // Why: Git permits commas in ref names, so Botmux's git log format uses a
   // control-character separator that Git ref names cannot contain.
   const parts = raw.includes(GIT_HISTORY_DECORATION_SEPARATOR)
     ? raw.split(GIT_HISTORY_DECORATION_SEPARATOR)

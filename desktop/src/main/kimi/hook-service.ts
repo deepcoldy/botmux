@@ -61,13 +61,13 @@ function getManagedScript(): string {
   return [
     '#!/bin/sh',
     ...buildPosixHookPayloadCapture(),
-    // Why: refresh PORT/TOKEN/ENV/VERSION from the current OrcaBotmux install so a PTY
-    // that survived an OrcaBotmux restart still reaches the live listener. See
+    // Why: refresh PORT/TOKEN/ENV/VERSION from the current Botmux install so a PTY
+    // that survived an Botmux restart still reaches the live listener. See
     // claude/hook-service.ts for the full rationale.
-    'if [ -n "$ORCA_AGENT_HOOK_ENDPOINT" ] && [ -r "$ORCA_AGENT_HOOK_ENDPOINT" ]; then',
-    '  . "$ORCA_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
+    'if [ -n "$BOTMUX_AGENT_HOOK_ENDPOINT" ] && [ -r "$BOTMUX_AGENT_HOOK_ENDPOINT" ]; then',
+    '  . "$BOTMUX_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
     'fi',
-    'if [ -z "$ORCA_AGENT_HOOK_PORT" ] || [ -z "$ORCA_AGENT_HOOK_TOKEN" ] || [ -z "$ORCA_PANE_KEY" ]; then',
+    'if [ -z "$BOTMUX_AGENT_HOOK_PORT" ] || [ -z "$BOTMUX_AGENT_HOOK_TOKEN" ] || [ -z "$BOTMUX_PANE_KEY" ]; then',
     '  exit 0',
     'fi',
     // Why: worktreeId embeds a filesystem path, so hand-building JSON in POSIX
@@ -76,16 +76,16 @@ function getManagedScript(): string {
     // Why: pipe payload to curl's stdin (`payload@-`) instead of an inline
     // `payload=$VALUE` arg, so tens-of-KB tool output stays off the curl
     // command line (EDR command-line false positives). Wire body is identical.
-    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${ORCA_AGENT_HOOK_PORT}/hook/kimi" \\',
+    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${BOTMUX_AGENT_HOOK_PORT}/hook/kimi" \\',
     '  --connect-timeout 0.5 --max-time 1.5 \\',
     '  -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '  -H "X-OrcaBotmux-Agent-Hook-Token: ${ORCA_AGENT_HOOK_TOKEN}" \\',
-    '  --data-urlencode "paneKey=${ORCA_PANE_KEY}" \\',
-    '  --data-urlencode "tabId=${ORCA_TAB_ID}" \\',
-    '  --data-urlencode "launchToken=${ORCA_AGENT_LAUNCH_TOKEN}" \\',
-    '  --data-urlencode "worktreeId=${ORCA_WORKTREE_ID}" \\',
-    '  --data-urlencode "env=${ORCA_AGENT_HOOK_ENV}" \\',
-    '  --data-urlencode "version=${ORCA_AGENT_HOOK_VERSION}" \\',
+    '  -H "X-Botmux-Agent-Hook-Token: ${BOTMUX_AGENT_HOOK_TOKEN}" \\',
+    '  --data-urlencode "paneKey=${BOTMUX_PANE_KEY}" \\',
+    '  --data-urlencode "tabId=${BOTMUX_TAB_ID}" \\',
+    '  --data-urlencode "launchToken=${BOTMUX_AGENT_LAUNCH_TOKEN}" \\',
+    '  --data-urlencode "worktreeId=${BOTMUX_WORKTREE_ID}" \\',
+    '  --data-urlencode "env=${BOTMUX_AGENT_HOOK_ENV}" \\',
+    '  --data-urlencode "version=${BOTMUX_AGENT_HOOK_VERSION}" \\',
     '  --data-urlencode "payload@-" >/dev/null 2>&1 || true',
     'exit 0',
     ''
@@ -191,14 +191,14 @@ export class KimiHookService {
     return this.getStatus()
   }
 
-  // Why: install OrcaBotmux's managed Kimi hooks on a remote box over SFTP, mirroring
+  // Why: install Botmux's managed Kimi hooks on a remote box over SFTP, mirroring
   // the local install. POSIX-only by design (Kimi's shell is sh/Git Bash); the
   // managed script body is already platform-independent.
   async installRemote(sftp: SFTPWrapper, remoteHome: string): Promise<AgentHookInstallStatus> {
     const remoteConfigPath = pathPosix.join(remoteHome, '.kimi-code', 'config.toml')
     const remoteScriptPath = pathPosix.join(
       remoteHome,
-      '.orca_botmux',
+      '.botmux',
       'agent-hooks',
       MANAGED_SCRIPT_FILE_NAME
     )

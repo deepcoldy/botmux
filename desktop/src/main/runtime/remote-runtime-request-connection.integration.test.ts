@@ -12,8 +12,8 @@ import type {
   RuntimeClientEvent,
   RuntimeClientEventStreamMessage
 } from '../../shared/runtime-client-events'
-import type { OrcaRuntimeService } from './orca-botmux-runtime'
-import { OrcaRuntimeRpcServer } from './runtime-rpc'
+import type { BotmuxRuntimeService } from './botmux-runtime'
+import { BotmuxRuntimeRpcServer } from './runtime-rpc'
 import { REMOTE_RUNTIME_SHARED_CONTROL_CAPABILITY } from '../../shared/protocol-version'
 
 const REMOTE_RUNTIME_TEST_TIMEOUT_MS = 15_000
@@ -29,7 +29,7 @@ describe('remote runtime request connection integration', () => {
     'fetches repos through the real E2EE WebSocket runtime',
     { timeout: REMOTE_RUNTIME_TEST_TIMEOUT_MS },
     async () => {
-      const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-request-'))
+      const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-request-'))
       const repoPath = join(userDataPath, 'repo')
       const repos: Repo[] = [
         {
@@ -50,8 +50,8 @@ describe('remote runtime request connection integration', () => {
         cancelMobileDictationForConnection: () => {},
         onClientDisconnected: () => {},
         listRepos: () => repos
-      } as unknown as OrcaRuntimeService
-      const server = new OrcaRuntimeRpcServer({
+      } as unknown as BotmuxRuntimeService
+      const server = new BotmuxRuntimeRpcServer({
         runtime,
         userDataPath,
         enableWebSocket: true,
@@ -90,7 +90,7 @@ describe('remote runtime request connection integration', () => {
     'streams server worktree changes to another remote client',
     { timeout: REMOTE_RUNTIME_TEST_TIMEOUT_MS },
     async () => {
-      const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-request-events-'))
+      const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-request-events-'))
       const repoPath = join(userDataPath, 'repo')
       const repo: Repo = {
         id: 'repo-1',
@@ -166,8 +166,8 @@ describe('remote runtime request connection integration', () => {
           }
           return { worktree }
         }
-      } as unknown as OrcaRuntimeService
-      const server = new OrcaRuntimeRpcServer({
+      } as unknown as BotmuxRuntimeService
+      const server = new BotmuxRuntimeRpcServer({
         runtime,
         userDataPath,
         enableWebSocket: true,
@@ -260,7 +260,7 @@ describe('remote runtime request connection integration', () => {
     'multiplexes shared-control calls and passive subscriptions through the real runtime',
     { timeout: REMOTE_RUNTIME_TEST_TIMEOUT_MS },
     async () => {
-      const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-shared-control-'))
+      const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-shared-control-'))
       const repoPath = join(userDataPath, 'repo')
       const repo: Repo = {
         id: 'repo-1',
@@ -392,8 +392,8 @@ describe('remote runtime request connection integration', () => {
           }
           return { worktree }
         }
-      } as unknown as OrcaRuntimeService
-      const server = new OrcaRuntimeRpcServer({
+      } as unknown as BotmuxRuntimeService
+      const server = new BotmuxRuntimeRpcServer({
         runtime,
         userDataPath,
         enableWebSocket: true,

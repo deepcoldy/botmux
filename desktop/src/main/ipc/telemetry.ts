@@ -54,7 +54,7 @@ import type { OptInVia } from '../../shared/telemetry-events'
 let storeRef: Store | null = null
 
 const MAIN_OWNED_TELEMETRY_EVENTS = new Set<EventName>([
-  'app_starred_orca',
+  'app_starred_botmux',
   'star_nag_outcome',
   'feature_interaction_usage_bucket_reached'
 ])
@@ -186,7 +186,7 @@ export function registerTelemetryHandlers(store: Store): void {
 
   // Read-only view of the effective consent state. The Privacy pane needs
   // this to render the correct helper text when an env var
-  // (DO_NOT_TRACK / ORCA_TELEMETRY_DISABLED / CI) blocks transmission —
+  // (DO_NOT_TRACK / BOTMUX_TELEMETRY_DISABLED / CI) blocks transmission —
   // those variables are main-side process state and the renderer has no
   // way to read them directly. No rate limit: this is a synchronous getter
   // with no mutation, bounded in work by one `resolveConsent` call.

@@ -218,7 +218,7 @@ describe('shouldRecordProcessGoneCrash', () => {
       shouldRecordProcessGoneCrash({
         source: 'child',
         processType: 'Utility',
-        serviceName: 'com.orca_botmux.unexpected',
+        serviceName: 'com.botmux.unexpected',
         reason: 'crashed',
         exitCode: 5,
         expectedTeardown: 'none'
@@ -329,7 +329,7 @@ describe('shouldRecordProcessGoneCrash', () => {
       shouldRecordProcessGoneCrash({
         source: 'child',
         processType: 'Utility',
-        serviceName: 'com.orca_botmux.unexpected',
+        serviceName: 'com.botmux.unexpected',
         reason: 'killed',
         exitCode: 9,
         expectedTeardown: 'renderer-reload'

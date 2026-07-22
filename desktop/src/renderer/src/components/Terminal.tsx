@@ -13,10 +13,10 @@ import {
 import { useAppStore } from '../store'
 import { folderWorkspaceKey } from '../../../shared/workspace-scope'
 import {
-  collectOrcaBotmuxWorkspaceSurfaceIds,
-  getCachedOrcaBotmuxControlPlaneWorktree,
-  isOrcaBotmuxControlPlaneHostId
-} from '../../../shared/orca-botmux-main-terminal-host'
+  collectBotmuxWorkspaceSurfaceIds,
+  getCachedBotmuxControlPlaneWorktree,
+  isBotmuxControlPlaneHostId
+} from '../../../shared/botmux-main-terminal-host'
 import { useAllWorktrees } from '../store/selectors'
 import { getConnectionId } from '../lib/connection-context'
 import { basename } from '../lib/path'
@@ -32,9 +32,9 @@ import { Button } from '@/components/ui/button'
 import TabBar from './tab-bar/TabBar'
 import TerminalPane from './terminal-pane/TerminalPane'
 import {
-  ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
-  ORCA_EDITOR_SAVE_AND_CLOSE_EVENT,
-  ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT,
+  BOTMUX_EDITOR_REQUEST_FILE_CLOSE_EVENT,
+  BOTMUX_EDITOR_SAVE_AND_CLOSE_EVENT,
+  BOTMUX_EDITOR_REQUEST_CMD_SAVE_EVENT,
   type EditorRequestFileCloseDetail,
   requestEditorSaveQuiesce
 } from './editor/editor-autosave'
@@ -258,20 +258,20 @@ function Terminal(): React.JSX.Element | null {
   const folderWorkspaces = useAppStore((s) => s.folderWorkspaces)
   const activeWorktreeId = useAppStore((s) => s.activeWorktreeId)
   const tabsByWorktree = useAppStore((s) => s.tabsByWorktree)
-  // Why: orca_botmux:session:* / global-orca-botmux-terminal are synthetic hosts (module
+  // Why: botmux:session:* / global-botmux-terminal are synthetic hosts (module
   // cache, not worktreesByRepo). Terminal only mounts panes for ids listed in
   // workspaceSurfaces — omitting them left open-attach with tab+startup but a
   // blank main area and ptyId=null forever (CDP repro 2026-07).
-  const orcaBotmuxWorkspaceSurfaces = useMemo(() => {
-    const ids = collectOrcaBotmuxWorkspaceSurfaceIds(Object.keys(tabsByWorktree), activeWorktreeId)
-    // Why: also include any orca_botmux:* keys present only in tabsByWorktree in case
-    // collectOrcaBotmuxWorkspaceSurfaceIds and the module cache are briefly out of
+  const botmuxWorkspaceSurfaces = useMemo(() => {
+    const ids = collectBotmuxWorkspaceSurfaceIds(Object.keys(tabsByWorktree), activeWorktreeId)
+    // Why: also include any botmux:* keys present only in tabsByWorktree in case
+    // collectBotmuxWorkspaceSurfaceIds and the module cache are briefly out of
     // sync across Vite module instances.
     for (const id of Object.keys(tabsByWorktree)) {
       if (
-        (id.startsWith('orca_botmux:agent:') ||
-          id.startsWith('orca_botmux:session:') ||
-          id === 'global-orca-botmux-terminal') &&
+        (id.startsWith('botmux:agent:') ||
+          id.startsWith('botmux:session:') ||
+          id === 'global-botmux-terminal') &&
         !ids.includes(id)
       ) {
         ids.push(id)
@@ -281,7 +281,7 @@ function Terminal(): React.JSX.Element | null {
     return ids.map((id) => ({
       id,
       path:
-        getCachedOrcaBotmuxControlPlaneWorktree(id)?.path ??
+        getCachedBotmuxControlPlaneWorktree(id)?.path ??
         getKnown?.(id)?.path ??
         ''
     }))
@@ -293,9 +293,9 @@ function Terminal(): React.JSX.Element | null {
         id: folderWorkspaceKey(workspace.id),
         path: workspace.folderPath
       })),
-      ...orcaBotmuxWorkspaceSurfaces
+      ...botmuxWorkspaceSurfaces
     ],
-    [allWorktrees, orcaBotmuxWorkspaceSurfaces, folderWorkspaces]
+    [allWorktrees, botmuxWorkspaceSurfaces, folderWorkspaces]
   )
   const renderedActiveWorktreeId = activeWorktreeId
   const activeWorktreeDeferralHostId = useAppStore((s) =>
@@ -328,7 +328,7 @@ function Terminal(): React.JSX.Element | null {
   const activeTabType = useAppStore((s) => s.activeTabType)
   const keybindings = useAppStore((s) => s.keybindings)
   const terminalShortcutPolicy = useAppStore(
-    (s) => s.settings?.terminalShortcutPolicy ?? 'orca-botmux-first'
+    (s) => s.settings?.terminalShortcutPolicy ?? 'botmux-first'
   )
   const mobileEmulatorEnabled = useAppStore((s) => s.settings?.mobileEmulatorEnabled !== false)
   const setActiveTabType = useAppStore((s) => s.setActiveTabType)
@@ -393,7 +393,7 @@ function Terminal(): React.JSX.Element | null {
   useTerminalProviderSnapshotCapability(workspaceSessionReady && hydrationSucceeded)
 
   // Why: the TabBar is rendered into the titlebar via a portal so tabs share
-  // the same row as the "orca_botmux" title. The target element is created by App.tsx.
+  // the same row as the "botmux" title. The target element is created by App.tsx.
   const titlebarTabsTarget = document.getElementById('titlebar-tabs')
 
   useEffect(() => {
@@ -450,7 +450,7 @@ function Terminal(): React.JSX.Element | null {
   // Why: while a save-and-close is awaiting the file to disappear from
   // openFiles, concurrent queueEditorCloseRequests calls (e.g. user clicks X
   // on another dirty tab, or a split-group dispatch fires
-  // ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT) must not re-open the dialog over
+  // BOTMUX_EDITOR_REQUEST_FILE_CLOSE_EVENT) must not re-open the dialog over
   // the in-flight save. Track the in-flight file here so
   // getNextQueuedEditorClose can skip it as an un-advanceable head.
   const inFlightSaveFileIdRef = useRef<string | null>(null)
@@ -656,7 +656,7 @@ function Terminal(): React.JSX.Element | null {
     // owns that write path now, so the dialog signals it through a custom
     // event instead of poking at editor component refs.
     setSaveDialogFileId(null)
-    window.dispatchEvent(new CustomEvent(ORCA_EDITOR_SAVE_AND_CLOSE_EVENT, { detail: { fileId } }))
+    window.dispatchEvent(new CustomEvent(BOTMUX_EDITOR_SAVE_AND_CLOSE_EVENT, { detail: { fileId } }))
     inFlightSaveFileIdRef.current = fileId
     let closed = false
     try {
@@ -770,12 +770,12 @@ function Terminal(): React.JSX.Element | null {
       queueEditorCloseRequests([fileId])
     }
     window.addEventListener(
-      ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
+      BOTMUX_EDITOR_REQUEST_FILE_CLOSE_EVENT,
       onRequestEditorClose as EventListener
     )
     return () =>
       window.removeEventListener(
-        ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
+        BOTMUX_EDITOR_REQUEST_FILE_CLOSE_EVENT,
         onRequestEditorClose as EventListener
       )
   }, [queueEditorCloseRequests])
@@ -1094,11 +1094,11 @@ function Terminal(): React.JSX.Element | null {
         // mount immediately, mirroring the cold-park eligibility rule.
         isTabDeferrable: (tabId) => {
           const tab = tabById.get(tabId)
-          // Why: orca_botmux agent/session hosts open with a queued ssh-attach
+          // Why: botmux agent/session hosts open with a queued ssh-attach
           // startup and must mount the TerminalPane immediately. Cold
           // deferral left attach tabs with pendingActivationSpawn and
           // ptyId=null forever (CDP: spawn never called).
-          if (isOrcaBotmuxControlPlaneHostId(renderedActiveWorktreeId)) {
+          if (isBotmuxControlPlaneHostId(renderedActiveWorktreeId)) {
             return false
           }
           return (
@@ -1146,10 +1146,10 @@ function Terminal(): React.JSX.Element | null {
       })
     }
     mountedWorktreeIdsRef.current.add(renderedActiveWorktreeId)
-    // Why: orca_botmux agent/session attach must never stay on a restricted mount
+    // Why: botmux agent/session attach must never stay on a restricted mount
     // set that omits the new tab — that left tabs with ptyId=null and
     // pty.spawn never called (overlay filtered the tab out).
-    if (isOrcaBotmuxControlPlaneHostId(renderedActiveWorktreeId)) {
+    if (isBotmuxControlPlaneHostId(renderedActiveWorktreeId)) {
       backgroundMountTabIdsByWorktreeRef.current.delete(renderedActiveWorktreeId)
       activationDeferredMountTabIdsByWorktreeRef.current.delete(renderedActiveWorktreeId)
     }
@@ -1798,7 +1798,7 @@ function Terminal(): React.JSX.Element | null {
           terminalShortcutPolicy
         })
       const notifyTerminalCapture = (actionId: KeybindingActionId): void => {
-        if (context !== 'terminal' || terminalShortcutPolicy !== 'orca-botmux-first') {
+        if (context !== 'terminal' || terminalShortcutPolicy !== 'botmux-first') {
           return
         }
         showTerminalShortcutCaptureNotification({
@@ -1920,7 +1920,7 @@ function Terminal(): React.JSX.Element | null {
           if (state.activeTabType === 'editor' && state.activeFileId) {
             e.preventDefault()
             notifyTerminalCapture('editor.save')
-            window.dispatchEvent(new Event(ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT))
+            window.dispatchEvent(new Event(BOTMUX_EDITOR_REQUEST_CMD_SAVE_EVENT))
             return
           }
         }

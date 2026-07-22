@@ -39,7 +39,7 @@ export default function WorktreeVisibilityDialog(): React.JSX.Element | null {
   const otherCount =
     detected?.authoritative === true
       ? detected.worktrees.filter(
-          (worktree) => !worktree.selectedCheckout && worktree.ownership !== 'orca-botmux-managed'
+          (worktree) => !worktree.selectedCheckout && worktree.ownership !== 'botmux-managed'
         ).length
       : 0
   const hiddenWorktreeLabel = `${hiddenCount} ${hiddenCount === 1 ? 'worktree' : 'worktrees'}`
@@ -72,7 +72,7 @@ export default function WorktreeVisibilityDialog(): React.JSX.Element | null {
           <DialogTitle>
             {translate(
               'auto.components.sidebar.WorktreeVisibilityDialog.83a5ba8dd1',
-              'Non-OrcaBotmux worktrees'
+              'Non-Botmux worktrees'
             )}
           </DialogTitle>
           <DialogDescription>{repo.displayName}</DialogDescription>

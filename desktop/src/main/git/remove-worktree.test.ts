@@ -1049,10 +1049,10 @@ describe('listWorktrees', () => {
       })
     )
 
-    await expect(listWorktrees('/private/tmp/orca-botmux-issue-1582-test/my-repo')).resolves.toEqual([])
+    await expect(listWorktrees('/private/tmp/botmux-issue-1582-test/my-repo')).resolves.toEqual([])
 
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(['worktree', 'list', '--porcelain', '-z'], {
-      cwd: '/private/tmp/orca-botmux-issue-1582-test/my-repo'
+      cwd: '/private/tmp/botmux-issue-1582-test/my-repo'
     })
     expect(warnSpy).not.toHaveBeenCalled()
     warnSpy.mockRestore()

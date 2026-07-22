@@ -121,7 +121,7 @@ describe('getComputerUsePermissionSetupState', () => {
     expect(
       getComputerUsePermissionSetupState({
         platform: 'darwin',
-        helperAppPath: '/Applications/OrcaBotmux Helper.app',
+        helperAppPath: '/Applications/Botmux Helper.app',
         helperUnavailableReason: null,
         permissions: [
           { id: 'accessibility', status: 'granted' },
@@ -183,7 +183,7 @@ describe('getSetupGuideProgressReady', () => {
     expect(
       getComputerUsePermissionSetupState({
         platform: 'darwin',
-        helperAppPath: '/Applications/OrcaBotmux Helper.app',
+        helperAppPath: '/Applications/Botmux Helper.app',
         helperUnavailableReason: null,
         permissions: [{ id: 'accessibility', status: 'not-granted' }]
       })

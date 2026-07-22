@@ -22,7 +22,7 @@ const KEYCHAIN_OPTIONS: SecureStore.SecureStoreOptions = {
 }
 
 function journalKey(hostId: string): string {
-  return `orca.mobile-relay.direct-upgrade.${hostId}`
+  return `botmux.mobile-relay.direct-upgrade.${hostId}`
 }
 
 export function createMobileRelayDirectUpgradeJournal(
@@ -84,6 +84,6 @@ function encodeBase64Url(value: Uint8Array): string {
 
 function requireNativeSecretStore(): void {
   if (Platform.OS === 'web') {
-    throw new Error('Orca Relay upgrade state requires a native secret store')
+    throw new Error('Botmux Relay upgrade state requires a native secret store')
   }
 }

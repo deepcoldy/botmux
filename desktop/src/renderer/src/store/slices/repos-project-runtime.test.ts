@@ -64,7 +64,7 @@ beforeEach(() => {
 function expectInstalledSkillRefreshEvent(): void {
   expect(
     dispatchEventMock.mock.calls.some(([event]) => {
-      return event instanceof CustomEvent && event.type === 'orca_botmux:installed-agent-skills-changed'
+      return event instanceof CustomEvent && event.type === 'botmux:installed-agent-skills-changed'
     })
   ).toBe(true)
 }
@@ -268,8 +268,8 @@ describe('repo slice project runtime updates', () => {
 
   it('preserves shared project source repos when updating local runtime preferences', async () => {
     const project: Project = {
-      id: 'github:stablyai/orca_botmux',
-      displayName: 'orca_botmux',
+      id: 'github:stablyai/botmux',
+      displayName: 'botmux',
       badgeColor: '#000',
       sourceRepoIds: ['local-repo', 'remote-repo'],
       createdAt: 1,
@@ -296,8 +296,8 @@ describe('repo slice project runtime updates', () => {
 
   it('clears local runtime preferences without dropping shared project source repos', async () => {
     const project: Project = {
-      id: 'github:stablyai/orca_botmux',
-      displayName: 'orca_botmux',
+      id: 'github:stablyai/botmux',
+      displayName: 'botmux',
       badgeColor: '#000',
       sourceRepoIds: ['local-repo', 'remote-repo'],
       localWindowsRuntimePreference: { kind: 'windows-host' },

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   focusActiveTerminalInput,
   sendToTerminal,
@@ -116,7 +116,7 @@ async function installClipboardReadTerminalBlurRepro(app: ElectronApplication): 
   await app.evaluate(({ BrowserWindow, ipcMain }) => {
     type ClipboardReadHandler = (event: unknown, ...args: unknown[]) => Promise<unknown> | unknown
     const global = globalThis as unknown as {
-      __orcaOriginalClipboardReadTextHandler?: ClipboardReadHandler
+      __botmuxOriginalClipboardReadTextHandler?: ClipboardReadHandler
     }
     const invokeHandlers = (
       ipcMain as unknown as {
@@ -124,10 +124,10 @@ async function installClipboardReadTerminalBlurRepro(app: ElectronApplication): 
       }
     )._invokeHandlers
     const handler = invokeHandlers?.get('clipboard:readText')
-    if (!invokeHandlers || !handler || global.__orcaOriginalClipboardReadTextHandler) {
+    if (!invokeHandlers || !handler || global.__botmuxOriginalClipboardReadTextHandler) {
       return
     }
-    global.__orcaOriginalClipboardReadTextHandler = handler
+    global.__botmuxOriginalClipboardReadTextHandler = handler
     invokeHandlers.set('clipboard:readText', async (event, ...args) => {
       const windows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed())
       await Promise.all(
@@ -145,7 +145,7 @@ async function installClipboardReadTerminalBlurRepro(app: ElectronApplication): 
       )
       // Why: reproduce the focus churn window before the async clipboard read resolves.
       await new Promise((resolve) => setTimeout(resolve, 0))
-      return global.__orcaOriginalClipboardReadTextHandler!(event, ...args)
+      return global.__botmuxOriginalClipboardReadTextHandler!(event, ...args)
     })
   })
 }
@@ -154,16 +154,16 @@ async function restoreClipboardReadTerminalBlurRepro(app: ElectronApplication): 
   await app.evaluate(({ ipcMain }) => {
     type ClipboardReadHandler = (event: unknown, ...args: unknown[]) => Promise<unknown> | unknown
     const global = globalThis as unknown as {
-      __orcaOriginalClipboardReadTextHandler?: ClipboardReadHandler
+      __botmuxOriginalClipboardReadTextHandler?: ClipboardReadHandler
     }
     const invokeHandlers = (
       ipcMain as unknown as {
         _invokeHandlers?: Map<string, ClipboardReadHandler>
       }
     )._invokeHandlers
-    if (invokeHandlers && global.__orcaOriginalClipboardReadTextHandler) {
-      invokeHandlers.set('clipboard:readText', global.__orcaOriginalClipboardReadTextHandler)
-      delete global.__orcaOriginalClipboardReadTextHandler
+    if (invokeHandlers && global.__botmuxOriginalClipboardReadTextHandler) {
+      invokeHandlers.set('clipboard:readText', global.__botmuxOriginalClipboardReadTextHandler)
+      delete global.__botmuxOriginalClipboardReadTextHandler
     }
   })
 }
@@ -186,42 +186,42 @@ async function openTerminalContextMenu(page: Page): Promise<void> {
 test.describe('terminal paste ownership', () => {
   test('keyboard paste shortcuts send clipboard text to the focused terminal exactly once', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-paste-ownership-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-paste-ownership-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `PASTE_READY_${runId}`, 10_000)
 
       for (const [index, chord] of keyboardPasteChords().entries()) {
-        const payload = `ORCA_E2E_PASTE_${runId}_${index}`
+        const payload = `BOTMUX_E2E_PASTE_${runId}_${index}`
         const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
         await clearTerminalPtyWriteLog(electronApp)
-        await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
-        await focusActiveTerminalInput(orcaBotmuxPage)
+        await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+        await focusActiveTerminalInput(botmuxPage)
 
-        await orcaBotmuxPage.keyboard.press(chord)
-        await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+        await botmuxPage.keyboard.press(chord)
+        await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
         const writes = (await readTerminalPtyWrites(electronApp)).join('')
         expect(countOccurrences(writes, payload), `${chord} PTY write count`).toBe(1)
       }
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -229,42 +229,42 @@ test.describe('terminal paste ownership', () => {
 
   test('keyboard paste survives transient terminal blur during clipboard read', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-paste-blur-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-paste-blur-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `PASTE_READY_${runId}`, 10_000)
 
-      const payload = `ORCA_E2E_TRANSIENT_BLUR_PASTE_${runId}`
+      const payload = `BOTMUX_E2E_TRANSIENT_BLUR_PASTE_${runId}`
       const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
       await clearTerminalPtyWriteLog(electronApp)
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await focusActiveTerminalInput(botmuxPage)
       await installClipboardReadTerminalBlurRepro(electronApp)
 
-      await orcaBotmuxPage.keyboard.press(keyboardPasteChords()[0])
-      await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+      await botmuxPage.keyboard.press(keyboardPasteChords()[0])
+      await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
       const writes = (await readTerminalPtyWrites(electronApp)).join('')
       expect(countOccurrences(writes, payload), 'transient blur PTY write count').toBe(1)
     } finally {
       await restoreClipboardReadTerminalBlurRepro(electronApp).catch(() => undefined)
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -272,41 +272,41 @@ test.describe('terminal paste ownership', () => {
 
   test('terminal context-menu Paste sends clipboard text exactly once', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-paste-context-menu-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-paste-context-menu-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `PASTE_READY_${runId}`, 10_000)
 
-      const payload = `ORCA_E2E_CONTEXT_MENU_PASTE_${runId}`
+      const payload = `BOTMUX_E2E_CONTEXT_MENU_PASTE_${runId}`
       const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
       await clearTerminalPtyWriteLog(electronApp)
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await focusActiveTerminalInput(botmuxPage)
 
-      await openTerminalContextMenu(orcaBotmuxPage)
-      await orcaBotmuxPage.getByRole('menuitem', { name: /Paste/ }).click()
-      await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+      await openTerminalContextMenu(botmuxPage)
+      await botmuxPage.getByRole('menuitem', { name: /Paste/ }).click()
+      await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
       const writes = (await readTerminalPtyWrites(electronApp)).join('')
       expect(countOccurrences(writes, payload), 'terminal context-menu PTY write count').toBe(1)
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -314,22 +314,22 @@ test.describe('terminal paste ownership', () => {
 
   test('Windows multiline keyboard paste normalizes terminal newlines with one PTY owner', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
     test.skip(process.platform !== 'win32', 'Windows multiline paste behavior is Windows-only')
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const sentinel = `ORCA_E2E_MULTILINE_DONE_${runId}`
+    const sentinel = `BOTMUX_E2E_MULTILINE_DONE_${runId}`
     const payload = [
-      `ORCA_E2E_MULTILINE_${runId}`,
+      `BOTMUX_E2E_MULTILINE_${runId}`,
       'line with spaces and tabs\tend',
       'PowerShell metacharacters: ` $ " \' ; | & < > @ { } ( )',
       'cmd metacharacters: % ! ^ & | < >',
@@ -337,29 +337,29 @@ test.describe('terminal paste ownership', () => {
       `mixed-newline-before\r\nlf-line\ncrlf-line\r\n${sentinel}`
     ].join('\n')
     // Why: xterm translates clipboard line endings to terminal Enter bytes;
-    // OrcaBotmux's direct Windows bracketed-paste path must produce the same bytes.
+    // Botmux's direct Windows bracketed-paste path must produce the same bytes.
     const terminalText = payload.replace(/\r?\n/g, '\r')
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-paste-multiline-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-paste-multiline-${runId}.mjs`)
     writeFileSync(scriptPath, pasteCollectScript(runId, sentinel, terminalText))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `PASTE_READY_${runId}`, 10_000)
 
       await clearTerminalPtyWriteLog(electronApp)
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await focusActiveTerminalInput(botmuxPage)
 
-      await orcaBotmuxPage.keyboard.press('Control+V')
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_COMPLETE_${runId}:MATCH`, 10_000, 12_000)
+      await botmuxPage.keyboard.press('Control+V')
+      await waitForTerminalOutput(botmuxPage, `PASTE_COMPLETE_${runId}:MATCH`, 10_000, 12_000)
 
       const writes = (await readTerminalPtyWrites(electronApp)).join('')
       expect(countOccurrences(writes, terminalText), 'multiline payload PTY write count').toBe(1)
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -367,43 +367,43 @@ test.describe('terminal paste ownership', () => {
 
   test('right-click paste sends clipboard text to the focused terminal exactly once', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(async () => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await botmuxPage.evaluate(async () => {
       await window.__store?.getState().updateSettings({ terminalRightClickToPaste: true })
     })
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-paste-right-click-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-paste-right-click-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `PASTE_READY_${runId}`, 10_000)
 
-      const payload = `ORCA_E2E_RIGHT_CLICK_PASTE_${runId}`
+      const payload = `BOTMUX_E2E_RIGHT_CLICK_PASTE_${runId}`
       const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
       await clearTerminalPtyWriteLog(electronApp)
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await focusActiveTerminalInput(botmuxPage)
 
-      await rightClickActiveTerminalSurface(orcaBotmuxPage)
-      await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+      await rightClickActiveTerminalSurface(botmuxPage)
+      await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
       const writes = (await readTerminalPtyWrites(electronApp)).join('')
       expect(countOccurrences(writes, payload), 'right-click PTY write count').toBe(1)
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }

@@ -48,9 +48,7 @@ import {
   updatePRState,
   rerunPRChecks,
   requestPRReviewers,
-  removePRReviewers,
-  checkOrcaStarred,
-  starOrca
+  removePRReviewers
 } from '../github/client'
 import type { GitHubPRBranchLookupOptions } from '../github/client'
 import {
@@ -105,9 +103,6 @@ import type {
   UpdateProjectItemFieldArgs,
   UpdatePullRequestBySlugArgs
 } from '../../shared/github-project-types'
-import { appStarSourceSchema } from '../../shared/gh-star-source'
-import { track } from '../telemetry/client'
-import { getCohortAtEmit } from '../telemetry/cohort-classifier'
 import { sendToTrustedUIRenderer } from './ui'
 
 const prRefreshVisibilityCleanupRegistered = new Set<number>()
@@ -302,7 +297,7 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
       )
       // Emit pr_created when a PR is first detected for a branch.
       // Why here: the renderer polls gh:prForBranch to check PR status per worktree.
-      // This captures PRs opened from any workflow (OrcaBotmux UI, gh CLI, github.com).
+      // This captures PRs opened from any workflow (Botmux UI, gh CLI, github.com).
       if (pr && !stats.hasCountedPR(pr.url)) {
         stats.record({
           type: 'pr_created',
@@ -1131,22 +1126,7 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
     )
   })
 
-  // Star operations target the OrcaBotmux repo itself — no repoPath validation needed
   ipcMain.handle('gh:viewer', () => getAuthenticatedViewer())
-  ipcMain.handle('gh:checkOrcaStarred', () => checkOrcaStarred())
-  ipcMain.handle('gh:starOrca', async (_event, source: unknown) => {
-    const sourceParse = appStarSourceSchema.safeParse(source)
-    const starred = await starOrca()
-    if (starred && sourceParse.success) {
-      // Why: this main-owned event bypasses renderer telemetry IPC, so cohort
-      // context must be attached here on the successful star path.
-      track('app_starred_orca', {
-        source: sourceParse.data,
-        ...getCohortAtEmit()
-      })
-    }
-    return starred
-  })
 
   // Why: `rate_limit` is exempt from GitHub's rate-limit accounting, so
   // polling is cheap. A 30s in-process cache still avoids the gh subprocess

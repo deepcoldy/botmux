@@ -17,7 +17,7 @@ const builderConfig = require('../../../config/electron-builder.config.cjs') as 
   linux?: { extraResources?: { from?: string; to?: string }[] }
   win?: { extraResources?: { from?: string; to?: string }[] }
 }
-const linuxLauncherAsset = new URL('../../../resources/linux/bin/orca-botmux-ide', import.meta.url)
+const linuxLauncherAsset = new URL('../../../resources/linux/bin/botmux-ide', import.meta.url)
 
 describe('packaged CLI assets', () => {
   it('ships embedded skill guides with the CLI instead of source Markdown', () => {
@@ -63,14 +63,14 @@ describe('packaged CLI assets', () => {
   itRunsUnixShell(
     'runs the Linux launcher from its packaged path and installed symlink',
     async () => {
-      const root = await mkdtemp(join(tmpdir(), 'orca-botmux-linux-cli-'))
+      const root = await mkdtemp(join(tmpdir(), 'botmux-linux-cli-'))
       try {
-        const appDir = join(root, 'orca_botmux')
+        const appDir = join(root, 'botmux')
         const resourcesDir = join(appDir, 'resources')
         const launcherDir = join(resourcesDir, 'bin')
         const cliDir = join(resourcesDir, 'app.asar.unpacked', 'out', 'cli')
-        const launcherPath = join(launcherDir, 'orca-botmux-ide')
-        const electronPath = join(appDir, 'orca-botmux-ide')
+        const launcherPath = join(launcherDir, 'botmux-ide')
+        const electronPath = join(appDir, 'botmux-ide')
         const cliPath = join(cliDir, 'index.js')
 
         await mkdir(launcherDir, { recursive: true })
@@ -96,9 +96,9 @@ printf 'arg=%s\\n' "$@"
 
         const homeDir = join(root, 'home')
         const commandDir = join(homeDir, '.local', 'bin')
-        const commandPath = join(commandDir, 'orca-botmux-ide')
+        const commandPath = join(commandDir, 'botmux-ide')
         await mkdir(commandDir, { recursive: true })
-        await mkdir(join(homeDir, 'orca_botmux'), { recursive: true })
+        await mkdir(join(homeDir, 'botmux'), { recursive: true })
         await symlink(launcherPath, commandPath)
 
         const symlinked = await execFileAsync(commandPath, ['--help'], {
@@ -115,13 +115,13 @@ printf 'arg=%s\\n' "$@"
   )
 
   itRunsUnixShell('runs the AppImage CLI wrapper through APPDIR at runtime', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-appimage-cli-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-appimage-cli-'))
     try {
-      const appDir = join(root, 'OrcaBotmux.AppDir')
+      const appDir = join(root, 'Botmux.AppDir')
       const cliDir = join(appDir, 'resources', 'app.asar.unpacked', 'out', 'cli')
       const cliPath = join(cliDir, 'index.js')
-      const appImagePath = join(root, "OrcaBotmux's AppImage.AppImage")
-      const commandPath = join(root, 'orca-botmux-ide')
+      const appImagePath = join(root, "Botmux's AppImage.AppImage")
+      const commandPath = join(root, 'botmux-ide')
       await mkdir(cliDir, { recursive: true })
       await writeFile(
         cliPath,
@@ -131,9 +131,9 @@ printf 'arg=%s\\n' "$@"
     appDir: process.env.APPDIR,
     runAsNode: process.env.ELECTRON_RUN_AS_NODE,
     nodeOptions: process.env.NODE_OPTIONS ?? null,
-    orcaNodeOptions: process.env.ORCA_NODE_OPTIONS ?? null,
+    botmuxNodeOptions: process.env.BOTMUX_NODE_OPTIONS ?? null,
     nodeReplExternalModule: process.env.NODE_REPL_EXTERNAL_MODULE ?? null,
-    orcaNodeReplExternalModule: process.env.ORCA_NODE_REPL_EXTERNAL_MODULE ?? null
+    botmuxNodeReplExternalModule: process.env.BOTMUX_NODE_REPL_EXTERNAL_MODULE ?? null
   }))
 }
 `,
@@ -165,18 +165,18 @@ exec node "$@"
         appDir: string
         runAsNode: string
         nodeOptions: string | null
-        orcaNodeOptions: string | null
+        botmuxNodeOptions: string | null
         nodeReplExternalModule: string | null
-        orcaNodeReplExternalModule: string | null
+        botmuxNodeReplExternalModule: string | null
       }
 
       expect(payload.argv).toEqual(['--help', 'two words'])
       expect(payload.appDir).toBe(appDir)
       expect(payload.runAsNode).toBe('1')
       expect(payload.nodeOptions).toBeNull()
-      expect(payload.orcaNodeOptions).toBe('--trace-warnings')
+      expect(payload.botmuxNodeOptions).toBe('--trace-warnings')
       expect(payload.nodeReplExternalModule).toBeNull()
-      expect(payload.orcaNodeReplExternalModule).toBe('external-loader')
+      expect(payload.botmuxNodeReplExternalModule).toBe('external-loader')
     } finally {
       await rm(root, { recursive: true, force: true })
     }

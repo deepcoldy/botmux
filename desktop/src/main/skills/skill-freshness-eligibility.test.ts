@@ -36,15 +36,15 @@ describe('skill freshness name-scoped update eligibility', () => {
   it('offers a name when at least one supported placement is outdated and all are official', () => {
     expect(
       eligibleSkillUpdateNames([
-        placement('orca-botmux-cli'),
-        placement('orca-botmux-cli', {
-          id: 'orca-botmux-cli-claude',
+        placement('botmux-cli'),
+        placement('botmux-cli', {
+          id: 'botmux-cli-claude',
           rootId: 'home-claude',
           topology: 'provider-alias',
           status: 'current'
         })
       ])
-    ).toEqual(['orca-botmux-cli'])
+    ).toEqual(['botmux-cli'])
   })
 
   it.each([
@@ -58,8 +58,8 @@ describe('skill freshness name-scoped update eligibility', () => {
   ] as const)('poisons a name for a %s placement in %s topology', (status, topology) => {
     expect(
       eligibleSkillUpdateNames([
-        placement('orca-botmux-cli'),
-        placement('orca-botmux-cli', { id: `poison-${status}-${topology}`, status, topology })
+        placement('botmux-cli'),
+        placement('botmux-cli', { id: `poison-${status}-${topology}`, status, topology })
       ])
     ).toEqual([])
   })
@@ -69,17 +69,17 @@ describe('skill freshness name-scoped update eligibility', () => {
     // and the duplicate row is flagged as maybe-not-reached rather than blocking.
     expect(
       eligibleSkillUpdateNames([
-        placement('orca-botmux-cli'),
-        placement('orca-botmux-cli', {
-          id: 'orca-botmux-cli-gemini',
+        placement('botmux-cli'),
+        placement('botmux-cli', {
+          id: 'botmux-cli-gemini',
           rootId: 'home-gemini',
-          unresolvedPath: '/home/.gemini/skills/orca-botmux-cli',
-          resolvedPath: '/home/.gemini/skills/orca-botmux-cli',
+          unresolvedPath: '/home/.gemini/skills/botmux-cli',
+          resolvedPath: '/home/.gemini/skills/botmux-cli',
           topology: 'independent-copy',
           status: 'current'
         })
       ])
-    ).toEqual(['orca-botmux-cli'])
+    ).toEqual(['botmux-cli'])
   })
 
   it('does not offer a skill that exists only as a standalone copy', () => {
@@ -87,10 +87,10 @@ describe('skill freshness name-scoped update eligibility', () => {
     // reliable target, so a duplicate-only skill stays unoffered.
     expect(
       eligibleSkillUpdateNames([
-        placement('orca-botmux-cli', {
+        placement('botmux-cli', {
           rootId: 'home-gemini',
-          unresolvedPath: '/home/.gemini/skills/orca-botmux-cli',
-          resolvedPath: '/home/.gemini/skills/orca-botmux-cli',
+          unresolvedPath: '/home/.gemini/skills/botmux-cli',
+          resolvedPath: '/home/.gemini/skills/botmux-cli',
           topology: 'independent-copy',
           status: 'outdated'
         })
@@ -113,10 +113,10 @@ describe('skill freshness name-scoped update eligibility', () => {
   })
 
   it('builds only an explicit, deterministic global command', () => {
-    expect(buildTargetedSkillUpdateCommand(['orchestration', 'orca-botmux-cli', 'orca-botmux-cli'])).toBe(
-      'npx skills update orca-botmux-cli orchestration --global'
+    expect(buildTargetedSkillUpdateCommand(['orchestration', 'botmux-cli', 'botmux-cli'])).toBe(
+      'npx skills update botmux-cli orchestration --global'
     )
     expect(buildTargetedSkillUpdateCommand([])).toBeNull()
-    expect(buildTargetedSkillUpdateCommand(['orca-botmux-cli;echo unsafe'])).toBeNull()
+    expect(buildTargetedSkillUpdateCommand(['botmux-cli;echo unsafe'])).toBeNull()
   })
 })

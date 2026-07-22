@@ -7,8 +7,8 @@ import { tmpdir } from 'node:os'
 import { DEVICE_REGISTRY_FILENAME, E2EE_KEYPAIR_FILENAME } from './mobile-pairing-files'
 
 // Mutable userData the electron mock resolves. We flip it mid-test to simulate
-// app.setName('orca_botmux') changing how app.getPath('userData') resolves (e.g. from
-// lowercase 'orca_botmux' to uppercase 'orca_botmux' on a case-sensitive filesystem) — the
+// app.setName('botmux') changing how app.getPath('userData') resolves (e.g. from
+// lowercase 'botmux' to uppercase 'botmux' on a case-sensitive filesystem) — the
 // divergence that drops paired devices. We use two genuinely distinct directory
 // names rather than case variants so the assertion is deterministic regardless
 // of whether the test host's filesystem is case-sensitive.
@@ -32,7 +32,7 @@ describe('mobile pairing userData path stability', () => {
   let lateDir: string
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'orca-botmux-pairing-path-'))
+    root = mkdtempSync(join(tmpdir(), 'botmux-pairing-path-'))
     canonicalDir = join(root, 'userdata-early')
     lateDir = join(root, 'userdata-late')
     mkdirSync(canonicalDir, { recursive: true })
@@ -50,7 +50,7 @@ describe('mobile pairing userData path stability', () => {
     const { initDataPath, getCanonicalUserDataPath } = await import('../persistence')
     initDataPath()
 
-    // app.setName('orca_botmux') happens later in startup, changing late resolution.
+    // app.setName('botmux') happens later in startup, changing late resolution.
     appState.userData = lateDir
 
     expect(getCanonicalUserDataPath()).toBe(canonicalDir)
@@ -63,17 +63,17 @@ describe('mobile pairing userData path stability', () => {
     const { initDataPath, getCanonicalUserDataPath } = await import('../persistence')
     initDataPath()
 
-    appState.userData = lateDir // app.setName('orca_botmux') has run by the time the runtime starts
+    appState.userData = lateDir // app.setName('botmux') has run by the time the runtime starts
 
     const { DeviceRegistry } = await import('./device-registry')
     const { loadOrCreateE2EEKeypair } = await import('./e2ee-keypair')
 
-    // Mirrors OrcaRuntimeRpcServer.start(): both read from the same userDataPath.
+    // Mirrors BotmuxRuntimeRpcServer.start(): both read from the same userDataPath.
     const registry = new DeviceRegistry(getCanonicalUserDataPath())
     registry.addDevice('iPhone')
     loadOrCreateE2EEKeypair(getCanonicalUserDataPath())
 
-    // Pairing credentials land beside orca-botmux-data.json so they survive restarts/updates.
+    // Pairing credentials land beside botmux-data.json so they survive restarts/updates.
     expect(existsSync(join(canonicalDir, DEVICE_REGISTRY_FILENAME))).toBe(true)
     expect(existsSync(join(canonicalDir, E2EE_KEYPAIR_FILENAME))).toBe(true)
     // The bug being guarded: the late path would have captured these instead.

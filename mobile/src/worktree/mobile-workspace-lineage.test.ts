@@ -7,7 +7,7 @@ function worktree(overrides: Partial<Worktree> = {}): Worktree {
     workspaceKind: 'git',
     worktreeId: 'worktree',
     repoId: 'repo-1',
-    repo: 'orca',
+    repo: 'botmux-app',
     branch: 'feature/mobile-parity',
     displayName: 'worktree',
     path: '/tmp/worktree',

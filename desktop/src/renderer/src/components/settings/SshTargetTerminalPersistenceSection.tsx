@@ -33,7 +33,7 @@ export function SshTargetTerminalPersistenceSection({
       )}
       description={translate(
         'auto.components.settings.SshTargetForm.137e88ce8d',
-        'Remote terminals keep running after OrcaBotmux disconnects from this host.'
+        'Remote terminals keep running after Botmux disconnects from this host.'
       )}
     >
       <div className="flex items-start justify-between gap-4 py-1 text-xs">

@@ -12,8 +12,8 @@ const {
   verifyPackagedMainRuntimeDeps
 } = require('./packaged-runtime-node-modules.cjs')
 
-const isMacRelease = process.env.ORCA_MAC_RELEASE === '1'
-const isLinuxArm64Release = process.env.ORCA_LINUX_ARM64_RELEASE === '1'
+const isMacRelease = process.env.BOTMUX_MAC_RELEASE === '1'
+const isLinuxArm64Release = process.env.BOTMUX_LINUX_ARM64_RELEASE === '1'
 const featureWallResources = {
   from: 'resources/onboarding/feature-wall',
   to: 'onboarding/feature-wall'
@@ -36,9 +36,9 @@ const relayExtraResource = {
 // runtime dependency closure to Resources/node_modules so bare require() calls
 // do not fall through to a developer checkout's node_modules.
 const botmuxTermRelayResource = {
-  // Why: OrcaBotmux session "PTY" button runs this from process.resourcesPath when packaged.
-  from: 'scripts/orca-botmux-term-relay.mjs',
-  to: 'orca-botmux-term-relay.mjs'
+  // Why: Botmux session "PTY" button runs this from process.resourcesPath when packaged.
+  from: 'scripts/botmux-term-relay.mjs',
+  to: 'botmux-term-relay.mjs'
 }
 
 const commonExtraResources = [
@@ -61,8 +61,8 @@ const winSpeechNativeResource = {
 
 /** @type {import('electron-builder').Configuration} */
 module.exports = {
-  appId: 'com.orca_botmux.desktop',
-  productName: 'orca_botmux',
+  appId: 'com.botmux.desktop',
+  productName: 'Botmux',
   directories: {
     buildResources: 'resources/build'
   },
@@ -80,7 +80,7 @@ module.exports = {
     // authoring sources too would duplicate content without a runtime consumer.
     '!skill-guides{,/**/*}',
     '!tests{,/**/*}',
-    // Why: pr-evidence/ is a local e2e screenshot output (ORCA_CAPTURE_EVIDENCE);
+    // Why: pr-evidence/ is a local e2e screenshot output (BOTMUX_CAPTURE_EVIDENCE);
     // it is gitignored, but exclude it defensively so a stray local capture at
     // package time never bloats app.asar.
     '!pr-evidence{,/**/*}',
@@ -186,15 +186,15 @@ module.exports = {
       chmodSync(join(resourcesDir, filename), 0o755)
     }
     if (context.electronPlatformName === 'darwin') {
-      await signMacComputerUseHelper(join(resourcesDir, 'OrcaBotmux Computer Use.app'), context.packager)
+      await signMacComputerUseHelper(join(resourcesDir, 'Botmux Computer Use.app'), context.packager)
       await signMacNotificationStatusHelper(
-        join(resourcesDir, '..', 'MacOS', 'orca-botmux-notification-status'),
+        join(resourcesDir, '..', 'MacOS', 'botmux-notification-status'),
         context.packager
       )
     }
   },
   win: {
-    executableName: 'orca_botmux',
+    executableName: 'botmux',
     // Why: Windows installers are signed after electron-builder packaging by
     // SignPath, so the packager cannot infer the updater publisherName.
     signtoolOptions: {
@@ -205,12 +205,12 @@ module.exports = {
       ...createPackagedRuntimeNodeModuleResources('win32'),
       winSpeechNativeResource,
       {
-        from: 'resources/win32/bin/orca_botmux.cmd',
-        to: 'bin/orca_botmux.cmd'
+        from: 'resources/win32/bin/botmux.cmd',
+        to: 'bin/botmux.cmd'
       },
       {
-        from: 'native/windows-cli-launcher/.build/orca_botmux.exe',
-        to: 'bin/orca_botmux.exe'
+        from: 'native/windows-cli-launcher/.build/botmux.exe',
+        to: 'bin/botmux.exe'
       },
       {
         from: 'node_modules/agent-browser/bin/agent-browser-win32-x64.exe',
@@ -224,7 +224,7 @@ module.exports = {
     ]
   },
   nsis: {
-    artifactName: 'orca-botmux-windows-setup.${ext}',
+    artifactName: 'botmux-windows-setup.${ext}',
     shortcutName: '${productName}',
     uninstallDisplayName: '${productName}',
     createDesktopShortcut: 'always',
@@ -239,19 +239,19 @@ module.exports = {
     entitlementsInherit: 'resources/build/entitlements.mac.plist',
     extendInfo: {
       NSAppleEventsUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to automate local apps when you request it.',
+        'Botmux allows terminal-launched developer tools to automate local apps when you request it.',
       NSBluetoothAlwaysUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
+        'Botmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
       NSBluetoothPeripheralUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
+        'Botmux allows terminal-launched developer tools to access Bluetooth devices when you request it.',
       NSCameraUsageDescription: "Application requests access to the device's camera.",
       NSLocationUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to access location when you request it.',
+        'Botmux allows terminal-launched developer tools to access location when you request it.',
       NSLocalNetworkUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to discover and connect to local development servers when you request it.',
+        'Botmux allows terminal-launched developer tools to discover and connect to local development servers when you request it.',
       NSMicrophoneUsageDescription: "Application requests access to the device's microphone.",
       NSAudioCaptureUsageDescription:
-        'OrcaBotmux allows terminal-launched developer tools to capture desktop audio when you request it.',
+        'Botmux allows terminal-launched developer tools to capture desktop audio when you request it.',
       NSBonjourServices: ['_http._tcp', '_https._tcp'],
       NSDocumentsFolderUsageDescription:
         "Application requests access to the user's Documents folder.",
@@ -269,8 +269,8 @@ module.exports = {
       ...createPackagedRuntimeNodeModuleResources('darwin'),
       macSpeechNativeResource,
       {
-        from: 'resources/darwin/bin/orca_botmux',
-        to: 'bin/orca_botmux'
+        from: 'resources/darwin/bin/botmux',
+        to: 'bin/botmux'
       },
       {
         from: 'node_modules/agent-browser/bin/agent-browser-darwin-${arch}',
@@ -283,8 +283,8 @@ module.exports = {
         to: 'serve-sim'
       },
       {
-        from: 'native/computer-use-macos/.build/release/OrcaBotmux Computer Use.app',
-        to: 'OrcaBotmux Computer Use.app'
+        from: 'native/computer-use-macos/.build/release/Botmux Computer Use.app',
+        to: 'Botmux Computer Use.app'
       },
       featureWallResources
     ],
@@ -293,8 +293,8 @@ module.exports = {
     // is nil) for executables launched out of Contents/Resources (#7929).
     extraFiles: [
       {
-        from: 'native/notification-status-macos/.build/release/orca-botmux-notification-status',
-        to: 'MacOS/orca-botmux-notification-status'
+        from: 'native/notification-status-macos/.build/release/botmux-notification-status',
+        to: 'MacOS/botmux-notification-status'
       }
     ],
     target: [
@@ -312,25 +312,25 @@ module.exports = {
   // silently downgrading to ad-hoc artifacts that look shippable in CI logs.
   forceCodeSigning: isMacRelease,
   dmg: {
-    artifactName: 'orca-botmux-macos-${arch}.${ext}'
+    artifactName: 'botmux-macos-${arch}.${ext}'
   },
-  // Why: deep-link pairing QR uses orca_botmux://pair (orca_botmux:// still decoded for legacy).
+  // Why: deep-link pairing QR uses botmux://pair (botmux:// still decoded for legacy).
   protocols: [
     {
-      name: 'OrcaBotmux Pairing',
-      schemes: ['orca_botmux']
+      name: 'Botmux Pairing',
+      schemes: ['botmux']
     }
   ],
   linux: {
-    // Why: avoid colliding with GNOME OrcaBotmux accessibility package on Ubuntu.
-    executableName: 'orca_botmux',
+    // Why: Linux package/command name is botmux-ide (packaging continuity).
+    executableName: 'botmux',
     // Why: the icns source lets electron-builder emit standard hicolor PNG
     // sizes; a single 1024px PNG is ignored by some Linux docks/launchers.
     icon: 'resources/build/icon.icns',
     desktop: {
       entry: {
         // Why: keep a stable WM_CLASS for dock grouping after rebrand.
-        StartupWMClass: 'orca_botmux'
+        StartupWMClass: 'botmux'
       }
     },
     extraResources: [
@@ -338,8 +338,8 @@ module.exports = {
       ...createPackagedRuntimeNodeModuleResources('linux'),
       linuxSpeechNativeResource,
       {
-        from: 'resources/linux/bin/orca-botmux-ide',
-        to: 'bin/orca-botmux-ide'
+        from: 'resources/linux/bin/botmux-ide',
+        to: 'bin/botmux-ide'
       },
       {
         from: 'node_modules/agent-browser/bin/agent-browser-linux-${arch}',
@@ -356,12 +356,12 @@ module.exports = {
     category: 'Utility'
   },
   appImage: {
-    artifactName: isLinuxArm64Release ? 'orca-botmux-linux-arm64.${ext}' : 'orca-botmux-linux.${ext}'
+    artifactName: isLinuxArm64Release ? 'botmux-linux-arm64.${ext}' : 'botmux-linux.${ext}'
   },
   deb: {
-    packageName: 'orca-botmux-ide',
-    artifactName: 'orca-botmux-ide_${version}_${arch}.${ext}',
-    // Why: xvfb lets the bundled `orca-botmux-desktop serve` CLI run browser panes on a headless
+    packageName: 'botmux-ide',
+    artifactName: 'botmux-ide_${version}_${arch}.${ext}',
+    // Why: xvfb lets the bundled `botmux-desktop serve` CLI run browser panes on a headless
     // Linux host — Chromium needs a display server even for offscreen rendering,
     // and serve starts Xvfb itself when present (see ensure-virtual-display.ts).
     depends: [
@@ -373,7 +373,7 @@ module.exports = {
       'xclip',
       'xvfb'
     ],
-    // Why: symlink the bundled CLI onto PATH at install time so `orca-botmux-ide serve`
+    // Why: symlink the bundled CLI onto PATH at install time so `botmux-ide serve`
     // works on a headless host. The in-app CLI registration (CliInstaller) is
     // GUI-triggered and can never run on a server, so without this the CLI is
     // unreachable from the shell on exactly the hosts that need it.
@@ -381,8 +381,8 @@ module.exports = {
     afterRemove: 'resources/linux/packaging/after-remove.sh'
   },
   rpm: {
-    packageName: 'orca-botmux-ide',
-    artifactName: 'orca-botmux-ide-${version}.${arch}.${ext}',
+    packageName: 'botmux-ide',
+    artifactName: 'botmux-ide-${version}.${arch}.${ext}',
     // Why: see deb depends. RPM distros ship Xvfb as xorg-x11-server-Xvfb (there
     // is no `xvfb` package), so the name differs from the deb here.
     depends: [
@@ -402,13 +402,13 @@ module.exports = {
   // (node-pty) for each target architecture when producing dual-arch macOS
   // builds (x64 + arm64). With npmRebuild disabled, CI on an arm64 runner
   // packages arm64 binaries into the x64 DMG, causing "posix_spawnp failed"
-  // on Intel Macs. The beforeBuild hook performs OrcaBotmux's targeted rebuild and
+  // on Intel Macs. The beforeBuild hook performs Botmux's targeted rebuild and
   // returns false so electron-builder does not rebuild optional cpu-features.
   npmRebuild: true,
   publish: {
     provider: 'github',
     owner: 'stablyai',
-    repo: 'orca_botmux',
+    repo: 'botmux',
     releaseType: 'release'
   }
 }
@@ -417,7 +417,7 @@ function chmodUnixCliLaunchers(resourcesDir, electronPlatformName) {
   if (electronPlatformName === 'win32') {
     return
   }
-  for (const launcherName of ['orca_botmux', 'orca-botmux-ide']) {
+  for (const launcherName of ['botmux', 'botmux-ide']) {
     const launcherPath = join(resourcesDir, 'bin', launcherName)
     if (!existsSync(launcherPath)) {
       continue
@@ -448,7 +448,7 @@ function chmodMacServeSimHelpers(resourcesDir, electronPlatformName) {
 async function signMacComputerUseHelper(helperAppPath, packager) {
   if (!existsSync(helperAppPath)) {
     if (isMacRelease) {
-      throw new Error(`Missing OrcaBotmux Computer Use helper app at ${helperAppPath}`)
+      throw new Error(`Missing Botmux Computer Use helper app at ${helperAppPath}`)
     }
     return
   }
@@ -457,15 +457,15 @@ async function signMacComputerUseHelper(helperAppPath, packager) {
       ? await packager.codeSigningInfo.value
       : null
   const identity =
-    process.env.ORCA_COMPUTER_MACOS_SIGN_IDENTITY ??
+    process.env.BOTMUX_COMPUTER_MACOS_SIGN_IDENTITY ??
     process.env.CSC_NAME ??
     findInstalledMacSigningIdentity(codeSigningInfo?.keychainFile) ??
     (isMacRelease ? null : '-')
   if (!identity) {
-    throw new Error('Missing signing identity for OrcaBotmux Computer Use helper app')
+    throw new Error('Missing signing identity for Botmux Computer Use helper app')
   }
   // Why: TCC grants attach to this nested app's code identity. Sign it before
-  // the outer OrcaBotmux.app is sealed so production builds preserve that identity.
+  // the outer Botmux.app is sealed so production builds preserve that identity.
   execFileSync('codesign', codesignArgs(identity, helperAppPath), { stdio: 'inherit' })
   execFileSync('codesign', ['--verify', '--deep', '--strict', helperAppPath], {
     stdio: 'inherit'
@@ -475,7 +475,7 @@ async function signMacComputerUseHelper(helperAppPath, packager) {
 async function signMacNotificationStatusHelper(helperPath, packager) {
   if (!existsSync(helperPath)) {
     if (isMacRelease) {
-      throw new Error(`Missing orca-botmux-notification-status helper at ${helperPath}`)
+      throw new Error(`Missing botmux-notification-status helper at ${helperPath}`)
     }
     return
   }
@@ -488,12 +488,12 @@ async function signMacNotificationStatusHelper(helperPath, packager) {
     findInstalledMacSigningIdentity(codeSigningInfo?.keychainFile) ??
     (isMacRelease ? null : '-')
   if (!identity) {
-    throw new Error('Missing signing identity for orca-botmux-notification-status helper')
+    throw new Error('Missing signing identity for botmux-notification-status helper')
   }
   // Why: macOS keys notification records to the code-signing identifier; the
   // binary embeds the app's CFBundleIdentifier in __TEXT,__info_plist so this
   // (and any later) `codesign --force` derives the correct identifier. Sign
-  // before the outer OrcaBotmux.app is sealed, like the computer-use helper.
+  // before the outer Botmux.app is sealed, like the computer-use helper.
   const args = ['--force', '--sign', identity]
   if (isMacRelease) {
     args.push('--options', 'runtime', '--timestamp')

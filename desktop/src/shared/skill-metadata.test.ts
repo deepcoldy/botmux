@@ -4,18 +4,18 @@ import { summarizeSkillMarkdown } from './skill-metadata'
 describe('summarizeSkillMarkdown', () => {
   it('reads name and folded description from YAML frontmatter', () => {
     const summary = summarizeSkillMarkdown(`---
-name: orca-botmux-cli
+name: botmux-cli
 description: >-
-  Use the orca_botmux CLI to drive a running editor;
+  Use the botmux CLI to drive a running editor;
   keep worktree comments current.
 ---
 
-# OrcaBotmux CLI
+# Botmux CLI
 `)
 
     expect(summary).toEqual({
-      name: 'orca-botmux-cli',
-      description: 'Use the orca_botmux CLI to drive a running editor; keep worktree comments current.'
+      name: 'botmux-cli',
+      description: 'Use the botmux CLI to drive a running editor; keep worktree comments current.'
     })
   })
 

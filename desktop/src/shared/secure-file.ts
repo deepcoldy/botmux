@@ -39,7 +39,7 @@ const hardenedPathsThisProcess = new Map<string, HardenedPathCacheEntry>()
 //
 // Known limitation: because this is a process-lifetime path cache, a directory that is deleted
 // and recreated during the same process will NOT be re-hardened. The secure dirs we own
-// (.orca_botmux runtime/auth/device stores) are not deleted at runtime, so this is acceptable; the
+// (.botmux runtime/auth/device stores) are not deleted at runtime, so this is acceptable; the
 // next process restart re-hardens. Do not rely on this cache if a path's lifecycle changes.
 const hardenedDirectoryPathsThisProcess = new Set<string>()
 
@@ -265,7 +265,7 @@ function bestEffortRestrictWindowsPath(targetPath: string, isDirectory: boolean)
     },
     () => {
       // Why: errors are intentionally ignored — credential-file hardening should not
-      // prevent OrcaBotmux from starting on Windows machines where PowerShell ACL APIs are
+      // prevent Botmux from starting on Windows machines where PowerShell ACL APIs are
       // unavailable or locked down.
     }
   )

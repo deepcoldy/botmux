@@ -46,7 +46,7 @@ export function resolveZoomTarget(args: {
   if (activeTabType === 'simulator') {
     return 'simulator'
   }
-  // Why: keyboard/menu zoom in an active browser tab belongs to OrcaBotmux chrome.
+  // Why: keyboard/menu zoom in an active browser tab belongs to Botmux chrome.
   // Browser page zoom has a dedicated route for wheel and page-specific IPC.
   if (activeTabType === 'browser') {
     return 'ui'

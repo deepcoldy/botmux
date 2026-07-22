@@ -6,10 +6,10 @@ import { posix } from 'node:path'
 // a stale .bash_profile on a zsh user would clobber the real .zshrc value.
 const ZSH_ENV_FILE = '.zshenv'
 const ZSH_AFTER_ENV_FILES = ['.zprofile', '.zshrc', '.zlogin']
-// Why: OrcaBotmux launches bash as a login shell (see local-pty-shell-ready.ts
+// Why: Botmux launches bash as a login shell (see local-pty-shell-ready.ts
 // getBashShellReadyRcfileContent and daemon/shell-ready.ts) which sources
 // .bash_profile / .bash_login / .profile but intentionally does NOT force
-// .bashrc. Scanning .bashrc would mirror values the live OrcaBotmux bash never sees.
+// .bashrc. Scanning .bashrc would mirror values the live Botmux bash never sees.
 const BASH_LOGIN_FILES = ['.bash_profile', '.bash_login', '.profile']
 
 function parseExportedValue(content: string, name: string, home: string): string | undefined {
@@ -50,7 +50,7 @@ function readStartupFile(path: string): string | null {
 
 function shellStartupFilePaths(home: string, shell: string | undefined): readonly string[] {
   if (!shell) {
-    // Why: OrcaBotmux's POSIX default shell is /bin/zsh when $SHELL is unset.
+    // Why: Botmux's POSIX default shell is /bin/zsh when $SHELL is unset.
     return zshStartupFilePaths(home)
   }
 
@@ -62,7 +62,7 @@ function shellStartupFilePaths(home: string, shell: string | undefined): readonl
     return BASH_LOGIN_FILES.map((file) => posix.join(home, file))
   }
   // Why: unsupported explicit shells (fish, nushell, custom wrappers) do not
-  // use OrcaBotmux's zsh/bash shell-ready startup files, so scanning those files
+  // use Botmux's zsh/bash shell-ready startup files, so scanning those files
   // would mirror values the live PTY shell never sees.
   return []
 }
@@ -127,7 +127,7 @@ const cache = new Map<string, string | undefined>()
  * Best-effort static read of a single env-var assignment from the user's
  * POSIX shell startup files.
  *
- * Why: GUI-launched OrcaBotmux does not inherit interactive shell exports, but the
+ * Why: GUI-launched Botmux does not inherit interactive shell exports, but the
  * PTY's startup file will later re-export them and override our overlay. By
  * peeking at the assignment up-front we can preserve the user's source value
  * before installing the overlay.

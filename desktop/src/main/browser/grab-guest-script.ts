@@ -10,7 +10,7 @@ build step that adds complexity without improving auditability. */
 // ephemeral: it installs on arm, resolves once on finalize, and fully removes
 // itself on teardown.
 //
-// Why a string builder rather than a bundled file: OrcaBotmux's browser guests have
+// Why a string builder rather than a bundled file: Botmux's browser guests have
 // no preload and no Node access. The injected code must be a plain JS string
 // that runs in the page's own world. Keeping it as a template here lets main
 // version it alongside the rest of the grab lifecycle.
@@ -44,22 +44,22 @@ export function buildGuestOverlayScript(action: GuestScriptAction): string {
 
 // ---------------------------------------------------------------------------
 // The arm script installs the overlay container and hover tracking.
-// It stores state on window.__orcaGrab so finalize/teardown can access it.
+// It stores state on window.__botmuxGrab so finalize/teardown can access it.
 // ---------------------------------------------------------------------------
 const ARM_SCRIPT = `(function() {
   'use strict';
 
   // Why: always tear down any pre-existing state before arming. A malicious
-  // guest page could predefine window.__orcaGrab with a fake extractPayload
+  // guest page could predefine window.__botmuxGrab with a fake extractPayload
   // function. By tearing down unconditionally we ensure our freshly installed
   // extraction logic is the only code that runs.
-  if (window.__orcaGrab) {
+  if (window.__botmuxGrab) {
     try {
-      if (typeof window.__orcaGrab.cleanup === 'function') {
-        window.__orcaGrab.cleanup();
+      if (typeof window.__botmuxGrab.cleanup === 'function') {
+        window.__botmuxGrab.cleanup();
       }
     } catch(e) {}
-    delete window.__orcaGrab;
+    delete window.__botmuxGrab;
   }
 
   // --- Budget constants (mirrored from shared types) ---
@@ -739,7 +739,7 @@ const ARM_SCRIPT = `(function() {
   // selection click. The overlay uses elementFromPoint (with itself temporarily
   // hidden) to identify the element underneath the pointer.
   var host = document.createElement('div');
-  host.id = '__orca-grab-host';
+  host.id = '__botmux-grab-host';
   host.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:2147483647;pointer-events:all;cursor:crosshair;';
   document.documentElement.appendChild(host);
 
@@ -816,7 +816,7 @@ const ARM_SCRIPT = `(function() {
   host.addEventListener('mousemove', onPointerMove);
 
   // Store state for awaitClick/finalize/teardown access
-  window.__orcaGrab = {
+  window.__botmuxGrab = {
     host: host,
     extractPayload: extractPayload,
     getCurrentElement: function() { return currentEl; },
@@ -832,7 +832,7 @@ const ARM_SCRIPT = `(function() {
     cleanup: function() {
       host.removeEventListener('mousemove', onPointerMove);
       try { host.remove(); } catch(e) {}
-      delete window.__orcaGrab;
+      delete window.__botmuxGrab;
     }
   };
 
@@ -846,7 +846,7 @@ const ARM_SCRIPT = `(function() {
 // ---------------------------------------------------------------------------
 const AWAIT_CLICK_SCRIPT = `new Promise(function(resolve, reject) {
   'use strict';
-  var grab = window.__orcaGrab;
+  var grab = window.__botmuxGrab;
   if (!grab) {
     reject(new Error('Grab not armed'));
     return;
@@ -902,7 +902,7 @@ const AWAIT_CLICK_SCRIPT = `new Promise(function(resolve, reject) {
     var payload = extractSelectedPayload(el);
     if (!payload) return;
     grab.freezeHighlight();
-    resolve({ __orcaContextMenu: true, payload: payload });
+    resolve({ __botmuxContextMenu: true, payload: payload });
   }
 
   grab.host.addEventListener('click', onClick, true);
@@ -915,7 +915,7 @@ const AWAIT_CLICK_SCRIPT = `new Promise(function(resolve, reject) {
     grab.cleanup();
     // Why: teardown cancellation is a normal user flow; resolving a marker
     // avoids a noisy guest-console Error while main still treats it as cancel.
-    resolve({ __orcaCancelled: true });
+    resolve({ __botmuxCancelled: true });
   };
 })`
 
@@ -924,7 +924,7 @@ const AWAIT_CLICK_SCRIPT = `new Promise(function(resolve, reject) {
 // ---------------------------------------------------------------------------
 const FINALIZE_SCRIPT = `(function() {
   'use strict';
-  var grab = window.__orcaGrab;
+  var grab = window.__botmuxGrab;
   if (!grab) return null;
   var el = grab.getCurrentElement();
   if (!el) return null;
@@ -947,7 +947,7 @@ const FINALIZE_SCRIPT = `(function() {
 // ---------------------------------------------------------------------------
 const EXTRACT_HOVER_SCRIPT = `(function() {
   'use strict';
-  var grab = window.__orcaGrab;
+  var grab = window.__botmuxGrab;
   if (!grab) return null;
   var el = grab.getCurrentElement();
   if (!el) return null;
@@ -963,7 +963,7 @@ const EXTRACT_HOVER_SCRIPT = `(function() {
 // ---------------------------------------------------------------------------
 const TEARDOWN_SCRIPT = `(function() {
   'use strict';
-  var grab = window.__orcaGrab;
+  var grab = window.__botmuxGrab;
   if (!grab) return true;
   // If there's an active awaitClick Promise, cancel it so the
   // executeJavaScript call in main rejects and settles the grab op.

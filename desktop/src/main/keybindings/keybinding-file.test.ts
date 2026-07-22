@@ -16,7 +16,7 @@ describe('keybinding-file', () => {
   let filePath: string
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'orca-botmux-keybindings-'))
+    dir = mkdtempSync(join(tmpdir(), 'botmux-keybindings-'))
     filePath = join(dir, 'keybindings.json')
   })
 
@@ -24,9 +24,9 @@ describe('keybinding-file', () => {
     rmSync(dir, { recursive: true, force: true })
   })
 
-  it('resolves the user-facing keybindings path under ~/.orca_botmux', () => {
+  it('resolves the user-facing keybindings path under ~/.botmux', () => {
     expect(getUserKeybindingsPath('/home/test')).toBe(
-      join('/home/test', '.orca_botmux', 'keybindings.json')
+      join('/home/test', '.botmux', 'keybindings.json')
     )
   })
 

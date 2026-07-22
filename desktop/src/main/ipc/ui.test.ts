@@ -57,7 +57,7 @@ function makeUIEvent(senderOverrides: Record<string, unknown> = {}): {
     sender: {
       id: 17,
       getType: () => 'window',
-      getURL: () => 'file:///orca_botmux/index.html',
+      getURL: () => 'file:///botmux/index.html',
       isDestroyed: () => false,
       ...senderOverrides
     }
@@ -260,7 +260,7 @@ describe('UI IPC', () => {
     fromWebContentsMock.mockClear()
     paste.mockClear()
     nativePasteHandler?.(makeUIEvent({ getURL: () => 'http://127.0.0.1:5173/workspace' }))
-    nativePasteHandler?.(makeUIEvent({ getURL: () => 'file:///orca_botmux/index.html' }))
+    nativePasteHandler?.(makeUIEvent({ getURL: () => 'file:///botmux/index.html' }))
     nativePasteHandler?.(makeUIEvent({ getURL: () => 'not a url' }))
 
     expect(fromWebContentsMock).not.toHaveBeenCalled()

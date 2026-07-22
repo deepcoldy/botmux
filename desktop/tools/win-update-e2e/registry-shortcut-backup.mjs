@@ -20,7 +20,7 @@ const UNINSTALL_ROOT = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Unin
 const APP_ROOT = 'HKCU\\Software'
 
 /**
- * Read-only discovery of the machine's current OrcaBotmux install registry state.
+ * Read-only discovery of the machine's current Botmux install registry state.
  * The uninstall entry is found by DisplayName (electron-builder writes the app
  * GUID as the key name, not a fixed string); the app key that carries
  * InstallLocation is found under HKCU\Software by its ShortcutName/InstallLocation.
@@ -33,14 +33,14 @@ export function discoverInstallRegistryState() {
     `$uninstallName = $null; $displayName = $null; $displayVersion = $null`,
     `foreach ($k in @(Get-ChildItem $un -ErrorAction SilentlyContinue)) {`,
     `  $dn = $k.GetValue('DisplayName'); $il = $k.GetValue('InstallLocation')`,
-    `  if ($dn -eq 'orca_botmux' -or ($il -and $il -match '\\\\Programs\\\\orca_botmux')) {`,
+    `  if ($dn -eq 'botmux' -or ($il -and $il -match '\\\\Programs\\\\botmux')) {`,
     `    $uninstallName = $k.PSChildName; $displayName = $dn; $displayVersion = $k.GetValue('DisplayVersion')`,
     `  }`,
     `}`,
     `$appName = $null; $installLocation = $null`,
     `foreach ($k in @(Get-ChildItem 'HKCU:\\Software' -ErrorAction SilentlyContinue)) {`,
     `  $il = $k.GetValue('InstallLocation'); $sn = $k.GetValue('ShortcutName')`,
-    `  if ($il -and ($sn -eq 'orca_botmux' -or $il -match 'orca_botmux')) {`,
+    `  if ($il -and ($sn -eq 'botmux' -or $il -match 'botmux')) {`,
     `    $appName = $k.PSChildName; $installLocation = $il`,
     `  }`,
     `}`,
@@ -62,7 +62,7 @@ export function discoverInstallRegistryState() {
   }
 }
 
-/** The two directories NSIS writes OrcaBotmux shortcuts into: Start Menu + Desktop. */
+/** The two directories NSIS writes Botmux shortcuts into: Start Menu + Desktop. */
 export function shortcutDirs() {
   const appData =
     process.env.APPDATA ?? path.join(process.env.USERPROFILE ?? '', 'AppData', 'Roaming')
@@ -81,16 +81,16 @@ function resolveDesktopDir() {
   return path.join(process.env.USERPROFILE ?? '', 'Desktop')
 }
 
-/** Read-only: list OrcaBotmux *.lnk shortcuts under the given dirs (recursive). */
-export function discoverOrcaShortcuts(dirs = shortcutDirs()) {
+/** Read-only: list Botmux *.lnk shortcuts under the given dirs (recursive). */
+export function discoverBotmuxShortcuts(dirs = shortcutDirs()) {
   const found = []
   for (const dir of dirs) {
-    collectOrcaLnks(dir, found)
+    collectBotmuxLnks(dir, found)
   }
   return found
 }
 
-function collectOrcaLnks(dir, out) {
+function collectBotmuxLnks(dir, out) {
   if (!existsSync(dir)) {
     return
   }
@@ -103,15 +103,15 @@ function collectOrcaLnks(dir, out) {
   for (const entry of entries) {
     const full = path.join(dir, entry.name)
     if (entry.isDirectory()) {
-      collectOrcaLnks(full, out)
-    } else if (entry.isFile() && /\.lnk$/i.test(entry.name) && /orca_botmux/i.test(entry.name)) {
+      collectBotmuxLnks(full, out)
+    } else if (entry.isFile() && /\.lnk$/i.test(entry.name) && /botmux/i.test(entry.name)) {
       out.push(full)
     }
   }
 }
 
 /**
- * Snapshot the shared install registry keys + OrcaBotmux shortcuts before an isolated
+ * Snapshot the shared install registry keys + Botmux shortcuts before an isolated
  * install writes over them. `reg export`s each existing key and copies each
  * existing shortcut into runDir, recording a manifest of what pre-existed (and
  * the pre-run InstallLocation) so restore knows what to put back vs. delete.
@@ -142,7 +142,7 @@ export function backupInstallState(runDir) {
     }
   }
   let i = 0
-  for (const lnk of discoverOrcaShortcuts(dirs)) {
+  for (const lnk of discoverBotmuxShortcuts(dirs)) {
     const backup = path.join(backupDir, `shortcut-${i}-${path.basename(lnk)}`)
     try {
       copyFileSync(lnk, backup)
@@ -160,7 +160,7 @@ export function backupInstallState(runDir) {
  * Restore the shared install state captured by backupInstallState. Keys that
  * pre-existed are `reg import`ed back to their original values; keys that did NOT
  * pre-exist but exist now (created by the test install) are `reg delete`d.
- * Pre-existing shortcuts are copied back; test-created OrcaBotmux shortcuts are removed.
+ * Pre-existing shortcuts are copied back; test-created Botmux shortcuts are removed.
  * Finally re-reads InstallLocation and, on mismatch, prints a LOUD block with the
  * exact manual `reg import` command to recover.
  */
@@ -229,7 +229,7 @@ function restoreShortcuts(manifest, result) {
       }
     }
   }
-  for (const lnk of discoverOrcaShortcuts(manifest.shortcutDirs)) {
+  for (const lnk of discoverBotmuxShortcuts(manifest.shortcutDirs)) {
     if (!preExisting.has(lnk.toLowerCase())) {
       try {
         rmSync(lnk, { force: true })
@@ -256,8 +256,8 @@ function printMismatchWarning(manifest, expected, actual) {
   console.error('!! WIN-UPDATE-E2E: REGISTRY RESTORE VERIFICATION FAILED')
   console.error(`!! Expected InstallLocation: ${expected ?? '(none / no pre-existing install)'}`)
   console.error(`!! Actual   InstallLocation: ${actual ?? '(none)'}`)
-  console.error('!! Your REAL OrcaBotmux install pointer may be hijacked to the test directory.')
-  console.error('!! The next real OrcaBotmux update could install into the test location.')
+  console.error('!! Your REAL Botmux install pointer may be hijacked to the test directory.')
+  console.error('!! The next real Botmux update could install into the test location.')
   console.error('!! Recover manually by running these command(s) in an elevated-free shell:')
   for (const cmd of recovery) {
     console.error(`!!   ${cmd}`)
@@ -307,6 +307,6 @@ function regDelete(keyPath) {
 if (process.argv[1] && path.resolve(process.argv[1]) === import.meta.filename) {
   console.log('[registry-shortcut-backup] discovered install registry state:')
   console.log(JSON.stringify(discoverInstallRegistryState(), null, 2))
-  console.log('[registry-shortcut-backup] OrcaBotmux shortcuts that would be backed up:')
-  console.log(JSON.stringify(discoverOrcaShortcuts(), null, 2))
+  console.log('[registry-shortcut-backup] Botmux shortcuts that would be backed up:')
+  console.log(JSON.stringify(discoverBotmuxShortcuts(), null, 2))
 }

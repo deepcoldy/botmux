@@ -227,7 +227,7 @@ describe('RelayDispatcher', () => {
     const cliId = dispatcher.attachClient(() => {})
 
     const pending = dispatcher.requestAnyClient(
-      'orca_botmux.cli',
+      'botmux.cli',
       { argv: ['status'] },
       { excludeClientId: cliId }
     )
@@ -235,7 +235,7 @@ describe('RelayDispatcher', () => {
     expect(ownerWritten).toHaveLength(1)
     const requestFrame = decodeFirstFrame(ownerWritten[0])
     const request = JSON.parse(requestFrame.payload.toString('utf-8')) as JsonRpcRequest
-    expect(request.method).toBe('orca_botmux.cli')
+    expect(request.method).toBe('botmux.cli')
     expect(request.params).toEqual({ argv: ['status'] })
 
     dispatcher.feedClient(
@@ -254,7 +254,7 @@ describe('RelayDispatcher', () => {
     const cliId = dispatcher.attachClient(() => {})
 
     const pending = dispatcher.requestAnyClient(
-      'orca_botmux.cli',
+      'botmux.cli',
       { argv: ['status'] },
       { excludeClientId: cliId }
     )
@@ -263,7 +263,7 @@ describe('RelayDispatcher', () => {
     expect(ownerWritten).toHaveLength(1)
     const requestFrame = decodeFirstFrame(ownerWritten[0])
     const request = JSON.parse(requestFrame.payload.toString('utf-8')) as JsonRpcRequest
-    expect(request.method).toBe('orca_botmux.cli')
+    expect(request.method).toBe('botmux.cli')
 
     dispatcher.feedClient(
       ownerId,
@@ -416,7 +416,7 @@ describe('RelayDispatcher', () => {
   it('detaches the primary client when its write throws (frame lost, trigger reconnect)', () => {
     // Regression: a primary-client write throw dropped the frame (possibly
     // pty.data/pty.exit) with no resend AND without notifying detach, so the
-    // owning OrcaBotmux's reconnect + PTY-reattach path never engaged until the ~20s
+    // owning Botmux's reconnect + PTY-reattach path never engaged until the ~20s
     // keepalive timeout — output/pane-death were silently lost in the meantime.
     let throwOnWrite = false
     const detachDispatcher = new RelayDispatcher((data) => {
@@ -429,7 +429,7 @@ describe('RelayDispatcher', () => {
       const detachListener = vi.fn()
       detachDispatcher.onClientDetached(detachListener)
 
-      // A frame the owning OrcaBotmux must not silently miss (e.g. a pane exit).
+      // A frame the owning Botmux must not silently miss (e.g. a pane exit).
       throwOnWrite = true
       detachDispatcher.notify('pty.exit', { id: 'pty-1', code: 0 })
 

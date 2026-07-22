@@ -13,14 +13,14 @@ export function getSystemNotificationSettingsCopy(
   if (platform === 'darwin') {
     return {
       failureTitle: 'macOS did not show the notification',
-      failureDescription: 'Enable Allow notifications for OrcaBotmux in System Settings.'
+      failureDescription: 'Enable Allow notifications for Botmux in System Settings.'
     }
   }
 
   if (platform === 'win32') {
     return {
       failureTitle: 'Windows did not show the notification',
-      failureDescription: 'Enable notifications for OrcaBotmux in Windows Settings.'
+      failureDescription: 'Enable notifications for Botmux in Windows Settings.'
     }
   }
 
@@ -109,7 +109,7 @@ export async function sendNotificationSettingsTestNotification(
         {
           description: translate(
             'auto.components.settings.NotificationsPane.115437bc35',
-            'If no macOS banner appeared, enable Allow notifications for OrcaBotmux.'
+            'If no macOS banner appeared, enable Allow notifications for Botmux.'
           ),
           action: {
             label: translate(
@@ -157,7 +157,7 @@ export async function sendNotificationSettingsTestNotification(
         {
           description: translate(
             'auto.components.settings.NotificationsPane.4676a95bc3',
-            'Check your desktop notification settings for OrcaBotmux.'
+            'Check your desktop notification settings for Botmux.'
           )
         }
       )

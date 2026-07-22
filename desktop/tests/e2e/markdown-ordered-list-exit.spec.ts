@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   assertLoadedThirdEmptyOrderedListItem,
@@ -60,14 +60,14 @@ const rows: MatrixRow[] = [
 ]
 
 test.describe('Markdown ordered-list exit regression', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   for (const row of rows) {
-    test(row.name, async ({ orcaBotmuxPage }, testInfo) => {
-      const context = await getActiveWorktreeContext(orcaBotmuxPage)
+    test(row.name, async ({ botmuxPage }, testInfo) => {
+      const context = await getActiveWorktreeContext(botmuxPage)
       let filePath: string | null = null
 
       try {
@@ -77,13 +77,13 @@ test.describe('Markdown ordered-list exit regression', () => {
           testInfo.workerIndex,
           row.initialMarkdown
         )
-        const activeFile = await openMarkdownFixture(orcaBotmuxPage, context, filePath)
+        const activeFile = await openMarkdownFixture(botmuxPage, context, filePath)
         const draftKey = activeFile.filePath
 
-        await row.run(orcaBotmuxPage, row.sentinel)
+        await row.run(botmuxPage, row.sentinel)
 
-        await expectSentinelParagraphOutsideOrderedList(orcaBotmuxPage, row.sentinel)
-        await expectSerializedDraftOutsideOrderedList(orcaBotmuxPage, draftKey, row.sentinel)
+        await expectSentinelParagraphOutsideOrderedList(botmuxPage, row.sentinel)
+        await expectSerializedDraftOutsideOrderedList(botmuxPage, draftKey, row.sentinel)
       } finally {
         await cleanupMarkdownFixture(filePath)
       }

@@ -14,7 +14,7 @@ function gitLiteralPathspec(filePath: string): string {
 }
 
 async function createRepoWithGlobNamedFiles(): Promise<string> {
-  const repo = await mkdtemp(path.join(tmpdir(), 'orca-botmux-status-pathspec-'))
+  const repo = await mkdtemp(path.join(tmpdir(), 'botmux-status-pathspec-'))
   tempRoots.push(repo)
   execFileSync('git', ['init', '-q'], { cwd: repo })
   execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repo })

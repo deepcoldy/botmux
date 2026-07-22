@@ -11,13 +11,15 @@ import {
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router'
 import { SafeAreaView } from 'react-native-safe-area-context'
 import { BellRing } from 'lucide-react-native'
-import { OrcaLogo } from '../src/components/OrcaLogo'
+import { BotmuxLogo } from '../src/components/BotmuxLogo'
 import { ensureNotificationPermissions } from '../src/notifications/mobile-notifications'
 import { savePushNotificationsEnabled } from '../src/storage/preferences'
 import { colors, radii, spacing, typography } from '../src/theme/mobile-theme'
+import { useMobileI18n } from '../src/i18n/mobile-i18n'
 
 export default function NotificationOptInScreen() {
   const router = useRouter()
+  const { t } = useMobileI18n()
   const params = useLocalSearchParams<{ hostId?: string | string[] }>()
   const hostId = Array.isArray(params.hostId) ? params.hostId[0] : params.hostId
   const [busyChoice, setBusyChoice] = useState<'enable' | 'skip' | null>(null)
@@ -48,29 +50,29 @@ export default function NotificationOptInScreen() {
         await savePushNotificationsEnabled(enabled)
         continueToApp()
       } catch {
-        setError('Notification settings could not be updated. Try again.')
+        setError(t('Notification settings could not be updated. Try again.'))
         setBusyChoice(null)
       }
     },
-    [busyChoice, continueToApp]
+    [busyChoice, continueToApp, t]
   )
 
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
         <View style={styles.brandRow}>
-          <OrcaLogo size={22} />
-          <Text style={styles.brandName}>Orca</Text>
+          <BotmuxLogo size={22} />
+          <Text style={styles.brandName}>Botmux</Text>
         </View>
 
         <View style={styles.content}>
           <View style={styles.iconSurface}>
             <BellRing size={30} color={colors.textPrimary} />
           </View>
-          <Text style={styles.eyebrow}>Notifications</Text>
-          <Text style={styles.title}>Stay updated while away</Text>
+          <Text style={styles.eyebrow}>{t('Notifications')}</Text>
+          <Text style={styles.title}>{t('Stay updated while away')}</Text>
           <Text style={styles.body}>
-            Get notified on this device when an agent needs your input or finishes a task.
+            {t('Get notified on this device when an agent needs your input or finishes a task.')}
           </Text>
         </View>
 
@@ -82,7 +84,7 @@ export default function NotificationOptInScreen() {
           ) : null}
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel="Enable agent notifications"
+            accessibilityLabel={t('Enable agent notifications')}
             disabled={busyChoice !== null}
             style={({ pressed }) => [
               styles.primaryButton,
@@ -94,7 +96,7 @@ export default function NotificationOptInScreen() {
             {busyChoice === 'enable' ? (
               <ActivityIndicator color={colors.bgBase} />
             ) : (
-              <Text style={styles.primaryButtonText}>Enable notifications</Text>
+              <Text style={styles.primaryButtonText}>{t('Enable notifications')}</Text>
             )}
           </Pressable>
           <Pressable
@@ -110,10 +112,10 @@ export default function NotificationOptInScreen() {
             {busyChoice === 'skip' ? (
               <ActivityIndicator color={colors.textSecondary} />
             ) : (
-              <Text style={styles.secondaryButtonText}>Not now</Text>
+              <Text style={styles.secondaryButtonText}>{t('Not now')}</Text>
             )}
           </Pressable>
-          <Text style={styles.footerNote}>You can change this any time in Settings.</Text>
+          <Text style={styles.footerNote}>{t('You can change this any time in Settings.')}</Text>
         </View>
       </ScrollView>
     </SafeAreaView>

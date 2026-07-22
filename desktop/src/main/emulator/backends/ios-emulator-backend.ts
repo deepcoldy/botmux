@@ -242,7 +242,7 @@ export class IosEmulatorBackend implements EmulatorBackend {
         )
       }
     }
-    // Why: serve-sim/CoreSimulator can surface Simulator.app while OrcaBotmux embeds the stream.
+    // Why: serve-sim/CoreSimulator can surface Simulator.app while Botmux embeds the stream.
     await hideNativeSimulatorApp().catch(() => {})
     return { ...info, streamCodec: 'mjpeg', backend: 'ios' }
   }

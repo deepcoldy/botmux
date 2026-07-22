@@ -58,7 +58,7 @@ function isRemoteTerminalGoneMessage(message: string): boolean {
 }
 
 /**
- * PTY transport backing a renderer terminal pane with a terminal on a remote OrcaBotmux
+ * PTY transport backing a renderer terminal pane with a terminal on a remote Botmux
  * runtime, over runtime RPC plus the multiplexed stream (create, subscribe, input,
  * resize, close, reattach).
  */

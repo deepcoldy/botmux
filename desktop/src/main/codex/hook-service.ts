@@ -48,7 +48,7 @@ import {
   type CodexHookTrustState,
   type CodexTrustEntry
 } from './config-toml-trust'
-import { getOrcaManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
+import { getBotmuxManagedCodexHomePath, getSystemCodexHomePath } from './codex-home-paths'
 import { syncSystemConfigIntoManagedCodexHome } from './codex-config-mirror'
 import {
   createCodexWslRuntimeHookInstallPlan,
@@ -70,7 +70,7 @@ import {
 // Why: PreToolUse/PostToolUse give the dashboard a live readout of the
 // in-flight tool (name + input preview) between UserPromptSubmit and Stop.
 // PermissionRequest is the human-input boundary: the managed script exits
-// without a decision so Codex still shows its normal approval UI, while OrcaBotmux
+// without a decision so Codex still shows its normal approval UI, while Botmux
 // can flip the pane to the red waiting state.
 const CODEX_EVENTS = [
   'SessionStart',
@@ -82,17 +82,17 @@ const CODEX_EVENTS = [
 ] as const
 
 function getConfigPath(): string {
-  return join(getOrcaManagedCodexHomePath(), 'hooks.json')
+  return join(getBotmuxManagedCodexHomePath(), 'hooks.json')
 }
 
 function writeCodexHooksJson(configPath: string, hooks: Record<string, HookDefinition[]>): void {
   // Why: Codex rejects unknown top-level hooks.json fields, so plugin manager
-  // bookkeeping such as `_managed` must not survive OrcaBotmux's rewrite.
+  // bookkeeping such as `_managed` must not survive Botmux's rewrite.
   writeHooksJson(configPath, { hooks })
 }
 
 function getCodexConfigTomlPath(): string {
-  return join(getOrcaManagedCodexHomePath(), 'config.toml')
+  return join(getBotmuxManagedCodexHomePath(), 'config.toml')
 }
 
 // Why: the managed-event subset of the shared PascalCase→label map; the
@@ -117,9 +117,11 @@ const CODEX_PLUGIN_ONLY_HOOK_PLACEHOLDERS = [
   '${PLUGIN_DATA}'
 ] as const
 
-const LEGACY_ORCA_PROFILE_NAME = 'orca-botmux-agent-status'
-const LEGACY_ORCA_PROFILE_BLOCK_START = '# BEGIN ORCA AGENT STATUS HOOKS'
-const LEGACY_ORCA_PROFILE_BLOCK_END = '# END ORCA AGENT STATUS HOOKS'
+// Why: managed Codex profile hooks live in ~/.codex/botmux-agent-status.config.toml
+// between these block markers so cleanup can remove only Botmux-owned content.
+const LEGACY_MANAGED_PROFILE_NAME = 'botmux-agent-status'
+const LEGACY_MANAGED_PROFILE_BLOCK_START = '# BEGIN BOTMUX AGENT STATUS HOOKS'
+const LEGACY_MANAGED_PROFILE_BLOCK_END = '# END BOTMUX AGENT STATUS HOOKS'
 
 type MirroredRuntimeUserHookTrustEntry = {
   entry: CodexTrustEntry
@@ -155,7 +157,7 @@ function getSystemCodexConfigTomlPath(): string {
 }
 
 function getLegacyCodexProfileTomlPath(): string {
-  return join(getSystemCodexHomePath(), `${LEGACY_ORCA_PROFILE_NAME}.config.toml`)
+  return join(getSystemCodexHomePath(), `${LEGACY_MANAGED_PROFILE_NAME}.config.toml`)
 }
 
 function collectManagedTrustEntries(
@@ -240,7 +242,7 @@ function commandUsesCodexPluginOnlyPlaceholder(command: string | undefined): boo
 }
 
 function removeCodexPluginEnvironmentCommands(definitions: HookDefinition[]): HookDefinition[] {
-  // Why: OrcaBotmux mirrors system hooks into a plain runtime hooks.json. Plugin
+  // Why: Botmux mirrors system hooks into a plain runtime hooks.json. Plugin
   // placeholders only work for Codex plugin hook sources, so copying those
   // commands here strips the environment they require and turns them into 127s.
   return removeManagedCommands(definitions, commandUsesCodexPluginOnlyPlaceholder)
@@ -282,9 +284,9 @@ function getRuntimeHooksWithSystemUserHooks(
       continue
     }
 
-    // Why: runtime hooks are derived from the user's system hooks plus OrcaBotmux's
+    // Why: runtime hooks are derived from the user's system hooks plus Botmux's
     // managed hooks. Reusing old runtime user-hook copies would keep deleted or
-    // edited ~/.codex/hooks.json entries alive for new OrcaBotmux-launched sessions.
+    // edited ~/.codex/hooks.json entries alive for new Botmux-launched sessions.
     nextHooks[eventName] = dedupeHookDefinitions(systemUserDefinitions)
   }
 
@@ -315,7 +317,7 @@ function getTrustedSystemUserHookSignatures(
     trustEntries = readHookTrustEntries(getSystemCodexConfigTomlPath())
   } catch (error) {
     // Why: a hand-broken system config.toml should only disable user-hook
-    // trust mirroring; OrcaBotmux's managed runtime hooks can still be installed.
+    // trust mirroring; Botmux's managed runtime hooks can still be installed.
     console.warn('[codex-hook-service] failed to read system hook trust entries', error)
     return signatures
   }
@@ -489,7 +491,7 @@ function buildHookTrustHeaderKeyPattern(key: string): string {
     const quoted = [`"${escapeRegex(escapeTomlString(variant))}"`]
     if (!variant.includes("'")) {
       // Why: tolerate raw-backslash literal keys left by Codex/manual approval
-      // while OrcaBotmux repairs mirrored runtime trust across both Windows variants.
+      // while Botmux repairs mirrored runtime trust across both Windows variants.
       quoted.push(`'${escapeRegex(variant)}'`)
     }
     return quoted
@@ -573,23 +575,24 @@ function cleanupLegacySystemManagedHooks(): void {
     }
   }
 
-  // Why: Codex hooks moved to OrcaBotmux's managed CODEX_HOME; old entries in
-  // ~/.codex would keep external Codex sessions reporting into OrcaBotmux.
+  // Why: Codex hooks moved to Botmux's managed CODEX_HOME; old entries in
+  // ~/.codex would keep external Codex sessions reporting into Botmux.
   if (removedManagedHook) {
-    // Why: this is the user's system hooks file, not OrcaBotmux's runtime copy.
-    // Remove only stale OrcaBotmux hook entries and preserve other managers' metadata.
+    // Why: this is the user's system hooks file, not Botmux's runtime copy.
+    // Remove only stale Botmux hook entries and preserve other managers' metadata.
     writeHooksJson(legacyConfigPath, { ...config, hooks: nextHooks })
   }
   removeMatchingTrustEntries(getSystemCodexConfigTomlPath(), trustEntries)
 }
 
 function stripLegacyManagedProfileBlock(content: string): string {
-  const start = content.indexOf(LEGACY_ORCA_PROFILE_BLOCK_START)
+  const start = content.indexOf(LEGACY_MANAGED_PROFILE_BLOCK_START)
   if (start === -1) {
     return content
   }
-  const endMarker = content.indexOf(LEGACY_ORCA_PROFILE_BLOCK_END, start)
-  const end = endMarker === -1 ? content.length : endMarker + LEGACY_ORCA_PROFILE_BLOCK_END.length
+  const endMarker = content.indexOf(LEGACY_MANAGED_PROFILE_BLOCK_END, start)
+  const end =
+    endMarker === -1 ? content.length : endMarker + LEGACY_MANAGED_PROFILE_BLOCK_END.length
   const before = content.slice(0, start).replace(/[ \t]*(?:\r?\n)*$/, '')
   const after = content.slice(end).replace(/^(?:\r?\n)+/, '')
   if (!before) {
@@ -612,8 +615,8 @@ function cleanupLegacyCodexProfileHooks(): void {
   if (next === existing) {
     return
   }
-  // Why: #2778 wrote OrcaBotmux hooks into a Codex profile file. Runtime CODEX_HOME
-  // supersedes that representation, so remove only OrcaBotmux's marked block.
+  // Why: #2778 wrote Botmux hooks into a Codex profile file. Runtime CODEX_HOME
+  // supersedes that representation, so remove only Botmux's marked block.
   if (next.trim().length === 0) {
     unlinkSync(profilePath)
   } else {
@@ -640,7 +643,7 @@ function removeRuntimeManagedHookTrustEntries(configPath: string): void {
       CODEX_EVENTS.map((event) => CODEX_EVENT_LABEL[event])
     )
     // Why: only drop entries WE wrote. The same config.toml can contain
-    // user-approved trust entries for non-OrcaBotmux commands, so match by hash
+    // user-approved trust entries for non-Botmux commands, so match by hash
     // equivalence to our managed command — a sourcePath-only filter would
     // wipe the user's manually-approved entries.
     const ourKeys: string[] = []
@@ -755,7 +758,7 @@ function removeStaleWslRuntimeManagedHookTrustEntries(
       continue
     }
     const runtimeHome = sourcePath.slice(0, -'/hooks.json'.length)
-    const command = wrapReadablePosixHookCommand(`${runtimeHome}/.orca_botmux/agent-hooks/codex-hook.sh`)
+    const command = wrapReadablePosixHookCommand(`${runtimeHome}/.botmux/agent-hooks/codex-hook.sh`)
     const expectedEntry: CodexTrustEntry = {
       sourcePath: parts.sourcePath,
       eventLabel: parts.eventLabel,
@@ -783,10 +786,10 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
       '@echo off',
       'setlocal',
       // Why: see claude/hook-service.ts for rationale. The endpoint file holds
-      // the live port/token for this OrcaBotmux install; sourcing it here lets a
+      // the live port/token for this Botmux install; sourcing it here lets a
       // surviving PTY reach the current server even though its env points at
-      // the prior OrcaBotmux's coordinates.
-      'if defined ORCA_AGENT_HOOK_ENDPOINT if exist "%ORCA_AGENT_HOOK_ENDPOINT%" call "%ORCA_AGENT_HOOK_ENDPOINT%" 2>nul',
+      // the prior Botmux's coordinates.
+      'if defined BOTMUX_AGENT_HOOK_ENDPOINT if exist "%BOTMUX_AGENT_HOOK_ENDPOINT%" call "%BOTMUX_AGENT_HOOK_ENDPOINT%" 2>nul',
       ...buildWindowsHookEnvironmentGuardLines(),
       buildWindowsAgentHookCurlPostCommand('codex'),
       'exit /b 0',
@@ -799,22 +802,22 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
     '#!/bin/sh',
     ...buildPosixHookPayloadCapture(),
     // Why: see claude/hook-service.ts for rationale. Sourcing refreshes
-    // PORT/TOKEN/ENV/VERSION from the current OrcaBotmux so a surviving PTY keeps
+    // PORT/TOKEN/ENV/VERSION from the current Botmux so a surviving PTY keeps
     // reporting after a restart.
     'load_hook_endpoint() {',
     '  endpoint_path="$1"',
     '  case "$endpoint_path" in',
     '    *.cmd)',
     // Why: Windows passes endpoint.cmd into WSL through WSLENV path translation.
-    // Parse only OrcaBotmux's known assignments; cmd.exe `set` lines are not shell syntax.
+    // Parse only Botmux's known assignments; cmd.exe `set` lines are not shell syntax.
     '      endpoint_cr=$(printf "\\r")',
     '      while IFS= read -r endpoint_line || [ -n "$endpoint_line" ]; do',
     '        endpoint_line=${endpoint_line%"$endpoint_cr"}',
     '        case "$endpoint_line" in',
-    '          "set ORCA_AGENT_HOOK_PORT="*) ORCA_AGENT_HOOK_PORT=${endpoint_line#*=} ;;',
-    '          "set ORCA_AGENT_HOOK_TOKEN="*) ORCA_AGENT_HOOK_TOKEN=${endpoint_line#*=} ;;',
-    '          "set ORCA_AGENT_HOOK_ENV="*) ORCA_AGENT_HOOK_ENV=${endpoint_line#*=} ;;',
-    '          "set ORCA_AGENT_HOOK_VERSION="*) ORCA_AGENT_HOOK_VERSION=${endpoint_line#*=} ;;',
+    '          "set BOTMUX_AGENT_HOOK_PORT="*) BOTMUX_AGENT_HOOK_PORT=${endpoint_line#*=} ;;',
+    '          "set BOTMUX_AGENT_HOOK_TOKEN="*) BOTMUX_AGENT_HOOK_TOKEN=${endpoint_line#*=} ;;',
+    '          "set BOTMUX_AGENT_HOOK_ENV="*) BOTMUX_AGENT_HOOK_ENV=${endpoint_line#*=} ;;',
+    '          "set BOTMUX_AGENT_HOOK_VERSION="*) BOTMUX_AGENT_HOOK_VERSION=${endpoint_line#*=} ;;',
     '        esac',
     '      done < "$endpoint_path"',
     '      ;;',
@@ -823,10 +826,10 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
     '      ;;',
     '  esac',
     '}',
-    'if [ -n "$ORCA_AGENT_HOOK_ENDPOINT" ] && [ -r "$ORCA_AGENT_HOOK_ENDPOINT" ]; then',
-    '  load_hook_endpoint "$ORCA_AGENT_HOOK_ENDPOINT"',
+    'if [ -n "$BOTMUX_AGENT_HOOK_ENDPOINT" ] && [ -r "$BOTMUX_AGENT_HOOK_ENDPOINT" ]; then',
+    '  load_hook_endpoint "$BOTMUX_AGENT_HOOK_ENDPOINT"',
     'fi',
-    'if [ -z "$ORCA_AGENT_HOOK_PORT" ] || [ -z "$ORCA_AGENT_HOOK_TOKEN" ] || [ -z "$ORCA_PANE_KEY" ]; then',
+    'if [ -z "$BOTMUX_AGENT_HOOK_PORT" ] || [ -z "$BOTMUX_AGENT_HOOK_TOKEN" ] || [ -z "$BOTMUX_PANE_KEY" ]; then',
     '  exit 0',
     'fi',
     'post_codex_hook() {',
@@ -840,17 +843,17 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
     // Why: pipe payload to curl's stdin (`payload@-`) instead of an inline
     // `payload=$VALUE` arg, so tens-of-KB tool output stays off the curl
     // command line (EDR command-line false positives). Wire body is identical.
-    '  printf \'%s\' "$payload" | "$curl_bin" -sS -X POST "http://127.0.0.1:${ORCA_AGENT_HOOK_PORT}/hook/codex" \\',
+    '  printf \'%s\' "$payload" | "$curl_bin" -sS -X POST "http://127.0.0.1:${BOTMUX_AGENT_HOOK_PORT}/hook/codex" \\',
     '    --connect-timeout "$connect_timeout" --max-time "$max_time" \\',
     '    --noproxy "127.0.0.1" \\',
     '    -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '    -H "X-OrcaBotmux-Agent-Hook-Token: ${ORCA_AGENT_HOOK_TOKEN}" \\',
-    '    --data-urlencode "paneKey=${ORCA_PANE_KEY}" \\',
-    '    --data-urlencode "tabId=${ORCA_TAB_ID}" \\',
-    '    --data-urlencode "launchToken=${ORCA_AGENT_LAUNCH_TOKEN}" \\',
-    '    --data-urlencode "worktreeId=${ORCA_WORKTREE_ID}" \\',
-    '    --data-urlencode "env=${ORCA_AGENT_HOOK_ENV}" \\',
-    '    --data-urlencode "version=${ORCA_AGENT_HOOK_VERSION}" \\',
+    '    -H "X-Botmux-Agent-Hook-Token: ${BOTMUX_AGENT_HOOK_TOKEN}" \\',
+    '    --data-urlencode "paneKey=${BOTMUX_PANE_KEY}" \\',
+    '    --data-urlencode "tabId=${BOTMUX_TAB_ID}" \\',
+    '    --data-urlencode "launchToken=${BOTMUX_AGENT_LAUNCH_TOKEN}" \\',
+    '    --data-urlencode "worktreeId=${BOTMUX_WORKTREE_ID}" \\',
+    '    --data-urlencode "env=${BOTMUX_AGENT_HOOK_ENV}" \\',
+    '    --data-urlencode "version=${BOTMUX_AGENT_HOOK_VERSION}" \\',
     '    --data-urlencode "payload@-"',
     '}',
     'is_wsl_runtime() {',
@@ -924,7 +927,7 @@ function installManagedHooksIntoWslRuntime(
   writeCodexHooksJson(plan.configPath, nextHooks)
   try {
     // Why: WSL runtime homes may carry user hook approvals we did not rebuild
-    // here; only upsert OrcaBotmux's entries instead of sweeping the whole source.
+    // here; only upsert Botmux's entries instead of sweeping the whole source.
     upsertHookTrustEntries(plan.tomlPath, trustEntries)
     removeStaleWslRuntimeManagedHookTrustEntries(plan.tomlPath, trustEntries)
   } catch (error) {
@@ -1222,7 +1225,7 @@ export class CodexHookService {
     const configPath = getConfigPath()
     const scriptPath = getManagedScriptPath()
     // Why: must run before this install rewrites hooks.json/config.toml —
-    // approvals the user made inside OrcaBotmux-launched Codex are keyed to the
+    // approvals the user made inside Botmux-launched Codex are keyed to the
     // previous launch's runtime layout, and stale-trust cleanup below would
     // delete them once the system config stops backing them.
     promoteCodexRuntimeHookApprovalsToSystem()
@@ -1311,7 +1314,7 @@ export class CodexHookService {
       syncSystemConfigIntoManagedCodexHome()
       // Why: system user hook approvals are mirrored into runtime CODEX_HOME.
       // If the user later revokes approval in ~/.codex/config.toml, preserving
-      // all old runtime [hooks.state.*] blocks would keep OrcaBotmux Codex trusted.
+      // all old runtime [hooks.state.*] blocks would keep Botmux Codex trusted.
       // Upsert first so duplicate repair can preserve a disabled managed copy
       // before stale cleanup removes old managed hook keys.
       upsertHookTrustEntries(tomlPath, trustEntries)
@@ -1341,7 +1344,7 @@ export class CodexHookService {
     remoteHome: string,
     options?: {
       /** Explicit CODEX_HOME dir (flat layout: hooks.json/config.toml at its
-       *  root). WSL sessions read OrcaBotmux's managed runtime home, not ~/.codex —
+       *  root). WSL sessions read Botmux's managed runtime home, not ~/.codex —
        *  installing to the default location leaves those sessions hookless. */
       codexHomeDir?: string
       /** Skip the trust write when config.toml doesn't exist yet. The WSL
@@ -1355,7 +1358,7 @@ export class CodexHookService {
       options?.codexHomeDir?.replace(/\/$/, '') ?? `${remoteHome.replace(/\/$/, '')}/.codex`
     const remoteConfigPath = `${codexHomeBase}/hooks.json`
     const remoteTomlPath = `${codexHomeBase}/config.toml`
-    const remoteScriptPath = `${remoteHome.replace(/\/$/, '')}/.orca_botmux/agent-hooks/codex-hook.sh`
+    const remoteScriptPath = `${remoteHome.replace(/\/$/, '')}/.botmux/agent-hooks/codex-hook.sh`
     try {
       const config = await readHooksJsonRemote(sftp, remoteConfigPath)
       if (!config) {
@@ -1406,11 +1409,11 @@ export class CodexHookService {
       config.hooks = nextHooks
       // Why: script/settings first, trust TOML last. A partial trust write
       // leaves Codex asking for approval rather than executing a missing script.
-      // Why: SSH remotes use POSIX `.sh` hook paths even when OrcaBotmux itself is
+      // Why: SSH remotes use POSIX `.sh` hook paths even when Botmux itself is
       // running on Windows; never derive remote script syntax from local OS.
       await writeManagedScriptRemote(sftp, remoteScriptPath, getManagedScript('posix'))
       // Why: SSH installs edit the user's remote ~/.codex/hooks.json directly.
-      // Preserve non-OrcaBotmux top-level metadata while replacing the hooks tree.
+      // Preserve non-Botmux top-level metadata while replacing the hooks tree.
       await writeHooksJsonRemote(sftp, remoteConfigPath, { ...config, hooks: nextHooks })
       try {
         const existingTomlRaw = await readTextFileRemote(sftp, remoteTomlPath)
@@ -1460,7 +1463,7 @@ export class CodexHookService {
 
   refreshRuntimeUserHooks(): AgentHookInstallStatus {
     const configPath = getConfigPath()
-    // Why: same as install() — capture in-OrcaBotmux approvals before this refresh
+    // Why: same as install() — capture in-Botmux approvals before this refresh
     // rewrites the runtime files they are keyed against.
     promoteCodexRuntimeHookApprovalsToSystem()
     const config = readHooksJson(configPath)
@@ -1486,8 +1489,8 @@ export class CodexHookService {
       const tomlPath = getCodexConfigTomlPath()
       const trustEntries = hookPlan.trustEntries.map(({ entry }) => entry)
       syncSystemConfigIntoManagedCodexHome()
-      // Why: this path is used when OrcaBotmux status hooks are disabled. The
-      // runtime CODEX_HOME should keep user hooks, but not OrcaBotmux-managed trust.
+      // Why: this path is used when Botmux status hooks are disabled. The
+      // runtime CODEX_HOME should keep user hooks, but not Botmux-managed trust.
       // Write current mirrored user trust first so stale cleanup compares
       // against current hashes while deleting old managed hook keys.
       upsertHookTrustEntries(tomlPath, trustEntries)

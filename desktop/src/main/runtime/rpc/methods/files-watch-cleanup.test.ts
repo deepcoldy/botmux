@@ -1,6 +1,6 @@
 import { expect, it, vi } from 'vitest'
 import { WatcherProcessFailure } from '../../../ipc/parcel-watcher-process-failure'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import type { RpcRequest } from '../core'
 import { RpcDispatcher } from '../dispatcher'
 import { FILE_METHODS } from './files'
@@ -67,7 +67,7 @@ it.each(['late', 'already-resolved', 'transient'] as const)(
       cleanupSubscription,
       cleanupSubscriptionAndWait,
       retrySubscriptionCleanupAfter
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: FILE_METHODS })
     const responses: { result?: { type?: string } }[] = []
 

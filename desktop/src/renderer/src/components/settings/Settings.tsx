@@ -10,7 +10,7 @@ import {
   type MutableRefObject
 } from 'react'
 import { toast } from 'sonner'
-import type { GlobalSettings, OrcaHooks, ProjectHostSetup, Repo } from '../../../../shared/types'
+import type { GlobalSettings, BotmuxHooks, ProjectHostSetup, Repo } from '../../../../shared/types'
 import type { SpeechModelState } from '../../../../shared/speech-types'
 import type {
   SourceControlAiSettings,
@@ -60,11 +60,9 @@ import { IntegrationsPane } from './IntegrationsPane'
 import { TasksPane } from './TasksPane'
 import { QuickCommandsPane } from './QuickCommandsPane'
 import { DeveloperPermissionsPane } from './DeveloperPermissionsPane'
-import { ComputerUsePane } from './ComputerUsePane'
 import { MobileSettingsPane } from './MobileSettingsPane'
-import { OrcaBotmuxBridgeSettingsPane } from './OrcaBotmuxBridgeSettingsPane'
+import { BotmuxBridgeSettingsPane } from './BotmuxBridgeSettingsPane'
 import { MobileEmulatorSettingsPane } from './MobileEmulatorSettingsPane'
-import { RuntimeEnvironmentsPane } from './RuntimeEnvironmentsPane'
 import { PrivacyPane } from './PrivacyPane'
 import { AdvancedPane } from './AdvancedPane'
 import { SettingsSidebar } from './SettingsSidebar'
@@ -286,7 +284,6 @@ function Settings(): React.JSX.Element {
   const settings = useAppStore((s) => s.settings)
   const keybindings = useAppStore((s) => s.keybindings)
   const updateSettings = useAppStore((s) => s.updateSettings)
-  const switchRuntimeEnvironment = useAppStore((s) => s.switchRuntimeEnvironment)
   const fetchSettings = useAppStore((s) => s.fetchSettings)
   const fetchKeybindings = useAppStore((s) => s.fetchKeybindings)
   const closeSettingsPage = useAppStore((s) => s.closeSettingsPage)
@@ -329,7 +326,7 @@ function Settings(): React.JSX.Element {
   )
 
   const [repoHooksMap, setRepoHooksMap] = useState<
-    Record<string, { hasHooks: boolean; hooks: OrcaHooks | null; mayNeedUpdate: boolean }>
+    Record<string, { hasHooks: boolean; hooks: BotmuxHooks | null; mayNeedUpdate: boolean }>
   >({})
   const systemPrefersDark = useSystemPrefersDark()
   const isWindows = isWindowsUserAgent()
@@ -883,7 +880,7 @@ function Settings(): React.JSX.Element {
         neededSectionIds.has('accounts') ||
         neededSectionIds.has('agents') ||
         needsRepoWindowsRuntimeCapabilities))
-  // Why: General owns the OrcaBotmux CLI controls, including WSL skill-location setup.
+  // Why: General owns the Botmux CLI controls, including WSL skill-location setup.
   const windowsTerminalCapabilities = useWindowsTerminalCapabilities(
     shouldLoadWindowsTerminalCapabilities,
     true,
@@ -927,7 +924,7 @@ function Settings(): React.JSX.Element {
     setRepoHooksMap((previous) => {
       const next = Object.fromEntries(
         Object.entries(previous).filter(([identity]) => repoHostIdentitySet.has(identity))
-      ) as Record<string, { hasHooks: boolean; hooks: OrcaHooks | null; mayNeedUpdate: boolean }>
+      ) as Record<string, { hasHooks: boolean; hooks: BotmuxHooks | null; mayNeedUpdate: boolean }>
       return Object.keys(next).length === Object.keys(previous).length ? previous : next
     })
   }, [repos])
@@ -1243,7 +1240,7 @@ function Settings(): React.JSX.Element {
                   )}
                   description={translate(
                     'auto.components.settings.Settings.21f09426ea',
-                    'Optional. OrcaBotmux works with your existing provider logins; add accounts only if you want OrcaBotmux to help switch between them.'
+                    'Optional. Botmux works with your existing provider logins; add accounts only if you want Botmux to help switch between them.'
                   )}
                   badge={translate(
                     'auto.hooks.useSettingsNavigationMetadata.7c79d3b7bf',
@@ -1269,7 +1266,7 @@ function Settings(): React.JSX.Element {
                   title={translate('auto.components.settings.Settings.00c3a7950d', 'Orchestration')}
                   description={translate(
                     'auto.components.settings.Settings.475980f53d',
-                    'Coordinate multiple coding agents through OrcaBotmux.'
+                    'Coordinate multiple coding agents through Botmux.'
                   )}
                   searchEntries={getSectionSearchEntries('orchestration')}
                 >
@@ -1291,36 +1288,20 @@ function Settings(): React.JSX.Element {
                 ) : null}
 
                 {showDesktopOnlySettings ? (
-                  <>
-                    <SettingsSection
-                      id="computer-use"
-                      title={translate(
-                        'auto.components.settings.Settings.c9841721cb',
-                        'Computer Use'
-                      )}
-                      description={translate(
-                        'auto.components.settings.Settings.7118953f14',
-                        'Enable agents to control any app on your computer.'
-                      )}
-                      searchEntries={getSectionSearchEntries('computer-use')}
-                    >
-                      {isSectionMounted('computer-use') ? <ComputerUsePane /> : null}
-                    </SettingsSection>
-
-                    <SettingsSection
-                      id="voice"
-                      title={translate('auto.components.settings.Settings.5063bb47a5', 'Voice')}
-                      description={translate(
-                        'auto.components.settings.Settings.eb1176a14e',
-                        'Local speech-to-text dictation with on-device models.'
-                      )}
-                      searchEntries={getSectionSearchEntries('voice')}
-                    >
-                      {isSectionMounted('voice') ? (
-                        <VoicePane settings={settings} updateSettings={updateSettings} />
-                      ) : null}
-                    </SettingsSection>
-                  </>
+                  // Why: Computer Use pane hidden from settings chrome; code retained.
+                  <SettingsSection
+                    id="voice"
+                    title={translate('auto.components.settings.Settings.5063bb47a5', 'Voice')}
+                    description={translate(
+                      'auto.components.settings.Settings.eb1176a14e',
+                      'Local speech-to-text dictation with on-device models.'
+                    )}
+                    searchEntries={getSectionSearchEntries('voice')}
+                  >
+                    {isSectionMounted('voice') ? (
+                      <VoicePane settings={settings} updateSettings={updateSettings} />
+                    ) : null}
+                  </SettingsSection>
                 ) : null}
 
                 <SettingsSection
@@ -1331,7 +1312,7 @@ function Settings(): React.JSX.Element {
                   )}
                   description={translate(
                     'auto.components.settings.Settings.6855b0f77d',
-                    'Finish the core workflows that make OrcaBotmux useful for parallel agent work.'
+                    'Finish the core workflows that make Botmux useful for parallel agent work.'
                   )}
                   searchEntries={getSectionSearchEntries('setup-guide')}
                   bodyClassName="overflow-hidden rounded-none border-0 bg-transparent p-0 shadow-none"
@@ -1390,16 +1371,16 @@ function Settings(): React.JSX.Element {
 
                 {showDesktopOnlySettings ? (
                   <SettingsSection
-                    id="orca-botmux-bridge"
-                    title={translate('settings.orcaBotmuxBridge.navTitle', 'Botmux Sessions')}
+                    id="botmux-bridge"
+                    title={translate('settings.botmuxBridge.navTitle', 'Botmux Sessions')}
                     badge="Bridge"
                     description={translate(
-                      'settings.orcaBotmuxBridge.navDescription',
-                      'Connect to local or SSH-remote orca_botmux daemon/dashboard (Feishu sessions).'
+                      'settings.botmuxBridge.navDescription',
+                      'Connect to local or SSH-remote botmux daemon/dashboard (Feishu sessions).'
                     )}
-                    searchEntries={getSectionSearchEntries('orca-botmux-bridge')}
+                    searchEntries={getSectionSearchEntries('botmux-bridge')}
                   >
-                    {isSectionMounted('orca-botmux-bridge') ? <OrcaBotmuxBridgeSettingsPane /> : null}
+                    {isSectionMounted('botmux-bridge') ? <BotmuxBridgeSettingsPane /> : null}
                   </SettingsSection>
                 ) : null}
 
@@ -1530,7 +1511,7 @@ function Settings(): React.JSX.Element {
                     )}
                     description={translate(
                       'auto.components.settings.Settings.01f9d36292',
-                      'Configure mobile emulator support for OrcaBotmux and coding agents.'
+                      'Configure mobile emulator support for Botmux and coding agents.'
                     )}
                     searchEntries={getSectionSearchEntries('mobile-emulator')}
                   >
@@ -1643,42 +1624,15 @@ function Settings(): React.JSX.Element {
                   title={translate('auto.components.settings.Settings.954a8f5aef', 'Stats & Usage')}
                   description={translate(
                     'auto.components.settings.Settings.8acf3f22e0',
-                    'OrcaBotmux stats plus Claude, Codex, OpenCode token analytics and Grok subscription usage.'
+                    'Botmux stats plus Claude, Codex, OpenCode token analytics and Grok subscription usage.'
                   )}
                   searchEntries={getSectionSearchEntries('stats')}
                 >
                   {isSectionMounted('stats') ? <StatsPane /> : null}
                 </SettingsSection>
 
-                <SettingsSection
-                  id="servers"
-                  title={translate(
-                    'auto.components.settings.Settings.bd0181eeca',
-                    'Remote OrcaBotmux Servers'
-                  )}
-                  badge="Beta"
-                  description={
-                    isWebClient
-                      ? translate(
-                          'auto.components.settings.Settings.7686cb5c36',
-                          'Connect this browser to a saved OrcaBotmux server.'
-                        )
-                      : translate(
-                          'auto.components.settings.Settings.b5ee17826b',
-                          'Pair remote OrcaBotmux runtimes for persistent sessions, richer remote state, and web or mobile handoff.'
-                        )
-                  }
-                  searchEntries={getSectionSearchEntries('servers')}
-                >
-                  {isSectionMounted('servers') ? (
-                    <RuntimeEnvironmentsPane
-                      settings={settings}
-                      switchRuntimeEnvironment={switchRuntimeEnvironment}
-                      canGeneratePairingUrl={!isWebClient}
-                      allowLocalRuntime={!isWebClient}
-                    />
-                  ) : null}
-                </SettingsSection>
+                {/* Why: Remote Botmux Servers pane hidden from settings chrome;
+                    RuntimeEnvironmentsPane implementation retained. */}
 
                 {showDesktopOnlySettings ? (
                   <SettingsSection

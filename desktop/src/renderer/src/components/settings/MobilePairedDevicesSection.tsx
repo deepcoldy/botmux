@@ -26,7 +26,7 @@ export function MobilePairedDevicesSection({
           {hasQrCode
             ? translate(
                 'auto.components.settings.MobilePane.1592afcc7a',
-                'No devices paired yet. Scan the QR code with the OrcaBotmux mobile app.'
+                'No devices paired yet. Scan the QR code with the Botmux mobile app.'
               )
             : translate('auto.components.settings.MobilePane.1b1b70279a', 'No devices paired yet.')}
         </p>

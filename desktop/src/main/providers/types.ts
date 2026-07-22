@@ -61,7 +61,7 @@ export type PtySpawnOptions = {
   startupCommandDelivery?: StartupCommandDelivery
   /** Minimal allowlisted launch ownership preserved by daemon reattach. */
   launchAgent?: TuiAgent
-  /** OrcaBotmux worktree identity. When present, the local provider scopes shell
+  /** Botmux worktree identity. When present, the local provider scopes shell
    *  history to this worktree so ArrowUp only surfaces local commands. */
   worktreeId?: string
   /** Stable terminal pane identity. Remote providers use this as PTY metadata
@@ -104,7 +104,7 @@ export type PtyProcessInfo = {
   title: string
   /** Owning worktree when the provider can report it authoritatively. */
   worktreeId?: string
-  /** Trusted ORCA_TERMINAL_HANDLE exported into this PTY, when known. */
+  /** Trusted BOTMUX_TERMINAL_HANDLE exported into this PTY, when known. */
   terminalHandle?: string
 }
 

@@ -11,9 +11,9 @@ import { useAppStore } from '@/store'
 import { MobileRelayBetaNotice } from './MobileRelayBetaNotice'
 export { getMobileSettingsPaneSearchEntries }
 
-const ORCA_IOS_APP_STORE_URL = 'https://apps.apple.com/app/orca-botmux-ide/id6766130217'
-const ORCA_ANDROID_APK_URL =
-  'https://github.com/stablyai/orca_botmux/releases/download/mobile-android-v0.0.31/app-release.apk'
+const BOTMUX_IOS_APP_STORE_URL = 'https://apps.apple.com/app/botmux-ide/id6766130217'
+const BOTMUX_ANDROID_APK_URL =
+  'https://github.com/stablyai/botmux/releases/download/mobile-android-v0.0.31/app-release.apk'
 
 export function MobileSettingsPane(): React.JSX.Element {
   const showMobileButton = useAppStore((s) => s.settings?.showMobileButton !== false)
@@ -34,11 +34,11 @@ export function MobileSettingsPane(): React.JSX.Element {
           <p>
             {translate(
               'auto.components.settings.MobileSettingsPane.installIntro',
-              'Install OrcaBotmux Mobile from the'
+              'Install Botmux Mobile from the'
             )}{' '}
             <button
               type="button"
-              onClick={() => void window.api.shell.openUrl(ORCA_IOS_APP_STORE_URL)}
+              onClick={() => void window.api.shell.openUrl(BOTMUX_IOS_APP_STORE_URL)}
               className="cursor-pointer underline underline-offset-2 hover:text-foreground"
             >
               {translate('auto.components.settings.MobileSettingsPane.b5a2ed83ff', 'App Store')}
@@ -48,7 +48,7 @@ export function MobileSettingsPane(): React.JSX.Element {
               type="button"
               // Why: Android is moving to Google Play soon, but until then
               // link directly to the pinned APK asset for the current mobile release.
-              onClick={() => void window.api.shell.openUrl(ORCA_ANDROID_APK_URL)}
+              onClick={() => void window.api.shell.openUrl(BOTMUX_ANDROID_APK_URL)}
               className="cursor-pointer underline underline-offset-2 hover:text-foreground"
             >
               {translate(
@@ -68,11 +68,11 @@ export function MobileSettingsPane(): React.JSX.Element {
       <SearchableSetting
         title={translate(
           'auto.components.settings.MobileSettingsPane.1de96ec8a6',
-          'Show OrcaBotmux Mobile Button'
+          'Show Botmux Mobile Button'
         )}
         description={translate(
           'auto.components.settings.MobileSettingsPane.682293cadf',
-          'Show the OrcaBotmux Mobile button at the top of the left sidebar.'
+          'Show the Botmux Mobile button at the top of the left sidebar.'
         )}
         keywords={getMobileSidebarShortcutSearchEntry().keywords}
       >
@@ -80,11 +80,11 @@ export function MobileSettingsPane(): React.JSX.Element {
         <SettingsSwitchRow
           label={translate(
             'auto.components.settings.MobileSettingsPane.1de96ec8a6',
-            'Show OrcaBotmux Mobile Button'
+            'Show Botmux Mobile Button'
           )}
           description={translate(
             'auto.components.settings.MobileSettingsPane.d4f2b65f30',
-            'Show the OrcaBotmux Mobile shortcut in the sidebar.'
+            'Show the Botmux Mobile shortcut in the sidebar.'
           )}
           checked={showMobileButton}
           onChange={() => updateSettings({ showMobileButton: !showMobileButton })}

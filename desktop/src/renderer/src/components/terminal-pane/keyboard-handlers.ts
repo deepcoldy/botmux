@@ -165,7 +165,7 @@ export function matchFileSearchShortcut(
   e: Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'shiftKey' | 'altKey' | 'repeat'>,
   platform: KeybindingPlatform,
   keybindings?: KeybindingOverrides,
-  terminalShortcutPolicy: TerminalShortcutPolicy = 'orca-botmux-first'
+  terminalShortcutPolicy: TerminalShortcutPolicy = 'botmux-first'
 ): boolean {
   if (e.repeat) {
     return false
@@ -210,7 +210,7 @@ type KeyboardHandlersDeps = {
 /**
  * Installs terminal-pane shortcuts on the tab keyboard scope.
  * Uses the shared shortcut policy before forwarding unmatched input to xterm
- * so configurable OrcaBotmux actions remain consistent across local and SSH panes.
+ * so configurable Botmux actions remain consistent across local and SSH panes.
  */
 export function useTerminalKeyboardShortcuts({
   tabId,
@@ -239,7 +239,7 @@ export function useTerminalKeyboardShortcuts({
   macOptionAsAltRef,
   paneKittyKeyboardModesRef,
   keybindings,
-  terminalShortcutPolicy = 'orca-botmux-first'
+  terminalShortcutPolicy = 'botmux-first'
 }: KeyboardHandlersDeps): void {
   useEffect(() => {
     if (!isActive) {

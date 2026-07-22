@@ -78,30 +78,30 @@ describe('SkillFreshnessStatusPill', () => {
   })
 
   it('shows Update available for an eligible outdated skill', async () => {
-    mocks.inventory = inventory([{ name: 'orca-botmux-cli', status: 'outdated' }], ['orca-botmux-cli'])
+    mocks.inventory = inventory([{ name: 'botmux-cli', status: 'outdated' }], ['botmux-cli'])
 
-    expect((await renderPill('orca-botmux-cli')).textContent).toBe('Update available')
+    expect((await renderPill('botmux-cli')).textContent).toBe('Update available')
   })
 
   it('shows Up to date when every placement is current', async () => {
-    mocks.inventory = inventory([{ name: 'orca-botmux-cli', status: 'current' }], [])
+    mocks.inventory = inventory([{ name: 'botmux-cli', status: 'current' }], [])
 
-    expect((await renderPill('orca-botmux-cli')).textContent).toBe('Up to date')
+    expect((await renderPill('botmux-cli')).textContent).toBe('Up to date')
   })
 
   it('falls back to Installed for a blocked outdated placement', async () => {
     mocks.inventory = inventory(
       [
-        { name: 'orca-botmux-cli', status: 'outdated' },
-        { name: 'orca-botmux-cli', status: 'unrecognized' }
+        { name: 'botmux-cli', status: 'outdated' },
+        { name: 'botmux-cli', status: 'unrecognized' }
       ],
       []
     )
 
-    expect((await renderPill('orca-botmux-cli')).textContent).toBe('Installed')
+    expect((await renderPill('botmux-cli')).textContent).toBe('Installed')
   })
 
   it('falls back to Installed before the inventory loads', async () => {
-    expect((await renderPill('orca-botmux-cli')).textContent).toBe('Installed')
+    expect((await renderPill('botmux-cli')).textContent).toBe('Installed')
   })
 })

@@ -3,8 +3,8 @@ import { router } from 'expo-router'
 import { colors, radii, spacing, typography } from '../theme/mobile-theme'
 import type { CompatVerdict } from '../transport/protocol-compat'
 
-const RELEASES_URL = 'https://github.com/stablyai/orca/releases'
-const IOS_APP_STORE_URL = 'itms-apps://apps.apple.com/app/orca-ide/id6766130217'
+const RELEASES_URL = 'https://github.com/deepcoldy/botmux/releases'
+const IOS_APP_STORE_URL = 'itms-apps://apps.apple.com/app/botmux-ide/id6766130217'
 
 type Props = {
   verdict: Extract<CompatVerdict, { kind: 'blocked' }>
@@ -22,10 +22,10 @@ export function ProtocolBlockScreen({ verdict }: Props) {
       : null
     : { label: 'Open GitHub Releases', url: RELEASES_URL }
 
-  const title = isMobileTooOld ? 'Update Orca Mobile' : 'Update Orca on your computer'
+  const title = isMobileTooOld ? 'Update Botmux Mobile' : 'Update Botmux on your computer'
   const body = isMobileTooOld
-    ? `This desktop needs a newer Orca Mobile app. Update Orca Mobile from ${mobileUpdateTarget.storeName}, then try this host again.`
-    : 'This paired desktop app is too old for your current Orca Mobile app. Update Orca on your computer, then try this host again.'
+    ? `This desktop needs a newer Botmux Mobile app. Update Botmux Mobile from ${mobileUpdateTarget.storeName}, then try this host again.`
+    : 'This paired desktop app is too old for your current Botmux Mobile app. Update Botmux on your computer, then try this host again.'
   const recoveryNote =
     'Already updated? Go back to Hosts and refresh the connection. If this message stays, remove this host and pair it again.'
 

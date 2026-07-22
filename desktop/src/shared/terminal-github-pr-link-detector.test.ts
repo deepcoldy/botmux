@@ -11,10 +11,10 @@ describe('createTerminalGitHubPRLinkDetector', () => {
   it('extracts GitHub pull request URLs from terminal output', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe('Created https://github.com/acme/orca_botmux/pull/42\r\n')).toEqual([
+    expect(observe('Created https://github.com/acme/botmux/pull/42\r\n')).toEqual([
       {
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       }
     ])
@@ -82,11 +82,11 @@ describe('createTerminalGitHubPRLinkDetector', () => {
   it('waits for a boundary when the URL is split across PTY chunks', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe('https://github.com/acme/orca_botmux/pull/4')).toEqual([])
+    expect(observe('https://github.com/acme/botmux/pull/4')).toEqual([])
     expect(observe('2\r\n')).toEqual([
       {
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       }
     ])
@@ -96,10 +96,10 @@ describe('createTerminalGitHubPRLinkDetector', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
     expect(observe('created https://gith')).toEqual([])
-    expect(observe('ub.com/acme/orca_botmux/pull/42\n')).toEqual([
+    expect(observe('ub.com/acme/botmux/pull/42\n')).toEqual([
       {
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       }
     ])
@@ -108,22 +108,22 @@ describe('createTerminalGitHubPRLinkDetector', () => {
   it('trims terminal punctuation around printed URLs', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe('Opened (https://github.com/acme/orca_botmux/pull/42).\n')[0]?.url).toBe(
-      'https://github.com/acme/orca_botmux/pull/42'
+    expect(observe('Opened (https://github.com/acme/botmux/pull/42).\n')[0]?.url).toBe(
+      'https://github.com/acme/botmux/pull/42'
     )
   })
 
   it('does not repeat the same PR URL from overlapping carry text', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe('https://github.com/acme/orca_botmux/pull/42\n')).toHaveLength(1)
+    expect(observe('https://github.com/acme/botmux/pull/42\n')).toHaveLength(1)
     expect(observe('more output\n')).toEqual([])
   })
 
   it('ignores non-PR GitHub-shaped links', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe('https://github.com/acme/orca_botmux/issues/42\n')).toEqual([])
+    expect(observe('https://github.com/acme/botmux/issues/42\n')).toEqual([])
   })
 
   it('extracts GitHub Enterprise pull request URLs from terminal output', () => {
@@ -167,10 +167,10 @@ describe('createTerminalGitHubPRLinkDetector', () => {
     const observe = createTerminalGitHubPRLinkDetector()
     const noise = `${'/pull/not-a-url '.repeat(20_000)}\n`
 
-    expect(observe(`${noise}Created https://github.com/acme/orca_botmux/pull/42\r\n`)).toEqual([
+    expect(observe(`${noise}Created https://github.com/acme/botmux/pull/42\r\n`)).toEqual([
       {
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       }
     ])
@@ -180,7 +180,7 @@ describe('createTerminalGitHubPRLinkDetector', () => {
   it('drops overlong incomplete URL carry instead of retaining pasted megabytes', () => {
     const observe = createTerminalGitHubPRLinkDetector()
 
-    expect(observe(`https://github.com/acme/orca_botmux/pull/${'4'.repeat(10_000)}`)).toEqual([])
+    expect(observe(`https://github.com/acme/botmux/pull/${'4'.repeat(10_000)}`)).toEqual([])
     expect(observe('2\r\n')).toEqual([])
   })
 })

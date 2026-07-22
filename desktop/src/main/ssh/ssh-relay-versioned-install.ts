@@ -1,7 +1,7 @@
 // Versioned-install plumbing for the remote relay.
 //
 // Why this exists: the relay used to install into a single shared directory
-// (~/.orca-botmux-remote/relay-v0.1.0) which the deploy step would overwrite in place
+// (~/.botmux-remote/relay-v0.1.0) which the deploy step would overwrite in place
 // on every cross-version push. A daemon already loaded into memory then served
 // new clients off rewritten on-disk code, producing protocol drift and a
 // reconnect loop. We now install each (RELAY_VERSION + content-hash) bundle
@@ -88,15 +88,15 @@ export function readLocalFullVersion(localRelayDir: string): string {
   const versionFile = join(localRelayDir, '.version')
   if (!existsSync(versionFile)) {
     throw new Error(
-      `OrcaBotmux's local relay build is missing its version marker at ${versionFile}. ` +
-        `This usually indicates a packaging or build problem; reinstall OrcaBotmux.`
+      `Botmux's local relay build is missing its version marker at ${versionFile}. ` +
+        `This usually indicates a packaging or build problem; reinstall Botmux.`
     )
   }
   const v = readFileSync(versionFile, 'utf-8').trim()
   if (!v) {
     throw new Error(
-      `OrcaBotmux's local relay version marker at ${versionFile} is empty. ` +
-        `This usually indicates a packaging or build problem; reinstall OrcaBotmux.`
+      `Botmux's local relay version marker at ${versionFile} is empty. ` +
+        `This usually indicates a packaging or build problem; reinstall Botmux.`
     )
   }
   return v

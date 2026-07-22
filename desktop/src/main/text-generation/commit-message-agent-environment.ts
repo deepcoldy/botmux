@@ -43,17 +43,17 @@ function prepareShellConfigDirEnv(agentId: string): { ok: true; env?: NodeJS.Pro
   if (!configVar) {
     return null
   }
-  // Why: each kind owns a distinct ORCA_*_SOURCE_* shadow so a headless commit
+  // Why: each kind owns a distinct BOTMUX_*_SOURCE_* shadow so a headless commit
   // run from inside a legacy OMP overlay restores the OMP source dir, never
   // the Pi one (and vice versa). PI_CODING_AGENT_DIR is the binary-facing var
   // both kinds consume — see src/main/pi/titlebar-extension-service.ts.
   const sourceVar =
     agentId === 'opencode'
-      ? 'ORCA_OPENCODE_SOURCE_CONFIG_DIR'
+      ? 'BOTMUX_OPENCODE_SOURCE_CONFIG_DIR'
       : agentId === 'pi'
-        ? 'ORCA_PI_SOURCE_AGENT_DIR'
+        ? 'BOTMUX_PI_SOURCE_AGENT_DIR'
         : agentId === 'omp'
-          ? 'ORCA_OMP_SOURCE_AGENT_DIR'
+          ? 'BOTMUX_OMP_SOURCE_AGENT_DIR'
           : undefined
 
   const value = readInheritedOrShellEnvVar(configVar, sourceVar)
@@ -61,9 +61,9 @@ function prepareShellConfigDirEnv(agentId: string): { ok: true; env?: NodeJS.Pro
     return { ok: true }
   }
 
-  // Why: GUI-launched OrcaBotmux may not inherit shell startup exports, but these
-  // vars point the headless CLI at the user's auth/config root. Nested OrcaBotmux
-  // launches inherit PTY overlays, so prefer ORCA_*_SOURCE_* when present.
+  // Why: GUI-launched Botmux may not inherit shell startup exports, but these
+  // vars point the headless CLI at the user's auth/config root. Nested Botmux
+  // launches inherit PTY overlays, so prefer BOTMUX_*_SOURCE_* when present.
   return { ok: true, env: { ...cloneProcessEnv(), [configVar]: value } }
 }
 

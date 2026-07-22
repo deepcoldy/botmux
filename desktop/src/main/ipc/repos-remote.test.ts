@@ -581,7 +581,7 @@ describe('projectGroups IPC validation', () => {
 
   it('returns partial local scan results after cancellation', async () => {
     vi.mocked(isGitRepo).mockReturnValue(false)
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-nested-local-cancel-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-nested-local-cancel-'))
     try {
       await mkdir(join(root, 'api', '.git'), { recursive: true })
       await mkdir(join(root, 'web', '.git'), { recursive: true })
@@ -808,7 +808,7 @@ describe('projectGroups IPC validation', () => {
   })
 
   it('imports selected local linked worktrees as one project rooted at the main worktree', async () => {
-    const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-nested-linked-worktrees-'))
+    const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-nested-linked-worktrees-'))
     try {
       const parentPath = join(tempRoot, 'paseo-worktrees', 'demo-project')
       const mainPath = join(tempRoot, 'source', 'demo-project')
@@ -1089,13 +1089,13 @@ describe('repos:addRemote', () => {
   it('clones a repo on an SSH target and registers the cloned path', async () => {
     const result = await handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
 
     expect(mockFilesystemProvider.createDir).toHaveBeenCalledWith('/home/user')
     expect(mockGitProvider.clone).toHaveBeenCalledWith(
-      ['clone', '--progress', '--', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux'],
+      ['clone', '--progress', '--', 'https://github.com/stablyai/botmux.git', 'botmux'],
       '/home/user',
       expect.objectContaining({
         signal: expect.any(AbortSignal),
@@ -1105,19 +1105,19 @@ describe('repos:addRemote', () => {
     )
     expect(mockStore.addRepo).toHaveBeenCalledWith(
       expect.objectContaining({
-        path: '/home/user/orca_botmux',
+        path: '/home/user/botmux',
         connectionId: 'conn-1',
         kind: 'git',
-        displayName: 'orca_botmux',
+        displayName: 'botmux',
         badgeColor: DEFAULT_REPO_BADGE_COLOR,
         externalWorktreeVisibility: 'hide',
         externalWorktreeVisibilityLegacy: false
       })
     )
     expect(mockMultiplexer.notify).toHaveBeenCalledWith('session.registerRoot', {
-      rootPath: '/home/user/orca_botmux'
+      rootPath: '/home/user/botmux'
     })
-    expect(result).toHaveProperty('path', '/home/user/orca_botmux')
+    expect(result).toHaveProperty('path', '/home/user/botmux')
     expect(result).toHaveProperty('connectionId', 'conn-1')
   })
 
@@ -1135,7 +1135,7 @@ describe('repos:addRemote', () => {
 
     await handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
 
@@ -1148,9 +1148,9 @@ describe('repos:addRemote', () => {
   it('returns an existing SSH repo instead of cloning the same target again', async () => {
     const existing = {
       id: 'existing-id',
-      path: '/home/user/orca_botmux',
+      path: '/home/user/botmux',
       connectionId: 'conn-1',
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       badgeColor: '#fff',
       addedAt: 1000,
       kind: 'git'
@@ -1159,7 +1159,7 @@ describe('repos:addRemote', () => {
 
     const result = await handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
 
@@ -1171,9 +1171,9 @@ describe('repos:addRemote', () => {
   it('upgrades an existing SSH folder repo after cloning into that path', async () => {
     const existing = {
       id: 'existing-folder',
-      path: '/home/user/orca_botmux',
+      path: '/home/user/botmux',
       connectionId: 'conn-1',
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       badgeColor: '#fff',
       addedAt: 1000,
       kind: 'folder'
@@ -1184,12 +1184,12 @@ describe('repos:addRemote', () => {
 
     const result = await handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
 
     expect(mockGitProvider.clone).toHaveBeenCalledWith(
-      ['clone', '--progress', '--', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux'],
+      ['clone', '--progress', '--', 'https://github.com/stablyai/botmux.git', 'botmux'],
       '/home/user',
       expect.objectContaining({
         signal: expect.any(AbortSignal),
@@ -1212,7 +1212,7 @@ describe('repos:addRemote', () => {
     await expect(
       handlers.get('repos:cloneRemote')!(null, {
         connectionId: 'conn-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/home/user'
       })
     ).rejects.toThrow('repository not found')
@@ -1231,7 +1231,7 @@ describe('repos:addRemote', () => {
 
     const firstClone = handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
     await waitForAssertion(() => expect(mockGitProvider.clone).toHaveBeenCalledTimes(1))
@@ -1239,7 +1239,7 @@ describe('repos:addRemote', () => {
     await expect(
       handlers.get('repos:cloneRemote')!(null, {
         connectionId: 'conn-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/home/user'
       })
     ).rejects.toThrow('A clone is already in progress for this SSH destination')
@@ -1253,7 +1253,7 @@ describe('repos:addRemote', () => {
 
     await handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '~/projects'
     })
 
@@ -1261,7 +1261,7 @@ describe('repos:addRemote', () => {
       path: '~/projects'
     })
     expect(mockGitProvider.clone).toHaveBeenCalledWith(
-      ['clone', '--progress', '--', 'https://github.com/stablyai/orca_botmux.git', 'orca_botmux'],
+      ['clone', '--progress', '--', 'https://github.com/stablyai/botmux.git', 'botmux'],
       '/home/ubuntu/projects',
       expect.any(Object)
     )
@@ -1274,7 +1274,7 @@ describe('repos:addRemote', () => {
     await expect(
       handlers.get('repos:cloneRemote')!(null, {
         connectionId: 'conn-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: '/home/user'
       })
     ).rejects.toThrow('destination already exists')
@@ -1293,7 +1293,7 @@ describe('repos:addRemote', () => {
 
     const clonePromise = handlers.get('repos:cloneRemote')!(null, {
       connectionId: 'conn-1',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/user'
     })
     await waitForAssertion(() => expect(mockGitProvider.clone).toHaveBeenCalledTimes(1))
@@ -1310,7 +1310,7 @@ describe('repos:addRemote', () => {
     await expect(
       handlers.get('repos:cloneRemote')!(null, {
         connectionId: 'conn-1',
-        url: 'https://github.com/stablyai/orca_botmux.git',
+        url: 'https://github.com/stablyai/botmux.git',
         destination: 'relative/path'
       })
     ).rejects.toThrow('Clone destination must be an absolute path on the SSH host')
@@ -1624,9 +1624,9 @@ describe('repos:addRemote', () => {
   it('returns an existing SSH repo when a selected subdirectory resolves to the repo root', async () => {
     const existing = {
       id: 'existing-id',
-      path: '/home/user/orca_botmux',
+      path: '/home/user/botmux',
       connectionId: 'conn-1',
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       badgeColor: '#fff',
       addedAt: 1000,
       kind: 'git'
@@ -1634,12 +1634,12 @@ describe('repos:addRemote', () => {
     mockStore.getRepos.mockReturnValue([existing])
     mockGitProvider.isGitRepoAsync.mockResolvedValueOnce({
       isRepo: true,
-      rootPath: '/home/user/orca_botmux'
+      rootPath: '/home/user/botmux'
     })
 
     const result = await handlers.get('repos:addRemote')!(null, {
       connectionId: 'conn-1',
-      remotePath: '/home/user/orca_botmux/src'
+      remotePath: '/home/user/botmux/src'
     })
 
     expect(result).toEqual({ repo: existing })
@@ -1708,7 +1708,7 @@ describe('repos:add + repos:clone', () => {
   const tempRoots: string[] = []
 
   const createTempRoot = async (): Promise<string> => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-repos-clone-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-repos-clone-'))
     tempRoots.push(root)
     return root
   }
@@ -1751,7 +1751,7 @@ describe('repos:add + repos:clone', () => {
     expect(result).toHaveProperty('repo.badgeColor', DEFAULT_REPO_BADGE_COLOR)
   })
 
-  it('defaults new git repos:add records to hiding non-OrcaBotmux worktrees', async () => {
+  it('defaults new git repos:add records to hiding non-Botmux worktrees', async () => {
     const result = await handlers.get('repos:add')!(null, { path: '/tmp/from-add', kind: 'git' })
 
     expect(mockStore.addRepo).toHaveBeenCalledWith(
@@ -1964,13 +1964,13 @@ describe('repos:add + repos:clone', () => {
     const destination = await createTempRoot()
 
     const result = await handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
 
     expect(mockStore.addRepo).toHaveBeenCalledWith(
       expect.objectContaining({
-        path: join(destination, 'orca_botmux'),
+        path: join(destination, 'botmux'),
         badgeColor: DEFAULT_REPO_BADGE_COLOR,
         kind: 'git',
         externalWorktreeVisibility: 'hide',
@@ -1983,7 +1983,7 @@ describe('repos:add + repos:clone', () => {
 
   it('drops a same-path negative submodule cache before a local clone', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     let cloned = false
     gitExecFileAsyncMock.mockImplementation((args: string[]) =>
       Promise.resolve({
@@ -2005,7 +2005,7 @@ describe('repos:add + repos:clone', () => {
 
     await expect(listSubmodulePaths(clonePath)).resolves.toEqual([])
     await handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await expect(listSubmodulePaths(clonePath)).resolves.toEqual(['vendor/lib'])
@@ -2018,11 +2018,11 @@ describe('repos:add + repos:clone', () => {
 
   it('preserves existing badgeColor when repos:clone upgrades folder->git after dedupe', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const existing = {
       id: 'folder-repo',
       path: clonePath,
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       badgeColor: '#8b5cf6',
       addedAt: 1,
       kind: 'folder'
@@ -2032,7 +2032,7 @@ describe('repos:add + repos:clone', () => {
     mockStore.updateRepo.mockReturnValue(upgraded)
 
     const result = await handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
 
@@ -2082,7 +2082,7 @@ describe('repos:add + repos:clone', () => {
 
     await expect(
       handlers.get('repos:clone')!(null, {
-        url: 'https://example.com/orca_botmux.git',
+        url: 'https://example.com/botmux.git',
         destination
       })
     ).rejects.toThrow('Clone destination must be an absolute path')
@@ -2096,7 +2096,7 @@ describe('repos:add + repos:clone', () => {
 
     await expect(
       handlers.get('repos:clone')!(null, {
-        url: 'https://example.com/team\\orca_botmux.git',
+        url: 'https://example.com/team\\botmux.git',
         destination
       })
     ).rejects.toThrow('Invalid repository name derived from URL')
@@ -2108,22 +2108,22 @@ describe('repos:add + repos:clone', () => {
     const destination = await createTempRoot()
 
     const result = await handlers.get('repos:clone')!(null, {
-      url: 'C:\\src\\orca_botmux.git',
+      url: 'C:\\src\\botmux.git',
       destination
     })
 
     expect(gitSpawnMock).toHaveBeenCalledWith(
-      ['clone', '--progress', '--', 'C:\\src\\orca_botmux.git', join(destination, 'orca_botmux')],
+      ['clone', '--progress', '--', 'C:\\src\\botmux.git', join(destination, 'botmux')],
       expect.objectContaining({ cwd: destination })
     )
-    expect(result).toHaveProperty('path', join(destination, 'orca_botmux'))
+    expect(result).toHaveProperty('path', join(destination, 'botmux'))
   })
 
   it('clones with the non-interactive credential guard so Git Credential Manager cannot pop its OAuth window (#7652)', async () => {
     const destination = await createTempRoot()
 
     await handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
 
@@ -2131,7 +2131,7 @@ describe('repos:add + repos:clone', () => {
     // Manager pop its "Connect to GitHub" OAuth window on Windows and loop it
     // when the network cannot complete the flow.
     expect(gitSpawnMock).toHaveBeenCalledWith(
-      ['clone', '--progress', '--', 'https://example.com/orca_botmux.git', join(destination, 'orca_botmux')],
+      ['clone', '--progress', '--', 'https://example.com/botmux.git', join(destination, 'botmux')],
       expect.objectContaining({
         env: expect.objectContaining({
           GIT_TERMINAL_PROMPT: '0',
@@ -2147,14 +2147,14 @@ describe('repos:add + repos:clone', () => {
 
   it('does not remove an existing target directory when aborting a pending clone', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     await mkdir(clonePath)
     await writeFile(join(clonePath, 'user-file.txt'), 'keep me')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2169,13 +2169,13 @@ describe('repos:add + repos:clone', () => {
 
   it('does not remove an existing target file when aborting a pending clone', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     await writeFile(clonePath, 'existing file')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2189,12 +2189,12 @@ describe('repos:add + repos:clone', () => {
 
   it('removes a fresh clone target only after the aborted process closes unsuccessfully', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2209,13 +2209,13 @@ describe('repos:add + repos:clone', () => {
 
   it('removes an owned fresh clone target when git exits unsuccessfully', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const partialFile = join(clonePath, 'partial.txt')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2234,7 +2234,7 @@ describe('repos:add + repos:clone', () => {
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2242,7 +2242,7 @@ describe('repos:add + repos:clone', () => {
     proc.stderr.emit(
       'data',
       Buffer.from(
-        "Cloning into 'orca_botmux'...\rfatal: destination path 'orca_botmux' already exists and is not an empty directory.\r\nand the repository exists.\n"
+        "Cloning into 'botmux'...\rfatal: destination path 'botmux' already exists and is not an empty directory.\r\nand the repository exists.\n"
       )
     )
     proc.emit('close', 128, null)
@@ -2250,20 +2250,20 @@ describe('repos:add + repos:clone', () => {
     await expect(clonePromise).rejects.toThrow(
       `Clone failed: Destination already exists and is not empty: ${join(
         destination,
-        'orca_botmux'
+        'botmux'
       )}. Choose a different parent folder, delete the existing folder, or add the existing repository instead.`
     )
   })
 
   it('removes an owned fresh clone target when git spawn emits an error', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const partialFile = join(clonePath, 'partial.txt')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2277,12 +2277,12 @@ describe('repos:add + repos:clone', () => {
 
   it('keeps a fresh clone target when abort races with a successful close', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2299,7 +2299,7 @@ describe('repos:add + repos:clone', () => {
 
   it('dedupes retry when abort races with a successful clone close', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const repos: unknown[] = []
     mockStore.getRepos.mockImplementation(() => repos)
     mockStore.addRepo.mockImplementation((repo: unknown) => {
@@ -2310,14 +2310,14 @@ describe('repos:add + repos:clone', () => {
     gitSpawnMock.mockReturnValueOnce(firstProc).mockReturnValueOnce(secondProc)
 
     const firstClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
 
     await handlers.get('repos:cloneAbort')!(null, undefined)
     const secondClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await new Promise((resolve) => setImmediate(resolve))
@@ -2333,7 +2333,7 @@ describe('repos:add + repos:clone', () => {
 
   it('serializes concurrent clones for the same target', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const repos: unknown[] = []
     mockStore.getRepos.mockImplementation(() => repos)
     mockStore.addRepo.mockImplementation((repo: unknown) => {
@@ -2343,11 +2343,11 @@ describe('repos:add + repos:clone', () => {
     gitSpawnMock.mockReturnValueOnce(firstProc)
 
     const firstClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     const secondClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2361,14 +2361,14 @@ describe('repos:add + repos:clone', () => {
 
   it('waits for pending abort cleanup before retrying the same clone target', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const partialFile = join(clonePath, 'partial.txt')
     const firstProc = createMockCloneProcess()
     const secondProc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(firstProc).mockReturnValueOnce(secondProc)
 
     const firstClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))
@@ -2376,7 +2376,7 @@ describe('repos:add + repos:clone', () => {
     await handlers.get('repos:cloneAbort')!(null, undefined)
 
     const secondClonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await new Promise((resolve) => setImmediate(resolve))
@@ -2398,13 +2398,13 @@ describe('repos:add + repos:clone', () => {
 
   it('skips abort cleanup when the claimed target is replaced before close', async () => {
     const destination = await createTempRoot()
-    const clonePath = join(destination, 'orca_botmux')
+    const clonePath = join(destination, 'botmux')
     const replacementFile = join(clonePath, 'replacement.txt')
     const proc = createMockCloneProcess()
     gitSpawnMock.mockReturnValueOnce(proc)
 
     const clonePromise = handlers.get('repos:clone')!(null, {
-      url: 'https://example.com/orca_botmux.git',
+      url: 'https://example.com/botmux.git',
       destination
     })
     await waitForAssertion(() => expect(gitSpawnMock).toHaveBeenCalledTimes(1))

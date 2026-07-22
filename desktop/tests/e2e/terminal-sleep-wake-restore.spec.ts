@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -144,12 +144,12 @@ function writeSleepWakePayloadScript(scriptPath: string, payload: string): void 
 
 test.describe('Terminal sleep wake restore', () => {
   test('restores slept terminal output and accepts fresh input after wake', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'sleep wake restore needs the seeded secondary worktree')
@@ -157,40 +157,40 @@ test.describe('Terminal sleep wake restore', () => {
       return
     }
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
     const restoreMarker = `SLEEP_WAKE_RESTORE_${runId}`
     const freshMarker = `SLEEP_WAKE_FRESH_${runId}`
     const expectedMarkers = sleepWakeExpectedMarkers(runId)
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-sleep-wake-restore-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-sleep-wake-restore-${runId}.mjs`)
     writeSleepWakePayloadScript(scriptPath, richSleepWakePayload(runId))
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, restoreMarker, 10_000, 20_000)
-      const beforeSleepDebug = await readSleepWakeTerminalDebug(orcaBotmuxPage, secondWorktreeId)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await waitForTerminalOutput(botmuxPage, restoreMarker, 10_000, 20_000)
+      const beforeSleepDebug = await readSleepWakeTerminalDebug(botmuxPage, secondWorktreeId)
       for (const marker of expectedMarkers) {
-        expect(await mainSnapshotContains(orcaBotmuxPage, ptyId, marker)).toBe(true)
+        expect(await mainSnapshotContains(botmuxPage, ptyId, marker)).toBe(true)
       }
 
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-      await sleepWorktreeTerminals(orcaBotmuxPage, secondWorktreeId)
-      const afterSleepDebug = await readSleepWakeTerminalDebug(orcaBotmuxPage, secondWorktreeId)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
+      await sleepWorktreeTerminals(botmuxPage, secondWorktreeId)
+      const afterSleepDebug = await readSleepWakeTerminalDebug(botmuxPage, secondWorktreeId)
       await expect
-        .poll(() => readLivePtyCountForWorktree(orcaBotmuxPage, secondWorktreeId), {
+        .poll(() => readLivePtyCountForWorktree(botmuxPage, secondWorktreeId), {
           timeout: 10_000,
           message: 'sleep did not release live PTYs for the background worktree'
         })
         .toBe(0)
 
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      const awakePtyId = await waitForActivePanePtyId(orcaBotmuxPage)
-      const afterWakeDebug = await readSleepWakeTerminalDebug(orcaBotmuxPage, secondWorktreeId)
-      const awakeTerminalContent = await getTerminalContent(orcaBotmuxPage, 20_000)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      const awakePtyId = await waitForActivePanePtyId(botmuxPage)
+      const afterWakeDebug = await readSleepWakeTerminalDebug(botmuxPage, secondWorktreeId)
+      const awakeTerminalContent = await getTerminalContent(botmuxPage, 20_000)
       for (const marker of expectedMarkers) {
         expect
           .soft(awakeTerminalContent.includes(marker), {
@@ -210,9 +210,9 @@ test.describe('Terminal sleep wake restore', () => {
           })
           .toBe(true)
       }
-      await waitForTerminalOutput(orcaBotmuxPage, restoreMarker, 15_000, 20_000)
-      await sendToTerminal(orcaBotmuxPage, awakePtyId, `printf '\\n${freshMarker}\\n'\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, freshMarker, 10_000, 20_000)
+      await waitForTerminalOutput(botmuxPage, restoreMarker, 15_000, 20_000)
+      await sendToTerminal(botmuxPage, awakePtyId, `printf '\\n${freshMarker}\\n'\r`)
+      await waitForTerminalOutput(botmuxPage, freshMarker, 10_000, 20_000)
     } finally {
       rmSync(scriptPath, { force: true })
     }

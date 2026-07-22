@@ -20,7 +20,7 @@ export function getRepoBackedTaskEmptyState(args: {
       ),
       description: translate(
         'auto.components.taskPageEmptyState.noProjectSourcesDescription',
-        'Select at least one project source so OrcaBotmux knows which host/account to fetch tasks from.'
+        'Select at least one project source so Botmux knows which host/account to fetch tasks from.'
       )
     }
   }

@@ -35,8 +35,8 @@ const journal = {
     },
     relay: {
       v: 1,
-      directorUrl: 'https://relay.onorca.dev',
-      cellUrl: 'https://relay-c1.onorca.dev',
+      directorUrl: 'https://relay.example.test',
+      cellUrl: 'https://relay-c1.example.test',
       assignmentEpoch: 7,
       relayHostId: 'AbCdEf0123_-xyZ9',
       inviteExpiresAt: 10_000,
@@ -109,7 +109,7 @@ describe('mobile relay credential bundle', () => {
   it('deletes the namespaced bundle and never enables it on web', async () => {
     await deleteMobileRelayCredentialBundle('host-1')
     expect(secureStore.deleteItemAsync).toHaveBeenCalledWith(
-      'orca.mobile-relay.credentials.host-1',
+      'botmux.mobile-relay.credentials.host-1',
       expect.any(Object)
     )
     platform.OS = 'web'

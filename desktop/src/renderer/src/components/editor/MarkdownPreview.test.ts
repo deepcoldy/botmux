@@ -82,49 +82,49 @@ describe('MarkdownPreview source link routing', () => {
   })
 
   it('derives a source root from floating file relative path', () => {
-    expect(deriveMarkdownPreviewSourceRoot('/tmp/orca_botmux/docs/note.md', 'docs/note.md')).toBe(
-      '/tmp/orca_botmux'
+    expect(deriveMarkdownPreviewSourceRoot('/tmp/botmux/docs/note.md', 'docs/note.md')).toBe(
+      '/tmp/botmux'
     )
   })
 
   it('falls back to the source file directory when no relative path is available', () => {
-    expect(deriveMarkdownPreviewSourceRoot('/tmp/orca_botmux/docs/note.md', null)).toBe('/tmp/orca_botmux/docs')
+    expect(deriveMarkdownPreviewSourceRoot('/tmp/botmux/docs/note.md', null)).toBe('/tmp/botmux/docs')
   })
 
   it('derives Windows source roots without dropping the drive separator', () => {
-    expect(deriveMarkdownPreviewSourceRoot('C:\\orca_botmux\\docs\\note.md', 'docs\\note.md')).toBe(
-      'C:/orca_botmux'
+    expect(deriveMarkdownPreviewSourceRoot('C:\\botmux\\docs\\note.md', 'docs\\note.md')).toBe(
+      'C:/botmux'
     )
   })
 
   it('falls back to the matching preview tab for preview-only source metadata', () => {
     const otherOwnerEdit = {
-      id: '/tmp/orca_botmux/docs/note.md',
-      filePath: '/tmp/orca_botmux/docs/note.md',
+      id: '/tmp/botmux/docs/note.md',
+      filePath: '/tmp/botmux/docs/note.md',
       relativePath: 'docs/note.md',
       worktreeId: 'wt-1',
       mode: 'edit'
     }
     const preview = {
-      id: 'markdown-preview::/tmp/orca_botmux/docs/note.md',
-      filePath: '/tmp/orca_botmux/docs/note.md',
+      id: 'markdown-preview::/tmp/botmux/docs/note.md',
+      filePath: '/tmp/botmux/docs/note.md',
       relativePath: 'docs/note.md',
       worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
       runtimeEnvironmentId: null,
       mode: 'markdown-preview',
-      markdownPreviewSourceFileId: '/tmp/orca_botmux/docs/note.md'
+      markdownPreviewSourceFileId: '/tmp/botmux/docs/note.md'
     }
 
     expect(
       findMarkdownPreviewSourceOpenFile([otherOwnerEdit, preview], {
-        sourceFileId: '/tmp/orca_botmux/docs/note.md',
-        filePath: '/tmp/orca_botmux/docs/note.md',
+        sourceFileId: '/tmp/botmux/docs/note.md',
+        filePath: '/tmp/botmux/docs/note.md',
         sourceWorktreeId: FLOATING_TERMINAL_WORKTREE_ID,
         sourceRuntimeEnvironmentId: null
       })
     ).toBe(preview)
     expect(deriveMarkdownPreviewSourceRoot(preview.filePath, preview.relativePath)).toBe(
-      '/tmp/orca_botmux'
+      '/tmp/botmux'
     )
   })
 

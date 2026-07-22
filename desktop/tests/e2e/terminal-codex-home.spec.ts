@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   execInTerminal,
   getTerminalContent,
@@ -9,7 +9,7 @@ import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } fro
 
 type CodexHomeProbe = {
   codexHome: string | null
-  orcaCodexHome: string | null
+  botmuxCodexHome: string | null
 }
 
 function readCodexHomeProbe(pageContent: string, marker: string): CodexHomeProbe | null {
@@ -21,39 +21,39 @@ function readCodexHomeProbe(pageContent: string, marker: string): CodexHomeProbe
 }
 
 test.describe('Terminal Codex runtime home', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
-  test('terminal process receives the OrcaBotmux-managed Codex home', async ({ orcaBotmuxPage }) => {
-    await waitForActiveTerminalManager(orcaBotmuxPage)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    const marker = `__ORCA_CODEX_HOME_E2E_${Date.now()}__`
+  test('terminal process receives the Botmux-managed Codex home', async ({ botmuxPage }) => {
+    await waitForActiveTerminalManager(botmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    const marker = `__BOTMUX_CODEX_HOME_E2E_${Date.now()}__`
     const command = [
       'node -e',
-      `"console.log('${marker}:' + JSON.stringify({codexHome: process.env.CODEX_HOME || null, orcaCodexHome: process.env.ORCA_CODEX_HOME || null}))"`
+      `"console.log('${marker}:' + JSON.stringify({codexHome: process.env.CODEX_HOME || null, botmuxCodexHome: process.env.BOTMUX_CODEX_HOME || null}))"`
     ].join(' ')
 
-    await execInTerminal(orcaBotmuxPage, ptyId, command)
+    await execInTerminal(botmuxPage, ptyId, command)
 
     let probe: CodexHomeProbe | null = null
     await expect
       .poll(
         async () => {
-          probe = readCodexHomeProbe(await getTerminalContent(orcaBotmuxPage), marker)
+          probe = readCodexHomeProbe(await getTerminalContent(botmuxPage), marker)
           return Boolean(
             probe?.codexHome &&
-            probe.orcaCodexHome &&
-            probe.codexHome === probe.orcaCodexHome &&
+            probe.botmuxCodexHome &&
+            probe.codexHome === probe.botmuxCodexHome &&
             /[\\/]codex-runtime-home[\\/]home$/.test(probe.codexHome)
           )
         },
-        { timeout: 15_000, message: 'Terminal did not expose OrcaBotmux-managed Codex home env' }
+        { timeout: 15_000, message: 'Terminal did not expose Botmux-managed Codex home env' }
       )
       .toBe(true)
 
-    expect(probe?.codexHome).toBe(probe?.orcaCodexHome)
+    expect(probe?.codexHome).toBe(probe?.botmuxCodexHome)
   })
 })

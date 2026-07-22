@@ -8,7 +8,7 @@
  * exit-waiter is released when the signal aborts, and an unsignalled one is not.
  */
 import { describe, expect, it } from 'vitest'
-import { OrcaRuntimeService } from './orca-botmux-runtime'
+import { BotmuxRuntimeService } from './botmux-runtime'
 import type { RuntimeTerminalWait } from '../../shared/runtime-types'
 
 type RuntimeInternals = {
@@ -17,24 +17,24 @@ type RuntimeInternals = {
   waitersByHandle: Map<string, Set<unknown>>
 }
 
-function internals(runtime: OrcaRuntimeService): RuntimeInternals {
+function internals(runtime: BotmuxRuntimeService): RuntimeInternals {
   return runtime as unknown as RuntimeInternals
 }
 
 // Register a live, connected PTY that a handle resolves to, so waitForTerminal
 // with condition:'exit' registers a pending waiter instead of resolving early.
-function registerLivePty(runtime: OrcaRuntimeService, ptyId: string, handle: string): void {
+function registerLivePty(runtime: BotmuxRuntimeService, ptyId: string, handle: string): void {
   internals(runtime).recordPtyWorktree(ptyId, 'wt-live', { connected: true })
   internals(runtime).handleByPtyId.set(ptyId, handle)
 }
 
-function waiterCount(runtime: OrcaRuntimeService, handle: string): number {
+function waiterCount(runtime: BotmuxRuntimeService, handle: string): number {
   return internals(runtime).waitersByHandle.get(handle)?.size ?? 0
 }
 
 describe('terminal.subscribe exit-waiter leak regression', () => {
   it('releases a signalled exit-waiter when the signal aborts', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     registerLivePty(runtime, 'pty-live', 'handle-live')
 
     const controller = new AbortController()
@@ -56,7 +56,7 @@ describe('terminal.subscribe exit-waiter leak regression', () => {
   })
 
   it('leaks an unsignalled exit-waiter across reconnects (documents the bug the fix prevents)', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     registerLivePty(runtime, 'pty-live', 'handle-live')
 
     // Three subscribes with no signal, as the pre-fix subscribe paths did.
@@ -70,7 +70,7 @@ describe('terminal.subscribe exit-waiter leak regression', () => {
   })
 
   it('does not leak when many signalled subscribes churn (reconnect simulation)', async () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     registerLivePty(runtime, 'pty-live', 'handle-live')
 
     for (let i = 0; i < 25; i += 1) {

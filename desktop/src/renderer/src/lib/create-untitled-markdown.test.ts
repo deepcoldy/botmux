@@ -122,10 +122,10 @@ describe('createUntitledMarkdownFile', () => {
       createUntitledMarkdownFile('/repo', 'wt-1', undefined, undefined, {
         now: new Date(2026, 4, 29, 7, 5),
         template: {
-          id: '.orca_botmux/templates/daily.md',
+          id: '.botmux/templates/daily.md',
           name: 'Daily',
-          filePath: '/repo/.orca_botmux/templates/daily.md',
-          relativePath: '.orca_botmux/templates/daily.md',
+          filePath: '/repo/.botmux/templates/daily.md',
+          relativePath: '.botmux/templates/daily.md',
           templateRelativePath: 'daily.md',
           basename: 'daily.md'
         }
@@ -137,7 +137,7 @@ describe('createUntitledMarkdownFile', () => {
     })
 
     expect(readFile).toHaveBeenCalledWith(
-      expect.objectContaining({ filePath: '/repo/.orca_botmux/templates/daily.md' })
+      expect.objectContaining({ filePath: '/repo/.botmux/templates/daily.md' })
     )
     expect(createFile).toHaveBeenCalledWith(
       expect.objectContaining({ filePath: '/repo/untitled.md' })
@@ -163,7 +163,7 @@ describe('createUntitledMarkdownFile', () => {
     })
     const writeFile = vi.fn().mockResolvedValueOnce(undefined)
     const pathExists = vi.fn(async ({ filePath }: { filePath: string }) =>
-      filePath.endsWith('/.orca_botmux/templates')
+      filePath.endsWith('/.botmux/templates')
     )
     const unsubscribe = subscribeMarkdownTemplatePicker((request) => {
       const template = request.templates[0]
@@ -200,7 +200,7 @@ describe('createUntitledMarkdownFile', () => {
     }
 
     expect(readDir).toHaveBeenCalledWith(
-      expect.objectContaining({ dirPath: '/repo/.orca_botmux/templates' })
+      expect.objectContaining({ dirPath: '/repo/.botmux/templates' })
     )
     expect(writeFile).toHaveBeenCalledWith(
       expect.objectContaining({ filePath: '/repo/untitled.md', content: '# Untitled\n' })

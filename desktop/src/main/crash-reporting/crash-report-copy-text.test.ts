@@ -4,7 +4,7 @@ import { formatCrashReportCopyText } from './crash-report-copy-text'
 describe('formatCrashReportCopyText', () => {
   it('appends only sanitized report and diagnostic omission failure fields', () => {
     const text = formatCrashReportCopyText('[Crash Report]', {
-      error: 'proxy failed at C:\\Users\\alice\\OrcaBotmux',
+      error: 'proxy failed at C:\\Users\\alice\\Botmux',
       diagnosticContext: {
         status: 'not_uploaded',
         reason: 'timeout token=super-secret-value\n- Forged field: hidden',

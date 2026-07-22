@@ -92,7 +92,7 @@ describe('FullDiskAccessSetupPrompt state helpers', () => {
     expect(isFullDiskAccessReady('unknown')).toBe(false)
   })
 
-  it('refreshes macOS Full Disk Access status when OrcaBotmux regains focus', async () => {
+  it('refreshes macOS Full Disk Access status when Botmux regains focus', async () => {
     setUserAgent('Macintosh')
     const getStatus = vi
       .fn()

@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { stageNodeScriptForTerminal } from './helpers/run-node-script-in-terminal'
 import {
   ensureTerminalVisible,
@@ -58,7 +58,7 @@ function buildSigwinchResetProbeCommand(): string {
     'setInterval(()=>{},1000)'
   ].join(';')
   // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-  return stageNodeScriptForTerminal(script, { prefix: 'orca-botmux-sigwinch-probe' }).command
+  return stageNodeScriptForTerminal(script, { prefix: 'botmux-sigwinch-probe' }).command
 }
 
 function buildSigwinchResetProbeSnapshot(label: string): string {
@@ -214,67 +214,67 @@ async function setHiddenSnapshotOverride(
 
 test.describe('Terminal tab switch SIGWINCH restore', () => {
   test('keeps an alternate-screen Codex viewport after hidden snapshot replay', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const shellTabId = (await getActiveTabId(orcaBotmuxPage))!
+    const shellTabId = (await getActiveTabId(botmuxPage))!
     const agentTabId = await createAgentMarkedTerminalTab(
-      orcaBotmuxPage,
+      botmuxPage,
       'codex',
       buildSigwinchResetProbeCommand()
     )
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPanePtyIdOnTab(orcaBotmuxPage, agentTabId)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPanePtyIdOnTab(botmuxPage, agentTabId)
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 8_000), {
+      .poll(() => getTerminalContent(botmuxPage, 8_000), {
         timeout: 10_000,
         message: 'SIGWINCH probe TUI did not paint its initial scrolled page'
       })
       .toContain(`VISIBLE_BEFORE_SWITCH page=${SIGWINCH_PROBE_PAGE}`)
-    const paneIdentity = await readPaneIdentityOnTab(orcaBotmuxPage, agentTabId)
-    await sendToTerminal(orcaBotmuxPage, paneIdentity.ptyId, 'ARM_SIGWINCH_PROBE\n')
+    const paneIdentity = await readPaneIdentityOnTab(botmuxPage, agentTabId)
+    await sendToTerminal(botmuxPage, paneIdentity.ptyId, 'ARM_SIGWINCH_PROBE\n')
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 8_000), {
+      .poll(() => getTerminalContent(botmuxPage, 8_000), {
         timeout: 10_000,
         message: 'SIGWINCH probe TUI did not arm after startup settled'
       })
       .toContain(`ARMED_BEFORE_SWITCH page=${SIGWINCH_PROBE_PAGE}`)
-    await orcaBotmuxPage.waitForTimeout(1_200)
-    const armedContentAfterSettle = await getTerminalContent(orcaBotmuxPage, 8_000)
+    await botmuxPage.waitForTimeout(1_200)
+    const armedContentAfterSettle = await getTerminalContent(botmuxPage, 8_000)
     expect(armedContentAfterSettle).not.toContain('TOP_AFTER_SIGWINCH page=0')
     const paneKey = `${agentTabId}:${paneIdentity.leafId}`
 
-    await activateTerminalTab(orcaBotmuxPage, shellTabId)
+    await activateTerminalTab(botmuxPage, shellTabId)
     const hiddenFrame = ['\x1b[?2026h', 'hidden probe frame', '\x1b[?2026l'].join('\r\n')
-    await resetHiddenOutputDebug(orcaBotmuxPage)
-    await injectPaneData(orcaBotmuxPage, paneKey, hiddenFrame, {
+    await resetHiddenOutputDebug(botmuxPage)
+    await injectPaneData(botmuxPage, paneKey, hiddenFrame, {
       seq: hiddenFrame.length,
       rawLength: hiddenFrame.length
     })
 
     await expect
-      .poll(async () => (await readHiddenOutputDebug(orcaBotmuxPage))?.hiddenRendererSkipCount ?? 0, {
+      .poll(async () => (await readHiddenOutputDebug(botmuxPage))?.hiddenRendererSkipCount ?? 0, {
         timeout: 5_000,
         message: 'Codex probe hidden output did not take the skipped renderer path'
       })
       .toBeGreaterThan(0)
-    await setHiddenSnapshotOverride(orcaBotmuxPage, paneIdentity.ptyId, {
+    await setHiddenSnapshotOverride(botmuxPage, paneIdentity.ptyId, {
       data: buildSigwinchResetProbeSnapshot('RESTORED_SNAPSHOT'),
       cols: paneIdentity.cols,
       rows: paneIdentity.rows,
       seq: hiddenFrame.length
     })
 
-    await activateTerminalTab(orcaBotmuxPage, agentTabId)
+    await activateTerminalTab(botmuxPage, agentTabId)
 
     await expect
       .poll(
         async () => {
-          const content = await getTerminalContent(orcaBotmuxPage, 8_000)
+          const content = await getTerminalContent(botmuxPage, 8_000)
           if (content.includes('TOP_AFTER_SIGWINCH page=0')) {
             return 'top'
           }
@@ -288,8 +288,8 @@ test.describe('Terminal tab switch SIGWINCH restore', () => {
         }
       )
       .toBe('snapshot')
-    await orcaBotmuxPage.waitForTimeout(1_200)
-    const contentAfterSettle = await getTerminalContent(orcaBotmuxPage, 8_000)
+    await botmuxPage.waitForTimeout(1_200)
+    const contentAfterSettle = await getTerminalContent(botmuxPage, 8_000)
     expect(contentAfterSettle).toContain(`RESTORED_SNAPSHOT page=${SIGWINCH_PROBE_PAGE}`)
     expect(contentAfterSettle).not.toContain('TOP_AFTER_SIGWINCH page=0')
   })

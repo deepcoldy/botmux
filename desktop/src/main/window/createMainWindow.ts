@@ -21,7 +21,7 @@ import {
   normalizeBrowserNavigationUrl,
   normalizeExternalBrowserUrl
 } from '../../shared/browser-url'
-import { ORCA_BROWSER_GUEST_WEB_PREFERENCES } from '../../shared/browser-guest-web-preferences'
+import { BOTMUX_BROWSER_GUEST_WEB_PREFERENCES } from '../../shared/browser-guest-web-preferences'
 import { isCrashReportReason } from '../../shared/crash-reporting'
 import {
   DEFAULT_RENDERER_RECOVERY_MAX_RECOVERIES,
@@ -153,7 +153,7 @@ type CreateMainWindowOptions = {
     details: Electron.RenderProcessGoneDetails,
     webContentsId: number
   ) => void
-  /** Returns true when OrcaBotmux should reload after an unexpected renderer loss.
+  /** Returns true when Botmux should reload after an unexpected renderer loss.
    *  Why: update relaunch and app quit intentionally tear down child
    *  processes; recovering those paths can fight Electron's shutdown. */
   shouldRecoverRenderer?: (
@@ -162,7 +162,7 @@ type CreateMainWindowOptions = {
   ) => boolean
   /** Called when consecutive auto-recoveries hit the circuit-breaker limit, so
    *  the host can record diagnostics and surface a recovery prompt instead of
-   *  letting OrcaBotmux crash-loop. */
+   *  letting Botmux crash-loop. */
   onRendererRecoveryExhausted?: (info: {
     details: Electron.RenderProcessGoneDetails
     webContentsId: number
@@ -280,10 +280,10 @@ export function createMainWindow(
     ...(savedBounds ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: MIN_WIDTH,
     minHeight: MIN_HEIGHT,
-    title: opts?.title ?? 'orca_botmux',
+    title: opts?.title ?? 'botmux',
     show: false,
     // Why: macOS swallows the app-activating click by default, so clicking
-    // back into OrcaBotmux (e.g. the floating workspace) needed a second click.
+    // back into Botmux (e.g. the floating workspace) needed a second click.
     // macOS-only option; Windows/Linux already deliver that click.
     acceptFirstMouse: true,
     // Why: on macOS the menu lives in the system menu bar, so the in-window
@@ -531,10 +531,10 @@ export function createMainWindow(
     // Why: arbitrary sites must stay inside an unprivileged guest surface. We
     // fail closed here so a renderer bug cannot smuggle preload, Node, or a
     // non-browser partition into the guest and widen the app privilege boundary.
-    // The one allowed data URL is OrcaBotmux's inert blank-tab bootstrap page; deny
+    // The one allowed data URL is Botmux's inert blank-tab bootstrap page; deny
     // every other data URL so the renderer cannot inject arbitrary inline HTML.
     // Why: session profiles use per-profile partitions (e.g.
-    // persist:orca-botmux-browser-session-<uuid>). The registry is the sole authority
+    // persist:botmux-browser-session-<uuid>). The registry is the sole authority
     // for which partitions are valid — renderer-provided strings that are not
     // in the allowlist are rejected.
     if (!normalizedSrc || !browserSessionRegistry.isAllowedPartition(partition)) {
@@ -556,7 +556,7 @@ export function createMainWindow(
     webPreferences.sandbox = true
     // Why: keep renderer-created webviews aligned with the browser guest policy
     // even if the host markup omits or misspells a preference.
-    Object.assign(webPreferences, ORCA_BROWSER_GUEST_WEB_PREFERENCES)
+    Object.assign(webPreferences, BOTMUX_BROWSER_GUEST_WEB_PREFERENCES)
     // Why: preserve the registry-validated partition instead of forcing the
     // legacy constant. This lets imported/isolated session profiles use their
     // own cookie/storage partition while keeping all other hardening intact.
@@ -566,7 +566,7 @@ export function createMainWindow(
   mainWindow.webContents.on('did-attach-webview', (_event, guest) => {
     // Why: popup and navigation policy must attach as soon as Chromium creates
     // the guest webContents. Waiting until renderer-driven registration leaves
-    // a race where target=_blank or early redirects can bypass OrcaBotmux's intended
+    // a race where target=_blank or early redirects can bypass Botmux's intended
     // fallback behavior.
     browserManager.attachGuestPolicies(guest)
   })
@@ -856,7 +856,7 @@ export function createMainWindow(
 
     const capturedTerminalActionId =
       focusedShortcutContext.context === 'terminal' &&
-      focusedShortcutContext.terminalShortcutPolicy === 'orca-botmux-first' &&
+      focusedShortcutContext.terminalShortcutPolicy === 'botmux-first' &&
       windowShortcutActionCapturesTerminal(action)
         ? getWindowShortcutActionId(action)
         : null
@@ -919,7 +919,7 @@ export function createMainWindow(
 
     if (isMacAppPasteInput(input)) {
       // Why: native chat/terminal panes can own focus without being native
-      // editable controls, so route Cmd+V through OrcaBotmux's paste ownership first.
+      // editable controls, so route Cmd+V through Botmux's paste ownership first.
       event.preventDefault()
       mainWindow.webContents.send('ui:appMenuPaste')
       return
@@ -1083,10 +1083,10 @@ export function createMainWindow(
     if (store.getUI().trayMinimizeNoticeShown !== true) {
       try {
         new Notification({
-          title: 'orca_botmux',
+          title: 'botmux',
           body: translateMain(
             'tray.minimizeNotice.body',
-            'OrcaBotmux is still running in the system tray'
+            'Botmux is still running in the system tray'
           )
         }).show()
       } catch {
@@ -1170,7 +1170,7 @@ export function createMainWindow(
       mainWindow.minimize()
     }
   }
-  // Why: orca_botmux session open (and similar intentional UI actions) must raise
+  // Why: botmux session open (and similar intentional UI actions) must raise
   // the desktop window so hidden-delivery does not leave attach output gated
   // while the user believes they opened a terminal.
   const focusChannel = 'window:focus'
@@ -1270,7 +1270,7 @@ export function createMainWindow(
     // Why: on updater-triggered shutdown, BrowserWindow can emit `closed`
     // after its webContents has already been destroyed. The destroyed
     // webContents owns its listeners, so do not touch `mainWindow.webContents`
-    // here or the quit path can crash before Squirrel.Mac relaunches OrcaBotmux.
+    // here or the quit path can crash before Squirrel.Mac relaunches Botmux.
     app.removeListener('before-quit', freezeBoundsOnQuit)
   })
 

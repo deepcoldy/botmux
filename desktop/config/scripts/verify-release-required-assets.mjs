@@ -11,22 +11,22 @@ export function getRequiredReleaseAssetNames(tag) {
     'latest-linux-arm64.yml',
     'latest-mac.yml',
     'latest.yml',
-    'orca-botmux-linux.AppImage',
-    'orca-botmux-linux-arm64.AppImage',
-    `orca_botmux-ide_${version}_amd64.deb`,
-    `orca_botmux-ide_${version}_arm64.deb`,
-    `orca_botmux-ide-${version}.x86_64.rpm`,
-    `orca_botmux-ide-${version}.aarch64.rpm`,
-    'orca-botmux-windows-setup.exe',
-    'orca-botmux-windows-setup.exe.blockmap',
-    `OrcaBotmux-${version}-mac.zip`,
-    `OrcaBotmux-${version}-mac.zip.blockmap`,
-    `OrcaBotmux-${version}-arm64-mac.zip`,
-    `OrcaBotmux-${version}-arm64-mac.zip.blockmap`,
-    'orca-botmux-macos-x64.dmg',
-    'orca-botmux-macos-x64.dmg.blockmap',
-    'orca-botmux-macos-arm64.dmg',
-    'orca-botmux-macos-arm64.dmg.blockmap'
+    'botmux-linux.AppImage',
+    'botmux-linux-arm64.AppImage',
+    `botmux-ide_${version}_amd64.deb`,
+    `botmux-ide_${version}_arm64.deb`,
+    `botmux-ide-${version}.x86_64.rpm`,
+    `botmux-ide-${version}.aarch64.rpm`,
+    'botmux-windows-setup.exe',
+    'botmux-windows-setup.exe.blockmap',
+    `Botmux-${version}-mac.zip`,
+    `Botmux-${version}-mac.zip.blockmap`,
+    `Botmux-${version}-arm64-mac.zip`,
+    `Botmux-${version}-arm64-mac.zip.blockmap`,
+    'botmux-macos-x64.dmg',
+    'botmux-macos-x64.dmg.blockmap',
+    'botmux-macos-arm64.dmg',
+    'botmux-macos-arm64.dmg.blockmap'
   ]
 }
 
@@ -150,7 +150,7 @@ async function main() {
   if (!token) {
     throw new Error('GH_TOKEN or GITHUB_TOKEN must be set')
   }
-  const repo = process.env.GITHUB_REPOSITORY || 'stablyai/orca_botmux'
+  const repo = process.env.GITHUB_REPOSITORY || 'stablyai/botmux'
   const result = await verifyRequiredReleaseAssets({ repo, tag, token })
   console.log(`Verified ${result.checked.length} required release assets for ${repo}@${tag}`)
 }

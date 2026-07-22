@@ -28,7 +28,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 
 function expectStablePaneSpawn(): string {
   const spawnArgs = mockSpawn.mock.calls[0]?.[0]
-  const paneKey = spawnArgs?.env?.ORCA_PANE_KEY
+  const paneKey = spawnArgs?.env?.BOTMUX_PANE_KEY
   const leafId = spawnArgs?.leafId
   expect(typeof paneKey).toBe('string')
   expect(typeof leafId).toBe('string')
@@ -232,8 +232,8 @@ describe('launchAgentBackgroundSession', () => {
         cwd: '/repo/worktree',
         command: "claude '--dangerously-skip-permissions' 'run the automation'",
         env: expect.objectContaining({
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1'
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1'
         }),
         connectionId: null,
         worktreeId: 'wt-1',
@@ -261,7 +261,7 @@ describe('launchAgentBackgroundSession', () => {
       launchToken: expect.stringMatching(UUID_RE)
     })
     expect(mockSpawn.mock.calls[0]?.[0].launchToken).toBe(
-      mockSpawn.mock.calls[0]?.[0].env.ORCA_AGENT_LAUNCH_TOKEN
+      mockSpawn.mock.calls[0]?.[0].env.BOTMUX_AGENT_LAUNCH_TOKEN
     )
     expect(mockSetTabCustomTitle).toHaveBeenCalledWith('tab-1', 'Nightly audit', {
       recordInteraction: false
@@ -382,7 +382,7 @@ describe('launchAgentBackgroundSession', () => {
     const effectiveLaunchConfig = {
       agentCommand: "claude '--dangerously-skip-permissions'",
       agentArgs: '--dangerously-skip-permissions',
-      agentEnv: { ORCA_AGENT_TEAMS_TEAM_ID: 'team-fresh' }
+      agentEnv: { BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-fresh' }
     }
     mockSpawn.mockResolvedValue({ id: 'pty-1', launchConfig: effectiveLaunchConfig })
     const { launchAgentBackgroundSession } = await import('./launch-agent-background-session')
@@ -397,7 +397,7 @@ describe('launchAgentBackgroundSession', () => {
     const leafId = paneKey.slice('tab-1:'.length)
     expect(mockRegisterAgentLaunchConfig).toHaveBeenLastCalledWith(paneKey, effectiveLaunchConfig, {
       agentType: 'claude',
-      launchToken: mockSpawn.mock.calls[0]?.[0].env.ORCA_AGENT_LAUNCH_TOKEN,
+      launchToken: mockSpawn.mock.calls[0]?.[0].env.BOTMUX_AGENT_LAUNCH_TOKEN,
       tabId: 'tab-1',
       leafId
     })
@@ -604,8 +604,8 @@ describe('launchAgentBackgroundSession', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       expect.objectContaining({
-        command: expect.stringContaining('ORCA_HERMES_STARTUP_QUERY'),
-        env: expect.objectContaining({ ORCA_HERMES_STARTUP_QUERY: 'run the automation' })
+        command: expect.stringContaining('BOTMUX_HERMES_STARTUP_QUERY'),
+        env: expect.objectContaining({ BOTMUX_HERMES_STARTUP_QUERY: 'run the automation' })
       })
     )
     expect(mockPasteDraftWhenAgentReady).not.toHaveBeenCalled()
@@ -625,7 +625,7 @@ describe('launchAgentBackgroundSession', () => {
     expect(mockSpawn).toHaveBeenCalledWith(
       expect.objectContaining({
         command: expect.stringContaining('powershell.exe -NoProfile -EncodedCommand'),
-        env: expect.objectContaining({ ORCA_HERMES_STARTUP_QUERY: 'run the automation' })
+        env: expect.objectContaining({ BOTMUX_HERMES_STARTUP_QUERY: 'run the automation' })
       })
     )
   })
@@ -642,9 +642,9 @@ describe('launchAgentBackgroundSession', () => {
 
     expect(mockSpawn).toHaveBeenCalledWith(
       expect.objectContaining({
-        command: expect.stringContaining('ORCA_HERMES_STARTUP_QUERY'),
+        command: expect.stringContaining('BOTMUX_HERMES_STARTUP_QUERY'),
         connectionId: 'ssh-1',
-        env: expect.objectContaining({ ORCA_HERMES_STARTUP_QUERY: 'remote automation prompt' })
+        env: expect.objectContaining({ BOTMUX_HERMES_STARTUP_QUERY: 'remote automation prompt' })
       })
     )
   })
@@ -703,7 +703,7 @@ describe('launchAgentBackgroundSession', () => {
       vi.advanceTimersByTime(50)
       expect(mockWrite).not.toHaveBeenCalled()
 
-      dataSidecar('\x1b]777;orca-botmux-shell-ready\x07user@remote repo % ')
+      dataSidecar('\x1b]777;botmux-shell-ready\x07user@remote repo % ')
       vi.advanceTimersByTime(50)
 
       expect(mockWrite).toHaveBeenCalledWith(
@@ -744,7 +744,7 @@ describe('launchAgentBackgroundSession', () => {
       vi.advanceTimersByTime(50)
       expect(mockWrite).not.toHaveBeenCalled()
 
-      dataSidecar('\x1b]777;orca-botmux-shell-ready\x07user@remote repo % ')
+      dataSidecar('\x1b]777;botmux-shell-ready\x07user@remote repo % ')
       vi.advanceTimersByTime(50)
 
       expect(mockWrite).toHaveBeenCalledWith(
@@ -773,7 +773,7 @@ describe('launchAgentBackgroundSession', () => {
       const exitSidecar = mockSubscribeToPtyExit.mock.calls[0]?.[1] as (code: number) => void
       exitSidecar(0)
 
-      dataSidecar('\x1b]777;orca-botmux-shell-ready\x07user@remote repo % ')
+      dataSidecar('\x1b]777;botmux-shell-ready\x07user@remote repo % ')
       vi.advanceTimersByTime(50)
 
       expect(mockWrite).not.toHaveBeenCalled()
@@ -798,7 +798,7 @@ describe('launchAgentBackgroundSession', () => {
 
     expect(mockSpawn).not.toHaveBeenCalled()
     const params = mockRuntimeEnvironmentCall.mock.calls[0]?.[0]?.params
-    const paneKey = params?.env?.ORCA_PANE_KEY
+    const paneKey = params?.env?.BOTMUX_PANE_KEY
     const leafId = typeof paneKey === 'string' ? paneKey.slice('tab-1:'.length) : ''
     expect(leafId).toMatch(UUID_RE)
     expect(mockRegisterAgentLaunchConfig).toHaveBeenCalledWith(
@@ -831,9 +831,9 @@ describe('launchAgentBackgroundSession', () => {
         command: "claude '--dangerously-skip-permissions' 'run the automation'",
         launchAgent: 'claude',
         env: expect.objectContaining({
-          ORCA_PANE_KEY: `tab-1:${leafId}`,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1'
+          BOTMUX_PANE_KEY: `tab-1:${leafId}`,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1'
         }),
         tabId: 'tab-1',
         leafId,

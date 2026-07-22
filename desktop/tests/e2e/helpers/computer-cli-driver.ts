@@ -5,27 +5,27 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
-const RUNTIME_METADATA_FILE = 'orca-botmux-runtime.json'
-let orcaDevUserDataPath: string | null = null
-let orcaServeProcess: ChildProcess | null = null
-let orcaServeStdout = ''
-let orcaServeStderr = ''
+const RUNTIME_METADATA_FILE = 'botmux-runtime.json'
+let botmuxDevUserDataPath: string | null = null
+let botmuxServeProcess: ChildProcess | null = null
+let botmuxServeStdout = ''
+let botmuxServeStderr = ''
 
 export type CliResult = {
   stdout: string
   stderr: string
 }
 
-type RunOrcaCliOptions = {
+type RunBotmuxCliOptions = {
   retryMissingRuntimeMetadata?: boolean
 }
 
-export async function runOrcaCli(
+export async function runBotmuxCli(
   args: string[],
-  options: RunOrcaCliOptions = {}
+  options: RunBotmuxCliOptions = {}
 ): Promise<CliResult> {
   try {
-    return await runOrcaCliOnce(args)
+    return await runBotmuxCliOnce(args)
   } catch (error) {
     if (
       options.retryMissingRuntimeMetadata !== false &&
@@ -33,20 +33,20 @@ export async function runOrcaCli(
     ) {
       // Why: Windows CI can let the dev runtime exit while launching the
       // fixture app; reopen once so the desktop action gets a live runtime.
-      await ensureOrcaRuntimeLaunched()
-      return await runOrcaCliOnce(args)
+      await ensureBotmuxRuntimeLaunched()
+      return await runBotmuxCliOnce(args)
     }
     throw error
   }
 }
 
-async function runOrcaCliOnce(args: string[]): Promise<CliResult> {
-  const devCli = join(process.cwd(), 'config/scripts/orca-botmux-desktop-dev.mjs')
-  const command = process.env.ORCA_COMPUTER_CLI ?? process.execPath
-  const cliArgs = process.env.ORCA_COMPUTER_CLI ? args : [devCli, ...args]
+async function runBotmuxCliOnce(args: string[]): Promise<CliResult> {
+  const devCli = join(process.cwd(), 'config/scripts/botmux-desktop-dev.mjs')
+  const command = process.env.BOTMUX_COMPUTER_CLI ?? process.execPath
+  const cliArgs = process.env.BOTMUX_COMPUTER_CLI ? args : [devCli, ...args]
   const env = { ...process.env }
-  if (!process.env.ORCA_COMPUTER_CLI && !env.ORCA_DEV_USER_DATA_PATH) {
-    env.ORCA_DEV_USER_DATA_PATH = await getComputerE2eOrcaDevUserDataPath()
+  if (!process.env.BOTMUX_COMPUTER_CLI && !env.BOTMUX_DEV_USER_DATA_PATH) {
+    env.BOTMUX_DEV_USER_DATA_PATH = await getComputerE2eBotmuxDevUserDataPath()
   }
   try {
     const result = await execFileAsync(command, cliArgs, {
@@ -63,21 +63,21 @@ async function runOrcaCliOnce(args: string[]): Promise<CliResult> {
   }
 }
 
-export async function ensureOrcaRuntimeLaunched(): Promise<void> {
-  if (!process.env.ORCA_COMPUTER_CLI && process.platform === 'win32') {
-    await ensureOrcaRuntimeServed()
+export async function ensureBotmuxRuntimeLaunched(): Promise<void> {
+  if (!process.env.BOTMUX_COMPUTER_CLI && process.platform === 'win32') {
+    await ensureBotmuxRuntimeServed()
     return
   }
-  await runOrcaCli(['open', '--json'], { retryMissingRuntimeMetadata: false })
-  await waitForOrcaRuntimeReady()
+  await runBotmuxCli(['open', '--json'], { retryMissingRuntimeMetadata: false })
+  await waitForBotmuxRuntimeReady()
 }
 
-export async function stopOrcaRuntime(): Promise<void> {
-  const processToStop = orcaServeProcess
+export async function stopBotmuxRuntime(): Promise<void> {
+  const processToStop = botmuxServeProcess
   if (!processToStop?.pid) {
     return
   }
-  orcaServeProcess = null
+  botmuxServeProcess = null
   if (process.platform === 'win32') {
     try {
       await execFileAsync('taskkill.exe', ['/PID', String(processToStop.pid), '/T', '/F'])
@@ -93,17 +93,17 @@ export function parseJsonOutput<T>(stdout: string): T {
   return JSON.parse(stdout) as T
 }
 
-async function getComputerE2eOrcaDevUserDataPath(): Promise<string> {
-  if (!orcaDevUserDataPath) {
-    // Why: the shared orca-botmux-desktop-dev profile can keep an older runtime alive across
+async function getComputerE2eBotmuxDevUserDataPath(): Promise<string> {
+  if (!botmuxDevUserDataPath) {
+    // Why: the shared botmux-desktop-dev profile can keep an older runtime alive across
     // local test runs, making computer-use E2E exercise stale provider code.
-    orcaDevUserDataPath = await mkdtemp(join(tmpdir(), 'orca-botmux-computer-runtime-'))
+    botmuxDevUserDataPath = await mkdtemp(join(tmpdir(), 'botmux-computer-runtime-'))
   }
-  return orcaDevUserDataPath
+  return botmuxDevUserDataPath
 }
 
-async function waitForOrcaRuntimeReady(): Promise<void> {
-  const userDataPath = await getComputerE2eOrcaDevUserDataPath()
+async function waitForBotmuxRuntimeReady(): Promise<void> {
+  const userDataPath = await getComputerE2eBotmuxDevUserDataPath()
   const metadataPath = join(userDataPath, RUNTIME_METADATA_FILE)
   const deadline = Date.now() + 15000
   let lastError: unknown = null
@@ -113,7 +113,7 @@ async function waitForOrcaRuntimeReady(): Promise<void> {
       await access(metadataPath)
       const status = parseJsonOutput<{
         result: { runtime: { reachable: boolean } }
-      }>((await runOrcaCli(['status', '--json'], { retryMissingRuntimeMetadata: false })).stdout)
+      }>((await runBotmuxCli(['status', '--json'], { retryMissingRuntimeMetadata: false })).stdout)
       if (status.result.runtime.reachable) {
         return
       }
@@ -125,45 +125,45 @@ async function waitForOrcaRuntimeReady(): Promise<void> {
 
   const detail = [
     lastError instanceof Error ? `Last error: ${lastError.message}` : null,
-    orcaServeStdout.trim() ? `serve stdout: ${orcaServeStdout.trim()}` : null,
-    orcaServeStderr.trim() ? `serve stderr: ${orcaServeStderr.trim()}` : null
+    botmuxServeStdout.trim() ? `serve stdout: ${botmuxServeStdout.trim()}` : null,
+    botmuxServeStderr.trim() ? `serve stderr: ${botmuxServeStderr.trim()}` : null
   ]
     .filter(Boolean)
     .join(' ')
-  throw new Error(`OrcaBotmux runtime metadata was not ready at ${metadataPath}.${detail}`)
+  throw new Error(`Botmux runtime metadata was not ready at ${metadataPath}.${detail}`)
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function ensureOrcaRuntimeServed(): Promise<void> {
-  if (!orcaServeProcess || orcaServeProcess.exitCode !== null) {
-    const devCli = join(process.cwd(), 'config/scripts/orca-botmux-desktop-dev.mjs')
+async function ensureBotmuxRuntimeServed(): Promise<void> {
+  if (!botmuxServeProcess || botmuxServeProcess.exitCode !== null) {
+    const devCli = join(process.cwd(), 'config/scripts/botmux-desktop-dev.mjs')
     const env = {
       ...process.env,
-      ORCA_DEV_USER_DATA_PATH: await getComputerE2eOrcaDevUserDataPath()
+      BOTMUX_DEV_USER_DATA_PATH: await getComputerE2eBotmuxDevUserDataPath()
     }
-    orcaServeStdout = ''
-    orcaServeStderr = ''
-    orcaServeProcess = spawn(process.execPath, [devCli, 'serve', '--no-pairing', '--json'], {
+    botmuxServeStdout = ''
+    botmuxServeStderr = ''
+    botmuxServeProcess = spawn(process.execPath, [devCli, 'serve', '--no-pairing', '--json'], {
       env,
       windowsHide: true
     })
-    orcaServeProcess.stdout?.on('data', (chunk) => {
-      orcaServeStdout += String(chunk)
+    botmuxServeProcess.stdout?.on('data', (chunk) => {
+      botmuxServeStdout += String(chunk)
     })
-    orcaServeProcess.stderr?.on('data', (chunk) => {
-      orcaServeStderr += String(chunk)
+    botmuxServeProcess.stderr?.on('data', (chunk) => {
+      botmuxServeStderr += String(chunk)
     })
-    orcaServeProcess.once('exit', () => {
-      orcaServeProcess = null
+    botmuxServeProcess.once('exit', () => {
+      botmuxServeProcess = null
     })
     process.once('exit', () => {
-      orcaServeProcess?.kill()
+      botmuxServeProcess?.kill()
     })
   }
-  await waitForOrcaRuntimeReady()
+  await waitForBotmuxRuntimeReady()
 }
 
 function isMissingRuntimeMetadataError(args: string[], error: unknown): boolean {
@@ -176,6 +176,6 @@ function isMissingRuntimeMetadataError(args: string[], error: unknown): boolean 
   const message = String((error as { message?: unknown }).message)
   return (
     message.includes('"code": "runtime_unavailable"') &&
-    message.includes('Could not read OrcaBotmux runtime metadata')
+    message.includes('Could not read Botmux runtime metadata')
   )
 }

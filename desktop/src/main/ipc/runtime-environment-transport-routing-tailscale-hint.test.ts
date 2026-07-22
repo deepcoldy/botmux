@@ -35,7 +35,7 @@ function seedEnvironment(name: string, endpoint: string): string {
 }
 
 beforeEach(() => {
-  userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-tailscale-hint-'))
+  userDataPath = mkdtempSync(join(tmpdir(), 'botmux-tailscale-hint-'))
 })
 
 afterEach(() => {

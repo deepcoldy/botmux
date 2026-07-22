@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 import type { Page } from '@stablyai/playwright-test'
 
@@ -51,7 +51,7 @@ function initializeGitRepo(repoPath: string): void {
 async function createProjectHeaderSortFixture(): Promise<string[]> {
   // Why: match the app's canonical repo.path on macOS, where os.tmpdir()
   // can resolve through /var -> /private/var.
-  const root = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-project-sort-')))
+  const root = realpathSync(await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-project-sort-')))
   tempRoots.push(root)
   const repoPaths = PROJECT_NAMES.map((name) => path.join(root, name))
   for (const repoPath of repoPaths) {
@@ -273,27 +273,27 @@ test.afterEach(() => {
 
 test.describe('Project Group manual sorting', () => {
   test('dragging a project header body reorders the visible project headers', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const repoPaths = await createProjectHeaderSortFixture()
-    const projects = await seedProjectHeaderSortScenario(orcaBotmuxPage, repoPaths)
+    const projects = await seedProjectHeaderSortScenario(botmuxPage, repoPaths)
 
     await expect
-      .poll(() => getProjectHeaderOrder(orcaBotmuxPage, projects), {
+      .poll(() => getProjectHeaderOrder(botmuxPage, projects), {
         timeout: 12_000,
         message: 'Project headers did not render in manual order'
       })
       .toEqual([projects.alphaId, projects.bravoId, projects.charlieId])
 
     await dragProjectBefore({
-      page: orcaBotmuxPage,
+      page: botmuxPage,
       draggedProjectId: projects.charlieId,
       targetProjectId: projects.bravoId
     })
 
     await expect
-      .poll(() => getProjectHeaderOrder(orcaBotmuxPage, projects), {
+      .poll(() => getProjectHeaderOrder(botmuxPage, projects), {
         timeout: 12_000,
         message: 'Dragged project header body did not persist the requested visible order'
       })
@@ -301,14 +301,14 @@ test.describe('Project Group manual sorting', () => {
   })
 
   test('dropping a project over another project body snaps to that section boundary', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const repoPaths = await createProjectHeaderSortFixture()
-    const projects = await seedProjectHeaderSortScenario(orcaBotmuxPage, repoPaths)
+    const projects = await seedProjectHeaderSortScenario(botmuxPage, repoPaths)
 
     await expect
-      .poll(() => getProjectHeaderOrder(orcaBotmuxPage, projects), {
+      .poll(() => getProjectHeaderOrder(botmuxPage, projects), {
         timeout: 12_000,
         message: 'Project headers did not render in manual order'
       })
@@ -319,13 +319,13 @@ test.describe('Project Group manual sorting', () => {
     // charlie's top) map to the slot after bravo, so alpha lands between bravo
     // and charlie deterministically regardless of the exact section height.
     await dragProjectIntoProjectBody({
-      page: orcaBotmuxPage,
+      page: botmuxPage,
       draggedProjectId: projects.alphaId,
       targetProjectId: projects.bravoId
     })
 
     await expect
-      .poll(() => getProjectHeaderOrder(orcaBotmuxPage, projects), {
+      .poll(() => getProjectHeaderOrder(botmuxPage, projects), {
         timeout: 12_000,
         message: 'Dropping into a project body should snap to the nearest boundary slot'
       })
@@ -333,26 +333,26 @@ test.describe('Project Group manual sorting', () => {
   })
 
   test('dragging a duplicate-ranked Project Group header reorders the visible headers', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const groups = await seedDuplicateTabOrderProjectGroups(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    const groups = await seedDuplicateTabOrderProjectGroups(botmuxPage)
 
     await expect
-      .poll(() => getProjectGroupHeaderOrder(orcaBotmuxPage, groups), {
+      .poll(() => getProjectGroupHeaderOrder(botmuxPage, groups), {
         timeout: 12_000,
         message: 'Project Group headers did not render in duplicate-rank name order'
       })
       .toEqual([groups.alphaId, groups.bravoId, groups.charlieId, groups.deltaId])
 
     await dragProjectGroupBefore({
-      page: orcaBotmuxPage,
+      page: botmuxPage,
       draggedGroupId: groups.deltaId,
       targetGroupId: groups.charlieId
     })
 
     await expect
-      .poll(() => getProjectGroupHeaderOrder(orcaBotmuxPage, groups), {
+      .poll(() => getProjectGroupHeaderOrder(botmuxPage, groups), {
         timeout: 12_000,
         message: 'Dragged Project Group header did not persist the requested visible order'
       })

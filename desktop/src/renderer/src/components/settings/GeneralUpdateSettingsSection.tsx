@@ -80,7 +80,7 @@ export function GeneralUpdateSettingsSection(): React.JSX.Element {
         )}
         description={translate(
           'auto.components.settings.GeneralUpdateSettingsSection.ceb579abaf',
-          'Check for app updates and install a newer OrcaBotmux version.'
+          'Check for app updates and install a newer Botmux version.'
         )}
         keywords={['update', 'version', 'release notes', 'download']}
         className="space-y-3"
@@ -170,7 +170,7 @@ export function GeneralUpdateSettingsSection(): React.JSX.Element {
               <a
                 href={
                   updateStatus.releaseUrl ??
-                  `https://github.com/stablyai/orca_botmux/releases/tag/v${updateStatus.version}`
+                  `https://github.com/stablyai/botmux/releases/tag/v${updateStatus.version}`
                 }
                 target="_blank"
                 rel="noopener noreferrer"
@@ -208,7 +208,7 @@ export function GeneralUpdateSettingsSection(): React.JSX.Element {
               <a
                 href={
                   updateStatus.releaseUrl ??
-                  `https://github.com/stablyai/orca_botmux/releases/tag/v${updateStatus.version}`
+                  `https://github.com/stablyai/botmux/releases/tag/v${updateStatus.version}`
                 }
                 target="_blank"
                 rel="noopener noreferrer"

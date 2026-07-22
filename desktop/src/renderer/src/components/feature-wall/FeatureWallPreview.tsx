@@ -78,13 +78,14 @@ export function RelatedFeatures(props: {
             <button
               type="button"
               onClick={() => {
+                // Why: product docs site is not shipped yet; related tiles only
+                // record interest telemetry (no external docs URL).
                 track('feature_wall_docs_clicked', {
                   group_id: workflow.id,
                   tile_id: tile.id,
                   source
                 })
                 track('feature_wall_tile_clicked', { tile_id: tile.id })
-                void window.api.shell.openUrl(tile.docsUrl)
               }}
               className="inline-flex items-center gap-1.5 text-left text-[13px] hover:underline hover:underline-offset-2"
             >

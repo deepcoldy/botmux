@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
 import { getRendererTitleLog, installRendererTitleLog } from './helpers/terminal-title-log'
 import {
@@ -158,24 +158,24 @@ async function isWorktreeUnread(page: Page, worktreeId: string): Promise<boolean
 
 test.describe('Droid notifications', () => {
   test('Codex hook completion dispatches while its worktree is inactive', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installMainProcessNotificationDispatchSpy(electronApp)
     const endpoint = await readHookEndpoint(electronApp)
 
     // Why: the synthetic hook bypasses the shell startup path; wait for a
     // responsive PTY so the notification liveness gate can observe the turn.
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const readyMarker = `__CODEX_HOOK_NOTIFY_READY_${Date.now()}__`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `printf '${readyMarker}\\n'\r`)
-    await waitForTerminalOutput(orcaBotmuxPage, readyMarker)
+    await sendToTerminal(botmuxPage, ptyId, `printf '${readyMarker}\\n'\r`)
+    await waitForTerminalOutput(botmuxPage, readyMarker)
 
-    const { paneKey, worktreeId } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
+    const { paneKey, worktreeId } = await waitForActivePaneHookDescriptor(botmuxPage)
     const prompt = `codex-hook-notify-${Date.now()}`
     await emitCodexHookStatus(endpoint, {
       paneKey,
@@ -186,7 +186,7 @@ test.describe('Droid notifications', () => {
     await expect
       .poll(
         async () =>
-          (await getRendererOrCachedAgentStatuses(orcaBotmuxPage)).some(
+          (await getRendererOrCachedAgentStatuses(botmuxPage)).some(
             (status) =>
               status.agentType === 'codex' && status.state === 'working' && status.prompt === prompt
           ),
@@ -199,7 +199,7 @@ test.describe('Droid notifications', () => {
       )
       .toBe(true)
 
-    await switchToOtherExistingWorktree(orcaBotmuxPage)
+    await switchToOtherExistingWorktree(botmuxPage)
 
     const finalMessage = `Codex hook completed ${Date.now()}`
     await emitCodexHookStatus(endpoint, {
@@ -212,7 +212,7 @@ test.describe('Droid notifications', () => {
     await expect
       .poll(
         async () =>
-          (await getAgentStatuses(orcaBotmuxPage)).some(
+          (await getAgentStatuses(botmuxPage)).some(
             (status) =>
               status.agentType === 'codex' &&
               status.state === 'done' &&
@@ -249,7 +249,7 @@ test.describe('Droid notifications', () => {
       ])
 
     await expect
-      .poll(async () => isWorktreeUnread(orcaBotmuxPage, worktreeId), {
+      .poll(async () => isWorktreeUnread(botmuxPage, worktreeId), {
         timeout: 10_000,
         message: 'Codex hook Stop did not mark the inactive worktree unread'
       })
@@ -257,22 +257,22 @@ test.describe('Droid notifications', () => {
   })
 
   test('Grok routine permission prompt hooks stay working and do not notify', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installMainProcessNotificationDispatchSpy(electronApp)
     const endpoint = await readHookEndpoint(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const readyMarker = `__GROK_HOOK_NOTIFY_READY_${Date.now()}__`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `printf '${readyMarker}\\n'\r`)
-    await waitForTerminalOutput(orcaBotmuxPage, readyMarker)
+    await sendToTerminal(botmuxPage, ptyId, `printf '${readyMarker}\\n'\r`)
+    await waitForTerminalOutput(botmuxPage, readyMarker)
 
-    const { paneKey, worktreeId } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
+    const { paneKey, worktreeId } = await waitForActivePaneHookDescriptor(botmuxPage)
     const prompt = `grok-hook-notify-${Date.now()}`
     await emitGrokHookPayload(endpoint, {
       paneKey,
@@ -285,7 +285,7 @@ test.describe('Droid notifications', () => {
     await expect
       .poll(
         async () =>
-          (await getAgentStatuses(orcaBotmuxPage)).some(
+          (await getAgentStatuses(botmuxPage)).some(
             (status) =>
               status.agentType === 'grok' && status.state === 'working' && status.prompt === prompt
           ),
@@ -316,9 +316,9 @@ test.describe('Droid notifications', () => {
       }
     })
 
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.waitForTimeout(500)
     expect(
-      (await getAgentStatuses(orcaBotmuxPage)).some(
+      (await getAgentStatuses(botmuxPage)).some(
         (status) =>
           status.agentType === 'grok' && status.prompt === prompt && status.state === 'waiting'
       )
@@ -341,7 +341,7 @@ test.describe('Droid notifications', () => {
     await expect
       .poll(
         async () =>
-          (await getAgentStatuses(orcaBotmuxPage)).some(
+          (await getAgentStatuses(botmuxPage)).some(
             (status) =>
               status.agentType === 'grok' &&
               status.state === 'done' &&
@@ -357,34 +357,34 @@ test.describe('Droid notifications', () => {
   })
 
   test('recognized agent title completion dispatches one task-complete notification', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     // Why: contextBridge freezes window.api, so notification invokes must be
     // observed in Electron's main process rather than monkey-patched renderer-side.
     await installMainProcessNotificationDispatchSpy(electronApp)
-    await installRendererTitleLog(orcaBotmuxPage)
+    await installRendererTitleLog(botmuxPage)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = `__CODEX_NOTIFY_READY_${Date.now()}__`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `printf '${marker}\\n'\r`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await sendToTerminal(botmuxPage, ptyId, `printf '${marker}\\n'\r`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
-    await emitOscTitle(orcaBotmuxPage, ptyId, 'Codex working')
+    await emitOscTitle(botmuxPage, ptyId, 'Codex working')
     await expect
-      .poll(async () => (await getRendererTitleLog(orcaBotmuxPage)).includes('Codex working'), {
+      .poll(async () => (await getRendererTitleLog(botmuxPage)).includes('Codex working'), {
         timeout: 10_000,
         message: 'Codex working title did not reach the renderer before completion'
       })
       .toBe(true)
 
-    await emitOscTitle(orcaBotmuxPage, ptyId, 'Codex done')
+    await emitOscTitle(botmuxPage, ptyId, 'Codex done')
     await expect
-      .poll(async () => (await getRendererTitleLog(orcaBotmuxPage)).includes('Codex done'), {
+      .poll(async () => (await getRendererTitleLog(botmuxPage)).includes('Codex done'), {
         timeout: 10_000,
         message: 'Codex done title did not reach the renderer'
       })
@@ -407,29 +407,29 @@ test.describe('Droid notifications', () => {
   })
 
   test('Factory Droid needs-input native title does not dispatch a task-complete notification', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     // Why: contextBridge freezes window.api, so notification invokes must be
     // observed in Electron's main process rather than monkey-patched renderer-side.
     await installMainProcessNotificationDispatchSpy(electronApp)
-    await installRendererTitleLog(orcaBotmuxPage)
+    await installRendererTitleLog(botmuxPage)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = `__DROID_NOTIFY_READY_${Date.now()}__`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `printf '${marker}\\n'\r`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await sendToTerminal(botmuxPage, ptyId, `printf '${marker}\\n'\r`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
-    await emitOscTitle(orcaBotmuxPage, ptyId, '⠋ Droid')
-    await emitOscTitle(orcaBotmuxPage, ptyId, 'Factory Droid needs input')
+    await emitOscTitle(botmuxPage, ptyId, '⠋ Droid')
+    await emitOscTitle(botmuxPage, ptyId, 'Factory Droid needs input')
 
     await expect
       .poll(
-        async () => (await getRendererTitleLog(orcaBotmuxPage)).includes('Factory Droid needs input'),
+        async () => (await getRendererTitleLog(botmuxPage)).includes('Factory Droid needs input'),
         {
           timeout: 10_000,
           message: 'Factory Droid marker title did not land'
@@ -439,7 +439,7 @@ test.describe('Droid notifications', () => {
 
     // Why: Factory Droid can show this title while Execute is still running
     // (for example `sleep 180`); hook events own Droid status, not this title.
-    await orcaBotmuxPage.waitForTimeout(500)
+    await botmuxPage.waitForTimeout(500)
     const dispatches = await getNotificationDispatches(electronApp)
     expect(dispatches).toEqual([])
   })

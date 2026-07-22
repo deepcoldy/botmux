@@ -27,18 +27,18 @@ function humanizePermission(permission: string): string {
 
 export function formatPermissionNotice(event: BrowserPermissionDeniedEvent): string {
   const target = event.origin === 'unknown' ? 'this page' : event.origin
-  return `${target} asked for ${humanizePermission(event.permission)}, and OrcaBotmux denied it.`
+  return `${target} asked for ${humanizePermission(event.permission)}, and Botmux denied it.`
 }
 
 export function formatPopupNotice(event: BrowserPopupEvent): string {
   const target = event.origin === 'unknown' ? 'A site' : event.origin
-  if (event.action === 'opened-in-orca_botmux') {
-    return `${target} opened a new page in OrcaBotmux.`
+  if (event.action === 'opened-in-botmux') {
+    return `${target} opened a new page in Botmux.`
   }
   if (event.action === 'opened-external') {
     return `${target} opened a new window in your default browser.`
   }
-  return `${target} tried to open a popup OrcaBotmux does not support here.`
+  return `${target} tried to open a popup Botmux does not support here.`
 }
 
 export function formatDownloadFinishedNotice(event: BrowserDownloadFinishedEvent): string {
@@ -94,13 +94,13 @@ export function formatLoadFailureDescription(
     if (loadError.code === -202) {
       return translate(
         'browser.loadFailure.certificateAuthorityInvalid',
-        "OrcaBotmux doesn't trust the authority that issued the certificate for {{value0}}.",
+        "Botmux doesn't trust the authority that issued the certificate for {{value0}}.",
         { value0: host }
       )
     }
     return translate(
       'browser.loadFailure.certificateVerificationFailed',
-      "OrcaBotmux couldn't verify the certificate for {{value0}}.",
+      "Botmux couldn't verify the certificate for {{value0}}.",
       { value0: host }
     )
   }

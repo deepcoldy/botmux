@@ -43,10 +43,10 @@ function envValue(name: string): string | null {
 
 function getAuthConfig(): BitbucketAuthConfig {
   return {
-    baseUrl: envValue('ORCA_BITBUCKET_API_BASE_URL') ?? DEFAULT_API_BASE_URL,
-    accessToken: envValue('ORCA_BITBUCKET_ACCESS_TOKEN'),
-    email: envValue('ORCA_BITBUCKET_EMAIL'),
-    apiToken: envValue('ORCA_BITBUCKET_API_TOKEN')
+    baseUrl: envValue('BOTMUX_BITBUCKET_API_BASE_URL') ?? DEFAULT_API_BASE_URL,
+    accessToken: envValue('BOTMUX_BITBUCKET_ACCESS_TOKEN'),
+    email: envValue('BOTMUX_BITBUCKET_EMAIL'),
+    apiToken: envValue('BOTMUX_BITBUCKET_API_TOKEN')
   }
 }
 

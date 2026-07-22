@@ -34,7 +34,7 @@ class ReproductionObservedError extends Error {
 
 async function setupAppFixture(page, fixture, gpuMode, sourceControl) {
   return await runWithTimeout(
-    'fixture registration in OrcaBotmux',
+    'fixture registration in Botmux',
     () =>
       page.evaluate(
         async ({ repoPath, plainPath, importedWorktreePaths, mode, openSourceControl }) => {
@@ -254,7 +254,7 @@ async function pingMainIpc(page) {
 async function readRendererProbe(page) {
   return await runWithTimeout(
     'renderer probe read',
-    () => page.evaluate(() => globalThis.__orcaApphangProbe?.probe ?? null),
+    () => page.evaluate(() => globalThis.__botmuxApphangProbe?.probe ?? null),
     rendererActionTimeoutMs
   )
 }
@@ -286,7 +286,7 @@ async function resetRendererProbe(page) {
     'renderer probe reset',
     () =>
       page.evaluate(() => {
-        const probe = globalThis.__orcaApphangProbe?.probe
+        const probe = globalThis.__botmuxApphangProbe?.probe
         if (!probe) {
           return
         }
@@ -303,7 +303,7 @@ async function resetRendererProbe(page) {
 
 async function runActivationCycle(page, target, args) {
   await resetRendererProbe(page)
-  const marker = `ORCA_APPHANG_${target.index}_${Date.now()}`
+  const marker = `BOTMUX_APPHANG_${target.index}_${Date.now()}`
   const cycleStartedAt = Date.now()
   const activationStartedAt = Date.now()
   await clickWorktreeCard(page, target.id)

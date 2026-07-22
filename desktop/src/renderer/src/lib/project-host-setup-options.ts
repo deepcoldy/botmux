@@ -185,7 +185,7 @@ function getHostSetupAvailability(host: ExecutionHostRegistryEntry): {
   if (host.health === 'blocked') {
     return {
       isAvailable: false,
-      detail: 'OrcaBotmux server version is incompatible'
+      detail: 'Botmux server version is incompatible'
     }
   }
   if (host.kind === 'runtime') {
@@ -201,7 +201,7 @@ function getHostSetupAvailability(host: ExecutionHostRegistryEntry): {
     ) {
       return {
         isAvailable: false,
-        detail: 'Update OrcaBotmux on this host to set up projects'
+        detail: 'Update Botmux on this host to set up projects'
       }
     }
   }

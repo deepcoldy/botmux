@@ -23,7 +23,7 @@ export function parseWebPairingInput(input: string): WebPairingOffer | null {
 
   try {
     const lower = trimmed.toLowerCase()
-    if (lower.startsWith('orca_botmux://') || lower.startsWith('orca_botmux://')) {
+    if (lower.startsWith('botmux://') || lower.startsWith('botmux://')) {
       const code = extractPairingCodeFromUrl(trimmed)
       return code ? decodePairingPayload(code) : null
     }
@@ -46,7 +46,7 @@ export function readPairingInputFromLocation(location: Location): string | null 
   if (!hash) {
     return null
   }
-  if (hash.startsWith('orca_botmux://pair') || hash.startsWith('orca_botmux://pair')) {
+  if (hash.startsWith('botmux://pair') || hash.startsWith('botmux://pair')) {
     return hash
   }
   const hashParams = new URLSearchParams(hash)
@@ -121,9 +121,9 @@ function extractPairingCodeFromUrl(url: string): string | null {
     return null
   }
   // Why: only hostname `pair` may carry runtime auth material. Accept legacy
-  // orca_botmux: during the vendor rebrand window.
+  // botmux: during the vendor rebrand window.
   if (
-    (parsed.protocol !== 'orca_botmux:' && parsed.protocol !== 'orca_botmux:') ||
+    (parsed.protocol !== 'botmux:' && parsed.protocol !== 'botmux:') ||
     parsed.hostname !== 'pair'
   ) {
     return null

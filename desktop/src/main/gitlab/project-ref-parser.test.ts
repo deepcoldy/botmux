@@ -7,9 +7,9 @@ describe('gitlab project ref parsing', () => {
       host: 'gitlab.com',
       path: 'acme/widgets'
     })
-    expect(parseGitLabProjectRef('git@gitlab.com:stablyai/orca_botmux.git')).toEqual({
+    expect(parseGitLabProjectRef('git@gitlab.com:stablyai/botmux.git')).toEqual({
       host: 'gitlab.com',
-      path: 'stablyai/orca_botmux'
+      path: 'stablyai/botmux'
     })
   })
 
@@ -25,7 +25,7 @@ describe('gitlab project ref parsing', () => {
   })
 
   it('returns null for non-GitLab hosts when host not in knownHosts', () => {
-    expect(parseGitLabProjectRef('git@github.com:stablyai/orca_botmux.git')).toBeNull()
+    expect(parseGitLabProjectRef('git@github.com:stablyai/botmux.git')).toBeNull()
     expect(parseGitLabProjectRef('git@example.com:foo/bar.git')).toBeNull()
   })
 
@@ -133,9 +133,9 @@ describe('gitlab project ref parsing', () => {
 
 describe('gitlab remote project ref candidates', () => {
   it('extracts self-hosted candidates before the host is trusted', () => {
-    expect(parseRemoteProjectRefCandidate('git@gitlab.internal:team/orca_botmux.git')).toEqual({
+    expect(parseRemoteProjectRefCandidate('git@gitlab.internal:team/botmux.git')).toEqual({
       host: 'gitlab.internal',
-      path: 'team/orca_botmux'
+      path: 'team/botmux'
     })
   })
 

@@ -4,9 +4,9 @@ import { useAllWorktrees, useRepoById, useRepoMap } from '@/store/selectors'
 import { isGitRepoKind } from '../../../../shared/repo-kind'
 import { getConnectionId } from '@/lib/connection-context'
 import {
-  resolveOrcaBotmuxToolingContext,
+  resolveBotmuxToolingContext,
   resolveRightSidebarToolingPath
-} from '@/lib/orca-botmux-tooling-context'
+} from '@/lib/botmux-tooling-context'
 import { getExecutionHostIdForWorktree } from '@/lib/worktree-runtime-owner'
 import { refreshGitStatusForWorktree } from './git-status-refresh'
 import { isWindowVisible } from '@/lib/window-visibility-interval'
@@ -42,17 +42,17 @@ export function useGitStatusPolling(options: { enabled?: boolean } = {}): void {
   // Why: botmux control-plane hosts are not in worktreesByRepo; tooling binds
   // git status to host id + session cwd over remote FS when no project match.
   const activeWorktreeId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
+    (s) => resolveBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
   )
   const isEphemeralBotmuxGit = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).isEphemeralGitSurface
+    (s) => resolveBotmuxToolingContext(s).isEphemeralGitSurface
   )
   const toolingSurfacePath = useAppStore((s) => resolveRightSidebarToolingPath(s))
   const botmuxFilesystemConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
   const activeWorktree = useAppStore((s) => {
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId ?? s.activeWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const activeExecutionHostId = useAppStore((s) =>

@@ -33,7 +33,7 @@ function dispatchPrelaunchedSession(worktreeId: string, info: EmulatorStreamInfo
   }
   window.setTimeout(() => {
     window.dispatchEvent(
-      new CustomEvent('orca_botmux:emulator-auto-attach', {
+      new CustomEvent('botmux:emulator-auto-attach', {
         detail: { worktreeId, info }
       })
     )

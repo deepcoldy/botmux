@@ -1,7 +1,7 @@
 import type React from 'react'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef } from 'react'
 import { useAppStore } from '@/store'
-import { resolveRightSidebarToolingPath } from '@/lib/orca-botmux-tooling-context'
+import { resolveRightSidebarToolingPath } from '@/lib/botmux-tooling-context'
 import type { SearchFileResult, SearchMatch, SearchResult } from '../../../../shared/types'
 import { buildSearchRows } from './search-rows'
 import { cancelRevealFrame, openMatchResult } from './search-match-open'

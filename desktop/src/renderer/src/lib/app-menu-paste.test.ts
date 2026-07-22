@@ -50,7 +50,7 @@ describe('app menu paste', () => {
     expect(performNativePaste).not.toHaveBeenCalled()
   })
 
-  it('falls back to native paste when no OrcaBotmux-owned target is focused', async () => {
+  it('falls back to native paste when no Botmux-owned target is focused', async () => {
     const button = document.createElement('button')
     document.body.appendChild(button)
     button.focus()

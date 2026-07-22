@@ -7,7 +7,7 @@ import {
   type RpcAnyMethod
 } from '../core'
 import { OptionalFiniteNumber, OptionalString, requiredString } from '../schemas'
-import type { DriverState, OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { DriverState, BotmuxRuntimeService } from '../../botmux-runtime'
 import {
   TerminalStreamOpcode,
   decodeTerminalStreamJson,
@@ -320,7 +320,7 @@ function* iterateTerminalOutputFrameChunks(
 }
 
 function isTerminalInputLockedForClient(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string,
   client: TerminalViewportClient | undefined
 ): boolean {
@@ -361,7 +361,7 @@ function resolveMobileFloorClientId(
 }
 
 async function sendTerminalStreamInput(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   args: {
     terminal: string
     text: string
@@ -396,7 +396,7 @@ async function sendTerminalStreamInput(
 }
 
 type MobileInputFloorClaimHolder = {
-  current: ReturnType<OrcaRuntimeService['beginMobileInputFloor']>
+  current: ReturnType<BotmuxRuntimeService['beginMobileInputFloor']>
 }
 
 async function commitMobileInputFloorClaim(claim: MobileInputFloorClaimHolder): Promise<void> {
@@ -432,7 +432,7 @@ function isTerminalSendGuardNotWritable(error: unknown): boolean {
 }
 
 function assertTerminalSendExactPtyBinding(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   handle: string,
   expectedPtyId: string | undefined
 ): void {
@@ -630,7 +630,7 @@ function requestedSnapshotScrollbackCandidates(requestedRows: number | undefined
 }
 
 async function serializeBudgetedRequestedSnapshot(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string,
   scrollbackRows: number | undefined
 ): Promise<SerializedSnapshot> {
@@ -688,7 +688,7 @@ function sendSnapshotFrames(
 }
 
 async function serializeBudgetedMobileSnapshot(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string,
   isMobile: boolean
 ): Promise<SerializedSnapshot> {
@@ -724,7 +724,7 @@ async function serializeBudgetedMobileSnapshot(
 }
 
 async function serializeStableMobileRendererSnapshot(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string
 ): Promise<SerializedSnapshot> {
   const candidates = [MOBILE_SUBSCRIBE_SCROLLBACK_ROWS, 500, 250, 100, 25, 0]
@@ -768,7 +768,7 @@ async function serializeStableMobileRendererSnapshot(
 // cols and replay it, so scrollback rewraps. Alt-screen TUIs are PTY-repainted
 // and have no scrollback, so they keep the geometry-only Resized frame.
 async function sendMobileResizeRestream(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string,
   sendFrame: (opcode: TerminalStreamOpcode, payload?: Uint8Array<ArrayBufferLike>) => void,
   event: { cols: number; rows: number; displayMode: string; reason: string; seq?: number },
@@ -804,7 +804,7 @@ async function sendMobileResizeRestream(
 }
 
 async function updateViewportForClient(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   ptyId: string,
   subscriptionKey: string,
   client: TerminalViewportClient,

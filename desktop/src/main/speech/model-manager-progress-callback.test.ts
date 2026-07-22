@@ -6,7 +6,7 @@ import { ModelManager } from './model-manager'
 
 vi.mock('electron', () => ({
   app: {
-    getPath: () => '/tmp/orca-botmux-speech-models-test'
+    getPath: () => '/tmp/botmux-speech-models-test'
   }
 }))
 
@@ -21,7 +21,7 @@ type ModelManagerInternals = {
 
 describe('ModelManager progress callbacks', () => {
   it('unsubscribes progress callbacks without replacing other listeners', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const manager = new ModelManager(dir)
       const internals = manager as unknown as ModelManagerInternals

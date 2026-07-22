@@ -7,7 +7,7 @@ const review: HostedReviewInfo & { provider: 'gitlab' } = {
   number: 12,
   title: 'Add queue badges',
   state: 'open',
-  url: 'https://gitlab.acme.internal/group/subgroup/orca_botmux/-/merge_requests/12',
+  url: 'https://gitlab.acme.internal/group/subgroup/botmux/-/merge_requests/12',
   status: 'pending',
   updatedAt: '2026-05-12T00:00:00.000Z',
   mergeable: 'MERGEABLE'
@@ -21,7 +21,7 @@ describe('hostedReviewSummaryFromGitLabInfo', () => {
       provider: 'gitlab',
       host: 'gitlab.acme.internal',
       owner: 'group/subgroup',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       number: 12
     })
     expect(summary.checksStatus).toBe('pending')

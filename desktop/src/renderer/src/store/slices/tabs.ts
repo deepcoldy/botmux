@@ -34,10 +34,11 @@ import { buildOrphanTerminalCleanupPatch, getOrphanTerminalIds } from './termina
 import { createBrowserUuid } from '@/lib/browser-uuid'
 import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
 import {
-  ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
+  BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
   FLOATING_TERMINAL_WORKTREE_ID
 } from '../../../../shared/constants'
-import { isOrcaBotmuxControlPlaneHostId } from '../../../../shared/orca-botmux-main-terminal-host'
+import { isBotmuxControlPlaneHostId } from '../../../../shared/botmux-main-terminal-host'
+import { resolveBotmuxHostSurfaceForTerminalTab } from '@/lib/sync-botmux-host-surface-for-terminal-tab'
 import { folderWorkspaceKey } from '../../../../shared/workspace-scope'
 import {
   addAdditionalValidWorkspaceKeys,
@@ -991,7 +992,7 @@ export const createTabsSlice: StateCreator<AppState, [], [], TabsSlice> = (set, 
         // Why: the split-group model can legally derive "terminal with no
         // active tab" after the final unified tab closes. That leaves the
         // worktree selected but render-empty, so the workspace shows a blank
-        // pane instead of OrcaBotmux's landing screen. When that happens, write the
+        // pane instead of Botmux's landing screen. When that happens, write the
         // landing-state fallback directly instead of recomputing active-surface
         // fields from a worktree that is no longer active.
         ...(shouldDeactivateWorktree
@@ -1301,7 +1302,7 @@ export const createTabsSlice: StateCreator<AppState, [], [], TabsSlice> = (set, 
     return groupId
   },
 
-  focusGroup: (worktreeId, groupId) =>
+  focusGroup: (worktreeId, groupId) => {
     set((state) => {
       const groupAlreadyFocused = state.activeGroupIdByWorktree[worktreeId] === groupId
       const nextActiveGroupIdByWorktree = groupAlreadyFocused
@@ -1379,7 +1380,29 @@ export const createTabsSlice: StateCreator<AppState, [], [], TabsSlice> = (set, 
           : {}),
         ...activeSurfacePatch
       }
-    }),
+    })
+    // Why: split-group body clicks only call focusGroup (not setActiveTab).
+    // Botmux hosts must still retarget left session highlight + right explorer
+    // cwd to the focused group's active terminal — same as tab-chrome activation.
+    const after = get()
+    if (after.activeWorktreeId !== worktreeId) {
+      return
+    }
+    if (after.activeTabType !== 'terminal' || !after.activeTabId) {
+      return
+    }
+    if (!isBotmuxControlPlaneHostId(worktreeId)) {
+      return
+    }
+    const surface = resolveBotmuxHostSurfaceForTerminalTab({
+      worktreeId,
+      terminalTabId: after.activeTabId,
+      hostTabs: after.tabsByWorktree[worktreeId] ?? []
+    })
+    if (surface) {
+      after.setBotmuxHostSurface(worktreeId, surface)
+    }
+  },
 
   closeEmptyGroup: (worktreeId, groupId) => {
     const state = get()
@@ -2074,17 +2097,18 @@ export const createTabsSlice: StateCreator<AppState, [], [], TabsSlice> = (set, 
         .map((w) => w.id)
     )
     validWorktreeIds.add(FLOATING_TERMINAL_WORKTREE_ID)
-    validWorktreeIds.add(ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
+    validWorktreeIds.add(BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
     for (const workspace of state.folderWorkspaces) {
       validWorktreeIds.add(folderWorkspaceKey(workspace.id))
     }
     addAdditionalValidWorkspaceKeys(validWorktreeIds, options)
-    // Preserve orca_botmux:session:* hosts that already own tabs in the snapshot.
-    for (const worktreeId of Object.keys(session.unifiedTabsByWorktree ?? {})) {
-      if (isOrcaBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
+    // Preserve botmux:session:* hosts that already own tabs in the snapshot.
+    // Session fields are unifiedTabs/tabGroups; runtime state uses *ByWorktree names.
+    for (const worktreeId of Object.keys(session.unifiedTabs ?? {})) {
+      if (isBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
     }
-    for (const worktreeId of Object.keys(session.groupsByWorktree ?? {})) {
-      if (isOrcaBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
+    for (const worktreeId of Object.keys(session.tabGroups ?? {})) {
+      if (isBotmuxControlPlaneHostId(worktreeId)) validWorktreeIds.add(worktreeId)
     }
     set(buildHydratedTabState(session, validWorktreeIds))
   }

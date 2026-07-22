@@ -32,7 +32,7 @@ describe('GitResponseStreamRegistry client ownership', () => {
     registries.push(registry)
     const payload = Buffer.alloc(GIT_RESPONSE_CHUNK_SIZE * (STREAM_ACK_WINDOW_CHUNKS * 3))
     const marker = registry.startStream(payload, dispatcher, context)
-    const streamId = marker.__orcaGitResponseStream.streamId
+    const streamId = marker.__botmuxGitResponseStream.streamId
 
     await flushPump()
     expect(notifyBulk).toHaveBeenCalledTimes(STREAM_ACK_WINDOW_CHUNKS)

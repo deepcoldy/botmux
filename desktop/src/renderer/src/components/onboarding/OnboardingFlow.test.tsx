@@ -40,11 +40,11 @@ describe('OnboardingFlow', () => {
     })
 
     expect(html).toContain('Set up notifications')
-    expect(html).not.toContain('Set up OrcaBotmux for agents')
-    expect(html).not.toContain('Explore OrcaBotmux')
+    expect(html).not.toContain('Set up Botmux for agents')
+    expect(html).not.toContain('Explore Botmux')
     expect(html).not.toContain('Take the tour')
     expect(html).toContain('Add your first project')
-    expect(html).not.toContain('Point OrcaBotmux at some code')
+    expect(html).not.toContain('Point Botmux at some code')
   })
 
   it.each([
@@ -65,8 +65,8 @@ describe('OnboardingFlow', () => {
       })
 
       expect(html).toContain(title)
-      expect(html).not.toContain('Set up OrcaBotmux for agents')
-      expect(html).not.toContain('Explore OrcaBotmux')
+      expect(html).not.toContain('Set up Botmux for agents')
+      expect(html).not.toContain('Explore Botmux')
     }
   )
 
@@ -88,8 +88,8 @@ describe('OnboardingFlow', () => {
       })
 
       expect(html).toContain(title)
-      expect(html).not.toContain('Set up OrcaBotmux for agents')
-      expect(html).not.toContain('Explore OrcaBotmux')
+      expect(html).not.toContain('Set up Botmux for agents')
+      expect(html).not.toContain('Explore Botmux')
     }
   )
 
@@ -177,7 +177,7 @@ describe('OnboardingFlow', () => {
     expect(html).toContain('Add your first project')
     expect(html).not.toContain('Set up GitHub tasks')
     expect(html).not.toContain('Connect your task sources')
-    expect(html).not.toContain('Point OrcaBotmux at some code')
+    expect(html).not.toContain('Point Botmux at some code')
     // Why: with both integrations (gh installed) and Windows terminal (Mac)
     // skipped, the stepper shows only the three real steps — no dead dots.
     expect(html).toContain('3 of 3')

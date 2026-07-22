@@ -40,14 +40,14 @@ type Harness = {
 }
 
 const BASE_ENV = {
-  ORCA_PANE_KEY: 'pane-1',
-  ORCA_AGENT_LAUNCH_TOKEN: 'launch-1',
-  ORCA_TAB_ID: 'tab-1',
-  ORCA_WORKTREE_ID: 'tree-1',
-  ORCA_AGENT_HOOK_PORT: '4321',
-  ORCA_AGENT_HOOK_TOKEN: 'token-1',
-  ORCA_AGENT_HOOK_ENV: 'env-1',
-  ORCA_AGENT_HOOK_VERSION: '1.2.3'
+  BOTMUX_PANE_KEY: 'pane-1',
+  BOTMUX_AGENT_LAUNCH_TOKEN: 'launch-1',
+  BOTMUX_TAB_ID: 'tab-1',
+  BOTMUX_WORKTREE_ID: 'tree-1',
+  BOTMUX_AGENT_HOOK_PORT: '4321',
+  BOTMUX_AGENT_HOOK_TOKEN: 'token-1',
+  BOTMUX_AGENT_HOOK_ENV: 'env-1',
+  BOTMUX_AGENT_HOOK_VERSION: '1.2.3'
 } satisfies Record<string, string>
 
 // Why: ownership keys on process.pid, so reload and child-process tests need
@@ -114,7 +114,7 @@ function createHarness(args: {
     },
     pid: args.pid ?? SELF_PID,
     title: args.title ?? 'node',
-    argv: args.argv ?? ['node', '/usr/bin/orca_botmux']
+    argv: args.argv ?? ['node', '/usr/bin/botmux']
   }
 
   const context = {
@@ -350,8 +350,8 @@ describe('getPiAgentStatusExtensionSource', () => {
 
       expect(child.handlers).toEqual({})
       expect(grandchild.handlers).toEqual({})
-      expect(child.processEnv.ORCA_PI_STATUS_OWNED).toBe(String(SELF_PID))
-      expect(grandchild.processEnv.ORCA_PI_STATUS_OWNED).toBe(String(SELF_PID))
+      expect(child.processEnv.BOTMUX_PI_STATUS_OWNED).toBe(String(SELF_PID))
+      expect(grandchild.processEnv.BOTMUX_PI_STATUS_OWNED).toBe(String(SELF_PID))
       expect(child.fetchMock).not.toHaveBeenCalled()
       expect(child.spawnMock).not.toHaveBeenCalled()
     }
@@ -366,7 +366,7 @@ describe('getPiAgentStatusExtensionSource', () => {
     expect(harness.fetchMock).toHaveBeenCalledTimes(1)
     const body = JSON.parse(String(harness.fetchMock.mock.calls[0]?.[1]?.body))
     expect(body.payload).toEqual({ hook_event_name: 'agent_end' })
-    expect(harness.processEnv.ORCA_PI_STATUS_OWNED).toBe(String(SELF_PID))
+    expect(harness.processEnv.BOTMUX_PI_STATUS_OWNED).toBe(String(SELF_PID))
   })
 
   it('keeps reporting after the lead re-runs the extension factory on reload', async () => {
@@ -374,7 +374,7 @@ describe('getPiAgentStatusExtensionSource', () => {
     // instead of mistaking its own marker for a nested child.
     const harness = createHarness({ kind: 'pi', pid: SELF_PID })
 
-    expect(harness.processEnv.ORCA_PI_STATUS_OWNED).toBe(String(SELF_PID))
+    expect(harness.processEnv.BOTMUX_PI_STATUS_OWNED).toBe(String(SELF_PID))
 
     harness.reload()
     await harness.callHook('agent_end')
@@ -429,7 +429,7 @@ describe('getPiAgentStatusExtensionSource', () => {
       '-H',
       'Content-Type: application/json',
       '-H',
-      'X-OrcaBotmux-Agent-Hook-Token: token-1',
+      'X-Botmux-Agent-Hook-Token: token-1',
       '--data-binary',
       '@-',
       'http://127.0.0.1:4321/hook/omp'
@@ -515,7 +515,7 @@ describe('getPiAgentStatusExtensionSource', () => {
     await Promise.resolve()
 
     // Why: Pi awaits extension handlers, so loopback status delivery cannot
-    // remain on the agent's critical path when OrcaBotmux is stalled or restarting.
+    // remain on the agent's critical path when Botmux is stalled or restarting.
     expect(harness.fetchMock).toHaveBeenCalledTimes(1)
     await vi.waitFor(() => expect(handlerReturned).toBe(true))
 

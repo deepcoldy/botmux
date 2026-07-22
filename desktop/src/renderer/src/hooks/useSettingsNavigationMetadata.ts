@@ -18,12 +18,10 @@ import {
   ListChecks,
   Lock,
   Mic,
-  MousePointerClick,
   Network,
   Palette,
   PanelsTopLeft,
   Play,
-  Server,
   ShieldCheck,
   SlidersHorizontal,
   Smartphone,
@@ -34,7 +32,7 @@ import {
   UserCog,
   Wrench
 } from 'lucide-react'
-import { OrcaLogoSettingsIcon } from '@/components/settings/orca-botmux-logo-settings-icon'
+import { BotmuxLogoSettingsIcon } from '@/components/settings/botmux-logo-settings-icon'
 import { LinearIcon } from '@/components/icons/LinearIcon'
 import type { Repo } from '../../../shared/types'
 import { getRepoKindLabel } from '../../../shared/repo-kind'
@@ -58,14 +56,9 @@ import { getBrowserPaneCombinedSearchEntries } from '@/components/settings/brows
 import { getNotificationsPaneSearchEntries } from '@/components/settings/notifications-search'
 import { getOrchestrationPaneSearchEntries } from '@/components/settings/orchestration-search'
 import { getLinearAgentSkillPaneSearchEntries } from '@/components/settings/linear-agent-skill-search'
-import {
-  getRuntimeEnvironmentsSearchEntry,
-  getWebRuntimeEnvironmentsSearchEntry
-} from '@/components/settings/runtime-environments-search'
 import { getSshPaneSearchEntries } from '@/components/settings/ssh-search'
 import { getMobileSettingsPaneSearchEntries } from '@/components/settings/mobile-settings-search'
 import { getMobileEmulatorSearchEntries } from '@/components/settings/mobile-emulator-search'
-import { getComputerUsePaneSearchEntries } from '@/components/settings/computer-use-search'
 import { getVoicePaneSearchEntries } from '@/components/settings/voice-pane-search'
 import { getDeveloperPermissionsPaneSearchEntries } from '@/components/settings/developer-permissions-search'
 import { getPrivacyPaneSearchEntries } from '@/components/settings/privacy-search'
@@ -134,9 +127,6 @@ export function buildSettingsNavigationMetadata({
     isWindowsTerminalHost,
     isMac
   })
-  const runtimeEnvironmentsSearchEntry = isWebClient
-    ? getWebRuntimeEnvironmentsSearchEntry()
-    : getRuntimeEnvironmentsSearchEntry()
   const reposById = new Map<string, Repo>()
   for (const repo of repos) {
     if (!reposById.has(repo.id)) {
@@ -179,7 +169,7 @@ export function buildSettingsNavigationMetadata({
       title: translate('auto.hooks.useSettingsNavigationMetadata.58a868e8e4', 'Orchestration'),
       description: translate(
         'auto.hooks.useSettingsNavigationMetadata.cd50cec5d7',
-        'Coordinate multiple coding agents through OrcaBotmux.'
+        'Coordinate multiple coding agents through Botmux.'
       ),
       icon: Network,
       searchEntries: getOrchestrationPaneSearchEntries(),
@@ -202,19 +192,10 @@ export function buildSettingsNavigationMetadata({
           }
         ]
       : []),
+    // Why: Computer Use settings are hidden for botmux product chrome;
+    // keep pane components and search helpers in-tree for a later re-enable.
     ...(showDesktopOnlySettings
       ? [
-          {
-            id: 'computer-use',
-            title: translate('auto.hooks.useSettingsNavigationMetadata.b35e92364b', 'Computer Use'),
-            description: translate(
-              'auto.hooks.useSettingsNavigationMetadata.0059bd17f3',
-              'Enable agents to control any app on your computer.'
-            ),
-            icon: MousePointerClick,
-            searchEntries: getComputerUsePaneSearchEntries(),
-            group: 'capabilities'
-          },
           {
             id: 'voice',
             title: translate('auto.hooks.useSettingsNavigationMetadata.6a50cdcd7c', 'Voice'),
@@ -236,9 +217,9 @@ export function buildSettingsNavigationMetadata({
       ),
       description: translate(
         'auto.hooks.useSettingsNavigationMetadata.5f32ac08f3',
-        'Finish the onboarding checklist for core OrcaBotmux workflows.'
+        'Finish the onboarding checklist for core Botmux workflows.'
       ),
-      icon: OrcaLogoSettingsIcon,
+      icon: BotmuxLogoSettingsIcon,
       searchEntries: [
         {
           title: translate(
@@ -253,7 +234,7 @@ export function buildSettingsNavigationMetadata({
             translate('auto.hooks.useSettingsNavigationMetadata.ea0b1bc7b8', 'setup guide'),
             translate(
               'auto.hooks.useSettingsNavigationMetadata.0505d0df29',
-              'get started with OrcaBotmux'
+              'get started with Botmux'
             ),
             translate('auto.hooks.useSettingsNavigationMetadata.724c440e72', 'getting started')
           ]
@@ -297,26 +278,24 @@ export function buildSettingsNavigationMetadata({
             group: 'setup'
           },
           {
-            id: 'orca-botmux-bridge',
-            title: translate('settings.orcaBotmuxBridge.navTitle', 'OrcaBotmux Sessions'),
+            id: 'botmux-bridge',
+            title: translate('settings.botmuxBridge.navTitle', 'Botmux Sessions'),
             description: translate(
-              'settings.orcaBotmuxBridge.navDescription',
-              'Connect to local or SSH-remote orca_botmux daemon/dashboard (Feishu sessions).'
+              'settings.botmuxBridge.navDescription',
+              'Connect to local or SSH-remote botmux daemon/dashboard (Feishu sessions).'
             ),
             icon: Radio,
             searchEntries: [
               {
-                id: 'orca-botmux-bridge-local',
-                label: translate(
-                  'settings.orcaBotmuxBridge.searchLocal',
-                  'Local orca_botmux dashboard'
+                title: translate(
+                  'settings.botmuxBridge.searchLocal',
+                  'Local botmux dashboard'
                 ),
-                keywords: ['feishu', 'daemon', 'orca_botmux']
+                keywords: ['feishu', 'daemon', 'botmux']
               },
               {
-                id: 'orca-botmux-bridge-ssh',
-                label: translate('settings.orcaBotmuxBridge.searchSsh', 'SSH remote orca_botmux'),
-                keywords: ['ssh', 'remote', 'tunnel', 'orca_botmux']
+                title: translate('settings.botmuxBridge.searchSsh', 'SSH remote botmux'),
+                keywords: ['ssh', 'remote', 'tunnel', 'botmux']
               }
             ],
             group: 'setup'
@@ -401,7 +380,7 @@ export function buildSettingsNavigationMetadata({
             ),
             description: translate(
               'auto.hooks.useSettingsNavigationMetadata.3d65d3f1b9',
-              'Configure mobile emulator support for OrcaBotmux and coding agents.'
+              'Configure mobile emulator support for Botmux and coding agents.'
             ),
             icon: TabletSmartphone,
             searchEntries: getMobileEmulatorSearchEntries(),
@@ -480,7 +459,7 @@ export function buildSettingsNavigationMetadata({
       title: translate('auto.hooks.useSettingsNavigationMetadata.d72a58b5b9', 'Stats & Usage'),
       description: translate(
         'auto.hooks.useSettingsNavigationMetadata.b351014180',
-        'OrcaBotmux stats plus Claude, Codex, OpenCode token analytics and Grok subscription usage.'
+        'Botmux stats plus Claude, Codex, OpenCode token analytics and Grok subscription usage.'
       ),
       icon: BarChart3,
       searchEntries: getStatsPaneSearchEntries(),
@@ -501,20 +480,8 @@ export function buildSettingsNavigationMetadata({
           }
         ]
       : []),
-    {
-      id: 'servers',
-      title: translate(
-        'auto.hooks.useSettingsNavigationMetadata.de0c2907a1',
-        'Remote OrcaBotmux Servers'
-      ),
-      description: isWebClient
-        ? 'Connect this browser to a saved OrcaBotmux server.'
-        : 'Pair remote OrcaBotmux runtimes for persistent sessions, richer remote state, and web or mobile handoff.',
-      icon: Server,
-      searchEntries: [runtimeEnvironmentsSearchEntry],
-      group: 'remote',
-      badge: translate('auto.hooks.useSettingsNavigationMetadata.40d80bad8a', 'Beta')
-    },
+    // Why: Remote Botmux Servers settings are hidden for botmux product
+    // chrome; RuntimeEnvironmentsPane code stays for a later re-enable.
     ...(showDesktopOnlySettings && isMac
       ? [
           {
@@ -594,7 +561,7 @@ export function buildSettingsNavigationMetadata({
       group: 'experimental'
     },
     // Why: one nav row per project, not per repo row — a project set up on
-    // multiple hosts (local + a Remote OrcaBotmux Server, or two clones) collapses to
+    // multiple hosts (local + a Remote Botmux Server, or two clones) collapses to
     // a single entry. Derived from repos alone so this list matches the panes.
     ...buildSettingsProjectList(repos).map(({ project, representativeRepoId, setups }) => {
       const representativeRepo = reposById.get(representativeRepoId) ?? repos[0]

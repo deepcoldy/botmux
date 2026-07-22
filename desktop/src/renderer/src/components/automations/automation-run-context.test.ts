@@ -15,11 +15,11 @@ function repo(id: string, path = `/repos/${id}`): Repo {
 function setup(overrides: Partial<ProjectHostSetup> = {}): ProjectHostSetup {
   return {
     id: 'setup-builder',
-    projectId: 'github:stablyai/orca_botmux',
+    projectId: 'github:stablyai/botmux',
     hostId: 'ssh:builder',
     repoId: 'repo-builder',
-    path: '/remote/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/remote/botmux',
+    displayName: 'botmux',
     setupState: 'ready',
     setupMethod: 'cloned',
     createdAt: 1,
@@ -33,24 +33,24 @@ describe('buildAutomationRunContextForRepo', () => {
     expect(
       buildAutomationRunContextForRepo({
         repoId: 'repo-builder',
-        repos: [repo('repo-local', '/local/orca_botmux'), repo('repo-builder', '/remote/orca_botmux')],
+        repos: [repo('repo-local', '/local/botmux'), repo('repo-builder', '/remote/botmux')],
         projectHostSetups: [
           setup({
             id: 'setup-local',
             hostId: 'local',
             repoId: 'repo-local',
-            path: '/local/orca_botmux'
+            path: '/local/botmux'
           }),
           setup()
         ]
       })
     ).toEqual({
       kind: 'workspace-run',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'ssh:builder',
       projectHostSetupId: 'setup-builder',
       repoId: 'repo-builder',
-      path: '/remote/orca_botmux'
+      path: '/remote/botmux'
     })
   })
 

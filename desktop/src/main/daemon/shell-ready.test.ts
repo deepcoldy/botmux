@@ -17,7 +17,7 @@ const itWithBash = hasBash ? it : it.skip
 const hasZsh = process.platform !== 'win32' && spawnSync('zsh', ['--version']).status === 0
 const itWithZsh = hasZsh ? it : it.skip
 
-const SHELL_READY_MARKER_OUTPUT = '\x1b]777;orca-botmux-shell-ready\x07'
+const SHELL_READY_MARKER_OUTPUT = '\x1b]777;botmux-shell-ready\x07'
 
 // Why: the shell-ready marker is emitted from zle-line-init, which only fires
 // on a real TTY — spawn through node-pty instead of spawnSync.
@@ -41,9 +41,9 @@ async function runInteractiveZshLogin(args: {
       HOME: args.tempHome,
       TERM: 'xterm-256color',
       ZDOTDIR: args.wrapperZdotdir,
-      ORCA_ORIG_ZDOTDIR: args.tempHome,
-      ORCA_ZSHENV_SOURCE_DIR: args.tempHome,
-      ORCA_SHELL_READY_MARKER: '1'
+      BOTMUX_ORIG_ZDOTDIR: args.tempHome,
+      BOTMUX_ZSHENV_SOURCE_DIR: args.tempHome,
+      BOTMUX_SHELL_READY_MARKER: '1'
     }
   })
   let output = ''
@@ -84,7 +84,7 @@ async function runInteractiveZshRc(args: {
       HOME: args.zdotdir,
       TERM: 'xterm-256color',
       ZDOTDIR: args.zdotdir,
-      ORCA_SHELL_READY_MARKER: '1'
+      BOTMUX_SHELL_READY_MARKER: '1'
     }
   })
   let output = ''
@@ -118,7 +118,7 @@ function runInteractiveBashRcfile(rcfileContent: string, tempDir: string): strin
       env: {
         ...process.env,
         HOME: tempDir,
-        ORCA_SHELL_READY_MARKER: '1',
+        BOTMUX_SHELL_READY_MARKER: '1',
         TERM: process.env.TERM || 'xterm'
       },
       timeout: 5000
@@ -146,39 +146,39 @@ function expectBashOsc133Lifecycle(output: string): void {
 }
 
 function expectZdotdirSourceContext(content: string, fileName: '.zprofile' | '.zshrc' | '.zlogin') {
-  expect(content).toContain('export ZDOTDIR="$_orca_home"')
-  expect(content).toContain(`source "$_orca_home/${fileName}"`)
-  expect(content).toContain('export ZDOTDIR="$_orca_wrapper_zdotdir"')
+  expect(content).toContain('export ZDOTDIR="$_botmux_home"')
+  expect(content).toContain(`source "$_botmux_home/${fileName}"`)
+  expect(content).toContain('export ZDOTDIR="$_botmux_wrapper_zdotdir"')
 }
 
 function expectFinalZdotdirRestoreContext(content: string) {
-  expect(content).toContain("after OrcaBotmux's last wrapper file has loaded")
-  expect(content).toContain('export ZDOTDIR="$_orca_home"')
+  expect(content).toContain("after Botmux's last wrapper file has loaded")
+  expect(content).toContain('export ZDOTDIR="$_botmux_home"')
 }
 
 describePosix('daemon shell-ready launch config', () => {
   let previousUserDataPath: string | undefined
-  let previousOrcaOrigZdotdir: string | undefined
+  let previousBotmuxOrigZdotdir: string | undefined
   let userDataPath: string
 
   beforeEach(() => {
-    previousUserDataPath = process.env.ORCA_USER_DATA_PATH
-    previousOrcaOrigZdotdir = process.env.ORCA_ORIG_ZDOTDIR
-    delete process.env.ORCA_ORIG_ZDOTDIR
+    previousUserDataPath = process.env.BOTMUX_USER_DATA_PATH
+    previousBotmuxOrigZdotdir = process.env.BOTMUX_ORIG_ZDOTDIR
+    delete process.env.BOTMUX_ORIG_ZDOTDIR
     userDataPath = mkdtempSync(join(tmpdir(), 'daemon-shell-ready-test-'))
-    process.env.ORCA_USER_DATA_PATH = userDataPath
+    process.env.BOTMUX_USER_DATA_PATH = userDataPath
   })
 
   afterEach(() => {
     if (previousUserDataPath === undefined) {
-      delete process.env.ORCA_USER_DATA_PATH
+      delete process.env.BOTMUX_USER_DATA_PATH
     } else {
-      process.env.ORCA_USER_DATA_PATH = previousUserDataPath
+      process.env.BOTMUX_USER_DATA_PATH = previousUserDataPath
     }
-    if (previousOrcaOrigZdotdir === undefined) {
-      delete process.env.ORCA_ORIG_ZDOTDIR
+    if (previousBotmuxOrigZdotdir === undefined) {
+      delete process.env.BOTMUX_ORIG_ZDOTDIR
     } else {
-      process.env.ORCA_ORIG_ZDOTDIR = previousOrcaOrigZdotdir
+      process.env.BOTMUX_ORIG_ZDOTDIR = previousBotmuxOrigZdotdir
     }
     rmSync(userDataPath, { recursive: true, force: true })
     vi.restoreAllMocks()
@@ -216,20 +216,20 @@ describePosix('daemon shell-ready launch config', () => {
     expect(existsSync(join(userDataPath, 'shell-ready', 'zsh', '.zshenv'))).toBe(true)
   })
 
-  it('falls back to HOME for ORCA_ORIG_ZDOTDIR when inherited ZDOTDIR points at a wrapper dir', async () => {
+  it('falls back to HOME for BOTMUX_ORIG_ZDOTDIR when inherited ZDOTDIR points at a wrapper dir', async () => {
     // Why: guards against the zsh recursion loop that happens when the daemon
-    // was forked from a shell which was itself an OrcaBotmux PTY. Such a shell has
+    // was forked from a shell which was itself an Botmux PTY. Such a shell has
     // ZDOTDIR=<some>/shell-ready/zsh; propagating that unchanged would make
-    // the wrapper `source "$ORCA_ORIG_ZDOTDIR/.zshenv"` source itself.
+    // the wrapper `source "$BOTMUX_ORIG_ZDOTDIR/.zshenv"` source itself.
     const previousZdotdir = process.env.ZDOTDIR
     const previousHome = process.env.HOME
-    process.env.ZDOTDIR = '/some/other/orca_botmux/shell-ready/zsh'
+    process.env.ZDOTDIR = '/some/other/botmux/shell-ready/zsh'
     process.env.HOME = '/Users/alice'
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice')
-      expect(config.env.ORCA_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -244,18 +244,18 @@ describePosix('daemon shell-ready launch config', () => {
     }
   })
 
-  it('uses inherited ORCA_ORIG_ZDOTDIR when ZDOTDIR is an OrcaBotmux wrapper dir', async () => {
+  it('uses inherited BOTMUX_ORIG_ZDOTDIR when ZDOTDIR is an Botmux wrapper dir', async () => {
     const previousZdotdir = process.env.ZDOTDIR
-    const previousOrigZdotdir = process.env.ORCA_ORIG_ZDOTDIR
+    const previousOrigZdotdir = process.env.BOTMUX_ORIG_ZDOTDIR
     const previousHome = process.env.HOME
-    process.env.ZDOTDIR = '/some/other/orca_botmux/shell-ready/zsh'
-    process.env.ORCA_ORIG_ZDOTDIR = '/Users/alice/.config/zsh'
+    process.env.ZDOTDIR = '/some/other/botmux/shell-ready/zsh'
+    process.env.BOTMUX_ORIG_ZDOTDIR = '/Users/alice/.config/zsh'
     process.env.HOME = '/Users/alice'
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice/.config/zsh')
-      expect(config.env.ORCA_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice/.config/zsh')
+      expect(config.env.BOTMUX_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -263,9 +263,9 @@ describePosix('daemon shell-ready launch config', () => {
         process.env.ZDOTDIR = previousZdotdir
       }
       if (previousOrigZdotdir === undefined) {
-        delete process.env.ORCA_ORIG_ZDOTDIR
+        delete process.env.BOTMUX_ORIG_ZDOTDIR
       } else {
-        process.env.ORCA_ORIG_ZDOTDIR = previousOrigZdotdir
+        process.env.BOTMUX_ORIG_ZDOTDIR = previousOrigZdotdir
       }
       if (previousHome === undefined) {
         delete process.env.HOME
@@ -275,18 +275,18 @@ describePosix('daemon shell-ready launch config', () => {
     }
   })
 
-  it('falls back to HOME when inherited ORCA_ORIG_ZDOTDIR points at a wrapper dir', async () => {
+  it('falls back to HOME when inherited BOTMUX_ORIG_ZDOTDIR points at a wrapper dir', async () => {
     const previousZdotdir = process.env.ZDOTDIR
-    const previousOrigZdotdir = process.env.ORCA_ORIG_ZDOTDIR
+    const previousOrigZdotdir = process.env.BOTMUX_ORIG_ZDOTDIR
     const previousHome = process.env.HOME
     delete process.env.ZDOTDIR
-    process.env.ORCA_ORIG_ZDOTDIR = '/some/other/orca_botmux/shell-ready/zsh'
+    process.env.BOTMUX_ORIG_ZDOTDIR = '/some/other/botmux/shell-ready/zsh'
     process.env.HOME = '/Users/alice'
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice')
-      expect(config.env.ORCA_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ZSHENV_SOURCE_DIR).toBe('/Users/alice')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -294,9 +294,9 @@ describePosix('daemon shell-ready launch config', () => {
         process.env.ZDOTDIR = previousZdotdir
       }
       if (previousOrigZdotdir === undefined) {
-        delete process.env.ORCA_ORIG_ZDOTDIR
+        delete process.env.BOTMUX_ORIG_ZDOTDIR
       } else {
-        process.env.ORCA_ORIG_ZDOTDIR = previousOrigZdotdir
+        process.env.BOTMUX_ORIG_ZDOTDIR = previousOrigZdotdir
       }
       if (previousHome === undefined) {
         delete process.env.HOME
@@ -306,7 +306,7 @@ describePosix('daemon shell-ready launch config', () => {
     }
   })
 
-  it('writes zsh wrappers that guard against ORCA_ORIG_ZDOTDIR self-loops', async () => {
+  it('writes zsh wrappers that guard against BOTMUX_ORIG_ZDOTDIR self-loops', async () => {
     const { getShellReadyLaunchConfig } = await importFreshShellReady()
 
     getShellReadyLaunchConfig('/bin/zsh')
@@ -315,9 +315,9 @@ describePosix('daemon shell-ready launch config', () => {
     const zprofile = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zprofile'), 'utf8')
     const zshrc = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zshrc'), 'utf8')
     const zlogin = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zlogin'), 'utf8')
-    expect(zshenv).toContain('_orca_user_zdotdir="${_orca_spawn_orig_zdotdir:-$HOME}"')
-    expect(zshenv).toContain('*/shell-ready/zsh) _orca_user_zdotdir="$HOME" ;;')
-    expect(zshenv).toContain('""|*/shell-ready/zsh) export ORCA_ORIG_ZDOTDIR="$HOME" ;;')
+    expect(zshenv).toContain('_botmux_user_zdotdir="${_botmux_spawn_orig_zdotdir:-$HOME}"')
+    expect(zshenv).toContain('*/shell-ready/zsh) _botmux_user_zdotdir="$HOME" ;;')
+    expect(zshenv).toContain('""|*/shell-ready/zsh) export BOTMUX_ORIG_ZDOTDIR="$HOME" ;;')
     expectZdotdirSourceContext(zprofile, '.zprofile')
     expectZdotdirSourceContext(zshrc, '.zshrc')
     expectZdotdirSourceContext(zlogin, '.zlogin')
@@ -331,15 +331,15 @@ describePosix('daemon shell-ready launch config', () => {
     getShellReadyLaunchConfig('/bin/zsh')
 
     const zlogin = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zlogin'), 'utf8')
-    expect(zlogin).toContain('zle -N zle-line-init __orca_prompt_mark')
-    expect(zlogin).toContain('__orca_prev_line_init_fn="${widgets[zle-line-init]#user:}"')
-    expect(zlogin).toContain('printf "\\033]777;orca-botmux-shell-ready\\007"')
+    expect(zlogin).toContain('zle -N zle-line-init __botmux_prompt_mark')
+    expect(zlogin).toContain('__botmux_prev_line_init_fn="${widgets[zle-line-init]#user:}"')
+    expect(zlogin).toContain('printf "\\033]777;botmux-shell-ready\\007"')
     // Why: add-zle-hook-widget aborts its hook chain when an earlier hook
     // exits non-zero, so the marker must not be registered through it.
     expect(zlogin).not.toContain('add-zle-hook-widget line-init')
     // Why: re-source guard — skip re-capturing when we are already the bound
     // widget so the prior widget chain survives a second source.
-    expect(zlogin).toContain('== "user:__orca_prompt_mark"')
+    expect(zlogin).toContain('== "user:__botmux_prompt_mark"')
   })
 
   // Why: regression guard — oh-my-zsh vi-mode installs a raw zle-line-init
@@ -352,7 +352,7 @@ describePosix('daemon shell-ready launch config', () => {
     async () => {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      const tempHome = mkdtempSync(join(tmpdir(), 'orca-botmux-zsh-vi-mode-'))
+      const tempHome = mkdtempSync(join(tmpdir(), 'botmux-zsh-vi-mode-'))
       writeFileSync(
         join(tempHome, '.zshrc'),
         [
@@ -382,15 +382,15 @@ describePosix('daemon shell-ready launch config', () => {
     async () => {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      const tempHome = mkdtempSync(join(tmpdir(), 'orca-botmux-zsh-azhw-'))
-      const userHookOutput = 'ORCA-TEST-USER-HOOK'
+      const tempHome = mkdtempSync(join(tmpdir(), 'botmux-zsh-azhw-'))
+      const userHookOutput = 'BOTMUX-TEST-USER-HOOK'
       writeFileSync(
         join(tempHome, '.zshrc'),
         [
-          `__orca_test_line_init_hook() { printf "${userHookOutput}" }`,
+          `__botmux_test_line_init_hook() { printf "${userHookOutput}" }`,
           'autoload -Uz add-zle-hook-widget',
-          'zle -N __orca_test_line_init_hook',
-          'add-zle-hook-widget line-init __orca_test_line_init_hook',
+          'zle -N __botmux_test_line_init_hook',
+          'add-zle-hook-widget line-init __botmux_test_line_init_hook',
           ''
         ].join('\n')
       )
@@ -416,21 +416,21 @@ describePosix('daemon shell-ready launch config', () => {
   )
 
   // Why: the marker block is normally sourced once per shell, but a re-source
-  // (nested OrcaBotmux, manual re-source) must stay idempotent — it must keep
+  // (nested Botmux, manual re-source) must stay idempotent — it must keep
   // chaining the user's original zle-line-init instead of clobbering the
   // captured function to empty and silently dropping it on later prompts.
   itWithZsh(
     'keeps chaining the prior zle-line-init widget when the marker block is sourced twice',
     async () => {
-      const zdotdir = mkdtempSync(join(tmpdir(), 'orca-botmux-zsh-resource-'))
-      const userHookOutput = 'ORCA-TEST-PRIOR-WIDGET'
-      const block = getZshShellReadyMarkerRegistrationBlock('\\033]777;orca-botmux-shell-ready\\007')
+      const zdotdir = mkdtempSync(join(tmpdir(), 'botmux-zsh-resource-'))
+      const userHookOutput = 'BOTMUX-TEST-PRIOR-WIDGET'
+      const block = getZshShellReadyMarkerRegistrationBlock('\\033]777;botmux-shell-ready\\007')
       writeFileSync(
         join(zdotdir, '.zshrc'),
         [
           // A user widget that mimics oh-my-zsh vi-mode owning zle-line-init.
-          `__orca_test_prior_widget() { printf "${userHookOutput}" }`,
-          'zle -N zle-line-init __orca_test_prior_widget',
+          `__botmux_test_prior_widget() { printf "${userHookOutput}" }`,
+          'zle -N zle-line-init __botmux_test_prior_widget',
           block,
           // Second source of the exact same block — must not drop the chain.
           block,
@@ -468,31 +468,31 @@ describePosix('daemon shell-ready launch config', () => {
     const zlogin = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zlogin'), 'utf8')
     const bashRc = readFileSync(join(userDataPath, 'shell-ready', 'bash', 'rcfile'), 'utf8')
     const restoreLine =
-      '[[ -n "${ORCA_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="${ORCA_OPENCODE_CONFIG_DIR}"'
+      '[[ -n "${BOTMUX_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="${BOTMUX_OPENCODE_CONFIG_DIR}"'
     const mimoRestoreLine =
-      '[[ -n "${ORCA_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="${ORCA_MIMOCODE_HOME}"'
+      '[[ -n "${BOTMUX_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="${BOTMUX_MIMOCODE_HOME}"'
     const codexRestoreLine =
-      '[[ -n "${ORCA_CODEX_HOME:-}" ]] && export CODEX_HOME="${ORCA_CODEX_HOME}"'
-    const agentTeamsPathRestoreLine = '[[ -n "${ORCA_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0'
-    const ompWrapperLine = 'command omp --extension "${ORCA_OMP_STATUS_EXTENSION}" "$@"'
+      '[[ -n "${BOTMUX_CODEX_HOME:-}" ]] && export CODEX_HOME="${BOTMUX_CODEX_HOME}"'
+    const agentTeamsPathRestoreLine = '[[ -n "${BOTMUX_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0'
+    const ompWrapperLine = 'command omp --extension "${BOTMUX_OMP_STATUS_EXTENSION}" "$@"'
     expect(zshrc).toContain(restoreLine)
     expect(zlogin).toContain(restoreLine)
     expect(bashRc).toContain(restoreLine)
     expect(zshrc).toContain(mimoRestoreLine)
     expect(zlogin).toContain(mimoRestoreLine)
     expect(bashRc).toContain(mimoRestoreLine)
-    expect(zshrc).not.toContain('ORCA_PI_CODING_AGENT_DIR')
-    expect(zlogin).not.toContain('ORCA_PI_CODING_AGENT_DIR')
-    expect(bashRc).not.toContain('ORCA_PI_CODING_AGENT_DIR')
+    expect(zshrc).not.toContain('BOTMUX_PI_CODING_AGENT_DIR')
+    expect(zlogin).not.toContain('BOTMUX_PI_CODING_AGENT_DIR')
+    expect(bashRc).not.toContain('BOTMUX_PI_CODING_AGENT_DIR')
     expect(zshrc).toContain(codexRestoreLine)
     expect(zlogin).toContain(codexRestoreLine)
     expect(zshrc).toContain(agentTeamsPathRestoreLine)
     expect(zlogin).toContain(agentTeamsPathRestoreLine)
     expect(bashRc).toContain(agentTeamsPathRestoreLine)
     expect(bashRc).toContain(codexRestoreLine)
-    expect(zshrc).not.toContain('ORCA_OMP_CODING_AGENT_DIR')
-    expect(zlogin).not.toContain('ORCA_OMP_CODING_AGENT_DIR')
-    expect(bashRc).not.toContain('ORCA_OMP_CODING_AGENT_DIR')
+    expect(zshrc).not.toContain('BOTMUX_OMP_CODING_AGENT_DIR')
+    expect(zlogin).not.toContain('BOTMUX_OMP_CODING_AGENT_DIR')
+    expect(bashRc).not.toContain('BOTMUX_OMP_CODING_AGENT_DIR')
     expect(zshrc).toContain(ompWrapperLine)
     expect(zlogin).toContain(ompWrapperLine)
     expect(bashRc).toContain(ompWrapperLine)
@@ -515,13 +515,13 @@ describePosix('daemon shell-ready launch config', () => {
     // precmd is prepended (captures $? first) and the epilogue is appended last,
     // so a framework that must be last in PROMPT_COMMAND stays between them.
     expect(bashRc).toContain(
-      'PROMPT_COMMAND="__orca_osc133_precmd${PROMPT_COMMAND:+;${PROMPT_COMMAND}};__orca_osc133_epilogue"'
+      'PROMPT_COMMAND="__botmux_osc133_precmd${PROMPT_COMMAND:+;${PROMPT_COMMAND}};__botmux_osc133_epilogue"'
     )
     // The final DEBUG arming runs after PROMPT_COMMAND setup so the rcfile's own
     // commands are not mistaken for a foreground command (lastIndexOf skips the
-    // identical re-arm inside __orca_osc133_epilogue).
-    expect(bashRc.lastIndexOf("trap '__orca_osc133_preexec' DEBUG")).toBeGreaterThan(
-      bashRc.indexOf('PROMPT_COMMAND="__orca_osc133_precmd')
+    // identical re-arm inside __botmux_osc133_epilogue).
+    expect(bashRc.lastIndexOf("trap '__botmux_osc133_preexec' DEBUG")).toBeGreaterThan(
+      bashRc.indexOf('PROMPT_COMMAND="__botmux_osc133_precmd')
     )
     expect(zshrc).toContain('printf "\\033]133;D;%s\\007"')
     expect(zshrc).toContain('printf "\\033]133;C\\007"')
@@ -563,7 +563,7 @@ describePosix('daemon shell-ready launch config', () => {
     async () => {
       const { getDaemonBashShellReadyRcfileContent } = await importFreshShellReady()
       // Minimal bash-preexec imitation (iTerm2/starship setups): re-arms its own
-      // DEBUG trap from PROMPT_COMMAND at the first prompt — silencing OrcaBotmux's
+      // DEBUG trap from PROMPT_COMMAND at the first prompt — silencing Botmux's
       // trap — and dispatches preexec_functions with the command as $1.
       writeFileSync(
         join(userDataPath, '.bash_profile'),
@@ -587,13 +587,13 @@ describePosix('daemon shell-ready launch config', () => {
   )
 
   itWithBash(
-    'dispatches a non-empty preexec_functions against the real command, not OrcaBotmux hooks',
+    'dispatches a non-empty preexec_functions against the real command, not Botmux hooks',
     async () => {
       const { getDaemonBashShellReadyRcfileContent } = await importFreshShellReady()
-      // Why: OrcaBotmux's epilogue captures bash-preexec's re-armed DEBUG trap and
+      // Why: Botmux's epilogue captures bash-preexec's re-armed DEBUG trap and
       // chains it. A real preexec callback must fire against the user's command —
-      // not __orca_osc133_epilogue. Mirror upstream bash-preexec faithfully: it
-      // enables `functrace` (so OrcaBotmux's `trap -p DEBUG` capture sees its trap),
+      // not __botmux_osc133_epilogue. Mirror upstream bash-preexec faithfully: it
+      // enables `functrace` (so Botmux's `trap -p DEBUG` capture sees its trap),
       // defers that install to the first prompt via PROMPT_COMMAND, and reads the
       // command from `history` (so DEBUG fires on prompt hooks never dispatch a
       // phantom). The naive `$BASH_COMMAND` imitation does none of these.
@@ -629,7 +629,7 @@ describePosix('daemon shell-ready launch config', () => {
       expectBashOsc133Lifecycle(output)
       expect(output).toContain('USER_PREEXEC:true')
       expect(output).toContain('USER_PREEXEC:false')
-      expect(output).not.toContain('USER_PREEXEC:__orca_osc133')
+      expect(output).not.toContain('USER_PREEXEC:__botmux_osc133')
       expect(output).not.toContain('USER_PREEXEC:__bp_')
     }
   )
@@ -647,17 +647,17 @@ describePosix('daemon shell-ready launch config', () => {
     expectBashOsc133Lifecycle(output)
   })
 
-  it('preserves a real inherited ZDOTDIR as ORCA_ORIG_ZDOTDIR', async () => {
+  it('preserves a real inherited ZDOTDIR as BOTMUX_ORIG_ZDOTDIR', async () => {
     // Why: users who run a custom zsh dotfiles directory legitimately set
-    // ZDOTDIR before launching OrcaBotmux. We only want to reject the self-loop
+    // ZDOTDIR before launching Botmux. We only want to reject the self-loop
     // case — any real user ZDOTDIR must round-trip so their configs load.
     const previousZdotdir = process.env.ZDOTDIR
     process.env.ZDOTDIR = '/Users/alice/.config/zsh'
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice/.config/zsh')
-      expect(config.env.ORCA_ZSHENV_SOURCE_DIR).toBe('/Users/alice/.config/zsh')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice/.config/zsh')
+      expect(config.env.BOTMUX_ZSHENV_SOURCE_DIR).toBe('/Users/alice/.config/zsh')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -673,12 +673,12 @@ describePosix('daemon shell-ready launch config', () => {
     // guards against a regression that would reintroduce the recursion loop.
     const previousZdotdir = process.env.ZDOTDIR
     const previousHome = process.env.HOME
-    process.env.ZDOTDIR = '/some/other/orca_botmux/shell-ready/zsh/'
+    process.env.ZDOTDIR = '/some/other/botmux/shell-ready/zsh/'
     process.env.HOME = '/Users/alice'
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -705,7 +705,7 @@ describePosix('daemon shell-ready launch config', () => {
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -729,7 +729,7 @@ describePosix('daemon shell-ready launch config', () => {
     try {
       const { getShellReadyLaunchConfig } = await importFreshShellReady()
       const config = getShellReadyLaunchConfig('/bin/zsh')
-      expect(config.env.ORCA_ORIG_ZDOTDIR).toBe('/Users/alice/shell-ready/zsh-custom')
+      expect(config.env.BOTMUX_ORIG_ZDOTDIR).toBe('/Users/alice/shell-ready/zsh-custom')
     } finally {
       if (previousZdotdir === undefined) {
         delete process.env.ZDOTDIR
@@ -750,18 +750,18 @@ describePosix('daemon shell-ready launch config', () => {
     const zshenv = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zshenv'), 'utf8')
 
     expect(zshenv).toContain('unset ZDOTDIR')
-    expect(zshenv).toContain('_orca_zshenv_source_dir="${ORCA_ZSHENV_SOURCE_DIR:-$HOME}"')
-    expect(zshenv).toContain('source "${_orca_zshenv_path}"')
-    expect(zshenv).toContain('_orca_discovered_zdotdir="${ZDOTDIR:-}"')
+    expect(zshenv).toContain('_botmux_zshenv_source_dir="${BOTMUX_ZSHENV_SOURCE_DIR:-$HOME}"')
+    expect(zshenv).toContain('source "${_botmux_zshenv_path}"')
+    expect(zshenv).toContain('_botmux_discovered_zdotdir="${ZDOTDIR:-}"')
     expect(zshenv).toContain(
-      'export ORCA_ORIG_ZDOTDIR="${_orca_discovered_zdotdir:-${_orca_user_zdotdir:-$HOME}}"'
+      'export BOTMUX_ORIG_ZDOTDIR="${_botmux_discovered_zdotdir:-${_botmux_user_zdotdir:-$HOME}}"'
     )
     expect(zshenv).toContain('export ZDOTDIR=')
   })
 
-  it('preserves spawn-env ORCA_ORIG_ZDOTDIR as fallback when discovery yields nothing', async () => {
+  it('preserves spawn-env BOTMUX_ORIG_ZDOTDIR as fallback when discovery yields nothing', async () => {
     // Why: if user .zshenv returns early or doesn't set ZDOTDIR, the wrapper
-    // should fall back to the spawn-env ORCA_ORIG_ZDOTDIR (if present), then HOME.
+    // should fall back to the spawn-env BOTMUX_ORIG_ZDOTDIR (if present), then HOME.
     const { getShellReadyLaunchConfig } = await importFreshShellReady()
 
     getShellReadyLaunchConfig('/bin/zsh')
@@ -769,9 +769,9 @@ describePosix('daemon shell-ready launch config', () => {
     const zshenv = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zshenv'), 'utf8')
 
     // Save spawn-env value before sourcing user .zshenv
-    expect(zshenv).toContain('_orca_spawn_orig_zdotdir="${ORCA_ORIG_ZDOTDIR:-}"')
+    expect(zshenv).toContain('_botmux_spawn_orig_zdotdir="${BOTMUX_ORIG_ZDOTDIR:-}"')
 
     // Fallback chain: discovered → normalized spawn-env path → HOME
-    expect(zshenv).toContain('${_orca_discovered_zdotdir:-${_orca_user_zdotdir:-$HOME}}')
+    expect(zshenv).toContain('${_botmux_discovered_zdotdir:-${_botmux_user_zdotdir:-$HOME}}')
   })
 })

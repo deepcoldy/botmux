@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { worktreeRow } from './worktree-row-locators'
 
@@ -41,27 +41,27 @@ async function prepareSidebarForSwitchTest(page: Page): Promise<[string, string]
 }
 
 test.describe('Worktree switch responsiveness', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   test('updates the selected workspace in the same click task when changing back', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const [firstWorktreeId, secondWorktreeId] = await prepareSidebarForSwitchTest(orcaBotmuxPage)
-    const firstRow = worktreeRow(orcaBotmuxPage, firstWorktreeId)
-    const secondRow = worktreeRow(orcaBotmuxPage, secondWorktreeId)
+    const [firstWorktreeId, secondWorktreeId] = await prepareSidebarForSwitchTest(botmuxPage)
+    const firstRow = worktreeRow(botmuxPage, firstWorktreeId)
+    const secondRow = worktreeRow(botmuxPage, secondWorktreeId)
 
     await expect(firstRow).toBeVisible()
     await expect(secondRow).toBeVisible()
     await expect(firstRow).toHaveAttribute('aria-current', 'page')
-    await expect(orcaBotmuxPage.locator('[data-rendered-active-worktree-id]')).toHaveAttribute(
+    await expect(botmuxPage.locator('[data-rendered-active-worktree-id]')).toHaveAttribute(
       'data-rendered-active-worktree-id',
       firstWorktreeId
     )
 
-    const result = await orcaBotmuxPage.evaluate(
+    const result = await botmuxPage.evaluate(
       async ({ firstId, secondId, timerDelayMs }) => {
         const option = (id: string): HTMLElement => {
           const element = [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(

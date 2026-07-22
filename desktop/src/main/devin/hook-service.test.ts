@@ -26,7 +26,7 @@ describe('DevinHookService', () => {
   let homeDir: string
 
   beforeEach(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-desktop-devin-home-'))
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-desktop-devin-home-'))
     homedirMock.mockReturnValue(homeDir)
     vi.stubEnv('APPDATA', join(homeDir, 'AppData', 'Roaming'))
   })
@@ -125,7 +125,7 @@ describe('DevinHookService', () => {
     const previous = process.platform
     Object.defineProperty(process, 'platform', { value: 'win32' })
     try {
-      const scriptPath = 'C:\\Users\\Ada Lovelace\\.orca_botmux\\agent-hooks\\devin-hook.cmd'
+      const scriptPath = 'C:\\Users\\Ada Lovelace\\.botmux\\agent-hooks\\devin-hook.cmd'
       const command = getDevinManagedCommand(scriptPath)
       const encoded = command.match(/ -EncodedCommand (\S+)$/)?.[1]
       expect(encoded).toBeDefined()

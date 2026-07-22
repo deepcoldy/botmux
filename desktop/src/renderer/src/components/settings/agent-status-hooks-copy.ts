@@ -12,7 +12,7 @@ export function getAgentStatusHooksTitle(): string {
 export function getAgentStatusHooksDescription(): string {
   return translate(
     AGENT_STATUS_HOOKS_DESCRIPTION_KEY,
-    'Shows working, waiting, and done states in OrcaBotmux. Turn off to remove OrcaBotmux-managed hooks and stop reinstalling them.'
+    'Shows working, waiting, and done states in Botmux. Turn off to remove Botmux-managed hooks and stop reinstalling them.'
   )
 }
 

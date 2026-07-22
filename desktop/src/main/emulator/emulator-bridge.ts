@@ -38,7 +38,7 @@ export class EmulatorBridge {
   }
 
   // Aggregated device list across host-supported backends (iOS simulators +
-  // Android devices/AVDs), for the unified `orca_botmux emulator list`.
+  // Android devices/AVDs), for the unified `botmux emulator list`.
   async listAllDevices(): Promise<EmulatorDevice[]> {
     const perBackend = await Promise.all(
       this.backends.map(async (backend) => {
@@ -283,7 +283,7 @@ export class EmulatorBridge {
     }
     throw new EmulatorError(
       'emulator_no_active',
-      'No active emulator for this worktree — use orca_botmux emulator attach or open the pane'
+      'No active emulator for this worktree — use botmux emulator attach or open the pane'
     )
   }
 

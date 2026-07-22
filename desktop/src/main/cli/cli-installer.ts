@@ -26,10 +26,10 @@ import {
 } from './windows-user-path-registry'
 
 const execFileAsync = promisify(execFile)
-const DEFAULT_MAC_COMMAND_PATH = '/usr/local/bin/orca_botmux'
-const DEV_COMMAND_NAME = 'orca-botmux-desktop-dev'
-const LINUX_COMMAND_NAME = 'orca-botmux-ide'
-const LEGACY_LINUX_COMMAND_NAME = 'orca_botmux'
+const DEFAULT_MAC_COMMAND_PATH = '/usr/local/bin/botmux'
+const DEV_COMMAND_NAME = 'botmux-desktop-dev'
+const LINUX_COMMAND_NAME = 'botmux-ide'
+const LEGACY_LINUX_COMMAND_NAME = 'botmux'
 const DEV_LAUNCHER_DIR = ['cli', 'bin']
 const WINDOWS_PATH_WRITE_TIMEOUT_MS = 5_000
 
@@ -86,8 +86,9 @@ export class CliInstaller {
       // Why: development builds must not claim the production shell command.
       return DEV_COMMAND_NAME
     }
-    // Why: packaged Linux uses `orca-botmux-ide` to avoid shadowing GNOME OrcaBotmux's /usr/bin/orca_botmux.
-    return this.platform === 'linux' ? LINUX_COMMAND_NAME : 'orca_botmux'
+    // Why: packaged Linux uses `botmux-ide` as the public shell command (deb/rpm
+    // package name continuity from the pre-rebrand packaged Linux CLI name packaging).
+    return this.platform === 'linux' ? LINUX_COMMAND_NAME : 'botmux'
   }
 
   constructor(options: CliInstallerOptions = {}) {
@@ -104,7 +105,7 @@ export class CliInstaller {
       join(this.homePath, 'AppData', 'Local')
     this.processPathEnv = options.processPathEnv ?? process.env.PATH ?? process.env.Path ?? null
     this.commandPathOverride =
-      options.commandPathOverride ?? process.env.ORCA_CLI_INSTALL_PATH ?? null
+      options.commandPathOverride ?? process.env.BOTMUX_CLI_INSTALL_PATH ?? null
     // Why: resolved once at construction — existsSync must not run on every
     // getStatus() call (hot path). /usr/local/bin is absent by default on Apple
     // Silicon Macs (Homebrew moved to /opt/homebrew); fall back to ~/.local/bin
@@ -115,7 +116,7 @@ export class CliInstaller {
     const candidateMacPath = options.defaultMacCommandPath ?? DEFAULT_MAC_COMMAND_PATH
     this.macCommandPath = existsSync(dirname(candidateMacPath))
       ? candidateMacPath
-      : join(this.homePath, '.local', 'bin', 'orca_botmux')
+      : join(this.homePath, '.local', 'bin', 'botmux')
     this.privilegedRunner = options.privilegedRunner ?? runMacPrivilegedCommand
     this.userPathReader = options.userPathReader ?? readWindowsUserPathRegistry
     this.userPathMutationReader =
@@ -155,7 +156,7 @@ export class CliInstaller {
         this.isLinuxAppImage() && this.appImagePath
           ? `The AppImage file at ${this.appImagePath} is missing. Move it back or re-run CLI registration from the current AppImage location.`
           : this.isPackaged
-            ? 'The bundled CLI launcher is missing from this OrcaBotmux build.'
+            ? 'The bundled CLI launcher is missing from this Botmux build.'
             : 'Development mode uses a generated launcher for validation only.'
       return {
         platform: this.platform,
@@ -191,7 +192,7 @@ export class CliInstaller {
       throw new Error(status.detail ?? 'CLI registration is unavailable on this build.')
     }
     if (status.state === 'conflict') {
-      throw new Error(`Refusing to replace non-OrcaBotmux command at ${status.commandPath}.`)
+      throw new Error(`Refusing to replace non-Botmux command at ${status.commandPath}.`)
     }
 
     // eslint-disable-next-line unicorn/prefer-ternary -- Why: the install path performs async side effects and is easier to audit as an explicit branch than as an awaited ternary.
@@ -202,7 +203,7 @@ export class CliInstaller {
       await this.installAppImageWrapper(status.commandPath, status.launcherPath)
       await this.removeLegacyLinuxCommandIfManaged(status.launcherPath)
     } else if (this.isWindowsPackagedBundledCommand(status.commandPath, status.launcherPath)) {
-      // Why: packaged Windows already ships resources/bin/orca_botmux.exe. Registration
+      // Why: packaged Windows already ships resources/bin/botmux.exe. Registration
       // only owns the user PATH entry; rewriting the asset makes it recurse.
     } else {
       // Why: mkdir stays here for the Windows wrapper path — the target dir is
@@ -237,10 +238,10 @@ export class CliInstaller {
       return status
     }
     if (status.state === 'conflict') {
-      throw new Error(`Refusing to remove non-OrcaBotmux command at ${status.commandPath}.`)
+      throw new Error(`Refusing to remove non-Botmux command at ${status.commandPath}.`)
     }
     if (status.state === 'stale') {
-      throw new Error(`Refusing to remove a command not owned by OrcaBotmux at ${status.commandPath}.`)
+      throw new Error(`Refusing to remove a command not owned by Botmux at ${status.commandPath}.`)
     }
 
     if (status.installMethod === 'symlink') {
@@ -319,12 +320,12 @@ export class CliInstaller {
       const status = await this.inspectSymlink(commandPath, launcherPath)
       if (status.state !== 'not_installed') {
         if (reachedDefaultCommandPath && !isDefaultCommandPath && status.state === 'conflict') {
-          // Why: a non-OrcaBotmux command after an empty/default install slot can be
+          // Why: a non-Botmux command after an empty/default install slot can be
           // shadowed safely by installing there; no user file needs replacing.
           continue
         }
         // Why: PATH lookup is first-match-wins; use the executable command the
-        // shell will actually run, while preserving conflicts that shadow OrcaBotmux.
+        // shell will actually run, while preserving conflicts that shadow Botmux.
         return commandPath
       }
     }
@@ -354,7 +355,7 @@ export class CliInstaller {
         return join(this.homePath, '.local', 'bin', DEV_COMMAND_NAME)
       }
       if (this.platform === 'win32') {
-        return join(this.localAppDataPath, 'Programs', 'OrcaBotmux Dev', 'bin', `${DEV_COMMAND_NAME}.cmd`)
+        return join(this.localAppDataPath, 'Programs', 'Botmux Dev', 'bin', `${DEV_COMMAND_NAME}.cmd`)
       }
     }
 
@@ -366,9 +367,8 @@ export class CliInstaller {
       // Why: Linux does not have a single privileged global shell-command flow
       // equivalent to macOS's /usr/local/bin integration. ~/.local/bin is the
       // least surprising user-scoped location that many distros already expose.
-      // Why `orca-botmux-ide`: GNOME OrcaBotmux (the screen reader) ships /usr/bin/orca_botmux on
-      // most Linux distros. Using `orca-botmux-ide` avoids shadowing that system
-      // command, matching the executableName already used for the Electron binary.
+      // Why `botmux-ide`: Linux packages ship that command name (historical
+      // continuity from the packaged Linux CLI name); matches electron-builder Linux packaging.
       return join(this.homePath, '.local', 'bin', LINUX_COMMAND_NAME)
     }
 
@@ -465,8 +465,8 @@ export class CliInstaller {
         return
       }
 
-      // Why: after the Linux command rename, the old OrcaBotmux-owned `orca_botmux` symlink
-      // would keep shadowing GNOME OrcaBotmux even though the new command is installed.
+      // Why: after the Linux command rename, the old Botmux-owned `botmux` symlink
+      // would leave a stale Botmux-managed bare `botmux` symlink after the rename to botmux-ide.
       await unlink(legacyCommandPath)
     } catch (error) {
       if (isMissingError(error)) {
@@ -494,7 +494,7 @@ export class CliInstaller {
 
     // Why: AppImage upgrades can leave a legacy symlink into a now-gone FUSE
     // mount; the stable AppImage path is not a sibling of that old target.
-    return /(?:^|[/\\])resources[/\\]bin[/\\]orca_botmux$/.test(resolvedTarget)
+    return /(?:^|[/\\])resources[/\\]bin[/\\]botmux$/.test(resolvedTarget)
   }
 
   private async installWindowsWrapper(commandPath: string, launcherPath: string): Promise<void> {
@@ -525,7 +525,7 @@ export class CliInstaller {
           supported: true,
           state: 'conflict',
           currentTarget: null,
-          detail: `${commandPath} exists but is not an OrcaBotmux launcher script.`
+          detail: `${commandPath} exists but is not an Botmux launcher script.`
         })
       }
 
@@ -552,7 +552,7 @@ export class CliInstaller {
           supported: true,
           state: 'not_installed',
           currentTarget: null,
-          detail: `Register ${commandPath} to use OrcaBotmux from the terminal.`
+          detail: `Register ${commandPath} to use Botmux from the terminal.`
         })
       }
       throw error
@@ -577,7 +577,7 @@ export class CliInstaller {
               supported: true,
               state: 'stale',
               currentTarget: managedTarget,
-              detail: `${commandPath} contains an older OrcaBotmux launcher.`
+              detail: `${commandPath} contains an older Botmux launcher.`
             })
           }
         }
@@ -589,7 +589,7 @@ export class CliInstaller {
           supported: true,
           state: 'conflict',
           currentTarget: null,
-          detail: `${commandPath} exists but is not an OrcaBotmux symlink.`
+          detail: `${commandPath} exists but is not an Botmux symlink.`
         })
       }
 
@@ -609,8 +609,8 @@ export class CliInstaller {
         detail: isInstalled
           ? `Registered at ${commandPath}.`
           : isManagedStaleTarget
-            ? `${commandPath} points to an older OrcaBotmux launcher.`
-            : `${commandPath} points to a non-OrcaBotmux launcher.`
+            ? `${commandPath} points to an older Botmux launcher.`
+            : `${commandPath} points to a non-Botmux launcher.`
       })
     } catch (error) {
       if (isMissingError(error)) {
@@ -621,7 +621,7 @@ export class CliInstaller {
           supported: true,
           state: 'not_installed',
           currentTarget: null,
-          detail: `Register ${commandPath} to use OrcaBotmux from the terminal.`
+          detail: `Register ${commandPath} to use Botmux from the terminal.`
         })
       }
       throw error
@@ -644,7 +644,7 @@ export class CliInstaller {
     }
 
     if (this.platform === 'darwin') {
-      // Why: prior packaged installs can leave a symlink to an older OrcaBotmux.app
+      // Why: prior packaged installs can leave a symlink to an older Botmux.app
       // resources launcher, but arbitrary user-owned symlinks must not be replaced.
       return /(?:^|[/\\])[^/\\]+\.app[/\\]Contents[/\\]Resources[/\\]bin[/\\][^/\\]+$/.test(
         resolvedTarget
@@ -671,7 +671,7 @@ export class CliInstaller {
     const siblingDevLauncherDir = resolve(siblingDevUserDataPath, ...DEV_LAUNCHER_DIR)
 
     // Why: development builds generate launchers under the sibling `*-dev`
-    // profile; packaged OrcaBotmux must be able to reclaim that public command.
+    // profile; packaged Botmux must be able to reclaim that public command.
     return (
       basename(siblingDevUserDataPath) === `${basename(packagedUserDataPath)}-dev` &&
       isPathInsideOrEqual(siblingDevLauncherDir, resolvedTarget)
@@ -709,7 +709,7 @@ export class CliInstaller {
           supported: true,
           state: 'conflict',
           currentTarget: null,
-          detail: `${commandPath} exists but is not an OrcaBotmux launcher script.`
+          detail: `${commandPath} exists but is not an Botmux launcher script.`
         })
       }
 
@@ -748,7 +748,7 @@ export class CliInstaller {
           supported: true,
           state: 'not_installed',
           currentTarget: null,
-          detail: `Register ${commandPath} to use OrcaBotmux from Command Prompt or PowerShell.`
+          detail: `Register ${commandPath} to use Botmux from Command Prompt or PowerShell.`
         })
       }
       throw error
@@ -821,7 +821,7 @@ export class CliInstaller {
         pathConfigured,
         state: 'not_installed',
         currentTarget: null,
-        detail: `Register ${status.commandPath} to use OrcaBotmux from Command Prompt or PowerShell.`
+        detail: `Register ${status.commandPath} to use Botmux from Command Prompt or PowerShell.`
       }
     }
 
@@ -832,7 +832,7 @@ export class CliInstaller {
         pathConfigured,
         detail:
           pathProbe.detail ??
-          'The OrcaBotmux launcher exists, but OrcaBotmux could not check your Windows user PATH.'
+          'The Botmux launcher exists, but Botmux could not check your Windows user PATH.'
       }
     }
 
@@ -922,8 +922,8 @@ export class CliInstaller {
       }
       const guidance =
         action === 'add'
-          ? `Add this folder to your PATH manually: ${pathDirectory}. Or run OrcaBotmux as an administrator and try again.`
-          : `Remove this folder from your PATH manually: ${pathDirectory}. Or run OrcaBotmux as an administrator and try again.`
+          ? `Add this folder to your PATH manually: ${pathDirectory}. Or run Botmux as an administrator and try again.`
+          : `Remove this folder from your PATH manually: ${pathDirectory}. Or run Botmux as an administrator and try again.`
       throw new Error(
         `Windows blocked updating your user PATH (access denied). This usually means your PATH environment variable is managed by Group Policy or your organization's device management. ${guidance}`,
         { cause: error }
@@ -954,7 +954,7 @@ async function ensureDevLauncher(args: {
   )
   await mkdir(dirname(launcherPath), { recursive: true })
 
-  // Why: packaged OrcaBotmux ships real platform launchers under resources/bin, but
+  // Why: packaged Botmux ships real platform launchers under resources/bin, but
   // development builds do not have that stable asset layout. Generating a
   // launcher in userData lets us validate the shell-command flow without
   // changing the packaged registration contract.
@@ -968,9 +968,9 @@ async function ensureDevLauncher(args: {
   })
   if (args.commandName === DEV_COMMAND_NAME && args.platform !== 'win32') {
     // Why: dev PTYs prepend userData/cli/bin to PATH, and product-owned
-    // commands are documented as `orca_botmux ...`. Keep that local alias fresh
+    // commands are documented as `botmux ...`. Keep that local alias fresh
     // without claiming the global production command.
-    await writeFile(join(dirname(launcherPath), 'orca_botmux'), content, {
+    await writeFile(join(dirname(launcherPath), 'botmux'), content, {
       encoding: 'utf8',
       mode: 0o755
     })
@@ -987,13 +987,13 @@ function buildUnixDevLauncher(
 set -euo pipefail
 ELECTRON=${quoteShell(execPathValue)}
 CLI=${quoteShell(cliEntryPath)}
-export ORCA_USER_DATA_PATH=${quoteShell(userDataPath)}
-if [ -z "\${ORCA_APP_EXECUTABLE:-}" ]; then
-  export ORCA_APP_EXECUTABLE="$ELECTRON"
-  export ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT=1
+export BOTMUX_USER_DATA_PATH=${quoteShell(userDataPath)}
+if [ -z "\${BOTMUX_APP_EXECUTABLE:-}" ]; then
+  export BOTMUX_APP_EXECUTABLE="$ELECTRON"
+  export BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT=1
 fi
-export ORCA_NODE_OPTIONS="\${NODE_OPTIONS-}"
-export ORCA_NODE_REPL_EXTERNAL_MODULE="\${NODE_REPL_EXTERNAL_MODULE-}"
+export BOTMUX_NODE_OPTIONS="\${NODE_OPTIONS-}"
+export BOTMUX_NODE_REPL_EXTERNAL_MODULE="\${NODE_REPL_EXTERNAL_MODULE-}"
 unset NODE_OPTIONS
 unset NODE_REPL_EXTERNAL_MODULE
 ELECTRON_RUN_AS_NODE=1 "$ELECTRON" "$CLI" "$@"
@@ -1009,13 +1009,13 @@ function buildWindowsDevLauncher(
 setlocal
 set "ELECTRON=${escapeWindowsBatchValue(execPathValue)}"
 set "CLI=${escapeWindowsBatchValue(cliEntryPath)}"
-set "ORCA_USER_DATA_PATH=${escapeWindowsBatchValue(userDataPath)}"
-if not defined ORCA_APP_EXECUTABLE (
-  set "ORCA_APP_EXECUTABLE=%ELECTRON%"
-  set "ORCA_APP_EXECUTABLE_NEEDS_APP_ROOT=1"
+set "BOTMUX_USER_DATA_PATH=${escapeWindowsBatchValue(userDataPath)}"
+if not defined BOTMUX_APP_EXECUTABLE (
+  set "BOTMUX_APP_EXECUTABLE=%ELECTRON%"
+  set "BOTMUX_APP_EXECUTABLE_NEEDS_APP_ROOT=1"
 )
-set "ORCA_NODE_OPTIONS=%NODE_OPTIONS%"
-set "ORCA_NODE_REPL_EXTERNAL_MODULE=%NODE_REPL_EXTERNAL_MODULE%"
+set "BOTMUX_NODE_OPTIONS=%NODE_OPTIONS%"
+set "BOTMUX_NODE_REPL_EXTERNAL_MODULE=%NODE_REPL_EXTERNAL_MODULE%"
 set NODE_OPTIONS=
 set NODE_REPL_EXTERNAL_MODULE=
 set ELECTRON_RUN_AS_NODE=1
@@ -1026,15 +1026,15 @@ set ELECTRON_RUN_AS_NODE=1
 function buildWindowsForwarder(launcherPath: string): string {
   return `@echo off
 setlocal
-set "ORCA_LAUNCHER=${escapeWindowsBatchValue(launcherPath)}"
-"%ORCA_LAUNCHER%" %*
+set "BOTMUX_LAUNCHER=${escapeWindowsBatchValue(launcherPath)}"
+"%BOTMUX_LAUNCHER%" %*
 `
 }
 
 function extractManagedUnixLauncherTarget(content: string): string | null {
   if (
     !content.includes('ELECTRON_RUN_AS_NODE=1') ||
-    !content.includes('ORCA_NODE_OPTIONS') ||
+    !content.includes('BOTMUX_NODE_OPTIONS') ||
     !content.includes('NODE_REPL_EXTERNAL_MODULE')
   ) {
     return null
@@ -1046,7 +1046,7 @@ function extractManagedUnixLauncherTarget(content: string): string | null {
   }
 
   // Why: older dev installs wrote a generated shell launcher directly to
-  // /usr/local/bin/orca_botmux. Treat only OrcaBotmux's compiled CLI entrypoints as managed;
+  // /usr/local/bin/botmux. Treat only Botmux's compiled CLI entrypoints as managed;
   // arbitrary user scripts that happen to launch Electron must stay conflicts.
   return /(?:^|[/\\])(?:out|app\.asar\.unpacked[/\\]out)[/\\]cli[/\\]index\.js$/.test(cliPath)
     ? cliPath
@@ -1199,7 +1199,7 @@ async function writeWindowsUserPath(value: string): Promise<void> {
   await runWindowsPathCommand([
     '-NoProfile',
     '-Command',
-    // Why: PATH registration must stay user-scoped on Windows so the OrcaBotmux
+    // Why: PATH registration must stay user-scoped on Windows so the Botmux
     // desktop app can manage the public shell command without requiring
     // elevation or mutating machine-wide environment state.
     `[Environment]::SetEnvironmentVariable('Path', ${quotePowerShell(value)}, 'User')`
@@ -1255,13 +1255,13 @@ export function getBundledLauncherPath(
   resourcesPath: string
 ): string | null {
   if (platform === 'darwin') {
-    return join(resourcesPath, 'bin', 'orca_botmux')
+    return join(resourcesPath, 'bin', 'botmux')
   }
   if (platform === 'linux') {
     return join(resourcesPath, 'bin', LINUX_COMMAND_NAME)
   }
   if (platform === 'win32') {
-    return join(resourcesPath, 'bin', 'orca_botmux.exe')
+    return join(resourcesPath, 'bin', 'botmux.exe')
   }
   return null
 }

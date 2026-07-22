@@ -132,12 +132,12 @@ const SYNCHRONIZED_OUTPUT_END_SEQUENCE = '\x1b[?2026l'
 // the lossy-backlog warning. Cap-agnostic wording: the byte limit scales with
 // the scrollback setting.
 const BACKGROUND_BACKLOG_WARNING =
-  '\x18\x1b[0m\r\n[OrcaBotmux skipped hidden terminal output because the backlog grew too large.]\r\n'
+  '\x18\x1b[0m\r\n[Botmux skipped hidden terminal output because the backlog grew too large.]\r\n'
 // Why a separate foreground message: a visible pane hitting the cap means the
 // drain could not keep up with a flood (starved renderer) — the output was
 // skipped, not merely produced while hidden.
 const FOREGROUND_BACKLOG_WARNING =
-  '\x18\x1b[0m\r\n[OrcaBotmux skipped a burst of terminal output because the backlog grew too large.]\r\n'
+  '\x18\x1b[0m\r\n[Botmux skipped a burst of terminal output because the backlog grew too large.]\r\n'
 const ALWAYS_REFRESH_FOREGROUND_SYNCHRONOUSLY = (): boolean => true
 
 const queuedByTerminal = new Map<TerminalOutputTarget, QueueEntry>()

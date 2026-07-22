@@ -7,7 +7,7 @@
  * PersistedUIState pipeline and is restored on the first (startup) hydration.
  *
  * Restart-persistence lives in E2E, not a store unit test: it needs the real
- * write -> orca-botmux-data.json -> ui.get() -> hydratePersistedUI round-trip across
+ * write -> botmux-data.json -> ui.get() -> hydratePersistedUI round-trip across
  * two Electron launches sharing one userDataDir, then the render layer proving
  * the page actually came back — with a real repo/worktree attached so the
  * relaunch also exercises the startup worktree hydration path (which must not
@@ -16,9 +16,9 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { getStoreState, waitForSessionReady } from './helpers/store'
-import { attachRepoAndOpenTerminal, createRestartSession } from './helpers/orca-botmux-restart'
+import { attachRepoAndOpenTerminal, createRestartSession } from './helpers/botmux-restart'
 import { TEST_REPO_PATH_FILE } from './global-setup'
 
 function seededRepoPathOrSkip(): string {

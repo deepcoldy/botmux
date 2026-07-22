@@ -15,7 +15,7 @@ export type BotmuxWorktreeScope = {
    * Bridge endpoint host id: `local` | `ssh:<sshTargetId>` | `platform:…`
    * Must match session.hostId.
    */
-  orcaBotmuxHostId: string
+  botmuxHostId: string
 }
 
 /** Normalize path for prefix comparison (local or remote POSIX). */
@@ -27,7 +27,7 @@ export function normalizeBotmuxMatchPath(path: string): string {
   return p
 }
 
-export function orcaBotmuxHostIdForRepoConnection(connectionId?: string | null): string {
+export function botmuxHostIdForRepoConnection(connectionId?: string | null): string {
   const id = connectionId?.trim()
   if (id) return `ssh:${id}`
   return 'local'
@@ -45,7 +45,7 @@ export function botmuxSessionBelongsToWorktree(
   session: BotmuxSessionPathHost,
   worktree: BotmuxWorktreeScope
 ): boolean {
-  if (session.hostId !== worktree.orcaBotmuxHostId) return false
+  if (session.hostId !== worktree.botmuxHostId) return false
   const cwd = session.cwd?.trim()
   if (!cwd) return false
   return isBotmuxPathInsideOrEqual(cwd, worktree.path)
@@ -64,10 +64,10 @@ export function filterBotmuxSessionsForWorktree<T extends BotmuxSessionPathHost>
  */
 export function applyBotmuxSessionWorktreeScope<T extends BotmuxSessionPathHost>(
   sessions: readonly T[],
-  scope?: { worktreePath?: string | null; orcaBotmuxHostId?: string | null } | null
+  scope?: { worktreePath?: string | null; botmuxHostId?: string | null } | null
 ): T[] {
   const path = scope?.worktreePath?.trim()
-  const host = scope?.orcaBotmuxHostId?.trim()
+  const host = scope?.botmuxHostId?.trim()
   if (!path || !host) return [...sessions]
-  return filterBotmuxSessionsForWorktree(sessions, { path, orcaBotmuxHostId: host })
+  return filterBotmuxSessionsForWorktree(sessions, { path, botmuxHostId: host })
 }

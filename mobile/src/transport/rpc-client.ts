@@ -305,7 +305,7 @@ export function connect(
             if (index !== -1) {
               connectWaiters.splice(index, 1)
             }
-            reject(new Error('Timed out while connecting to the remote Orca runtime.'))
+            reject(new Error('Timed out while connecting to the remote Botmux runtime.'))
           },
           Math.max(0, timeoutMs)
         )

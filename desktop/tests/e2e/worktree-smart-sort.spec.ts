@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import type { Page } from '@stablyai/playwright-test'
 import type { TerminalPaneLayoutNode } from '../../src/shared/types'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
@@ -211,20 +211,20 @@ async function getSmartSortScenarioReadiness(
 }
 
 test.describe('Worktree Smart Sort', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   test('renders attention-needed worktrees above finished agents in Smart mode', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const scenario = await seedSmartSortScenario(orcaBotmuxPage)
+    const scenario = await seedSmartSortScenario(botmuxPage)
     const { blockedId, doneId } = scenario
 
     await expect
-      .poll(() => getSmartSortScenarioReadiness(orcaBotmuxPage, scenario), {
+      .poll(() => getSmartSortScenarioReadiness(botmuxPage, scenario), {
         timeout: 8_000,
         message: 'Smart sort scenario did not seed live PTYs and fresh agent statuses'
       })
@@ -237,13 +237,13 @@ test.describe('Worktree Smart Sort', () => {
       })
 
     await expect
-      .poll(async () => (await getVisibleWorktreeIdsByTop(orcaBotmuxPage)).slice(0, 2), {
+      .poll(async () => (await getVisibleWorktreeIdsByTop(botmuxPage)).slice(0, 2), {
         timeout: 12_000,
         message: 'Smart sort did not promote the blocked worktree in the visible sidebar'
       })
       .toEqual([blockedId, doneId])
 
-    await expect(worktreeRow(orcaBotmuxPage, blockedId)).toBeVisible()
-    await expect(worktreeRow(orcaBotmuxPage, doneId)).toBeVisible()
+    await expect(worktreeRow(botmuxPage, blockedId)).toBeVisible()
+    await expect(worktreeRow(botmuxPage, doneId)).toBeVisible()
   })
 })

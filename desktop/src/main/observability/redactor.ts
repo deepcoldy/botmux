@@ -7,7 +7,7 @@
 //   3. Server-side ingest — a third pass. The client-side redactor runs on
 //      an attacker-controllable binary; server-side redaction is the
 //      defense-in-depth guarantee on the one path where bundle bytes reach
-//      OrcaBotmux infrastructure. We expose `serverSideRedact()` separately so
+//      Botmux infrastructure. We expose `serverSideRedact()` separately so
 //      the server can additionally drop `install_id`/`installId`/
 //      `distinct_id` keys (which are valid in product telemetry but must not
 //      ride along on a bundle — see "Why bundles do not carry install_id").
@@ -129,7 +129,7 @@ const CLIENT_ATTR_BLOCKLIST = new Set([
 
 // Mode-3 server-side pass adds the PostHog-lane identity keys. These are
 // valid in product telemetry but must not ride along inside a bundle —
-// otherwise an OrcaBotmux staff member opening the bundle could re-identify all
+// otherwise an Botmux staff member opening the bundle could re-identify all
 // PostHog history for that user (see telemetry-error-tracking.md §"Why
 // bundles do not carry install_id").
 const SERVER_ATTR_BLOCKLIST_EXTRA = new Set([

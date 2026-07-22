@@ -14,18 +14,18 @@ describe('getUntitledFileRoot', () => {
   it('falls back to the file root for floating markdown files', () => {
     expect(
       getUntitledFileRoot({
-        filePath: '/Users/alice/Library/Application Support/OrcaBotmux/floating-workspace/untitled.md',
+        filePath: '/Users/alice/Library/Application Support/Botmux/floating-workspace/untitled.md',
         relativePath: 'untitled.md'
       })
-    ).toBe('/Users/alice/Library/Application Support/OrcaBotmux/floating-workspace')
+    ).toBe('/Users/alice/Library/Application Support/Botmux/floating-workspace')
   })
 
   it('handles nested untitled relative paths', () => {
     expect(
       getUntitledFileRoot({
-        filePath: '/tmp/orca_botmux/floating-workspace/notes/untitled.md',
+        filePath: '/tmp/botmux/floating-workspace/notes/untitled.md',
         relativePath: 'notes/untitled.md'
       })
-    ).toBe('/tmp/orca_botmux/floating-workspace')
+    ).toBe('/tmp/botmux/floating-workspace')
   })
 })

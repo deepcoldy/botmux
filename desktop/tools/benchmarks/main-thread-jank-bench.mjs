@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * OrcaBotmux main-thread jank / subprocess-churn benchmark (issue #7576).
+ * Botmux main-thread jank / subprocess-churn benchmark (issue #7576).
  *
  * Reproduces the reporter's setup: a running app with an active git worktree
  * and the Source Control sidebar open, measured at steady state. The app is
- * launched with ORCA_MAIN_THREAD_DIAGNOSTICS=1 so the main process emits one
+ * launched with BOTMUX_MAIN_THREAD_DIAGNOSTICS=1 so the main process emits one
  * `[main-thread] {json}` stderr line every 5s containing:
  *   - worst event-loop stall in the window (maxGapMs) and stall counts
  *   - subprocess spawns since the last report, keyed by command
@@ -17,7 +17,7 @@
  * Usage:
  *   node tools/benchmarks/main-thread-jank-bench.mjs --label baseline
  *     [--duration-s 120] [--warmup-s 20] [--fixture-dir <path>]
- *     [--exe <path-to-packaged-OrcaBotmux>] [--headless] [--no-log-stream]
+ *     [--exe <path-to-packaged-Botmux>] [--headless] [--no-log-stream]
  *
  * The window must stay VISIBLE during the run: git-status polling is gated on
  * document visibility, so a hidden/minimized window measures nothing.
@@ -81,7 +81,7 @@ function parseArgs(argv) {
  * churn-producing configuration: one git repo as the active worktree with the
  * Source Control sidebar open (engages the 3s interactive git-status poll).
  * The branch is pushed to a local `origin` but has NO configured upstream —
- * the shape OrcaBotmux worktrees commonly have, which forces the effective-upstream
+ * the shape Botmux worktrees commonly have, which forces the effective-upstream
  * probe (the most spawn-heavy status path) on every poll tick.
  */
 function ensureFixture(fixtureDir) {
@@ -161,7 +161,7 @@ function ensureFixture(fixtureDir) {
       defaultTerminalTabsAppliedByWorktreeId: { [worktreeId]: true }
     }
   }
-  writeFileSync(join(fixtureDir, 'orca-botmux-data.json'), JSON.stringify(state, null, 2))
+  writeFileSync(join(fixtureDir, 'botmux-data.json'), JSON.stringify(state, null, 2))
   return repoPath
 }
 
@@ -280,12 +280,12 @@ async function main() {
 
   const env = {
     ...process.env,
-    ORCA_STARTUP_DIAGNOSTICS: '1',
-    ORCA_MAIN_THREAD_DIAGNOSTICS: '1',
-    ORCA_E2E_USER_DATA_DIR: fixtureDir
+    BOTMUX_STARTUP_DIAGNOSTICS: '1',
+    BOTMUX_MAIN_THREAD_DIAGNOSTICS: '1',
+    BOTMUX_E2E_USER_DATA_DIR: fixtureDir
   }
   if (args.headless) {
-    env.ORCA_E2E_HEADLESS = '1'
+    env.BOTMUX_E2E_HEADLESS = '1'
     console.warn(
       '[bench] --headless: visibility-gated polling will NOT engage; harness smoke test only'
     )

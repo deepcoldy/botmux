@@ -12,7 +12,7 @@ function readAppDirArg(argv) {
     return explicit.slice('--app-dir='.length)
   }
   if (process.platform === 'darwin') {
-    return 'dist/mac-arm64/OrcaBotmux.app'
+    return 'dist/mac-arm64/Botmux.app'
   }
   if (process.platform === 'win32') {
     return 'dist/win-unpacked'
@@ -22,16 +22,16 @@ function readAppDirArg(argv) {
 
 function getPackagedCliPath(appDir) {
   if (process.platform === 'darwin' || appDir.endsWith('.app')) {
-    return join(appDir, 'Contents', 'Resources', 'bin', 'orca_botmux')
+    return join(appDir, 'Contents', 'Resources', 'bin', 'botmux')
   }
   if (process.platform === 'win32') {
-    return join(appDir, 'resources', 'bin', 'orca_botmux.exe')
+    return join(appDir, 'resources', 'bin', 'botmux.exe')
   }
-  return join(appDir, 'resources', 'bin', 'orca-botmux-ide')
+  return join(appDir, 'resources', 'bin', 'botmux-ide')
 }
 
 const appDir = resolve(readAppDirArg(process.argv.slice(2)))
-const tempRoot = await mkdtemp(join(tmpdir(), 'orca-botmux-packaged-cli-smoke-'))
+const tempRoot = await mkdtemp(join(tmpdir(), 'botmux-packaged-cli-smoke-'))
 const copiedAppDir = join(tempRoot, basename(appDir))
 
 try {

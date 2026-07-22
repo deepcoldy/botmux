@@ -74,7 +74,7 @@ export async function main(root = process.cwd()) {
     return 0
   }
 
-  console.error('Renderer vertical scroll containers must use an OrcaBotmux scrollbar style.')
+  console.error('Renderer vertical scroll containers must use an Botmux scrollbar style.')
   console.error('Put the scrollbar class in the same class literal as the vertical overflow class.')
   console.error('Use scrollbar-sleek, scrollbar-editor, or worktree-sidebar-scrollbar.')
   console.error('')

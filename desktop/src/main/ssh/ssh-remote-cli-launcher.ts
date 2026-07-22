@@ -26,25 +26,25 @@ using System.Diagnostics;
 using System.IO;
 using System.Text;
 
-internal static class OrcaRemoteCliLauncher
+internal static class BotmuxRemoteCliLauncher
 {
     private static int Main(string[] args)
     {
         try
         {
-            string nodePath = RequireEnvironmentVariable("ORCA_RELAY_NODE_PATH");
-            string relayDirectory = RequireEnvironmentVariable("ORCA_RELAY_DIR");
-            string socketPath = RequireEnvironmentVariable("ORCA_RELAY_SOCKET_PATH");
+            string nodePath = RequireEnvironmentVariable("BOTMUX_RELAY_NODE_PATH");
+            string relayDirectory = RequireEnvironmentVariable("BOTMUX_RELAY_DIR");
+            string socketPath = RequireEnvironmentVariable("BOTMUX_RELAY_SOCKET_PATH");
             string relayPath = Path.Combine(relayDirectory, "relay.js");
 
             if (!File.Exists(nodePath))
             {
-                Console.Error.WriteLine("OrcaBotmux SSH CLI bridge cannot find Node.js at \"{0}\"", nodePath);
+                Console.Error.WriteLine("Botmux SSH CLI bridge cannot find Node.js at \"{0}\"", nodePath);
                 return 1;
             }
             if (!File.Exists(relayPath))
             {
-                Console.Error.WriteLine("OrcaBotmux SSH CLI bridge cannot find the relay at \"{0}\"", relayPath);
+                Console.Error.WriteLine("Botmux SSH CLI bridge cannot find the relay at \"{0}\"", relayPath);
                 return 1;
             }
 
@@ -63,7 +63,7 @@ internal static class OrcaRemoteCliLauncher
         }
         catch (Exception error)
         {
-            Console.Error.WriteLine("Unable to start the OrcaBotmux SSH CLI bridge: {0}", error.Message);
+            Console.Error.WriteLine("Unable to start the Botmux SSH CLI bridge: {0}", error.Message);
             return 1;
         }
     }
@@ -84,7 +84,7 @@ internal static class OrcaRemoteCliLauncher
         AppendArgument(commandLine, relayPath);
         AppendArgument(commandLine, "--sock-path");
         AppendArgument(commandLine, socketPath);
-        AppendArgument(commandLine, "--orca-botmux-cli");
+        AppendArgument(commandLine, "--botmux-cli");
         foreach (string arg in args)
         {
             AppendArgument(commandLine, arg);
@@ -173,12 +173,12 @@ function createWindowsLauncherCompileCommand(
       '$windowsDirectory = if ($env:WINDIR) { $env:WINDIR } else { $env:SystemRoot }',
       `$compilerCandidates = @((Join-Path $windowsDirectory 'Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe'), (Join-Path $windowsDirectory 'Microsoft.NET\\Framework\\v4.0.30319\\csc.exe'))`,
       '$compiler = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1',
-      "if (-not $compiler) { Write-Error 'Unable to find the .NET Framework C# compiler required for the OrcaBotmux SSH CLI launcher.'; exit 1 }",
+      "if (-not $compiler) { Write-Error 'Unable to find the .NET Framework C# compiler required for the Botmux SSH CLI launcher.'; exit 1 }",
       `& $compiler ${compilerArgs}`,
       'if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',
-      `if (-not (Test-Path -LiteralPath ${powerShellLiteral(launcherPath)} -PathType Leaf)) { Write-Error 'The OrcaBotmux SSH CLI launcher compiler produced no executable.'; exit 1 }`,
+      `if (-not (Test-Path -LiteralPath ${powerShellLiteral(launcherPath)} -PathType Leaf)) { Write-Error 'The Botmux SSH CLI launcher compiler produced no executable.'; exit 1 }`,
       // Why: remove the legacy %* bridge only after a successful compile, so a
-      // host missing csc.exe keeps its existing CLI (orca_botmux.exe shadows orca_botmux.cmd).
+      // host missing csc.exe keeps its existing CLI (botmux.exe shadows botmux.cmd).
       `Remove-Item -LiteralPath ${powerShellLiteral(legacyShimPath)} -Force -ErrorAction SilentlyContinue`,
       `Remove-Item -LiteralPath ${powerShellLiteral(sourcePath)} -Force`
     ].join('; ')
@@ -187,11 +187,11 @@ function createWindowsLauncherCompileCommand(
 
 export function createRemoteCliInstallPlan(env: RemoteCliInstallEnv): RemoteCliInstallPlan {
   if (isWindowsRemoteHost(env.hostPlatform)) {
-    const launcherFileName = 'orca_botmux.exe'
-    const sourceFileName = 'orca-botmux-launcher.cs'
+    const launcherFileName = 'botmux.exe'
+    const sourceFileName = 'botmux-launcher.cs'
     const launcherPath = joinRemotePath(env.hostPlatform, env.binDir, launcherFileName)
     const sourcePath = joinRemotePath(env.hostPlatform, env.binDir, sourceFileName)
-    const legacyShimPath = joinRemotePath(env.hostPlatform, env.binDir, 'orca_botmux.cmd')
+    const legacyShimPath = joinRemotePath(env.hostPlatform, env.binDir, 'botmux.cmd')
     const binDir = joinRemotePath(env.hostPlatform, env.binDir)
     return {
       launcherPath,
@@ -211,7 +211,7 @@ export function createRemoteCliInstallPlan(env: RemoteCliInstallEnv): RemoteCliI
     }
   }
 
-  const launcherPath = joinRemotePath(env.hostPlatform, env.binDir, 'orca_botmux')
+  const launcherPath = joinRemotePath(env.hostPlatform, env.binDir, 'botmux')
   return {
     launcherPath,
     files: [
@@ -220,14 +220,14 @@ export function createRemoteCliInstallPlan(env: RemoteCliInstallEnv): RemoteCliI
         contents: [
           '#!/usr/bin/env sh',
           'set -eu',
-          `ORCA_RELAY_NODE_PATH=\${ORCA_RELAY_NODE_PATH:-${quoteSh(env.nodePath)}}`,
-          `ORCA_RELAY_DIR=\${ORCA_RELAY_DIR:-${quoteSh(env.relayDir)}}`,
-          `ORCA_RELAY_SOCKET_PATH=\${ORCA_RELAY_SOCKET_PATH:-${quoteSh(env.sockPath)}}`,
-          'if [ ! -S "$ORCA_RELAY_SOCKET_PATH" ]; then',
-          '  echo "OrcaBotmux SSH CLI bridge cannot find the relay socket: $ORCA_RELAY_SOCKET_PATH" >&2',
+          `BOTMUX_RELAY_NODE_PATH=\${BOTMUX_RELAY_NODE_PATH:-${quoteSh(env.nodePath)}}`,
+          `BOTMUX_RELAY_DIR=\${BOTMUX_RELAY_DIR:-${quoteSh(env.relayDir)}}`,
+          `BOTMUX_RELAY_SOCKET_PATH=\${BOTMUX_RELAY_SOCKET_PATH:-${quoteSh(env.sockPath)}}`,
+          'if [ ! -S "$BOTMUX_RELAY_SOCKET_PATH" ]; then',
+          '  echo "Botmux SSH CLI bridge cannot find the relay socket: $BOTMUX_RELAY_SOCKET_PATH" >&2',
           '  exit 1',
           'fi',
-          'exec "$ORCA_RELAY_NODE_PATH" "$ORCA_RELAY_DIR/relay.js" --sock-path "$ORCA_RELAY_SOCKET_PATH" --orca-botmux-cli "$@"',
+          'exec "$BOTMUX_RELAY_NODE_PATH" "$BOTMUX_RELAY_DIR/relay.js" --sock-path "$BOTMUX_RELAY_SOCKET_PATH" --botmux-cli "$@"',
           ''
         ].join('\n')
       }

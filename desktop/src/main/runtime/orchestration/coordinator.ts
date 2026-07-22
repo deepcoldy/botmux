@@ -34,7 +34,7 @@ export type CoordinatorRuntime = {
   getTerminalPaneKey?(handle: string): string | null
   // Why: Windows can host native and WSL workers concurrently, so the
   // worker pane—not the coordinator process—selects the packaged CLI name.
-  getTerminalOrchestrationCliCommand?(handle: string): 'orca_botmux' | 'orca-botmux-ide'
+  getTerminalOrchestrationCliCommand?(handle: string): 'botmux' | 'botmux-ide'
 }
 
 // Why (§3.1): single threshold, no warn/refuse split. Coordinator picked 20
@@ -473,7 +473,7 @@ export class Coordinator {
       this.runtime.getTerminalPaneKey?.(targetHandle) ?? undefined
     )
 
-    // Why: agents dispatched by the coordinator must use orca-botmux-desktop-dev in dev mode
+    // Why: agents dispatched by the coordinator must use botmux-desktop-dev in dev mode
     // so they talk to the dev runtime's socket, not production (Section 6.4).
     // Why (§3.4): `strippedSpec` drops the `allow-stale-base: true` line so
     // the worker's `--- TASK ---` block does not contain the infra flag (which
@@ -488,7 +488,7 @@ export class Coordinator {
       taskSpec: strippedSpec,
       coordinatorHandle: this.opts.coordinatorHandle,
       workerHandle: targetHandle,
-      devMode: process.env.ORCA_USER_DATA_PATH?.includes('orca-botmux-desktop-dev'),
+      devMode: process.env.BOTMUX_USER_DATA_PATH?.includes('botmux-desktop-dev'),
       ...(this.runtime.getTerminalOrchestrationCliCommand
         ? { cliCommand: this.runtime.getTerminalOrchestrationCliCommand(targetHandle) }
         : {}),

@@ -55,7 +55,7 @@ export const NEVER_TRANSLATE_VALUES = new Set([
   'OpenClaw',
   'OpenCode',
   'OpenCode Go',
-  'orca_botmux',
+  'botmux',
   'Pi',
   'PostHog',
   'Qwen Code',
@@ -163,7 +163,7 @@ export const NEVER_TRANSLATE_VALUES = new Set([
   '/home/user',
   '/home/user/project',
   '/path/to/destination',
-  '.orca_botmux/issue-command',
+  '.botmux/issue-command',
   'PLAN.md',
   'feat/mobile-page',
   'sk-...',
@@ -182,7 +182,7 @@ export const BRAND_MISTRANSLATIONS = {
     Gemini: ['쌍둥이자리'],
     Claude: ['클로드'],
     Grok: ['그록'],
-    OrcaBotmux: ['오르카', '범고래'],
+    Botmux: ['오르카', '범고래'],
     Cursor: ['커서'],
     OpenCode: ['오픈코드'],
     OpenClaw: ['오픈클로'],
@@ -220,7 +220,7 @@ export const BRAND_MISTRANSLATIONS = {
     Gemini: ['双子座'],
     Claude: ['克洛德', '克劳德'],
     Grok: ['格罗克'],
-    OrcaBotmux: ['虎鲸', '逆戟鲸'],
+    Botmux: ['虎鲸', '逆戟鲸'],
     Cursor: ['光标'],
     OpenCode: ['开放代码'],
     OpenClaw: ['开爪'],
@@ -268,7 +268,7 @@ export const BRAND_MISTRANSLATIONS = {
     Gemini: ['双子座'],
     Claude: ['クロード'],
     Grok: ['グロック'],
-    OrcaBotmux: ['シャチ', '逆戟鲸', 'オルカ'],
+    Botmux: ['シャチ', '逆戟鲸', 'オルカ'],
     Cursor: ['カーソル'],
     OpenCode: ['オープンコード', 'オープン・コード'],
     OpenClaw: ['オープンクロー'],
@@ -305,7 +305,7 @@ export const BRAND_MISTRANSLATIONS = {
     Codex: ['códice', 'Códice'],
     Gemini: ['Géminis'],
     Claude: ['claudia', 'Claudia'],
-    OrcaBotmux: ['orca_botmux', 'Orcas', 'orcas'],
+    Botmux: ['botmux'],
     OpenCode: ['código abierto', 'Código abierto'],
     OpenClaude: ['Openclaude'],
     Antigravity: ['antigravedad', 'Antigravedad'],
@@ -347,7 +347,7 @@ export function shouldPreserveEnglishValue(enValue, key = '') {
   if (!enValue?.trim()) {
     return true
   }
-  if (/^https?:\/\//.test(enValue) || enValue.startsWith('orca_botmux://')) {
+  if (/^https?:\/\//.test(enValue) || enValue.startsWith('botmux://')) {
     return true
   }
   if (isEnglishOnlyKey(key)) {
@@ -423,7 +423,7 @@ function applyCjkLatinTermSpacing(localeValue, locale) {
     )
   if (locale === 'ko') {
     // Korean particles attach to the noun (no space) only when the particle is a complete token at a
-    // boundary — re-glue "OrcaBotmux 에"/"PR 을"/"에서는" but keep "Jira 이슈"/"OrcaBotmux 로고"/"agent 에뮬레이터".
+    // boundary — re-glue "Botmux 에"/"PR 을"/"에서는" but keep "Jira 이슈"/"Botmux 로고"/"agent 에뮬레이터".
     result = result.replace(
       new RegExp(
         `(${CJK_LATIN_SPACED_TERM_PATTERN}) ((?:에서|에게|에는|에선|으로|로서|로써|부터|까지|보다|처럼|은|는|이|가|을|를|와|과|의|에|로|도|만)+)(?=$|[\\s.,!?…·:;)\\]}"'」』])`,
@@ -497,19 +497,19 @@ export function repairTranslatedValue({ key, enValue, localeValue, locale }) {
     result = applyCjkLatinTermSpacing(result, locale)
   }
 
-  if (enValue.includes('orca_botmux://')) {
-    result = result.replace(/虎鲸:\/\//g, 'orca_botmux://')
+  if (enValue.includes('botmux://')) {
+    result = result.replace(/虎鲸:\/\//g, 'botmux://')
   }
 
-  if (enValue === 'orca_botmux' || enValue.startsWith('OrcaBotmux ')) {
+  if (enValue === 'botmux' || enValue.startsWith('Botmux ')) {
     result = result
-      .replaceAll('虎鲸', 'orca_botmux')
-      .replaceAll('逆戟鲸', 'orca_botmux')
-      .replaceAll('シャチ', 'orca_botmux')
+      .replaceAll('虎鲸', 'botmux')
+      .replaceAll('逆戟鲸', 'botmux')
+      .replaceAll('シャチ', 'botmux')
   }
 
-  if (enValue.includes('orca_botmux://')) {
-    result = result.replace(/シャチ:\/\//g, 'orca_botmux://')
+  if (enValue.includes('botmux://')) {
+    result = result.replace(/シャチ:\/\//g, 'botmux://')
   }
 
   return result
@@ -567,22 +567,22 @@ export function repairCatalog(enCatalog, localeCatalog, locale) {
 
   if (localeCatalog.menu) {
     if (locale === 'zh') {
-      if (localeCatalog.menu.exploreOrca !== '探索 OrcaBotmux') {
-        localeCatalog.menu.exploreOrca = '探索 OrcaBotmux'
+      if (localeCatalog.menu.exploreBotmux !== '探索 Botmux') {
+        localeCatalog.menu.exploreBotmux = '探索 Botmux'
         repaired += 1
       }
-      if (localeCatalog.menu.gettingStarted !== 'OrcaBotmux 入门') {
-        localeCatalog.menu.gettingStarted = 'OrcaBotmux 入门'
+      if (localeCatalog.menu.gettingStarted !== 'Botmux 入门') {
+        localeCatalog.menu.gettingStarted = 'Botmux 入门'
         repaired += 1
       }
     }
     if (locale === 'ko') {
-      if (localeCatalog.menu.exploreOrca !== 'OrcaBotmux 둘러보기') {
-        localeCatalog.menu.exploreOrca = 'OrcaBotmux 둘러보기'
+      if (localeCatalog.menu.exploreBotmux !== 'Botmux 둘러보기') {
+        localeCatalog.menu.exploreBotmux = 'Botmux 둘러보기'
         repaired += 1
       }
-      if (localeCatalog.menu.gettingStarted !== 'OrcaBotmux 시작하기') {
-        localeCatalog.menu.gettingStarted = 'OrcaBotmux 시작하기'
+      if (localeCatalog.menu.gettingStarted !== 'Botmux 시작하기') {
+        localeCatalog.menu.gettingStarted = 'Botmux 시작하기'
         repaired += 1
       }
     }

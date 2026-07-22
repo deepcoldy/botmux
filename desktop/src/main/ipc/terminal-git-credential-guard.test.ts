@@ -72,12 +72,12 @@ describe('applyTerminalGitCredentialPromptGuard', () => {
     }
   })
 
-  it('does not treat a generic OrcaBotmux CLI command as an agent', () => {
+  it('does not treat a generic Botmux CLI command as an agent', () => {
     const env: Record<string, string> = { PATH: '/usr/bin' }
 
     expect(
       applyTerminalGitCredentialPromptGuard(env, {
-        launchCommand: 'orca_botmux status',
+        launchCommand: 'botmux status',
         platform: 'linux'
       })
     ).toBe(false)

@@ -28,7 +28,7 @@ type ParsedTomlString = {
   end: number
 }
 
-// Why: OrcaBotmux mirrors config.toml into a managed CODEX_HOME, but Codex resolves
+// Why: Botmux mirrors config.toml into a managed CODEX_HOME, but Codex resolves
 // path-valued config settings from the file it read. Keep user-owned assets in
 // ~/.codex reachable after the mirror moves the TOML. Best-effort by design:
 // values spelled as inline tables, quoted keys, or triple-quoted strings pass

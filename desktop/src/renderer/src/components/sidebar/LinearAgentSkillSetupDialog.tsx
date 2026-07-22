@@ -13,7 +13,7 @@ import {
 } from '@/components/ui/dialog'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  isOrcaCliAvailableOnPath
+  isBotmuxCliAvailableOnPath
 } from '@/lib/agent-skill-cli-prerequisite'
 import { translate } from '@/i18n/i18n'
 
@@ -147,7 +147,7 @@ export function LinearAgentSkillSetupDialog({
               )}
               preInstallNotice={AGENT_SKILL_CLI_PREREQUISITE_NOTICE}
               getPrerequisiteStatus={getPrerequisiteStatus}
-              isPrerequisiteAvailable={isOrcaCliAvailableOnPath}
+              isPrerequisiteAvailable={isBotmuxCliAvailableOnPath}
               onBeforeOpenTerminal={onBeforeOpenTerminal}
               onRecheck={onRecheck}
             />

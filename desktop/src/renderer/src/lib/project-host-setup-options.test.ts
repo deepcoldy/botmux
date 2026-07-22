@@ -123,8 +123,8 @@ describe('buildProjectHostSetupOptions', () => {
       projectHostSetups: [
         setup('local', 'project-1', 'local', 'local-repo'),
         setup('vm', 'project-1', ephemeralHostId, 'vm-repo', {
-          path: '/vercel/sandbox/orca_botmux',
-          displayName: 'orca_botmux'
+          path: '/vercel/sandbox/botmux',
+          displayName: 'botmux'
         })
       ]
     })
@@ -137,7 +137,7 @@ describe('buildProjectHostSetupOptions', () => {
   it('omits runtime-owned SSH (per-workspace-env) setups even when their host is filtered out', () => {
     // The execution-host registry filters runtime-owned targets, so the setup's host is absent
     // here — guard on the hostId so the hidden target never becomes a selectable run-target.
-    const runtimeSshHostId = 'ssh:runtime-ssh-orca-botmux-e37aa3a9' as ExecutionHostId
+    const runtimeSshHostId = 'ssh:runtime-ssh-botmux-e37aa3a9' as ExecutionHostId
     const options = buildProjectHostSetupOptions({
       projectId: 'project-1',
       eligibleRepos: [repo('local-repo'), repo('vm-repo')],
@@ -145,8 +145,8 @@ describe('buildProjectHostSetupOptions', () => {
       projectHostSetups: [
         setup('local', 'project-1', 'local', 'local-repo'),
         setup('vm', 'project-1', runtimeSshHostId, 'vm-repo', {
-          path: '/workspace/orca_botmux',
-          displayName: 'orca_botmux'
+          path: '/workspace/botmux',
+          displayName: 'botmux'
         })
       ]
     })
@@ -315,7 +315,7 @@ describe('buildProjectHostSetupOptions', () => {
         id: 'needs-setup:runtime:gpu',
         kind: 'needs-setup',
         label: 'GPU VM',
-        detail: 'OrcaBotmux server version is incompatible',
+        detail: 'Botmux server version is incompatible',
         isAvailable: false
       })
     ])
@@ -332,7 +332,7 @@ describe('buildProjectHostSetupOptions', () => {
     expect(options.at(-1)).toMatchObject({
       id: 'needs-setup:runtime:gpu',
       kind: 'needs-setup',
-      detail: 'Update OrcaBotmux on this host to set up projects',
+      detail: 'Update Botmux on this host to set up projects',
       isAvailable: false
     })
   })
@@ -354,7 +354,7 @@ describe('buildProjectHostSetupOptions', () => {
     expect(options.at(-1)).toMatchObject({
       id: 'needs-setup:runtime:gpu',
       kind: 'needs-setup',
-      detail: 'Update OrcaBotmux on this host to set up projects',
+      detail: 'Update Botmux on this host to set up projects',
       isAvailable: false
     })
   })

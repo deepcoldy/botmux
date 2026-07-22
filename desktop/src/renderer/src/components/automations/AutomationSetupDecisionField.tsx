@@ -5,14 +5,14 @@ import { cn } from '@/lib/utils'
 import { translate } from '@/i18n/i18n'
 import { getVisibleAutomationSetupDecision } from './automation-setup-decision'
 import type { AutomationCreateTarget, AutomationDraft } from './AutomationEditorDialog'
-import type { OrcaHooks, ProjectHostSetup, Repo } from '../../../../shared/types'
+import type { BotmuxHooks, ProjectHostSetup, Repo } from '../../../../shared/types'
 
 type AutomationSetupDecisionFieldProps = {
   createTarget: AutomationCreateTarget
   draft: AutomationDraft
   repos: readonly Repo[]
   projectHostSetups: readonly ProjectHostSetup[]
-  yamlHooks?: OrcaHooks | null
+  yamlHooks?: BotmuxHooks | null
   onDraftChange: (updater: (current: AutomationDraft) => AutomationDraft) => void
   onSetupDecisionTouched: () => void
 }

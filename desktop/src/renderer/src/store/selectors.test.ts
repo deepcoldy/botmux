@@ -243,8 +243,8 @@ describe('store selectors', () => {
     const repos = [
       makeRepo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux'
+        path: '/Users/alice/botmux',
+        displayName: 'botmux'
       })
     ]
     const state = { repos }
@@ -265,8 +265,8 @@ describe('store selectors', () => {
     const repos = [
       makeRepo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux'
+        path: '/Users/alice/botmux',
+        displayName: 'botmux'
       })
     ]
     const projects = [
@@ -285,8 +285,8 @@ describe('store selectors', () => {
         projectId: 'project-1',
         hostId: 'local' as const,
         repoId: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
         setupState: 'ready' as const,
         setupMethod: 'legacy-repo' as const,
         createdAt: 1,
@@ -303,33 +303,33 @@ describe('store selectors', () => {
   it('groups hydrated VM project setups under the repo-derived project identity', () => {
     const repos = [
       makeRepo({
-        id: 'local-orca_botmux',
-        path: '/Users/alice/stably/orca_botmux',
-        displayName: 'orca_botmux',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        id: 'local-botmux',
+        path: '/Users/alice/stably/botmux',
+        displayName: 'botmux',
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       }),
       makeRepo({
-        id: 'vm-orca_botmux',
-        path: '/vercel/sandbox/orca_botmux',
-        displayName: 'orca_botmux',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+        id: 'vm-botmux',
+        path: '/vercel/sandbox/botmux',
+        displayName: 'botmux',
+        upstream: { owner: 'stablyai', repo: 'botmux' },
         executionHostId: toRuntimeExecutionHostId('vm-env')
       })
     ]
     const projects = [
       {
-        id: 'github:stablyai/orca_botmux',
-        displayName: 'orca_botmux',
+        id: 'github:stablyai/botmux',
+        displayName: 'botmux',
         badgeColor: '#737373',
-        sourceRepoIds: ['local-orca_botmux'],
+        sourceRepoIds: ['local-botmux'],
         createdAt: 1,
         updatedAt: 1
       },
       {
-        id: 'repo:vm-orca_botmux',
-        displayName: 'vercel/sandbox/orca_botmux',
+        id: 'repo:vm-botmux',
+        displayName: 'vercel/sandbox/botmux',
         badgeColor: '#737373',
-        sourceRepoIds: ['vm-orca_botmux'],
+        sourceRepoIds: ['vm-botmux'],
         createdAt: 1,
         updatedAt: 1
       }
@@ -337,11 +337,11 @@ describe('store selectors', () => {
     const projectHostSetups = [
       {
         id: 'local-setup',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'local' as const,
-        repoId: 'local-orca_botmux',
-        path: '/Users/alice/stably/orca_botmux',
-        displayName: 'orca_botmux',
+        repoId: 'local-botmux',
+        path: '/Users/alice/stably/botmux',
+        displayName: 'botmux',
         setupState: 'ready' as const,
         setupMethod: 'legacy-repo' as const,
         createdAt: 1,
@@ -349,11 +349,11 @@ describe('store selectors', () => {
       },
       {
         id: 'vm-setup',
-        projectId: 'repo:vm-orca_botmux',
+        projectId: 'repo:vm-botmux',
         hostId: toRuntimeExecutionHostId('vm-env'),
-        repoId: 'vm-orca_botmux',
-        path: '/vercel/sandbox/orca_botmux',
-        displayName: 'orca_botmux',
+        repoId: 'vm-botmux',
+        path: '/vercel/sandbox/botmux',
+        displayName: 'botmux',
         setupState: 'ready' as const,
         setupMethod: 'provisioned' as const,
         createdAt: 1,
@@ -367,11 +367,11 @@ describe('store selectors', () => {
       projectHostSetups
     })
 
-    expect(projection.projects.map((project) => project.id)).toEqual(['github:stablyai/orca_botmux'])
+    expect(projection.projects.map((project) => project.id)).toEqual(['github:stablyai/botmux'])
     expect(projection.setups).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: 'local-setup', projectId: 'github:stablyai/orca_botmux' }),
-        expect.objectContaining({ id: 'vm-setup', projectId: 'github:stablyai/orca_botmux' })
+        expect.objectContaining({ id: 'local-setup', projectId: 'github:stablyai/botmux' }),
+        expect.objectContaining({ id: 'vm-setup', projectId: 'github:stablyai/botmux' })
       ])
     )
   })
@@ -380,9 +380,9 @@ describe('store selectors', () => {
     const repos = [
       makeRepo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux',
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        path: '/Users/alice/botmux',
+        displayName: 'botmux',
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       })
     ]
 
@@ -394,17 +394,17 @@ describe('store selectors', () => {
 
     expect(projection.projects).toEqual([
       expect.objectContaining({
-        id: 'github:stablyai/orca_botmux',
+        id: 'github:stablyai/botmux',
         sourceRepoIds: ['repo-1']
       })
     ])
     expect(projection.setups).toEqual([
       expect.objectContaining({
         id: 'repo-1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: 'repo-1',
         hostId: 'local',
-        path: '/Users/alice/orca_botmux'
+        path: '/Users/alice/botmux'
       })
     ])
   })
@@ -413,8 +413,8 @@ describe('store selectors', () => {
     const repos = [
       makeRepo({
         id: 'repo-1',
-        path: '/Users/alice/orca_botmux',
-        displayName: 'orca_botmux'
+        path: '/Users/alice/botmux',
+        displayName: 'botmux'
       })
     ]
     const projects = [

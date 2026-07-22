@@ -198,24 +198,24 @@ describe('agent process recognition', () => {
     ).toEqual({ agent: 'gemini', processName: 'gemini' })
   })
 
-  it('recognizes only the agent subcommand of the generic OrcaBotmux CLI', () => {
-    expect(recognizeAgentProcessFromCommandLine('orca_botmux claude-teams')).toEqual({
+  it('recognizes only the agent subcommand of the generic Botmux CLI', () => {
+    expect(recognizeAgentProcessFromCommandLine('botmux claude-teams')).toEqual({
       agent: 'claude-agent-teams',
-      processName: 'orca_botmux'
+      processName: 'botmux'
     })
-    expect(recognizeAgentProcessFromCommandLine('orca_botmux status')).toBeNull()
-    expect(recognizeAgentProcessFromCommandLine('orca-botmux-desktop-dev terminal list')).toBeNull()
-    expect(recognizeAgentProcessFromCommandLine('node /usr/local/bin/orca_botmux claude-teams')).toEqual({
+    expect(recognizeAgentProcessFromCommandLine('botmux status')).toBeNull()
+    expect(recognizeAgentProcessFromCommandLine('botmux-desktop-dev terminal list')).toBeNull()
+    expect(recognizeAgentProcessFromCommandLine('node /usr/local/bin/botmux claude-teams')).toEqual({
       agent: 'claude-agent-teams',
-      processName: 'orca_botmux'
+      processName: 'botmux'
     })
-    expect(recognizeAgentProcessFromCommandLine('node /usr/local/bin/orca_botmux status')).toBeNull()
+    expect(recognizeAgentProcessFromCommandLine('node /usr/local/bin/botmux status')).toBeNull()
   })
 
   it('does not classify prompt text as a wrapped agent command', () => {
     expect(
       recognizeAgentProcessFromCommandLine(
-        'node /tmp/not-an-agent.js "compare opencode vs orca_botmux in Gemini CLI"'
+        'node /tmp/not-an-agent.js "compare opencode vs botmux in Gemini CLI"'
       )
     ).toBeNull()
     expect(recognizeAgentProcessFromCommandLine(String.raw`node C:\tmp\not-an-agent.js`)).toBeNull()

@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 
 const tempRoots: string[] = []
@@ -79,21 +79,21 @@ test.afterAll(async () => {
 
 test.describe('Windows project runtime smoke', () => {
   test('keeps a Windows-host project and WSL project available side by side', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
     test.skip(process.platform !== 'win32', 'Windows project runtime smoke requires Windows')
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
 
-    const wsl = await orcaBotmuxPage.evaluate(async () => ({
+    const wsl = await botmuxPage.evaluate(async () => ({
       available: await window.api.wsl.isAvailable(),
       distros: await window.api.wsl.listDistros()
     }))
     test.skip(!wsl.available || wsl.distros.length === 0, 'WSL distro is required for smoke')
     const wslDistro = wsl.distros[0]!
-    const wslRepoPath = await createGitRepo('orca-botmux-e2e-project-runtime-', 'wsl-runtime-project')
+    const wslRepoPath = await createGitRepo('botmux-e2e-project-runtime-', 'wsl-runtime-project')
 
-    const smoke = await orcaBotmuxPage.evaluate(
+    const smoke = await botmuxPage.evaluate(
       async ({ hostRepoPath, wslRepoPath, wslDistro }) => {
         const store = window.__store
         if (!store) {
@@ -142,15 +142,15 @@ test.describe('Windows project runtime smoke', () => {
     expect(smoke.hostWorktreeCount).toBeGreaterThan(0)
     expect(smoke.wslWorktreeCount).toBeGreaterThan(0)
 
-    await openRepoSettings(orcaBotmuxPage, smoke.hostRepoId)
-    const hostSection = orcaBotmuxPage.locator(`[data-settings-section="repo-${smoke.hostRepoId}"]`)
+    await openRepoSettings(botmuxPage, smoke.hostRepoId)
+    const hostSection = botmuxPage.locator(`[data-settings-section="repo-${smoke.hostRepoId}"]`)
     await expect(hostSection.getByText('Project Runtime')).toBeVisible()
     await expect(hostSection.getByText('This project runs on Windows.')).toBeVisible()
-    await chooseProjectRuntime(orcaBotmuxPage, smoke.hostRepoId, 'WSL')
+    await chooseProjectRuntime(botmuxPage, smoke.hostRepoId, 'WSL')
     await expect(
       hostSection.getByText(`This project runs in ${smoke.wslDistro} via WSL.`)
     ).toBeVisible()
-    const hostAfterWslUiSwitch = await orcaBotmuxPage.evaluate((hostRepoId) => {
+    const hostAfterWslUiSwitch = await botmuxPage.evaluate((hostRepoId) => {
       const state = window.__store!.getState()
       const hostProject = state.projects.find((project) =>
         project.sourceRepoIds.includes(hostRepoId)
@@ -159,9 +159,9 @@ test.describe('Windows project runtime smoke', () => {
     }, smoke.hostRepoId)
     expect(hostAfterWslUiSwitch).toEqual({ kind: 'wsl', distro: smoke.wslDistro })
 
-    await chooseProjectRuntime(orcaBotmuxPage, smoke.hostRepoId, 'Windows')
+    await chooseProjectRuntime(botmuxPage, smoke.hostRepoId, 'Windows')
     await expect(hostSection.getByText('This project runs on Windows.')).toBeVisible()
-    const hostAfterWindowsUiSwitch = await orcaBotmuxPage.evaluate((hostRepoId) => {
+    const hostAfterWindowsUiSwitch = await botmuxPage.evaluate((hostRepoId) => {
       const state = window.__store!.getState()
       const hostProject = state.projects.find((project) =>
         project.sourceRepoIds.includes(hostRepoId)
@@ -170,14 +170,14 @@ test.describe('Windows project runtime smoke', () => {
     }, smoke.hostRepoId)
     expect(hostAfterWindowsUiSwitch).toEqual({ kind: 'windows-host' })
 
-    await openRepoSettings(orcaBotmuxPage, smoke.wslRepoId)
-    const wslSection = orcaBotmuxPage.locator(`[data-settings-section="repo-${smoke.wslRepoId}"]`)
+    await openRepoSettings(botmuxPage, smoke.wslRepoId)
+    const wslSection = botmuxPage.locator(`[data-settings-section="repo-${smoke.wslRepoId}"]`)
     await expect(wslSection.getByText('Project Runtime')).toBeVisible()
     await expect(
       wslSection.getByText(`This project runs in ${smoke.wslDistro} via WSL.`)
     ).toBeVisible()
 
-    await orcaBotmuxPage.evaluate(async (repoId) => {
+    await botmuxPage.evaluate(async (repoId) => {
       await window.api.repos.remove({ repoId })
     }, smoke.wslRepoId)
   })

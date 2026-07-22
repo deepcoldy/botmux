@@ -15,13 +15,13 @@ describe('removeAppImageRuntimeEnv', () => {
     Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' })
 
     const env = {
-      APPIMAGE: '/data/apps/orca_botmux.appimage',
-      APPDIR: '/tmp/.mount_orca123',
-      ARGV0: '/data/apps/orca_botmux.appimage',
+      APPIMAGE: '/data/apps/botmux.appimage',
+      APPDIR: '/tmp/.mount_botmux123',
+      ARGV0: '/data/apps/botmux.appimage',
       OWD: '/home/user',
-      APPIMAGE_LIBRARY_PATH: '/tmp/.mount_orca123/usr/lib',
-      PATH: ['/tmp/.mount_orca123', '/tmp/.mount_orca123/usr/sbin', '/usr/bin'].join(delimiter),
-      LD_LIBRARY_PATH: ['/tmp/.mount_orca123/usr/lib', '/opt/audio/lib'].join(delimiter),
+      APPIMAGE_LIBRARY_PATH: '/tmp/.mount_botmux123/usr/lib',
+      PATH: ['/tmp/.mount_botmux123', '/tmp/.mount_botmux123/usr/sbin', '/usr/bin'].join(delimiter),
+      LD_LIBRARY_PATH: ['/tmp/.mount_botmux123/usr/lib', '/opt/audio/lib'].join(delimiter),
       HOME: '/home/user'
     }
 
@@ -52,7 +52,7 @@ describe('removeAppImageRuntimeEnv', () => {
   it('removes AppImage ARGV0 even without a mounted APPDIR', () => {
     Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' })
     const env = {
-      ARGV0: '/data/apps/orca_botmux.appimage',
+      ARGV0: '/data/apps/botmux.appimage',
       PATH: ['/usr/local/bin', '/usr/bin'].join(delimiter)
     }
 
@@ -66,19 +66,19 @@ describe('removeAppImageRuntimeEnv', () => {
   it('leaves AppImage-looking env untouched outside Linux', () => {
     Object.defineProperty(process, 'platform', { configurable: true, value: 'darwin' })
     const env = {
-      APPIMAGE: '/data/apps/orca_botmux.appimage',
-      APPDIR: '/tmp/.mount_orca123',
-      ARGV0: '/data/apps/orca_botmux.appimage',
-      PATH: ['/tmp/.mount_orca123/usr/bin', '/usr/bin'].join(delimiter)
+      APPIMAGE: '/data/apps/botmux.appimage',
+      APPDIR: '/tmp/.mount_botmux123',
+      ARGV0: '/data/apps/botmux.appimage',
+      PATH: ['/tmp/.mount_botmux123/usr/bin', '/usr/bin'].join(delimiter)
     }
 
     removeAppImageRuntimeEnv(env)
 
     expect(env).toEqual({
-      APPIMAGE: '/data/apps/orca_botmux.appimage',
-      APPDIR: '/tmp/.mount_orca123',
-      ARGV0: '/data/apps/orca_botmux.appimage',
-      PATH: ['/tmp/.mount_orca123/usr/bin', '/usr/bin'].join(delimiter)
+      APPIMAGE: '/data/apps/botmux.appimage',
+      APPDIR: '/tmp/.mount_botmux123',
+      ARGV0: '/data/apps/botmux.appimage',
+      PATH: ['/tmp/.mount_botmux123/usr/bin', '/usr/bin'].join(delimiter)
     })
   })
 })

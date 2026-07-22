@@ -236,7 +236,7 @@ function SetupScriptPromptCard(): React.JSX.Element | null {
               onOpenSettings: () => openLocalCommandSettings(importedRepoId),
               description: translate(
                 'auto.components.sidebar.SetupScriptPromptCard.a49196d538',
-                'Runs when OrcaBotmux creates a new worktree.'
+                'Runs when Botmux creates a new worktree.'
               )
             })
           }

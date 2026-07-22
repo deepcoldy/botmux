@@ -5,7 +5,7 @@ import { getVersionManagerBinPaths } from '../codex-cli/command'
 import { getMainE2EConfig } from '../e2e-config'
 
 const DEV_PARENT_SHUTDOWN_GRACE_MS = 3000
-const HTTP1_COMPATIBILITY_ENV_VAR = 'ORCA_DISABLE_HTTP2'
+const HTTP1_COMPATIBILITY_ENV_VAR = 'BOTMUX_DISABLE_HTTP2'
 const TRUE_ENV_VALUES = new Set(['1', 'true', 'yes', 'on'])
 const FALSE_ENV_VALUES = new Set(['0', 'false', 'no', 'off'])
 let devParentShutdownRequested = false
@@ -30,7 +30,7 @@ function parseBooleanEnvFlag(value: string | undefined): boolean | null {
 }
 
 function readPersistedHttp1CompatibilityMode(userDataPath: string): boolean {
-  const dataFile = join(userDataPath, 'orca-botmux-data.json')
+  const dataFile = join(userDataPath, 'botmux-data.json')
   if (!existsSync(dataFile)) {
     return false
   }
@@ -78,7 +78,7 @@ function requestDevParentShutdown(): void {
     // Why: in dev, losing the supervising parent means this Electron process is
     // already orphaned from the terminal session. We try app.quit() first so
     // normal cleanup still runs, but fall back to app.exit() when macOS quit
-    // handlers or window-close guards stall and would otherwise leave OrcaBotmux
+    // handlers or window-close guards stall and would otherwise leave Botmux
     // hanging after Ctrl+C ends `pnpm dev`.
     app.exit(0)
   }, DEV_PARENT_SHUTDOWN_GRACE_MS)
@@ -147,7 +147,7 @@ export function patchPackagedProcessPath(): void {
         // Pi's vite-plus installer). GUI-launched Electron inherits a minimal PATH
         // without shell rc files, so these stay invisible to `which` probes — and
         // the Agents settings page reports them as "Not installed" even when the
-        // user can run them from Terminal. See stablyai/orca_botmux#829.
+        // user can run them from Terminal. See stablyai/botmux#829.
         join(home, '.opencode/bin'),
         join(home, '.vite-plus/bin')
       )
@@ -190,33 +190,33 @@ export function configureDevUserDataPath(isDev: boolean): void {
   if (!isDev) {
     return
   }
-  const overrideUserDataPath = process.env.ORCA_DEV_USER_DATA_PATH
+  const overrideUserDataPath = process.env.BOTMUX_DEV_USER_DATA_PATH
   if (overrideUserDataPath) {
     // Why: automated Electron repros need an isolated profile so persisted
-    // tabs/worktrees from the developer's normal `orca-botmux-desktop-dev` session do not
+    // tabs/worktrees from the developer's normal `botmux-desktop-dev` session do not
     // change startup behavior and hide or create window-management bugs.
     app.setPath('userData', overrideUserDataPath)
     return
   }
-  // Why: development runs share the same machine as packaged OrcaBotmux, and both
+  // Why: development runs share the same machine as packaged Botmux, and both
   // publish runtime bootstrap files under userData. Without a dev-only path,
   // `pnpm dev` can overwrite the packaged app's runtime pointer and make the
-  // public `orca_botmux` CLI look broken even though the packaged app is still open.
-  // Why: vendor import — isolate orca_botmux from a co-installed OrcaBotmux's
-  // `orca-botmux-desktop-dev` userData so worktrees, pairing tokens, and daemon sockets do not collide.
-  app.setPath('userData', join(app.getPath('appData'), 'orca-botmux-desktop-dev'))
+  // public `botmux` CLI look broken even though the packaged app is still open.
+  // Why: vendor import — isolate botmux from a co-installed Botmux's
+  // `botmux-desktop-dev` userData so worktrees, pairing tokens, and daemon sockets do not collide.
+  app.setPath('userData', join(app.getPath('appData'), 'botmux-desktop-dev'))
 }
 
-export function configureOrcaUserDataPathEnv(): void {
-  // Why: app relaunches can inherit an ORCA_USER_DATA_PATH from an older CLI or
+export function configureBotmuxUserDataPathEnv(): void {
+  // Why: app relaunches can inherit an BOTMUX_USER_DATA_PATH from an older CLI or
   // updater process. Main must canonicalize it before CLI-shared modules build
-  // runtime-home paths, or migrations can bridge two OrcaBotmux app-data directories.
-  process.env.ORCA_USER_DATA_PATH = app.getPath('userData')
+  // runtime-home paths, or migrations can bridge two Botmux app-data directories.
+  process.env.BOTMUX_USER_DATA_PATH = app.getPath('userData')
 }
 
 export function shouldInstallManagedHooks(isDev: boolean): boolean {
   void isDev
-  // Why: managed hook installation now targets OrcaBotmux-owned, environment-scoped
+  // Why: managed hook installation now targets Botmux-owned, environment-scoped
   // homes for Codex rather than the user's default ~/.codex state, so plain
   // dev runs need the install path enabled to keep hook-backed agent statuses
   // accurate without an opt-in flag. The remaining agents still rely on the
@@ -272,7 +272,7 @@ export function installDevParentWatchdog(isDev: boolean): void {
       clearInterval(timer)
       // Why: electron-vite's dev runner starts Electron with plain spawn() and
       // inherited stdio, not an IPC channel. On macOS that means Ctrl+C can end
-      // the dev runner while leaving OrcaBotmux open. Watching the original parent PID
+      // the dev runner while leaving Botmux open. Watching the original parent PID
       // keeps dev shutdown coupled to the terminal session without affecting the
       // packaged app, which is not supervised by electron-vite.
       requestDevParentShutdown()

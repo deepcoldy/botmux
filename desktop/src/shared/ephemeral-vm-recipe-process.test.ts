@@ -13,7 +13,7 @@ afterEach(() => {
 })
 
 function makeRepo(): string {
-  const root = mkdtempSync(join(tmpdir(), 'orca-botmux-vm-recipe-process-'))
+  const root = mkdtempSync(join(tmpdir(), 'botmux-vm-recipe-process-'))
   tmpRoots.push(root)
   return root
 }

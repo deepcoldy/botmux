@@ -25,13 +25,13 @@ function makeSettings(voiceEnabled = false): Pick<GlobalSettings, 'voice'> {
 function makeCliStatus(overrides: Partial<CliInstallStatus> = {}): CliInstallStatus {
   return {
     platform: 'darwin',
-    commandName: 'orca_botmux',
+    commandName: 'botmux',
     supported: true,
     state: 'installed',
-    commandPath: '/usr/local/bin/orca_botmux',
+    commandPath: '/usr/local/bin/botmux',
     pathDirectory: '/usr/local/bin',
     pathConfigured: true,
-    launcherPath: '/Applications/OrcaBotmux.app/Contents/MacOS/orca_botmux',
+    launcherPath: '/Applications/Botmux.app/Contents/MacOS/botmux',
     installMethod: 'symlink',
     currentTarget: null,
     unsupportedReason: null,
@@ -54,7 +54,7 @@ describe('feature tip startup gate', () => {
         settings: makeSettings(),
         suppressedByOnboardingThisSession: false
       })
-    ).toEqual({ kind: 'open', tipId: 'orca-botmux-cli' })
+    ).toEqual({ kind: 'open', tipId: 'botmux-cli' })
   })
 
   it('suppresses feature tips for first-time users while onboarding is showing', () => {
@@ -102,7 +102,7 @@ describe('feature tip startup gate', () => {
         settings: makeSettings(),
         suppressedByOnboardingThisSession: false
       })
-    ).toEqual({ kind: 'open', tipId: 'orca-botmux-cli' })
+    ).toEqual({ kind: 'open', tipId: 'botmux-cli' })
   })
 
   it('opens the CLI tip after voice dictation is already enabled', () => {
@@ -118,7 +118,7 @@ describe('feature tip startup gate', () => {
         settings: makeSettings(true),
         suppressedByOnboardingThisSession: false
       })
-    ).toEqual({ kind: 'open', tipId: 'orca-botmux-cli' })
+    ).toEqual({ kind: 'open', tipId: 'botmux-cli' })
   })
 
   it('opens the command palette tip after the CLI tip was marked seen', () => {
@@ -126,7 +126,7 @@ describe('feature tip startup gate', () => {
       getFeatureTipsAppOpenDecision({
         activeModal: 'none',
         cliInstalled: true,
-        featureTipsSeenIds: ['orca-botmux-cli'],
+        featureTipsSeenIds: ['botmux-cli'],
         featureInteractions: {},
         onboarding: existingUserOnboarding,
         persistedUIReady: true,
@@ -142,7 +142,7 @@ describe('feature tip startup gate', () => {
       getFeatureTipsAppOpenDecision({
         activeModal: 'none',
         cliInstalled: false,
-        featureTipsSeenIds: ['voice-dictation', 'orca-botmux-cli', 'cmd-j-palette'],
+        featureTipsSeenIds: ['voice-dictation', 'botmux-cli', 'cmd-j-palette'],
         featureInteractions: {},
         onboarding: existingUserOnboarding,
         persistedUIReady: true,

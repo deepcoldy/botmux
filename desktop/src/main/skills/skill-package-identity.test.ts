@@ -12,7 +12,7 @@ import {
 const temporaryDirectories: string[] = []
 
 async function temporarySkill(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'orca-botmux-skill-freshness-'))
+  const root = await mkdtemp(join(tmpdir(), 'botmux-skill-freshness-'))
   temporaryDirectories.push(root)
   return root
 }

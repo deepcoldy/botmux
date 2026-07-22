@@ -106,7 +106,7 @@ describe('enqueueGitHubPRRefresh host guard', () => {
     const store = createTestStore()
     seed(store, {
       id: 'rt-1',
-      path: '/Users/lobster/orca_botmux/workspaces/openclaw/imessage-performance',
+      path: '/Users/lobster/botmux/workspaces/openclaw/imessage-performance',
       name: 'imessage-performance',
       kind: 'git',
       executionHostId: 'runtime:env-1'

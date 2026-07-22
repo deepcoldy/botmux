@@ -26,7 +26,7 @@ export default function TerminalSearch({
   const requestQuery = getFindRequestQuery(query)
 
   // Why: the default xterm SearchAddon highlights blend into common
-  // terminal backgrounds (see orca_botmux#612). Providing explicit decoration
+  // terminal backgrounds (see botmux#612). Providing explicit decoration
   // colors gives all matches a visible yellow background and the
   // current match a brighter orange, matching the contrast VS Code and
   // iTerm2 use for terminal search. xterm requires #RRGGBB format for

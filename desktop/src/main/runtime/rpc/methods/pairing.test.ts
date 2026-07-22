@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import { BotmuxRuntimeService } from '../../botmux-runtime'
 import { RpcDispatcher } from '../dispatcher'
 import { PAIRING_METHODS } from './pairing'
 
@@ -10,7 +10,7 @@ function dispatchPairing(
 ): Promise<Record<string, unknown>> {
   return new Promise((resolve) => {
     const dispatcher = new RpcDispatcher({
-      runtime: new OrcaRuntimeService(),
+      runtime: new BotmuxRuntimeService(),
       methods: PAIRING_METHODS
     })
     void dispatcher.dispatchStreaming(

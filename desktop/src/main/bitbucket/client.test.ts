@@ -40,10 +40,10 @@ function bitbucketPr(id = 7) {
 describe('Bitbucket client', () => {
   beforeEach(() => {
     process.env = { ...OLD_ENV }
-    process.env.ORCA_BITBUCKET_API_BASE_URL = 'https://api.test.local/2.0'
-    process.env.ORCA_BITBUCKET_EMAIL = 'user@example.com'
-    process.env.ORCA_BITBUCKET_API_TOKEN = 'token'
-    delete process.env.ORCA_BITBUCKET_ACCESS_TOKEN
+    process.env.BOTMUX_BITBUCKET_API_BASE_URL = 'https://api.test.local/2.0'
+    process.env.BOTMUX_BITBUCKET_EMAIL = 'user@example.com'
+    process.env.BOTMUX_BITBUCKET_API_TOKEN = 'token'
+    delete process.env.BOTMUX_BITBUCKET_ACCESS_TOKEN
     gitExecFileAsyncMock.mockReset()
     gitExecFileAsyncMock.mockResolvedValue({
       stdout: 'git@bitbucket.org:team/repo.git\n',

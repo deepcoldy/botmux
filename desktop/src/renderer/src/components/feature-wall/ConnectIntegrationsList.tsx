@@ -107,7 +107,7 @@ export function ConnectIntegrationsList(): React.JSX.Element {
           )}
           description={translate(
             'auto.components.feature.wall.ConnectIntegrationsList.review_step_description',
-            'Connect a review provider so OrcaBotmux can show PR or MR status, checks, and reviews.'
+            'Connect a review provider so Botmux can show PR or MR status, checks, and reviews.'
           )}
           summary={
             <>
@@ -136,11 +136,11 @@ export function ConnectIntegrationsList(): React.JSX.Element {
           expanded={taskExpanded}
           title={translate(
             'auto.components.feature.wall.ConnectIntegrationsList.task_step_title',
-            'Start agents on your tasks without leaving OrcaBotmux'
+            'Start agents on your tasks without leaving Botmux'
           )}
           description={translate(
             'auto.components.feature.wall.ConnectIntegrationsList.33b650af52',
-            'Connect where your team tracks work. OrcaBotmux starts workspaces with the issue title, link, and context already attached.'
+            'Connect where your team tracks work. Botmux starts workspaces with the issue title, link, and context already attached.'
           )}
           summary={
             status.trackerProviderName ? (

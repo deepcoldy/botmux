@@ -110,11 +110,11 @@ export function GrokAccountsSection(): React.JSX.Element {
                 {tokenFresh
                   ? translate(
                       'auto.components.settings.GrokAccountsSection.b36fa2c908',
-                      'Signed in. OrcaBotmux reads the Grok CLI session stored on disk.'
+                      'Signed in. Botmux reads the Grok CLI session stored on disk.'
                     )
                   : translate(
                       'auto.components.settings.GrokAccountsSection.f08c41de73',
-                      'Session expired — run grok on the computer running OrcaBotmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed.'
+                      'Session expired — run grok on the computer running Botmux and wait for it to start. If prompted, complete sign-in, then click Refresh usage. No chat message is needed.'
                     )}
               </p>
             </>

@@ -56,7 +56,7 @@ function isolatedScanRoots(root: string) {
 }
 
 function createTempOpenCodeDb(): { db: Database.Database; path: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-ai-vault-sqlite-'))
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-ai-vault-sqlite-'))
   tempDbDirs.push(dir)
   const path = join(dir, 'opencode.db')
   return { db: new Database(path), path }
@@ -105,7 +105,7 @@ function applyOpenCodeSchema(db: Database.Database): void {
 
 describe('scanAiVaultSessions — OpenCode SQLite + legacy file coexistence', () => {
   it('discovers SQLite sessions next to a custom OpenCode storage directory', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-ai-vault-custom-opencode-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-ai-vault-custom-opencode-'))
     tempRoots.push(root)
     const roots = isolatedScanRoots(root)
     const opencodeDataDir = join(root, 'custom-opencode')
@@ -143,7 +143,7 @@ describe('scanAiVaultSessions — OpenCode SQLite + legacy file coexistence', ()
   })
 
   it('surfaces SQLite sessions alongside legacy file sessions and dedups by sessionId', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-ai-vault-mixed-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-ai-vault-mixed-'))
     tempRoots.push(root)
     const roots = isolatedScanRoots(root)
 

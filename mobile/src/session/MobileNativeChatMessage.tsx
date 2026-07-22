@@ -20,6 +20,7 @@ import {
   summarizeToolRun,
   toolFilePath
 } from './mobile-native-chat-tool-summary'
+import { useMobileI18n } from '../i18n/mobile-i18n'
 
 const MAX_VISIBLE_TOOL_PAIRS = 6
 const MAX_TOOL_RUN_DIFF_ROWS = 240
@@ -239,13 +240,14 @@ function AgentControls({
   onCopy: () => void
   onScrollToTop?: () => void
 }): React.JSX.Element {
+  const { t } = useMobileI18n()
   return (
     <View style={styles.controls}>
       <Pressable
         style={({ pressed }) => [styles.controlButton, pressed && styles.controlPressed]}
         onPress={onCopy}
         hitSlop={8}
-        accessibilityLabel="Copy message"
+        accessibilityLabel={t('Copy message')}
       >
         <Copy size={14} color={colors.textMuted} strokeWidth={2} />
       </Pressable>
@@ -254,7 +256,7 @@ function AgentControls({
           style={({ pressed }) => [styles.controlButton, pressed && styles.controlPressed]}
           onPress={onScrollToTop}
           hitSlop={8}
-          accessibilityLabel="Scroll this message to top"
+          accessibilityLabel={t('Scroll this message to top')}
         >
           <ArrowUp size={14} color={colors.textMuted} strokeWidth={2} />
         </Pressable>
@@ -283,6 +285,7 @@ function MobileNativeChatMessageImpl({
   onScrollToMessage?: (index: number) => void
   onOpenFile?: (relativePath: string) => void
 }): React.JSX.Element {
+  const { t } = useMobileI18n()
   const isUser = message.role === 'user'
   const isReasoning = message.role === 'reasoning'
   const isAgent = !isUser
@@ -331,7 +334,7 @@ function MobileNativeChatMessageImpl({
 
   return (
     <View style={[styles.row, isUser && styles.rowUser]}>
-      {isUser && queued ? <Text style={styles.queuedTag}>Queued</Text> : null}
+      {isUser && queued ? <Text style={styles.queuedTag}>{t('Queued')}</Text> : null}
       <View
         style={[
           styles.content,

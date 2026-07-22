@@ -25,7 +25,7 @@ async function loadStoreModule() {
 }
 
 beforeEach(() => {
-  tempHome = mkdtempLike('orca-botmux-openai-key-store-')
+  tempHome = mkdtempLike('botmux-openai-key-store-')
   safeStorageMock.decryptString.mockClear()
   safeStorageMock.encryptString.mockClear()
   safeStorageMock.isEncryptionAvailable.mockClear()
@@ -37,9 +37,9 @@ function mkdtempLike(prefix: string): string {
 }
 
 function writeStoredOpenAiKey(value: string): void {
-  const orcaDir = join(tempHome, '.orca_botmux')
-  mkdirSync(orcaDir, { recursive: true })
-  writeFileSync(join(orcaDir, 'openai-speech-token.enc'), value)
+  const botmuxDir = join(tempHome, '.botmux')
+  mkdirSync(botmuxDir, { recursive: true })
+  writeFileSync(join(botmuxDir, 'openai-speech-token.enc'), value)
 }
 
 describe('OpenAI speech API key store', () => {
@@ -82,7 +82,7 @@ describe('OpenAI speech API key store', () => {
     const store = await loadStoreModule()
 
     expect(store.hasOpenAiSpeechApiKey()).toBe(false)
-    expect(existsSync(join(tempHome, '.orca_botmux'))).toBe(false)
+    expect(existsSync(join(tempHome, '.botmux'))).toBe(false)
     expect(safeStorageMock.decryptString).not.toHaveBeenCalled()
   })
 })

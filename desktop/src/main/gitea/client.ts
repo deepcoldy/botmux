@@ -50,10 +50,10 @@ export function normalizeGiteaApiBaseUrl(value: string): string {
 }
 
 function getAuthConfig(): GiteaAuthConfig {
-  const apiBaseUrl = envValue('ORCA_GITEA_API_BASE_URL')
+  const apiBaseUrl = envValue('BOTMUX_GITEA_API_BASE_URL')
   return {
     apiBaseUrl: apiBaseUrl ? normalizeGiteaApiBaseUrl(apiBaseUrl) : null,
-    token: envValue('ORCA_GITEA_TOKEN')
+    token: envValue('BOTMUX_GITEA_TOKEN')
   }
 }
 
@@ -126,7 +126,7 @@ function giteaPullRequestScanKey(repo: GiteaRepoRef): string {
   return `${configuredApiBaseUrl(repo)}/${encodedRepoPath(repo)}`
 }
 
-/** Invalidate the shared /pulls scan after OrcaBotmux itself creates a PR so the
+/** Invalidate the shared /pulls scan after Botmux itself creates a PR so the
  *  next worktree-card refresh sees it instead of a cached miss. */
 export function invalidateGiteaPullRequestScanForRepo(repo: GiteaRepoRef): void {
   invalidateGiteaPullRequestScan(giteaPullRequestScanKey(repo))

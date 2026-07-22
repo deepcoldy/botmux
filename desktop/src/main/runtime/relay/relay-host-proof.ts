@@ -1,8 +1,8 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import nacl from 'tweetnacl'
 
-const HOST_PROOF_TRANSCRIPT_DOMAIN = 'orca-botmux-relay-host-proof/v1'
-const HOST_CHALLENGE_PLAINTEXT_DOMAIN = 'orca-botmux-relay-host-challenge/v1'
+const HOST_PROOF_TRANSCRIPT_DOMAIN = 'botmux-relay-host-proof/v1'
+const HOST_CHALLENGE_PLAINTEXT_DOMAIN = 'botmux-relay-host-challenge/v1'
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
 

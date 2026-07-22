@@ -36,7 +36,7 @@ describe('CursorHookService', () => {
   let homeDir: string
 
   beforeEach(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-cursor-home-'))
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-cursor-home-'))
     homedirMock.mockReturnValue(homeDir)
   })
 
@@ -64,13 +64,13 @@ describe('CursorHookService', () => {
         process.platform === 'win32' ? WINDOWS_POWERSHELL_LAUNCHER : /cursor-hook/
       )
       if (process.platform !== 'win32') {
-        expect(definition?.command).toContain(join(homeDir, '.orca_botmux'))
+        expect(definition?.command).toContain(join(homeDir, '.botmux'))
       }
       expect(definition?.hooks).toBeUndefined()
     }
 
     const script = readFileSync(
-      join(homeDir, '.orca_botmux', 'agent-hooks', CURSOR_SCRIPT_FILE_NAME),
+      join(homeDir, '.botmux', 'agent-hooks', CURSOR_SCRIPT_FILE_NAME),
       'utf8'
     )
     expect(script).toContain('/hook/cursor')
@@ -93,7 +93,7 @@ describe('CursorHookService', () => {
   it.skipIf(process.platform !== 'win32')(
     'wraps the managed hook command to survive spaces in the profile path (#6078)',
     () => {
-      const spaceHome = join(tmpdir(), 'orca_botmux cursor home with spaces')
+      const spaceHome = join(tmpdir(), 'botmux cursor home with spaces')
       mkdirSync(spaceHome, { recursive: true })
       homedirMock.mockReturnValue(spaceHome)
       try {
@@ -124,10 +124,10 @@ describe('CursorHookService', () => {
           hooks: {
             beforeSubmitPrompt: [
               { command: '/usr/local/bin/user-hook' },
-              { command: '/old/path/.orca_botmux/agent-hooks/cursor-hook.sh' }
+              { command: '/old/path/.botmux/agent-hooks/cursor-hook.sh' }
             ],
             retiredEvent: [
-              { command: '/old/path/.orca_botmux/agent-hooks/cursor-hook.sh' },
+              { command: '/old/path/.botmux/agent-hooks/cursor-hook.sh' },
               { command: '/usr/local/bin/retired-user-hook' }
             ]
           }

@@ -36,10 +36,10 @@ function normalizeApiBaseUrl(value: string): string {
 
 function getAuthConfig(): AzureDevOpsCreateAuthConfig {
   return {
-    apiBaseUrl: envValue('ORCA_AZURE_DEVOPS_API_BASE_URL'),
-    pat: envValue('ORCA_AZURE_DEVOPS_TOKEN') ?? envValue('ORCA_AZURE_DEVOPS_PAT'),
-    accessToken: envValue('ORCA_AZURE_DEVOPS_ACCESS_TOKEN'),
-    username: envValue('ORCA_AZURE_DEVOPS_USERNAME')
+    apiBaseUrl: envValue('BOTMUX_AZURE_DEVOPS_API_BASE_URL'),
+    pat: envValue('BOTMUX_AZURE_DEVOPS_TOKEN') ?? envValue('BOTMUX_AZURE_DEVOPS_PAT'),
+    accessToken: envValue('BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN'),
+    username: envValue('BOTMUX_AZURE_DEVOPS_USERNAME')
   }
 }
 
@@ -97,7 +97,7 @@ function classifyCreateError(error: unknown): CreateHostedReviewResult {
       ok: false,
       code: 'auth_required',
       error:
-        'Create PR failed: Azure DevOps is not authenticated. Next step: set ORCA_AZURE_DEVOPS_TOKEN in this environment.'
+        'Create PR failed: Azure DevOps is not authenticated. Next step: set BOTMUX_AZURE_DEVOPS_TOKEN in this environment.'
     }
   }
   if (status === 409 || lower.includes('already exists') || lower.includes('active pull request')) {

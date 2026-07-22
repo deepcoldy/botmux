@@ -8,7 +8,7 @@ const {
   collectDiagnosticBundleMock,
   getDiagnosticsStatusMock,
   recordCrashBreadcrumbMock,
-  resolveDiagnosticOrcaChannelMock,
+  resolveDiagnosticBotmuxChannelMock,
   spanEndMock,
   startSpanMock,
   submitFeedbackMock
@@ -21,7 +21,7 @@ const {
     collectDiagnosticBundleMock: vi.fn(),
     getDiagnosticsStatusMock: vi.fn(),
     recordCrashBreadcrumbMock: vi.fn(),
-    resolveDiagnosticOrcaChannelMock: vi.fn(),
+    resolveDiagnosticBotmuxChannelMock: vi.fn(),
     spanEndMock,
     startSpanMock: vi.fn(() => ({
       traceId: 'trace-id',
@@ -68,7 +68,7 @@ vi.mock('../observability', () => ({
 }))
 
 vi.mock('../observability/diagnostic-upload-endpoint', () => ({
-  resolveDiagnosticOrcaChannel: resolveDiagnosticOrcaChannelMock
+  resolveDiagnosticBotmuxChannel: resolveDiagnosticBotmuxChannelMock
 }))
 
 vi.mock('../observability/tracer', () => ({
@@ -128,8 +128,8 @@ describe('registerCrashReportingHandlers', () => {
       traceFilePath: '/tmp/main.trace.ndjson',
       traceFamilySize: 25
     })
-    resolveDiagnosticOrcaChannelMock.mockReset()
-    resolveDiagnosticOrcaChannelMock.mockReturnValue('stable')
+    resolveDiagnosticBotmuxChannelMock.mockReset()
+    resolveDiagnosticBotmuxChannelMock.mockReturnValue('stable')
     startSpanMock.mockClear()
     spanEndMock.mockClear()
     submitFeedbackMock.mockReset()
@@ -203,7 +203,7 @@ describe('registerCrashReportingHandlers', () => {
       reportId: pending.id,
       notes: 'current notes',
       submissionFailure: {
-        error: 'fallback failed at C:\\Users\\alice\\OrcaBotmux',
+        error: 'fallback failed at C:\\Users\\alice\\Botmux',
         diagnosticContext: {
           status: 'not_uploaded',
           reason: 'attachment token=super-secret-value',
@@ -320,7 +320,7 @@ describe('registerCrashReportingHandlers', () => {
       }
     })
     expect(collectDiagnosticBundleMock).toHaveBeenCalledWith(
-      expect.objectContaining({ lookbackMinutes: 3 * 24 * 60, orcaChannel: 'stable' })
+      expect.objectContaining({ lookbackMinutes: 3 * 24 * 60, botmuxChannel: 'stable' })
     )
     expect(submitFeedbackMock).toHaveBeenCalledWith({
       feedback: expect.stringContaining('Report ID: not captured'),

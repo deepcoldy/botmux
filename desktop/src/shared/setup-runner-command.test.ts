@@ -8,45 +8,45 @@ describe('buildSetupRunnerCommand', () => {
   it('uses bash for WSL UNC runner scripts regardless of host casing', () => {
     expect(
       buildSetupRunnerCommand(
-        '\\\\WSL.LOCALHOST\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+        '\\\\WSL.LOCALHOST\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         'windows'
       )
-    ).toBe('bash /home/jin/repo/.git/worktrees/feature/orca_botmux/setup-runner.sh')
+    ).toBe('bash /home/jin/repo/.git/worktrees/feature/botmux/setup-runner.sh')
   })
 
   it('uses bash with Linux paths for forward-slash WSL UNC runner scripts', () => {
     expect(
       buildSetupRunnerCommand(
-        '//wsl.localhost/Ubuntu/home/jin/repo/.git/worktrees/feature/orca_botmux/setup-runner.sh',
+        '//wsl.localhost/Ubuntu/home/jin/repo/.git/worktrees/feature/botmux/setup-runner.sh',
         'windows'
       )
-    ).toBe('bash /home/jin/repo/.git/worktrees/feature/orca_botmux/setup-runner.sh')
+    ).toBe('bash /home/jin/repo/.git/worktrees/feature/botmux/setup-runner.sh')
   })
 
   it('keeps generic forward-slash UNC runner scripts on cmd.exe', () => {
     expect(
-      buildSetupRunnerCommand('//server/share/repo/.git/orca_botmux/setup-runner.cmd', 'windows')
-    ).toBe('cmd.exe /c "//server/share/repo/.git/orca_botmux/setup-runner.cmd"')
+      buildSetupRunnerCommand('//server/share/repo/.git/botmux/setup-runner.cmd', 'windows')
+    ).toBe('cmd.exe /c "//server/share/repo/.git/botmux/setup-runner.cmd"')
   })
 })
 
 describe('getSetupRunnerCommandPlatformForPath', () => {
   it('prefers POSIX for absolute POSIX runner paths even from Windows clients', () => {
     expect(
-      getSetupRunnerCommandPlatformForPath('/remote/repo/.git/orca_botmux/setup-runner.sh', 'windows')
+      getSetupRunnerCommandPlatformForPath('/remote/repo/.git/botmux/setup-runner.sh', 'windows')
     ).toBe('posix')
   })
 
   it('prefers Windows for native Windows runner paths even from POSIX clients', () => {
     expect(
-      getSetupRunnerCommandPlatformForPath('C:\\repo\\.git\\orca_botmux\\setup-runner.cmd', 'posix')
+      getSetupRunnerCommandPlatformForPath('C:\\repo\\.git\\botmux\\setup-runner.cmd', 'posix')
     ).toBe('windows')
   })
 
   it('keeps WSL UNC paths on the Windows resolver so they can be converted', () => {
     expect(
       getSetupRunnerCommandPlatformForPath(
-        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\orca_botmux\\setup-runner.sh',
+        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\botmux\\setup-runner.sh',
         'posix'
       )
     ).toBe('windows')
@@ -55,13 +55,13 @@ describe('getSetupRunnerCommandPlatformForPath', () => {
   it('keeps forward-slash UNC paths on the Windows resolver', () => {
     expect(
       getSetupRunnerCommandPlatformForPath(
-        '//wsl.localhost/Ubuntu/home/jin/repo/.git/orca_botmux/setup-runner.sh',
+        '//wsl.localhost/Ubuntu/home/jin/repo/.git/botmux/setup-runner.sh',
         'posix'
       )
     ).toBe('windows')
     expect(
       getSetupRunnerCommandPlatformForPath(
-        '//server/share/repo/.git/orca_botmux/setup-runner.cmd',
+        '//server/share/repo/.git/botmux/setup-runner.cmd',
         'posix'
       )
     ).toBe('windows')

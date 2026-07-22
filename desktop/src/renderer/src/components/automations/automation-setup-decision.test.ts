@@ -9,7 +9,7 @@ import {
 const repo: Repo = {
   id: 'repo-1',
   path: '/repo',
-  displayName: 'orca_botmux',
+  displayName: 'botmux',
   badgeColor: 'blue',
   addedAt: 1,
   kind: 'git',
@@ -27,7 +27,7 @@ function setup(overrides: Partial<ProjectHostSetup> = {}): ProjectHostSetup {
     hostId: 'local',
     repoId: 'repo-1',
     path: '/repo',
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     setupState: 'ready',
     setupMethod: 'legacy-repo',
     createdAt: 1,
@@ -44,7 +44,7 @@ describe('automation setup decision defaults', () => {
   ] as const)('maps %s setup policy to %s', (setupRunPolicy, expectedDecision) => {
     expect(
       getVisibleAutomationSetupDecision({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -63,7 +63,7 @@ describe('automation setup decision defaults', () => {
     ).toBe(expectedDecision)
   })
 
-  it('hides setup choice outside OrcaBotmux new-run automations with setup', () => {
+  it('hides setup choice outside Botmux new-run automations with setup', () => {
     const baseArgs = {
       repoId: 'repo-1',
       repos: [repo],
@@ -74,7 +74,7 @@ describe('automation setup decision defaults', () => {
     expect(
       getVisibleAutomationSetupDecision({
         ...baseArgs,
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'existing'
       })
     ).toBeUndefined()
@@ -88,7 +88,7 @@ describe('automation setup decision defaults', () => {
     expect(
       getVisibleAutomationSetupDecision({
         ...baseArgs,
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repos: [
           {
@@ -103,7 +103,7 @@ describe('automation setup decision defaults', () => {
   it('uses ready project-host setup hook settings before repo fallback', () => {
     expect(
       getVisibleAutomationSetupDecision({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [repo],
@@ -121,10 +121,10 @@ describe('automation setup decision defaults', () => {
     ).toBe('skip')
   })
 
-  it('shows setup choice for shared orca_botmux.yaml setup and default tabs', () => {
+  it('shows setup choice for shared botmux.yaml setup and default tabs', () => {
     expect(
       getVisibleAutomationSetupDecision({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -147,7 +147,7 @@ describe('automation setup decision defaults', () => {
 
     expect(
       getVisibleAutomationSetupDecision({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -172,7 +172,7 @@ describe('automation setup decision defaults', () => {
   it('omits setup decision when no setup source is visible', () => {
     expect(
       resolveAutomationSetupDecisionForSave({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -192,7 +192,7 @@ describe('automation setup decision defaults', () => {
     ).toBeUndefined()
     expect(
       resolveAutomationSetupDecisionForSave({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -213,7 +213,7 @@ describe('automation setup decision defaults', () => {
 
     expect(
       resolveAutomationSetupDecisionForSave({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [
@@ -236,7 +236,7 @@ describe('automation setup decision defaults', () => {
   it('fails closed when saving before shared hook inspection is available', () => {
     expect(
       resolveAutomationSetupDecisionForSave({
-        createTarget: 'orca_botmux',
+        createTarget: 'botmux',
         workspaceMode: 'new_per_run',
         repoId: 'repo-1',
         repos: [

@@ -78,7 +78,7 @@ function runtimeHealth(
   status: RuntimeStatus | null | undefined,
   compatibility: RuntimeCompatVerdict | null
 ): ExecutionHostHealth {
-  // Why: with no live status we have no evidence the OrcaBotmux server is reachable, so
+  // Why: with no live status we have no evidence the Botmux server is reachable, so
   // it must read 'disconnected' (like SSH) rather than defaulting to 'available'.
   // A configured-but-never-connected host was showing "Connected" otherwise.
   if (!status) {
@@ -160,7 +160,7 @@ function addRuntimeHost(
     id: hostId,
     kind: 'runtime',
     label,
-    detail: 'OrcaBotmux server',
+    detail: 'Botmux server',
     health: controlHealth ?? runtimeHealth(status, compatibility),
     compatibility: compatibility ?? undefined,
     capabilities: status?.capabilities,

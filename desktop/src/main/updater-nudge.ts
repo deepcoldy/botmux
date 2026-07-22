@@ -7,9 +7,15 @@ export type NudgeConfig = {
   maxVersion?: string
 }
 
+// Why: reserved until Botmux hosts its own what's-new nudge endpoint.
+const NUDGE_JSON_URL = ''
+
 export async function fetchNudge(): Promise<NudgeConfig | null> {
   try {
-    const res = await net.fetch('https://onorca.dev/whats-new/nudge.json', {
+    if (!NUDGE_JSON_URL) {
+      return null
+    }
+    const res = await net.fetch(NUDGE_JSON_URL, {
       signal: AbortSignal.timeout(5000)
     })
     if (!res.ok) {

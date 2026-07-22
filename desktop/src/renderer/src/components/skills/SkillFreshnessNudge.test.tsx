@@ -24,15 +24,15 @@ function placement(
   overrides: Partial<SkillFreshnessInstallation> = {}
 ): SkillFreshnessInstallation {
   return {
-    id: 'orca-botmux-cli',
-    name: 'orca-botmux-cli',
+    id: 'botmux-cli',
+    name: 'botmux-cli',
     rootId: 'home-agents',
     providers: ['agent-skills'],
     sourceKind: 'home',
     sourceLabel: 'Agent skills home',
-    unresolvedPath: '/home/.agents/skills/orca-botmux-cli',
-    resolvedPath: '/home/.agents/skills/orca-botmux-cli',
-    physicalIdentity: 'physical-orca-botmux-cli',
+    unresolvedPath: '/home/.agents/skills/botmux-cli',
+    resolvedPath: '/home/.agents/skills/botmux-cli',
+    physicalIdentity: 'physical-botmux-cli',
     topology: 'canonical-copy',
     status: 'outdated',
     installedReleaseRevision: 1,
@@ -50,7 +50,7 @@ function eligibleInventory(): SkillFreshnessInventory {
   return {
     schemaVersion: 1,
     installations: [placement()],
-    eligibleUpdateNames: ['orca-botmux-cli'],
+    eligibleUpdateNames: ['botmux-cli'],
     scannedAt: 1
   }
 }
@@ -100,7 +100,7 @@ async function rerenderNudge(): Promise<void> {
   })
 }
 
-const DISMISSAL_KEY = ['physical-orca-botmux-cli', 'orca-botmux-cli', '2'].join('\0')
+const DISMISSAL_KEY = ['physical-botmux-cli', 'botmux-cli', '2'].join('\0')
 
 describe('SkillFreshnessNudge', () => {
   beforeEach(() => {

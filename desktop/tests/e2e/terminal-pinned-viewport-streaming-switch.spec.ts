@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { expect, test } from './helpers/orca-botmux-app'
+import { expect, test } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -51,7 +51,7 @@ for (let tick = 0; tick < 800; tick += 1) {
 async function closeFeatureTips(page: Page): Promise<void> {
   await page.evaluate(() => {
     const store = window.__store
-    store?.getState().markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+    store?.getState().markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     if (store?.getState().activeModal === 'feature-tips') {
       store.getState().closeModal()
     }
@@ -142,13 +142,13 @@ async function readSettledViewport(
 
 test.describe('Terminal pinned viewport with streaming agent across worktree switch', () => {
   test('returning to a pinned pane with an active stream does not land at the top', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await closeFeatureTips(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    await closeFeatureTips(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'streaming pinned repro needs the seeded secondary worktree')
@@ -156,38 +156,38 @@ test.describe('Terminal pinned viewport with streaming agent across worktree swi
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-streaming-switch-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-streaming-switch-${runId}.mjs`)
     writeFileSync(scriptPath, streamingAgentFixtureScript(runId))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 15_000,
           message: 'streaming fixture did not reach terminal scrollback'
         })
         .toContain(`STREAMING_SWITCH_${runId}_PRESTREAM_DONE`)
 
-      const pinned = await pinActiveTerminalNearBottom(orcaBotmuxPage)
+      const pinned = await pinActiveTerminalNearBottom(botmuxPage)
       expect(pinned.baseY).toBeGreaterThan(100)
-      await orcaBotmuxPage.waitForTimeout(150)
+      await botmuxPage.waitForTimeout(150)
 
       // Stream continues while hidden; hidden byte drops mark the pane for a
       // snapshot restore on return.
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(3_000)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(3_000)
 
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-      const settled = await readSettledViewport(orcaBotmuxPage, pinned.tabId)
+      const settled = await readSettledViewport(botmuxPage, pinned.tabId)
       const bottomDistance = settled.baseY - settled.viewportY
       // The user pinned six rows above the bottom. A faithful restore keeps
       // them near the pin; the bug clamps to the very top of the scrollback.

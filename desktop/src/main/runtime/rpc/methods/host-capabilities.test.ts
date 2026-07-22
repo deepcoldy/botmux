@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 
 const { isPwshAvailable, isWslAvailable, listWslDistros, isGitBashAvailable } = vi.hoisted(() => ({
   isPwshAvailable: vi.fn(),
@@ -33,7 +33,7 @@ describe('host capability RPC methods', () => {
     isWslAvailable.mockReturnValue(true)
     listWslDistros.mockReturnValue(['Ubuntu'])
     isGitBashAvailable.mockReturnValue(true)
-    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as OrcaRuntimeService
+    const runtime = { getRuntimeId: () => 'test-runtime' } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: HOST_CAPABILITY_METHODS })
 
     await expect(dispatcher.dispatch(makeRequest('host.pwsh.isAvailable'))).resolves.toMatchObject({

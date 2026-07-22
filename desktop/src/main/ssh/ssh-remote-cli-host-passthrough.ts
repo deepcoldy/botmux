@@ -1,7 +1,7 @@
-// Why: the SSH relay shim (`~/.orca-botmux-relay/bin/orca_botmux`) forwards CLI invocations
+// Why: the SSH relay shim (`~/.botmux-relay/bin/botmux`) forwards CLI invocations
 // to the host app. Instead of re-implementing every command in a hand-rolled
-// switch (the cause of "Unsupported SSH OrcaBotmux CLI command", #7716), the host
-// runs the real bundled `orca_botmux` CLI entry in Electron node mode — the same
+// switch (the cause of "Unsupported SSH Botmux CLI command", #7716), the host
+// runs the real bundled `botmux` CLI entry in Electron node mode — the same
 // entry the local shell command uses — so remote invocations get the full
 // command surface (orchestration, worktree, terminal, ...) by construction.
 import { app } from 'electron'
@@ -10,14 +10,14 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { getCanonicalUserDataPath } from '../persistence'
 
-export type RemoteOrcaCliRequest = {
+export type RemoteBotmuxCliRequest = {
   argv: string[]
   cwd: string
   env: Record<string, string>
   stdin?: string
 }
 
-export type RemoteOrcaCliResult = {
+export type RemoteBotmuxCliResult = {
   stdout: string
   stderr: string
   exitCode: number
@@ -38,15 +38,15 @@ export type HostCliPassthroughOptions = {
  * working even on broken installs. */
 export class HostCliUnavailableError extends Error {}
 
-// Why: only OrcaBotmux terminal-context vars may cross from the remote shell into
-// the host CLI process. Remote PATH / ORCA_USER_DATA_PATH are paths on the
+// Why: only Botmux terminal-context vars may cross from the remote shell into
+// the host CLI process. Remote PATH / BOTMUX_USER_DATA_PATH are paths on the
 // remote machine (meaningless or instance-hijacking on the host), and
 // NODE_OPTIONS-style vars could alter host execution.
 const REMOTE_CONTEXT_ENV_VARS = [
-  'ORCA_TERMINAL_HANDLE',
-  'ORCA_WORKTREE_ID',
-  'ORCA_PANE_KEY',
-  'ORCA_WORKSPACE_ID'
+  'BOTMUX_TERMINAL_HANDLE',
+  'BOTMUX_WORKTREE_ID',
+  'BOTMUX_PANE_KEY',
+  'BOTMUX_WORKSPACE_ID'
 ] as const
 
 // Why: bound captured output so a runaway command cannot balloon the relay
@@ -94,25 +94,25 @@ export function buildHostCliEnv(args: {
   }
   // Why: bind the subprocess to this app instance's runtime metadata (dev and
   // parallel instances use non-default userData dirs).
-  env.ORCA_USER_DATA_PATH = args.userDataPath
+  env.BOTMUX_USER_DATA_PATH = args.userDataPath
   // Why: the caller's working directory lives on the remote machine, so the
-  // subprocess cwd cannot be chdir'd there; ORCA_CLI_CWD carries it for
+  // subprocess cwd cannot be chdir'd there; BOTMUX_CLI_CWD carries it for
   // cwd-based selectors like `--worktree active`.
-  env.ORCA_CLI_CWD = args.remoteCwd
+  env.BOTMUX_CLI_CWD = args.remoteCwd
   // Why: same node-mode hygiene as the shipped CLI launchers — stash and clear
   // NODE_OPTIONS so Electron's node bootstrap does not inherit them.
-  env.ORCA_NODE_OPTIONS = args.hostEnv.NODE_OPTIONS ?? ''
-  env.ORCA_NODE_REPL_EXTERNAL_MODULE = args.hostEnv.NODE_REPL_EXTERNAL_MODULE ?? ''
+  env.BOTMUX_NODE_OPTIONS = args.hostEnv.NODE_OPTIONS ?? ''
+  env.BOTMUX_NODE_REPL_EXTERNAL_MODULE = args.hostEnv.NODE_REPL_EXTERNAL_MODULE ?? ''
   delete env.NODE_OPTIONS
   delete env.NODE_REPL_EXTERNAL_MODULE
   env.ELECTRON_RUN_AS_NODE = '1'
   return env
 }
 
-export async function runHostOrcaCliPassthrough(
-  request: RemoteOrcaCliRequest,
+export async function runHostBotmuxCliPassthrough(
+  request: RemoteBotmuxCliRequest,
   options: HostCliPassthroughOptions = {}
-): Promise<RemoteOrcaCliResult> {
+): Promise<RemoteBotmuxCliResult> {
   // Why: per-field lazy defaults keep the module testable — tests inject all
   // three, so no Electron API is touched outside the production path.
   const execPath = options.execPath ?? process.execPath
@@ -127,8 +127,8 @@ export async function runHostOrcaCliPassthrough(
         appPath: app.getAppPath()
       })
     // Why: must match the userData dir the runtime RPC server writes metadata
-    // to (see index.ts OrcaRuntimeRpcServer wiring), or the CLI subprocess
-    // reports "OrcaBotmux is not running" against a healthy app.
+    // to (see index.ts BotmuxRuntimeRpcServer wiring), or the CLI subprocess
+    // reports "Botmux is not running" against a healthy app.
     userDataPath = options.userDataPath ?? getCanonicalUserDataPath()
   } catch (err) {
     // Why: no Electron app context (or broken install paths) — degrade to the
@@ -143,7 +143,7 @@ export async function runHostOrcaCliPassthrough(
   const killTimeoutMs = options.killTimeoutMs ?? resolveHostCliKillTimeoutMs(request.argv)
 
   if (!entryExists(cliEntryPath)) {
-    throw new HostCliUnavailableError(`OrcaBotmux CLI entry not found at ${cliEntryPath}`)
+    throw new HostCliUnavailableError(`Botmux CLI entry not found at ${cliEntryPath}`)
   }
 
   const env = buildHostCliEnv({
@@ -153,7 +153,7 @@ export async function runHostOrcaCliPassthrough(
     remoteCwd: request.cwd
   })
 
-  return await new Promise<RemoteOrcaCliResult>((resolve, reject) => {
+  return await new Promise<RemoteBotmuxCliResult>((resolve, reject) => {
     let settled = false
     const child = spawn(execPath, [cliEntryPath, ...request.argv], {
       env,
@@ -176,7 +176,7 @@ export async function runHostOrcaCliPassthrough(
       }
       resolve({
         stdout: stdout.toString(),
-        stderr: `${stderr.toString()}OrcaBotmux CLI bridge timed out after ${killTimeoutMs}ms on the host.\n`,
+        stderr: `${stderr.toString()}Botmux CLI bridge timed out after ${killTimeoutMs}ms on the host.\n`,
         exitCode: 1
       })
     }, killTimeoutMs)
@@ -192,7 +192,7 @@ export async function runHostOrcaCliPassthrough(
       // runnable at all — signal the caller to use the legacy fallback rather
       // than reporting a confusing per-command failure.
       reject(
-        new HostCliUnavailableError(`Failed to launch the OrcaBotmux CLI on the host: ${err.message}`)
+        new HostCliUnavailableError(`Failed to launch the Botmux CLI on the host: ${err.message}`)
       )
     })
 
@@ -249,7 +249,7 @@ class CappedOutputCollector {
 
   toString(): string {
     const text = Buffer.concat(this.chunks).toString('utf8')
-    return this.truncated ? `${text}\n[orca_botmux ssh cli] output truncated\n` : text
+    return this.truncated ? `${text}\n[botmux ssh cli] output truncated\n` : text
   }
 }
 

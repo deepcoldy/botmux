@@ -374,7 +374,7 @@ export default function BrowserAddressBar({
             onFocus={handleFocus}
             onBlur={handleBlur}
             onKeyDown={handleKeyDown}
-            data-orca-botmux-browser-address-bar="true"
+            data-botmux-browser-address-bar="true"
             className="h-auto border-0 bg-transparent px-0 text-sm shadow-none focus-visible:ring-0"
             spellCheck={false}
             autoCapitalize="none"

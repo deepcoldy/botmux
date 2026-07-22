@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { plainClassName, reportUnstyledScrollbars } from './check-styled-scrollbars.mjs'
 
 describe('check-styled-scrollbars', () => {
-  it('reports renderer vertical scroll containers without an OrcaBotmux scrollbar style', () => {
+  it('reports renderer vertical scroll containers without an Botmux scrollbar style', () => {
     const reports = reportUnstyledScrollbars(
       'Example.tsx',
       'export function Example() { return <div className="max-h-64 overflow-y-auto" /> }'
@@ -21,7 +21,7 @@ describe('check-styled-scrollbars', () => {
     expect(reports).toHaveLength(0)
   })
 
-  it('does not accept nonexistent scrollbar classes as OrcaBotmux scrollbar styles', () => {
+  it('does not accept nonexistent scrollbar classes as Botmux scrollbar styles', () => {
     const reports = reportUnstyledScrollbars(
       'Example.tsx',
       'export function Example() { return <div className="max-h-64 overflow-auto scrollbar-none" /> }'
@@ -111,7 +111,7 @@ describe('check-styled-scrollbars', () => {
     expect(reports).toHaveLength(0)
   })
 
-  it('reports inline vertical overflow without an OrcaBotmux scrollbar class', () => {
+  it('reports inline vertical overflow without an Botmux scrollbar class', () => {
     const reports = reportUnstyledScrollbars(
       'Example.tsx',
       "export function Example() { return <div style={{ overflowY: 'auto' }} /> }"
@@ -120,7 +120,7 @@ describe('check-styled-scrollbars', () => {
     expect(reports).toHaveLength(1)
   })
 
-  it('accepts inline vertical overflow with a stable OrcaBotmux scrollbar class', () => {
+  it('accepts inline vertical overflow with a stable Botmux scrollbar class', () => {
     const reports = reportUnstyledScrollbars(
       'Example.tsx',
       'export function Example() { return <div className="scrollbar-editor" style={{ overflow: \'auto\' }} /> }'
@@ -145,7 +145,7 @@ describe('check-styled-scrollbars', () => {
     }
   })
 
-  it('reports logical inline style spreads without an OrcaBotmux scrollbar class', () => {
+  it('reports logical inline style spreads without an Botmux scrollbar class', () => {
     const reports = reportUnstyledScrollbars(
       'Example.tsx',
       "export function Example({ open }) { return <div style={{ ...(open && { overflowY: 'auto' }) }} /> }"

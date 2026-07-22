@@ -8,7 +8,7 @@ import {
   cleanupEphemeralVmRuntime,
   provisionEphemeralVmRuntime
 } from './ephemeral-vm-runtime-service'
-import type { OrcaVmRecipe } from '../shared/types'
+import type { BotmuxVmRecipe } from '../shared/types'
 
 const tempDirs: string[] = []
 
@@ -52,8 +52,8 @@ describe('ephemeral VM runtime service', () => {
   })
 
   it('persists a successful recipe-created runtime and cleans it up', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-service-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-service-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-service-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-service-repo-')
     const startPath = join(repoPath, 'start.js')
     const cleanupPath = join(repoPath, 'cleanup.js')
     writeFileSync(
@@ -63,7 +63,7 @@ describe('ephemeral VM runtime service', () => {
         '  schemaVersion: 1,',
         `  pairingCode: ${JSON.stringify(makePairingCode())},`,
         "  projectRoot: '/workspace/repo',",
-        '  userData: { providerResourceId: process.env.ORCA_VM_INSTANCE_ID }',
+        '  userData: { providerResourceId: process.env.BOTMUX_VM_INSTANCE_ID }',
         '}))'
       ].join('\n')
     )
@@ -80,7 +80,7 @@ describe('ephemeral VM runtime service', () => {
         '})'
       ].join('\n')
     )
-    const recipe: OrcaVmRecipe = {
+    const recipe: BotmuxVmRecipe = {
       id: 'cloud-sandbox',
       name: 'Cloud Sandbox',
       create: nodeCommand(startPath),
@@ -135,8 +135,8 @@ describe('ephemeral VM runtime service', () => {
   })
 
   it('does not persist a runtime when recipe output cannot be parsed', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-service-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-service-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-service-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-service-repo-')
     const startPath = join(repoPath, 'start.js')
     writeFileSync(startPath, "console.log('not json')\n")
 

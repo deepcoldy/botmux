@@ -42,7 +42,7 @@ describe('ensureWindowsUserDataAclGrant', () => {
   let userDataPath: string
 
   beforeEach(() => {
-    userDataPath = mkdtempSync(join(os.tmpdir(), 'orca-botmux-acl-test-'))
+    userDataPath = mkdtempSync(join(os.tmpdir(), 'botmux-acl-test-'))
   })
 
   afterEach(() => {

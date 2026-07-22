@@ -50,8 +50,8 @@ export function AutomationEditorPromptSection({
           .
         </p>
       </Field>
-      {/* Why: the OrcaBotmux/Hermes target toggle changes form height; collapsing the
-          OrcaBotmux-only precheck row keeps the dialog from snapping vertically. */}
+      {/* Why: the Botmux/Hermes target toggle changes form height; collapsing the
+          Botmux-only precheck row keeps the dialog from snapping vertically. */}
       <div
         className={cn(
           'grid overflow-hidden transition-[grid-template-rows] duration-200 ease-out',

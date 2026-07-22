@@ -45,7 +45,7 @@ function PetStatusSegmentInner(): React.JSX.Element {
   const handleImport = async (): Promise<void> => {
     console.log('[pet-overlay] upload: click')
     if (!window.api?.pet?.import) {
-      console.warn('[pet-overlay] upload: window.api.pet.import missing — restart OrcaBotmux')
+      console.warn('[pet-overlay] upload: window.api.pet.import missing — restart Botmux')
       toast.error(
         translate(
           'auto.components.status.bar.PetStatusSegment.e6234bcc17',

@@ -127,7 +127,7 @@ describe('parseArgs', () => {
         {
           path: ['emulator', 'permissions'],
           summary: 'Permissions',
-          usage: 'orca_botmux emulator permissions <op> <package> [permission]',
+          usage: 'botmux emulator permissions <op> <package> [permission]',
           allowedFlags: ['op', 'package', 'permission'],
           positionalArgs: ['op', 'package', 'permission']
         }
@@ -172,13 +172,13 @@ describe('command aliases', () => {
         ['worktree', 'delete']
       ],
       summary: 'Remove a worktree',
-      usage: 'orca_botmux worktree rm --worktree <selector>',
+      usage: 'botmux worktree rm --worktree <selector>',
       allowedFlags: ['worktree', 'force']
     },
     {
       path: ['repo', 'show'],
       summary: 'Show a repo',
-      usage: 'orca_botmux repo show --repo <selector>',
+      usage: 'botmux repo show --repo <selector>',
       allowedFlags: ['repo'],
       positionalArgs: ['repo']
     }
@@ -239,7 +239,7 @@ describe('validateCommandAndFlags', () => {
     {
       path: ['demo'],
       summary: 'Demo command',
-      usage: 'orca_botmux demo',
+      usage: 'botmux demo',
       allowedFlags: []
     }
   ]
@@ -282,7 +282,7 @@ describe('validateCommandAndFlags', () => {
       {
         path: ['worktree', 'rm'],
         summary: 'Remove a worktree',
-        usage: 'orca_botmux worktree rm',
+        usage: 'botmux worktree rm',
         allowedFlags: ['worktree', 'force', 'run-hooks']
       }
     ]
@@ -305,7 +305,7 @@ describe('validateCommandAndFlags', () => {
       {
         path: ['worktree', 'rm'],
         summary: 'Remove a worktree',
-        usage: 'orca_botmux worktree rm',
+        usage: 'botmux worktree rm',
         allowedFlags: []
       }
     ]
@@ -317,7 +317,7 @@ describe('validateCommandAndFlags', () => {
     } catch (error) {
       const data = (error as { data?: { suggestions: string[]; nextSteps: string[] } }).data
       expect(data?.suggestions).toContain('worktree rm')
-      expect(data?.nextSteps[0]).toContain('orca_botmux worktree rm')
+      expect(data?.nextSteps[0]).toContain('botmux worktree rm')
     }
   })
 })

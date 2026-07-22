@@ -10,8 +10,8 @@ export type BrowserPopupEvent = {
   browserPageId: string
   /** Sanitized to origin/host so auth query params never leak into UI state. */
   origin: string
-  /** Whether OrcaBotmux opened the target in OrcaBotmux, opened it externally, or blocked it as unsafe. */
-  action: 'opened-in-orca_botmux' | 'opened-external' | 'blocked'
+  /** Whether Botmux opened the target in Botmux, opened it externally, or blocked it as unsafe. */
+  action: 'opened-in-botmux' | 'opened-external' | 'blocked'
 }
 
 export type BrowserDownloadRequestedEvent = {

@@ -29,7 +29,7 @@ describe('repo header action targets', () => {
   })
 
   it('does not ignore plain header text or the header itself', () => {
-    const header = createHeader('<span id="label">OrcaBotmux</span>')
+    const header = createHeader('<span id="label">Botmux</span>')
 
     expect(isRepoHeaderActionTarget(header.querySelector('#label'), header)).toBe(false)
     expect(isRepoHeaderActionTarget(header, header)).toBe(false)

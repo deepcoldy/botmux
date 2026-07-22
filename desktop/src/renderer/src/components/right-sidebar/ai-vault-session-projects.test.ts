@@ -10,7 +10,7 @@ const baseSession: AiVaultSession = {
   agent: 'claude',
   sessionId: 'session-1',
   title: 'Implement project history',
-  cwd: '/Users/ada/orca_botmux',
+  cwd: '/Users/ada/botmux',
   branch: 'feature/history',
   model: 'claude-sonnet-4-5',
   filePath: '/Users/ada/.claude/projects/session-1.jsonl',
@@ -23,7 +23,7 @@ const baseSession: AiVaultSession = {
   previewMessages: [],
   queuedMessageCount: 0,
   subagentTranscriptCount: 0,
-  resumeCommand: "cd '/Users/ada/orca_botmux' && claude --resume 'session-1'",
+  resumeCommand: "cd '/Users/ada/botmux' && claude --resume 'session-1'",
   subagent: null
 }
 
@@ -37,13 +37,13 @@ describe('toAiVaultProjectKey', () => {
 
 describe('buildAiVaultProjectContext', () => {
   it('uses durable worktree project ids before repo fallback', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'Legacy Repo', path: '/Users/ada/orca_botmux' })
-    const project = makeProject({ id: 'project-1', displayName: 'Canonical OrcaBotmux' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'Legacy Repo', path: '/Users/ada/botmux' })
+    const project = makeProject({ id: 'project-1', displayName: 'Canonical Botmux' })
     const worktree = makeWorktree({
       id: 'wt-1',
       repoId: repo.id,
       projectId: project.id,
-      path: '/Users/ada/orca_botmux'
+      path: '/Users/ada/botmux'
     })
 
     const context = buildAiVaultProjectContext({
@@ -62,24 +62,24 @@ describe('buildAiVaultProjectContext', () => {
     expect(context.sessionProjectById.get(baseSession.id)).toMatchObject({
       kind: 'repo',
       key: 'project:project-1',
-      label: 'Canonical OrcaBotmux'
+      label: 'Canonical Botmux'
     })
   })
 
   it('normalizes compatibility project ids to repo keys', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'orca_botmux', path: '/Users/ada/orca_botmux' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'botmux', path: '/Users/ada/botmux' })
     const worktree = makeWorktree({
       id: 'wt-1',
       repoId: repo.id,
       projectId: 'repo:repo-1',
-      path: '/Users/ada/orca_botmux'
+      path: '/Users/ada/botmux'
     })
 
     const context = buildAiVaultProjectContext({
       repos: [repo],
       worktrees: [worktree],
       projectHostSetupProjection: makeProjection({
-        projects: [makeProject({ id: 'repo:repo-1', displayName: 'Compatibility OrcaBotmux' })],
+        projects: [makeProject({ id: 'repo:repo-1', displayName: 'Compatibility Botmux' })],
         setups: [makeSetup({ repoId: repo.id, projectId: 'repo:repo-1', path: repo.path })]
       }),
       activeRepo: repo,
@@ -89,7 +89,7 @@ describe('buildAiVaultProjectContext', () => {
 
     expect(context.activeProjectKey).toBe('repo:repo-1')
     expect(context.sessionProjectById.get(baseSession.id)?.key).toBe('repo:repo-1')
-    expect(context.projectLabelByKey.get('repo:repo-1')).toBe('orca_botmux')
+    expect(context.projectLabelByKey.get('repo:repo-1')).toBe('botmux')
   })
 
   it('falls back to repo ids for legacy records without project metadata', () => {
@@ -114,23 +114,23 @@ describe('buildAiVaultProjectContext', () => {
   })
 
   it('inherits setup project ids for legacy worktrees without project metadata', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'OrcaBotmux Repo', path: '/repo/orca_botmux' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'Botmux Repo', path: '/repo/botmux' })
     const worktree = makeWorktree({
       id: 'wt-legacy',
       repoId: repo.id,
-      path: '/repo/orca_botmux'
+      path: '/repo/botmux'
     })
-    const session = makeSession({ id: 'claude:legacy-worktree', cwd: '/repo/orca_botmux/src' })
+    const session = makeSession({ id: 'claude:legacy-worktree', cwd: '/repo/botmux/src' })
 
     const context = buildAiVaultProjectContext({
       repos: [repo],
       worktrees: [worktree],
       projectHostSetupProjection: makeProjection({
-        projects: [makeProject({ id: 'github:stablyai/orca_botmux', displayName: 'Canonical OrcaBotmux' })],
+        projects: [makeProject({ id: 'github:stablyai/botmux', displayName: 'Canonical Botmux' })],
         setups: [
           makeSetup({
             repoId: repo.id,
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             path: repo.path
           })
         ]
@@ -140,32 +140,32 @@ describe('buildAiVaultProjectContext', () => {
       sessions: [session]
     })
 
-    expect(context.activeProjectKey).toBe('project:github:stablyai/orca_botmux')
+    expect(context.activeProjectKey).toBe('project:github:stablyai/botmux')
     expect(context.sessionProjectById.get(session.id)).toMatchObject({
       kind: 'repo',
-      key: 'project:github:stablyai/orca_botmux',
-      label: 'Canonical OrcaBotmux'
+      key: 'project:github:stablyai/botmux',
+      label: 'Canonical Botmux'
     })
   })
 
   it('uses active worktree setup project ids when active repo is unavailable', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'OrcaBotmux Repo', path: '/repo/orca_botmux' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'Botmux Repo', path: '/repo/botmux' })
     const worktree = makeWorktree({
       id: 'wt-restored',
       repoId: repo.id,
-      path: '/repo/orca_botmux'
+      path: '/repo/botmux'
     })
-    const session = makeSession({ id: 'claude:restored', cwd: '/repo/orca_botmux/src' })
+    const session = makeSession({ id: 'claude:restored', cwd: '/repo/botmux/src' })
 
     const context = buildAiVaultProjectContext({
       repos: [repo],
       worktrees: [worktree],
       projectHostSetupProjection: makeProjection({
-        projects: [makeProject({ id: 'github:stablyai/orca_botmux', displayName: 'Canonical OrcaBotmux' })],
+        projects: [makeProject({ id: 'github:stablyai/botmux', displayName: 'Canonical Botmux' })],
         setups: [
           makeSetup({
             repoId: repo.id,
-            projectId: 'github:stablyai/orca_botmux',
+            projectId: 'github:stablyai/botmux',
             path: repo.path
           })
         ]
@@ -175,20 +175,20 @@ describe('buildAiVaultProjectContext', () => {
       sessions: [session]
     })
 
-    expect(context.activeProjectKey).toBe('project:github:stablyai/orca_botmux')
-    expect(context.sessionProjectById.get(session.id)?.key).toBe('project:github:stablyai/orca_botmux')
+    expect(context.activeProjectKey).toBe('project:github:stablyai/botmux')
+    expect(context.sessionProjectById.get(session.id)?.key).toBe('project:github:stablyai/botmux')
   })
 
   it('inherits setup host ids for legacy worktrees without host metadata', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'Runtime Repo', path: '/runtime/orca_botmux' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'Runtime Repo', path: '/runtime/botmux' })
     const worktree = makeWorktree({
       id: 'wt-runtime',
       repoId: repo.id,
-      path: '/runtime/orca_botmux'
+      path: '/runtime/botmux'
     })
     const session = makeSession({
       id: 'claude:runtime-worktree',
-      cwd: '/runtime/orca_botmux/src',
+      cwd: '/runtime/botmux/src',
       executionHostId: 'runtime:preview'
     })
 
@@ -301,16 +301,16 @@ describe('buildAiVaultProjectContext', () => {
   })
 
   it('uses the session host when matching overlapping local and SSH project paths', () => {
-    const localRepo = makeRepo({ id: 'local', displayName: 'Local', path: '/srv/orca_botmux' })
+    const localRepo = makeRepo({ id: 'local', displayName: 'Local', path: '/srv/botmux' })
     const sshRepo = makeRepo({
       id: 'ssh',
       displayName: 'SSH',
-      path: '/srv/orca_botmux',
+      path: '/srv/botmux',
       connectionId: 'target-1'
     })
     const session = makeSession({
       id: 'claude:ssh-session',
-      cwd: '/srv/orca_botmux/src',
+      cwd: '/srv/botmux/src',
       executionHostId: 'ssh:target-1'
     })
 
@@ -344,11 +344,11 @@ describe('buildAiVaultProjectContext', () => {
   })
 
   it('falls back to folder when a legacy hostless session matches multiple host buckets', () => {
-    const localRepo = makeRepo({ id: 'local', displayName: 'Local', path: '/srv/orca_botmux' })
-    const runtimeRepo = makeRepo({ id: 'runtime', displayName: 'Runtime', path: '/srv/orca_botmux' })
+    const localRepo = makeRepo({ id: 'local', displayName: 'Local', path: '/srv/botmux' })
+    const runtimeRepo = makeRepo({ id: 'runtime', displayName: 'Runtime', path: '/srv/botmux' })
     const session = makeSession({
       id: 'claude:runtime-ambiguous',
-      cwd: '/srv/orca_botmux/src',
+      cwd: '/srv/botmux/src',
       executionHostId: undefined as unknown as AiVaultSession['executionHostId']
     })
 
@@ -374,8 +374,8 @@ describe('buildAiVaultProjectContext', () => {
 
     expect(context.sessionProjectById.get(session.id)).toMatchObject({
       kind: 'folder',
-      key: 'folder:/srv/orca_botmux/src',
-      label: 'orca_botmux/src'
+      key: 'folder:/srv/botmux/src',
+      label: 'botmux/src'
     })
   })
 
@@ -426,7 +426,7 @@ describe('buildAiVaultProjectContext', () => {
   })
 
   it('maps null cwd sessions to unknown', () => {
-    const repo = makeRepo({ id: 'repo-1', displayName: 'orca_botmux', path: '/repo' })
+    const repo = makeRepo({ id: 'repo-1', displayName: 'botmux', path: '/repo' })
     const session = makeSession({ id: 'claude:unknown', cwd: null })
 
     const context = buildAiVaultProjectContext({
@@ -453,8 +453,8 @@ function makeSession(overrides: Partial<AiVaultSession>): AiVaultSession {
 function makeRepo(overrides: Partial<Repo>): Repo {
   return {
     id: 'repo-1',
-    path: '/Users/ada/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/Users/ada/botmux',
+    displayName: 'botmux',
     badgeColor: '#737373',
     addedAt: 1,
     ...overrides
@@ -479,8 +479,8 @@ function makeSetup(overrides: Partial<ProjectHostSetup>): ProjectHostSetup {
     projectId: 'project-1',
     hostId: 'local',
     repoId: 'repo-1',
-    path: '/Users/ada/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/Users/ada/botmux',
+    displayName: 'botmux',
     setupState: 'ready',
     setupMethod: 'legacy-repo',
     createdAt: 1,
@@ -503,7 +503,7 @@ function makeWorktree(overrides: Partial<Worktree>): Worktree {
     isPinned: false,
     sortOrder: 0,
     lastActivityAt: 1,
-    path: '/Users/ada/orca_botmux',
+    path: '/Users/ada/botmux',
     head: 'abc123',
     branch: 'main',
     isBare: false,

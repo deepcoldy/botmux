@@ -190,7 +190,7 @@ describe('detectAgentStatusFromTitle', () => {
 
   // --- Cursor (cursor-agent) synthesized titles ---
   // Why: cursor-agent's native OSC title stays literally "Cursor Agent" for
-  // the entire turn, so OrcaBotmux synthesizes decorated titles from hook events
+  // the entire turn, so Botmux synthesizes decorated titles from hook events
   // to drive the existing spinner/unread pipeline. These tests pin the
   // contract the main-process hook listener relies on.
   it('treats the bare "Cursor Agent" native title as a no-op (not idle)', () => {
@@ -476,7 +476,7 @@ describe('getAgentLabel', () => {
 
   it('treats Claude Code prefixed task titles as Claude even when they mention another CLI', () => {
     expect(getAgentLabel('✳ Gemini CLI')).toBe('Claude Code')
-    expect(getAgentLabel('. Compare Opencode Vs OrcaBotmux')).toBe('Claude Code')
+    expect(getAgentLabel('. Compare Opencode Vs Botmux')).toBe('Claude Code')
     expect(getAgentLabel('* Review Codex behavior')).toBe('Claude Code')
   })
 
@@ -544,7 +544,7 @@ describe('getAgentLabel', () => {
     expect(getAgentLabel('Cursor - action required')).toBe('Cursor')
     expect(getAgentLabel('⠋ preserve cursor visibility across replays')).toBe('Claude Code')
     expect(getAgentLabel('⠋ Codex: fix cursor offsets')).toBe('Codex')
-    expect(getAgentLabel('Terminal Cursor and OrcaBotmux slows down')).toBeNull()
+    expect(getAgentLabel('Terminal Cursor and Botmux slows down')).toBeNull()
   })
 })
 

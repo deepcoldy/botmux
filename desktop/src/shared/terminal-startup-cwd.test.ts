@@ -101,9 +101,9 @@ describe('resolveTerminalStartupCwd', () => {
   it('falls back to a non-ASCII workspace root for a missing cwd (#7239)', () => {
     // Why: issue #7239 reproduced in a Japanese-named worktree; the fallback
     // must preserve the selected worktree path verbatim.
-    const worktreePath = '/Users/motoki/orca_botmux/workspaces/nakamuramotoki/Fableと議論'
+    const worktreePath = '/Users/motoki/botmux/workspaces/nakamuramotoki/Fableと議論'
     expect(
-      resolveTerminalStartupCwd(worktreePath, '/var/tmp/orca-botmux-stale', {
+      resolveTerminalStartupCwd(worktreePath, '/var/tmp/botmux-stale', {
         directoryExists: (path) => path === worktreePath
       })
     ).toBe(worktreePath)
@@ -200,27 +200,27 @@ describe('resolveTerminalStartupCwd', () => {
     expect(directoryExists).not.toHaveBeenCalled()
   })
 
-  it('uses requested cwd for orca_botmux agent/session hosts without splitting on ::', () => {
+  it('uses requested cwd for botmux agent/session hosts without splitting on ::', () => {
     const directoryExists = vi.fn(() => false)
     // Legacy :: agent id must not invent path from agent key segment
     expect(
       resolveTerminalStartupCwdForWorkspace({
         workspaceId:
-          'orca_botmux:agent:ssh%3Assh-d2::claude-code%3A%3Arelay-loopy(d2)',
+          'botmux:agent:ssh%3Assh-d2::claude-code%3A%3Arelay-loopy(d2)',
         requestedCwd: '.',
         missingDirFallback: { directoryExists }
       })
     ).toBe('.')
     expect(
       resolveTerminalStartupCwdForWorkspace({
-        workspaceId: 'orca_botmux:agent:ssh%3Assh-d2~~claude-code%3A%3Arelay',
+        workspaceId: 'botmux:agent:ssh%3Assh-d2~~claude-code%3A%3Arelay',
         requestedCwd: '.',
         missingDirFallback: { directoryExists }
       })
     ).toBe('.')
     expect(
       resolveTerminalStartupCwdForWorkspace({
-        workspaceId: 'orca_botmux:session:bfbe5372-351b-4835-aa0b-0c4d80ba6061',
+        workspaceId: 'botmux:session:bfbe5372-351b-4835-aa0b-0c4d80ba6061',
         requestedCwd: '.',
         missingDirFallback: { directoryExists }
       })

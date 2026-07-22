@@ -29,12 +29,12 @@ function shouldIgnoreRemoteSelection(commandPath: string[]): boolean {
   )
 }
 
-// Why: the SSH relay bridge executes this CLI on the OrcaBotmux host while the
+// Why: the SSH relay bridge executes this CLI on the Botmux host while the
 // caller's shell cwd lives on the remote machine (which cannot be chdir'd
-// into). ORCA_CLI_CWD carries that remote cwd so cwd-based selectors like
+// into). BOTMUX_CLI_CWD carries that remote cwd so cwd-based selectors like
 // `--worktree active` resolve against the caller's directory.
 function resolveInvocationCwd(): string {
-  const override = process.env.ORCA_CLI_CWD
+  const override = process.env.BOTMUX_CLI_CWD
   return typeof override === 'string' && override.length > 0 ? override : process.cwd()
 }
 
@@ -71,7 +71,7 @@ export async function main(
 
   try {
     // Why: CLI syntax and flag errors should be reported before any runtime
-    // lookup so users do not get misleading "OrcaBotmux is not running" failures for
+    // lookup so users do not get misleading "Botmux is not running" failures for
     // simple command typos or unsupported flags.
     validateCommandAndFlags(COMMAND_SPECS, parsed)
     const ignoreRemoteSelection = shouldIgnoreRemoteSelection(parsed.commandPath)
@@ -79,7 +79,7 @@ export async function main(
     const environmentSelector = ignoreRemoteSelection ? null : parsed.flags.get('environment')
     // Why: pass `null` (not `undefined`) when remote selection is suppressed
     // so the RuntimeClient default parameter does not re-activate the
-    // ORCA_PAIRING_CODE / ORCA_ENVIRONMENT env-var fallback for commands
+    // BOTMUX_PAIRING_CODE / BOTMUX_ENVIRONMENT env-var fallback for commands
     // that must run locally (environment / serve).
     let client: RuntimeClient | undefined
     await dispatch(parsed.commandPath, {
@@ -109,8 +109,8 @@ export async function main(
 
 async function runClaudeTeams(argv: string[], cwd: string): Promise<void> {
   try {
-    // Why: everything after `orca_botmux claude-teams` belongs to Claude Code, not
-    // OrcaBotmux's own flag parser, so new Claude flags work without OrcaBotmux changes.
+    // Why: everything after `botmux claude-teams` belongs to Claude Code, not
+    // Botmux's own flag parser, so new Claude flags work without Botmux changes.
     const client = new RuntimeClient(undefined, undefined, null, null)
     await dispatch(['claude-teams'], {
       flags: new Map(),
@@ -133,8 +133,8 @@ async function runAgentTeamsTmuxShim(argv: string[]): Promise<void> {
     }>(
       'agentTeams.tmuxCompat',
       {
-        teamId: process.env.ORCA_AGENT_TEAMS_TEAM_ID,
-        token: process.env.ORCA_AGENT_TEAMS_TOKEN,
+        teamId: process.env.BOTMUX_AGENT_TEAMS_TEAM_ID,
+        token: process.env.BOTMUX_AGENT_TEAMS_TOKEN,
         envPane: process.env.TMUX_PANE,
         cwd: process.cwd(),
         argv

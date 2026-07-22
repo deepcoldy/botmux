@@ -6,7 +6,7 @@ export function paneEnv(team: AgentTeam, fakePaneId: string): Record<string, str
   return {
     ...team.baseEnv,
     TMUX_PANE: fakePaneId,
-    ORCA_AGENT_TEAMS_LEADER_PANE: team.leaderPane
+    BOTMUX_AGENT_TEAMS_LEADER_PANE: team.leaderPane
   }
 }
 
@@ -21,7 +21,7 @@ export function resolveSplitTarget(
       direction: 'horizontal'
     }
   }
-  // Why: tmux `split-window -h` means left/right panes; OrcaBotmux names that
+  // Why: tmux `split-window -h` means left/right panes; Botmux names that
   // layout by the vertical divider it creates.
   return { pane: targetPane, direction: horizontal ? 'vertical' : 'horizontal' }
 }

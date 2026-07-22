@@ -49,7 +49,7 @@ describe('resolveExplicitTerminalTitleAgentType', () => {
   it('treats Claude generic status prefixes as activity-only, not identity', () => {
     expect(resolveExplicitTerminalTitleAgentType('✳ investigating startup')).toBeNull()
     expect(resolveExplicitTerminalTitleAgentType('⠸ investigating startup')).toBeNull()
-    expect(resolveExplicitTerminalTitleAgentType('. Compare Opencode Vs OrcaBotmux')).toBeNull()
+    expect(resolveExplicitTerminalTitleAgentType('. Compare Opencode Vs Botmux')).toBeNull()
     expect(resolveExplicitTerminalTitleAgentType('* Review Codex behavior')).toBeNull()
   })
 

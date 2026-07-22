@@ -53,7 +53,7 @@ export const COMPUTER_HANDLERS: Record<string, CommandHandler> = {
         return 'Computer-use permission setup is only required on macOS.'
       }
       const firstLine = value.launchedHelper
-        ? 'Opened OrcaBotmux Computer Use permission setup.'
+        ? 'Opened Botmux Computer Use permission setup.'
         : 'Computer Use permissions checked.'
       return [
         firstLine,
@@ -63,7 +63,7 @@ export const COMPUTER_HANDLERS: Record<string, CommandHandler> = {
           ? `Next: ${value.nextStep}`
           : 'Computer Use permissions are already granted.',
         value.launchedHelper
-          ? 'Use the Allow buttons or drag "OrcaBotmux Computer Use" into the macOS permission list.'
+          ? 'Use the Allow buttons or drag "Botmux Computer Use" into the macOS permission list.'
           : null
       ]
         .filter((line) => line !== null)

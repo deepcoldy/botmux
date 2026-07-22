@@ -15,8 +15,8 @@
 //   DO_NOT_TRACK=1            → disable bundle button. KEEP local file.
 //                                Local file writes never leave the machine,
 //                                so they are not "tracking" in the DNT sense.
-//   ORCA_TELEMETRY_DISABLED=1 → identical to DO_NOT_TRACK for this lane.
-//   ORCA_DIAGNOSTICS_DISABLED=1 → ALSO disable local file writes. The escape
+//   BOTMUX_TELEMETRY_DISABLED=1 → identical to DO_NOT_TRACK for this lane.
+//   BOTMUX_DIAGNOSTICS_DISABLED=1 → ALSO disable local file writes. The escape
 //                                hatch for users on devices where even local
 //                                debug logs are policy-forbidden.
 //   CI detection              → disable everything in this lane.
@@ -69,8 +69,8 @@ export type ObservabilityConsent = {
   /** Reason any of the lanes are disabled, for debug surfaces. */
   readonly disabledReason?:
     | 'do_not_track'
-    | 'orca_botmux_telemetry_disabled'
-    | 'orca_botmux_diagnostics_disabled'
+    | 'botmux_telemetry_disabled'
+    | 'botmux_diagnostics_disabled'
     | 'ci'
 }
 
@@ -93,8 +93,8 @@ export function resolveObservabilityConsent(): ObservabilityConsent {
   // CI and DNT/disabled have different effects on which sub-lanes are gated.
   // Keep the ordering aligned with §Consent boundaries above.
   const dnt = envOn('DO_NOT_TRACK')
-  const orcaDisabled = envOn('ORCA_TELEMETRY_DISABLED')
-  const diagnosticsDisabled = envOn('ORCA_DIAGNOSTICS_DISABLED')
+  const botmuxDisabled = envOn('BOTMUX_TELEMETRY_DISABLED')
+  const diagnosticsDisabled = envOn('BOTMUX_DIAGNOSTICS_DISABLED')
   const ci = inCI()
 
   if (ci) {
@@ -108,16 +108,16 @@ export function resolveObservabilityConsent(): ObservabilityConsent {
     return {
       localFileEnabled: false,
       bundleEnabled: false,
-      disabledReason: 'orca_botmux_diagnostics_disabled'
+      disabledReason: 'botmux_diagnostics_disabled'
     }
   }
-  if (dnt || orcaDisabled) {
+  if (dnt || botmuxDisabled) {
     // Local file remains active — DNT is a *network* signal, and the local
     // file never leaves the machine.
     return {
       localFileEnabled: true,
       bundleEnabled: false,
-      disabledReason: dnt ? 'do_not_track' : 'orca_botmux_telemetry_disabled'
+      disabledReason: dnt ? 'do_not_track' : 'botmux_telemetry_disabled'
     }
   }
 
@@ -148,7 +148,7 @@ export function initObservability(): ObservabilityConsent {
   const c = resolveObservabilityConsent()
   consent = c
   if (!c.localFileEnabled) {
-    // Disabled at the CI / ORCA_DIAGNOSTICS_DISABLED level — leave the
+    // Disabled at the CI / BOTMUX_DIAGNOSTICS_DISABLED level — leave the
     // tracer's active sink unset, so all spans are no-ops.
     return c
   }
@@ -195,14 +195,14 @@ export function getDiagnosticsStatus(): DiagnosticsStatus {
 }
 
 /** Collect a bundle from the live trace folder. The `appVersion` /
- *  `platform` / `arch` / `osRelease` / `orcaChannel` inputs come from main
+ *  `platform` / `arch` / `osRelease` / `botmuxChannel` inputs come from main
  *  and are baked into the bundle header. NEVER pass `install_id` here —
  *  the bundle's identity is the per-bundle submission ID, not the
  *  PostHog-lane install_id (Issue 8 in the security review). */
 export function collectDiagnosticBundle(
   meta: Pick<
     CollectBundleOptions,
-    'appVersion' | 'platform' | 'arch' | 'osRelease' | 'orcaChannel' | 'lookbackMinutes'
+    'appVersion' | 'platform' | 'arch' | 'osRelease' | 'botmuxChannel' | 'lookbackMinutes'
   >
 ): CollectedBundle {
   // Flush the active sink first so the very latest spans are present in the

@@ -37,7 +37,7 @@ import {
   getPtyIdsForConnection,
   getSshPtyProvider
 } from './pty'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 
 let sshStore: SshConnectionStore | null = null
 let connectionManager: SshConnectionManager | null = null
@@ -48,7 +48,7 @@ let persistedStore: Store | null = null
 let advertisedUrlWatcherUnsubscribe: (() => void) | null = null
 let powerMonitorUnsubscribe: (() => void) | null = null
 let currentGetMainWindow: () => BrowserWindow | null = () => null
-let currentRuntime: OrcaRuntimeService | undefined
+let currentRuntime: BotmuxRuntimeService | undefined
 
 const SSH_IPC_CHANNELS = [
   'ssh:listTargets',
@@ -285,8 +285,54 @@ function connectionSupportsFolderDownload(targetId: string): boolean {
 }
 
 function getPublicSshState(targetId: string): SshConnectionState | undefined {
-  const state = relayStateOverrides.get(targetId) ?? connectionManager!.getState(targetId)
-  return state ? withSshRemotePlatform(targetId, state) : undefined
+  const override = relayStateOverrides.get(targetId)
+  if (override) {
+    return withSshRemotePlatform(targetId, override)
+  }
+
+  const state = connectionManager!.getState(targetId)
+  if (!state) {
+    return undefined
+  }
+
+  // Why: connectionManager tracks the SSH TCP socket. Explorer / Source Control
+  // need relay-backed FS/git providers, which only exist while the session is
+  // ready. Reporting TCP-connected as "connected" makes ensureSshTargetConnected
+  // skip reconnect while readDir/git.status fail with "Remote connection dropped".
+  if (state.status === 'connected') {
+    const sessionState = activeSessions.get(targetId)?.getState()
+    if (sessionState === 'ready') {
+      return withSshRemotePlatform(targetId, {
+        ...state,
+        supportsFolderDownload: connectionSupportsFolderDownload(targetId)
+      })
+    }
+    if (sessionState === 'deploying') {
+      return withSshRemotePlatform(targetId, {
+        targetId,
+        status: 'deploying-relay',
+        error: null,
+        reconnectAttempt: state.reconnectAttempt
+      })
+    }
+    if (sessionState === 'reconnecting') {
+      return withSshRemotePlatform(targetId, {
+        targetId,
+        status: 'reconnecting',
+        error: state.error ?? 'Relay channel reconnecting...',
+        reconnectAttempt: state.reconnectAttempt
+      })
+    }
+    // TCP up but no usable relay (idle / disposed / missing session).
+    return withSshRemotePlatform(targetId, {
+      targetId,
+      status: 'disconnected',
+      error: null,
+      reconnectAttempt: 0
+    })
+  }
+
+  return withSshRemotePlatform(targetId, state)
 }
 
 function broadcastPortForwards(getMainWindow: () => BrowserWindow | null, targetId: string): void {
@@ -548,6 +594,28 @@ function createSshConnectionCallbacks(): SshConnectionCallbacks {
           'Relay channel reconnecting...',
           state.reconnectAttempt
         )
+      } else if (state.status === 'connected' && session && sessionState !== 'ready') {
+        // Why: TCP can report connected while establish() is still deploying,
+        // or after providers were torn down. Never push a false "connected"
+        // that unblocks Explorer/SC before the relay FS/git stack is ready.
+        clearRelayStateOverride(targetId)
+        if (sessionState === 'deploying') {
+          broadcastSshState(getCurrentMainWindow, targetId, {
+            targetId,
+            status: 'deploying-relay',
+            error: null,
+            reconnectAttempt: state.reconnectAttempt
+          })
+        } else if (sessionState === 'reconnecting') {
+          broadcastSshState(getCurrentMainWindow, targetId, {
+            targetId,
+            status: 'reconnecting',
+            error: state.error ?? 'Relay channel reconnecting...',
+            reconnectAttempt: state.reconnectAttempt
+          })
+        }
+        // idle / disposed: wait for doConnect / reconnect to publish the
+        // next real status (deploying-relay / connected / error).
       } else {
         clearRelayStateOverride(targetId)
         broadcastSshState(getCurrentMainWindow, targetId, state)
@@ -707,7 +775,7 @@ function refreshActiveRelaySessions(): void {
 export function registerSshHandlers(
   store: Store,
   getMainWindow: () => BrowserWindow | null,
-  runtime?: OrcaRuntimeService
+  runtime?: BotmuxRuntimeService
 ): { connectionManager: SshConnectionManager; sshStore: SshConnectionStore } {
   // Why: on macOS, app re-activation creates a new BrowserWindow and re-calls
   // this function. ipcMain.handle() throws if a handler is already registered,
@@ -1322,11 +1390,11 @@ export function getActiveMultiplexer(connectionId: string): SshChannelMultiplexe
 }
 
 /**
- * Prefer an existing OrcaBotmux SSH connection's port-forward manager for orca_botmux
+ * Prefer an existing Botmux SSH connection's port-forward manager for botmux
  * dashboard tunnels (instead of spawning a second system `ssh -L`).
  * Returns null when the target is not connected so callers can fall back.
  */
-export async function openOrcaBotmuxDashboardPortForwardOnConnectedSsh(args: {
+export async function openBotmuxDashboardPortForwardOnConnectedSsh(args: {
   targetId: string
   remotePort: number
   localPort: number
@@ -1358,7 +1426,7 @@ export async function openOrcaBotmuxDashboardPortForwardOnConnectedSsh(args: {
       (f) =>
         f.remoteHost === '127.0.0.1' &&
         f.remotePort === args.remotePort &&
-        (f.label?.includes('orca-botmux-dashboard') || f.label?.includes('OrcaBotmux dashboard'))
+        (f.label?.includes('botmux-dashboard') || f.label?.includes('Botmux dashboard'))
     )
   if (existing) {
     return {
@@ -1376,7 +1444,7 @@ export async function openOrcaBotmuxDashboardPortForwardOnConnectedSsh(args: {
       args.localPort,
       '127.0.0.1',
       args.remotePort,
-      args.label ?? 'OrcaBotmux dashboard'
+      args.label ?? 'Botmux dashboard'
     )
     persistPortForwards(args.targetId)
     broadcastPortForwards(currentGetMainWindow, args.targetId)

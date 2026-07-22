@@ -54,7 +54,7 @@ function makeDetectedResult(
     ...overrides,
     worktrees: worktrees.map((worktree) => ({
       ...worktree,
-      ownership: 'orca-botmux-managed' as const,
+      ownership: 'botmux-managed' as const,
       selectedCheckout: false,
       visible: true
     }))
@@ -130,7 +130,7 @@ function createTestStore() {
         // Why: this test isolates the worktree slice, so it only provides the
         // state surface that `createWorktreeSlice` reads and writes.
         ...createWorktreeSlice(...a),
-        trustedOrcaHooks: {},
+        trustedBotmuxHooks: {},
         repos: [],
         projectHostSetups: [],
         deleteProjectHostSetup: vi.fn().mockResolvedValue(null),
@@ -739,7 +739,7 @@ describe('fetchWorktrees', () => {
     const sshWorktree = makeWorktree({
       id: 'repo1::/ssh/wt1',
       repoId: 'repo1',
-      path: '/home/orca_botmux/wt1'
+      path: '/home/botmux/wt1'
     })
     let releaseLocal!: () => void
     let releaseSsh!: () => void
@@ -778,7 +778,7 @@ describe('fetchWorktrees', () => {
         },
         {
           id: 'repo1',
-          path: '/home/orca_botmux/repo1',
+          path: '/home/botmux/repo1',
           displayName: 'Repo One SSH',
           badgeColor: '#000',
           addedAt: 0,
@@ -806,9 +806,9 @@ describe('fetchWorktrees', () => {
   it('preserves SSH host identity when detected and visible refreshes overlap', async () => {
     const store = createTestStore()
     const sshWorktree = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/wt1',
+      id: 'repo-ssh::/home/botmux/wt1',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/wt1'
+      path: '/home/botmux/wt1'
     })
     let releaseScan!: () => void
     const scanStarted = new Promise<void>((resolve) => {
@@ -827,7 +827,7 @@ describe('fetchWorktrees', () => {
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -858,9 +858,9 @@ describe('fetchWorktrees', () => {
   it('preserves SSH host identity when visible refresh starts before detected refresh', async () => {
     const store = createTestStore()
     const sshWorktree = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/wt1',
+      id: 'repo-ssh::/home/botmux/wt1',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/wt1'
+      path: '/home/botmux/wt1'
     })
     let releaseScan!: () => void
     const scanStarted = new Promise<void>((resolve) => {
@@ -879,7 +879,7 @@ describe('fetchWorktrees', () => {
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -1230,9 +1230,9 @@ describe('fetchWorktrees', () => {
   it('fetches SSH repo worktrees through local IPC even when a runtime is focused', async () => {
     const store = createTestStore()
     const sshWorktree = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/wt1',
+      id: 'repo-ssh::/home/botmux/wt1',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/wt1',
+      path: '/home/botmux/wt1',
       branch: 'refs/heads/ssh'
     })
     store.setState({
@@ -1240,7 +1240,7 @@ describe('fetchWorktrees', () => {
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -1303,9 +1303,9 @@ describe('fetchWorktrees', () => {
   it('stamps runtime worktrees with the owning project host setup', async () => {
     const store = createTestStore()
     const remote = makeWorktree({
-      id: 'repo-remote::/vercel/sandbox/orca_botmux',
+      id: 'repo-remote::/vercel/sandbox/botmux',
       repoId: 'repo-remote',
-      path: '/vercel/sandbox/orca_botmux',
+      path: '/vercel/sandbox/botmux',
       branch: 'refs/heads/Jinwoo-H/vm-improve-2',
       hostId: 'local'
     })
@@ -1313,8 +1313,8 @@ describe('fetchWorktrees', () => {
       repos: [
         {
           id: 'repo-remote',
-          path: '/vercel/sandbox/orca_botmux',
-          displayName: 'orca_botmux',
+          path: '/vercel/sandbox/botmux',
+          displayName: 'botmux',
           badgeColor: '#000',
           addedAt: 0,
           executionHostId: 'runtime:env-1'
@@ -1323,11 +1323,11 @@ describe('fetchWorktrees', () => {
       projectHostSetups: [
         {
           id: 'repo-remote',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'runtime:env-1',
           repoId: 'repo-remote',
-          path: '/vercel/sandbox/orca_botmux',
-          displayName: 'orca_botmux',
+          path: '/vercel/sandbox/botmux',
+          displayName: 'botmux',
           setupState: 'ready',
           setupMethod: 'imported-existing-folder',
           createdAt: 1,
@@ -1348,7 +1348,7 @@ describe('fetchWorktrees', () => {
       {
         ...remote,
         hostId: 'runtime:env-1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         projectHostSetupId: 'repo-remote'
       }
     ])
@@ -1356,7 +1356,7 @@ describe('fetchWorktrees', () => {
       expect.objectContaining({
         id: remote.id,
         hostId: 'runtime:env-1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         projectHostSetupId: 'repo-remote'
       })
     ])
@@ -1399,7 +1399,7 @@ describe('fetchWorktrees', () => {
       repoId: 'repo1',
       authoritative: true,
       source: 'session-fallback',
-      worktrees: [{ id: remote.id, ownership: 'orca-botmux-managed', visible: true }]
+      worktrees: [{ id: remote.id, ownership: 'botmux-managed', visible: true }]
     })
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
@@ -3497,7 +3497,7 @@ describe('removeWorktree state cleanup', () => {
     const wt = makeWorktree({ id: 'repo1::/path/wt1', repoId: 'repo1', path: '/path/wt1' })
     const orphanedSetup = {
       id: 'setup-runtime-ssh',
-      hostId: 'ssh:runtime-ssh-orca-botmux-1'
+      hostId: 'ssh:runtime-ssh-botmux-1'
     } as unknown as AppState['projectHostSetups'][number]
     const userSshSetup = {
       id: 'setup-user-ssh',
@@ -3514,7 +3514,7 @@ describe('removeWorktree state cleanup', () => {
         id: 'runtime-1',
         workspaceId: 'repo1::/path/wt1',
         cleanupStatus: 'not_started',
-        sshTargetId: 'runtime-ssh-orca-botmux-1'
+        sshTargetId: 'runtime-ssh-botmux-1'
       }
     ])
 
@@ -3705,7 +3705,7 @@ describe('removeWorktree state cleanup', () => {
 
     const sidebar = new EventTarget()
     let worktreePresentWhenRecorded: boolean | null = null
-    sidebar.addEventListener('orca-botmux-record-virtualized-scroll-anchor', () => {
+    sidebar.addEventListener('botmux-record-virtualized-scroll-anchor', () => {
       worktreePresentWhenRecorded =
         store.getState().worktreesByRepo.repo1?.some((w) => w.id === wt.id) ?? false
     })
@@ -4072,11 +4072,11 @@ describe('worktree remote runtime mutations', () => {
         undefined,
         {
           command: "codex 'summarize repo'",
-          env: { ORCA_AGENT_MODE: 'direct' },
+          env: { BOTMUX_AGENT_MODE: 'direct' },
           launchConfig: {
             agentCommand: 'codex',
             agentArgs: '--model gpt-5',
-            agentEnv: { ORCA_AGENT_MODE: 'direct' }
+            agentEnv: { BOTMUX_AGENT_MODE: 'direct' }
           }
         }
       )
@@ -4092,11 +4092,11 @@ describe('worktree remote runtime mutations', () => {
           displayName: 'Launch agent',
           createdWithAgent: 'codex',
           startupCommand: "codex 'summarize repo'",
-          startupEnv: { ORCA_AGENT_MODE: 'direct' },
+          startupEnv: { BOTMUX_AGENT_MODE: 'direct' },
           startupLaunchConfig: {
             agentCommand: 'codex',
             agentArgs: '--model gpt-5',
-            agentEnv: { ORCA_AGENT_MODE: 'direct' }
+            agentEnv: { BOTMUX_AGENT_MODE: 'direct' }
           },
           activate: true
         })
@@ -4140,7 +4140,7 @@ describe('worktree remote runtime mutations', () => {
         undefined,
         {
           command: "claude --prefill 'summarize repo'",
-          env: { ORCA_AGENT_MODE: 'direct' },
+          env: { BOTMUX_AGENT_MODE: 'direct' },
           telemetry: {
             agent_kind: 'claude-code',
             launch_source: 'new_workspace_composer',
@@ -4159,7 +4159,7 @@ describe('worktree remote runtime mutations', () => {
         createdWithAgent: 'claude',
         startup: {
           command: "claude --prefill 'summarize repo'",
-          env: { ORCA_AGENT_MODE: 'direct' },
+          env: { BOTMUX_AGENT_MODE: 'direct' },
           telemetry: {
             agent_kind: 'claude-code',
             launch_source: 'new_workspace_composer',
@@ -4260,16 +4260,16 @@ describe('worktree remote runtime mutations', () => {
   it('removes SSH-owned worktrees through local IPC even when a runtime is focused', async () => {
     const store = createTestStore()
     const wt = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/wt1',
+      id: 'repo-ssh::/home/botmux/wt1',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/wt1'
+      path: '/home/botmux/wt1'
     })
     store.setState({
       settings: { activeRuntimeEnvironmentId: 'env-1' } as never,
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -4354,16 +4354,16 @@ describe('worktree remote runtime mutations', () => {
   it('persists SSH-owned worktree metadata through local IPC even when a runtime is focused', async () => {
     const store = createTestStore()
     const wt = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/wt1',
+      id: 'repo-ssh::/home/botmux/wt1',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/wt1'
+      path: '/home/botmux/wt1'
     })
     store.setState({
       settings: { activeRuntimeEnvironmentId: 'env-1' } as never,
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -4747,7 +4747,7 @@ describe('worktree remote runtime mutations', () => {
   it('hydrates a missing push target for an existing linked GitHub PR', async () => {
     const store = createTestStore()
     const pushTarget = {
-      remoteName: 'pr-tmchow-orca_botmux',
+      remoteName: 'pr-tmchow-botmux',
       branchName: 'tmchow/worktree-delete-button'
     }
     const wt = makeWorktree({
@@ -4895,9 +4895,9 @@ describe('worktree remote runtime mutations', () => {
     const store = createTestStore()
     const pushTarget = { remoteName: 'fork', branchName: 'feature/ssh-pr' }
     const wt = makeWorktree({
-      id: 'repo-ssh::/home/orca_botmux/runtime-wt',
+      id: 'repo-ssh::/home/botmux/runtime-wt',
       repoId: 'repo-ssh',
-      path: '/home/orca_botmux/runtime-wt',
+      path: '/home/botmux/runtime-wt',
       linkedPR: 5571
     })
     mockApi.worktrees.resolvePrBase.mockResolvedValueOnce({
@@ -4909,7 +4909,7 @@ describe('worktree remote runtime mutations', () => {
       repos: [
         {
           id: 'repo-ssh',
-          path: '/home/orca_botmux/repo',
+          path: '/home/botmux/repo',
           displayName: 'SSH Repo',
           badgeColor: '#000',
           addedAt: 0,
@@ -5023,32 +5023,32 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link',
       pushTarget: {
         remoteName: 'origin',
         branchName: 'feature/pr-link',
-        remoteUrl: 'https://github.com/acme/orca_botmux.git'
+        remoteUrl: 'https://github.com/acme/botmux.git'
       }
     })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
     } as unknown as Partial<AppState>)
 
     store.getState().observeTerminalGitHubPullRequestLink(wt.id, {
-      url: 'https://github.com/acme/orca_botmux/pull/42',
-      slug: { owner: 'acme', repo: 'orca_botmux' },
+      url: 'https://github.com/acme/botmux/pull/42',
+      slug: { owner: 'acme', repo: 'botmux' },
       number: 42
     })
 
     expect(store.getState().worktreesByRepo.repo1[0]?.linkedPR).toBeNull()
     expect(mockApi.worktrees.resolvePrBase).not.toHaveBeenCalled()
     expect(mockApi.worktrees.updateMeta).not.toHaveBeenCalled()
-    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/orca_botmux', 'feature/pr-link', {
+    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/botmux', 'feature/pr-link', {
       force: true,
       repoId: 'repo1',
       worktreeId: wt.id,
@@ -5072,7 +5072,7 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link',
       pushTarget: {
         remoteName: 'origin',
@@ -5081,20 +5081,20 @@ describe('worktree remote runtime mutations', () => {
     })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
     } as unknown as Partial<AppState>)
 
     store.getState().observeTerminalGitHubPullRequestLink(wt.id, {
-      url: 'https://github.com/acme/orca_botmux/pull/42',
-      slug: { owner: 'acme', repo: 'orca_botmux' },
+      url: 'https://github.com/acme/botmux/pull/42',
+      slug: { owner: 'acme', repo: 'botmux' },
       number: 42
     })
 
     expect(store.getState().worktreesByRepo.repo1[0]?.linkedPR).toBeNull()
-    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/orca_botmux', 'feature/pr-link', {
+    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/botmux', 'feature/pr-link', {
       force: true,
       repoId: 'repo1',
       worktreeId: wt.id,
@@ -5124,7 +5124,7 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link',
       pushTarget: {
         remoteName: 'origin',
@@ -5133,15 +5133,15 @@ describe('worktree remote runtime mutations', () => {
     })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
     } as unknown as Partial<AppState>)
 
     store.getState().observeTerminalGitHubPullRequestLink(wt.id, {
-      url: 'https://github.com/acme/orca_botmux/pull/42',
-      slug: { owner: 'acme', repo: 'orca_botmux' },
+      url: 'https://github.com/acme/botmux/pull/42',
+      slug: { owner: 'acme', repo: 'botmux' },
       number: 42
     })
     expect(mockApi.worktrees.updateMeta).not.toHaveBeenCalled()
@@ -5178,20 +5178,20 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link'
     })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
     } as unknown as Partial<AppState>)
 
     store.getState().observeTerminalGitHubPullRequestLink(wt.id, {
-      url: 'https://github.com/acme/orca_botmux/pull/42',
-      slug: { owner: 'acme', repo: 'orca_botmux' },
+      url: 'https://github.com/acme/botmux/pull/42',
+      slug: { owner: 'acme', repo: 'botmux' },
       number: 42
     })
 
@@ -5226,25 +5226,25 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link',
       pushTarget: {
         remoteName: 'origin',
         branchName: 'feature/pr-link',
-        remoteUrl: 'https://github.com/acme/orca_botmux.git'
+        remoteUrl: 'https://github.com/acme/botmux.git'
       }
     })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
     } as unknown as Partial<AppState>)
 
     store.getState().observeTerminalGitHubPullRequestLink(wt.id, {
-      url: 'https://github.com/acme/orca_botmux/pull/1',
-      slug: { owner: 'acme', repo: 'orca_botmux' },
+      url: 'https://github.com/acme/botmux/pull/1',
+      slug: { owner: 'acme', repo: 'botmux' },
       number: 1
     })
 
@@ -5265,13 +5265,13 @@ describe('worktree remote runtime mutations', () => {
     const wt = makeWorktree({
       id: 'repo1::/path/wt1',
       repoId: 'repo1',
-      path: '/worktrees/orca_botmux',
+      path: '/worktrees/botmux',
       branch: 'refs/heads/feature/pr-link'
     })
     mockApi.worktrees.resolvePrBase.mockResolvedValueOnce({ baseBranch: 'main' })
     store.setState({
       repos: [
-        { id: 'repo1', path: '/repos/orca_botmux', displayName: 'orca_botmux', badgeColor: '#000', addedAt: 0 }
+        { id: 'repo1', path: '/repos/botmux', displayName: 'botmux', badgeColor: '#000', addedAt: 0 }
       ],
       worktreesByRepo: { repo1: [wt] },
       fetchPRForBranch
@@ -5284,7 +5284,7 @@ describe('worktree remote runtime mutations', () => {
     })
 
     expect(store.getState().worktreesByRepo.repo1[0]?.linkedPR).toBeNull()
-    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/orca_botmux', 'feature/pr-link', {
+    expect(fetchPRForBranch).toHaveBeenCalledWith('/repos/botmux', 'feature/pr-link', {
       force: true,
       repoId: 'repo1',
       worktreeId: wt.id,
@@ -6229,7 +6229,7 @@ describe('fetchAllWorktrees hydration-time purge (design §4.4)', () => {
         ]
       },
       browserTabsByWorktree: {
-        [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://orca_botmux.test' }]
+        [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://botmux.test' }]
       },
       activeBrowserTabIdByWorktree: {
         [FLOATING_TERMINAL_WORKTREE_ID]: 'floating-browser'
@@ -6288,7 +6288,7 @@ describe('fetchAllWorktrees hydration-time purge (design §4.4)', () => {
       ]
     })
     expect(store.getState().browserTabsByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toEqual([
-      { id: 'floating-browser', url: 'https://orca_botmux.test' }
+      { id: 'floating-browser', url: 'https://botmux.test' }
     ])
     expect(store.getState().openFiles).toEqual([floatingFile])
     expect(store.getState().activeFileIdByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toBe(
@@ -6462,7 +6462,7 @@ describe('purgeWorktreeTerminalState direct (design §4.4)', () => {
         ]
       },
       browserTabsByWorktree: {
-        [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://orca_botmux.test' }]
+        [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://botmux.test' }]
       },
       openFiles: [
         floatingFile,
@@ -6516,7 +6516,7 @@ describe('purgeWorktreeTerminalState direct (design §4.4)', () => {
       ]
     })
     expect(store.getState().browserTabsByWorktree[FLOATING_TERMINAL_WORKTREE_ID]).toEqual([
-      { id: 'floating-browser', url: 'https://orca_botmux.test' }
+      { id: 'floating-browser', url: 'https://botmux.test' }
     ])
     expect(store.getState().openFiles).toEqual([floatingFile])
     expect(store.getState().activeFileIdByWorktree).toEqual({
@@ -6534,7 +6534,7 @@ describe('purgeWorktreeTerminalState direct (design §4.4)', () => {
     const store = createTestStore()
     const tabsByWorktree = {}
     const browserTabsByWorktree = {
-      [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://orca_botmux.test' }]
+      [FLOATING_TERMINAL_WORKTREE_ID]: [{ id: 'floating-browser', url: 'https://botmux.test' }]
     }
     const openFiles = [
       {
@@ -7291,19 +7291,19 @@ describe('pending worktree creation state', () => {
         taskSourceContext: {
           kind: 'task-source',
           provider: 'github',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'local',
           projectHostSetupId: 'setup-local',
           repoId: 'repo-local',
-          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+          providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
         },
         workspaceRunContext: {
           kind: 'workspace-run',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           hostId: 'ssh:ssh-1',
           projectHostSetupId: 'setup-ssh',
           repoId: 'repo-ssh',
-          path: '/home/orca_botmux/orca_botmux'
+          path: '/home/botmux/botmux'
         },
         name: 'feature',
         setupDecision: 'inherit',

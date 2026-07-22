@@ -65,7 +65,7 @@ import { TASK_SOURCE_CONTEXT_RUNTIME_CAPABILITY } from '../../../../shared/proto
 import type { PreflightStatus } from '../../../../preload/api-types'
 import type { RuntimeStatus } from '../../../../shared/runtime-types'
 import type { TaskSourceContext } from '../../../../shared/task-source-context'
-import type { OrcaHooks, Repo, Worktree } from '../../../../shared/types'
+import type { BotmuxHooks, Repo, Worktree } from '../../../../shared/types'
 import { getWorktreePathBasenameFromId } from '../../../../shared/worktree-id'
 import {
   buildAutomationCronSchedule,
@@ -149,7 +149,7 @@ import { translate } from '@/i18n/i18n'
 
 const AGENTS = getAgentCatalog().map((agent) => agent.id)
 const DEFAULT_TIME = '09:00'
-const AUTOMATIONS_CHANGED_EVENT = 'orca_botmux:automations-changed'
+const AUTOMATIONS_CHANGED_EVENT = 'botmux:automations-changed'
 type AutomationPaneTab = 'overview' | 'runs'
 type RepoBackedAutomationSourceContext = TaskSourceContext & { provider: 'github' | 'gitlab' }
 
@@ -415,7 +415,7 @@ export default function AutomationsPage(): React.JSX.Element {
   const [isLoading, setIsLoading] = useState(true)
   const [isSaving, setIsSaving] = useState(false)
   const [createOpen, setCreateOpen] = useState(false)
-  const [createTarget, setCreateTarget] = useState<AutomationCreateTarget>('orca_botmux')
+  const [createTarget, setCreateTarget] = useState<AutomationCreateTarget>('botmux')
   const [editingAutomationId, setEditingAutomationId] = useState<string | null>(null)
   const [relativeNow, setRelativeNow] = useState(Date.now())
   const [activePaneTab, setActivePaneTab] = useState<AutomationPaneTab>('overview')
@@ -469,10 +469,10 @@ export default function AutomationsPage(): React.JSX.Element {
   const setupDecisionDefaultSignatureRef = useRef<string | null>(null)
   const setupDecisionTouchedRef = useRef(false)
   const automationHookCheckPromisesRef = useRef<
-    Map<string, Promise<{ hooks: OrcaHooks | null; ok: boolean }>>
+    Map<string, Promise<{ hooks: BotmuxHooks | null; ok: boolean }>>
   >(new Map())
   const [automationYamlHooksByRepoKey, setAutomationYamlHooksByRepoKey] = useState<
-    Record<string, OrcaHooks | null>
+    Record<string, BotmuxHooks | null>
   >({})
   const [draft, setDraft] = useState<AutomationDraft>({
     name: '',
@@ -588,7 +588,7 @@ export default function AutomationsPage(): React.JSX.Element {
     [repos, settings]
   )
   const loadAutomationYamlHooksForRepo = useCallback(
-    async (repoId: string): Promise<OrcaHooks | null> => {
+    async (repoId: string): Promise<BotmuxHooks | null> => {
       const key = getAutomationHooksCacheKey(repoId)
       if (Object.prototype.hasOwnProperty.call(automationYamlHooksByRepoKey, key)) {
         return automationYamlHooksByRepoKey[key] ?? null
@@ -600,7 +600,7 @@ export default function AutomationsPage(): React.JSX.Element {
       const settingsForRepo = getSettingsForRepoRuntimeOwner({ repos, settings }, repoId)
       const promise = checkRuntimeHooks(settingsForRepo, repoId)
         .then((result) => ({
-          hooks: result.status === 'error' ? null : ((result.hooks as OrcaHooks | null) ?? null),
+          hooks: result.status === 'error' ? null : ((result.hooks as BotmuxHooks | null) ?? null),
           ok: result.status !== 'error'
         }))
         .catch(() => ({ hooks: null, ok: false }))
@@ -1197,7 +1197,7 @@ export default function AutomationsPage(): React.JSX.Element {
   useEffect(() => {
     if (
       !createOpen ||
-      createTarget !== 'orca_botmux' ||
+      createTarget !== 'botmux' ||
       draft.workspaceMode !== 'new_per_run' ||
       !draft.projectId
     ) {
@@ -1271,7 +1271,7 @@ export default function AutomationsPage(): React.JSX.Element {
     const target = getDefaultTarget()
     setEditingAutomationId(null)
     setEditingExternalTarget(null)
-    setCreateTarget('orca_botmux')
+    setCreateTarget('botmux')
     const baseDraft: AutomationDraft = {
       name: '',
       prompt: '',
@@ -1312,7 +1312,7 @@ export default function AutomationsPage(): React.JSX.Element {
   const openEditDialog = async (automation: Automation): Promise<void> => {
     const requestId = (editRequestRef.current += 1)
     setEditingExternalTarget(null)
-    setCreateTarget('orca_botmux')
+    setCreateTarget('botmux')
     let latest = automation
     try {
       latest =
@@ -1600,7 +1600,7 @@ export default function AutomationsPage(): React.JSX.Element {
         repos,
         projectHostSetups,
         yamlHooks:
-          createTarget === 'orca_botmux' && draft.workspaceMode === 'new_per_run'
+          createTarget === 'botmux' && draft.workspaceMode === 'new_per_run'
             ? await loadAutomationYamlHooksForRepo(draft.projectId)
             : null,
         draftSetupDecision: draft.setupDecision
@@ -2913,7 +2913,7 @@ export default function AutomationsPage(): React.JSX.Element {
                         selectedAutomationRunPage.scheduledFor,
                         relativeNow
                       ),
-                      'orca_botmux',
+                      'botmux',
                       selectedAutomationRunPageWorkspaceDisplay?.detailLabel ?? 'No workspace'
                     ]}
                     detail={

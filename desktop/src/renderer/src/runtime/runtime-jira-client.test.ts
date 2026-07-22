@@ -40,7 +40,7 @@ describe('runtime Jira client search bounds', () => {
     await expect(
       jiraListAssignableUsers(
         { activeRuntimeEnvironmentId: 'env-1' },
-        'ORCA-1',
+        'BMUX-1',
         'x'.repeat(9 * 1024),
         'site-1'
       )

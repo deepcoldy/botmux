@@ -228,7 +228,7 @@ export function ExperimentalPane({
               <p className="text-xs text-muted-foreground">
                 {translate(
                   'auto.components.settings.ExperimentalPane.agentHibernation.copy',
-                  'Stops idle background agent terminals after the configured idle window and resumes supported sessions when you open them again. Agent sleep preserves launch options for agents started by OrcaBotmux. Manually started agents may resume with your current OrcaBotmux defaults. Experimental while we tune the safety model.'
+                  'Stops idle background agent terminals after the configured idle window and resumes supported sessions when you open them again. Agent sleep preserves launch options for agents started by Botmux. Manually started agents may resume with your current Botmux defaults. Experimental while we tune the safety model.'
                 )}
               </p>
             </div>
@@ -253,7 +253,7 @@ export function ExperimentalPane({
               )}
               description={translate(
                 'auto.components.settings.ExperimentalPane.agentHibernation.idleMinutesDescription',
-                'How many idle minutes a completed background agent must wait before OrcaBotmux can sleep it.'
+                'How many idle minutes a completed background agent must wait before Botmux can sleep it.'
               )}
               value={agentHibernationIdleMinutes}
               min={MIN_AGENT_HIBERNATION_IDLE_MS / MS_PER_MINUTE}

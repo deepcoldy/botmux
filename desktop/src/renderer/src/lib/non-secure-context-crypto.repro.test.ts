@@ -28,9 +28,9 @@ describe('non-secure context (plain HTTP LAN web client)', () => {
     expect(() => (globalThis.crypto as Crypto).randomUUID()).toThrow()
   })
 
-  it('hashOrcaHookScript does not throw when crypto.subtle is missing', async () => {
-    const { hashOrcaHookScript } = await import('./orca-botmux-hook-trust')
-    const hash = await hashOrcaHookScript('echo hi')
+  it('hashBotmuxHookScript does not throw when crypto.subtle is missing', async () => {
+    const { hashBotmuxHookScript } = await import('./botmux-hook-trust')
+    const hash = await hashBotmuxHookScript('echo hi')
     expect(hash).toMatch(/^[0-9a-f]+$/)
   })
 
@@ -38,16 +38,16 @@ describe('non-secure context (plain HTTP LAN web client)', () => {
   // mismatches and the user is re-prompted to approve a hook they already
   // trusted on the desktop app.
   it('produces the same hash as crypto.subtle did in a secure context', async () => {
-    const { hashOrcaHookScript } = await import('./orca-botmux-hook-trust')
+    const { hashBotmuxHookScript } = await import('./botmux-hook-trust')
     const secureHash = await (async () => {
       Object.defineProperty(globalThis, 'crypto', { configurable: true, value: realCrypto })
-      return hashOrcaHookScript('echo hi')
+      return hashBotmuxHookScript('echo hi')
     })()
     Object.defineProperty(globalThis, 'crypto', {
       configurable: true,
       value: { getRandomValues: realCrypto.getRandomValues.bind(realCrypto) }
     })
-    expect(await hashOrcaHookScript('echo hi')).toBe(secureHash)
+    expect(await hashBotmuxHookScript('echo hi')).toBe(secureHash)
   })
 
   it('createBrowserUuid does not throw when randomUUID is missing', async () => {

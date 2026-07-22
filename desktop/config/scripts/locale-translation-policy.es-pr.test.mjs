@@ -25,10 +25,10 @@ describe('locale-translation-policy es PR glossary', () => {
   it('rewrites PR inside longer sentences', () => {
     expect(
       repairEs(
-        'Add OrcaBotmux attribution to commits, PRs, and issues.',
-        'Agregue la atribución de OrcaBotmux a commits, relaciones públicas y problemas.'
+        'Add Botmux attribution to commits, PRs, and issues.',
+        'Agregue la atribución de Botmux a commits, relaciones públicas y problemas.'
       )
-    ).toBe('Agregue la atribución de OrcaBotmux a commits, PR y problemas.')
+    ).toBe('Agregue la atribución de Botmux a commits, PR y problemas.')
     expect(
       repairEs(
         'Open the PR details to view current reviewers.',

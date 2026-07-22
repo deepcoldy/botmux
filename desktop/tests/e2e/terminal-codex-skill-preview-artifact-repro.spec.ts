@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { realpathSync } from 'node:fs'
 import path from 'node:path'
 import type { ElectronApplication, Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { removeWorktreeViaStore } from './helpers/dead-terminal'
 import {
   ensureTerminalVisible,
@@ -18,20 +18,20 @@ import {
 } from './helpers/terminal'
 import { compareTerminalScreenshots } from './terminal-screenshot-diff'
 
-const RUN_REPRO = process.env.ORCA_E2E_CODEX_SKILL_PREVIEW_REPRO === '1'
-const EXPECT_NO_ARTIFACTS = process.env.ORCA_E2E_EXPECT_NO_CODEX_SKILL_PREVIEW_ARTIFACTS === '1'
+const RUN_REPRO = process.env.BOTMUX_E2E_CODEX_SKILL_PREVIEW_REPRO === '1'
+const EXPECT_NO_ARTIFACTS = process.env.BOTMUX_E2E_EXPECT_NO_CODEX_SKILL_PREVIEW_ARTIFACTS === '1'
 const FULLSCREEN_MIN_SIZE = { width: 1200, height: 760 }
 const MIN_REPRO_DIFF_RATIO = 0.006
 const MAX_CLEAN_DIFF_RATIO = 0.0015
-const ORCA_REPO_PATH = realpathSync(process.cwd())
+const BOTMUX_REPO_PATH = realpathSync(process.cwd())
 const ARTIFACT_DIR = path.join(process.cwd(), '.tmp', 'codex-skill-preview-real-flow')
 
 const CODEX_READY_RE = /Ask Codex|OpenAI Codex/i
 const CODEX_TRUST_PROMPT_RE =
   /Do you trust|trust this folder|Trust this|Working with untrusted contents/i
 const CODEX_UPDATE_PROMPT_RE = /update available|install update|Skip for now|Skip until next/i
-const CODEX_SKILL_PREVIEW_RE = /Press enter to insert|esc to close|electron|orca-botmux-cli|orca-botmux-emulator/i
-const SETUP_PANE_ACTIVITY_RE = /install-orca-botmux-skills|pnpm|Progress:|Packages:|Lockfile/i
+const CODEX_SKILL_PREVIEW_RE = /Press enter to insert|esc to close|electron|botmux-cli|botmux-emulator/i
+const SETUP_PANE_ACTIVITY_RE = /install-botmux-skills|pnpm|Progress:|Packages:|Lockfile/i
 const CLEAN_SKILL_ROW_RE = /^  [A-Za-z][A-Za-z0-9 .-]{1,32}\s+\[Skill\]\s/
 const CODEX_READY_SETTLE_MS = 3_500
 const SETUP_CHANGES_AFTER_PREVIEW = 3
@@ -106,7 +106,7 @@ async function setStableFullscreenWindow(
   await page.waitForTimeout(1_200)
 }
 
-async function addRealOrcaRepo(page: Page, repoPath: string): Promise<string> {
+async function addRealBotmuxRepo(page: Page, repoPath: string): Promise<string> {
   return page.evaluate(async (repoPath) => {
     await window.api.repos.add({ path: repoPath }).catch((error: unknown) => {
       if (!/already|exists|duplicate/i.test(String(error))) {
@@ -122,7 +122,7 @@ async function addRealOrcaRepo(page: Page, repoPath: string): Promise<string> {
     await state.fetchRepos()
     const repo = store.getState().repos.find((candidate) => candidate.path === repoPath)
     if (!repo) {
-      throw new Error(`Real OrcaBotmux repo did not load: ${repoPath}`)
+      throw new Error(`Real Botmux repo did not load: ${repoPath}`)
     }
 
     await store.getState().updateRepo(repo.id, {
@@ -140,7 +140,7 @@ async function addRealOrcaRepo(page: Page, repoPath: string): Promise<string> {
       (candidate) => candidate.path === repoPath
     )
     if (!worktree) {
-      throw new Error(`Real OrcaBotmux worktree did not load: ${repoPath}`)
+      throw new Error(`Real Botmux worktree did not load: ${repoPath}`)
     }
 
     nextState.updateSettings({
@@ -199,7 +199,7 @@ async function createWorkspaceThroughComposer(page: Page, workspaceName: string)
         }, workspaceName),
       {
         timeout: 60_000,
-        message: `Workspace ${workspaceName} did not appear in the real OrcaBotmux repo`
+        message: `Workspace ${workspaceName} did not appear in the real Botmux repo`
       }
     )
     .not.toBeNull()
@@ -220,7 +220,7 @@ async function createWorkspaceThroughComposer(page: Page, workspaceName: string)
   await expect
     .poll(() => getActiveWorktreeId(page), {
       timeout: 30_000,
-      message: 'Created real OrcaBotmux workspace did not become active'
+      message: 'Created real Botmux workspace did not become active'
     })
     .toBe(createdId)
   expect(createdId).not.toBe(previousWorktreeId)
@@ -566,83 +566,83 @@ test.describe('Codex skill preview terminal artifact repro @headful', () => {
 
   const createdWorktreeIds: string[] = []
 
-  test.skip(!RUN_REPRO, 'Set ORCA_E2E_CODEX_SKILL_PREVIEW_REPRO=1 to run this repro.')
+  test.skip(!RUN_REPRO, 'Set BOTMUX_E2E_CODEX_SKILL_PREVIEW_REPRO=1 to run this repro.')
 
-  test.afterEach(async ({ orcaBotmuxPage }) => {
+  test.afterEach(async ({ botmuxPage }) => {
     for (const id of createdWorktreeIds) {
-      await removeWorktreeViaStore(orcaBotmuxPage, id)
+      await removeWorktreeViaStore(botmuxPage, id)
     }
     createdWorktreeIds.length = 0
   })
 
-  test('captures the real OrcaBotmux repo setup-split Codex skill preview overpaint before any click', async ({
+  test('captures the real Botmux repo setup-split Codex skill preview overpaint before any click', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.setTimeout(240_000)
     test.skip(process.platform === 'win32', 'Codex skill preview repro uses POSIX shell commands')
 
-    await setStableFullscreenWindow(electronApp, orcaBotmuxPage)
-    await waitForSessionReady(orcaBotmuxPage)
-    await addRealOrcaRepo(orcaBotmuxPage, ORCA_REPO_PATH)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await setStableFullscreenWindow(electronApp, botmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await addRealBotmuxRepo(botmuxPage, BOTMUX_REPO_PATH)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     const workspaceName = `codex-skill-preview-${Date.now()}`
-    const worktreeId = await createWorkspaceThroughComposer(orcaBotmuxPage, workspaceName)
+    const worktreeId = await createWorkspaceThroughComposer(botmuxPage, workspaceName)
     createdWorktreeIds.push(worktreeId)
 
-    await ensureTerminalVisible(orcaBotmuxPage, 30_000)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPaneCount(orcaBotmuxPage, 2, 60_000)
-    await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
-    const webglActive = await forceTerminalWebgl(orcaBotmuxPage)
+    await ensureTerminalVisible(botmuxPage, 30_000)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPaneCount(botmuxPage, 2, 60_000)
+    await waitForPaneIdentitySnapshot(botmuxPage, 2)
+    const webglActive = await forceTerminalWebgl(botmuxPage)
     test.skip(!webglActive, 'Codex skill preview artifact repro needs WebGL rendering')
 
-    const leftPane = await focusLeftTerminalPane(orcaBotmuxPage)
-    const rightPane = await getRightTerminalPane(orcaBotmuxPage)
+    const leftPane = await focusLeftTerminalPane(botmuxPage)
+    const rightPane = await getRightTerminalPane(botmuxPage)
     expect(leftPane.hasWebgl).toBe(true)
     expect(rightPane.hasWebgl).toBe(true)
     expect(leftPane.proposed).toEqual({ cols: leftPane.cols, rows: leftPane.rows })
     expect(leftPane.appliedPtySize).toEqual({ cols: leftPane.cols, rows: leftPane.rows })
     expect(leftPane.isUserScrolling).toBe(false)
     await waitForPaneContent(
-      orcaBotmuxPage,
+      botmuxPage,
       rightPane.tabId,
       rightPane.ptyId,
       SETUP_PANE_ACTIVITY_RE,
       60_000
     )
-    await dismissCodexPromptsIfPresent(orcaBotmuxPage, leftPane)
-    await waitForPaneContent(orcaBotmuxPage, leftPane.tabId, leftPane.ptyId, CODEX_READY_RE, 60_000)
+    await dismissCodexPromptsIfPresent(botmuxPage, leftPane)
+    await waitForPaneContent(botmuxPage, leftPane.tabId, leftPane.ptyId, CODEX_READY_RE, 60_000)
     await waitForPaneContent(
-      orcaBotmuxPage,
+      botmuxPage,
       leftPane.tabId,
       leftPane.ptyId,
       /usage limit reset|YOLO mode|permissions/i,
       15_000
     )
-    await orcaBotmuxPage.waitForTimeout(CODEX_READY_SETTLE_MS)
-    await waitForPaneVisibleContentChanges(orcaBotmuxPage, rightPane, 1, 8_000)
+    await botmuxPage.waitForTimeout(CODEX_READY_SETTLE_MS)
+    await waitForPaneVisibleContentChanges(botmuxPage, rightPane, 1, 8_000)
 
-    await focusLeftTerminalPane(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.type('test $e', { delay: 70 })
+    await focusLeftTerminalPane(botmuxPage)
+    await botmuxPage.keyboard.type('test $e', { delay: 70 })
     await waitForPaneContent(
-      orcaBotmuxPage,
+      botmuxPage,
       leftPane.tabId,
       leftPane.ptyId,
       CODEX_SKILL_PREVIEW_RE,
       30_000
     )
     const setupChangesAfterPreview = await waitForPaneVisibleContentChanges(
-      orcaBotmuxPage,
+      botmuxPage,
       rightPane,
       SETUP_CHANGES_AFTER_PREVIEW,
       12_000
     )
 
-    const evidence = await captureClickEvidence(orcaBotmuxPage, leftPane, testInfo)
+    const evidence = await captureClickEvidence(botmuxPage, leftPane, testInfo)
     const overpaintedSkillRows = getOverpaintedSkillRows(evidence.beforeContent)
     const detectedArtifact =
       overpaintedSkillRows.length >= 2 || evidence.diffRatio >= MIN_REPRO_DIFF_RATIO
@@ -655,7 +655,7 @@ test.describe('Codex skill preview terminal artifact repro @headful', () => {
         leftPane: evidence.leftPane,
         setupChangesAfterPreview,
         overpaintedSkillRows,
-        repoPath: ORCA_REPO_PATH
+        repoPath: BOTMUX_REPO_PATH
       })
     })
 

@@ -8,7 +8,7 @@ import { readLocalLogTailRange } from './local-log-tail-reader'
 const tempPaths: string[] = []
 
 async function makeLog(content: string): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), 'orca-botmux-local-log-tail-'))
+  const directory = await mkdtemp(join(tmpdir(), 'botmux-local-log-tail-'))
   tempPaths.push(directory)
   const filePath = join(directory, 'session.jsonl')
   await writeFile(filePath, content)

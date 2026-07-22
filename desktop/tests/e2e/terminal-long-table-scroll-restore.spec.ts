@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -270,7 +270,7 @@ async function readTerminalBoxTableWrapDiagnostics(page: Page): Promise<{
 async function closeFeatureTips(page: Page): Promise<void> {
   await page.evaluate(() => {
     const store = window.__store
-    store?.getState().markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+    store?.getState().markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     if (store?.getState().activeModal === 'feature-tips') {
       store.getState().closeModal()
     }
@@ -340,17 +340,17 @@ async function readTerminalRenderDiagnostics(page: Page): Promise<TerminalRender
 
 test.describe('Terminal long table scroll restore repro', () => {
   test('reproduces long markdown table artifacts after workspace switch and scroll', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(() => {
+    await waitForSessionReady(botmuxPage)
+    await botmuxPage.evaluate(() => {
       window.__store
         ?.getState()
-        .markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+        .markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     })
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'long table restore repro needs the seeded secondary worktree')
@@ -358,40 +358,40 @@ test.describe('Terminal long table scroll restore repro', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
     const runId = randomUUID()
     const marker = `LONG_TABLE_SCROLL_RESTORE_${runId}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-long-table-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-long-table-${runId}.mjs`)
     writeFileSync(scriptPath, longMarkdownTableScript(runId))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
-      await orcaBotmuxPage.waitForTimeout(80)
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(1_500)
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await botmuxPage.waitForTimeout(80)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(1_500)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 10_000,
           message: 'long table marker did not survive workspace switch'
         })
         .toContain(marker)
 
-      await scrollActiveTerminalLikeUser(orcaBotmuxPage)
-      await closeFeatureTips(orcaBotmuxPage)
-      const diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+      await scrollActiveTerminalLikeUser(botmuxPage)
+      await closeFeatureTips(botmuxPage)
+      const diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
       const restoredPane = diagnostics.allPaneStates.find((paneState) => paneState.hasMarker)
       expect(restoredPane).toBeDefined()
       expect(diagnostics.cursorHidden).toBe(false)
-      await orcaBotmuxPage.waitForTimeout(100)
+      await botmuxPage.waitForTimeout(100)
       const screenshotPath = testInfo.outputPath('long-table-after-switch-scroll.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('long-table-after-switch-scroll.png', {
         path: screenshotPath,
         contentType: 'image/png'
@@ -402,17 +402,17 @@ test.describe('Terminal long table scroll restore repro', () => {
   })
 
   test('keeps narrow wrapped signer markdown table coherent after restore and scroll', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(() => {
+    await waitForSessionReady(botmuxPage)
+    await botmuxPage.evaluate(() => {
       window.__store
         ?.getState()
-        .markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+        .markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     })
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'narrow signer table repro needs the seeded secondary worktree')
@@ -420,48 +420,48 @@ test.describe('Terminal long table scroll restore repro', () => {
       return
     }
 
-    await setRenderedTableViewport(orcaBotmuxPage)
-    await forceDarkTerminalRendererPath(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await setRenderedTableViewport(botmuxPage)
+    await forceDarkTerminalRendererPath(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
     const runId = randomUUID()
     const marker = `NARROW_SIGNER_TABLE_RESTORE_${runId}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-narrow-signer-table-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-narrow-signer-table-${runId}.mjs`)
     writeFileSync(scriptPath, narrowSignerMarkdownTableScript(runId))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
-      await orcaBotmuxPage.waitForTimeout(80)
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(1_000)
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await botmuxPage.waitForTimeout(80)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(1_000)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 10_000,
           message: 'narrow signer table marker did not survive workspace switch'
         })
         .toContain(marker)
 
-      await scrollActiveTerminalLikeUser(orcaBotmuxPage)
-      await closeFeatureTips(orcaBotmuxPage)
-      const diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
+      await scrollActiveTerminalLikeUser(botmuxPage)
+      await closeFeatureTips(botmuxPage)
+      const diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
       // Why: renderer cell metrics can land one column wider in headless runs;
       // the content and screenshot assertions below cover the actual regression.
       expect(diagnostics.cols).toBeLessThanOrEqual(112)
       expect(diagnostics.cursorHidden).toBe(false)
 
-      const content = await getTerminalContent(orcaBotmuxPage, 30_000)
+      const content = await getTerminalContent(botmuxPage, 30_000)
       expect(content).toContain('Signer')
       expect(content).toContain('did:key:z6Mkuw5kQqz1QvZ9f3d2aB7f19f0cAC7B4F3c9E725')
       expect(content).toContain(marker)
 
       const screenshotPath = testInfo.outputPath('narrow-signer-table-after-switch-scroll.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('narrow-signer-table-after-switch-scroll.png', {
         path: screenshotPath,
         contentType: 'image/png'
@@ -474,18 +474,18 @@ test.describe('Terminal long table scroll restore repro', () => {
   // Why: keeps the user-shaped markdown path covered in the broader e2e suite;
   // the faster raw-table spec is the release-blocking golden for this bug.
   test('keeps real emoji markdown table right edge clean after restore and scroll', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await closeFeatureTips(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(() => {
+    await waitForSessionReady(botmuxPage)
+    await closeFeatureTips(botmuxPage)
+    await botmuxPage.evaluate(() => {
       window.__store
         ?.getState()
-        .markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+        .markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     })
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'real emoji table repro needs the seeded secondary worktree')
@@ -493,40 +493,40 @@ test.describe('Terminal long table scroll restore repro', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await setNarrowTerminalViewport(orcaBotmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await setNarrowTerminalViewport(botmuxPage)
     const renderedTableTerminalCols = await waitForRenderedTerminalColumnsAtMost(
-      orcaBotmuxPage,
+      botmuxPage,
       NARROW_TERMINAL_MAX_COLS
     )
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyColumnsAtMost(orcaBotmuxPage, ptyId, renderedTableTerminalCols)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyColumnsAtMost(botmuxPage, ptyId, renderedTableTerminalCols)
     const runId = randomUUID()
     const marker = `EMOJI_FIXTURE_TABLE_RESTORE_${runId}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-emoji-fixture-table-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-emoji-fixture-table-${runId}.mjs`)
     writeFileSync(scriptPath, emojiFixtureMarkdownTableScript(EMOJI_TABLE_FIXTURE, runId))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
-      await orcaBotmuxPage.waitForTimeout(80)
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(1_000)
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await botmuxPage.waitForTimeout(80)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(1_000)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
       // Why: worktree activation can restore the right sidebar. This repro is
       // intentionally narrow, but it must stay wide enough for its generated table.
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await setNarrowTerminalViewport(orcaBotmuxPage)
-      await waitForRenderedTerminalColumnsAtMost(orcaBotmuxPage, NARROW_TERMINAL_MAX_COLS)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await setNarrowTerminalViewport(botmuxPage)
+      await waitForRenderedTerminalColumnsAtMost(botmuxPage, NARROW_TERMINAL_MAX_COLS)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 10_000,
           message: 'real emoji table marker did not survive workspace switch'
         })
         .toContain(marker)
-      const generatedWidthContent = await getTerminalContent(orcaBotmuxPage, 30_000)
+      const generatedWidthContent = await getTerminalContent(botmuxPage, 30_000)
       const generatedWidthMatch = generatedWidthContent.match(
         new RegExp(`${emojiFixtureTableWidthMarker(runId)}(\\d+)`)
       )
@@ -538,17 +538,17 @@ test.describe('Terminal long table scroll restore repro', () => {
       // across terminal lines. A lower cell fragment still exercises the
       // restored markdown-table viewport without depending on early output.
       const retainedEmojiCell = 'Peac'
-      await scrollActiveTerminalToText(orcaBotmuxPage, retainedEmojiCell)
-      await closeFeatureTips(orcaBotmuxPage)
+      await scrollActiveTerminalToText(botmuxPage, retainedEmojiCell)
+      await closeFeatureTips(botmuxPage)
       await expect
-        .poll(() => readActiveTerminalVisibleText(orcaBotmuxPage), {
+        .poll(() => readActiveTerminalVisibleText(botmuxPage), {
           timeout: 5_000,
           message: `${retainedEmojiCell} row fragment should be visible before screenshot`
         })
         .toContain(retainedEmojiCell)
-      const diagnostics = await readTerminalRenderDiagnostics(orcaBotmuxPage)
-      const overpaint = await readTerminalRightEdgeOverpaint(orcaBotmuxPage)
-      const wrapDiagnostics = await readTerminalBoxTableWrapDiagnostics(orcaBotmuxPage)
+      const diagnostics = await readTerminalRenderDiagnostics(botmuxPage)
+      const overpaint = await readTerminalRightEdgeOverpaint(botmuxPage)
+      const wrapDiagnostics = await readTerminalBoxTableWrapDiagnostics(botmuxPage)
       expect(diagnostics.cols).toBeLessThanOrEqual(NARROW_TERMINAL_MAX_COLS)
       expect(wrapDiagnostics.cols).toBeGreaterThanOrEqual(generatedTableWidth)
       expect(diagnostics.cursorHidden).toBe(false)
@@ -562,7 +562,7 @@ test.describe('Terminal long table scroll restore repro', () => {
       })
 
       const screenshotPath = testInfo.outputPath('real-emoji-table-after-switch-scroll.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('real-emoji-table-after-switch-scroll.png', {
         path: screenshotPath,
         contentType: 'image/png'

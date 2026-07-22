@@ -30,7 +30,7 @@ function makeRepo(overrides: Partial<Repo> & Pick<Repo, 'id' | 'displayName' | '
 function makeProject({ id, ...overrides }: Partial<Project> & Pick<Project, 'id'>): Project {
   return {
     id,
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#737373',
     sourceRepoIds: ['local-repo', 'remote-repo'],
     createdAt: 100,
@@ -44,7 +44,7 @@ function makeSetup(
     Pick<ProjectHostSetup, 'id' | 'projectId' | 'repoId' | 'hostId' | 'path'>
 ): ProjectHostSetup {
   return {
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     kind: 'git',
     setupState: 'ready',
     setupMethod: 'legacy-repo',
@@ -110,32 +110,32 @@ describe('RepositoryHostSetupsSection', () => {
   it('shows a viewing-host selector when the project has multiple settings-backed hosts', () => {
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     const remoteRepo = makeRepo({
       id: 'remote-repo',
-      displayName: 'orca_botmux',
-      path: '/home/alice/orca_botmux',
+      displayName: 'botmux',
+      path: '/home/alice/botmux',
       connectionId: 'openclaw 2'
     })
     useAppStore.setState({
       repos: [localRepo, remoteRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         }),
         makeSetup({
           id: 'remote-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'remote-repo',
           hostId: toSshExecutionHostId('openclaw 2'),
-          path: '/home/alice/orca_botmux'
+          path: '/home/alice/botmux'
         })
       ],
       sshTargetLabels: new Map([['openclaw 2', 'openclaw 2']])
@@ -153,32 +153,32 @@ describe('RepositoryHostSetupsSection', () => {
     const setSettingsProjectHostSelection = vi.fn()
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     const remoteRepo = makeRepo({
       id: 'remote-repo',
-      displayName: 'orca_botmux',
-      path: '/home/alice/orca_botmux',
+      displayName: 'botmux',
+      path: '/home/alice/botmux',
       connectionId: 'openclaw 2'
     })
     useAppStore.setState({
       repos: [localRepo, remoteRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         }),
         makeSetup({
           id: 'remote-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'remote-repo',
           hostId: toSshExecutionHostId('openclaw 2'),
-          path: '/home/alice/orca_botmux'
+          path: '/home/alice/botmux'
         })
       ],
       openSettingsPage,
@@ -200,7 +200,7 @@ describe('RepositoryHostSetupsSection', () => {
 
     // The single project pane switches host in place — no navigation.
     expect(setSettingsProjectHostSelection).toHaveBeenCalledWith(
-      'github:stablyai/orca_botmux',
+      'github:stablyai/botmux',
       toSshExecutionHostId('openclaw 2')
     )
     expect(openSettingsPage).not.toHaveBeenCalled()
@@ -209,10 +209,10 @@ describe('RepositoryHostSetupsSection', () => {
 
   it('removes independent setup metadata instead of opening an empty repo target', async () => {
     const deleteProjectHostSetup = vi.fn().mockResolvedValue({
-      project: makeProject({ id: 'github:stablyai/orca_botmux' }),
+      project: makeProject({ id: 'github:stablyai/botmux' }),
       setup: makeSetup({
         id: 'gpu-setup',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: '',
         hostId: 'runtime:gpu',
         path: ''
@@ -222,23 +222,23 @@ describe('RepositoryHostSetupsSection', () => {
     const openSettingsTarget = vi.fn()
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         }),
         makeSetup({
           id: 'gpu-setup',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: '',
           hostId: 'runtime:gpu',
           path: '',
@@ -273,36 +273,36 @@ describe('RepositoryHostSetupsSection', () => {
     const openSettingsTarget = vi.fn()
     const setSettingsProjectHostSelection = vi.fn()
     const setupProjectExistingFolder = vi.fn().mockResolvedValue({
-      project: makeProject({ id: 'github:stablyai/orca_botmux' }),
+      project: makeProject({ id: 'github:stablyai/botmux' }),
       setup: makeSetup({
         id: 'remote-repo',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: 'remote-repo',
         hostId: toSshExecutionHostId('openclaw 2'),
-        path: '/home/alice/orca_botmux'
+        path: '/home/alice/botmux'
       }),
       repo: makeRepo({
         id: 'remote-repo',
-        displayName: 'orca_botmux',
-        path: '/home/alice/orca_botmux',
+        displayName: 'botmux',
+        path: '/home/alice/botmux',
         connectionId: 'openclaw 2'
       })
     })
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         })
       ],
       sshTargetLabels: new Map([['openclaw 2', 'openclaw 2']]),
@@ -320,7 +320,7 @@ describe('RepositoryHostSetupsSection', () => {
       'input[placeholder="/path/to/project/on/host"]'
     )
     expect(pathInput).toBeTruthy()
-    typeIntoInput(pathInput!, '/home/alice/orca_botmux')
+    typeIntoInput(pathInput!, '/home/alice/botmux')
 
     const importButton = findButton('Import')
     expect(importButton).toBeTruthy()
@@ -330,14 +330,14 @@ describe('RepositoryHostSetupsSection', () => {
     })
 
     expect(setupProjectExistingFolder).toHaveBeenCalledWith({
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'ssh:openclaw%202',
-      path: '/home/alice/orca_botmux',
+      path: '/home/alice/botmux',
       kind: 'git',
-      displayName: 'orca_botmux'
+      displayName: 'botmux'
     })
     expect(setSettingsProjectHostSelection).toHaveBeenCalledWith(
-      'github:stablyai/orca_botmux',
+      'github:stablyai/botmux',
       'ssh:openclaw%202'
     )
     expect(openSettingsPage).not.toHaveBeenCalled()
@@ -349,36 +349,36 @@ describe('RepositoryHostSetupsSection', () => {
     const openSettingsTarget = vi.fn()
     const setSettingsProjectHostSelection = vi.fn()
     const setupProjectClone = vi.fn().mockResolvedValue({
-      project: makeProject({ id: 'github:stablyai/orca_botmux' }),
+      project: makeProject({ id: 'github:stablyai/botmux' }),
       setup: makeSetup({
         id: 'remote-repo',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: 'remote-repo',
         hostId: toSshExecutionHostId('openclaw 2'),
-        path: '/home/alice/orca_botmux'
+        path: '/home/alice/botmux'
       }),
       repo: makeRepo({
         id: 'remote-repo',
-        displayName: 'orca_botmux',
-        path: '/home/alice/orca_botmux',
+        displayName: 'botmux',
+        path: '/home/alice/botmux',
         connectionId: 'openclaw 2'
       })
     })
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         })
       ],
       sshTargetLabels: new Map([['openclaw 2', 'openclaw 2']]),
@@ -400,7 +400,7 @@ describe('RepositoryHostSetupsSection', () => {
     )
     expect(urlInput).toBeTruthy()
     expect(destinationInput).toBeTruthy()
-    typeIntoInput(urlInput!, 'https://github.com/stablyai/orca_botmux.git')
+    typeIntoInput(urlInput!, 'https://github.com/stablyai/botmux.git')
     typeIntoInput(destinationInput!, '/home/alice')
 
     const cloneButton = findButton('Clone')
@@ -411,14 +411,14 @@ describe('RepositoryHostSetupsSection', () => {
     })
 
     expect(setupProjectClone).toHaveBeenCalledWith({
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'ssh:openclaw%202',
-      url: 'https://github.com/stablyai/orca_botmux.git',
+      url: 'https://github.com/stablyai/botmux.git',
       destination: '/home/alice',
-      displayName: 'orca_botmux'
+      displayName: 'botmux'
     })
     expect(setSettingsProjectHostSelection).toHaveBeenCalledWith(
-      'github:stablyai/orca_botmux',
+      'github:stablyai/botmux',
       'ssh:openclaw%202'
     )
     expect(openSettingsPage).not.toHaveBeenCalled()
@@ -427,10 +427,10 @@ describe('RepositoryHostSetupsSection', () => {
 
   it('creates pending setup metadata for a known host without requiring a path', async () => {
     const createProjectHostSetup = vi.fn().mockResolvedValue({
-      project: makeProject({ id: 'github:stablyai/orca_botmux' }),
+      project: makeProject({ id: 'github:stablyai/botmux' }),
       setup: makeSetup({
         id: 'gpu-setup',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: '',
         hostId: 'runtime:gpu',
         path: '',
@@ -440,19 +440,19 @@ describe('RepositoryHostSetupsSection', () => {
     })
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         })
       ],
       settings: { activeRuntimeEnvironmentId: 'gpu' } as never,
@@ -495,9 +495,9 @@ describe('RepositoryHostSetupsSection', () => {
     })
 
     expect(createProjectHostSetup).toHaveBeenCalledWith({
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu',
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       setupState: 'not-set-up',
       setupMethod: 'provisioned'
     })
@@ -509,19 +509,19 @@ describe('RepositoryHostSetupsSection', () => {
     const setupProjectExistingFolder = vi.fn()
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         })
       ],
       settings: { activeRuntimeEnvironmentId: null } as never,
@@ -553,7 +553,7 @@ describe('RepositoryHostSetupsSection', () => {
     renderSection(localRepo)
     clickButton('Add to another host')
 
-    expect(container.textContent).toContain('Update OrcaBotmux on this host to set up projects')
+    expect(container.textContent).toContain('Update Botmux on this host to set up projects')
     const browseButton = findButton('Browse folder')
     const plannedButton = findButton('Add host placeholder')
     expect(browseButton?.disabled).toBe(true)
@@ -570,10 +570,10 @@ describe('RepositoryHostSetupsSection', () => {
 
   it('offers inactive runtime hosts discovered from hydrated runtime status', async () => {
     const createProjectHostSetup = vi.fn().mockResolvedValue({
-      project: makeProject({ id: 'github:stablyai/orca_botmux' }),
+      project: makeProject({ id: 'github:stablyai/botmux' }),
       setup: makeSetup({
         id: 'gpu-setup',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         repoId: '',
         hostId: 'runtime:gpu',
         path: '',
@@ -583,19 +583,19 @@ describe('RepositoryHostSetupsSection', () => {
     })
     const localRepo = makeRepo({
       id: 'local-repo',
-      displayName: 'orca_botmux',
-      path: '/Users/alice/orca_botmux'
+      displayName: 'botmux',
+      path: '/Users/alice/botmux'
     })
     useAppStore.setState({
       repos: [localRepo],
-      projects: [makeProject({ id: 'github:stablyai/orca_botmux' })],
+      projects: [makeProject({ id: 'github:stablyai/botmux' })],
       projectHostSetups: [
         makeSetup({
           id: 'local-repo',
-          projectId: 'github:stablyai/orca_botmux',
+          projectId: 'github:stablyai/botmux',
           repoId: 'local-repo',
           hostId: 'local',
-          path: '/Users/alice/orca_botmux'
+          path: '/Users/alice/botmux'
         })
       ],
       settings: { activeRuntimeEnvironmentId: null } as never,
@@ -637,9 +637,9 @@ describe('RepositoryHostSetupsSection', () => {
     })
 
     expect(createProjectHostSetup).toHaveBeenCalledWith({
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu',
-      displayName: 'orca_botmux',
+      displayName: 'botmux',
       setupState: 'not-set-up',
       setupMethod: 'provisioned'
     })

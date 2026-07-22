@@ -9,14 +9,14 @@ import { WORK_ITEM_LINK_QUERY_MAX_BYTES } from './work-item-link-query-bounds'
 
 describe('buildGitHubRepoUrl', () => {
   it('builds a GitHub repository URL from an owner/repo slug', () => {
-    expect(buildGitHubRepoUrl({ owner: 'stablyai', repo: 'orca_botmux' })).toBe(
-      'https://github.com/stablyai/orca_botmux'
+    expect(buildGitHubRepoUrl({ owner: 'stablyai', repo: 'botmux' })).toBe(
+      'https://github.com/stablyai/botmux'
     )
   })
 
   it('encodes path segments', () => {
-    expect(buildGitHubRepoUrl({ owner: 'stably ai', repo: 'orca_botmux/tools' })).toBe(
-      'https://github.com/stably%20ai/orca_botmux%2Ftools'
+    expect(buildGitHubRepoUrl({ owner: 'stably ai', repo: 'botmux/tools' })).toBe(
+      'https://github.com/stably%20ai/botmux%2Ftools'
     )
   })
 })
@@ -25,8 +25,8 @@ describe('parseGitHubIssueOrPRNumber', () => {
   it('parses plain issue numbers and GitHub pull request URLs', () => {
     expect(parseGitHubIssueOrPRNumber('42')).toBe(42)
     expect(parseGitHubIssueOrPRNumber('#42')).toBe(42)
-    expect(parseGitHubIssueOrPRNumber('https://github.com/stablyai/orca_botmux/pull/123')).toBe(123)
-    expect(parseGitHubIssueOrPRNumber('https://github.com/stablyai/orca_botmux/issues/923')).toBe(923)
+    expect(parseGitHubIssueOrPRNumber('https://github.com/stablyai/botmux/pull/123')).toBe(123)
+    expect(parseGitHubIssueOrPRNumber('https://github.com/stablyai/botmux/issues/923')).toBe(923)
     expect(parseGitHubIssueOrPRNumber('https://github.my-company.net/MyOrg/my_repo/pull/395')).toBe(
       395
     )
@@ -65,8 +65,8 @@ describe('parseGitHubIssueOrPRNumber', () => {
 
 describe('parseGitHubIssueOrPRLink', () => {
   it('parses slug, number, and type for direct item URLs', () => {
-    expect(parseGitHubIssueOrPRLink('https://github.com/stablyai/orca_botmux/pull/123')).toEqual({
-      slug: { owner: 'stablyai', repo: 'orca_botmux' },
+    expect(parseGitHubIssueOrPRLink('https://github.com/stablyai/botmux/pull/123')).toEqual({
+      slug: { owner: 'stablyai', repo: 'botmux' },
       number: 123,
       type: 'pr'
     })
@@ -84,8 +84,8 @@ describe('parseGitHubIssueOrPRLink', () => {
       number: 395,
       type: 'pr'
     })
-    expect(parseGitHubIssueOrPRLink('https://github.com/stablyai/orca_botmux/issues/923')).toEqual({
-      slug: { owner: 'stablyai', repo: 'orca_botmux' },
+    expect(parseGitHubIssueOrPRLink('https://github.com/stablyai/botmux/issues/923')).toEqual({
+      slug: { owner: 'stablyai', repo: 'botmux' },
       number: 923,
       type: 'issue'
     })
@@ -131,11 +131,11 @@ describe('parseGitHubIssueOrPRLink', () => {
 
 describe('normalizeGitHubLinkQuery', () => {
   it('accepts full GitHub URLs whose slug differs from the selected repo slug', () => {
-    expect(normalizeGitHubLinkQuery('https://github.com/stablyai/orca_botmux/issues/923')).toEqual({
-      query: 'https://github.com/stablyai/orca_botmux/issues/923',
+    expect(normalizeGitHubLinkQuery('https://github.com/stablyai/botmux/issues/923')).toEqual({
+      query: 'https://github.com/stablyai/botmux/issues/923',
       directNumber: 923,
       directLink: {
-        slug: { owner: 'stablyai', repo: 'orca_botmux' },
+        slug: { owner: 'stablyai', repo: 'botmux' },
         number: 923,
         type: 'issue'
       }
@@ -143,11 +143,11 @@ describe('normalizeGitHubLinkQuery', () => {
   })
 
   it('preserves PR route intent for full GitHub URLs', () => {
-    expect(normalizeGitHubLinkQuery('https://github.com/stablyai/orca_botmux/pull/6934')).toEqual({
-      query: 'https://github.com/stablyai/orca_botmux/pull/6934',
+    expect(normalizeGitHubLinkQuery('https://github.com/stablyai/botmux/pull/6934')).toEqual({
+      query: 'https://github.com/stablyai/botmux/pull/6934',
       directNumber: 6934,
       directLink: {
-        slug: { owner: 'stablyai', repo: 'orca_botmux' },
+        slug: { owner: 'stablyai', repo: 'botmux' },
         number: 6934,
         type: 'pr'
       }
@@ -155,11 +155,11 @@ describe('normalizeGitHubLinkQuery', () => {
   })
 
   it('preserves route intent for URLs with uppercase schemes', () => {
-    expect(normalizeGitHubLinkQuery('HTTPS://github.com/stablyai/orca_botmux/pull/6934')).toEqual({
-      query: 'HTTPS://github.com/stablyai/orca_botmux/pull/6934',
+    expect(normalizeGitHubLinkQuery('HTTPS://github.com/stablyai/botmux/pull/6934')).toEqual({
+      query: 'HTTPS://github.com/stablyai/botmux/pull/6934',
       directNumber: 6934,
       directLink: {
-        slug: { owner: 'stablyai', repo: 'orca_botmux' },
+        slug: { owner: 'stablyai', repo: 'botmux' },
         number: 6934,
         type: 'pr'
       }

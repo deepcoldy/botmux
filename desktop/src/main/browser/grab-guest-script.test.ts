@@ -30,8 +30,8 @@ describe('buildGuestOverlayScript', () => {
   it('arm script contains shadow DOM setup', () => {
     const script = buildGuestOverlayScript('arm')
     expect(script).toContain('attachShadow')
-    expect(script).toContain('__orca-grab-host')
-    expect(script).toContain('__orcaGrab')
+    expect(script).toContain('__botmux-grab-host')
+    expect(script).toContain('__botmuxGrab')
   })
 
   it('arm script contains budget constants matching shared types', () => {
@@ -91,13 +91,13 @@ describe('buildGuestOverlayScript', () => {
   it('teardown script cleans up the overlay', () => {
     const script = buildGuestOverlayScript('teardown')
     expect(script).toContain('cleanup')
-    expect(script).toContain('__orcaGrab')
+    expect(script).toContain('__botmuxGrab')
   })
 
   it('teardown script cancels pending awaitClick', () => {
     const script = buildGuestOverlayScript('teardown')
     expect(script).toContain('cancelAwait')
-    expect(buildGuestOverlayScript('awaitClick')).toContain('__orcaCancelled')
+    expect(buildGuestOverlayScript('awaitClick')).toContain('__botmuxCancelled')
   })
 
   it('arm script uses full-viewport overlay as click catcher', () => {

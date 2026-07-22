@@ -21,8 +21,8 @@ import {
   writeTextFileRemoteAtomic
 } from '../agent-hooks/installer-utils-remote'
 
-const HERMES_PLUGIN_NAME = 'orca-botmux-status'
-const HERMES_PLUGIN_MARKER = 'Managed by OrcaBotmux. Do not edit; changes may be overwritten.'
+const HERMES_PLUGIN_NAME = 'botmux-status'
+const HERMES_PLUGIN_MARKER = 'Managed by Botmux. Do not edit; changes may be overwritten.'
 
 const HERMES_EVENTS = [
   'on_session_start',
@@ -109,7 +109,7 @@ function enablePlugin(config: HermesConfig): HermesConfig {
   plugins.enabled = Array.from(new Set([...enabled, HERMES_PLUGIN_NAME])).sort()
   if (disabled === null) {
     // Why: Hermes treats a malformed disabled list as empty. Normalize it here
-    // so OrcaBotmux's install status matches what the real Hermes loader will do.
+    // so Botmux's install status matches what the real Hermes loader will do.
     plugins.disabled = []
   } else if (disabled.includes(HERMES_PLUGIN_NAME)) {
     const filtered = disabled.filter((name) => name !== HERMES_PLUGIN_NAME)
@@ -200,7 +200,7 @@ function getPluginFilesState(pluginDir = getPluginDir()): {
     return {
       present: true,
       managed,
-      detail: managed ? null : 'Hermes orca-botmux-status plugin exists but is not OrcaBotmux-managed'
+      detail: managed ? null : 'Hermes botmux-status plugin exists but is not Botmux-managed'
     }
   } catch (error) {
     return {
@@ -240,8 +240,8 @@ function buildStatus(configPath: string, config: HermesConfig): AgentHookInstall
   const details = [
     pluginFiles.detail,
     enablement.detail,
-    !enablement.enabled ? 'orca-botmux-status is not enabled in Hermes config.yaml' : null,
-    enablement.disabled ? 'orca-botmux-status is disabled in Hermes config.yaml' : null
+    !enablement.enabled ? 'botmux-status is not enabled in Hermes config.yaml' : null,
+    enablement.disabled ? 'botmux-status is disabled in Hermes config.yaml' : null
   ].filter((detail): detail is string => Boolean(detail))
 
   let state: AgentHookInstallState
@@ -272,8 +272,8 @@ function getPluginManifest(): string {
     `# ${HERMES_PLUGIN_MARKER}`,
     `name: ${HERMES_PLUGIN_NAME}`,
     'version: 1.0.0',
-    'description: "Reports Hermes Agent lifecycle events to OrcaBotmux."',
-    'author: "orca_botmux"',
+    'description: "Reports Hermes Agent lifecycle events to Botmux."',
+    'author: "botmux"',
     'kind: standalone',
     'provides_hooks:',
     ...HERMES_EVENTS.map((event) => `  - ${event}`),
@@ -352,7 +352,7 @@ def _jsonable(value: Any, depth: int = 0, budget: Optional[list[int]] = None) ->
 
 def _endpoint_env() -> dict[str, str]:
     env = dict(os.environ)
-    endpoint = env.get("ORCA_AGENT_HOOK_ENDPOINT", "")
+    endpoint = env.get("BOTMUX_AGENT_HOOK_ENDPOINT", "")
     if endpoint and os.path.isfile(endpoint):
         try:
             with open(endpoint, "r", encoding="utf-8") as f:
@@ -370,20 +370,20 @@ def _endpoint_env() -> dict[str, str]:
     return env
 
 
-def _post_to_orca(payload: dict[str, Any]) -> None:
+def _post_to_botmux(payload: dict[str, Any]) -> None:
     env = _endpoint_env()
-    port = env.get("ORCA_AGENT_HOOK_PORT", "")
-    token = env.get("ORCA_AGENT_HOOK_TOKEN", "")
-    pane_key = env.get("ORCA_PANE_KEY", "")
+    port = env.get("BOTMUX_AGENT_HOOK_PORT", "")
+    token = env.get("BOTMUX_AGENT_HOOK_TOKEN", "")
+    pane_key = env.get("BOTMUX_PANE_KEY", "")
     if not port or not token or not pane_key:
         return
     body = {
         "paneKey": pane_key,
-        "launchToken": env.get("ORCA_AGENT_LAUNCH_TOKEN", ""),
-        "tabId": env.get("ORCA_TAB_ID", ""),
-        "worktreeId": env.get("ORCA_WORKTREE_ID", ""),
-        "env": env.get("ORCA_AGENT_HOOK_ENV", ""),
-        "version": env.get("ORCA_AGENT_HOOK_VERSION", ""),
+        "launchToken": env.get("BOTMUX_AGENT_LAUNCH_TOKEN", ""),
+        "tabId": env.get("BOTMUX_TAB_ID", ""),
+        "worktreeId": env.get("BOTMUX_WORKTREE_ID", ""),
+        "env": env.get("BOTMUX_AGENT_HOOK_ENV", ""),
+        "version": env.get("BOTMUX_AGENT_HOOK_VERSION", ""),
         "payload": payload,
     }
     data = json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -393,7 +393,7 @@ def _post_to_orca(payload: dict[str, Any]) -> None:
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "X-OrcaBotmux-Agent-Hook-Token": token,
+            "X-Botmux-Agent-Hook-Token": token,
         },
     )
     try:
@@ -425,7 +425,7 @@ def _payload_for_event(event_name: str, kwargs: dict[str, Any]) -> dict[str, Any
 
 def _make_hook(event_name: str) -> Callable[..., None]:
     def _hook(**kwargs: Any) -> None:
-        _post_to_orca(_payload_for_event(event_name, kwargs))
+        _post_to_botmux(_payload_for_event(event_name, kwargs))
 
     return _hook
 

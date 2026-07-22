@@ -12,7 +12,7 @@ async function createRepoWithOutsideDirectory(): Promise<{
   outsideDir: string
   outsideFile: string
 }> {
-  const root = await mkdtemp(path.join(tmpdir(), 'orca-botmux-discard-symlink-'))
+  const root = await mkdtemp(path.join(tmpdir(), 'botmux-discard-symlink-'))
   tempRoots.push(root)
   const repo = path.join(root, 'repo')
   const outsideDir = path.join(root, 'outside')

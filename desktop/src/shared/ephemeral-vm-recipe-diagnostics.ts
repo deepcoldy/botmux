@@ -16,7 +16,7 @@ export function getEphemeralVmRecipeResultWarnings(
   result: EphemeralVmRecipeResult
 ): EphemeralVmRecipeResultWarning[] {
   const connection = getEphemeralVmRecipeResultConnection(result)
-  if (connection.type !== 'orca-botmux-server') {
+  if (connection.type !== 'botmux-server') {
     return []
   }
   const pairing = parsePairingCode(connection.pairingCode)
@@ -39,7 +39,7 @@ export function redactEphemeralVmRecipeDiagnosticText(text: string): string {
     return text
   }
   return text
-    .replace(/orca_botmux:\/\/pair\?code=[A-Za-z0-9_-]+/g, 'orca_botmux://pair?code=[redacted]')
+    .replace(/botmux:\/\/pair\?code=[A-Za-z0-9_-]+/g, 'botmux://pair?code=[redacted]')
     .replace(
       /("(?:pairingCode|deviceToken|publicKeyB64|token|secret|password|apiKey|accessToken|identityFile|identityAgent|proxyCommand)"\s*:\s*)"[^"]*"/gi,
       '$1"[redacted]"'
@@ -59,14 +59,14 @@ export function redactEphemeralVmRecipeResultForDiagnostics(
   }
   return {
     ...result,
-    pairingCode: 'orca_botmux://pair?code=[redacted]',
+    pairingCode: 'botmux://pair?code=[redacted]',
     ...(userData ? { userData } : {})
   }
 }
 
 function redactConnection(connection: EphemeralVmRecipeConnection): EphemeralVmRecipeConnection {
-  if (connection.type === 'orca-botmux-server') {
-    return { ...connection, pairingCode: 'orca_botmux://pair?code=[redacted]' }
+  if (connection.type === 'botmux-server') {
+    return { ...connection, pairingCode: 'botmux://pair?code=[redacted]' }
   }
   return {
     ...connection,

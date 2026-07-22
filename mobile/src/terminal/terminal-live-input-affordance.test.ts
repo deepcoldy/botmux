@@ -28,7 +28,7 @@ describe('terminal live input affordance', () => {
 
     expect(block).toContain('onPress={focusLiveInput}')
     expect(block).toContain('accessibilityRole="button"')
-    expect(block).toContain('accessibilityLabel="Show keyboard for live terminal input"')
+    expect(block).toContain("accessibilityLabel={t('Show keyboard for live terminal input')}")
     expect(block).toContain(
       'accessibilityHint="Typed text is sent directly to the active terminal"'
     )

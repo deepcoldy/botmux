@@ -25,7 +25,7 @@ export function RichMarkdownAnnotationOverlay({
       {target ? (
         <button
           type="button"
-          className="orca-botmux-diff-comment-add-btn rich-markdown-comment-add-btn"
+          className="botmux-diff-comment-add-btn rich-markdown-comment-add-btn"
           style={{
             top: target.buttonTop ?? 56,
             left: target.buttonLeft ?? 16

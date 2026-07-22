@@ -37,7 +37,7 @@ describe('WorkspaceSessionHandler', () => {
   let written: Buffer[]
 
   beforeEach(() => {
-    baseDir = mkdtempSync(join(tmpdir(), 'orca-botmux-workspace-session-'))
+    baseDir = mkdtempSync(join(tmpdir(), 'botmux-workspace-session-'))
     written = []
     dispatcher = new RelayDispatcher((data) => {
       written.push(Buffer.from(data))

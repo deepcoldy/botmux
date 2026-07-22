@@ -69,17 +69,17 @@ function table(rows: GitHubProjectRow[]): GitHubProjectTable {
 
 describe('filterProjectTableRowsByOpenRepos', () => {
   it('keeps rows whose repository slug resolves to at least one live repo', () => {
-    const rows = [row('visible', 'acme/orca_botmux'), row('missing', 'acme/removed')]
+    const rows = [row('visible', 'acme/botmux'), row('missing', 'acme/removed')]
     const filtered = filterProjectTableRowsByOpenRepos(table(rows), (slug) =>
-      slug?.toLowerCase() === 'acme/orca_botmux' ? [repo('repo-1')] : []
+      slug?.toLowerCase() === 'acme/botmux' ? [repo('repo-1')] : []
     )
 
     expect(filtered.rows.map((r) => r.id)).toEqual(['visible'])
     expect(filtered.totalCount).toBe(1)
   })
 
-  it('keeps rows while any of multiple OrcaBotmux repos map to the slug', () => {
-    const rows = [row('visible', 'acme/orca_botmux')]
+  it('keeps rows while any of multiple Botmux repos map to the slug', () => {
+    const rows = [row('visible', 'acme/botmux')]
     const filtered = filterProjectTableRowsByOpenRepos(table(rows), () => [
       repo('repo-1'),
       repo('repo-2')
@@ -89,7 +89,7 @@ describe('filterProjectTableRowsByOpenRepos', () => {
   })
 
   it('filters missing or unresolved repository slugs', () => {
-    const rows = [row('missing-slug', null), row('unresolved', 'gitlab/orca_botmux')]
+    const rows = [row('missing-slug', null), row('unresolved', 'gitlab/botmux')]
     const filtered = filterProjectTableRowsByOpenRepos(table(rows), () => [])
 
     expect(filtered.rows).toEqual([])
@@ -99,10 +99,10 @@ describe('filterProjectTableRowsByOpenRepos', () => {
 
 describe('filterProjectTableRowsBySelectedRepos', () => {
   it('keeps a row when at least one slug match is selected', () => {
-    const rows = [row('visible', 'acme/orca_botmux'), row('hidden', 'acme/tool')]
+    const rows = [row('visible', 'acme/botmux'), row('hidden', 'acme/tool')]
     const filtered = filterProjectTableRowsBySelectedRepos(
       table(rows),
-      (slug) => (slug?.toLowerCase() === 'acme/orca_botmux' ? [repo('repo-1')] : [repo('repo-2')]),
+      (slug) => (slug?.toLowerCase() === 'acme/botmux' ? [repo('repo-1')] : [repo('repo-2')]),
       true,
       new Set(['repo-1'])
     )
@@ -112,7 +112,7 @@ describe('filterProjectTableRowsBySelectedRepos', () => {
   })
 
   it('filters a row when only unselected repos match', () => {
-    const rows = [row('hidden', 'acme/orca_botmux')]
+    const rows = [row('hidden', 'acme/botmux')]
     const filtered = filterProjectTableRowsBySelectedRepos(
       table(rows),
       () => [repo('repo-2')],
@@ -125,7 +125,7 @@ describe('filterProjectTableRowsBySelectedRepos', () => {
   })
 
   it('keeps a row with multiple selected matches for action ambiguity handling', () => {
-    const rows = [row('ambiguous', 'acme/orca_botmux')]
+    const rows = [row('ambiguous', 'acme/botmux')]
     const filtered = filterProjectTableRowsBySelectedRepos(
       table(rows),
       () => [repo('repo-1'), repo('repo-2'), repo('repo-3')],
@@ -140,7 +140,7 @@ describe('filterProjectTableRowsBySelectedRepos', () => {
 describe('resolveSelectedProjectRowRepo', () => {
   it('reports loading without reading stale slug matches', () => {
     const resolution = resolveSelectedProjectRowRepo({
-      row: row('loading', 'acme/orca_botmux'),
+      row: row('loading', 'acme/botmux'),
       lookupSlug: () => {
         throw new Error('should not read stale matches')
       },
@@ -162,9 +162,9 @@ describe('resolveSelectedProjectRowRepo', () => {
     expect(resolution.status).toBe('invalid_slug')
   })
 
-  it('reports no global match when OrcaBotmux has no repo for the slug', () => {
+  it('reports no global match when Botmux has no repo for the slug', () => {
     const resolution = resolveSelectedProjectRowRepo({
-      row: row('missing', 'acme/orca_botmux'),
+      row: row('missing', 'acme/botmux'),
       lookupSlug: () => [],
       slugIndexReady: true,
       selectedRepoIds: new Set(['repo-1'])
@@ -175,7 +175,7 @@ describe('resolveSelectedProjectRowRepo', () => {
 
   it('reports global-only matches when the repo is not selected', () => {
     const resolution = resolveSelectedProjectRowRepo({
-      row: row('unselected', 'acme/orca_botmux'),
+      row: row('unselected', 'acme/botmux'),
       lookupSlug: () => [repo('repo-2')],
       slugIndexReady: true,
       selectedRepoIds: new Set(['repo-1'])
@@ -186,7 +186,7 @@ describe('resolveSelectedProjectRowRepo', () => {
 
   it('returns the selected match when exactly one matching repo is selected', () => {
     const resolution = resolveSelectedProjectRowRepo({
-      row: row('selected', 'acme/orca_botmux'),
+      row: row('selected', 'acme/botmux'),
       lookupSlug: () => [repo('repo-1'), repo('repo-2')],
       slugIndexReady: true,
       selectedRepoIds: new Set(['repo-2'])
@@ -197,7 +197,7 @@ describe('resolveSelectedProjectRowRepo', () => {
 
   it('reports ambiguity when multiple matching repos are selected', () => {
     const resolution = resolveSelectedProjectRowRepo({
-      row: row('ambiguous', 'acme/orca_botmux'),
+      row: row('ambiguous', 'acme/botmux'),
       lookupSlug: () => [repo('repo-1'), repo('repo-2')],
       slugIndexReady: true,
       selectedRepoIds: new Set(['repo-1', 'repo-2'])

@@ -16,8 +16,8 @@ import {
 import { track } from './telemetry'
 
 const SETUP_GUIDE_TELEMETRY_COMPLETED_STEPS_STORAGE_KEY =
-  'orca_botmux.setupGuideTelemetryCompletedSteps.v1'
-const TERMINAL_PANE_SPLIT_TELEMETRY_STORAGE_KEY = 'orca_botmux.terminalPaneSplitTelemetry.v1'
+  'botmux.setupGuideTelemetryCompletedSteps.v1'
+const TERMINAL_PANE_SPLIT_TELEMETRY_STORAGE_KEY = 'botmux.terminalPaneSplitTelemetry.v1'
 
 type FeatureEducationTelemetryEventName = Extract<
   EventName,

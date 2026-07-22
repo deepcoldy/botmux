@@ -28,7 +28,7 @@ beforeEach(() => {
 })
 
 describe('openFileInBrowserTab', () => {
-  it('opens a local file URL in the OrcaBotmux browser with the filename as title', () => {
+  it('opens a local file URL in the Botmux browser with the filename as title', () => {
     openFileInBrowserTab({
       filePath: '/tmp/example file.html',
       worktreeId: 'wt-1'

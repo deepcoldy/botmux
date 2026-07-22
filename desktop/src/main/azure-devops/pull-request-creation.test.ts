@@ -27,7 +27,7 @@ const OLD_FETCH = globalThis.fetch
 
 describe('Azure DevOps pull request creation', () => {
   beforeEach(() => {
-    process.env = { ...OLD_ENV, ORCA_AZURE_DEVOPS_TOKEN: 'pat-token' }
+    process.env = { ...OLD_ENV, BOTMUX_AZURE_DEVOPS_TOKEN: 'pat-token' }
     gitExecFileAsyncMock.mockReset()
     getSshGitProviderMock.mockReset()
     gitExecFileAsyncMock.mockResolvedValue({
@@ -44,7 +44,7 @@ describe('Azure DevOps pull request creation', () => {
   })
 
   it('treats token-only auth as sufficient for repo-scoped creation', () => {
-    delete process.env.ORCA_AZURE_DEVOPS_API_BASE_URL
+    delete process.env.BOTMUX_AZURE_DEVOPS_API_BASE_URL
     expect(isAzureDevOpsReviewCreationAuthenticated()).toBe(true)
   })
 

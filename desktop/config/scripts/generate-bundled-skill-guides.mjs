@@ -10,11 +10,11 @@ const REPO_ROOT = path.resolve(SCRIPT_DIR, '..', '..')
 const CANONICAL_GUIDE_NAMES = [
   'computer-use',
   'linear-tickets',
-  'orca-botmux-cli',
-  'orca-botmux-emulator',
-  'orca-botmux-emulator-android',
-  'orca-botmux-linear',
-  'orca-botmux-per-workspace-env',
+  'botmux-cli',
+  'botmux-emulator',
+  'botmux-emulator-android',
+  'botmux-linear',
+  'botmux-per-workspace-env',
   'orchestration'
 ]
 
@@ -23,11 +23,11 @@ const CANONICAL_GUIDE_NAMES = [
 const GUIDE_ALIASES = {
   'computer-use': [],
   'linear-tickets': [],
-  'orca-botmux-cli': [],
-  'orca-botmux-emulator': [],
-  'orca-botmux-emulator-android': [],
-  'orca-botmux-linear': [],
-  'orca-botmux-per-workspace-env': [],
+  'botmux-cli': [],
+  'botmux-emulator': [],
+  'botmux-emulator-android': [],
+  'botmux-linear': [],
+  'botmux-per-workspace-env': [],
   orchestration: []
 }
 

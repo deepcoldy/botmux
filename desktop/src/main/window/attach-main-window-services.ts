@@ -18,7 +18,7 @@ import { registerSshHandlers } from '../ipc/ssh'
 import { registerRemoteWorkspaceHandlers } from '../ipc/remote-workspace'
 import { browserManager } from '../browser/browser-manager'
 import { hasSystemMediaAccess, requestSystemMediaAccess } from '../browser/browser-media-access'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import {
   checkForUpdatesFromMenu,
   downloadUpdate,
@@ -68,7 +68,7 @@ let activeRuntimeNotifierToken: number | null = null
 export function attachMainWindowServices(
   mainWindow: BrowserWindow,
   store: Store,
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   getSelectedCodexHomePath?: (target?: CodexAccountSelectionTarget) => string | null,
   prepareClaudeAuth?: (
     target?: ClaudeAccountSelectionTarget
@@ -116,7 +116,7 @@ export function attachMainWindowServices(
   })
   // Why: warm-reattach gap.
   // Daemon-hosted PTYs survive renderer restarts on purpose, so on a fresh
-  // OrcaBotmux launch the daemon's `listSessions()` returns sessions that
+  // Botmux launch the daemon's `listSessions()` returns sessions that
   // `pty:spawn` hasn't re-registered yet. Without this hydration, the
   // memory snapshot omits those PTYs and the renderer mislabels their
   // workspaces as `· REMOTE` while showing `—` for CPU/Memory.
@@ -137,23 +137,23 @@ export function attachMainWindowServices(
       })
   }
   registerSshHandlers(store, () => mainWindow, runtime)
-  // Why: orca_botmux multi-host endpoints persist across restarts; reconnect only
-  // after SSH handlers exist so OrcaBotmux port-forward + auto-connect work.
-  void import('../orca-botmux-bridge/orca-botmux-bridge-service')
+  // Why: botmux multi-host endpoints persist across restarts; reconnect only
+  // after SSH handlers exist so Botmux port-forward + auto-connect work.
+  void import('../botmux-bridge/botmux-bridge-service')
     .then(({ reconnectPersistedBotmuxEndpoints }) => reconnectPersistedBotmuxEndpoints())
     .then((result) => {
       if (result.attempted > 0) {
         console.log(
-          `[orca-botmux-bridge] reconnected ${result.connected}/${result.attempted} persisted endpoint(s)`
+          `[botmux-bridge] reconnected ${result.connected}/${result.attempted} persisted endpoint(s)`
         )
       }
       if (result.failures.length > 0) {
-        console.warn('[orca-botmux-bridge] reconnect failures', result.failures)
+        console.warn('[botmux-bridge] reconnect failures', result.failures)
       }
     })
     .catch((error) => {
       console.warn(
-        '[orca-botmux-bridge] persisted reconnect skipped',
+        '[botmux-bridge] persisted reconnect skipped',
         error instanceof Error ? error.message : error
       )
     })
@@ -273,7 +273,7 @@ function registerAppReloadHandler(
 
 function registerRuntimeWindowLifecycle(
   mainWindow: BrowserWindow,
-  runtime: OrcaRuntimeService
+  runtime: BotmuxRuntimeService
 ): void {
   const notifierToken = ++runtimeNotifierTokenCounter
   activeRuntimeNotifierToken = notifierToken

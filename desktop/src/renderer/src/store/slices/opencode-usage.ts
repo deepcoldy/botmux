@@ -32,7 +32,7 @@ export const createOpenCodeUsageSlice: StateCreator<AppState, [], [], OpenCodeUs
   set,
   get
 ) => ({
-  openCodeUsageScope: 'orca_botmux',
+  openCodeUsageScope: 'botmux',
   openCodeUsageRange: '30d',
   openCodeUsageScanState: null,
   openCodeUsageSummary: null,

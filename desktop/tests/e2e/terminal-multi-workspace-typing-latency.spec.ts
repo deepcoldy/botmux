@@ -11,7 +11,7 @@
  *   echo-half   = pty echo    -> marker visible in the xterm buffer
  * All three clocks are epoch ms on one machine, so the halves add up.
  *
- * Scenarios are gated behind ORCA_TYPING_BENCH=1 (they are benchmarks that
+ * Scenarios are gated behind BOTMUX_TYPING_BENCH=1 (they are benchmarks that
  * may legitimately "fail" while the bug reproduces, not CI regression gates).
  * Entry point: pnpm bench:multi-workspace-typing  (see
  * config/scripts/run-multi-workspace-typing-bench.mjs for knobs). Results are
@@ -22,7 +22,7 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveWorktreeId,
@@ -51,19 +51,19 @@ import {
   writeTypingEchoProbeScript
 } from './sustained-agent-typing-load-scripts'
 
-const BENCH_ENABLED = process.env.ORCA_TYPING_BENCH === '1'
+const BENCH_ENABLED = process.env.BOTMUX_TYPING_BENCH === '1'
 
 function readPositiveInt(name: string, fallback: number): number {
   const value = Number(process.env[name])
   return Number.isInteger(value) && value > 0 ? value : fallback
 }
 
-const LOAD_PANES = readPositiveInt('ORCA_TYPING_BENCH_LOAD_PANES', 4)
-const LOAD_RATE_KBPS = readPositiveInt('ORCA_TYPING_BENCH_RATE_KBPS', 256)
-const KEY_COUNT = readPositiveInt('ORCA_TYPING_BENCH_KEYS', 32)
-const KEY_CADENCE_MS = readPositiveInt('ORCA_TYPING_BENCH_KEY_CADENCE_MS', 250)
-const CPU_WORKERS = readPositiveInt('ORCA_TYPING_BENCH_CPU_WORKERS', 0)
-const BENCH_LABEL = process.env.ORCA_TYPING_BENCH_LABEL ?? 'dev'
+const LOAD_PANES = readPositiveInt('BOTMUX_TYPING_BENCH_LOAD_PANES', 4)
+const LOAD_RATE_KBPS = readPositiveInt('BOTMUX_TYPING_BENCH_RATE_KBPS', 256)
+const KEY_COUNT = readPositiveInt('BOTMUX_TYPING_BENCH_KEYS', 32)
+const KEY_CADENCE_MS = readPositiveInt('BOTMUX_TYPING_BENCH_KEY_CADENCE_MS', 250)
+const CPU_WORKERS = readPositiveInt('BOTMUX_TYPING_BENCH_CPU_WORKERS', 0)
+const BENCH_LABEL = process.env.BOTMUX_TYPING_BENCH_LABEL ?? 'dev'
 
 const KEY_CHARS = 'abcdefghijklmnopqrstuvwxyz'
 const TIMER_SAMPLE_MS = 16
@@ -437,109 +437,109 @@ test.describe('Multi-workspace sustained typing latency bench', () => {
   test.setTimeout(10 * 60 * 1000)
 
   test('baseline: paced typing with no agent load', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
     test.skip(!BENCH_ENABLED, 'Bench-only: run via pnpm bench:multi-workspace-typing')
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const typingPtyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const typingPtyId = await waitForActivePanePtyId(botmuxPage)
 
     const runId = randomUUID()
-    const probePath = path.join(testRepoPath, `.orca-botmux-mwt-probe-${runId}.mjs`)
-    const sidecarPath = path.join(testRepoPath, `.orca-botmux-mwt-arrivals-${runId}.jsonl`)
+    const probePath = path.join(testRepoPath, `.botmux-mwt-probe-${runId}.mjs`)
+    const sidecarPath = path.join(testRepoPath, `.botmux-mwt-arrivals-${runId}.jsonl`)
     writeTypingEchoProbeScript(probePath, runId, sidecarPath)
     try {
-      await resetDeliveryDebug(orcaBotmuxPage)
-      await startTypingProbe(orcaBotmuxPage, typingPtyId, probePath, runId)
-      const measurement = await measurePacedTyping(orcaBotmuxPage, runId, sidecarPath)
+      await resetDeliveryDebug(botmuxPage)
+      await startTypingProbe(botmuxPage, typingPtyId, probePath, runId)
+      const measurement = await measurePacedTyping(botmuxPage, runId, sidecarPath)
       writeBenchReport(
         testInfo,
         'baseline',
         measurement,
-        await readSchedulerDebug(orcaBotmuxPage),
-        await readMainDeliveryDebug(orcaBotmuxPage)
+        await readSchedulerDebug(botmuxPage),
+        await readMainDeliveryDebug(botmuxPage)
       )
       expect(measurement.missingEchoCount).toBe(0)
       expect(measurement.totalMs?.p50 ?? Number.POSITIVE_INFINITY).toBeLessThan(250)
     } finally {
-      await stopPtysQuietly(orcaBotmuxPage, [typingPtyId])
+      await stopPtysQuietly(botmuxPage, [typingPtyId])
       rmSync(probePath, { force: true })
       rmSync(sidecarPath, { force: true })
     }
   })
 
   test('typing under sustained hidden multi-workspace agent load', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
     test.skip(!BENCH_ENABLED, 'Bench-only: run via pnpm bench:multi-workspace-typing')
-    await waitForSessionReady(orcaBotmuxPage)
-    const typingWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const loadWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find((id) => id !== typingWorktreeId)
+    await waitForSessionReady(botmuxPage)
+    const typingWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const loadWorktreeId = (await getAllWorktreeIds(botmuxPage)).find((id) => id !== typingWorktreeId)
     expect(Boolean(loadWorktreeId), 'bench needs the seeded secondary worktree').toBe(true)
     if (!loadWorktreeId) {
       return
     }
 
     const runId = randomUUID()
-    const loadPath = path.join(testRepoPath, `.orca-botmux-mwt-load-${runId}.mjs`)
-    const probePath = path.join(testRepoPath, `.orca-botmux-mwt-probe-${runId}.mjs`)
-    const sidecarPath = path.join(testRepoPath, `.orca-botmux-mwt-arrivals-${runId}.jsonl`)
+    const loadPath = path.join(testRepoPath, `.botmux-mwt-load-${runId}.mjs`)
+    const probePath = path.join(testRepoPath, `.botmux-mwt-probe-${runId}.mjs`)
+    const sidecarPath = path.join(testRepoPath, `.botmux-mwt-arrivals-${runId}.jsonl`)
     writeSustainedAgentLoadScript(loadPath, runId, testRepoPath)
     writeTypingEchoProbeScript(probePath, runId, sidecarPath)
 
     const cpuWorkers = spawnCpuPressureWorkers()
     let loadPanes: TerminalLoadPane[] = []
     try {
-      await switchToWorktree(orcaBotmuxPage, loadWorktreeId)
-      loadPanes = await ensureActiveWorktreePaneLoad(orcaBotmuxPage, LOAD_PANES)
-      await startSustainedLoadInPanes(orcaBotmuxPage, loadPanes, loadPath, runId, testRepoPath)
+      await switchToWorktree(botmuxPage, loadWorktreeId)
+      loadPanes = await ensureActiveWorktreePaneLoad(botmuxPage, LOAD_PANES)
+      await startSustainedLoadInPanes(botmuxPage, loadPanes, loadPath, runId, testRepoPath)
 
-      await switchToWorktree(orcaBotmuxPage, typingWorktreeId)
+      await switchToWorktree(botmuxPage, typingWorktreeId)
       await expect
-        .poll(() => getActiveWorktreeId(orcaBotmuxPage), { timeout: 10_000 })
+        .poll(() => getActiveWorktreeId(botmuxPage), { timeout: 10_000 })
         .toBe(typingWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      const typingPtyId = await waitForActivePanePtyId(orcaBotmuxPage)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      const typingPtyId = await waitForActivePanePtyId(botmuxPage)
 
-      await resetDeliveryDebug(orcaBotmuxPage)
+      await resetDeliveryDebug(botmuxPage)
       // Load is flowing when the hidden-delivery gate starts dropping the
       // background worktree's bytes — the topology the complaint describes.
       await expect
         .poll(
-          async () => (await readMainDeliveryDebug(orcaBotmuxPage))?.hiddenDeliveryDroppedChars ?? 0,
+          async () => (await readMainDeliveryDebug(botmuxPage))?.hiddenDeliveryDroppedChars ?? 0,
           { timeout: 30_000, message: 'hidden load never started flowing' }
         )
         .toBeGreaterThan(0)
 
-      await startTypingProbe(orcaBotmuxPage, typingPtyId, probePath, runId)
-      const measurement = await measurePacedTyping(orcaBotmuxPage, runId, sidecarPath)
+      await startTypingProbe(botmuxPage, typingPtyId, probePath, runId)
+      const measurement = await measurePacedTyping(botmuxPage, runId, sidecarPath)
       writeBenchReport(
         testInfo,
         `hidden-load-${LOAD_PANES}x${LOAD_RATE_KBPS}kbps-cpu${CPU_WORKERS}`,
         measurement,
-        await readSchedulerDebug(orcaBotmuxPage),
-        await readMainDeliveryDebug(orcaBotmuxPage)
+        await readSchedulerDebug(botmuxPage),
+        await readMainDeliveryDebug(botmuxPage)
       )
       // Hang detector only — the JSON report is the benchmark output. A
       // reproduced regression shows up as large percentiles, not a hard fail.
       expect(measurement.missingEchoCount).toBe(0)
 
-      await stopPtysQuietly(orcaBotmuxPage, [typingPtyId])
+      await stopPtysQuietly(botmuxPage, [typingPtyId])
     } finally {
       for (const worker of cpuWorkers) {
         worker.kill('SIGKILL')
       }
-      await switchToWorktree(orcaBotmuxPage, loadWorktreeId).catch(() => undefined)
+      await switchToWorktree(botmuxPage, loadWorktreeId).catch(() => undefined)
       await stopPtysQuietly(
-        orcaBotmuxPage,
+        botmuxPage,
         loadPanes.map((pane) => pane.ptyId)
       )
-      await switchToWorktree(orcaBotmuxPage, typingWorktreeId).catch(() => undefined)
+      await switchToWorktree(botmuxPage, typingWorktreeId).catch(() => undefined)
       rmSync(loadPath, { force: true })
       rmSync(probePath, { force: true })
       rmSync(sidecarPath, { force: true })
@@ -548,19 +548,19 @@ test.describe('Multi-workspace sustained typing latency bench', () => {
   })
 
   test('typing under sustained visible split agent load', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo) => {
     test.skip(!BENCH_ENABLED, 'Bench-only: run via pnpm bench:multi-workspace-typing')
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     const runId = randomUUID()
-    const loadPath = path.join(testRepoPath, `.orca-botmux-mwt-load-${runId}.mjs`)
-    const probePath = path.join(testRepoPath, `.orca-botmux-mwt-probe-${runId}.mjs`)
-    const sidecarPath = path.join(testRepoPath, `.orca-botmux-mwt-arrivals-${runId}.jsonl`)
+    const loadPath = path.join(testRepoPath, `.botmux-mwt-load-${runId}.mjs`)
+    const probePath = path.join(testRepoPath, `.botmux-mwt-probe-${runId}.mjs`)
+    const sidecarPath = path.join(testRepoPath, `.botmux-mwt-arrivals-${runId}.jsonl`)
     writeSustainedAgentLoadScript(loadPath, runId, testRepoPath)
     writeTypingEchoProbeScript(probePath, runId, sidecarPath)
 
@@ -569,20 +569,20 @@ test.describe('Multi-workspace sustained typing latency bench', () => {
     try {
       // Pane 0 types; the rest replay the agent stream side by side — the
       // "Claude Code running in a visible split" shape.
-      panes = await ensureActiveWorktreePaneLoad(orcaBotmuxPage, 2)
+      panes = await ensureActiveWorktreePaneLoad(botmuxPage, 2)
       const [typingPane, ...loadPanes] = panes
-      await startSustainedLoadInPanes(orcaBotmuxPage, loadPanes, loadPath, runId, testRepoPath)
-      await focusPane(orcaBotmuxPage, typingPane.paneKey)
+      await startSustainedLoadInPanes(botmuxPage, loadPanes, loadPath, runId, testRepoPath)
+      await focusPane(botmuxPage, typingPane.paneKey)
 
-      await resetDeliveryDebug(orcaBotmuxPage)
-      await startTypingProbe(orcaBotmuxPage, typingPane.ptyId, probePath, runId)
-      const measurement = await measurePacedTyping(orcaBotmuxPage, runId, sidecarPath)
+      await resetDeliveryDebug(botmuxPage)
+      await startTypingProbe(botmuxPage, typingPane.ptyId, probePath, runId)
+      const measurement = await measurePacedTyping(botmuxPage, runId, sidecarPath)
       writeBenchReport(
         testInfo,
         `visible-split-${LOAD_RATE_KBPS}kbps-cpu${CPU_WORKERS}`,
         measurement,
-        await readSchedulerDebug(orcaBotmuxPage),
-        await readMainDeliveryDebug(orcaBotmuxPage)
+        await readSchedulerDebug(botmuxPage),
+        await readMainDeliveryDebug(botmuxPage)
       )
       expect(measurement.missingEchoCount).toBe(0)
     } finally {
@@ -590,7 +590,7 @@ test.describe('Multi-workspace sustained typing latency bench', () => {
         worker.kill('SIGKILL')
       }
       await stopPtysQuietly(
-        orcaBotmuxPage,
+        botmuxPage,
         panes.map((pane) => pane.ptyId)
       )
       rmSync(loadPath, { force: true })

@@ -114,7 +114,7 @@ function buildWslShellArgs(linuxCwd: string, distro?: string): string[] {
     buildWslInteractiveLoginShellCommand()
   ].join(' && ')
   // Why: WSL users often customize zsh rather than bash; launch the distro's
-  // login shell so terminal PATH matches the environment OrcaBotmux detects.
+  // login shell so terminal PATH matches the environment Botmux detects.
   const shellArgs = ['--', 'sh', '-c', escapeWslShCommandForWindows(setupCommand)]
   return distro ? ['-d', distro, ...shellArgs] : shellArgs
 }

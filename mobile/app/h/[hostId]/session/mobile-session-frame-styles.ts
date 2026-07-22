@@ -121,6 +121,18 @@ export const mobileSessionFrameStyles = StyleSheet.create({
   tabTextActive: {
     color: colors.textPrimary
   },
+  /** Visible close control so users do not need to discover long-press. */
+  tabCloseButton: {
+    marginLeft: 2,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  tabCloseButtonPressed: {
+    backgroundColor: colors.bgRaised
+  },
   newTerminalButton: {
     width: 40,
     height: 36,

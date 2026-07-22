@@ -77,12 +77,12 @@ describe('getWorkItemDetails PR file viewed state', () => {
       number: 42,
       title: 'Review files',
       state: 'open',
-      url: 'https://github.com/stablyai/orca_botmux/pull/42',
+      url: 'https://github.com/stablyai/botmux/pull/42',
       labels: [],
       updatedAt: '2026-04-01T00:00:00Z',
       author: null
     })
-    getOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'orca_botmux' })
+    getOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'botmux' })
     getPRCommentsMock.mockResolvedValue([])
     getPRChecksMock.mockResolvedValue([])
     ghExecFileAsyncMock.mockImplementation((args: string[]) => {
@@ -115,7 +115,7 @@ describe('getWorkItemDetails PR file viewed state', () => {
         })
       }
       const endpoint = args.find((arg) => arg.startsWith('repos/')) ?? ''
-      if (endpoint === 'repos/stablyai/orca_botmux/pulls/42') {
+      if (endpoint === 'repos/stablyai/botmux/pulls/42') {
         return Promise.resolve({
           stdout: JSON.stringify({
             body: 'PR body',
@@ -124,7 +124,7 @@ describe('getWorkItemDetails PR file viewed state', () => {
           })
         })
       }
-      if (endpoint === 'repos/stablyai/orca_botmux/pulls/42/files?per_page=100') {
+      if (endpoint === 'repos/stablyai/botmux/pulls/42/files?per_page=100') {
         return Promise.resolve({
           stdout: JSON.stringify([
             {
@@ -176,12 +176,12 @@ describe('getWorkItemDetails PR file viewed state', () => {
       number: 42,
       title: 'Review files',
       state: 'open',
-      url: 'https://github.com/stablyai/orca_botmux/pull/42',
+      url: 'https://github.com/stablyai/botmux/pull/42',
       labels: [],
       updatedAt: '2026-04-01T00:00:00Z',
       author: null
     })
-    getOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'orca_botmux' })
+    getOwnerRepoMock.mockResolvedValue({ owner: 'stablyai', repo: 'botmux' })
     getPRCommentsMock.mockResolvedValue([])
     getPRChecksMock.mockRejectedValue(
       Object.assign(new Error('Command failed: gh pr checks 42'), {
@@ -213,7 +213,7 @@ describe('getWorkItemDetails PR file viewed state', () => {
         })
       }
       const endpoint = args.find((arg) => arg.startsWith('repos/')) ?? ''
-      if (endpoint === 'repos/stablyai/orca_botmux/pulls/42') {
+      if (endpoint === 'repos/stablyai/botmux/pulls/42') {
         return Promise.resolve({
           stdout: JSON.stringify({
             body: 'PR body',
@@ -222,7 +222,7 @@ describe('getWorkItemDetails PR file viewed state', () => {
           })
         })
       }
-      if (endpoint === 'repos/stablyai/orca_botmux/pulls/42/files?per_page=100') {
+      if (endpoint === 'repos/stablyai/botmux/pulls/42/files?per_page=100') {
         return Promise.resolve({ stdout: '[]' })
       }
       return Promise.reject(new Error(`unexpected gh call: ${args.join(' ')}`))

@@ -53,11 +53,11 @@ export function CliRegistrationDialog({
             {isEnabled
               ? translate(
                   'auto.components.settings.CliSection.a030816e3e',
-                  'This removes the shell command symlink. OrcaBotmux itself remains installed.'
+                  'This removes the shell command symlink. Botmux itself remains installed.'
                 )
               : translate(
                   'auto.components.settings.CliSection.aa6536977e',
-                  'OrcaBotmux will register {{value0}} so the command works from your terminal.',
+                  'Botmux will register {{value0}} so the command works from your terminal.',
                   { value0: commandPath ?? commandName }
                 )}
           </DialogDescription>

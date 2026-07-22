@@ -3,7 +3,7 @@ import {
   AGENT_HOOK_INSTALL_PLUGINS_METHOD,
   AGENT_HOOK_NOTIFICATION_METHOD,
   AGENT_HOOK_REQUEST_REPLAY_METHOD,
-  ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV,
+  BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV,
   isRemoteAgentHooksEnabled,
   type AgentHookRelayEnvelope
 } from './agent-hook-relay'
@@ -44,14 +44,14 @@ describe('isRemoteAgentHooksEnabled', () => {
   })
 
   it('is off for empty / "0"', () => {
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '' })).toBe(false)
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '0' })).toBe(false)
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '   ' })).toBe(false)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '' })).toBe(false)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '0' })).toBe(false)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '   ' })).toBe(false)
   })
 
   it('is on for any other non-empty value', () => {
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '1' })).toBe(true)
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: 'on' })).toBe(true)
-    expect(isRemoteAgentHooksEnabled({ [ORCA_FEATURE_REMOTE_AGENT_HOOKS_ENV]: 'true' })).toBe(true)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: '1' })).toBe(true)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: 'on' })).toBe(true)
+    expect(isRemoteAgentHooksEnabled({ [BOTMUX_FEATURE_REMOTE_AGENT_HOOKS_ENV]: 'true' })).toBe(true)
   })
 })

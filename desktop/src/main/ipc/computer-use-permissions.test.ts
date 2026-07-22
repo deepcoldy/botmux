@@ -30,7 +30,7 @@ describe('registerComputerUsePermissionHandlers', () => {
   it('launches the computer-use helper setup', async () => {
     const result = {
       platform: 'darwin',
-      helperAppPath: '/Applications/OrcaBotmux Computer Use.app',
+      helperAppPath: '/Applications/Botmux Computer Use.app',
       permissionId: 'accessibility',
       openedSettings: false,
       launchedHelper: true

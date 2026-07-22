@@ -114,7 +114,7 @@ describe('sendNativeChatMessage', () => {
     expect(sendRuntimePtyInput).not.toHaveBeenCalled()
   })
 
-  it('matches orca-botmux-runtime writeTerminalAction Enter gap (500ms)', () => {
+  it('matches botmux-runtime writeTerminalAction Enter gap (500ms)', () => {
     expect(NATIVE_CHAT_SUBMIT_DELAY_MS).toBe(500)
   })
 
@@ -248,7 +248,7 @@ describe('sendNativeChatMessageWithImageAttachments', () => {
 
   it('clears the line, then bracket-pastes image paths before prompt text', () => {
     const handle = sendNativeChatMessageWithImageAttachments(SETTINGS, PTY, 'what do you see?', [
-      '/tmp/orca-botmux-paste-image.png'
+      '/tmp/botmux-paste-image.png'
     ])
 
     expect(handle.settleAfterMs).toBe(
@@ -257,7 +257,7 @@ describe('sendNativeChatMessageWithImageAttachments', () => {
 
     expectWriteOrder(sendRuntimePtyInput.mock.calls, [
       NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT,
-      buildNativeChatImagePasteBytes('/tmp/orca-botmux-paste-image.png')
+      buildNativeChatImagePasteBytes('/tmp/botmux-paste-image.png')
     ])
 
     vi.advanceTimersByTime(NATIVE_CHAT_IMAGE_ATTACHMENT_SETTLE_MS)
@@ -274,14 +274,14 @@ describe('sendNativeChatMessageWithImageAttachments', () => {
 
   it('waits the normal submit gap for an attachment-only send', () => {
     const handle = sendNativeChatMessageWithImageAttachments(SETTINGS, PTY, '', [
-      '/tmp/orca-botmux-paste-image.png'
+      '/tmp/botmux-paste-image.png'
     ])
 
     expect(handle.settleAfterMs).toBe(NATIVE_CHAT_SUBMIT_DELAY_MS)
 
     expectWriteOrder(sendRuntimePtyInput.mock.calls, [
       NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT,
-      buildNativeChatImagePasteBytes('/tmp/orca-botmux-paste-image.png')
+      buildNativeChatImagePasteBytes('/tmp/botmux-paste-image.png')
     ])
 
     vi.advanceTimersByTime(NATIVE_CHAT_SUBMIT_DELAY_MS - 1)
@@ -294,7 +294,7 @@ describe('sendNativeChatMessageWithImageAttachments', () => {
 
   it('cancels deferred prompt and Enter writes after the attachment path', () => {
     const handle = sendNativeChatMessageWithImageAttachments(SETTINGS, PTY, 'describe', [
-      '/tmp/orca-botmux-paste-image.png'
+      '/tmp/botmux-paste-image.png'
     ])
     handle.cancel()
     vi.runAllTimers()
@@ -302,7 +302,7 @@ describe('sendNativeChatMessageWithImageAttachments', () => {
     // Pre-clear + image body + cancel clear; no Enter.
     expectWriteOrder(sendRuntimePtyInput.mock.calls, [
       NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT,
-      buildNativeChatImagePasteBytes('/tmp/orca-botmux-paste-image.png'),
+      buildNativeChatImagePasteBytes('/tmp/botmux-paste-image.png'),
       NATIVE_CHAT_CLEAR_UNSUBMITTED_INPUT
     ])
     expect(sendRuntimePtyInput.mock.calls.some((call) => call[2] === NATIVE_CHAT_SUBMIT)).toBe(

@@ -48,8 +48,8 @@ describe('buildNativeChatPasteBytes', () => {
 
 describe('buildNativeChatImagePasteBytes', () => {
   it('always bracket-pastes the image path so agent TUIs attach it as an image', () => {
-    expect(buildNativeChatImagePasteBytes('/tmp/orca-botmux-paste-image.png')).toBe(
-      `${BEGIN}/tmp/orca-botmux-paste-image.png${END}`
+    expect(buildNativeChatImagePasteBytes('/tmp/botmux-paste-image.png')).toBe(
+      `${BEGIN}/tmp/botmux-paste-image.png${END}`
     )
   })
 

@@ -25,13 +25,13 @@ async function renderLine(): Promise<HTMLDivElement> {
   await act(async () => {
     root.render(
       <NewExternalWorktreesInboxLine
-        repoDisplayName="orca_botmux"
+        repoDisplayName="botmux"
         inboxWorktrees={[
           {
             id: 'external-1',
             displayName: 'payments-refactor',
             branch: 'refs/heads/payments-refactor',
-            path: '/worktrees/orca_botmux/payments-refactor'
+            path: '/worktrees/botmux/payments-refactor'
           }
         ]}
         pending={false}
@@ -64,14 +64,14 @@ describe('NewExternalWorktreesInboxLine', () => {
     const container = await renderLine()
 
     const suppressButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Hide external worktrees permanently for orca_botmux"]'
+      'button[aria-label="Hide external worktrees permanently for botmux"]'
     )
     expect(suppressButton).not.toBeNull()
     expect(suppressButton?.className).toContain('can-hover:group-hover:opacity-100')
     expect(container.textContent).toContain("Don't show again")
 
     const expandButton = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Expand new externally-created worktrees for orca_botmux"]'
+      'button[aria-label="Expand new externally-created worktrees for botmux"]'
     )
     await act(async () => {
       expandButton?.click()

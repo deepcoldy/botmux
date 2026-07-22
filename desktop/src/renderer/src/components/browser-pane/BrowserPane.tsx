@@ -60,9 +60,9 @@ import { Label } from '@/components/ui/label'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { useAppStore } from '@/store'
 import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
-import { ORCA_BROWSER_BLANK_URL, ORCA_BROWSER_PARTITION } from '../../../../shared/constants'
+import { BOTMUX_BROWSER_BLANK_URL, BOTMUX_BROWSER_PARTITION } from '../../../../shared/constants'
 import { BROWSER_CERTIFICATE_TRUST_RUNTIME_CAPABILITY } from '../../../../shared/protocol-version'
-import { getOrcaProfileBrowserDefaultPartition } from '../../../../shared/orca-botmux-profiles'
+import { getBotmuxProfileBrowserDefaultPartition } from '../../../../shared/botmux-profiles'
 import type {
   BrowserCertificateProceedResult,
   BrowserLoadError,
@@ -132,7 +132,7 @@ import {
 } from './remote-browser-keyboard'
 import {
   consumeBrowserFocusRequest,
-  ORCA_BROWSER_FOCUS_REQUEST_EVENT,
+  BOTMUX_BROWSER_FOCUS_REQUEST_EVENT,
   type BrowserFocusRequestDetail
 } from './browser-focus'
 import {
@@ -561,15 +561,15 @@ function buildLoadError(event: {
 }
 
 function toDisplayUrl(url: string): string {
-  return url === ORCA_BROWSER_BLANK_URL ? 'about:blank' : redactKagiSessionToken(url)
+  return url === BOTMUX_BROWSER_BLANK_URL ? 'about:blank' : redactKagiSessionToken(url)
 }
 
 function getBrowserDisplayTitle(title: string | null | undefined, url: string): string {
   if (
     url === 'about:blank' ||
-    url === ORCA_BROWSER_BLANK_URL ||
+    url === BOTMUX_BROWSER_BLANK_URL ||
     title === 'about:blank' ||
-    title === ORCA_BROWSER_BLANK_URL ||
+    title === BOTMUX_BROWSER_BLANK_URL ||
     !title
   ) {
     return 'New Tab'
@@ -1460,7 +1460,7 @@ function RemoteBrowserPagePane({
       const createRemotePage = async (): Promise<string | null> => {
         const currentUrl = currentBrowserTabUrlRef.current
         const initialUrl =
-          currentUrl === ORCA_BROWSER_BLANK_URL ? 'about:blank' : currentUrl || 'about:blank'
+          currentUrl === BOTMUX_BROWSER_BLANK_URL ? 'about:blank' : currentUrl || 'about:blank'
         const created = await callRuntimeRpc<{ browserPageId: string }>(
           target,
           'browser.tabCreate',
@@ -1949,9 +1949,9 @@ function RemoteBrowserPagePane({
       const target = imageRef.current ?? remoteViewportRef.current
       target?.focus()
     }
-    window.addEventListener(ORCA_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
+    window.addEventListener(BOTMUX_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
     return () =>
-      window.removeEventListener(ORCA_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
+      window.removeEventListener(BOTMUX_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
   }, [browserTab.id, isActive])
 
   const runRemoteNavigation = useCallback(
@@ -2425,7 +2425,7 @@ function RemoteBrowserPagePane({
   const showRemoteFailureOverlay =
     Boolean(browserTab.loadError) &&
     remoteFailureUrl !== 'about:blank' &&
-    remoteFailureUrl !== ORCA_BROWSER_BLANK_URL
+    remoteFailureUrl !== BOTMUX_BROWSER_BLANK_URL
 
   // Why: markup works on remote panes by snapshotting the already-displayed
   // screencast <img> — no in-page injection needed, so it is enabled here even
@@ -2478,7 +2478,7 @@ function RemoteBrowserPagePane({
                     >
                       {translate(
                         'auto.components.browser.pane.BrowserPane.b5b87d6cbb',
-                        'Open Link In OrcaBotmux Browser'
+                        'Open Link In Botmux Browser'
                       )}
                     </button>
                     <button
@@ -2973,9 +2973,9 @@ function BrowserPagePane({
   const createBrowserTab = useAppStore((s) => s.createBrowserTab)
   const consumeAddressBarFocusRequest = useAppStore((s) => s.consumeAddressBarFocusRequest)
   const browserSessionProfiles = useAppStore((s) => s.browserSessionProfiles)
-  const activeOrcaProfileId = useAppStore((s) => s.activeOrcaProfileId)
-  const fallbackBrowserPartition = activeOrcaProfileId
-    ? getOrcaProfileBrowserDefaultPartition(activeOrcaProfileId)
+  const activeBotmuxProfileId = useAppStore((s) => s.activeBotmuxProfileId)
+  const fallbackBrowserPartition = activeBotmuxProfileId
+    ? getBotmuxProfileBrowserDefaultPartition(activeBotmuxProfileId)
     : null
   const defaultSessionProfile = browserSessionProfiles.find((p) => p.id === 'default') ?? null
   const sessionProfile = sessionProfileId
@@ -2986,7 +2986,7 @@ function BrowserPagePane({
     sessionProfile?.partition ??
     defaultSessionProfile?.partition ??
     fallbackBrowserPartition ??
-    ORCA_BROWSER_PARTITION
+    BOTMUX_BROWSER_PARTITION
   const browserSessionImportState = useAppStore((s) => s.browserSessionImportState)
   const clearBrowserSessionImportState = useAppStore((s) => s.clearBrowserSessionImportState)
   const showBrowserZoomFeedback = useCallback((level: number): void => {
@@ -3510,9 +3510,9 @@ function BrowserPagePane({
     // re-selecting an already-active page never remounts. Listening for the
     // matching event lets the active pane consume the durable request
     // immediately without regressing the mount/activation path above.
-    window.addEventListener(ORCA_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
+    window.addEventListener(BOTMUX_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
     return () =>
-      window.removeEventListener(ORCA_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
+      window.removeEventListener(BOTMUX_BROWSER_FOCUS_REQUEST_EVENT, handleBrowserFocusRequest)
   }, [browserTab.id, focusAddressBarNow, focusWebviewNow, isActive])
 
   // Cmd/Ctrl+F — find in page (renderer path: focus on browser chrome)
@@ -3698,13 +3698,13 @@ function BrowserPagePane({
           // when no user-visible navigation happened. If we sync that into the
           // tab model on every activation, switching tabs flashes the blue
           // loading dot and makes hidden tabs look like they are reloading.
-          // Only explicit navigation/load events should drive OrcaBotmux's loading UI.
+          // Only explicit navigation/load events should drive Botmux's loading UI.
           canGoBack: webview.canGoBack(),
           canGoForward: webview.canGoForward()
         })
       } catch {
         // Why: Electron only exposes these getters after the guest fully
-        // attaches. Ignoring the transient failure avoids crashing OrcaBotmux while
+        // attaches. Ignoring the transient failure avoids crashing Botmux while
         // the webview guest becomes ready.
       }
     },
@@ -3928,7 +3928,7 @@ function BrowserPagePane({
           trackNextLoadingEventRef.current = false
           // Why: some webview failures still emit did-stop-loading on the
           // original destination URL. If we clear loadError here, the failed
-          // navigation falls back to a blank Chromium surface even though OrcaBotmux
+          // navigation falls back to a blank Chromium surface even though Botmux
           // already knows this exact load failed.
           onUpdatePageStateRef.current(browserTab.id, {
             loading: false,
@@ -3952,7 +3952,7 @@ function BrowserPagePane({
         setAddressBarValue(toDisplayUrl(browserModelUrl))
       }
       onSetUrlRef.current(browserTab.id, browserModelUrl)
-      if (keepAddressBarFocusRef.current && currentUrl === ORCA_BROWSER_BLANK_URL) {
+      if (keepAddressBarFocusRef.current && currentUrl === BOTMUX_BROWSER_BLANK_URL) {
         focusAddressBarNow()
       } else {
         keepAddressBarFocusRef.current = false
@@ -4026,7 +4026,7 @@ function BrowserPagePane({
       }
       if (event.errorCode === -3) {
         // Why: Chromium reports redirect/cancel races as ERR_ABORTED (-3) even
-        // when the replacement navigation succeeds. Ignore that noise so OrcaBotmux
+        // when the replacement navigation succeeds. Ignore that noise so Botmux
         // does not show a false load failure for a working page.
         return
       }
@@ -4089,11 +4089,11 @@ function BrowserPagePane({
     if (needsInitialNavigation) {
       // Why: connection-refused localhost tabs can fail before Electron wires up
       // event delivery if src is assigned too early. Attach listeners first so
-      // OrcaBotmux never misses the initial did-fail-load signal for a new tab.
-      // Only non-blank initial tabs should light up OrcaBotmux's loading indicator.
+      // Botmux never misses the initial did-fail-load signal for a new tab.
+      // Only non-blank initial tabs should light up Botmux's loading indicator.
       const initialUrl =
-        normalizeBrowserNavigationUrl(initialBrowserUrlRef.current) ?? ORCA_BROWSER_BLANK_URL
-      trackNextLoadingEventRef.current = initialUrl !== ORCA_BROWSER_BLANK_URL
+        normalizeBrowserNavigationUrl(initialBrowserUrlRef.current) ?? BOTMUX_BROWSER_BLANK_URL
+      trackNextLoadingEventRef.current = initialUrl !== BOTMUX_BROWSER_BLANK_URL
       lastKnownWebviewUrlRef.current = initialUrl
       webview.src = initialUrl
     }
@@ -4212,13 +4212,13 @@ function BrowserPagePane({
       webview.src !== normalizedUrl &&
       declaredSrc !== normalizedUrl
     ) {
-      // Why: browserTab.url changes are OrcaBotmux-driven navigations (address bar,
+      // Why: browserTab.url changes are Botmux-driven navigations (address bar,
       // terminal link open, retry target update). Gate the next did-start-loading
       // event so only real navigations, not tab activation churn, show loading UI.
-      trackNextLoadingEventRef.current = normalizedUrl !== ORCA_BROWSER_BLANK_URL
+      trackNextLoadingEventRef.current = normalizedUrl !== BOTMUX_BROWSER_BLANK_URL
       lastKnownWebviewUrlRef.current = normalizedUrl
       webview.src = normalizedUrl
-      if (normalizedUrl !== ORCA_BROWSER_BLANK_URL) {
+      if (normalizedUrl !== BOTMUX_BROWSER_BLANK_URL) {
         keepAddressBarFocusRef.current = false
         if (document.activeElement === addressBarInputRef.current) {
           focusWebviewNow()
@@ -4264,7 +4264,7 @@ function BrowserPagePane({
 
     // Why: some Electron builds paint Chromium's internal chrome-error page
     // without delivering a timely did-fail-load event to the renderer webview.
-    // Polling only while the active tab is "loading" gives OrcaBotmux a last-resort
+    // Polling only while the active tab is "loading" gives Botmux a last-resort
     // path to swap the black guest surface without waking every retained
     // inactive browser pane on a 250ms loop.
     detectChromiumErrorPage()
@@ -4678,11 +4678,11 @@ function BrowserPagePane({
         if (!webview) {
           return
         }
-        trackNextLoadingEventRef.current = targetUrl !== ORCA_BROWSER_BLANK_URL
+        trackNextLoadingEventRef.current = targetUrl !== BOTMUX_BROWSER_BLANK_URL
         lastKnownWebviewUrlRef.current =
           normalizeBrowserNavigationUrl(browserModelUrl) ?? browserModelUrl
         webview.src = targetUrl
-        if (targetUrl !== ORCA_BROWSER_BLANK_URL) {
+        if (targetUrl !== BOTMUX_BROWSER_BLANK_URL) {
           focusWebviewNow()
         }
       }
@@ -4772,7 +4772,7 @@ function BrowserPagePane({
   // Why: the store initially holds 'about:blank', but once the webview loads
   // with the safe data: URL, handleDidStopLoading writes the resolved URL back.
   // Match both so the "New Browser Tab" overlay stays visible for blank tabs.
-  const isBlankTab = browserTab.url === 'about:blank' || browserTab.url === ORCA_BROWSER_BLANK_URL
+  const isBlankTab = browserTab.url === 'about:blank' || browserTab.url === BOTMUX_BROWSER_BLANK_URL
   const externalUrl = getOpenableExternalUrl(webviewRef.current, browserTab.url)
   const currentBrowserUrl = getCurrentBrowserUrl(webviewRef.current, browserTab.url)
   const failedNavigationUrl = browserTab.loadError?.validatedUrl ?? currentBrowserUrl
@@ -4957,7 +4957,7 @@ function BrowserPagePane({
                     >
                       {translate(
                         'auto.components.browser.pane.BrowserPane.b5b87d6cbb',
-                        'Open Link In OrcaBotmux Browser'
+                        'Open Link In Botmux Browser'
                       )}
                     </button>
                     <button

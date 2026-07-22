@@ -51,7 +51,7 @@ export function getShortcutTerminalStatus(
   })
   return activeInTerminal
     ? {
-        label: translate('auto.components.settings.ShortcutsPane.2a0e8aeccf', 'OrcaBotmux first'),
+        label: translate('auto.components.settings.ShortcutsPane.2a0e8aeccf', 'Botmux first'),
         description: translate(
           'auto.components.settings.ShortcutsPane.dfa8ff612f',
           'Also runs while a terminal or TUI has keyboard focus.'

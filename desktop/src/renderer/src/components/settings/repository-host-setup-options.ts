@@ -68,7 +68,7 @@ function getHostSetupAvailability(host: ExecutionHostRegistryEntry): {
       isAvailable: false,
       detail: translate(
         'auto.components.settings.RepositoryPane.hostSetupBlockedVersion',
-        'OrcaBotmux server version is incompatible'
+        'Botmux server version is incompatible'
       )
     }
   }
@@ -91,7 +91,7 @@ function getHostSetupAvailability(host: ExecutionHostRegistryEntry): {
         isAvailable: false,
         detail: translate(
           'auto.components.settings.RepositoryPane.hostSetupMissingCapability',
-          'Update OrcaBotmux on this host to set up projects'
+          'Update Botmux on this host to set up projects'
         )
       }
     }

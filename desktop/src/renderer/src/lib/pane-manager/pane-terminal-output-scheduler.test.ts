@@ -1412,7 +1412,7 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(0)
 
     const output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).toContain('OrcaBotmux skipped hidden terminal output')
+    expect(output).toContain('Botmux skipped hidden terminal output')
     expect(output).toContain('after-cap')
     expect(output).not.toContain('x'.repeat(1024))
   })
@@ -1434,7 +1434,7 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(0)
 
     const output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).toContain('OrcaBotmux skipped a burst of terminal output')
+    expect(output).toContain('Botmux skipped a burst of terminal output')
     expect(output).toContain('after-cap')
     expect(output).not.toContain('x'.repeat(1024))
   })
@@ -1474,7 +1474,7 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(0)
 
     let output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).not.toContain('OrcaBotmux skipped')
+    expect(output).not.toContain('Botmux skipped')
     expect(output).toContain('x'.repeat(1024))
 
     // But the scaled cap still bounds a runaway flood.
@@ -1484,7 +1484,7 @@ describe('pane terminal output scheduler', () => {
     }
     vi.advanceTimersByTime(0)
     output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).toContain('OrcaBotmux skipped a burst of terminal output')
+    expect(output).toContain('Botmux skipped a burst of terminal output')
   })
 
   it('caps a held/coalesced foreground backlog as well', async () => {
@@ -1502,7 +1502,7 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(1_000)
 
     const output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).toContain('OrcaBotmux skipped a burst of terminal output')
+    expect(output).toContain('Botmux skipped a burst of terminal output')
     expect(output).not.toContain('y'.repeat(1024))
   })
 
@@ -1518,7 +1518,7 @@ describe('pane terminal output scheduler', () => {
     vi.advanceTimersByTime(0)
 
     const output = terminal.write.mock.calls.map(([data]) => data).join('')
-    expect(output).toContain('OrcaBotmux skipped hidden terminal output')
+    expect(output).toContain('Botmux skipped hidden terminal output')
     expect(output).not.toContain('x'.repeat(512))
   })
 

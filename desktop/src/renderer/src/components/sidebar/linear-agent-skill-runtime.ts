@@ -4,7 +4,7 @@ import type { SkillDiscoveryTarget } from '../../../../shared/skills'
 import { translate } from '@/i18n/i18n'
 import type { LocalAgentRuntime } from '../settings/CliSkillRuntimeSetup'
 
-const LOCAL_DISMISS_STORAGE_KEY_PREFIX = 'orca_botmux.linearTicketsSkill.setupDismissed'
+const LOCAL_DISMISS_STORAGE_KEY_PREFIX = 'botmux.linearTicketsSkill.setupDismissed'
 
 export type LinearAgentSkillPromptSettings = Pick<
   GlobalSettings,

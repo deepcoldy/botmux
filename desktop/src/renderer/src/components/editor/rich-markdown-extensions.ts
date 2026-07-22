@@ -22,7 +22,7 @@ import {
   createRichMarkdownLiteral
 } from './raw-markdown-html'
 import {
-  createOrcaDetailsExtensions,
+  createBotmuxDetailsExtensions,
   getRichMarkdownPlaceholder
 } from './rich-markdown-details-extension'
 import { createMarkdownDocLink } from './rich-markdown-doc-link'
@@ -64,7 +64,7 @@ export function createRichMarkdownExtensions({
   }
   const extensions: AnyExtension[] = [
     // Why: rich-mode detection must use the exact same markdown extension set as
-    // the live editor. If these drift, OrcaBotmux can claim a document is editable in
+    // the live editor. If these drift, Botmux can claim a document is editable in
     // preview and then still lose syntax on save.
     StarterKit.configure({
       link: false,
@@ -194,7 +194,7 @@ export function createRichMarkdownExtensions({
     TaskItem.configure({
       nested: true
     }),
-    ...createOrcaDetailsExtensions(),
+    ...createBotmuxDetailsExtensions(),
     Table.configure({
       resizable: false
     }),

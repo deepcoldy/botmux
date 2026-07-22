@@ -3,9 +3,9 @@ import { isWorkItemLookupText } from './work-item-lookup-text'
 
 describe('isWorkItemLookupText', () => {
   it('detects GitHub PR and issue URLs', () => {
-    expect(isWorkItemLookupText('https://github.com/stablyai/orca_botmux/pull/4900')).toBe(true)
-    expect(isWorkItemLookupText('https://github.com/stablyai/orca_botmux/issues/123')).toBe(true)
-    expect(isWorkItemLookupText('  https://www.github.com/stablyai/orca_botmux/pull/1 ')).toBe(true)
+    expect(isWorkItemLookupText('https://github.com/stablyai/botmux/pull/4900')).toBe(true)
+    expect(isWorkItemLookupText('https://github.com/stablyai/botmux/issues/123')).toBe(true)
+    expect(isWorkItemLookupText('  https://www.github.com/stablyai/botmux/pull/1 ')).toBe(true)
   })
 
   it('detects hash-number shorthand', () => {

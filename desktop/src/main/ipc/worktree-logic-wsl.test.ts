@@ -31,7 +31,7 @@ describe('computeWorktreePath WSL layout', () => {
         nestWorkspaces: true,
         workspaceDir: 'C:\\workspaces'
       })
-    ).toBe('\\\\wsl.localhost\\Ubuntu\\home\\jin\\orca_botmux\\workspaces\\repo\\feature')
+    ).toBe('\\\\wsl.localhost\\Ubuntu\\home\\jin\\botmux\\workspaces\\repo\\feature')
   })
 
   it('falls back to the configured Windows workspace when WSL home lookup fails', () => {

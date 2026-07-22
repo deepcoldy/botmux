@@ -145,7 +145,7 @@ export class ClaudeAccountService {
     try {
       const captured = await this.runClaudeLoginAndCapture(managedAuth)
       if (!captured.identity.email) {
-        throw new Error('Claude login completed, but OrcaBotmux could not resolve the account email.')
+        throw new Error('Claude login completed, but Botmux could not resolve the account email.')
       }
       // Why: duplicate rows confuse account selection and rate-limit tracking;
       // the per-row Re-authenticate action already refreshes credentials.
@@ -211,7 +211,7 @@ export class ClaudeAccountService {
       wslLinuxAuthPath: account.wslLinuxAuthPath ?? null
     })
     if (!captured.identity.email) {
-      throw new Error('Claude login completed, but OrcaBotmux could not resolve the account email.')
+      throw new Error('Claude login completed, but Botmux could not resolve the account email.')
     }
 
     const settings = this.store.getSettings()
@@ -523,7 +523,7 @@ export class ClaudeAccountService {
   } {
     if (location.managedAuthRuntime !== 'wsl') {
       return {
-        windowsPath: mkdtempSync(join(tmpdir(), 'orca-botmux-claude-login-')),
+        windowsPath: mkdtempSync(join(tmpdir(), 'botmux-claude-login-')),
         linuxPath: null,
         wslDistro: null
       }
@@ -539,7 +539,7 @@ export class ClaudeAccountService {
         '--',
         'bash',
         '-lc',
-        'mktemp -d "${TMPDIR:-/tmp}/orca-botmux-claude-login.XXXXXX"'
+        'mktemp -d "${TMPDIR:-/tmp}/botmux-claude-login.XXXXXX"'
       ],
       { encoding: 'utf-8', timeout: 5000 }
     )
@@ -752,7 +752,7 @@ export class ClaudeAccountService {
 
     const managedAuthPath = join(this.getManagedAccountsRoot(), accountId, 'auth')
     mkdirSync(managedAuthPath, { recursive: true })
-    writeFileSync(join(managedAuthPath, '.orca-botmux-managed-claude-auth'), `${accountId}\n`, 'utf-8')
+    writeFileSync(join(managedAuthPath, '.botmux-managed-claude-auth'), `${accountId}\n`, 'utf-8')
     return {
       managedAuthPath: this.assertManagedAuthPath(managedAuthPath, accountId),
       managedAuthRuntime: 'host',
@@ -785,8 +785,8 @@ export class ClaudeAccountService {
       throw new Error('Could not resolve the active WSL home directory for Claude login.')
     }
 
-    const wslLinuxAuthPath = `${home.replace(/\/$/, '')}/.local/share/orca_botmux/claude-accounts/${accountId}/auth`
-    const markerPath = `${wslLinuxAuthPath}/.orca-botmux-managed-claude-auth`
+    const wslLinuxAuthPath = `${home.replace(/\/$/, '')}/.local/share/botmux/claude-accounts/${accountId}/auth`
+    const markerPath = `${wslLinuxAuthPath}/.botmux-managed-claude-auth`
     execFileSync(
       'wsl.exe',
       [
@@ -819,10 +819,10 @@ export class ClaudeAccountService {
     const wslInfo = parseWslUncPath(candidatePath)
     if (wslInfo) {
       if (
-        !wslInfo.linuxPath.includes('/.local/share/orca_botmux/claude-accounts/') ||
+        !wslInfo.linuxPath.includes('/.local/share/botmux/claude-accounts/') ||
         !wslInfo.linuxPath.endsWith('/auth')
       ) {
-        throw new Error('Managed WSL Claude auth storage is outside OrcaBotmux account storage.')
+        throw new Error('Managed WSL Claude auth storage is outside Botmux account storage.')
       }
       if (process.platform === 'win32') {
         try {
@@ -838,13 +838,13 @@ export class ClaudeAccountService {
                 [
                   'set -euo pipefail',
                   `candidate=${shellQuote(wslInfo.linuxPath)}`,
-                  'managed_root="${HOME%/}/.local/share/orca_botmux/claude-accounts"',
+                  'managed_root="${HOME%/}/.local/share/botmux/claude-accounts"',
                   'candidate_real=$(readlink -f -- "$candidate")',
                   'managed_root_real=$(readlink -f -- "$managed_root")',
-                  'test -f "$candidate_real/.orca-botmux-managed-claude-auth"',
+                  'test -f "$candidate_real/.botmux-managed-claude-auth"',
                   expectedAccountId
-                    ? `test "$(cat "$candidate_real/.orca-botmux-managed-claude-auth")" = ${shellQuote(expectedAccountId)}`
-                    : 'test -n "$(cat "$candidate_real/.orca-botmux-managed-claude-auth")"',
+                    ? `test "$(cat "$candidate_real/.botmux-managed-claude-auth")" = ${shellQuote(expectedAccountId)}`
+                    : 'test -n "$(cat "$candidate_real/.botmux-managed-claude-auth")"',
                   'case "$candidate_real" in "$managed_root_real"/*/auth) printf "%s\\n" "$candidate_real" ;; *) exit 35 ;; esac'
                 ].join('\n')
               )
@@ -856,16 +856,16 @@ export class ClaudeAccountService {
           }
           return toWindowsWslPath(canonicalLinuxPath, wslInfo.distro)
         } catch (error) {
-          throw new Error('Managed WSL Claude auth storage is outside OrcaBotmux account storage.', {
+          throw new Error('Managed WSL Claude auth storage is outside Botmux account storage.', {
             cause: error
           })
         }
       }
       if (
         !existsSync(candidatePath) ||
-        !existsSync(join(candidatePath, '.orca-botmux-managed-claude-auth'))
+        !existsSync(join(candidatePath, '.botmux-managed-claude-auth'))
       ) {
-        throw new Error('Managed Claude auth storage is not owned by OrcaBotmux.')
+        throw new Error('Managed Claude auth storage is not owned by Botmux.')
       }
       return candidatePath
     }
@@ -879,7 +879,7 @@ export class ClaudeAccountService {
       adoptLegacyMarker: true
     })
     if (!trustedPath) {
-      throw new Error('Managed Claude auth storage is not owned by OrcaBotmux.')
+      throw new Error('Managed Claude auth storage is not owned by Botmux.')
     }
     return trustedPath
   }

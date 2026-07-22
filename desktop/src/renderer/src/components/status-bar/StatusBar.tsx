@@ -528,7 +528,7 @@ function getClaudeStatusAccountsFromSettings(
   }
 }
 
-// Why: with a Remote OrcaBotmux Server active, accounts persisted in local
+// Why: with a Remote Botmux Server active, accounts persisted in local
 // GlobalSettings describe this desktop, not the account owner; the snapshot
 // fetched from the server must win (#7973).
 export function resolveCodexStatusAccountState(
@@ -1874,7 +1874,7 @@ export function ProviderDetailsMenu({
 // StatusBar
 // ---------------------------------------------------------------------------
 
-const CLOSE_ALL_CONTEXT_MENUS_EVENT = 'orca-botmux-close-all-context-menus'
+const CLOSE_ALL_CONTEXT_MENUS_EVENT = 'botmux-close-all-context-menus'
 
 function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Element | null {
   const floatingTerminalShortcut = useShortcutLabel('floatingTerminal.toggle')
@@ -1961,7 +1961,7 @@ function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Ele
     setIsRefreshing(true)
     try {
       // Why: also re-run PATH detection so a freshly-installed CLI's bar
-      // appears (and a removed CLI's bar hides) without restarting OrcaBotmux.
+      // appears (and a removed CLI's bar hides) without restarting Botmux.
       await Promise.all([refreshRateLimits(), refreshDetectedAgents()])
     } finally {
       if (mountedRef.current) {
@@ -2242,7 +2242,7 @@ function StatusBarInner({ floatingTerminalOpen }: StatusBarProps): React.JSX.Ele
                 >
                   <PanelsTopLeft className="size-3.5" />
                   {showFloatingWorkspaceAttentionDot ? (
-                    // Why: amber = OrcaBotmux's "needs attention" convention; ring
+                    // Why: amber = Botmux's "needs attention" convention; ring
                     // matches the button fill so the dot reads on the icon.
                     <span
                       aria-hidden

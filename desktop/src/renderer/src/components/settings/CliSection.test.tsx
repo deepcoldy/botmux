@@ -95,7 +95,7 @@ describe('CliSection project runtime defaults', () => {
     await capturedPanel.props?.onBeforeOpenTerminal()
 
     expect(capturedPanel.useInstalledAgentSkill).toHaveBeenCalledWith(
-      'orca-botmux-cli',
+      'botmux-cli',
       expect.objectContaining({
         discoveryTarget: { runtime: 'wsl', wslDistro: 'Ubuntu' },
         sourceKinds: ['global']
@@ -114,17 +114,17 @@ describe('CliSection project runtime defaults', () => {
   it('renders an inline unknown PATH state without offering a mutation', async () => {
     const getInstallStatus = vi.fn().mockResolvedValue({
       platform: 'win32',
-      commandName: 'orca_botmux',
-      commandPath: 'C:\\Program Files\\OrcaBotmux\\resources\\bin\\orca_botmux.exe',
-      pathDirectory: 'C:\\Program Files\\OrcaBotmux\\resources\\bin',
+      commandName: 'botmux',
+      commandPath: 'C:\\Program Files\\Botmux\\resources\\bin\\botmux.exe',
+      pathDirectory: 'C:\\Program Files\\Botmux\\resources\\bin',
       pathConfigured: null,
-      launcherPath: 'C:\\Program Files\\OrcaBotmux\\resources\\bin\\orca_botmux.exe',
+      launcherPath: 'C:\\Program Files\\Botmux\\resources\\bin\\botmux.exe',
       installMethod: 'wrapper',
       supported: true,
       state: 'installed',
-      currentTarget: 'C:\\Program Files\\OrcaBotmux\\resources\\bin\\orca_botmux.exe',
+      currentTarget: 'C:\\Program Files\\Botmux\\resources\\bin\\botmux.exe',
       unsupportedReason: null,
-      detail: 'OrcaBotmux could not read the Windows user PATH registry value.'
+      detail: 'Botmux could not read the Windows user PATH registry value.'
     })
     Object.assign(window, {
       api: {

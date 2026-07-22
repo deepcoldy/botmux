@@ -74,7 +74,7 @@ export async function fetchReleases(repo, token, fetchImpl = fetch) {
 
 async function main() {
   const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN
-  const repo = process.env.GITHUB_REPOSITORY || 'stablyai/orca_botmux'
+  const repo = process.env.GITHUB_REPOSITORY || 'stablyai/botmux'
   const releases = await fetchReleases(repo, token)
   process.stdout.write(latestStableDesktopReleaseTag(releases))
 }

@@ -186,7 +186,7 @@ export type LinearProjectCreateInput = {
   targetDate?: string
 }
 
-const ORCA_PROJECT_FIELDS = `
+const BOTMUX_PROJECT_FIELDS = `
   id
   name
   description
@@ -242,8 +242,8 @@ const ORCA_PROJECT_FIELDS = `
   }
 `
 
-const ORCA_PROJECT_DETAIL_FIELDS = `
-  ${ORCA_PROJECT_FIELDS}
+const BOTMUX_PROJECT_DETAIL_FIELDS = `
+  ${BOTMUX_PROJECT_FIELDS}
   projectMilestones(first: 20) {
     nodes {
       id
@@ -275,7 +275,7 @@ const ORCA_PROJECT_DETAIL_FIELDS = `
   }
 `
 
-const ORCA_ISSUE_FIELDS = `
+const BOTMUX_ISSUE_FIELDS = `
   id
   identifier
   title
@@ -309,10 +309,10 @@ const ORCA_ISSUE_FIELDS = `
 `
 
 const PROJECTS_QUERY = `
-  query OrcaLinearProjects($first: Int, $filter: ProjectFilter, $orderBy: PaginationOrderBy) {
+  query BotmuxLinearProjects($first: Int, $filter: ProjectFilter, $orderBy: PaginationOrderBy) {
     projects(first: $first, filter: $filter, orderBy: $orderBy) {
       nodes {
-        ${ORCA_PROJECT_FIELDS}
+        ${BOTMUX_PROJECT_FIELDS}
       }
       pageInfo {
         hasNextPage
@@ -322,10 +322,10 @@ const PROJECTS_QUERY = `
 `
 
 const SEARCH_PROJECTS_QUERY = `
-  query OrcaLinearProjectSearch($term: String!, $first: Int, $after: String) {
+  query BotmuxLinearProjectSearch($term: String!, $first: Int, $after: String) {
     searchProjects(term: $term, first: $first, after: $after) {
       nodes {
-        ${ORCA_PROJECT_FIELDS}
+        ${BOTMUX_PROJECT_FIELDS}
       }
       pageInfo {
         hasNextPage
@@ -336,26 +336,26 @@ const SEARCH_PROJECTS_QUERY = `
 `
 
 const PROJECT_QUERY = `
-  query OrcaLinearProject($id: String!) {
+  query BotmuxLinearProject($id: String!) {
     project(id: $id) {
-      ${ORCA_PROJECT_DETAIL_FIELDS}
+      ${BOTMUX_PROJECT_DETAIL_FIELDS}
     }
   }
 `
 
 const CREATE_PROJECT_MUTATION = `
-  mutation OrcaLinearProjectCreate($input: ProjectCreateInput!) {
+  mutation BotmuxLinearProjectCreate($input: ProjectCreateInput!) {
     projectCreate(input: $input) {
       success
       project {
-        ${ORCA_PROJECT_DETAIL_FIELDS}
+        ${BOTMUX_PROJECT_DETAIL_FIELDS}
       }
     }
   }
 `
 
 const PROJECT_ISSUES_QUERY = `
-  query OrcaLinearProjectIssues(
+  query BotmuxLinearProjectIssues(
     $id: String!,
     $first: Int,
     $after: String,
@@ -364,7 +364,7 @@ const PROJECT_ISSUES_QUERY = `
     project(id: $id) {
       issues(first: $first, after: $after, orderBy: $orderBy) {
         nodes {
-          ${ORCA_ISSUE_FIELDS}
+          ${BOTMUX_ISSUE_FIELDS}
         }
         pageInfo {
           hasNextPage
@@ -376,7 +376,7 @@ const PROJECT_ISSUES_QUERY = `
 `
 
 const PROJECT_TEAMS_QUERY = `
-  query OrcaLinearProjectTeams($id: String!, $first: Int, $after: String) {
+  query BotmuxLinearProjectTeams($id: String!, $first: Int, $after: String) {
     project(id: $id) {
       teams(first: $first, after: $after) {
         nodes {
@@ -394,7 +394,7 @@ const PROJECT_TEAMS_QUERY = `
 `
 
 const CUSTOM_VIEWS_QUERY = `
-  query OrcaLinearCustomViews(
+  query BotmuxLinearCustomViews(
     $first: Int,
     $filter: CustomViewFilter,
     $orderBy: PaginationOrderBy
@@ -435,7 +435,7 @@ const CUSTOM_VIEWS_QUERY = `
 `
 
 const CUSTOM_VIEW_QUERY = `
-  query OrcaLinearCustomView($id: String!) {
+  query BotmuxLinearCustomView($id: String!) {
     customView(id: $id) {
       id
       name
@@ -467,7 +467,7 @@ const CUSTOM_VIEW_QUERY = `
 `
 
 const CUSTOM_VIEW_ISSUES_QUERY = `
-  query OrcaLinearCustomViewIssues(
+  query BotmuxLinearCustomViewIssues(
     $id: String!,
     $first: Int,
     $after: String,
@@ -478,7 +478,7 @@ const CUSTOM_VIEW_ISSUES_QUERY = `
       modelName
       issues(first: $first, after: $after, orderBy: $orderBy) {
         nodes {
-          ${ORCA_ISSUE_FIELDS}
+          ${BOTMUX_ISSUE_FIELDS}
         }
         pageInfo {
           hasNextPage
@@ -490,13 +490,13 @@ const CUSTOM_VIEW_ISSUES_QUERY = `
 `
 
 const CUSTOM_VIEW_PROJECTS_QUERY = `
-  query OrcaLinearCustomViewProjects($id: String!, $first: Int, $orderBy: PaginationOrderBy) {
+  query BotmuxLinearCustomViewProjects($id: String!, $first: Int, $orderBy: PaginationOrderBy) {
     customView(id: $id) {
       id
       modelName
       projects(first: $first, orderBy: $orderBy) {
         nodes {
-          ${ORCA_PROJECT_FIELDS}
+          ${BOTMUX_PROJECT_FIELDS}
         }
         pageInfo {
           hasNextPage
@@ -779,7 +779,7 @@ async function readIssueConnectionPages(
 
   while (items.length < limit) {
     // Why: Linear returns issue connections in pages of up to 50; expanded
-    // OrcaBotmux reads must follow cursors to show more than one backend page.
+    // Botmux reads must follow cursors to show more than one backend page.
     const first = Math.min(LINEAR_ISSUE_API_PAGE_SIZE_MAX, limit - items.length)
     const connection = await loadConnection(after ? { first, after } : { first })
     const nodes = connection?.nodes ?? []

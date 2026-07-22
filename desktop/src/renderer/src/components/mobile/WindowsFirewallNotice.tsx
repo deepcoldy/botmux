@@ -93,7 +93,7 @@ export function WindowsFirewallNotice({
           toast.success(
             translate(
               'auto.components.mobile.WindowsFirewallNotice.repair-success',
-              'Windows Firewall now allows OrcaBotmux Mobile on private networks'
+              'Windows Firewall now allows Botmux Mobile on private networks'
             )
           )
           return
@@ -148,7 +148,7 @@ export function WindowsFirewallNotice({
                 : blockingRuleDetected
                   ? translate(
                       'auto.components.mobile.WindowsFirewallNotice.blocked-title',
-                      'Windows may be blocking OrcaBotmux Mobile'
+                      'Windows may be blocking Botmux Mobile'
                     )
                   : translate(
                       'auto.components.mobile.WindowsFirewallNotice.missing-title',
@@ -159,17 +159,17 @@ export function WindowsFirewallNotice({
               {networkIsPublic
                 ? translate(
                     'auto.components.mobile.WindowsFirewallNotice.public-description',
-                    'Change this trusted Wi-Fi network to Private before allowing OrcaBotmux Mobile connections.'
+                    'Change this trusted Wi-Fi network to Private before allowing Botmux Mobile connections.'
                   )
                 : blockingRuleDetected
                   ? translate(
                       'auto.components.mobile.WindowsFirewallNotice.blocked-description',
-                      'An existing inbound Block rule can override the pairing exception. Repair removes conflicting TCP rules for this OrcaBotmux app, then allows port {{port}} on Private networks.',
+                      'An existing inbound Block rule can override the pairing exception. Repair removes conflicting TCP rules for this Botmux app, then allows port {{port}} on Private networks.',
                       { port: firewallStatus.port }
                     )
                   : translate(
                       'auto.components.mobile.WindowsFirewallNotice.missing-description',
-                      'Windows may block the pairing server. Add a rule for this OrcaBotmux app and TCP port {{port}} on Private networks.',
+                      'Windows may block the pairing server. Add a rule for this Botmux app and TCP port {{port}} on Private networks.',
                       { port: firewallStatus.port }
                     )}
             </p>

@@ -139,6 +139,18 @@ describe('TerminalWebView scroll routing', () => {
     expect(readyBlock).toContain('void p.finally')
   })
 
+  it('never snaps fit scale to 1 while the logical grid still overflows the viewport', () => {
+    const commit = sliceBetween('function commitFitScale(', 'function isAltScreenActive(')
+    expect(commit).toContain('gridOverflowsViewport')
+    // Why: when the logical grid is wider than the phone, scale must come from
+    // cell×cols — not scrollWidth (often equals the clipped viewport width).
+    expect(commit).toContain('vpW / expectedW')
+    expect(commit).toContain('currentScale * 0.97')
+    // Why: regression — old code snapped any scale >= 0.95 to 1 unconditionally,
+    // clipping desktop-wide TUI columns on phone (right-edge text missing).
+    expect(commit).not.toMatch(/if \(currentScale >= 0\.95\) currentScale = 1;/)
+  })
+
   it('hides xterm scrollbars and drives the mobile scroll indicator from committed rows', () => {
     expect(source).toContain('<div id="scroll-indicator"><div id="scroll-thumb"></div></div>')
     expect(source).toContain('.xterm .xterm-viewport::-webkit-scrollbar')

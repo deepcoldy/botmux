@@ -1,5 +1,5 @@
 import type { TuiAgent } from './types'
-import { getOrcaCliCommandNameForPlatform } from './orca-botmux-cli-command-name'
+import { getBotmuxCliCommandNameForPlatform } from './botmux-cli-command-name'
 
 export type AgentPromptInjectionMode =
   | 'argv'
@@ -42,8 +42,8 @@ export type TuiAgentConfig = {
   draftPromptFlag?: string
   /** Why: agents that don't expose a `--prefill <text>`-style CLI flag but
    * CAN read an env var on startup to seed their input box without
-   * submitting. Today only pi uses this (via OrcaBotmux's overlay-installed
-   * `orca-botmux-prefill` extension reading `ORCA_PI_PREFILL`). Equivalent in
+   * submitting. Today only pi uses this (via Botmux's overlay-installed
+   * `botmux-prefill` extension reading `BOTMUX_PI_PREFILL`). Equivalent in
    * effect to `draftPromptFlag`: avoids the bracketed-paste-after-ready
    * race when the agent's startup output is long (pi prints banner,
    * skills, and extensions for several seconds, which keeps the
@@ -61,7 +61,7 @@ export type TuiAgentConfig = {
   /** Why: most TUIs need both bracketed-paste enablement and a quiet render
    * window before pasted bytes reliably land in the composer. Codex can use
    * a stronger signal from its own renderer: chat_composer.rs writes the
-   * `›` prompt only when the composer row exists, so OrcaBotmux can paste as soon
+   * `›` prompt only when the composer row exists, so Botmux can paste as soon
    * as that prompt appears after bracketed paste is enabled. */
   draftPasteReadySignal?: DraftPasteReadySignal
   /** Windows Shift+Enter override. Omitted agents keep the legacy Esc+CR path
@@ -78,24 +78,24 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     // Why: `claude --prefill <text>` lands the TUI with `<text>` in the
     // input box, nothing submitted. Strictly better than the paste-after-
     // ready fallback because it eliminates the readiness race entirely.
-    // See PR https://github.com/stablyai/orca_botmux/pull/926 for context.
+    // See PR https://github.com/stablyai/botmux/pull/926 for context.
     draftPromptFlag: '--prefill'
   },
   'claude-agent-teams': {
-    // Why: this is an OrcaBotmux-provided launch mode, not a separate upstream
-    // binary. Detection follows the OrcaBotmux CLI and requires Claude below.
-    detectCmd: 'orca_botmux',
-    detectCmdAliases: ['orca-botmux-desktop-dev', 'orca-botmux-ide'],
-    // Why: the OrcaBotmux shim alone exists on fresh installs. Require Claude too so
+    // Why: this is an Botmux-provided launch mode, not a separate upstream
+    // binary. Detection follows the Botmux CLI and requires Claude below.
+    detectCmd: 'botmux',
+    detectCmdAliases: ['botmux-desktop-dev', 'botmux-ide'],
+    // Why: the Botmux shim alone exists on fresh installs. Require Claude too so
     // onboarding does not report Agent Teams when no agent CLI is installed.
     detectRequiredCommands: ['claude'],
     // Why: native Windows and WSL use Claude's in-process Agent Teams fallback,
-    // not the OrcaBotmux native-pane/tmux-shim wrapper exposed by this agent entry.
+    // not the Botmux native-pane/tmux-shim wrapper exposed by this agent entry.
     detectUnsupportedRuntimes: ['win32', 'wsl'],
-    launchCmd: 'orca_botmux claude-teams',
+    launchCmd: 'botmux claude-teams',
     launchCmdByPlatform: {
-      linux: `${getOrcaCliCommandNameForPlatform('linux')} claude-teams`,
-      win32: `${getOrcaCliCommandNameForPlatform('win32')} claude-teams`
+      linux: `${getBotmuxCliCommandNameForPlatform('linux')} claude-teams`,
+      win32: `${getBotmuxCliCommandNameForPlatform('win32')} claude-teams`
     },
     expectedProcess: 'claude',
     promptInjectionMode: 'stdin-after-start'
@@ -126,7 +126,7 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     launchCmd: 'ante',
     expectedProcess: 'ante',
     // Why: `ante --prompt` is Ante's documented headless mode (runs the task
-    // once and exits), so OrcaBotmux launches the bare interactive TUI and injects
+    // once and exits), so Botmux launches the bare interactive TUI and injects
     // the composed prompt after startup to keep the hosted session alive.
     promptInjectionMode: 'stdin-after-start'
   },
@@ -156,19 +156,19 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     promptInjectionMode: 'argv',
     // Why: pi has no `--prefill` flag, and bracketed-paste-after-ready
     // races against its multi-second startup output (banner + skills +
-    // extensions list) so the paste frequently never lands. OrcaBotmux's
-    // overlay installs an `orca-botmux-prefill` pi extension (see
+    // extensions list) so the paste frequently never lands. Botmux's
+    // overlay installs an `botmux-prefill` pi extension (see
     // src/main/pi/titlebar-extension-service.ts) that reads this env var
     // on session_start and calls `pi.ui.setEditorText(text)`. Same
     // user-visible behavior as `claude --prefill <text>`.
-    draftPromptEnvVar: 'ORCA_PI_PREFILL'
+    draftPromptEnvVar: 'BOTMUX_PI_PREFILL'
   },
   omp: {
     detectCmd: 'omp',
     launchCmd: 'omp',
     expectedProcess: 'omp',
     promptInjectionMode: 'argv',
-    draftPromptEnvVar: 'ORCA_OMP_PREFILL'
+    draftPromptEnvVar: 'BOTMUX_OMP_PREFILL'
   },
   gemini: {
     detectCmd: 'gemini',
@@ -254,7 +254,7 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     detectCmd: 'command-code',
     // Why: Command Code's documented positional prompt starts the turn, while
     // paste-after-start can leave the prompt sitting in the composer. `--trust`
-    // mirrors the preflight trust behavior OrcaBotmux applies to other first-run
+    // mirrors the preflight trust behavior Botmux applies to other first-run
     // TUIs so launch prompts do not consume the task text.
     launchCmd: 'command-code --trust',
     expectedProcess: 'command-code',
@@ -286,7 +286,7 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     launchCmd: 'droid',
     expectedProcess: 'droid',
     promptInjectionMode: 'argv',
-    // Why: Droid decodes CSI-u on Windows and treats OrcaBotmux's legacy Esc+CR
+    // Why: Droid decodes CSI-u on Windows and treats Botmux's legacy Esc+CR
     // fallback as plain Enter, which submits instead of inserting a newline.
     windowsShiftEnterEncoding: 'csi-u'
   },
@@ -323,7 +323,7 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
   hermes: {
     detectCmd: 'hermes',
     // Why: bare `hermes` opens the classic REPL in recent Hermes releases;
-    // `--tui` starts the full-screen agent UI OrcaBotmux is designed to host.
+    // `--tui` starts the full-screen agent UI Botmux is designed to host.
     launchCmd: 'hermes --tui',
     expectedProcess: 'hermes',
     // Why: Hermes owns prompt delivery through its startup-query contract,
@@ -341,9 +341,9 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     launchCmd: 'copilot',
     expectedProcess: 'copilot',
     // Why: `copilot --prompt <text>` runs non-interactively and exits on
-    // completion, which would kill the TUI session OrcaBotmux is hosting.
+    // completion, which would kill the TUI session Botmux is hosting.
     // `-i/--interactive <prompt>` starts an interactive session with the
-    // initial prompt pre-executed — the behavior OrcaBotmux needs.
+    // initial prompt pre-executed — the behavior Botmux needs.
     promptInjectionMode: 'flag-interactive',
     // Why: Copilot's first-launch trust menu used to swallow our bracketed
     // paste. Pre-appending the workspace path to `trustedFolders` in
@@ -370,7 +370,7 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     launchCmd: 'devin',
     expectedProcess: 'devin',
     // Why: `devin -- <prompt>` auto-submits immediately (docs.devin.ai/cli).
-    // `stdin-after-start` starts the REPL with no argv prompt; OrcaBotmux then sends
+    // `stdin-after-start` starts the REPL with no argv prompt; Botmux then sends
     // `followupPrompt` to the PTY as plain input + Enter after startup (not
     // bracketed paste). Use `draftPrompt` / agent-paste-draft for review-before-send.
     promptInjectionMode: 'stdin-after-start'
@@ -390,8 +390,8 @@ export function getTuiAgentLaunchCommand(
   platform: NodeJS.Platform,
   opts?: { isRemote?: boolean }
 ): string {
-  // Why: the SSH relay shim is always named `orca_botmux` on Unix, so the local-only
-  // `orca-botmux-ide` rename (avoids shadowing the GNOME OrcaBotmux screen reader) must not
+  // Why: the SSH relay shim is always named `botmux` on Unix, so the local-only
+  // `botmux-ide` Linux packaged command must not
   // leak to Linux remotes — the remote has no such desktop binary on PATH.
   if (opts?.isRemote && platform === 'linux') {
     return config.launchCmd

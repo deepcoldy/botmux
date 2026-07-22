@@ -75,11 +75,11 @@ function assertParentWorktreeFlagsCompatible(flags: Map<string, string | boolean
 }
 
 function getEnvParentWorkspace(): string | undefined {
-  const workspaceId = process.env.ORCA_WORKSPACE_ID
+  const workspaceId = process.env.BOTMUX_WORKSPACE_ID
   if (typeof workspaceId === 'string' && isWorkspaceKey(workspaceId)) {
     return workspaceId
   }
-  const worktreeId = process.env.ORCA_WORKTREE_ID
+  const worktreeId = process.env.BOTMUX_WORKTREE_ID
   if (typeof worktreeId === 'string' && worktreeId.length > 0) {
     return isWorkspaceKey(worktreeId) ? worktreeId : worktreeWorkspaceKey(worktreeId)
   }
@@ -165,7 +165,7 @@ async function getCreateRepoSelector(
   }
   throw new RuntimeClientError(
     'invalid_argument',
-    'Missing repo selector. Pass --repo or run from inside an OrcaBotmux-managed worktree.'
+    'Missing repo selector. Pass --repo or run from inside an Botmux-managed worktree.'
   )
 }
 
@@ -199,9 +199,9 @@ export const WORKTREE_HANDLERS: Record<string, CommandHandler> = {
     assertCreateParentFlagsCompatible(flags)
     assertWorkspaceTargetFlagsCompatible(flags)
     const callerTerminalHandle =
-      typeof process.env.ORCA_TERMINAL_HANDLE === 'string' &&
-      process.env.ORCA_TERMINAL_HANDLE.length > 0
-        ? process.env.ORCA_TERMINAL_HANDLE
+      typeof process.env.BOTMUX_TERMINAL_HANDLE === 'string' &&
+      process.env.BOTMUX_TERMINAL_HANDLE.length > 0
+        ? process.env.BOTMUX_TERMINAL_HANDLE
         : undefined
     const explicitParent = await resolveCreateParentSelector(flags, cwd, client)
     const explicitParentWorktree = explicitParent.parentWorktree
@@ -220,8 +220,8 @@ export const WORKTREE_HANDLERS: Record<string, CommandHandler> = {
       needsCwdRepoInference
     ) {
       try {
-        // Why: agent shells can lose ORCA_TERMINAL_HANDLE while still running
-        // inside an OrcaBotmux worktree. Cwd keeps CLI-created children nestable and
+        // Why: agent shells can lose BOTMUX_TERMINAL_HANDLE while still running
+        // inside an Botmux worktree. Cwd keeps CLI-created children nestable and
         // lets create infer the repo for the common current-workspace case.
         cwdParentWorktree = await resolveCurrentWorktreeSelector(cwd, client)
       } catch {

@@ -44,7 +44,7 @@ describe('parseClaudeUsageRecord', () => {
   })
 
   it('merges duplicate streamed assistant usage by message and request id', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-claude-dedupe-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-claude-dedupe-'))
     const filePath = join(root, 'session.jsonl')
     try {
       await writeFile(
@@ -105,7 +105,7 @@ describe('parseClaudeUsageRecord', () => {
 })
 
 describe('Claude usage aggregation', () => {
-  it('attributes OrcaBotmux worktree usage and preserves multi-location session breakdowns', async () => {
+  it('attributes Botmux worktree usage and preserves multi-location session breakdowns', async () => {
     const attributed = await attributeClaudeUsageTurns(
       [
         {

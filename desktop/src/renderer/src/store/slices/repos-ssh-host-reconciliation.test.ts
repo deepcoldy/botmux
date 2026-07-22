@@ -206,7 +206,7 @@ describe('SSH repo host reconciliation', () => {
           authoritative: true,
           source: 'git',
           worktrees: [
-            { ...staleWorktree, ownership: 'orca-botmux-managed', selectedCheckout: false, visible: true }
+            { ...staleWorktree, ownership: 'botmux-managed', selectedCheckout: false, visible: true }
           ]
         }
       }
@@ -221,7 +221,7 @@ describe('SSH repo host reconciliation', () => {
       authoritative: true,
       source: 'git',
       worktrees: [
-        { ...staleWorktree, ownership: 'orca-botmux-managed', selectedCheckout: false, visible: true }
+        { ...staleWorktree, ownership: 'botmux-managed', selectedCheckout: false, visible: true }
       ]
     })
     await staleFetch
@@ -232,7 +232,7 @@ describe('SSH repo host reconciliation', () => {
     expect(store.getState().detectedWorktreesByRepo[repoId].worktrees).toEqual([
       {
         ...directSshWorktree('ssh-new', 'stale'),
-        ownership: 'orca-botmux-managed',
+        ownership: 'botmux-managed',
         selectedCheckout: false,
         visible: true
       }
@@ -257,7 +257,7 @@ describe('SSH repo host reconciliation', () => {
       authoritative: true,
       source: 'git',
       worktrees: [
-        { ...staleWorktree, ownership: 'orca-botmux-managed', selectedCheckout: false, visible: true }
+        { ...staleWorktree, ownership: 'botmux-managed', selectedCheckout: false, visible: true }
       ]
     })
     await staleFetch

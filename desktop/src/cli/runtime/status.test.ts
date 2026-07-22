@@ -29,7 +29,7 @@ afterEach(async () => {
 // metadata; Windows uses named pipes and cannot run this fixture directly.
 describe.skipIf(process.platform === 'win32')('CLI runtime status', () => {
   it('uses the legacy singular runtime transport when reporting status', async () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-status-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-status-'))
     const endpoint = join(userDataPath, 'runtime.sock')
     const server = createServer((socket) => {
       sockets.add(socket)

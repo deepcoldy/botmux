@@ -1,5 +1,5 @@
 /* eslint-disable no-control-regex, max-lines -- Why: ANSI/OSC stripping must match raw
- * control sequences in PTY output, same as src/main/runtime/orca-botmux-runtime.ts;
+ * control sequences in PTY output, same as src/main/runtime/botmux-runtime.ts;
  * URL parsing, host classification, cache lifecycle, and cross-worktree lookup
  * are tightly coupled and kept in one file to keep the rules in lockstep. */
 // Watches PTY output for HTTP(S) URLs that dev servers (Vite, Next, etc.)

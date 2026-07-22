@@ -87,7 +87,7 @@ function formatForkSyncResult(result: GitForkSyncResult): { title: string; descr
       blockedDescription ??
       translate(
         'auto.components.settings.RepositoryForkSyncSection.blockedFallback',
-        'OrcaBotmux could not fast-forward this fork safely.'
+        'Botmux could not fast-forward this fork safely.'
       )
   }
 }
@@ -199,7 +199,7 @@ export function RepositoryForkSyncSection({
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.RepositoryForkSyncSection.longDescription',
-              'When this fork is behind upstream, OrcaBotmux can safely fast-forward its default branch. OrcaBotmux skips the update if the branch has local-only commits or conflicts.'
+              'When this fork is behind upstream, Botmux can safely fast-forward its default branch. Botmux skips the update if the branch has local-only commits or conflicts.'
             )}
           </p>
           <p className="text-xs text-muted-foreground">

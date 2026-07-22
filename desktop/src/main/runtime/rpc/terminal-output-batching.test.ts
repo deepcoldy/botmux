@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from './dispatcher'
 import type { RpcRequest } from './core'
-import type { OrcaRuntimeService } from '../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../botmux-runtime'
 import { TERMINAL_METHODS } from './methods/terminal'
 import type { RuntimeTerminalWait } from '../../../shared/runtime-types'
 import {
@@ -12,14 +12,14 @@ import {
   encodeTerminalStreamText
 } from '../../../shared/terminal-stream-protocol'
 
-function stubRuntime(overrides: Partial<OrcaRuntimeService> = {}): OrcaRuntimeService {
+function stubRuntime(overrides: Partial<BotmuxRuntimeService> = {}): BotmuxRuntimeService {
   return {
     getRuntimeId: () => 'test-runtime',
     // Why: subscribe streams register as remote view subscribers for Phase-5
     // query-authority suppression (terminal-query-authority.md).
     registerRemoteTerminalViewSubscriber: () => () => {},
     ...overrides
-  } as OrcaRuntimeService
+  } as BotmuxRuntimeService
 }
 
 function makeRequest(method: string, params?: unknown): RpcRequest {
@@ -287,7 +287,7 @@ describe('terminal output batching', () => {
     const commit = vi.fn().mockResolvedValue(undefined)
     const rollback = vi.fn()
     const beginMobileInputFloor = vi.fn(
-      (): ReturnType<OrcaRuntimeService['beginMobileInputFloor']> => ({ commit, rollback })
+      (): ReturnType<BotmuxRuntimeService['beginMobileInputFloor']> => ({ commit, rollback })
     )
     const runtime = stubRuntime({
       resolveLeafForHandle: vi.fn().mockReturnValue({ ptyId: 'pty-1' }),

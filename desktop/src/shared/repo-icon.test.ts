@@ -16,13 +16,13 @@ describe('sanitizeRepoIcon', () => {
         type: 'image',
         src: 'https://github.com/stablyai.png?size=64',
         source: 'github',
-        label: 'stablyai/orca_botmux'
+        label: 'stablyai/botmux'
       })
     ).toEqual({
       type: 'image',
       src: 'https://github.com/stablyai.png?size=64',
       source: 'github',
-      label: 'stablyai/orca_botmux'
+      label: 'stablyai/botmux'
     })
     expect(
       sanitizeRepoIcon({

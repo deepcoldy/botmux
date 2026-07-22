@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   sendToTerminal,
@@ -14,7 +14,7 @@ import {
   type DockerSshRelayTarget
 } from './helpers/docker-ssh-relay-target'
 
-const RUN_DOCKER_SSH = process.env.ORCA_E2E_SSH_DOCKER === '1'
+const RUN_DOCKER_SSH = process.env.BOTMUX_E2E_SSH_DOCKER === '1'
 
 type ConnectedDockerRemote = {
   targetId: string
@@ -141,47 +141,47 @@ async function readTerminalAgentStatus(
 }
 
 test.describe('Docker SSH Pi-compatible agent titles', () => {
-  test.skip(!RUN_DOCKER_SSH, 'Set ORCA_E2E_SSH_DOCKER=1 to run Docker-backed SSH relay tests.')
+  test.skip(!RUN_DOCKER_SSH, 'Set BOTMUX_E2E_SSH_DOCKER=1 to run Docker-backed SSH relay tests.')
   test.skip(process.platform === 'win32', 'Docker SSH relay tests use POSIX ssh tooling.')
 
   test('classifies OMP and Pi title transitions from a remote terminal', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerRemote(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const ptyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
-      const terminalHandle = await findTerminalByPtyId(orcaBotmuxPage, ptyId)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerRemote(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const ptyId = await waitForActivePanePtyId(botmuxPage, 60_000)
+      const terminalHandle = await findTerminalByPtyId(botmuxPage, ptyId)
 
       const marker = `PI_COMPATIBLE_TITLE_READY_${Date.now()}`
-      await sendToTerminal(orcaBotmuxPage, ptyId, `printf '${marker}\\n'\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, marker, 20_000, 60_000)
+      await sendToTerminal(botmuxPage, ptyId, `printf '${marker}\\n'\r`)
+      await waitForTerminalOutput(botmuxPage, marker, 20_000, 60_000)
 
-      await emitOscTitle(orcaBotmuxPage, ptyId, '\u280b OMP')
+      await emitOscTitle(botmuxPage, ptyId, '\u280b OMP')
       await expect
-        .poll(async () => readTerminalAgentStatus(orcaBotmuxPage, terminalHandle), {
+        .poll(async () => readTerminalAgentStatus(botmuxPage, terminalHandle), {
           timeout: 10_000,
           message: 'Remote OMP working title did not classify as an agent status'
         })
         .toMatchObject({ isRunningAgent: true, status: 'working' })
 
-      await emitOscTitle(orcaBotmuxPage, ptyId, 'OMP ready')
+      await emitOscTitle(botmuxPage, ptyId, 'OMP ready')
       await expect
-        .poll(async () => readTerminalAgentStatus(orcaBotmuxPage, terminalHandle), {
+        .poll(async () => readTerminalAgentStatus(botmuxPage, terminalHandle), {
           timeout: 10_000,
           message: 'Remote OMP ready title did not classify as idle'
         })
         .toMatchObject({ isRunningAgent: true, status: 'idle' })
 
-      await emitOscTitle(orcaBotmuxPage, ptyId, '\u280b Pi')
+      await emitOscTitle(botmuxPage, ptyId, '\u280b Pi')
       await expect
-        .poll(async () => readTerminalAgentStatus(orcaBotmuxPage, terminalHandle), {
+        .poll(async () => readTerminalAgentStatus(botmuxPage, terminalHandle), {
           timeout: 10_000,
           message: 'Remote Pi working title did not classify as an agent status'
         })

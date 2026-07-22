@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef } from 'react'
 import { useAppStore } from '../store'
 import { focusTerminalTabSurface } from '../lib/focus-terminal-tab-surface'
 import {
-  ORCA_BROWSER_FOCUS_REQUEST_EVENT,
+  BOTMUX_BROWSER_FOCUS_REQUEST_EVENT,
   queueBrowserFocusRequest,
   type BrowserFocusRequestDetail
 } from '../components/browser-pane/browser-focus'
@@ -98,7 +98,7 @@ export function useModalReturnFocus(visible: boolean): {
     if (focusCapturedElement()) {
       return
     }
-    focusFirstMatchingSurface(['[data-orca-botmux-emulator-frame="true"] [tabindex]'])
+    focusFirstMatchingSurface(['[data-botmux-emulator-frame="true"] [tabindex]'])
   }, [focusCapturedElement, focusFirstMatchingSurface])
 
   const focusFallbackSurface = useCallback((): void => {
@@ -107,7 +107,7 @@ export function useModalReturnFocus(visible: boolean): {
 
   const requestBrowserFocus = useCallback((detail: BrowserFocusRequestDetail): void => {
     queueBrowserFocusRequest(detail)
-    window.dispatchEvent(new CustomEvent(ORCA_BROWSER_FOCUS_REQUEST_EVENT, { detail }))
+    window.dispatchEvent(new CustomEvent(BOTMUX_BROWSER_FOCUS_REQUEST_EVENT, { detail }))
   }, [])
 
   const captureReturnFocus = useCallback((): void => {
@@ -132,7 +132,7 @@ export function useModalReturnFocus(visible: boolean): {
     // Why: this can be called from Radix onOpenAutoFocus, before focus moves
     // into the dialog, preserving address-bar/editor/simulator identity.
     const browserTarget =
-      tabType === 'browser' && activeElement?.closest('[data-orca-botmux-browser-address-bar="true"]')
+      tabType === 'browser' && activeElement?.closest('[data-botmux-browser-address-bar="true"]')
         ? 'address-bar'
         : 'webview'
     capturedElementRef.current = isRestorableFocusedElement(activeElement) ? activeElement : null

@@ -1,13 +1,14 @@
 {
-  "name": "orca-botmux-desktop",
+  "name": "botmux-desktop",
   "version": "1.4.146-rc.0",
-  "description": "orca_botmux Desktop for parallel agentic development",
-  "homepage": "https://github.com/deepcoldy/orca_botmux",
-  "author": "orca_botmux contributors",
+  "description": "botmux Desktop for parallel agentic development",
+  "homepage": "https://github.com/deepcoldy/botmux",
+  "author": "botmux contributors",
   "private": true,
   "bin": {
-    "orca-botmux-desktop": "./out/cli/index.js",
-    "orca-botmux-desktop-dev": "./config/scripts/orca-botmux-dev.mjs"
+    "botmux": "./out/cli/index.js",
+    "botmux-desktop": "./out/cli/index.js",
+    "botmux-desktop-dev": "./config/scripts/botmux-desktop-dev.mjs"
   },
   "main": "./out/main/index.js",
   "scripts": {
@@ -46,7 +47,7 @@
     "pack:local": "node scripts/pack-local.mjs",
     "pack:local:install": "node scripts/pack-local.mjs --install",
     "smoke:desktop": "node scripts/smoke-desktop.mjs",
-    "rebrand": "node scripts/rebrand-full-orca-botmux.mjs",
+    "rebrand": "node ../scripts/rebrand-to-botmux-final.mjs --root=desktop",
     "dev-stable-name": "pnpm run ensure:electron-runtime && node config/scripts/run-electron-vite-dev.mjs --stable-name",
     "dev:web": "vite --config vite.web.config.ts --host 127.0.0.1",
     "build:relay": "node config/scripts/build-relay.mjs",
@@ -79,7 +80,7 @@
     "build:win": "pnpm run build:desktop && pnpm run ensure:electron-runtime && electron-builder --config config/electron-builder.config.cjs --win",
     "build:icons": "bash resources/icon-source/generate.sh",
     "build:mac": "pnpm run build:desktop && pnpm run build:computer-macos && pnpm run build:notification-status-macos && pnpm run ensure:electron-runtime && electron-builder --config config/electron-builder.config.cjs --mac",
-    "build:mac:release": "node config/scripts/verify-macos-release-env.mjs && ORCA_MAC_RELEASE=1 pnpm run build:desktop && ORCA_MAC_RELEASE=1 pnpm run build:computer-macos && ORCA_MAC_RELEASE=1 pnpm run build:notification-status-macos && pnpm run ensure:electron-runtime && ORCA_MAC_RELEASE=1 electron-builder --config config/electron-builder.config.cjs --mac",
+    "build:mac:release": "node config/scripts/verify-macos-release-env.mjs && BOTMUX_MAC_RELEASE=1 pnpm run build:desktop && BOTMUX_MAC_RELEASE=1 pnpm run build:computer-macos && BOTMUX_MAC_RELEASE=1 pnpm run build:notification-status-macos && pnpm run ensure:electron-runtime && BOTMUX_MAC_RELEASE=1 electron-builder --config config/electron-builder.config.cjs --mac",
     "build:linux": "pnpm run build:desktop && pnpm run ensure:electron-runtime && electron-builder --config config/electron-builder.config.cjs --linux AppImage deb",
     "test:e2e": "pnpm run ensure:electron-runtime && npx playwright test --config tests/playwright.config.ts --project=electron-headless",
     "test:e2e:floating-mobile-emulator": "pnpm run ensure:electron-runtime && npx playwright test tests/e2e/floating-mobile-emulator-tab.spec.ts --config tests/playwright.config.ts --project electron-headless --workers=1",
@@ -106,7 +107,8 @@
     "bench:multi-workspace-typing": "pnpm run ensure:electron-runtime && node config/scripts/run-multi-workspace-typing-bench.mjs",
     "bench:cold-park-reveal": "pnpm run ensure:electron-runtime && node tools/benchmarks/terminal-cold-park-reveal-bench.mjs",
     "bench:cold-park-resource": "pnpm run ensure:electron-runtime && node tools/benchmarks/terminal-cold-park-resource-bench.mjs",
-    "bench:compare": "node config/scripts/compare-benchmark-artifacts.mjs"
+    "bench:compare": "node config/scripts/compare-benchmark-artifacts.mjs",
+    "check:brand": "node ../scripts/check-botmux-brand-gate.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",

@@ -124,12 +124,12 @@ function getDefaultState(): ClaudeUsagePersistedState {
 }
 
 export function initClaudeUsagePath(): void {
-  _claudeUsageFile = join(app.getPath('userData'), 'orca-botmux-claude-usage.json')
+  _claudeUsageFile = join(app.getPath('userData'), 'botmux-claude-usage.json')
 }
 
 function getClaudeUsageFile(): string {
   if (!_claudeUsageFile) {
-    _claudeUsageFile = join(app.getPath('userData'), 'orca-botmux-claude-usage.json')
+    _claudeUsageFile = join(app.getPath('userData'), 'botmux-claude-usage.json')
   }
   return _claudeUsageFile
 }
@@ -355,7 +355,7 @@ export class ClaudeUsageStore {
     } catch (error) {
       // Why: Claude usage is a local analytics feature, not primary workspace
       // state. A corrupt cache should degrade to a fresh rebuild instead of
-      // preventing OrcaBotmux from booting, but we leave the file on disk for debugging.
+      // preventing Botmux from booting, but we leave the file on disk for debugging.
       console.error('[claude-usage] Failed to load persisted state, starting fresh:', error)
       return getDefaultState()
     }
@@ -525,8 +525,8 @@ export class ClaudeUsageStore {
       topModel,
       topProject,
       // Why: the empty-state UX is scope/range specific. Using global persisted
-      // data here makes the OrcaBotmux-only view render empty charts instead of the
-      // intended "no usage for this scope" message when only off-OrcaBotmux logs exist.
+      // data here makes the Botmux-only view render empty charts instead of the
+      // intended "no usage for this scope" message when only off-Botmux logs exist.
       hasAnyClaudeData: filteredSessions.length > 0 || filteredDaily.length > 0
     }
   }
@@ -812,7 +812,7 @@ export class ClaudeUsageStore {
       estimatedCostUsd,
       estimatedCostSource: estimatedCostUsd === null ? null : 'api_equivalent',
       providerSessionId: session.sessionId,
-      // Why: OrcaBotmux terminal tab ids and Claude usage session ids are different
+      // Why: Botmux terminal tab ids and Claude usage session ids are different
       // systems today, so attribution is intentionally limited to one local
       // provider session in the run's worktree/time window.
       attribution: 'provider_session_time_window',
@@ -828,7 +828,7 @@ export class ClaudeUsageStore {
       if (cutoff && entry.day < cutoff) {
         return false
       }
-      if (scope === 'orca_botmux' && entry.worktreeId === null) {
+      if (scope === 'botmux' && entry.worktreeId === null) {
         return false
       }
       return true
@@ -848,7 +848,7 @@ export class ClaudeUsageStore {
       if (cutoff && day < cutoff) {
         return false
       }
-      if (scope === 'orca_botmux') {
+      if (scope === 'botmux') {
         return session.locationBreakdown.some((entry) => entry.worktreeId !== null)
       }
       return true

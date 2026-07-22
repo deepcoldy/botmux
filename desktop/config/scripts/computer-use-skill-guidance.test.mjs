@@ -9,12 +9,12 @@ describe('computer-use skill guidance', () => {
   it('keeps web-app targeting on the computer-use surface', () => {
     const skill = readFileSync(skillPath, 'utf8')
 
-    expect(skill).toContain('Use this skill for desktop UI through `orca_botmux computer`')
+    expect(skill).toContain('Use this skill for desktop UI through `botmux computer`')
     expect(skill).toContain('operate the desktop browser app/window that contains the page')
-    expect(skill).not.toContain('orca_botmux goto')
-    expect(skill).not.toContain('orca_botmux snapshot')
-    expect(skill).not.toContain('orca_botmux click')
-    expect(skill).not.toContain('orca_botmux fill')
+    expect(skill).not.toContain('botmux goto')
+    expect(skill).not.toContain('botmux snapshot')
+    expect(skill).not.toContain('botmux click')
+    expect(skill).not.toContain('botmux fill')
     expect(skill).not.toContain('Routing:')
   })
 

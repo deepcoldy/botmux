@@ -277,8 +277,8 @@ function makeRefreshState(
 
 function makeToolbar(overrides: Partial<Parameters<typeof FileExplorerToolbar>[0]> = {}) {
   return FileExplorerToolbar({
-    repoName: 'orca_botmux',
-    worktreePath: '/tmp/orca_botmux',
+    repoName: 'botmux',
+    worktreePath: '/tmp/botmux',
     connectionId: null,
     refresh: makeRefreshState(),
     canRefresh: true,
@@ -296,7 +296,7 @@ function makeToolbar(overrides: Partial<Parameters<typeof FileExplorerToolbar>[0
 beforeEach(() => {
   toastErrorMock.mockReset()
   toastSuccessMock.mockReset()
-  delete (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
+  delete (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__
 })
 
 describe('getNextNameFilterCollapsedPaths', () => {
@@ -442,7 +442,7 @@ describe('FileExplorerToolbar', () => {
     const element = makeToolbar({ connectionId: 'ssh-1' })
 
     const openInItems = findOpenInMenuItems(element)
-    expect(openInItems.props.worktreePath).toBe('/tmp/orca_botmux')
+    expect(openInItems.props.worktreePath).toBe('/tmp/botmux')
     expect(openInItems.props.connectionId).toBe('ssh-1')
     expect(openInItems.props.labelPrefix).toBe('Open in ')
   })
@@ -606,14 +606,14 @@ describe('FileExplorerRow collapse folder action', () => {
     expect(shouldShowRemoteDownloadAction(fileNode, 'ssh-1', null, false)).toBe(true)
     expect(shouldShowRemoteDownloadAction(directoryNode, null, runtimeContext)).toBe(false)
 
-    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    ;(globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ = true
 
     expect(shouldShowRemoteDownloadAction(fileNode, 'ssh-1')).toBe(false)
     expect(shouldShowRemoteDownloadAction(fileNode, null, runtimeContext)).toBe(false)
   })
 
   it('shows OS file copy for single local rows and SSH file rows on desktop', () => {
-    const previous = (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
+    const previous = (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__
     try {
       expect(shouldShowCopyFileAction(fileNode, null, 1)).toBe(true)
       expect(shouldShowCopyFileAction(directoryNode, null, 1)).toBe(true)
@@ -621,11 +621,11 @@ describe('FileExplorerRow collapse folder action', () => {
       expect(shouldShowCopyFileAction(fileNode, 'ssh-1', 1)).toBe(true)
       expect(shouldShowCopyFileAction(directoryNode, 'ssh-1', 1)).toBe(false)
 
-      ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+      ;(globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ = true
 
       expect(shouldShowCopyFileAction(fileNode, null, 1)).toBe(false)
     } finally {
-      ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = previous
+      ;(globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ = previous
     }
   })
 

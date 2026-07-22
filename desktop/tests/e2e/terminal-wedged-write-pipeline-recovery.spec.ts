@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   focusActiveTerminalInput,
@@ -47,39 +47,39 @@ async function wedgeActivePaneWritePipeline(
 
 test.describe('Wedged terminal write pipeline recovery', () => {
   test('pane recovers rendering and input after its write pipeline wedges', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForActivePanePtyId(orcaBotmuxPage)
-    await focusActiveTerminalInput(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForActivePanePtyId(botmuxPage)
+    await focusActiveTerminalInput(botmuxPage)
 
     // Prove the pane is healthy first.
     const runId = Date.now()
     const beforeMarker = `WEDGE_BASELINE_${runId}`
-    await orcaBotmuxPage.keyboard.type(`echo ${beforeMarker}`, { delay: 20 })
-    await orcaBotmuxPage.keyboard.press('Enter')
+    await botmuxPage.keyboard.type(`echo ${beforeMarker}`, { delay: 20 })
+    await botmuxPage.keyboard.press('Enter')
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(beforeMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(beforeMarker), {
         timeout: 15_000,
         message: 'Baseline echo did not render — pane unhealthy before wedge'
       })
       .toBe(true)
 
-    await wedgeActivePaneWritePipeline(orcaBotmuxPage)
+    await wedgeActivePaneWritePipeline(botmuxPage)
 
     // Type through the wedge. The PTY is alive: bytes reach the shell and the
     // shell echoes them — but a wedged pipeline never parses the echo, so
     // without recovery the marker never renders.
     const afterMarker = `WEDGE_RECOVERED_${runId}`
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.type(`echo ${afterMarker}`, { delay: 20 })
-    await orcaBotmuxPage.keyboard.press('Enter')
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.type(`echo ${afterMarker}`, { delay: 20 })
+    await botmuxPage.keyboard.press('Enter')
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(afterMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(afterMarker), {
         // Generous: recovery is certified by a probe write with a 10s stall
         // check, so the rebuild can legitimately take >20s to kick in.
         timeout: 45_000,
@@ -90,21 +90,21 @@ test.describe('Wedged terminal write pipeline recovery', () => {
   })
 
   test('pane recovers after its xterm is disposed under live bindings (zombie pane)', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await focusActiveTerminalInput(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await focusActiveTerminalInput(botmuxPage)
 
     const runId = Date.now()
     const beforeMarker = `ZOMBIE_BASELINE_${runId}`
-    await orcaBotmuxPage.keyboard.type(`echo ${beforeMarker}`, { delay: 20 })
-    await orcaBotmuxPage.keyboard.press('Enter')
+    await botmuxPage.keyboard.type(`echo ${beforeMarker}`, { delay: 20 })
+    await botmuxPage.keyboard.press('Enter')
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(beforeMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(beforeMarker), {
         timeout: 15_000,
         message: 'Baseline echo did not render — pane unhealthy before dispose'
       })
@@ -115,7 +115,7 @@ test.describe('Wedged terminal write pipeline recovery', () => {
     // terminal silently drops its completion callback (verified against
     // 6.1.0-beta.287), so delivery acks leak and keyboard onData never fires —
     // the pane looks painted but is a fossil: input dead, output dead, PTY alive.
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       const worktreeId = state?.activeWorktreeId
       const tabId =
@@ -136,10 +136,10 @@ test.describe('Wedged terminal write pipeline recovery', () => {
     // health signal recovery must catch (typing can't be one here — a disposed
     // xterm emits no onData at all).
     const outputMarker = `ZOMBIE_OUTPUT_${runId}`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `echo ${outputMarker}\r`)
+    await sendToTerminal(botmuxPage, ptyId, `echo ${outputMarker}\r`)
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(outputMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(outputMarker), {
         timeout: 45_000,
         message:
           'Output written after the pane xterm was disposed never rendered — zombie pane was not recovered'
@@ -147,12 +147,12 @@ test.describe('Wedged terminal write pipeline recovery', () => {
       .toBe(true)
 
     // Input must be live again end-to-end after recovery.
-    await focusActiveTerminalInput(orcaBotmuxPage)
+    await focusActiveTerminalInput(botmuxPage)
     const typedMarker = `ZOMBIE_INPUT_${runId}`
-    await orcaBotmuxPage.keyboard.type(`echo ${typedMarker}`, { delay: 20 })
-    await orcaBotmuxPage.keyboard.press('Enter')
+    await botmuxPage.keyboard.type(`echo ${typedMarker}`, { delay: 20 })
+    await botmuxPage.keyboard.press('Enter')
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(typedMarker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(typedMarker), {
         timeout: 15_000,
         message: 'Typed input never reached the PTY after zombie-pane recovery'
       })

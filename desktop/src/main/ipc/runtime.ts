@@ -1,5 +1,5 @@
 import { BrowserWindow, ipcMain } from 'electron'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import type {
   RuntimeBrowserDriverState,
   RuntimeStatus,
@@ -10,7 +10,7 @@ import type {
 import type { RuntimeRpcResponse } from '../../shared/runtime-rpc-envelope'
 import { RpcDispatcher } from '../runtime/rpc/dispatcher'
 
-export function registerRuntimeHandlers(runtime: OrcaRuntimeService): void {
+export function registerRuntimeHandlers(runtime: BotmuxRuntimeService): void {
   ipcMain.removeHandler('runtime:syncWindowGraph')
   ipcMain.removeHandler('runtime:getStatus')
   ipcMain.removeHandler('runtime:call')

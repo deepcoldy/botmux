@@ -5,7 +5,7 @@
  * - Browser works and also retains state when switching tabs etc.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import {
@@ -344,47 +344,47 @@ async function writeBrowserInputValue(
 }
 
 test.describe('Browser Tab', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   /**
    * User Prompt:
    * - Browser works and also retains state when switching tabs etc.
    */
-  test('creating a browser tab adds it and activates browser view', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    const browserTabsBefore = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+  test('creating a browser tab adds it and activates browser view', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    const browserTabsBefore = await getBrowserTabs(botmuxPage, worktreeId)
 
-    await createBrowserTab(orcaBotmuxPage, worktreeId)
+    await createBrowserTab(botmuxPage, worktreeId)
 
     // Wait for the browser tab to appear in the store
     await expect
-      .poll(async () => (await getBrowserTabs(orcaBotmuxPage, worktreeId)).length, { timeout: 5_000 })
+      .poll(async () => (await getBrowserTabs(botmuxPage, worktreeId)).length, { timeout: 5_000 })
       .toBe(browserTabsBefore.length + 1)
 
     // The active tab type should switch to 'browser'
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).toBe('browser')
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).toBe('browser')
   })
 
   /**
    * User Prompt:
    * - Browser works and also retains state when switching tabs etc.
    */
-  test('browser tab is created and active in the store', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('browser tab is created and active in the store', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await createBrowserTab(orcaBotmuxPage, worktreeId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('browser')
+    await createBrowserTab(botmuxPage, worktreeId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('browser')
 
     // Verify the browser tab exists in the store
-    const browserTabs = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+    const browserTabs = await getBrowserTabs(botmuxPage, worktreeId)
     expect(browserTabs.length).toBeGreaterThan(0)
 
     // The active browser tab should have a URL (even if it's about:blank or the default)
-    const activeBrowserTabId = await orcaBotmuxPage.evaluate(() => {
+    const activeBrowserTabId = await botmuxPage.evaluate(() => {
       const store = window.__store
       return store?.getState().activeBrowserTabId ?? null
     })
@@ -395,81 +395,81 @@ test.describe('Browser Tab', () => {
    * User Prompt:
    * - Browser works and also retains state when switching tabs etc.
    */
-  test('browser tab retains state when switching to terminal and back', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('browser tab retains state when switching to terminal and back', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await createBrowserTab(orcaBotmuxPage, worktreeId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('browser')
+    await createBrowserTab(botmuxPage, worktreeId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('browser')
 
     // Record the browser tab info
-    const browserTabsBefore = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+    const browserTabsBefore = await getBrowserTabs(botmuxPage, worktreeId)
     expect(browserTabsBefore.length).toBeGreaterThan(0)
     const browserTabId = browserTabsBefore.at(-1)?.id
     expect(browserTabId).toBeTruthy()
 
     // Switch to the terminal view
-    await switchToTerminalTab(orcaBotmuxPage, worktreeId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).toBe('terminal')
+    await switchToTerminalTab(botmuxPage, worktreeId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).toBe('terminal')
 
     // Switch back to browser tab
-    await switchToBrowserTab(orcaBotmuxPage, worktreeId, browserTabId!)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).toBe('browser')
+    await switchToBrowserTab(botmuxPage, worktreeId, browserTabId!)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).toBe('browser')
 
     // The browser tab should still exist with the same ID
-    const browserTabsAfter = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+    const browserTabsAfter = await getBrowserTabs(botmuxPage, worktreeId)
     const tabStillExists = browserTabsAfter.some((tab) => tab.id === browserTabId)
     expect(tabStillExists).toBe(true)
   })
 
   test('browser webview form state survives switching between browser tabs', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const formServer = await startBrowserFormServer()
     try {
-      const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+      const worktreeId = (await getActiveWorktreeId(botmuxPage))!
       const firstTab = await createBrowserTab(
-        orcaBotmuxPage,
+        botmuxPage,
         worktreeId,
         formServer.url('First search'),
         'First Form'
       )
       expect(firstTab?.id).toBeTruthy()
-      await writeBrowserInputValue(orcaBotmuxPage, firstTab!.id, 'first typed value')
+      await writeBrowserInputValue(botmuxPage, firstTab!.id, 'first typed value')
 
       const secondTab = await createBrowserTab(
-        orcaBotmuxPage,
+        botmuxPage,
         worktreeId,
         formServer.url('Second search'),
         'Second Form'
       )
       expect(secondTab?.id).toBeTruthy()
-      await writeBrowserInputValue(orcaBotmuxPage, secondTab!.id, 'second typed value')
+      await writeBrowserInputValue(botmuxPage, secondTab!.id, 'second typed value')
 
       // Why: switching browser tabs used to unmount and reparent the inactive
       // Electron webview, which recreated the guest document and erased form DOM.
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, firstTab!.id)
+      await switchToBrowserTab(botmuxPage, worktreeId, firstTab!.id)
       await expect
-        .poll(async () => readBrowserInputValue(orcaBotmuxPage, firstTab!.id), { timeout: 5_000 })
+        .poll(async () => readBrowserInputValue(botmuxPage, firstTab!.id), { timeout: 5_000 })
         .toBe('first typed value')
 
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, secondTab!.id)
+      await switchToBrowserTab(botmuxPage, worktreeId, secondTab!.id)
       await expect
-        .poll(async () => readBrowserInputValue(orcaBotmuxPage, secondTab!.id), { timeout: 5_000 })
+        .poll(async () => readBrowserInputValue(botmuxPage, secondTab!.id), { timeout: 5_000 })
         .toBe('second typed value')
     } finally {
       await formServer.close()
     }
   })
 
-  test('plain links stay current while explicit new-tab gestures activate OrcaBotmux tabs', async ({
+  test('plain links stay current while explicit new-tab gestures activate Botmux tabs', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const linkServer = await startBrowserLinkServer()
     try {
-      const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+      const worktreeId = (await getActiveWorktreeId(botmuxPage))!
       const sourceTab = await createBrowserTab(
-        orcaBotmuxPage,
+        botmuxPage,
         worktreeId,
         linkServer.sourceUrl,
         'Source page'
@@ -479,52 +479,52 @@ test.describe('Browser Tab', () => {
       const baseWindowCount = await electronApp.evaluate(
         ({ BaseWindow }) => BaseWindow.getAllWindows().length
       )
-      const baseTabCount = await orcaBotmuxPage.locator('[data-tab-id]').count()
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#external-link')
+      const baseTabCount = await botmuxPage.locator('[data-tab-id]').count()
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#external-link')
 
-      const sourceTabLocator = orcaBotmuxPage.locator(`[data-tab-id="${sourceTab!.id}"]`)
+      const sourceTabLocator = botmuxPage.locator(`[data-tab-id="${sourceTab!.id}"]`)
       await expect(sourceTabLocator).toContainText('Linked destination', { timeout: 10_000 })
-      await expect(orcaBotmuxPage.locator('[data-tab-id]')).toHaveCount(baseTabCount)
+      await expect(botmuxPage.locator('[data-tab-id]')).toHaveCount(baseTabCount)
 
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#return-link')
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#return-link')
       await expect(sourceTabLocator).toContainText('Source page', { timeout: 10_000 })
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#frame-link', {
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#frame-link', {
         frameSelector: '#link-frame'
       })
       await expect(sourceTabLocator).toContainText('Frame destination', { timeout: 10_000 })
-      await expect(orcaBotmuxPage.locator('[data-tab-id]')).toHaveCount(baseTabCount)
+      await expect(botmuxPage.locator('[data-tab-id]')).toHaveCount(baseTabCount)
 
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#return-link')
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#return-link')
       await expect(sourceTabLocator).toContainText('Source page', { timeout: 10_000 })
 
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#frame-modifier-link', {
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#frame-modifier-link', {
         frameSelector: '#link-frame',
         modifiers: process.platform === 'darwin' ? ['meta'] : ['control']
       })
-      await expectBrowserTabActive(orcaBotmuxPage, 'Frame modifier destination')
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, sourceTab!.id)
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#frame-middle-link', {
+      await expectBrowserTabActive(botmuxPage, 'Frame modifier destination')
+      await switchToBrowserTab(botmuxPage, worktreeId, sourceTab!.id)
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#frame-middle-link', {
         button: 'middle',
         frameSelector: '#link-frame'
       })
-      await expectBrowserTabActive(orcaBotmuxPage, 'Frame middle destination')
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, sourceTab!.id)
+      await expectBrowserTabActive(botmuxPage, 'Frame middle destination')
+      await switchToBrowserTab(botmuxPage, worktreeId, sourceTab!.id)
 
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#modifier-link', {
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#modifier-link', {
         modifiers: process.platform === 'darwin' ? ['meta'] : ['control']
       })
-      await expectBrowserTabActive(orcaBotmuxPage, 'Modifier destination')
-      await switchToBrowserTab(orcaBotmuxPage, worktreeId, sourceTab!.id)
+      await expectBrowserTabActive(botmuxPage, 'Modifier destination')
+      await switchToBrowserTab(botmuxPage, worktreeId, sourceTab!.id)
 
-      const tabCountBeforeCancelledClick = await orcaBotmuxPage.locator('[data-tab-id]').count()
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#cancelled-link')
+      const tabCountBeforeCancelledClick = await botmuxPage.locator('[data-tab-id]').count()
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#cancelled-link')
       await expect(
-        orcaBotmuxPage.locator('[data-tab-id]').filter({ hasText: 'Click handled in page' })
+        botmuxPage.locator('[data-tab-id]').filter({ hasText: 'Click handled in page' })
       ).toBeVisible({ timeout: 10_000 })
-      await expect(orcaBotmuxPage.locator('[data-tab-id]')).toHaveCount(tabCountBeforeCancelledClick)
+      await expect(botmuxPage.locator('[data-tab-id]')).toHaveCount(tabCountBeforeCancelledClick)
 
-      await clickBrowserLink(orcaBotmuxPage, sourceTab!.id, '#middle-link', { button: 'middle' })
-      await expectBrowserTabActive(orcaBotmuxPage, 'Middle-click destination')
+      await clickBrowserLink(botmuxPage, sourceTab!.id, '#middle-link', { button: 'middle' })
+      await expectBrowserTabActive(botmuxPage, 'Middle-click destination')
       await expect
         .poll(() => electronApp.evaluate(({ BaseWindow }) => BaseWindow.getAllWindows().length), {
           timeout: 5_000
@@ -539,33 +539,33 @@ test.describe('Browser Tab', () => {
    * User Prompt:
    * - Browser works and also retains state when switching tabs etc.
    */
-  test('browser tab retains state when switching worktrees and back', async ({ orcaBotmuxPage }) => {
-    const allWorktreeIds = await getAllWorktreeIds(orcaBotmuxPage)
+  test('browser tab retains state when switching worktrees and back', async ({ botmuxPage }) => {
+    const allWorktreeIds = await getAllWorktreeIds(botmuxPage)
     if (allWorktreeIds.length < 2) {
       test.skip(true, 'Need at least 2 worktrees to test worktree switching')
     }
 
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await createBrowserTab(orcaBotmuxPage, worktreeId)
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 5_000 }).toBe('browser')
+    await createBrowserTab(botmuxPage, worktreeId)
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 5_000 }).toBe('browser')
 
-    const browserTabsBefore = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+    const browserTabsBefore = await getBrowserTabs(botmuxPage, worktreeId)
     expect(browserTabsBefore.length).toBeGreaterThan(0)
 
     // Switch to a different worktree via the store
-    const otherId = await switchToOtherWorktree(orcaBotmuxPage, worktreeId)
+    const otherId = await switchToOtherWorktree(botmuxPage, worktreeId)
     expect(otherId).not.toBeNull()
-    await expect.poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 5_000 }).toBe(otherId)
+    await expect.poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 5_000 }).toBe(otherId)
 
     // Switch back to the original worktree
-    await switchToWorktree(orcaBotmuxPage, worktreeId)
+    await switchToWorktree(botmuxPage, worktreeId)
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 5_000 })
+      .poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 5_000 })
       .toBe(worktreeId)
 
     // Browser tabs should still be preserved
-    const browserTabsAfter = await getBrowserTabs(orcaBotmuxPage, worktreeId)
+    const browserTabsAfter = await getBrowserTabs(botmuxPage, worktreeId)
     expect(browserTabsAfter.length).toBe(browserTabsBefore.length)
   })
 })

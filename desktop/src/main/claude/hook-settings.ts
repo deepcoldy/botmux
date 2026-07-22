@@ -30,7 +30,7 @@ export const CLAUDE_EVENTS = [
   { eventName: 'UserPromptSubmit', definition: { hooks: [{ type: 'command', command: '' }] } },
   { eventName: 'Stop', definition: { hooks: [{ type: 'command', command: '' }] } },
   // Why: OpenClaude skips normal Stop hooks after API/model errors and emits
-  // StopFailure instead; without this hook OrcaBotmux leaves the turn spinning.
+  // StopFailure instead; without this hook Botmux leaves the turn spinning.
   { eventName: 'StopFailure', definition: { hooks: [{ type: 'command', command: '' }] } },
   // Why: subagent/teammate lifecycle feeds the sidebar's child rows and keeps
   // a pane 'working' while background children outlive the lead's turn.

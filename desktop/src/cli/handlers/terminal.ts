@@ -86,7 +86,7 @@ export const TERMINAL_HANDLERS: Record<string, CommandHandler> = {
       text: getOptionalStringFlag(flags, 'text'),
       enter: flags.get('enter') === true,
       interrupt: flags.get('interrupt') === true,
-      client: { id: 'orca-botmux-cli', type: 'desktop' }
+      client: { id: 'botmux-cli', type: 'desktop' }
     })
     printResult(result, json, formatTerminalSend)
   },

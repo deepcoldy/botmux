@@ -17,17 +17,17 @@ function repo(id: string, overrides: Partial<Repo> = {}): Repo {
     displayName: id,
     badgeColor: '#111111',
     addedAt: 1,
-    upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+    upstream: { owner: 'stablyai', repo: 'botmux' },
     ...overrides
   }
 }
 
 function project(overrides: Partial<Project> = {}): Project {
   return {
-    id: 'github:stablyai/orca_botmux',
-    displayName: 'orca_botmux',
+    id: 'github:stablyai/botmux',
+    displayName: 'botmux',
     badgeColor: '#111111',
-    providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' },
+    providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' },
     sourceRepoIds: ['local-repo', 'ssh-repo'],
     createdAt: 1,
     updatedAt: 1,
@@ -38,11 +38,11 @@ function project(overrides: Partial<Project> = {}): Project {
 function setup(overrides: Partial<ProjectHostSetup>): ProjectHostSetup {
   return {
     id: overrides.id ?? 'local-setup',
-    projectId: overrides.projectId ?? 'github:stablyai/orca_botmux',
+    projectId: overrides.projectId ?? 'github:stablyai/botmux',
     hostId: overrides.hostId ?? 'local',
     repoId: overrides.repoId ?? 'local-repo',
-    path: overrides.path ?? '/tmp/orca_botmux',
-    displayName: overrides.displayName ?? 'orca_botmux',
+    path: overrides.path ?? '/tmp/botmux',
+    displayName: overrides.displayName ?? 'botmux',
     setupState: overrides.setupState ?? 'ready',
     setupMethod: overrides.setupMethod ?? 'legacy-repo',
     createdAt: 1,
@@ -80,12 +80,12 @@ describe('buildNewWorkspaceProjectOptions', () => {
 
     expect(options).toEqual([
       {
-        id: 'github:stablyai/orca_botmux',
+        id: 'github:stablyai/botmux',
         kind: 'project',
-        projectId: 'github:stablyai/orca_botmux',
-        displayName: 'orca_botmux',
+        projectId: 'github:stablyai/botmux',
+        displayName: 'botmux',
         badgeColor: '#111111',
-        detail: 'stablyai/orca_botmux'
+        detail: 'stablyai/botmux'
       }
     ])
   })
@@ -105,7 +105,7 @@ describe('buildNewWorkspaceProjectOptions', () => {
       eligibleRepos: [repo('local-repo'), repo('other-repo')]
     })
 
-    expect(options.map((option) => option.id)).toEqual(['github:stablyai/orca_botmux'])
+    expect(options.map((option) => option.id)).toEqual(['github:stablyai/botmux'])
   })
 
   it('shows configured directories when project names are duplicated', () => {
@@ -363,11 +363,11 @@ describe('buildNewWorkspaceProjectOptions', () => {
     const options: NewWorkspaceProjectOption[] = [
       {
         kind: 'project',
-        id: 'orca_botmux',
-        projectId: 'orca_botmux',
-        displayName: 'orca_botmux',
+        id: 'botmux',
+        projectId: 'botmux',
+        displayName: 'botmux',
         badgeColor: '#111111',
-        detail: 'stablyai/orca_botmux'
+        detail: 'stablyai/botmux'
       },
       {
         kind: 'project',
@@ -380,7 +380,7 @@ describe('buildNewWorkspaceProjectOptions', () => {
     ]
 
     expect(searchNewWorkspaceProjectOptions(options, 'docs')).toEqual([options[1]])
-    expect(searchNewWorkspaceProjectOptions(options, 'stablyai/orca_botmux')).toEqual([options[0]])
+    expect(searchNewWorkspaceProjectOptions(options, 'stablyai/botmux')).toEqual([options[0]])
   })
 
   it('rejects oversized pasted searches before reading project options', () => {
@@ -408,10 +408,10 @@ describe('buildNewWorkspaceProjectOptions', () => {
 describe('buildNewWorkspaceFolderSourceOptions', () => {
   it('keeps concrete source repos separate even when they are the same logical project', () => {
     const options = buildNewWorkspaceFolderSourceOptions([
-      repo('local-repo', { displayName: 'orca_botmux', path: '/tmp/orca_botmux' }),
+      repo('local-repo', { displayName: 'botmux', path: '/tmp/botmux' }),
       repo('ssh-repo', {
-        displayName: 'orca_botmux',
-        path: '/srv/orca_botmux',
+        displayName: 'botmux',
+        path: '/srv/botmux',
         connectionId: 'ssh:builder'
       })
     ])
@@ -420,7 +420,7 @@ describe('buildNewWorkspaceFolderSourceOptions', () => {
       'folder-source:local-repo',
       'folder-source:ssh-repo'
     ])
-    expect(options.map((option) => option.detail).sort()).toEqual(['/srv/orca_botmux', '/tmp/orca_botmux'])
+    expect(options.map((option) => option.detail).sort()).toEqual(['/srv/botmux', '/tmp/botmux'])
     expect(getRepoIdFromNewWorkspaceFolderSourceOptionId('folder-source:ssh-repo')).toBe('ssh-repo')
   })
 })
@@ -439,7 +439,7 @@ describe('buildNewWorkspaceCreateTargetOptions', () => {
     })
 
     expect(options.map((option) => option.id).sort()).toEqual([
-      'github:stablyai/orca_botmux',
+      'github:stablyai/botmux',
       'project-group:folder-group'
     ])
     expect(options.find((option) => option.id === 'project-group:folder-group')).toMatchObject({

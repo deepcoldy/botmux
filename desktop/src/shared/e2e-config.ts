@@ -3,7 +3,7 @@ export type E2EConfig = {
   headless: boolean
   exposeStore: boolean
   userDataDir: string | null
-  /** Test-only override (ORCA_E2E_TERMINAL_PARKING_DELAY_MS) shrinking the
+  /** Test-only override (BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS) shrinking the
    *  terminal hidden-view parking delays. null means use production timing. */
   terminalParkingDelayMs: number | null
 }

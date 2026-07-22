@@ -197,7 +197,7 @@ export class AutomationService {
         runId: run.id,
         status: 'skipped_missed',
         workspaceId: automation.workspaceId,
-        error: 'OrcaBotmux was unavailable during the missed-run grace window.'
+        error: 'Botmux was unavailable during the missed-run grace window.'
       })
       this.store.advanceAutomationNextRun(automation.id, now)
       return
@@ -231,7 +231,7 @@ export class AutomationService {
         runId: run.id,
         status: 'skipped_unavailable',
         workspaceId: automation.workspaceId,
-        error: 'No OrcaBotmux window was available to launch the automation.'
+        error: 'No Botmux window was available to launch the automation.'
       })
     }
     const updated = this.store.updateAutomationRun({

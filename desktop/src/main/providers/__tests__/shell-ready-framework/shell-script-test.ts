@@ -65,8 +65,8 @@ export async function shellScriptTest(
       // Why: the framework creates user startup files under testHome after
       // computing the wrapper config; route wrapper discovery to that fixture.
       HOME: testHome,
-      ORCA_ORIG_ZDOTDIR: testHome,
-      ORCA_ZSHENV_SOURCE_DIR: testHome
+      BOTMUX_ORIG_ZDOTDIR: testHome,
+      BOTMUX_ZSHENV_SOURCE_DIR: testHome
     }
 
     const spawnOptions = {
@@ -112,7 +112,7 @@ export async function shellScriptTest(
 }
 
 const TEMP_PATH_PATTERN =
-  /\/(?:var\/folders|tmp)\/[^\s]+?\/(?:shell-test|orca_botmux|shell-ready)-[a-z]+-[a-z0-9-]+/g
+  /\/(?:var\/folders|tmp)\/[^\s]+?\/(?:shell-test|botmux|shell-ready)-[a-z]+-[a-z0-9-]+/g
 const PID_PATTERN = /\bpid:\s*\d+/gi
 
 function normalizeOutput(

@@ -301,7 +301,7 @@ export async function getMergeRequest(
  * Find the merge request whose source branch matches the given branch
  * name. Mirrors github/getPRForBranch — returns the most recently
  * updated MR for the branch, or null when none exists. The branch is the
- * local checkout's current ref (OrcaBotmux strips refs/heads/ prefix upstream
+ * local checkout's current ref (Botmux strips refs/heads/ prefix upstream
  * so we don't need to here).
  */
 export async function getMergeRequestForBranch(
@@ -744,7 +744,7 @@ export async function fetchIssuesAsWorkItems(
  * IPC handler's path-validation guard has something to check.
  *
  * Why: GitLab's todos surface is the closest GitLab-native analogue of
- * GitHub's notifications/inbox. Surfacing it in OrcaBotmux lets users start
+ * GitHub's notifications/inbox. Surfacing it in Botmux lets users start
  * work directly from a mention/assignment without going to gitlab.com
  * first.
  */

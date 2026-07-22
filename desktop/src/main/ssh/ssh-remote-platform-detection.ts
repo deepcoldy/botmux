@@ -8,7 +8,7 @@ import { execCommand } from './ssh-relay-deploy-helpers'
 import { getRemoteHostPlatform, type RemoteHostPlatform } from './ssh-remote-platform'
 import { powerShellCommand } from './ssh-remote-powershell'
 
-const PLATFORM_PROBE_MARKER = '__ORCA_REMOTE_PLATFORM__'
+const PLATFORM_PROBE_MARKER = '__BOTMUX_REMOTE_PLATFORM__'
 
 export async function detectRemoteHostPlatform(
   conn: SshConnection,

@@ -128,7 +128,7 @@ export default function NewExternalWorktreesInboxLine({
           <p className="px-1.5 py-1 text-[10px] leading-4 text-muted-foreground">
             {translate(
               'auto.components.sidebar.NewExternalWorktreesInboxLine.4d7a1c9e53',
-              'These worktrees were created outside of OrcaBotmux.'
+              'These worktrees were created outside of Botmux.'
             )}
           </p>
           <ul className="grid gap-0.5">

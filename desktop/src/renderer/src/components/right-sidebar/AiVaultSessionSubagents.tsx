@@ -6,8 +6,8 @@ import { Button } from '@/components/ui/button'
 import { AgentStateDot, agentStateLabel, type AgentDotState } from '@/components/AgentStateDot'
 import type { AiVaultSession, AiVaultSubagentRunStatus } from '../../../../shared/ai-vault-types'
 import { LOCAL_EXECUTION_HOST_ID } from '../../../../shared/execution-host'
-import { canOpenAiVaultSessionLogInOrca } from './ai-vault-session-path-actions'
-import { openAiVaultSessionLogInOrca } from './ai-vault-session-log-open'
+import { canOpenAiVaultSessionLogInBotmux } from './ai-vault-session-path-actions'
+import { openAiVaultSessionLogInBotmux } from './ai-vault-session-log-open'
 import { translate } from '@/i18n/i18n'
 
 type SubagentListState = { status: 'loading' } | { status: 'loaded'; sessions: AiVaultSession[] }
@@ -145,7 +145,7 @@ function SubagentSessionLine({ session }: { session: AiVaultSession }): React.JS
           { value0: session.messageCount }
         )}
       </span>
-      {canOpenAiVaultSessionLogInOrca(session) ? (
+      {canOpenAiVaultSessionLogInBotmux(session) ? (
         <Button
           type="button"
           variant="ghost"
@@ -157,7 +157,7 @@ function SubagentSessionLine({ session }: { session: AiVaultSession }): React.JS
           )}
           onClick={(event) => {
             event.stopPropagation()
-            void openAiVaultSessionLogInOrca(session)
+            void openAiVaultSessionLogInBotmux(session)
           }}
           className="shrink-0 text-muted-foreground"
         >

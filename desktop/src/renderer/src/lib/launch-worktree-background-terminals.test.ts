@@ -16,7 +16,7 @@ let uuidIndex = 0
 
 const setupLaunch = {
   runnerScriptPath: '/tmp/setup.sh',
-  envVars: { ORCA_WORKTREE_PATH: '/repo/worktree' }
+  envVars: { BOTMUX_WORKTREE_PATH: '/repo/worktree' }
 }
 
 const state = {
@@ -143,7 +143,7 @@ describe('launchWorktreeBackgroundTerminals', () => {
       2,
       expect.objectContaining({
         command: 'bash /tmp/setup.sh',
-        env: expect.objectContaining({ ORCA_WORKTREE_PATH: '/repo/worktree' }),
+        env: expect.objectContaining({ BOTMUX_WORKTREE_PATH: '/repo/worktree' }),
         tabId: 'tab-2',
         leafId: '00000000-0000-4000-8000-000000000002'
       })
@@ -236,15 +236,15 @@ describe('launchWorktreeBackgroundTerminals', () => {
     await launchWorktreeBackgroundTerminals({
       worktreeId: 'wt-1',
       setup: {
-        runnerScriptPath: 'C:\\repo\\.git\\worktrees\\wt\\orca_botmux\\setup-runner.cmd',
-        envVars: { ORCA_WORKTREE_PATH: 'C:\\repo\\worktree' }
+        runnerScriptPath: 'C:\\repo\\.git\\worktrees\\wt\\botmux\\setup-runner.cmd',
+        envVars: { BOTMUX_WORKTREE_PATH: 'C:\\repo\\worktree' }
       }
     })
 
     expect(mockSpawn).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
-        command: 'cmd.exe /c "C:\\repo\\.git\\worktrees\\wt\\orca_botmux\\setup-runner.cmd"',
+        command: 'cmd.exe /c "C:\\repo\\.git\\worktrees\\wt\\botmux\\setup-runner.cmd"',
         connectionId: 'ssh-windows'
       })
     )

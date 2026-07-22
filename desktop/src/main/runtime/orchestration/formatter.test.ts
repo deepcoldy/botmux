@@ -72,7 +72,7 @@ describe('formatMessageBanner', () => {
   it('includes reply hint with message ID', () => {
     const banner = formatMessageBanner(makeMessage({ id: 'msg_xyz789' }))
     expect(banner).toContain(
-      '[Reply: orca_botmux orchestration reply --id msg_xyz789 --from term_coord --body "..."]'
+      '[Reply: botmux orchestration reply --id msg_xyz789 --from term_coord --body "..."]'
     )
   })
 

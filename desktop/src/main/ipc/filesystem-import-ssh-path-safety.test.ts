@@ -38,7 +38,7 @@ function createProvider(uploadSession: FileUploadSession): IFilesystemProvider {
 
 describe('SSH import remote path safety', () => {
   const connectionId = 'ssh-windows'
-  const destDir = 'C:/Users/me/project/.orca_botmux/drops'
+  const destDir = 'C:/Users/me/project/.botmux/drops'
   let provider: IFilesystemProvider
   let uploadSession: FileUploadSession
 
@@ -60,7 +60,7 @@ describe('SSH import remote path safety', () => {
   it.runIf(process.platform !== 'win32')(
     'rejects a POSIX filename containing Windows traversal before remote stat',
     async () => {
-      const sourcePath = '/tmp/..\\..\\.ssh\\orca_botmux_drop'
+      const sourcePath = '/tmp/..\\..\\.ssh\\botmux_drop'
 
       const { results } = await importExternalPathsSsh([sourcePath], destDir, connectionId)
 
@@ -76,7 +76,7 @@ describe('SSH import remote path safety', () => {
     }
   )
 
-  it.each(['report.txt:orca_botmux', 'NUL', 'trailing.', 'question?.txt'])(
+  it.each(['report.txt:botmux', 'NUL', 'trailing.', 'question?.txt'])(
     'rejects Windows-special top-level name %j before remote stat',
     async (name) => {
       const { results } = await importExternalPathsSsh([`/tmp/${name}`], destDir, connectionId)
@@ -100,7 +100,7 @@ describe('SSH import remote path safety', () => {
     })
     readdirMock.mockResolvedValue([
       {
-        name: '..\\..\\.ssh\\orca_botmux_drop',
+        name: '..\\..\\.ssh\\botmux_drop',
         isFile: () => true,
         isDirectory: () => false,
         isSymbolicLink: () => false

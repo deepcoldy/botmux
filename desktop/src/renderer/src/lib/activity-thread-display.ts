@@ -6,7 +6,7 @@ import type {
 import type { TerminalTab, Worktree } from '../../../shared/types'
 import {
   getAgentRowPrimaryText,
-  isOrcaDispatchPrompt,
+  isBotmuxDispatchPrompt,
   orchestrationLabelsMatchLiveDispatch
 } from './agent-row-primary-text'
 
@@ -27,7 +27,7 @@ export function isTerseAgentFollowUpPrompt(prompt: string): boolean {
 }
 
 function taskTitleFromPrompt(prompt: string): string | null {
-  if (isOrcaDispatchPrompt(prompt)) {
+  if (isBotmuxDispatchPrompt(prompt)) {
     const preview = getAgentRowPrimaryText({ prompt })
     return preview || null
   }
@@ -70,7 +70,7 @@ function orchestrationLabelForEntry(
   if (!label) {
     return null
   }
-  if (isOrcaDispatchPrompt(entry.prompt)) {
+  if (isBotmuxDispatchPrompt(entry.prompt)) {
     return orchestrationLabelsMatchLiveDispatch(entry) ? label : null
   }
   if (taskTitleFromPrompt(entry.prompt)) {

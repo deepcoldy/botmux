@@ -58,15 +58,15 @@ vi.mock('./runtime-client', () => {
     RuntimeClient,
     RuntimeClientError,
     RuntimeRpcFailureError,
-    serveOrcaApp: vi.fn(),
-    getDefaultUserDataPath: vi.fn(() => '/tmp/orca-botmux-user-data')
+    serveBotmuxApp: vi.fn(),
+    getDefaultUserDataPath: vi.fn(() => '/tmp/botmux-user-data')
   }
 })
 
 import { dispatch } from './dispatch'
 import { main } from './index'
 
-describe('orca_botmux skills CLI', () => {
+describe('botmux skills CLI', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     runtimeClientConstructorMock.mockClear()
@@ -168,7 +168,7 @@ describe('orca_botmux skills CLI', () => {
     await main(['--help'], '/tmp/repo')
 
     expect(String(logSpy.mock.calls[0]?.[0])).toContain(
-      'Usage: orca_botmux skills get <topic> [--full] [--json]'
+      'Usage: botmux skills get <topic> [--full] [--json]'
     )
     expect(String(logSpy.mock.calls[1]?.[0])).toContain(
       'Commands:\n  list               List version-matched skill guides'

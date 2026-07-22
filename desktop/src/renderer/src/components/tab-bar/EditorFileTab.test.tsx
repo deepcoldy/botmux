@@ -195,7 +195,7 @@ vi.mock('../right-sidebar/status-display', () => ({
 }))
 
 vi.mock('./SortableTab', () => ({
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca-botmux-close-all-context-menus'
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux-close-all-context-menus'
 }))
 
 vi.mock('./drop-indicator', () => ({

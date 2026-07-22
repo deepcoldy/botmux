@@ -41,17 +41,17 @@ describe('automation run identity', () => {
     const value = automation({
       runContext: {
         kind: 'workspace-run',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:builder',
         projectHostSetupId: 'setup-builder',
         repoId: 'remote-repo',
-        path: '/remote/orca_botmux'
+        path: '/remote/botmux'
       }
     })
 
     expect(getAutomationLegacyRepoId(value)).toBe('legacy-repo')
     expect(getAutomationRunRepoId(value)).toBe('remote-repo')
-    expect(getAutomationRunProjectId(value)).toBe('github:stablyai/orca_botmux')
+    expect(getAutomationRunProjectId(value)).toBe('github:stablyai/botmux')
   })
 
   it('falls back to the legacy repo id for pre-host-context automations', () => {

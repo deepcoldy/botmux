@@ -165,7 +165,7 @@ export function GitLabRateLimitPanel({ className }: { className?: string }): Rea
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.gitlab.gitlab.rate.limit.display.2f9c16d6c3',
-              'OrcaBotmux uses REST through the GitLab CLI.'
+              'Botmux uses REST through the GitLab CLI.'
             )}
           </p>
           <ProviderHostScopeControl

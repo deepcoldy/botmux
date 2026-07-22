@@ -65,16 +65,16 @@ vi.mock('./SshDisconnectedDialog', () => ({
 
 vi.mock('./WorktreeContextMenu', () => ({
   default: ({ children }: { children: ReactNode }) => <>{children}</>,
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca_botmux:test-close-context-menus',
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux:test-close-context-menus',
   WORKTREE_NATIVE_CONTEXT_MENU_ATTR: 'data-worktree-native-context-menu',
-  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-orca-botmux-context-menu-scope'
+  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-botmux-context-menu-scope'
 }))
 
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-1',
     path: '/repo',
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#999999',
     repoIcon: { type: 'emoji', emoji: '🦊' },
     addedAt: 1,
@@ -129,7 +129,7 @@ describe('WorktreeCard pinned repo icon', () => {
       )
 
       expect(markup).toContain('🦊')
-      expect(markup).toContain('Project orca_botmux')
+      expect(markup).toContain('Project botmux')
     },
     WORKTREE_CARD_IMPORT_TIMEOUT_MS
   )
@@ -148,7 +148,7 @@ describe('WorktreeCard pinned repo icon', () => {
       )
 
       expect(markup).not.toContain('🦊')
-      expect(markup).not.toContain('Project orca_botmux')
+      expect(markup).not.toContain('Project botmux')
     },
     WORKTREE_CARD_IMPORT_TIMEOUT_MS
   )
@@ -169,7 +169,7 @@ describe('WorktreeCard pinned repo icon', () => {
       )
 
       expect(markup).toContain('🦊')
-      expect(markup).toContain('Project orca_botmux')
+      expect(markup).toContain('Project botmux')
       expect(markup).not.toContain('data-worktree-card-meta-row=""')
     },
     WORKTREE_CARD_IMPORT_TIMEOUT_MS

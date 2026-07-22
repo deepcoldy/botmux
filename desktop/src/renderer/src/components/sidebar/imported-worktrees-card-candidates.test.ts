@@ -14,7 +14,7 @@ import type {
 const repo: Repo = {
   id: 'repo-1',
   path: '/repo',
-  displayName: 'orca_botmux',
+  displayName: 'botmux',
   badgeColor: '#000000',
   addedAt: Date.UTC(2026, 4, 24),
   externalWorktreeVisibility: 'hide'
@@ -75,7 +75,7 @@ describe('getHiddenImportedWorktrees', () => {
         hidden,
         detectedWorktree({ id: 'visible', visible: true }),
         detectedWorktree({ id: 'selected', selectedCheckout: true }),
-        detectedWorktree({ id: 'orca-botmux-managed', ownership: 'orca-botmux-managed' })
+        detectedWorktree({ id: 'botmux-managed', ownership: 'botmux-managed' })
       ])
     )
 

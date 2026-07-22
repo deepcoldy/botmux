@@ -24,7 +24,7 @@ import {
 import { translate } from '@/i18n/i18n'
 import { createBrowserUuid } from '@/lib/browser-uuid'
 
-const AUTOMATIONS_CHANGED_EVENT = 'orca_botmux:automations-changed'
+const AUTOMATIONS_CHANGED_EVENT = 'botmux:automations-changed'
 const activeReuseDispatchTabIds = new Set<string>()
 
 function acquireReuseDispatchTab(tabId: string): (() => void) | null {

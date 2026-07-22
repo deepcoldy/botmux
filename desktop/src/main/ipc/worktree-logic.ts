@@ -1,5 +1,5 @@
 import { resolve, relative, isAbsolute, posix, sep, win32 } from 'node:path'
-import type { GlobalSettings, OrcaWorkspaceLayout, Repo } from '../../shared/types'
+import type { GlobalSettings, BotmuxWorkspaceLayout, Repo } from '../../shared/types'
 import { isWindowsAbsolutePathLike, resolveRuntimePath } from '../../shared/cross-platform-path'
 import { isWslUncPath } from '../../shared/wsl-paths'
 import { splitWorktreeId } from '../../shared/worktree-id'
@@ -79,8 +79,8 @@ export function ensurePathWithinWorkspace(targetPath: string, workspaceDir: stri
  * must also live on the WSL filesystem. Creating them on the Windows side
  * (/mnt/c/...) would be extremely slow due to cross-filesystem I/O and
  * the terminal would open a Windows shell instead of WSL. We mirror the
- * Windows workspace layout inside ~/orca_botmux/workspaces on the WSL filesystem
- * (e.g. \\wsl.localhost\Ubuntu\home\user\orca_botmux\workspaces\repo\feature).
+ * Windows workspace layout inside ~/botmux/workspaces on the WSL filesystem
+ * (e.g. \\wsl.localhost\Ubuntu\home\user\botmux\workspaces\repo\feature).
  */
 export function computeWorktreePath(
   sanitizedName: string,
@@ -106,7 +106,7 @@ export function computeWorkspaceRoot(repoPath: string, settings: { workspaceDir:
       // Mirror absolute local desktop workspace roots inside the distro so
       // terminals stay on the WSL filesystem; repo-relative roots can resolve
       // directly against the WSL repo path.
-      return win32.join(wslHome, 'orca_botmux', 'workspaces')
+      return win32.join(wslHome, 'botmux', 'workspaces')
     }
   }
   return resolveWorkspaceDirForRepo(repoPath, settings.workspaceDir)
@@ -143,7 +143,7 @@ export function getWorktreePathSettings(
 export function getWorktreeCreationLayout(
   repo: WorktreeBasePathRepo,
   settings: WorktreePathSettings
-): OrcaWorkspaceLayout {
+): BotmuxWorkspaceLayout {
   return {
     path: getEffectiveWorktreeBasePath(repo, settings),
     nestWorkspaces: settings.nestWorkspaces

@@ -41,7 +41,7 @@ vi.mock('../menu/register-app-menu', () => ({
 import { registerKeybindingHandlers } from './keybindings'
 
 const snapshot: KeybindingFileSnapshot = {
-  path: '/Users/example/.orca_botmux/keybindings.json',
+  path: '/Users/example/.botmux/keybindings.json',
   platform: 'darwin',
   exists: true,
   overrides: {},
@@ -75,7 +75,7 @@ describe('registerKeybindingHandlers', () => {
     expect(authorizeExternalPathMock).toHaveBeenCalledWith(snapshot.path)
   })
 
-  it('authorizes the keybindings file before opening it outside OrcaBotmux', async () => {
+  it('authorizes the keybindings file before opening it outside Botmux', async () => {
     openPathMock.mockResolvedValue('')
     registerKeybindingHandlers({ ensureFile: vi.fn(() => snapshot) } as never)
 

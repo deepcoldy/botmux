@@ -1,27 +1,27 @@
 import { track } from '@/lib/telemetry'
 import type { EventProps } from '../../../../shared/telemetry-events'
 
-export type OrcaCliFeatureTipSource = EventProps<'orca_botmux_cli_feature_tip_shown'>['source']
-export type OrcaCliFeatureTipSetupResult = EventProps<'orca_botmux_cli_feature_tip_setup_result'>['result']
+export type BotmuxCliFeatureTipSource = EventProps<'botmux_cli_feature_tip_shown'>['source']
+export type BotmuxCliFeatureTipSetupResult = EventProps<'botmux_cli_feature_tip_setup_result'>['result']
 export type CmdJPaletteFeatureTipSource = EventProps<'cmd_j_palette_feature_tip_shown'>['source']
 
-export function getOrcaCliFeatureTipTelemetrySource(value: unknown): OrcaCliFeatureTipSource {
+export function getBotmuxCliFeatureTipTelemetrySource(value: unknown): BotmuxCliFeatureTipSource {
   return value === 'app_open' ? 'app_open' : 'manual'
 }
 
-export function trackOrcaCliFeatureTipShown(source: OrcaCliFeatureTipSource): void {
-  track('orca_botmux_cli_feature_tip_shown', { source })
+export function trackBotmuxCliFeatureTipShown(source: BotmuxCliFeatureTipSource): void {
+  track('botmux_cli_feature_tip_shown', { source })
 }
 
-export function trackOrcaCliFeatureTipSetupClicked(source: OrcaCliFeatureTipSource): void {
-  track('orca_botmux_cli_feature_tip_setup_clicked', { source })
+export function trackBotmuxCliFeatureTipSetupClicked(source: BotmuxCliFeatureTipSource): void {
+  track('botmux_cli_feature_tip_setup_clicked', { source })
 }
 
-export function trackOrcaCliFeatureTipSetupResult(
-  source: OrcaCliFeatureTipSource,
-  result: OrcaCliFeatureTipSetupResult
+export function trackBotmuxCliFeatureTipSetupResult(
+  source: BotmuxCliFeatureTipSource,
+  result: BotmuxCliFeatureTipSetupResult
 ): void {
-  track('orca_botmux_cli_feature_tip_setup_result', { source, result })
+  track('botmux_cli_feature_tip_setup_result', { source, result })
 }
 
 export function trackCmdJPaletteFeatureTipShown(source: CmdJPaletteFeatureTipSource): void {

@@ -5,7 +5,7 @@
  * source controls and close affordance are present.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree, getStoreState } from './helpers/store'
 
 type RenderedTaskSource = {
@@ -50,19 +50,19 @@ async function getRenderedTaskSources(
 }
 
 test.describe('Tasks page', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('opening the tasks view renders the tasks UI', async ({ orcaBotmuxPage }) => {
-    await openTasksPage(orcaBotmuxPage)
+  test('opening the tasks view renders the tasks UI', async ({ botmuxPage }) => {
+    await openTasksPage(botmuxPage)
 
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe('tasks')
 
-    await expect(orcaBotmuxPage.getByRole('button', { name: 'Close tasks' })).toBeVisible({
+    await expect(botmuxPage.getByRole('button', { name: 'Close tasks' })).toBeVisible({
       timeout: 10_000
     })
 
@@ -72,7 +72,7 @@ test.describe('Tasks page', () => {
     await expect
       .poll(
         async () => {
-          renderedSources = await getRenderedTaskSources(orcaBotmuxPage)
+          renderedSources = await getRenderedTaskSources(botmuxPage)
           return renderedSources.length
         },
         {
@@ -85,7 +85,7 @@ test.describe('Tasks page', () => {
     await expect
       .poll(
         async () => {
-          renderedSources = await getRenderedTaskSources(orcaBotmuxPage)
+          renderedSources = await getRenderedTaskSources(botmuxPage)
           return renderedSources.some((source) => source.active)
         },
         {
@@ -95,27 +95,27 @@ test.describe('Tasks page', () => {
       )
       .toBe(true)
     if (renderedSources.some((source) => source.source === 'github' && source.active)) {
-      await expect(orcaBotmuxPage.getByRole('button', { name: 'Issues', exact: true })).toBeVisible()
-      await expect(orcaBotmuxPage.getByRole('button', { name: 'PRs', exact: true })).toBeVisible()
-      await expect(orcaBotmuxPage.getByRole('button', { name: 'Projects', exact: true })).toBeVisible()
-      await expect(orcaBotmuxPage.getByPlaceholder(/Search GitHub (issues|PRs)/i)).toBeVisible()
+      await expect(botmuxPage.getByRole('button', { name: 'Issues', exact: true })).toBeVisible()
+      await expect(botmuxPage.getByRole('button', { name: 'PRs', exact: true })).toBeVisible()
+      await expect(botmuxPage.getByRole('button', { name: 'Projects', exact: true })).toBeVisible()
+      await expect(botmuxPage.getByPlaceholder(/Search GitHub (issues|PRs)/i)).toBeVisible()
     }
   })
 
-  test('closing the tasks page returns to the previous view', async ({ orcaBotmuxPage }) => {
-    const previousView = await getStoreState<string>(orcaBotmuxPage, 'activeView')
+  test('closing the tasks page returns to the previous view', async ({ botmuxPage }) => {
+    const previousView = await getStoreState<string>(botmuxPage, 'activeView')
 
-    await openTasksPage(orcaBotmuxPage)
+    await openTasksPage(botmuxPage)
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe('tasks')
     // Sanity: the tasks UI actually painted before we close it.
-    await expect(orcaBotmuxPage.getByRole('button', { name: 'Close tasks' })).toBeVisible()
+    await expect(botmuxPage.getByRole('button', { name: 'Close tasks' })).toBeVisible()
 
-    await orcaBotmuxPage.getByRole('button', { name: 'Close tasks' }).click()
+    await botmuxPage.getByRole('button', { name: 'Close tasks' }).click()
 
     await expect
-      .poll(async () => getStoreState<string>(orcaBotmuxPage, 'activeView'), { timeout: 5_000 })
+      .poll(async () => getStoreState<string>(botmuxPage, 'activeView'), { timeout: 5_000 })
       .toBe(previousView)
     // Why: the load-bearing check is that the previous view's DOM actually
     // re-rendered — a store-only `activeView` assertion would pass even if the
@@ -124,9 +124,9 @@ test.describe('Tasks page', () => {
     // previous view was terminal (by far the common case in E2E setup), that
     // element must be visible. Tasks-close also hides the "Close tasks"
     // button regardless of previous view, so we assert that too.
-    await expect(orcaBotmuxPage.getByRole('button', { name: 'Close tasks' })).toHaveCount(0)
+    await expect(botmuxPage.getByRole('button', { name: 'Close tasks' })).toHaveCount(0)
     if (previousView === 'terminal') {
-      await expect(orcaBotmuxPage.locator('.xterm').first()).toBeVisible({ timeout: 5_000 })
+      await expect(botmuxPage.locator('.xterm').first()).toBeVisible({ timeout: 5_000 })
     }
   })
 })

@@ -57,7 +57,7 @@ export function catalogDefaultValues(model: CatalogModel): Record<string, Sessio
   return Object.fromEntries(model.options.map((option) => [option.id, option.kind.defaultValue]))
 }
 
-/** Merge live rows over the static seed while retaining only option shapes OrcaBotmux
+/** Merge live rows over the static seed while retaining only option shapes Botmux
  * can actually map. Newly discovered ids remain model-only until cataloged. */
 export function mergeCatalogModels(
   seed: readonly CatalogModel[],

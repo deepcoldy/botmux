@@ -105,7 +105,7 @@ describe('searchBaseRefs (widened glob)', () => {
   let tmpDir: string
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'orca-botmux-repo-test-'))
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'botmux-repo-test-'))
     initRepo(tmpDir)
   })
 
@@ -466,7 +466,7 @@ describe('getDefaultBaseRef (regression — unchanged behavior)', () => {
   let tmpDir: string
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'orca-botmux-repo-test-'))
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'botmux-repo-test-'))
     initRepo(tmpDir)
   })
 
@@ -580,7 +580,7 @@ describe('getRemoteCount', () => {
   let tmpDir: string
 
   beforeEach(() => {
-    tmpDir = mkdtempSync(path.join(tmpdir(), 'orca-botmux-repo-test-'))
+    tmpDir = mkdtempSync(path.join(tmpdir(), 'botmux-repo-test-'))
     initRepo(tmpDir)
   })
 

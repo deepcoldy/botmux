@@ -4,7 +4,7 @@ import { getConnectionIdFromState } from './connection-owner-resolution'
 import { resolveLiveAgentStatusConnectionRouting } from './agent-status-connection-ownership'
 
 /**
- * Why: Command Code has no prompt-submit hook, so when OrcaBotmux submits a generated
+ * Why: Command Code has no prompt-submit hook, so when Botmux submits a generated
  * prompt after the TUI is ready, seed `working` at delivery time so sidebar and
  * activity surfaces don't stay idle until the first real hook event arrives.
  */

@@ -31,7 +31,7 @@ describe('rebuild-native-deps Electron install fallback', () => {
 
       const result = runRebuildScript(projectDir, {
         npm_lifecycle_event: 'postinstall',
-        ORCA_STRICT_ELECTRON_INSTALL: ''
+        BOTMUX_STRICT_ELECTRON_INSTALL: ''
       })
 
       expect(result.status, result.stderr).toBe(0)
@@ -58,7 +58,7 @@ describe('rebuild-native-deps Electron install fallback', () => {
 
       const result = runRebuildScript(projectDir, {
         npm_lifecycle_event: 'postinstall',
-        ORCA_STRICT_ELECTRON_INSTALL: '1'
+        BOTMUX_STRICT_ELECTRON_INSTALL: '1'
       })
 
       expect(result.status).toBe(1)
@@ -110,7 +110,7 @@ describe('rebuild-native-deps Electron install fallback', () => {
       writeFileSync(join(projectDir, 'node_modules', 'electron', 'path.txt'), 'stale-path')
 
       const result = runRebuildScript(projectDir, {
-        ORCA_STRICT_ELECTRON_INSTALL: '1'
+        BOTMUX_STRICT_ELECTRON_INSTALL: '1'
       })
 
       expect(result.status).toBe(1)
@@ -132,13 +132,13 @@ describe('rebuild-native-deps patched node-pty rebuild', () => {
       try {
         const rebuildLogPath = join(projectDir, 'electron-rebuild.log')
         writeFakeUsableElectronPackage(projectDir, { platform: 'win32' })
-        writeFakeElectronRebuild(projectDir, { logPathEnv: 'ORCA_REBUILD_TEST_LOG' })
+        writeFakeElectronRebuild(projectDir, { logPathEnv: 'BOTMUX_REBUILD_TEST_LOG' })
         writeFakeLoadableNodePty(projectDir, { nativeDir: '../build/Release/' })
         writeFakeWindowsRegistry(projectDir)
         writeFakeNodePtyConptyPayload(projectDir, process.arch)
 
         const result = runRebuildScript(projectDir, {
-          ORCA_REBUILD_TEST_LOG: rebuildLogPath,
+          BOTMUX_REBUILD_TEST_LOG: rebuildLogPath,
           npm_config_platform: 'win32',
           npm_config_arch: process.arch
         })
@@ -187,12 +187,12 @@ describe('rebuild-native-deps patched node-pty rebuild', () => {
       try {
         const rebuildLogPath = join(projectDir, 'electron-rebuild.log')
         writeFakeUsableElectronPackage(projectDir)
-        writeFakeElectronRebuild(projectDir, { logPathEnv: 'ORCA_REBUILD_TEST_LOG' })
+        writeFakeElectronRebuild(projectDir, { logPathEnv: 'BOTMUX_REBUILD_TEST_LOG' })
         writeFakeLoadableNodePty(projectDir)
         writeNodePtyPatchFile(projectDir)
 
         const result = runRebuildScript(projectDir, {
-          ORCA_REBUILD_TEST_LOG: rebuildLogPath
+          BOTMUX_REBUILD_TEST_LOG: rebuildLogPath
         })
 
         expect(result.status, result.stderr).toBe(0)
@@ -218,13 +218,13 @@ describe('rebuild-native-deps patched node-pty rebuild', () => {
       try {
         const rebuildLogPath = join(projectDir, 'electron-rebuild.log')
         writeFakeUsableElectronPackage(projectDir)
-        writeFakeElectronRebuild(projectDir, { logPathEnv: 'ORCA_REBUILD_TEST_LOG' })
+        writeFakeElectronRebuild(projectDir, { logPathEnv: 'BOTMUX_REBUILD_TEST_LOG' })
         writeFakeLoadableNodePty(projectDir, { nativeDir: '../build/Release/' })
         writeNodePtyPatchFile(projectDir)
         writePatchedNodePtyBuildArtifacts(projectDir)
 
         const result = runRebuildScript(projectDir, {
-          ORCA_REBUILD_TEST_LOG: rebuildLogPath
+          BOTMUX_REBUILD_TEST_LOG: rebuildLogPath
         })
 
         expect(result.status, result.stderr).toBe(0)
@@ -246,18 +246,18 @@ describe('rebuild-native-deps patched node-pty rebuild', () => {
       try {
         const rebuildLogPath = join(projectDir, 'electron-rebuild.log')
         writeFakeUsableElectronPackage(projectDir)
-        writeFakeElectronRebuild(projectDir, { logPathEnv: 'ORCA_REBUILD_TEST_LOG' })
+        writeFakeElectronRebuild(projectDir, { logPathEnv: 'BOTMUX_REBUILD_TEST_LOG' })
         writeFakeLoadableNodePty(projectDir, { nativeDir: '../prebuilds/darwin-arm64/' })
         writeNodePtyPatchFile(projectDir)
         writePatchedNodePtyBuildArtifacts(projectDir)
 
         const result = runRebuildScript(projectDir, {
-          ORCA_REBUILD_TEST_LOG: rebuildLogPath
+          BOTMUX_REBUILD_TEST_LOG: rebuildLogPath
         })
 
         expect(result.status, result.stderr).toBe(0)
         expect(result.stdout).toContain('Native modules do not load in Electron; rebuilding.')
-        expect(result.stdout).toContain("expected build/Release so OrcaBotmux's node-pty patch is active")
+        expect(result.stdout).toContain("expected build/Release so Botmux's node-pty patch is active")
 
         const rebuildCall = JSON.parse(readFileSync(rebuildLogPath, 'utf8').trim())
         expect(rebuildCall.onlyModules).toEqual(['node-pty'])
@@ -270,7 +270,7 @@ describe('rebuild-native-deps patched node-pty rebuild', () => {
 })
 
 function mkTempProject() {
-  const projectDir = mkdtempSync(join(tmpdir(), 'orca-botmux-rebuild-native-deps-'))
+  const projectDir = mkdtempSync(join(tmpdir(), 'botmux-rebuild-native-deps-'))
   mkdirSync(join(projectDir, 'config', 'scripts'), { recursive: true })
   copyFileSync(sourceScriptPath, join(projectDir, 'config', 'scripts', 'rebuild-native-deps.mjs'))
   copyFileSync(
@@ -288,7 +288,7 @@ function runRebuildScript(projectDir, extraEnv = {}, args = []) {
   }
   for (const key of Object.keys(env)) {
     if (
-      key.toLowerCase() === 'orca_botmux_strict_electron_install' ||
+      key.toLowerCase() === 'botmux_strict_electron_install' ||
       key.toLowerCase() === 'npm_lifecycle_event'
     ) {
       delete env[key]

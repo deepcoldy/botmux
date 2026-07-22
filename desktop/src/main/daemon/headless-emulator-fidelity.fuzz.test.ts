@@ -149,7 +149,7 @@ async function runFidelityCase(testCase: FidelityCase): Promise<FidelityDiff | n
         restored.terminal.modes.bracketedPasteMode
       ),
       // Why alt is excluded from the two comparisons below:
-      // - scrollback: serializeHeadlessTerminalBuffer (orca-botmux-runtime.ts)
+      // - scrollback: serializeHeadlessTerminalBuffer (botmux-runtime.ts)
       //   deliberately forces scrollbackRows=0 while an alt-screen TUI is
       //   active, so normal-buffer history is not part of the alt contract.
       // - application cursor: HeadlessEmulator.getModes reports
@@ -280,7 +280,7 @@ describe('headless emulator snapshot fidelity fuzz', () => {
   // ── HEADLINE FINDING (do not delete while unfixed upstream) ──────────────
   // @xterm/addon-serialize 0.15.0-beta.287 does not round-trip null cells
   // that touch a soft-wrap boundary. Two variants, both found by this fuzz
-  // and minimized below. Every OrcaBotmux snapshot consumer is affected: hidden
+  // and minimized below. Every Botmux snapshot consumer is affected: hidden
   // reveal, parked-tab reveal, sleep/wake restore, and mobile subscribe
   // replay paint lost/shifted characters or stray '-' fillers whenever a TUI
   // erased inside a soft-wrapped line (shell line editing, status lines wider
@@ -398,7 +398,7 @@ describe('headless emulator snapshot fidelity fuzz', () => {
 
   // ── Bug C regression guard: cursor exact when the last row fills the margin ──
   // Upstream @xterm/addon-serialize computes its relative cursor-restore from
-  // a wrap-pending position and lands one column short. FIXED OrcaBotmux-side: the
+  // a wrap-pending position and lands one column short. FIXED Botmux-side: the
   // emulator snapshot appends an absolute CUP from the source's authoritative
   // cursor (serializeWithAbsoluteCursor). Found by fuzz seeds 454, 1696;
   // mechanism in notes/garble-fuzz-divergences.md (Bug C).

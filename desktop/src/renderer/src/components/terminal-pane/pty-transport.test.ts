@@ -1767,7 +1767,7 @@ describe('createIpcPtyTransport', () => {
     const { createIpcPtyTransport } = await import('./pty-transport')
     const spawnMock = vi
       .fn()
-      .mockRejectedValue(new Error('No PTY provider for connection runtime-ssh-orca-botmux-1'))
+      .mockRejectedValue(new Error('No PTY provider for connection runtime-ssh-botmux-1'))
     ;(globalThis as { window: typeof window }).window = {
       ...originalWindow,
       api: {
@@ -1786,7 +1786,7 @@ describe('createIpcPtyTransport', () => {
     } as unknown as typeof window
 
     const onError = vi.fn()
-    await createIpcPtyTransport({ connectionId: 'runtime-ssh-orca-botmux-1' }).connect({
+    await createIpcPtyTransport({ connectionId: 'runtime-ssh-botmux-1' }).connect({
       url: '',
       callbacks: { onError }
     })
@@ -2003,7 +2003,7 @@ describe('createRemoteRuntimePtyTransport', () => {
     const transport = createRemoteRuntimePtyTransport('env-1', {
       worktreeId: 'repo1::/remote/wt',
       command: 'claude',
-      env: { ORCA_TAB_ID: 'tab-1' },
+      env: { BOTMUX_TAB_ID: 'tab-1' },
       tabId: 'tab-1',
       leafId: '11111111-1111-4111-8111-111111111111'
     })
@@ -2020,7 +2020,7 @@ describe('createRemoteRuntimePtyTransport', () => {
       params: {
         worktree: 'id:repo1::/remote/wt',
         command: 'claude',
-        env: { ORCA_TAB_ID: 'tab-1' },
+        env: { BOTMUX_TAB_ID: 'tab-1' },
         tabId: 'tab-1',
         leafId: '11111111-1111-4111-8111-111111111111',
         focus: false,

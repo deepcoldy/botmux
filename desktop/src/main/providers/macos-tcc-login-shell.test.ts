@@ -29,13 +29,13 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
 
   beforeEach(() => {
     origPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
-    origDisable = process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
-    delete process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
+    origDisable = process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
+    delete process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
     existsSyncMock.mockReturnValue(true)
     userInfoMock.mockReturnValue({ username: 'ada', homedir: '/Users/ada' })
     execFileMock.mockImplementation(
       (_file: string, _args: string[], _options: unknown, callback: ExecFileCallback) => {
-        callback(null, 'ORCA_LOGIN_PREFLIGHT_OK', '')
+        callback(null, 'BOTMUX_LOGIN_PREFLIGHT_OK', '')
         return { stdin: { end: stdinEndMock } }
       }
     )
@@ -47,9 +47,9 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
       Object.defineProperty(process, 'platform', origPlatform)
     }
     if (origDisable === undefined) {
-      delete process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
+      delete process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
     } else {
-      process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL = origDisable
+      process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL = origDisable
     }
     vi.clearAllMocks()
   })
@@ -63,7 +63,7 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
     })
     expect(execFileMock).toHaveBeenCalledWith(
       '/usr/bin/login',
-      ['-flpq', 'ada', '/usr/bin/printf', 'ORCA_LOGIN_PREFLIGHT_OK'],
+      ['-flpq', 'ada', '/usr/bin/printf', 'BOTMUX_LOGIN_PREFLIGHT_OK'],
       {
         cwd: '/Users/ada',
         encoding: 'utf8',
@@ -120,7 +120,7 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
       (_file: string, _args: string[], _options: unknown, callback: ExecFileCallback) => {
         callback(
           Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
-          'ORCA_LOGIN_PREFLIGHT_OK',
+          'BOTMUX_LOGIN_PREFLIGHT_OK',
           ''
         )
         return { stdin: { end: stdinEndMock } }
@@ -148,7 +148,7 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
     setPlatform('darwin')
     await prepareMacosTccLoginShell()
     expect(
-      wrapShellSpawnForMacosTccAttribution('/bin/bash', ['--rcfile', '/orca_botmux/bash/rcfile'])
+      wrapShellSpawnForMacosTccAttribution('/bin/bash', ['--rcfile', '/botmux/bash/rcfile'])
     ).toEqual({
       file: '/usr/bin/login',
       args: [
@@ -158,7 +158,7 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
         'SHELL=/bin/bash',
         '/bin/bash',
         '--rcfile',
-        '/orca_botmux/bash/rcfile'
+        '/botmux/bash/rcfile'
       ]
     })
   })
@@ -252,7 +252,7 @@ describe('wrapShellSpawnForMacosTccAttribution', () => {
 
   it('falls back to the plain spawn when disabled via env', () => {
     setPlatform('darwin')
-    process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL = '1'
+    process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL = '1'
     expect(wrapShellSpawnForMacosTccAttribution('/bin/zsh', ['-l'])).toEqual({
       file: '/bin/zsh',
       args: ['-l']

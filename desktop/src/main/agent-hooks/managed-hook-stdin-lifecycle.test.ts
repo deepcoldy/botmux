@@ -14,7 +14,7 @@ const { homedirMock } = vi.hoisted(() => ({
 
 vi.mock('electron', () => ({
   app: {
-    getPath: () => '/tmp/orca-botmux-user-data'
+    getPath: () => '/tmp/botmux-user-data'
   }
 }))
 
@@ -145,12 +145,12 @@ function runHookProcess(
 
 function hookEnvironment(extraEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !key.startsWith('ORCA_'))
+    Object.entries(process.env).filter(([key]) => !key.startsWith('BOTMUX_'))
   )
   return {
     ...env,
     HOME: REMOTE_HOME,
-    ORCA_AGENT_HOOK_ENDPOINT: '',
+    BOTMUX_AGENT_HOOK_ENDPOINT: '',
     ...extraEnv
   }
 }
@@ -166,7 +166,7 @@ async function generatePosixScripts(): Promise<Map<string, string>> {
     const status = await entry.install(memory.sftp)
     expect(status.state, `${entry.agent} install status`).toBe('installed')
     const generated = [...memory.fs.files.entries()].filter(
-      ([path]) => path.includes('/.orca_botmux/agent-hooks/') && path.endsWith('.sh')
+      ([path]) => path.includes('/.botmux/agent-hooks/') && path.endsWith('.sh')
     )
     expect(generated, `${entry.agent} generated scripts`).toHaveLength(1)
     scripts.set(entry.agent, generated[0][1])
@@ -188,7 +188,7 @@ function withPlatform<T>(platform: NodeJS.Platform, run: () => T): T {
 
 describe('Windows managed hook stdin structure', () => {
   it('routes every batch guard to a shared drain epilogue', () => {
-    const home = mkdtempSync(join(tmpdir(), 'orca-botmux-hook-stdin-windows-'))
+    const home = mkdtempSync(join(tmpdir(), 'botmux-hook-stdin-windows-'))
     homedirMock.mockReturnValue(home)
     const previousGrokHome = process.env.GROK_HOME
     const previousKimiHome = process.env.KIMI_CODE_HOME
@@ -200,7 +200,7 @@ describe('Windows managed hook stdin structure', () => {
           expect(entry.install().state, `${entry.agent} install status`).toBe('installed')
         }
       })
-      const hooksDir = join(home, '.orca_botmux', 'agent-hooks')
+      const hooksDir = join(home, '.botmux', 'agent-hooks')
       const fileNames = readdirSync(hooksDir)
       const mainBatchScripts = fileNames.filter(
         (name) => name.endsWith('-hook.cmd') && !name.startsWith('antigravity-')
@@ -210,17 +210,17 @@ describe('Windows managed hook stdin structure', () => {
       for (const fileName of mainBatchScripts) {
         const script = readFileSync(join(hooksDir, fileName), 'utf8')
         expect(script, `${fileName} port guard`).toContain(
-          'if "%ORCA_AGENT_HOOK_PORT%"=="" goto :orca_botmux_agent_hook_drain_stdin'
+          'if "%BOTMUX_AGENT_HOOK_PORT%"=="" goto :botmux_agent_hook_drain_stdin'
         )
         expect(script, `${fileName} token guard`).toContain(
-          'if "%ORCA_AGENT_HOOK_TOKEN%"=="" goto :orca_botmux_agent_hook_drain_stdin'
+          'if "%BOTMUX_AGENT_HOOK_TOKEN%"=="" goto :botmux_agent_hook_drain_stdin'
         )
         expect(script, `${fileName} pane guard`).toContain(
-          'if "%ORCA_PANE_KEY%"=="" goto :orca_botmux_agent_hook_drain_stdin'
+          'if "%BOTMUX_PANE_KEY%"=="" goto :botmux_agent_hook_drain_stdin'
         )
         expect(script, `${fileName} drain epilogue`).toContain(
           [
-            ':orca_botmux_agent_hook_drain_stdin',
+            ':botmux_agent_hook_drain_stdin',
             '"%SystemRoot%\\System32\\more.com" >nul 2>nul',
             'exit /b 0'
           ].join('\r\n')
@@ -229,7 +229,7 @@ describe('Windows managed hook stdin structure', () => {
 
       const copilot = readFileSync(join(hooksDir, 'copilot-hook.ps1'), 'utf8')
       expect(copilot.indexOf('[Console]::In.ReadToEnd()')).toBeLessThan(
-        copilot.indexOf('if (-not $env:ORCA_AGENT_HOOK_PORT')
+        copilot.indexOf('if (-not $env:BOTMUX_AGENT_HOOK_PORT')
       )
       const kimi = readFileSync(join(hooksDir, 'kimi-hook.sh'), 'utf8')
       expect(kimi.indexOf('payload=$(cat)')).toBeLessThan(kimi.indexOf('exit 0'))
@@ -252,13 +252,13 @@ describe('Windows managed hook stdin structure', () => {
   it.skipIf(process.platform !== 'win32')(
     'executes every local script and missing-script launcher without a broken writer',
     async () => {
-      const home = mkdtempSync(join(tmpdir(), 'orca-botmux-hook-stdin-windows-live-'))
+      const home = mkdtempSync(join(tmpdir(), 'botmux-hook-stdin-windows-live-'))
       homedirMock.mockReturnValue(home)
       try {
         for (const entry of LOCAL_INSTALLERS) {
           expect(entry.install().state, `${entry.agent} install status`).toBe('installed')
         }
-        const hooksDir = join(home, '.orca_botmux', 'agent-hooks')
+        const hooksDir = join(home, '.botmux', 'agent-hooks')
         const mainScripts = readdirSync(hooksDir).filter(
           (name) =>
             name === 'antigravity-hook.cmd' ||
@@ -290,7 +290,7 @@ describe('Windows managed hook stdin structure', () => {
           expect(result.stdinErrors, `${fileName} stdin errors`).toHaveLength(0)
         }
 
-        const missingScript = 'C:\\missing\\orca-botmux-hook.cmd'
+        const missingScript = 'C:\\missing\\botmux-hook.cmd'
         // Why: the cmd fast path is intentionally a bare, directly-spawnable .cmd
         // path (Codex/Antigravity/Devin launch it as argv[0], not via cmd.exe), so
         // it cannot own stdin for a missing script — a cmd-builtin drain would make
@@ -334,15 +334,15 @@ describe.skipIf(process.platform === 'win32')('managed hook stdin lifecycle', ()
     }
   })
 
-  it('accepts a large payload without OrcaBotmux environment or a broken writer', async () => {
+  it('accepts a large payload without Botmux environment or a broken writer', async () => {
     const scripts = await generatePosixScripts()
     for (const [agent, script] of scripts) {
       const extraEnv =
         agent === 'command-code'
           ? {
-              ORCA_AGENT_HOOK_PORT: '1',
-              ORCA_AGENT_HOOK_TOKEN: 'test-token',
-              ORCA_PANE_KEY: 'test-pane'
+              BOTMUX_AGENT_HOOK_PORT: '1',
+              BOTMUX_AGENT_HOOK_TOKEN: 'test-token',
+              BOTMUX_PANE_KEY: 'test-pane'
             }
           : {}
       const result = await runPosixHook(script, extraEnv)
@@ -360,7 +360,7 @@ describe.skipIf(process.platform === 'win32')('managed hook stdin lifecycle', ()
   })
 
   it('drains a large payload when the configured script is missing', async () => {
-    const result = await runPosixHook(wrapPosixHookCommand('/missing/orca-botmux-hook.sh'))
+    const result = await runPosixHook(wrapPosixHookCommand('/missing/botmux-hook.sh'))
     expect(result.exitCode).toBe(0)
     expect(result.stdinErrors).toHaveLength(0)
   })

@@ -69,7 +69,7 @@ vi.mock('@tanstack/react-virtual', () => ({
 }))
 
 vi.mock('@/hooks/useVirtualizedScrollAnchor', () => ({
-  VIRTUALIZED_SCROLL_ANCHOR_RECORD_EVENT: 'orca_botmux:test-record-scroll-anchor',
+  VIRTUALIZED_SCROLL_ANCHOR_RECORD_EVENT: 'botmux:test-record-scroll-anchor',
   useVirtualizedScrollAnchor: vi.fn()
 }))
 
@@ -208,8 +208,8 @@ vi.mock('./WorktreeActivityStatusIndicator', () => ({
 vi.mock('./WorktreeContextMenu', () => ({
   default: ({ children }: { children: React.ReactNode }) =>
     React.createElement(React.Fragment, null, children),
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca_botmux:test-close-context-menus',
-  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-orca-botmux-context-menu-scope'
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux:test-close-context-menus',
+  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-botmux-context-menu-scope'
 }))
 
 vi.mock('./SshDisconnectedDialog', () => ({

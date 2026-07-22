@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
  * Decomposes cross-terminal pipeline results: feeds the same fixtures from
- * terminal-pipeline-bench through a bare @xterm/headless Terminal — no OrcaBotmux
+ * terminal-pipeline-bench through a bare @xterm/headless Terminal — no Botmux
  * layers, no IPC, no rendering — to locate where throughput is lost.
  *
  * If headless xterm parses a fixture near the plain-text rate, the pipeline
- * gap for that fixture lives in OrcaBotmux's layers (delivery, side-effect
+ * gap for that fixture lives in Botmux's layers (delivery, side-effect
  * scanning, renderer paint). If headless collapses too, the cost is intrinsic
  * to xterm.js's parser/buffer for that byte pattern.
  *

@@ -1,7 +1,7 @@
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { waitForActiveTerminalManager } from './helpers/terminal'
 import { analyzeRasterCursorCells, type RasterCursorCell } from './terminal-cursor-raster-probe'
@@ -698,53 +698,53 @@ async function captureQueuedMessageFrames(
 
 test.describe('Codex terminal cursor jitter repro', () => {
   test('keeps queued-message cursor out of the Working status row in native Windows Codex @headful', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.skip(process.platform !== 'win32', 'native Windows cursor repro only runs on Windows')
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await installPtyWriteDiagnostics(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await installPtyWriteDiagnostics(botmuxPage)
     rmSync(ARTIFACT_DIR, { recursive: true, force: true })
     mkdirSync(ARTIFACT_DIR, { recursive: true })
 
     const shellCase = SHELL_CASES[0]!
-    const { tabId, ptyId } = await prepareCodexTerminal(orcaBotmuxPage, shellCase)
-    await installPtyOutputDiagnostics(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.type(CODEX_REPO_PROMPT)
-    await orcaBotmuxPage.waitForTimeout(250)
-    await orcaBotmuxPage.keyboard.press('Enter')
-    await orcaBotmuxPage.waitForTimeout(1_000)
-    if (!CODEX_WORKING_STATUS_RE.test(await getTerminalContentForTab(orcaBotmuxPage, tabId, 8_000))) {
-      await orcaBotmuxPage.keyboard.press('Enter')
+    const { tabId, ptyId } = await prepareCodexTerminal(botmuxPage, shellCase)
+    await installPtyOutputDiagnostics(botmuxPage)
+    await botmuxPage.keyboard.type(CODEX_REPO_PROMPT)
+    await botmuxPage.waitForTimeout(250)
+    await botmuxPage.keyboard.press('Enter')
+    await botmuxPage.waitForTimeout(1_000)
+    if (!CODEX_WORKING_STATUS_RE.test(await getTerminalContentForTab(botmuxPage, tabId, 8_000))) {
+      await botmuxPage.keyboard.press('Enter')
     }
-    await orcaBotmuxPage.waitForTimeout(3_000)
-    const submittedContent = await getTerminalContentForTab(orcaBotmuxPage, tabId, 8_000)
+    await botmuxPage.waitForTimeout(3_000)
+    const submittedContent = await getTerminalContentForTab(botmuxPage, tabId, 8_000)
     writeFileSync(path.join(ARTIFACT_DIR, 'queued-message-after-submit.txt'), submittedContent)
     await expect
       .poll(
         async () =>
-          CODEX_WORKING_STATUS_RE.test(await getTerminalContentForTab(orcaBotmuxPage, tabId, 8_000)),
+          CODEX_WORKING_STATUS_RE.test(await getTerminalContentForTab(botmuxPage, tabId, 8_000)),
         {
           timeout: 30_000,
           message: 'Codex did not enter Working state'
         }
       )
       .toBe(true)
-    await applyCursorProbeTheme(orcaBotmuxPage, tabId)
+    await applyCursorProbeTheme(botmuxPage, tabId)
     const workingOnlyFrames = await captureQueuedMessageFrames(
-      orcaBotmuxPage,
+      botmuxPage,
       `${shellCase.label}-no-input`,
       tabId,
       ptyId,
       testInfo
     )
-    await orcaBotmuxPage.keyboard.insertText('s')
+    await botmuxPage.keyboard.insertText('s')
     await expect
       .poll(
         async () =>
-          (await readScreenLines(orcaBotmuxPage, tabId)).some((line) => isQueuedInputLine(line.text)),
+          (await readScreenLines(botmuxPage, tabId)).some((line) => isQueuedInputLine(line.text)),
         {
           timeout: 5_000,
           message: 'queued input did not appear before cursor capture'
@@ -752,15 +752,15 @@ test.describe('Codex terminal cursor jitter repro', () => {
       )
       .toBe(true)
     const frames = await captureQueuedMessageFrames(
-      orcaBotmuxPage,
+      botmuxPage,
       shellCase.label,
       tabId,
       ptyId,
       testInfo
     )
 
-    const snapshot = await readScreenSnapshot(orcaBotmuxPage, shellCase.label, tabId, ptyId)
-    const rawChunks = await readPtyOutputDiagnostics(orcaBotmuxPage)
+    const snapshot = await readScreenSnapshot(botmuxPage, shellCase.label, tabId, ptyId)
+    const rawChunks = await readPtyOutputDiagnostics(botmuxPage)
     const visibleWorkingOnlyCursorFrames = workingOnlyFrames.filter(isPromptCursorFrame)
     const unexpectedWorkingOnlyCursorFrames = workingOnlyFrames.filter(
       isUnexpectedVisibleCursorFrame

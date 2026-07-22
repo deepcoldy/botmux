@@ -59,7 +59,7 @@ describe('terminal path helpers', () => {
     it('does not treat regular URL hosts as local file paths', () => {
       expect(
         extractTerminalFileLinks(
-          'PR opened: https://github.com/stablyai/orca-botmux-marketing-website/pull/82'
+          'PR opened: https://github.com/stablyai/botmux-marketing-website/pull/82'
         )
       ).toEqual([])
     })
@@ -320,21 +320,21 @@ describe('terminal path helpers', () => {
 
   describe('plain-text file:// URIs', () => {
     it('extracts a printed file:// URI as a file link resolving to its path', () => {
-      const line = 'Report: file:///Users/dev/orca_botmux/report.html'
+      const line = 'Report: file:///Users/dev/botmux/report.html'
       const link = extractTerminalFileLinks(line).find(
-        (candidate) => candidate.displayText === 'file:///Users/dev/orca_botmux/report.html'
+        (candidate) => candidate.displayText === 'file:///Users/dev/botmux/report.html'
       )
-      expect(link).toMatchObject({ pathText: '/Users/dev/orca_botmux/report.html' })
-      expect(resolveTerminalFileLink(link!, '/Users/dev/orca_botmux')).toEqual({
-        absolutePath: '/Users/dev/orca_botmux/report.html',
+      expect(link).toMatchObject({ pathText: '/Users/dev/botmux/report.html' })
+      expect(resolveTerminalFileLink(link!, '/Users/dev/botmux')).toEqual({
+        absolutePath: '/Users/dev/botmux/report.html',
         line: null,
         column: null
       })
     })
 
     it('does not also emit a bare-path link for the URI body', () => {
-      const links = extractTerminalFileLinks('file:///Users/dev/orca_botmux/report.html')
-      expect(links.map((link) => link.displayText)).toEqual(['file:///Users/dev/orca_botmux/report.html'])
+      const links = extractTerminalFileLinks('file:///Users/dev/botmux/report.html')
+      expect(links.map((link) => link.displayText)).toEqual(['file:///Users/dev/botmux/report.html'])
     })
 
     it('exposes file:// URIs to the hover candidate pass as well', () => {

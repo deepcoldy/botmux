@@ -3,7 +3,7 @@ import { normalizeWslColdRestoreCwd } from './wsl-cold-restore-cwd'
 
 const base = {
   platform: 'win32' as const,
-  hostname: 'DESKTOP-ORCA',
+  hostname: 'DESKTOP-BOTMUX',
   requestedCwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo',
   wslDistro: 'Ubuntu'
 }
@@ -13,8 +13,8 @@ describe('normalizeWslColdRestoreCwd', () => {
     ['C:\\work', 'C:\\work'],
     ['\\\\wsl.localhost\\ubuntu\\home\\jin', '\\\\wsl.localhost\\ubuntu\\home\\jin'],
     ['/home/jin', '\\\\wsl.localhost\\Ubuntu\\home\\jin'],
-    ['\\\\desktop-orca_botmux\\home\\jin', '\\\\wsl.localhost\\Ubuntu\\home\\jin'],
-    ['\\\\DESKTOP-ORCA\\mnt\\c\\work', 'C:\\work']
+    ['\\\\desktop-botmux\\home\\jin', '\\\\wsl.localhost\\Ubuntu\\home\\jin'],
+    ['\\\\DESKTOP-BOTMUX\\mnt\\c\\work', 'C:\\work']
   ])('allows or repairs %s', (recoveredCwd, expected) => {
     expect(normalizeWslColdRestoreCwd({ ...base, recoveredCwd })).toBe(expected)
   })

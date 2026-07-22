@@ -2,19 +2,19 @@ import type { App } from 'electron'
 import { writeStartupDiagnosticLine, type StartupDiagnosticSink } from './startup-diagnostics'
 
 export const SINGLE_INSTANCE_LOCK_FAILURE_MESSAGE =
-  '[single-instance] Another OrcaBotmux instance is already running for this userData profile; exiting this launch after requesting the existing window. If no OrcaBotmux process is running, this may be an Electron/macOS single-instance lock failure.'
-export const SINGLE_INSTANCE_LOCK_BYPASS_ENV = 'ORCA_BYPASS_SINGLE_INSTANCE_LOCK'
-export const SINGLE_INSTANCE_LOCK_E2E_ENFORCE_ENV = 'ORCA_E2E_ENFORCE_SINGLE_INSTANCE_LOCK'
+  '[single-instance] Another Botmux instance is already running for this userData profile; exiting this launch after requesting the existing window. If no Botmux process is running, this may be an Electron/macOS single-instance lock failure.'
+export const SINGLE_INSTANCE_LOCK_BYPASS_ENV = 'BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK'
+export const SINGLE_INSTANCE_LOCK_E2E_ENFORCE_ENV = 'BOTMUX_E2E_ENFORCE_SINGLE_INSTANCE_LOCK'
 export const SINGLE_INSTANCE_LOCK_BYPASS_MESSAGE =
-  '[single-instance] ORCA_BYPASS_SINGLE_INSTANCE_LOCK=1 is set; bypassing the packaged macOS single-instance lock for diagnostics. Do not use this with another OrcaBotmux instance running for the same profile.'
+  '[single-instance] BOTMUX_BYPASS_SINGLE_INSTANCE_LOCK=1 is set; bypassing the packaged macOS single-instance lock for diagnostics. Do not use this with another Botmux instance running for the same profile.'
 
 /**
- * Why: OrcaBotmux writes two canonical discovery files into `<userData>/`:
- * `orca-botmux-runtime.json` (RPC endpoint + authToken for the bundled CLI) and
+ * Why: Botmux writes two canonical discovery files into `<userData>/`:
+ * `botmux-runtime.json` (RPC endpoint + authToken for the bundled CLI) and
  * `agent-hooks/endpoint.env` (hook port + token for cursor-agent/claude/codex
  * scripts). Without a single-instance lock, every AppImage/.app double-click
  * boots a fresh Electron main that clobbers both files. When the most recent
- * instance quits, metadata points at a dead pid and `orca_botmux status` reports
+ * instance quits, metadata points at a dead pid and `botmux status` reports
  * `stale_bootstrap` even though the original process is still running.
  *
  * This helper centralises the lock gate so it is testable in isolation and
@@ -23,7 +23,7 @@ export const SINGLE_INSTANCE_LOCK_BYPASS_MESSAGE =
  *
  * Electron derives the lock identity from the current `userData` path, so
  * callers MUST invoke this AFTER `configureDevUserDataPath(is.dev)` — that
- * way dev (`orca-botmux-desktop-dev` userData) and packaged (`orca_botmux` userData) runs lock in
+ * way dev (`botmux-desktop-dev` userData) and packaged (`botmux` userData) runs lock in
  * separate namespaces instead of serialising against each other.
  */
 export function acquireSingleInstanceLock(app: App, onSecondInstance: () => void): boolean {

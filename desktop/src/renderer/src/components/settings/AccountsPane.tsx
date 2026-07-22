@@ -136,7 +136,7 @@ function MiniMaxCookieHelpPopover(): React.JSX.Element {
         <p className="text-muted-foreground">
           {translate(
             'auto.components.settings.AccountsPane.4e32e030b2',
-            'Stored locally. OrcaBotmux sends it only to platform.minimax.io for usage refreshes.'
+            'Stored locally. Botmux sends it only to platform.minimax.io for usage refreshes.'
           )}
         </p>
       </div>
@@ -316,7 +316,7 @@ export function AccountsPane({
     wslDistros,
     wslCapabilitiesLoading
   )
-  // Why: with a Remote OrcaBotmux Server active the server owns provider accounts
+  // Why: with a Remote Botmux Server active the server owns provider accounts
   // (see #7973); every list/select/remove below must scope to it, not host/WSL.
   const isRemoteAccountScope = hasRemoteProviderAccountOwner(settings)
   const activeRuntimeEnvironmentId = settings.activeRuntimeEnvironmentId?.trim() || null
@@ -744,7 +744,7 @@ export function AccountsPane({
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.AccountsPane.72b36ea174',
-              'Optional. OrcaBotmux can use your normal Claude login; add accounts only if you want quick switching without moving chat sessions.'
+              'Optional. Botmux can use your normal Claude login; add accounts only if you want quick switching without moving chat sessions.'
             )}
           </p>
         </div>
@@ -875,7 +875,7 @@ export function AccountsPane({
                     )
                   : translate(
                       'auto.components.settings.AccountsPane.3fe7862418',
-                      "No managed Claude accounts for {{value0}}. OrcaBotmux will use that environment's system default Claude login until you add one here.",
+                      "No managed Claude accounts for {{value0}}. Botmux will use that environment's system default Claude login until you add one here.",
                       { value0: accountRuntimeSentenceLabel }
                     )}
               </div>
@@ -1007,7 +1007,7 @@ export function AccountsPane({
           <p className="text-xs text-muted-foreground">
             {translate(
               'auto.components.settings.AccountsPane.cedfab35ab',
-              'Optional. OrcaBotmux can use your normal Codex login; add accounts only if you want quick switching in OrcaBotmux.'
+              'Optional. Botmux can use your normal Codex login; add accounts only if you want quick switching in Botmux.'
             )}
           </p>
           <p className="text-xs text-muted-foreground">
@@ -1019,7 +1019,7 @@ export function AccountsPane({
                 )
               : translate(
                   'auto.components.settings.AccountsPane.340d6f7a85',
-                  'Each account keeps its own local sign-in context in OrcaBotmux. Account auth stays on this device.'
+                  'Each account keeps its own local sign-in context in Botmux. Account auth stays on this device.'
                 )}
           </p>
         </div>
@@ -1028,7 +1028,7 @@ export function AccountsPane({
           title={translate('auto.components.settings.AccountsPane.3180536c7a', 'Codex Accounts')}
           description={translate(
             'auto.components.settings.AccountsPane.d0d53b7eb0',
-            'Manage which Codex account OrcaBotmux uses for live rate limit fetching.'
+            'Manage which Codex account Botmux uses for live rate limit fetching.'
           )}
           // Why: this single SearchableSetting backs the whole Codex section,
           // including the "Active Codex Account" sub-control (account picker
@@ -1190,7 +1190,7 @@ export function AccountsPane({
                     )
                   : translate(
                       'auto.components.settings.AccountsPane.b4c9450319',
-                      "No managed Codex accounts for {{value0}}. OrcaBotmux will use that environment's system default Codex login until you add one here.",
+                      "No managed Codex accounts for {{value0}}. Botmux will use that environment's system default Codex login until you add one here.",
                       { value0: accountRuntimeSentenceLabel }
                     )}
               </div>
@@ -1385,7 +1385,7 @@ export function AccountsPane({
           )}
           description={translate(
             'auto.components.settings.AccountsPane.d676c41fc6',
-            'Extracts OAuth credentials from your local Gemini CLI installation to authenticate with Google. This uses credentials issued to the Gemini CLI app, not OrcaBotmux. May break if Google updates the CLI. Use at your own risk.'
+            'Extracts OAuth credentials from your local Gemini CLI installation to authenticate with Google. This uses credentials issued to the Gemini CLI app, not Botmux. May break if Google updates the CLI. Use at your own risk.'
           )}
           keywords={[
             'gemini',
@@ -1408,7 +1408,7 @@ export function AccountsPane({
             <p className="text-xs text-muted-foreground">
               {translate(
                 'auto.components.settings.AccountsPane.c2aee76420',
-                'Extracts OAuth credentials from your local Gemini CLI installation to authenticate with Google for {{value0}}. This uses credentials issued to the Gemini CLI app, not OrcaBotmux. May break if Google updates the CLI. Use at your own risk.',
+                'Extracts OAuth credentials from your local Gemini CLI installation to authenticate with Google for {{value0}}. This uses credentials issued to the Gemini CLI app, not Botmux. May break if Google updates the CLI. Use at your own risk.',
                 { value0: localAccountRuntimeSentenceLabel }
               )}
             </p>
@@ -1830,7 +1830,7 @@ export function AccountsPane({
             <DialogDescription>
               {translate(
                 'auto.components.settings.AccountsPane.99c8f9e498',
-                'OrcaBotmux will delete the managed Codex home for this saved account. If it is currently active, OrcaBotmux falls back to the system default Codex login.'
+                'Botmux will delete the managed Codex home for this saved account. If it is currently active, Botmux falls back to the system default Codex login.'
               )}
             </DialogDescription>
           </DialogHeader>
@@ -1873,7 +1873,7 @@ export function AccountsPane({
             <DialogDescription>
               {translate(
                 'auto.components.settings.AccountsPane.854ebbcc45',
-                'OrcaBotmux will delete the managed Claude auth for this saved account. If it is currently active, OrcaBotmux falls back to the system default Claude login.'
+                'Botmux will delete the managed Claude auth for this saved account. If it is currently active, Botmux falls back to the system default Claude login.'
               )}
             </DialogDescription>
           </DialogHeader>

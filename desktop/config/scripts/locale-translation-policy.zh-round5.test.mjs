@@ -3,23 +3,23 @@ import { describe, expect, it } from 'vitest'
 import { repairTranslatedValue } from './locale-translation-policy.mjs'
 
 describe('locale-translation-policy zh round 5', () => {
-  it('fixes brand spacing, hosted review, and OrcaBotmux Mobile regressions', () => {
+  it('fixes brand spacing, hosted review, and Botmux Mobile regressions', () => {
     expect(
       repairTranslatedValue({
         key: 'auto.components.stats.ShareUsageCard.0eb31e79ee',
-        enValue: 'OrcaBotmux IDE',
-        localeValue: 'OrcaBotmux集成开发环境',
+        enValue: 'Botmux IDE',
+        localeValue: 'Botmux集成开发环境',
         locale: 'zh'
       })
-    ).toBe('OrcaBotmux IDE')
+    ).toBe('Botmux IDE')
     expect(
       repairTranslatedValue({
         key: 'auto.components.settings.ShortcutsPane.2a0e8aeccf',
-        enValue: 'OrcaBotmux first',
-        localeValue: 'OrcaBotmux第一',
+        enValue: 'Botmux first',
+        localeValue: 'Botmux第一',
         locale: 'zh'
       })
-    ).toBe('OrcaBotmux 优先')
+    ).toBe('Botmux 优先')
     expect(
       repairTranslatedValue({
         key: 'auto.components.settings.CommitMessageAiPane.2dafc7646e',
@@ -39,19 +39,19 @@ describe('locale-translation-policy zh round 5', () => {
     expect(
       repairTranslatedValue({
         key: 'menu.showMobileButton',
-        enValue: 'Show OrcaBotmux Mobile Button',
-        localeValue: '显示 OrcaBotmux 移动按钮',
+        enValue: 'Show Botmux Mobile Button',
+        localeValue: '显示 Botmux 移动按钮',
         locale: 'zh'
       })
-    ).toBe('显示 OrcaBotmux Mobile 按钮')
+    ).toBe('显示 Botmux Mobile 按钮')
     expect(
       repairTranslatedValue({
         key: 'auto.components.settings.GitPane.e02ea23a32',
-        enValue: 'OrcaBotmux Attribution',
-        localeValue: 'OrcaBotmux归属',
+        enValue: 'Botmux Attribution',
+        localeValue: 'Botmux归属',
         locale: 'zh'
       })
-    ).toBe('OrcaBotmux 归因')
+    ).toBe('Botmux 归因')
     expect(
       repairTranslatedValue({
         key: 'auto.hooks.useSettingsNavigationMetadata.ab4b21b58e',
@@ -182,12 +182,12 @@ describe('locale-translation-policy zh round 5', () => {
       repairTranslatedValue({
         key: 'auto.store.slices.worktrees.d1d78a7baa',
         enValue:
-          'Git could not safely delete branch "{{value0}}"{{value1}}, so OrcaBotmux kept it to avoid losing local commits.',
+          'Git could not safely delete branch "{{value0}}"{{value1}}, so Botmux kept it to avoid losing local commits.',
         localeValue:
-          'Git 无法安全删除分支“{{value0}}”{{value1}}，因此 OrcaBotmux 保留它以避免丢失本地提交。',
+          'Git 无法安全删除分支“{{value0}}”{{value1}}，因此 Botmux 保留它以避免丢失本地提交。',
         locale: 'zh'
       })
-    ).toBe('Git 无法安全删除分支“{{value0}}”{{value1}}，因此 OrcaBotmux 保留它以避免丢失本地 commits。')
+    ).toBe('Git 无法安全删除分支“{{value0}}”{{value1}}，因此 Botmux 保留它以避免丢失本地 commits。')
   })
 
   it('does not confuse proxy copy with Agent terminology', () => {

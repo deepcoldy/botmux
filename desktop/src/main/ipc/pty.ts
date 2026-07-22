@@ -16,7 +16,7 @@ import {
   powerMonitor
 } from 'electron'
 export { getBashShellReadyRcfileContent } from '../providers/local-pty-shell-ready'
-import type { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import type { Store } from '../persistence'
 import type { GlobalSettings, TuiAgent } from '../../shared/types'
 import { normalizeRuntimePathForComparison } from '../../shared/cross-platform-path'
@@ -81,7 +81,7 @@ import {
   applyTerminalAttributionEnv,
   resolveAttributionShellFamily
 } from '../attribution/terminal-attribution'
-import { ensureLinuxTerminalOrcaCliShimDir } from '../cli/linux-terminal-orca-botmux-cli-shim'
+import { ensureLinuxTerminalBotmuxCliShimDir } from '../cli/linux-terminal-botmux-cli-shim'
 import { registerPty, unregisterPty } from '../memory/pty-registry'
 import { advertisedUrlWatcher } from '../ports/advertised-url-watcher'
 import { track } from '../telemetry/client'
@@ -119,7 +119,7 @@ import {
 } from '../agent-hooks/migration-unsupported-pty-state'
 import { parseWslPath } from '../wsl'
 import { mergePersistedWindowsPath } from '../pty/windows-environment-path'
-import { addOrcaWslInteropEnv } from '../pty/wsl-orca-botmux-env'
+import { addBotmuxWslInteropEnv } from '../pty/wsl-botmux-env'
 import { PtyProducerFlowController } from './pty-producer-flow-control'
 import { beginTerminalInstall } from './watcher-removal-gate'
 import {
@@ -204,14 +204,14 @@ const ptyPaneKey = new Map<string, string>()
 const paneKeyPtyId = new Map<string, string>()
 
 const AGENT_HOOK_RUNTIME_ENV_KEYS = [
-  'ORCA_AGENT_HOOK_PORT',
-  'ORCA_AGENT_HOOK_TOKEN',
-  'ORCA_AGENT_HOOK_ENV',
-  'ORCA_AGENT_HOOK_VERSION',
-  'ORCA_AGENT_HOOK_ENDPOINT',
+  'BOTMUX_AGENT_HOOK_PORT',
+  'BOTMUX_AGENT_HOOK_TOKEN',
+  'BOTMUX_AGENT_HOOK_ENV',
+  'BOTMUX_AGENT_HOOK_VERSION',
+  'BOTMUX_AGENT_HOOK_ENDPOINT',
   // Why: PR 2778 briefly exported this scoped Claude settings path. Keep
   // deleting stale inherited values so older PTYs cannot leak the reverted path.
-  'ORCA_CLAUDE_AGENT_STATUS_SETTINGS'
+  'BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS'
 ] as const
 
 export function getPtyIdForPaneKey(paneKey: string): string | undefined {
@@ -430,18 +430,18 @@ function stripRemotePaneEnvWhenHooksDisabled(
   }
   if (
     !env ||
-    (!('ORCA_PANE_KEY' in env) &&
-      !('ORCA_TAB_ID' in env) &&
-      !('ORCA_WORKTREE_ID' in env) &&
-      !('ORCA_AGENT_LAUNCH_TOKEN' in env))
+    (!('BOTMUX_PANE_KEY' in env) &&
+      !('BOTMUX_TAB_ID' in env) &&
+      !('BOTMUX_WORKTREE_ID' in env) &&
+      !('BOTMUX_AGENT_LAUNCH_TOKEN' in env))
   ) {
     return env
   }
   const stripped = { ...env }
-  delete stripped.ORCA_PANE_KEY
-  delete stripped.ORCA_TAB_ID
-  delete stripped.ORCA_WORKTREE_ID
-  delete stripped.ORCA_AGENT_LAUNCH_TOKEN
+  delete stripped.BOTMUX_PANE_KEY
+  delete stripped.BOTMUX_TAB_ID
+  delete stripped.BOTMUX_WORKTREE_ID
+  delete stripped.BOTMUX_AGENT_LAUNCH_TOKEN
   return stripped
 }
 
@@ -591,7 +591,7 @@ function promoteAgentTeamsShimPath(
   env: Record<string, string> | undefined,
   requestedPath: string | undefined
 ): void {
-  if (!env?.ORCA_AGENT_TEAMS_TEAM_ID) {
+  if (!env?.BOTMUX_AGENT_TEAMS_TEAM_ID) {
     return
   }
   const shimPath = firstPathEntry(requestedPath)
@@ -603,7 +603,7 @@ function promoteAgentTeamsShimPath(
   const remaining = currentPath
     .split(delimiter)
     .filter((entry) => entry.length > 0 && entry !== shimPath)
-  // Why: host env injection can prepend OrcaBotmux's attribution/dev shims. Claude
+  // Why: host env injection can prepend Botmux's attribution/dev shims. Claude
   // Agent Teams must still resolve our fake tmux before any real tmux.
   env[currentPathKey] = [shimPath, ...remaining].join(delimiter)
 }
@@ -627,7 +627,7 @@ function shouldSkipCodexHomeEnvForWindowsShell(
   return isWslShellName(shellPath) || (typeof cwd === 'string' && parseWslPath(cwd) !== null)
 }
 
-const CODEX_HOME_ENV_KEYS = ['CODEX_HOME', 'ORCA_CODEX_HOME'] as const
+const CODEX_HOME_ENV_KEYS = ['CODEX_HOME', 'BOTMUX_CODEX_HOME'] as const
 type GetSelectedCodexHomePath = (target?: CodexAccountSelectionTarget) => string | null
 type PrepareClaudeAuth = (
   target?: ClaudeAccountSelectionTarget
@@ -672,9 +672,9 @@ function resolvePiAgentSourceDir(
   baseEnv: Record<string, string>,
   kind: PiAgentKind
 ): string | undefined {
-  const sourceKey = kind === 'omp' ? 'ORCA_OMP_SOURCE_AGENT_DIR' : 'ORCA_PI_SOURCE_AGENT_DIR'
-  const overlayKey = kind === 'omp' ? 'ORCA_OMP_CODING_AGENT_DIR' : 'ORCA_PI_CODING_AGENT_DIR'
-  const otherOverlayKey = kind === 'omp' ? 'ORCA_PI_CODING_AGENT_DIR' : 'ORCA_OMP_CODING_AGENT_DIR'
+  const sourceKey = kind === 'omp' ? 'BOTMUX_OMP_SOURCE_AGENT_DIR' : 'BOTMUX_PI_SOURCE_AGENT_DIR'
+  const overlayKey = kind === 'omp' ? 'BOTMUX_OMP_CODING_AGENT_DIR' : 'BOTMUX_PI_CODING_AGENT_DIR'
+  const otherOverlayKey = kind === 'omp' ? 'BOTMUX_PI_CODING_AGENT_DIR' : 'BOTMUX_OMP_CODING_AGENT_DIR'
 
   const sourceDir = readEnvWithProcessFallback(baseEnv, sourceKey)
   if (sourceDir) {
@@ -684,7 +684,7 @@ function resolvePiAgentSourceDir(
   const publicDir = readEnvWithProcessFallback(baseEnv, 'PI_CODING_AGENT_DIR')
   const ownOverlayDir = readEnvWithProcessFallback(baseEnv, overlayKey)
   const otherOverlayDir = readEnvWithProcessFallback(baseEnv, otherOverlayKey)
-  // Why: if PI_CODING_AGENT_DIR is just a restored OrcaBotmux overlay from either
+  // Why: if PI_CODING_AGENT_DIR is just a restored Botmux overlay from either
   // kind and the matching source shadow is absent, remirroring it would leak
   // another agent's overlay tree into this launch. Fall through to defaults.
   if (publicDir && publicDir !== ownOverlayDir && publicDir !== otherOverlayDir) {
@@ -702,19 +702,19 @@ function resolveScopedPiAgentSourceDir(
   baseEnv: Record<string, string>,
   kind: PiAgentKind
 ): string | undefined {
-  const sourceKey = kind === 'omp' ? 'ORCA_OMP_SOURCE_AGENT_DIR' : 'ORCA_PI_SOURCE_AGENT_DIR'
+  const sourceKey = kind === 'omp' ? 'BOTMUX_OMP_SOURCE_AGENT_DIR' : 'BOTMUX_PI_SOURCE_AGENT_DIR'
   return readEnvWithProcessFallback(baseEnv, sourceKey)
 }
 
 function clearPiAgentShadowEnv(baseEnv: Record<string, string>, kind: PiAgentKind): void {
   if (kind === 'omp') {
-    delete baseEnv.ORCA_OMP_CODING_AGENT_DIR
-    delete baseEnv.ORCA_OMP_SOURCE_AGENT_DIR
-    delete baseEnv.ORCA_OMP_STATUS_EXTENSION
+    delete baseEnv.BOTMUX_OMP_CODING_AGENT_DIR
+    delete baseEnv.BOTMUX_OMP_SOURCE_AGENT_DIR
+    delete baseEnv.BOTMUX_OMP_STATUS_EXTENSION
     return
   }
-  delete baseEnv.ORCA_PI_CODING_AGENT_DIR
-  delete baseEnv.ORCA_PI_SOURCE_AGENT_DIR
+  delete baseEnv.BOTMUX_PI_CODING_AGENT_DIR
+  delete baseEnv.BOTMUX_PI_SOURCE_AGENT_DIR
 }
 
 function exposePiManagedExtensionEnv(
@@ -723,24 +723,24 @@ function exposePiManagedExtensionEnv(
   managedEnv: Record<string, string>
 ): void {
   if (kind === 'omp') {
-    delete baseEnv.ORCA_OMP_CODING_AGENT_DIR
-    if (managedEnv.ORCA_OMP_SOURCE_AGENT_DIR) {
-      baseEnv.ORCA_OMP_SOURCE_AGENT_DIR = managedEnv.ORCA_OMP_SOURCE_AGENT_DIR
+    delete baseEnv.BOTMUX_OMP_CODING_AGENT_DIR
+    if (managedEnv.BOTMUX_OMP_SOURCE_AGENT_DIR) {
+      baseEnv.BOTMUX_OMP_SOURCE_AGENT_DIR = managedEnv.BOTMUX_OMP_SOURCE_AGENT_DIR
     } else {
-      delete baseEnv.ORCA_OMP_SOURCE_AGENT_DIR
+      delete baseEnv.BOTMUX_OMP_SOURCE_AGENT_DIR
     }
-    if (managedEnv.ORCA_OMP_STATUS_EXTENSION) {
-      baseEnv.ORCA_OMP_STATUS_EXTENSION = managedEnv.ORCA_OMP_STATUS_EXTENSION
+    if (managedEnv.BOTMUX_OMP_STATUS_EXTENSION) {
+      baseEnv.BOTMUX_OMP_STATUS_EXTENSION = managedEnv.BOTMUX_OMP_STATUS_EXTENSION
     } else {
-      delete baseEnv.ORCA_OMP_STATUS_EXTENSION
+      delete baseEnv.BOTMUX_OMP_STATUS_EXTENSION
     }
     return
   }
-  delete baseEnv.ORCA_PI_CODING_AGENT_DIR
-  if (managedEnv.ORCA_PI_SOURCE_AGENT_DIR) {
-    baseEnv.ORCA_PI_SOURCE_AGENT_DIR = managedEnv.ORCA_PI_SOURCE_AGENT_DIR
+  delete baseEnv.BOTMUX_PI_CODING_AGENT_DIR
+  if (managedEnv.BOTMUX_PI_SOURCE_AGENT_DIR) {
+    baseEnv.BOTMUX_PI_SOURCE_AGENT_DIR = managedEnv.BOTMUX_PI_SOURCE_AGENT_DIR
   } else {
-    delete baseEnv.ORCA_PI_SOURCE_AGENT_DIR
+    delete baseEnv.BOTMUX_PI_SOURCE_AGENT_DIR
   }
 }
 
@@ -764,9 +764,9 @@ function getInheritedAgentHookEnvKeysToDelete(
   return AGENT_HOOK_RUNTIME_ENV_KEYS.filter((key) => env[key] === undefined)
 }
 
-// Why: when agent status is disabled, a nested OrcaBotmux terminal can still pass
+// Why: when agent status is disabled, a nested Botmux terminal can still pass
 // through prior OpenCode or legacy Pi/OMP overlay env. Restore the user's
-// original source dir when OrcaBotmux recorded one, otherwise strip only values
+// original source dir when Botmux recorded one, otherwise strip only values
 // known to be ours.
 function restoreOrStripOverlayEnv(
   baseEnv: Record<string, string>,
@@ -795,13 +795,13 @@ function isMimoLaunchCommand(launchCommand: string | undefined): boolean {
 }
 
 function resolveMimocodeSourceHome(baseEnv: Record<string, string>): string | undefined {
-  const sourceHome = baseEnv.ORCA_MIMOCODE_SOURCE_HOME ?? process.env.ORCA_MIMOCODE_SOURCE_HOME
+  const sourceHome = baseEnv.BOTMUX_MIMOCODE_SOURCE_HOME ?? process.env.BOTMUX_MIMOCODE_SOURCE_HOME
   if (sourceHome) {
     return sourceHome
   }
   const configHome = baseEnv.MIMOCODE_HOME ?? process.env.MIMOCODE_HOME
-  const orcaHome = baseEnv.ORCA_MIMOCODE_HOME ?? process.env.ORCA_MIMOCODE_HOME
-  if (configHome && orcaHome && configHome === orcaHome) {
+  const botmuxHome = baseEnv.BOTMUX_MIMOCODE_HOME ?? process.env.BOTMUX_MIMOCODE_HOME
+  if (configHome && botmuxHome && configHome === botmuxHome) {
     return undefined
   }
   return configHome
@@ -809,18 +809,18 @@ function resolveMimocodeSourceHome(baseEnv: Record<string, string>): string | un
 
 function resolveOpenCodeSourceConfigDir(baseEnv: Record<string, string>): string | undefined {
   const sourceDir =
-    baseEnv.ORCA_OPENCODE_SOURCE_CONFIG_DIR ?? process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR
+    baseEnv.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR ?? process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
   if (sourceDir) {
     return sourceDir
   }
 
   const configDir = baseEnv.OPENCODE_CONFIG_DIR ?? process.env.OPENCODE_CONFIG_DIR
-  const orcaConfigDir = baseEnv.ORCA_OPENCODE_CONFIG_DIR ?? process.env.ORCA_OPENCODE_CONFIG_DIR
-  // Why: nested OrcaBotmux terminals inherit OPENCODE_CONFIG_DIR from the parent
-  // PTY. If there is no recorded source dir, that value is OrcaBotmux-owned, not a
-  // user config. Treating it as user config makes child Orcas mirror OrcaBotmux's
+  const botmuxConfigDir = baseEnv.BOTMUX_OPENCODE_CONFIG_DIR ?? process.env.BOTMUX_OPENCODE_CONFIG_DIR
+  // Why: nested Botmux terminals inherit OPENCODE_CONFIG_DIR from the parent
+  // PTY. If there is no recorded source dir, that value is Botmux-owned, not a
+  // user config. Treating it as user config makes child Botmux instances mirror Botmux's
   // hook dir and can create large OpenCode runtime trees per terminal.
-  if (configDir && orcaConfigDir && configDir === orcaConfigDir) {
+  if (configDir && botmuxConfigDir && configDir === botmuxConfigDir) {
     return undefined
   }
 
@@ -837,7 +837,7 @@ function resolveOpenCodeSourceConfigDir(baseEnv: Record<string, string>): string
 /**
  * Mutates `baseEnv` in place with all host-local PTY env vars and returns it.
  *
- * This is the single source of truth for the env shape an OrcaBotmux PTY needs
+ * This is the single source of truth for the env shape an Botmux PTY needs
  * BEFORE the provider-specific wrapper (LocalPtyProvider's TERM/LANG defaults,
  * DaemonPtyAdapter's subprocess env). Callers are responsible for the SSH
  * guard — if `args.connectionId` is set, do NOT call this function, because
@@ -885,54 +885,54 @@ export function buildPtyHostEnv(
 
   if (opts.agentStatusHooksEnabled) {
     // Why: OPENCODE_CONFIG_DIR is a singular path, not a colon-list, so a user
-    // value cannot coexist with an OrcaBotmux-only injection. Hand the user's value
+    // value cannot coexist with an Botmux-only injection. Hand the user's value
     // (when present) to the hook service and let it materialize a source-scoped
-    // mirror overlay that lets the user's plugins and OrcaBotmux's status plugin
+    // mirror overlay that lets the user's plugins and Botmux's status plugin
     // load together. See docs/opencode-config-dir-collision.md.
     Object.assign(baseEnv, openCodeHookService.buildPtyEnv(id, preexistingOpenCodeConfigDir))
     if (baseEnv.OPENCODE_CONFIG_DIR) {
       // Why: ~/.zshrc can re-export the user's default after spawn; shell-ready
       // wrappers restore this PTY-scoped value after user startup files run.
-      baseEnv.ORCA_OPENCODE_CONFIG_DIR = baseEnv.OPENCODE_CONFIG_DIR
+      baseEnv.BOTMUX_OPENCODE_CONFIG_DIR = baseEnv.OPENCODE_CONFIG_DIR
       if (preexistingOpenCodeConfigDir) {
-        // Why: terminals launched from another OrcaBotmux terminal inherit the overlay
+        // Why: terminals launched from another Botmux terminal inherit the overlay
         // as OPENCODE_CONFIG_DIR; keep the original source so overlays do not
         // mirror overlays and drop the user's real config.
-        baseEnv.ORCA_OPENCODE_SOURCE_CONFIG_DIR = preexistingOpenCodeConfigDir
+        baseEnv.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR = preexistingOpenCodeConfigDir
       } else {
-        delete baseEnv.ORCA_OPENCODE_SOURCE_CONFIG_DIR
+        delete baseEnv.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
       }
     }
     if (isMimoLaunchCommand(launchCommandHint)) {
       const preexistingMimocodeHome = resolveMimocodeSourceHome(baseEnv)
       Object.assign(baseEnv, mimoCodeHookService.buildPtyEnv(id, preexistingMimocodeHome))
       if (baseEnv.MIMOCODE_HOME) {
-        baseEnv.ORCA_MIMOCODE_HOME = baseEnv.MIMOCODE_HOME
+        baseEnv.BOTMUX_MIMOCODE_HOME = baseEnv.MIMOCODE_HOME
         if (preexistingMimocodeHome) {
-          baseEnv.ORCA_MIMOCODE_SOURCE_HOME = preexistingMimocodeHome
+          baseEnv.BOTMUX_MIMOCODE_SOURCE_HOME = preexistingMimocodeHome
         } else {
-          delete baseEnv.ORCA_MIMOCODE_SOURCE_HOME
+          delete baseEnv.BOTMUX_MIMOCODE_SOURCE_HOME
         }
       }
     }
   } else {
     restoreOrStripOverlayEnv(baseEnv, {
       primary: 'OPENCODE_CONFIG_DIR',
-      overlay: 'ORCA_OPENCODE_CONFIG_DIR',
-      source: 'ORCA_OPENCODE_SOURCE_CONFIG_DIR'
+      overlay: 'BOTMUX_OPENCODE_CONFIG_DIR',
+      source: 'BOTMUX_OPENCODE_SOURCE_CONFIG_DIR'
     })
     restoreOrStripOverlayEnv(baseEnv, {
       primary: 'MIMOCODE_HOME',
-      overlay: 'ORCA_MIMOCODE_HOME',
-      source: 'ORCA_MIMOCODE_SOURCE_HOME'
+      overlay: 'BOTMUX_MIMOCODE_HOME',
+      source: 'BOTMUX_MIMOCODE_SOURCE_HOME'
     })
   }
 
-  // Why: Claude/Codex native hooks run inside the shell process, so OrcaBotmux
+  // Why: Claude/Codex native hooks run inside the shell process, so Botmux
   // must inject the loopback receiver coordinates before the agent starts.
   // Without these env vars the global hook config cannot map callbacks back
-  // to the correct OrcaBotmux pane.
-  // Why: nested OrcaBotmux terminals can inherit another process's hook endpoint or
+  // to the correct Botmux pane.
+  // Why: nested Botmux terminals can inherit another process's hook endpoint or
   // token. Strip all hook runtime coordinates before injecting this PTY's fresh
   // server values so callbacks route to the owning app/runtime.
   for (const key of AGENT_HOOK_RUNTIME_ENV_KEYS) {
@@ -950,13 +950,13 @@ export function buildPtyHostEnv(
       wslHookRelayManager.ensureForDistro(distro)
       const guestEndpoint = wslHookRelayManager.getGuestEndpointFilePath(distro)
       if (guestEndpoint) {
-        baseEnv.ORCA_AGENT_HOOK_ENDPOINT = guestEndpoint
+        baseEnv.BOTMUX_AGENT_HOOK_ENDPOINT = guestEndpoint
       }
     }
   }
 
   // Why: PI_CODING_AGENT_DIR owns Pi's / OMP's full config/session root. Keep
-  // that home as the user's normal source of truth and install only OrcaBotmux-owned,
+  // that home as the user's normal source of truth and install only Botmux-owned,
   // env-guarded extension files into the selected agent's extension dir.
   if (opts.agentStatusHooksEnabled) {
     clearPiAgentShadowEnv(baseEnv, 'pi')
@@ -977,44 +977,44 @@ export function buildPtyHostEnv(
     // so a nested PTY does not inherit a stale overlay from either agent.
     restoreOrStripOverlayEnv(baseEnv, {
       primary: 'PI_CODING_AGENT_DIR',
-      overlay: 'ORCA_PI_CODING_AGENT_DIR',
-      source: 'ORCA_PI_SOURCE_AGENT_DIR'
+      overlay: 'BOTMUX_PI_CODING_AGENT_DIR',
+      source: 'BOTMUX_PI_SOURCE_AGENT_DIR'
     })
     restoreOrStripOverlayEnv(baseEnv, {
       primary: 'PI_CODING_AGENT_DIR',
-      overlay: 'ORCA_OMP_CODING_AGENT_DIR',
-      source: 'ORCA_OMP_SOURCE_AGENT_DIR'
+      overlay: 'BOTMUX_OMP_CODING_AGENT_DIR',
+      source: 'BOTMUX_OMP_SOURCE_AGENT_DIR'
     })
-    delete baseEnv.ORCA_OMP_STATUS_EXTENSION
+    delete baseEnv.BOTMUX_OMP_STATUS_EXTENSION
   }
 
-  // Why: Codex account switching now materializes auth into an OrcaBotmux-scoped
-  // runtime home, and Codex launched inside OrcaBotmux terminals must use that same
+  // Why: Codex account switching now materializes auth into an Botmux-scoped
+  // runtime home, and Codex launched inside Botmux terminals must use that same
   // prepared home as quota fetches and other entry points. Keep the override
-  // PTY-scoped so dev/prod Orcas do not share hooks through ~/.codex.
+  // PTY-scoped so dev/prod Botmux instances do not share hooks through ~/.codex.
   if (opts.skipCodexHomeEnv) {
     delete baseEnv.CODEX_HOME
-    delete baseEnv.ORCA_CODEX_HOME
+    delete baseEnv.BOTMUX_CODEX_HOME
   } else if (opts.selectedCodexHomePath) {
     baseEnv.CODEX_HOME = opts.selectedCodexHomePath
     // Why: user startup files may re-export CODEX_HOME; shell-ready wrappers
     // restore this runtime home before Codex can be launched from the prompt.
-    baseEnv.ORCA_CODEX_HOME = opts.selectedCodexHomePath
+    baseEnv.BOTMUX_CODEX_HOME = opts.selectedCodexHomePath
   }
 
-  // Why: WSL shells need the managed userData root for shell-ready wrappers; dev-mode terminals need the same export so `orca_botmux` targets the live dev instance.
+  // Why: WSL shells need the managed userData root for shell-ready wrappers; dev-mode terminals need the same export so `botmux` targets the live dev instance.
   if (opts.isWsl) {
-    baseEnv.ORCA_USER_DATA_PATH = opts.userDataPath
-    // Why: managed WSL registration deliberately uses `orca-botmux-ide`; exposing
-    // that literal keeps agent guidance scoped to WSL without a bare-orca_botmux shim.
-    baseEnv.ORCA_CLI_COMMAND = opts.isPackaged ? 'orca-botmux-ide' : 'orca-botmux-desktop-dev'
+    baseEnv.BOTMUX_USER_DATA_PATH = opts.userDataPath
+    // Why: managed WSL registration deliberately uses `botmux-ide`; exposing
+    // that literal keeps agent guidance scoped to WSL without a bare-botmux shim.
+    baseEnv.BOTMUX_CLI_COMMAND = opts.isPackaged ? 'botmux-ide' : 'botmux-desktop-dev'
   } else {
     if (!opts.isPackaged) {
-      baseEnv.ORCA_USER_DATA_PATH ??= opts.userDataPath
+      baseEnv.BOTMUX_USER_DATA_PATH ??= opts.userDataPath
     }
-    delete baseEnv.ORCA_CLI_COMMAND
+    delete baseEnv.BOTMUX_CLI_COMMAND
   }
-  // Why: dev mode needs the launcher PATH override so `orca_botmux` resolves to the dev build instead of the production binary at /usr/local/bin/orca_botmux.
+  // Why: dev mode needs the launcher PATH override so `botmux` resolves to the dev build instead of the production binary at /usr/local/bin/botmux.
   if (!opts.isPackaged) {
     const devCliBin = join(opts.userDataPath, 'cli', 'bin')
     const inheritedPath = readInheritedPath(baseEnv)
@@ -1024,11 +1024,11 @@ export function buildPtyHostEnv(
     // for dev terminals).
     baseEnv.PATH = inheritedPath ? `${devCliBin}${delimiter}${inheritedPath}` : devCliBin
   } else if (process.platform === 'linux') {
-    // Why: the Linux CLI installs as `orca-botmux-ide` (never shadowing GNOME's
-    // /usr/bin/orca_botmux screen reader), but agent-facing guidance invokes bare
-    // `orca_botmux`. Scope a bare-`orca_botmux` shim to OrcaBotmux-managed PTYs so agents reach
-    // the OrcaBotmux CLI instead of the screen reader (stablyai/orca_botmux#7904).
-    const shimDir = ensureLinuxTerminalOrcaCliShimDir({ userDataPath: opts.userDataPath })
+    // Why: the Linux CLI installs as `botmux-ide` (packaged public command;
+    // missing bare botmux on PATH), but agent-facing guidance invokes bare
+    // `botmux`. Scope a bare-`botmux` shim to Botmux-managed PTYs so agents reach
+    // the Botmux CLI (stablyai/botmux#7904).
+    const shimDir = ensureLinuxTerminalBotmuxCliShimDir({ userDataPath: opts.userDataPath })
     if (shimDir) {
       const inheritedEntries = readInheritedPath(baseEnv)
         .split(delimiter)
@@ -1038,15 +1038,15 @@ export function buildPtyHostEnv(
   }
 
   // Why: GitHub attribution should only affect commands launched from
-  // OrcaBotmux's own PTYs. Injecting lightweight PATH shims at spawn-time keeps
-  // the behavior local to OrcaBotmux instead of rewriting user git config or
+  // Botmux's own PTYs. Injecting lightweight PATH shims at spawn-time keeps
+  // the behavior local to Botmux instead of rewriting user git config or
   // touching external shells.
   if (!opts.githubAttributionEnabled) {
-    delete baseEnv.ORCA_ENABLE_GIT_ATTRIBUTION
-    delete baseEnv.ORCA_GIT_COMMIT_TRAILER
-    delete baseEnv.ORCA_GH_PR_FOOTER
-    delete baseEnv.ORCA_GH_ISSUE_FOOTER
-    delete baseEnv.ORCA_ATTRIBUTION_SHIM_DIR
+    delete baseEnv.BOTMUX_ENABLE_GIT_ATTRIBUTION
+    delete baseEnv.BOTMUX_GIT_COMMIT_TRAILER
+    delete baseEnv.BOTMUX_GH_PR_FOOTER
+    delete baseEnv.BOTMUX_GH_ISSUE_FOOTER
+    delete baseEnv.BOTMUX_ATTRIBUTION_SHIM_DIR
   }
   applyTerminalAttributionEnv(baseEnv, {
     enabled: opts.githubAttributionEnabled,
@@ -1080,15 +1080,15 @@ function beginPtySpawnForWorktree(
   cwd: string | undefined,
   connectionId: string | null | undefined
 ): () => void {
-  // Why: orca_botmux synthetic ids are not repoId::path; splitWorktreeId would
+  // Why: botmux synthetic ids are not repoId::path; splitWorktreeId would
   // invent a fake path from the agent key segment.
-  const isOrcaBotmuxSynthetic =
+  const isBotmuxSynthetic =
     typeof worktreeId === 'string' &&
-    (worktreeId.startsWith('orca_botmux:agent:') ||
-      worktreeId.startsWith('orca_botmux:session:') ||
-      worktreeId === 'global-orca-botmux-terminal')
+    (worktreeId.startsWith('botmux:agent:') ||
+      worktreeId.startsWith('botmux:session:') ||
+      worktreeId === 'global-botmux-terminal')
   const worktreePath =
-    worktreeId && !isOrcaBotmuxSynthetic
+    worktreeId && !isBotmuxSynthetic
       ? splitWorktreeIdForFilesystem(worktreeId)?.worktreePath
       : undefined
   const installPaths = new Map<string, string>()
@@ -1510,7 +1510,7 @@ export function unbindLocalProviderListeners(): void {
 
 export function registerPtyHandlers(
   mainWindow: BrowserWindow,
-  runtime?: OrcaRuntimeService,
+  runtime?: BotmuxRuntimeService,
   getSelectedCodexHomePath?: GetSelectedCodexHomePath,
   getSettings?: () => GlobalSettings,
   prepareClaudeAuth?: PrepareClaudeAuth,
@@ -1617,19 +1617,19 @@ export function registerPtyHandlers(
         })
         // Why: agents need their own terminal handle at process start so they
         // can self-identify in orchestration messages without an extra RPC.
-        const requestedHandle = baseEnv.ORCA_TERMINAL_HANDLE
+        const requestedHandle = baseEnv.BOTMUX_TERMINAL_HANDLE
         const preAllocatedHandle =
           requestedHandle && trustedTerminalHandleEnv.has(requestedHandle)
             ? requestedHandle
             : runtime?.preAllocateHandleForPty(id)
         if (requestedHandle && requestedHandle !== preAllocatedHandle) {
-          delete env.ORCA_TERMINAL_HANDLE
+          delete env.BOTMUX_TERMINAL_HANDLE
         }
         if (preAllocatedHandle) {
-          env.ORCA_TERMINAL_HANDLE = preAllocatedHandle
+          env.BOTMUX_TERMINAL_HANDLE = preAllocatedHandle
         }
         if (ctx?.isWsl === true) {
-          addOrcaWslInteropEnv(env)
+          addBotmuxWslInteropEnv(env)
         }
         return env
       },
@@ -3107,9 +3107,9 @@ export function registerPtyHandlers(
       let env: Record<string, string> | undefined = claudeAuth
         ? { ...sshScopedEnv, ...claudeAuth.envPatch }
         : sshScopedEnv
-      const requestedAgentTeamsPath = env?.ORCA_AGENT_TEAMS_TEAM_ID ? env.PATH : undefined
+      const requestedAgentTeamsPath = env?.BOTMUX_AGENT_TEAMS_TEAM_ID ? env.PATH : undefined
       if (args.preAllocatedHandle) {
-        env = { ...env, ORCA_TERMINAL_HANDLE: args.preAllocatedHandle }
+        env = { ...env, BOTMUX_TERMINAL_HANDLE: args.preAllocatedHandle }
       }
       const selectedCodexHomePath = isDaemonHostSpawn
         ? getCompatibleSelectedCodexHomePath(
@@ -3412,7 +3412,7 @@ export function registerPtyHandlers(
         // Why: runtime-owned CLI PTYs bypass the renderer `pty:spawn` handler,
         // so record their spawn-time paneKey here too. Synthetic hook titles and
         // paneKey-scoped cache cleanup both depend on this reverse lookup.
-        const paneKey = rememberPaneKeyForPty(result.id, env?.ORCA_PANE_KEY)
+        const paneKey = rememberPaneKeyForPty(result.id, env?.BOTMUX_PANE_KEY)
         const pendingSerializer = paneKey ? pendingByPaneKey.get(paneKey) : undefined
         const inheritRendererReadiness =
           result.isReattach === true &&
@@ -3827,7 +3827,7 @@ export function registerPtyHandlers(
         tabId?: string
         leafId?: string
         // Why: telemetry-plan.md§Agent launch semantics. The renderer
-        // threads what OrcaBotmux was *asked* to launch through this field; main
+        // threads what Botmux was *asked* to launch through this field; main
         // fires `agent_started` only after `provider.spawn` resolves. Loose
         // typing on the IPC boundary because the main-side schema
         // validator is the single enforcement point — `track()` will drop
@@ -3951,12 +3951,12 @@ export function registerPtyHandlers(
       const startupTerminalColorQueryReplyColors = getStartupTerminalColorQueryReplyColors(args)
       // Why: the renderer sets pane env for SSH too. Only forward it to the
       // remote when the relay hook path is enabled; otherwise a newer relay
-      // could emit statuses this OrcaBotmux build is not prepared to route.
+      // could emit statuses this Botmux build is not prepared to route.
       const sshSourceEnv = stripRemotePaneEnvWhenHooksDisabled(args.connectionId, args.env)
       const baseEnvWithAuth = claudeAuth
         ? { ...sshSourceEnv, ...claudeAuth.envPatch }
         : sshSourceEnv
-      const spawnPaneKey = baseEnvWithAuth?.ORCA_PANE_KEY
+      const spawnPaneKey = baseEnvWithAuth?.BOTMUX_PANE_KEY
       const parsedSpawnPaneKey = parseValidPaneKey(spawnPaneKey)
       const verifiedPaneKey =
         parsedSpawnPaneKey &&
@@ -4025,32 +4025,32 @@ export function registerPtyHandlers(
           }
         }
       }
-      const requestedAgentTeamsPath = baseEnv?.ORCA_AGENT_TEAMS_TEAM_ID ? baseEnv.PATH : undefined
+      const requestedAgentTeamsPath = baseEnv?.BOTMUX_AGENT_TEAMS_TEAM_ID ? baseEnv.PATH : undefined
       const agentTeamsEnvToDelete = shouldRefreshAgentTeamsEnv
-        ? ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+        ? ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
         : undefined
       if (baseEnv && stablePaneKey) {
-        baseEnv.ORCA_PANE_KEY = stablePaneKey
+        baseEnv.BOTMUX_PANE_KEY = stablePaneKey
         if (typeof args.tabId === 'string') {
-          baseEnv.ORCA_TAB_ID = args.tabId
+          baseEnv.BOTMUX_TAB_ID = args.tabId
         } else if (!args.connectionId) {
-          delete baseEnv.ORCA_TAB_ID
+          delete baseEnv.BOTMUX_TAB_ID
         }
         if (typeof args.worktreeId === 'string') {
-          baseEnv.ORCA_WORKTREE_ID = args.worktreeId
+          baseEnv.BOTMUX_WORKTREE_ID = args.worktreeId
         } else if (!args.connectionId) {
-          delete baseEnv.ORCA_WORKTREE_ID
+          delete baseEnv.BOTMUX_WORKTREE_ID
         }
       } else if (baseEnv) {
-        // Why: ORCA_PANE_KEY crosses into shells and hook registries. Only the
+        // Why: BOTMUX_PANE_KEY crosses into shells and hook registries. Only the
         // key proven to match this spawn's tab+leaf may leave the IPC boundary.
-        delete baseEnv.ORCA_PANE_KEY
-        delete baseEnv.ORCA_TAB_ID
-        delete baseEnv.ORCA_WORKTREE_ID
-        delete baseEnv.ORCA_AGENT_LAUNCH_TOKEN
+        delete baseEnv.BOTMUX_PANE_KEY
+        delete baseEnv.BOTMUX_TAB_ID
+        delete baseEnv.BOTMUX_WORKTREE_ID
+        delete baseEnv.BOTMUX_AGENT_LAUNCH_TOKEN
       }
       const validatedPaneKey = stablePaneKey
-      // Why: SSH can strip ORCA_PANE_KEY when remote hooks are disabled; the
+      // Why: SSH can strip BOTMUX_PANE_KEY when remote hooks are disabled; the
       // IPC tab/leaf metadata still names the pane and matches runtime fallback.
       const reservationPaneKey = metadataPaneKey ?? validatedPaneKey
       const validatedLeafId = verifiedLeafId ?? metadataLeafId
@@ -4130,7 +4130,7 @@ export function registerPtyHandlers(
       }
       spawnTiming.mark('host_env')
       const spawnEnv = preAllocatedHandle
-        ? { ...env, ORCA_TERMINAL_HANDLE: preAllocatedHandle }
+        ? { ...env, BOTMUX_TERMINAL_HANDLE: preAllocatedHandle }
         : env
       const envToDelete = claudeAuth?.stripAuthEnv
         ? [...CLAUDE_AUTH_ENV_VARS, 'ANTHROPIC_CUSTOM_HEADERS']
@@ -4391,7 +4391,7 @@ export function registerPtyHandlers(
         }
         const relayResultId = getRelayPtyId(args.connectionId, result.id)
         if (store && args.connectionId) {
-          // Why: remote PTYs live in the SSH relay grace window after OrcaBotmux
+          // Why: remote PTYs live in the SSH relay grace window after Botmux
           // detaches. Persist their IDs immediately so reconnect can reattach
           // instead of treating the tab as a fresh shell.
           store.upsertSshRemotePtyLease({
@@ -4555,7 +4555,7 @@ export function registerPtyHandlers(
         if (isClaudeLaunch) {
           markClaudePtySpawned(result.id)
         }
-        // Why: renderer sets ORCA_PANE_KEY in `args.env` for every pane-owned
+        // Why: renderer sets BOTMUX_PANE_KEY in `args.env` for every pane-owned
         // spawn (see pty-connection.ts). Recording the mapping here lets
         // clearProviderPtyState clear the agent-hooks server's per-paneKey
         // caches when the PTY exits.
@@ -5472,13 +5472,13 @@ export function registerPtyHandlers(
 }
 
 export function registerHeadlessPtyRuntime(
-  runtime: OrcaRuntimeService,
+  runtime: BotmuxRuntimeService,
   getSelectedCodexHomePath?: GetSelectedCodexHomePath,
   getSettings?: () => GlobalSettings,
   prepareClaudeAuth?: PrepareClaudeAuth,
   store?: Store
 ): void {
-  // Why: headless `orca-botmux-desktop serve` has no renderer window, but the runtime still
+  // Why: headless `botmux-desktop serve` has no renderer window, but the runtime still
   // needs the same PTY controller and provider listeners as desktop so remote
   // clients can create, stream, inspect, and stop terminals.
   const headlessWindow = {

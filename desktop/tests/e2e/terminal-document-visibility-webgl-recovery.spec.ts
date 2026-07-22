@@ -1,6 +1,6 @@
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
 import { PNG } from 'pngjs'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   splitActiveTerminalPane,
@@ -283,22 +283,22 @@ async function dispatchDocumentVisibilityCycle(page: Page): Promise<void> {
 test.describe('terminal document visibility WebGL recovery @headful', () => {
   test('clears the WebGL atlas and keeps terminal text painted after document visibility resumes', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
 
-    const webglActive = await forceWebgl(orcaBotmuxPage)
+    const webglActive = await forceWebgl(botmuxPage)
     test.skip(!webglActive, 'WebGL was not active in this headful environment')
 
-    await writeStableTerminalContent(orcaBotmuxPage)
-    expect(await patchAtlasCounter(orcaBotmuxPage)).toBe(true)
-    expect(await countPatchedWebglAddons(orcaBotmuxPage)).toBeGreaterThanOrEqual(2)
-    const baseline = await terminalScreenshots(orcaBotmuxPage)
+    await writeStableTerminalContent(botmuxPage)
+    expect(await patchAtlasCounter(botmuxPage)).toBe(true)
+    expect(await countPatchedWebglAddons(botmuxPage)).toBeGreaterThanOrEqual(2)
+    const baseline = await terminalScreenshots(botmuxPage)
     expect(baseline.length).toBeGreaterThanOrEqual(2)
     const baselineInkPixels = baseline.map(countTerminalInkPixels)
     for (const inkPixels of baselineInkPixels) {
@@ -309,35 +309,35 @@ test.describe('terminal document visibility WebGL recovery @headful', () => {
       // Why: this is the app-level background/foreground path where the
       // TerminalPane stays mounted and visible, so React pane visibility does
       // not run its normal resume recovery.
-      await resetAtlasResetCount(orcaBotmuxPage)
+      await resetAtlasResetCount(botmuxPage)
       const browserWindowVisibilityWorked = await tryBrowserWindowVisibilityCycle(
         electronApp,
-        orcaBotmuxPage
+        botmuxPage
       )
       console.log(
         `[visibility-webgl] browserWindowVisibilityWorked=${browserWindowVisibilityWorked}`
       )
       if (browserWindowVisibilityWorked) {
         await expect
-          .poll(() => readAtlasResetCount(orcaBotmuxPage), {
+          .poll(() => readAtlasResetCount(botmuxPage), {
             timeout: 2_000,
             message: 'BrowserWindow visibility resume did not clear the WebGL atlas'
           })
           .toBeGreaterThan(0)
       } else {
-        await resetAtlasResetCount(orcaBotmuxPage)
-        await dispatchDocumentVisibilityCycle(orcaBotmuxPage)
+        await resetAtlasResetCount(botmuxPage)
+        await dispatchDocumentVisibilityCycle(botmuxPage)
         await expect
-          .poll(() => readAtlasResetCount(orcaBotmuxPage), {
+          .poll(() => readAtlasResetCount(botmuxPage), {
             timeout: 2_000,
             message: 'document visibility resume did not clear the WebGL atlas'
           })
           .toBeGreaterThan(0)
       }
 
-      await waitForTerminalPaint(orcaBotmuxPage)
+      await waitForTerminalPaint(botmuxPage)
 
-      const afterResume = await terminalScreenshots(orcaBotmuxPage)
+      const afterResume = await terminalScreenshots(botmuxPage)
       for (const [index, baselineShot] of baseline.entries()) {
         await testInfo.attach(`visibility-webgl-baseline-${index}`, {
           body: baselineShot,

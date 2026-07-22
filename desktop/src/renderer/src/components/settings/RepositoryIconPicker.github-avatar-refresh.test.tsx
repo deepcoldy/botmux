@@ -33,8 +33,8 @@ globalThis.window = { api: { gh: apiMocks } }
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-1',
-    path: '/workspace/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/workspace/botmux',
+    displayName: 'botmux',
     badgeColor: '#2563eb',
     addedAt: 1,
     kind: 'git',
@@ -73,11 +73,11 @@ describe('RepositoryIconPicker GitHub avatar refresh', () => {
         type: 'image',
         src: 'https://github.com/stablyai.png?size=64',
         source: 'github',
-        label: 'stablyai/orca_botmux'
+        label: 'stablyai/botmux'
       }
     })
     apiMocks.repoUpstream.mockResolvedValueOnce(null)
-    apiMocks.repoSlug.mockResolvedValueOnce({ owner: 'parkerrex', repo: 'orca_botmux' })
+    apiMocks.repoSlug.mockResolvedValueOnce({ owner: 'parkerrex', repo: 'botmux' })
 
     act(() => {
       root.render(<RepositoryIconPicker repo={repo} updateRepo={updateRepo} />)
@@ -89,7 +89,7 @@ describe('RepositoryIconPicker GitHub avatar refresh', () => {
         type: 'image',
         src: 'https://github.com/parkerrex.png?size=64',
         source: 'github',
-        label: 'parkerrex/orca_botmux'
+        label: 'parkerrex/botmux'
       }
     })
   })
@@ -98,18 +98,18 @@ describe('RepositoryIconPicker GitHub avatar refresh', () => {
     const updateRepo = vi.fn()
     // A fork whose avatar tracks its parent org, resolved earlier while online.
     const repo = makeRepo({
-      upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+      upstream: { owner: 'stablyai', repo: 'botmux' },
       repoIcon: {
         type: 'image',
         src: 'https://github.com/stablyai.png?size=64',
         source: 'github',
-        label: 'stablyai/orca_botmux'
+        label: 'stablyai/botmux'
       }
     })
     // Offline/unauthed: the parent lookup returns null. The fork's own origin
     // owner must NOT be persisted over the parent identity.
     apiMocks.repoUpstream.mockResolvedValueOnce(null)
-    apiMocks.repoSlug.mockResolvedValueOnce({ owner: 'parkerrex', repo: 'orca_botmux' })
+    apiMocks.repoSlug.mockResolvedValueOnce({ owner: 'parkerrex', repo: 'botmux' })
 
     act(() => {
       root.render(<RepositoryIconPicker repo={repo} updateRepo={updateRepo} />)

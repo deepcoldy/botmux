@@ -18,7 +18,7 @@ const projectDir = path.resolve(import.meta.dirname, '..', '..')
 const temporaryDirectories = []
 
 async function createFixture() {
-  const root = await mkdtemp(path.join(tmpdir(), 'orca-botmux-bundled-skill-guides-'))
+  const root = await mkdtemp(path.join(tmpdir(), 'botmux-bundled-skill-guides-'))
   temporaryDirectories.push(root)
   await Promise.all([
     cp(path.join(projectDir, 'skill-guides'), path.join(root, 'skill-guides'), {
@@ -64,19 +64,19 @@ describe('bundled skill guide generator', () => {
   })
 
   it('keeps CLI guide examples safe across shells and Linux command names', async () => {
-    for (const name of ['orca-botmux-cli', 'computer-use', 'orca-botmux-emulator', 'orca-botmux-emulator-android']) {
+    for (const name of ['botmux-cli', 'computer-use', 'botmux-emulator', 'botmux-emulator-android']) {
       const source = await readFile(path.join(projectDir, 'skill-guides', `${name}.md`), 'utf8')
 
-      expect(source).toContain('ORCA_CLI_COMMAND')
-      expect(source).toContain('orca-botmux-desktop-dev')
-      expect(source).toContain('orca-botmux-ide')
+      expect(source).toContain('BOTMUX_CLI_COMMAND')
+      expect(source).toContain('botmux-desktop-dev')
+      expect(source).toContain('botmux-ide')
       expect(source).toContain('PowerShell')
       expect(source).toContain('cmd.exe')
-      expect(source).toMatch(/^ORCA .+--json$/mu)
-      // Why: bare command lines can launch GNOME OrcaBotmux, while shell variables make
+      expect(source).toMatch(/^BOTMUX .+--json$/mu)
+      // Why: bare command lines may miss the packaged Linux CLI, while shell variables make
       // the same guide unusable from PowerShell and cmd.exe.
-      expect(source).not.toMatch(/^orca_botmux /mu)
-      expect(source).not.toMatch(/\$ORCA(?:_|\b)/u)
+      expect(source).not.toMatch(/^botmux /mu)
+      expect(source).not.toMatch(/\$BOTMUX(?:_|\b)/u)
     }
   })
 

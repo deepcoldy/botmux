@@ -15,7 +15,7 @@ vi.mock('electron', () => ({
     setApplicationMenu: setApplicationMenuMock
   },
   app: {
-    name: 'orca_botmux'
+    name: 'botmux'
   }
 }))
 
@@ -146,7 +146,7 @@ describe('registerAppMenu', () => {
     // Why: Check for Updates lives under the app-name menu on macOS and
     // under Help on Windows/Linux. The click behavior must be identical
     // either way.
-    const parentLabel = isMac ? 'orca_botmux' : 'Help'
+    const parentLabel = isMac ? 'botmux' : 'Help'
     const item = getSubmenu(getTemplate(), parentLabel).find(
       (entry) => entry.label === 'Check for Updates...'
     )
@@ -202,7 +202,7 @@ describe('registerAppMenu', () => {
     expect(paletteItem?.accelerator).toBeUndefined()
   })
 
-  it('routes Edit > Paste through OrcaBotmux coordinated paste ownership', () => {
+  it('routes Edit > Paste through Botmux coordinated paste ownership', () => {
     const send = vi.fn()
     getFocusedWindowMock.mockReturnValue({ webContents: { send } })
     registerAppMenu(buildMenuOptions())
@@ -223,10 +223,10 @@ describe('registerAppMenu', () => {
     registerAppMenu(buildMenuOptions())
 
     const template = getTemplate()
-    // Why: no redundant app-named "orca_botmux" menu should exist on non-mac — the
+    // Why: no redundant app-named "botmux" menu should exist on non-mac — the
     // app-menu contents (Settings, Exit, Check for Updates, About) have been
     // redistributed so users see them in File / Help instead.
-    expect(template.find((item) => item.label === 'orca_botmux')).toBeUndefined()
+    expect(template.find((item) => item.label === 'botmux')).toBeUndefined()
 
     const fileLabels = getSubmenu(template, 'File').map((item) => item.label)
     expect(fileLabels).not.toContain(`Export as PDF...\t${isMac ? '⌘⇧E' : 'Ctrl+Shift+E'}`)
@@ -239,18 +239,18 @@ describe('registerAppMenu', () => {
     expect(helpLabels).toEqual(
       expect.arrayContaining([
         'Report Crash...',
-        'Getting Started with orca_botmux',
+        'Getting Started with botmux',
         'Check for Updates...'
       ])
     )
-    expect(helpLabels).not.toContain('Explore OrcaBotmux')
+    expect(helpLabels).not.toContain('Explore Botmux')
   })
 
   it.runIf(isMac)('keeps the macOS app-named menu with Settings and quit roles', () => {
     registerAppMenu(buildMenuOptions())
 
     const template = getTemplate()
-    const appSubmenu = getSubmenu(template, 'orca_botmux')
+    const appSubmenu = getSubmenu(template, 'botmux')
     const appLabels = appSubmenu.map((item) => item.label)
     expect(appLabels).toEqual(
       expect.arrayContaining(['Check for Updates...', `Settings\t${isMac ? '⌘,' : 'Ctrl+,'}`])
@@ -262,16 +262,16 @@ describe('registerAppMenu', () => {
     expect(helpLabels).toEqual([
       'Report Crash...',
       undefined,
-      'Getting Started with orca_botmux'
+      'Getting Started with botmux'
     ])
   })
 
-  it('routes Getting Started with orca_botmux through its callback', () => {
+  it('routes Getting Started with botmux through its callback', () => {
     const options = buildMenuOptions()
     registerAppMenu(options)
 
     const setupGuideItem = getSubmenu(getTemplate(), 'Help').find(
-      (entry) => entry.label === 'Getting Started with orca_botmux'
+      (entry) => entry.label === 'Getting Started with botmux'
     )
     expect(setupGuideItem?.accelerator).toBeUndefined()
 
@@ -285,8 +285,8 @@ describe('registerAppMenu', () => {
   it('does not expose Feature tour / Explore UG menu item', () => {
     registerAppMenu(buildMenuOptions())
     const helpLabels = getSubmenu(getTemplate(), 'Help').map((item) => item.label)
-    expect(helpLabels).not.toContain('Explore OrcaBotmux')
-    expect(helpLabels).not.toContain('Explore orca_botmux')
+    expect(helpLabels).not.toContain('Explore Botmux')
+    expect(helpLabels).not.toContain('Explore botmux')
   })
 
   it('routes Report Crash through its callback', () => {
@@ -331,7 +331,7 @@ describe('registerAppMenu', () => {
     expect(automationsItem?.type).toBe('checkbox')
     expect(automationsItem?.checked).toBe(false)
 
-    const mobileItem = appearanceSubmenu.find((item) => item.label === 'Show OrcaBotmux Mobile Button')
+    const mobileItem = appearanceSubmenu.find((item) => item.label === 'Show Botmux Mobile Button')
     expect(mobileItem?.type).toBe('checkbox')
     expect(mobileItem?.checked).toBe(true)
 
@@ -357,7 +357,7 @@ describe('registerAppMenu', () => {
       .find((item) => item.label === 'Show Automations Button')
       ?.click?.({} as never, {} as never, {} as never)
     appearanceSubmenu
-      .find((item) => item.label === 'Show OrcaBotmux Mobile Button')
+      .find((item) => item.label === 'Show Botmux Mobile Button')
       ?.click?.({} as never, {} as never, {} as never)
     appearanceSubmenu
       .find((item) => item.label === 'Show Titlebar App Name')

@@ -24,7 +24,7 @@ function getLifecycleGroupRecipientError(type: 'worker_done' | 'heartbeat'): str
 // should never set this — there is no surface documentation. A bogus value
 // falls back to the default rather than disabling the keepalive.
 function resolveKeepaliveIntervalMs(): number {
-  const raw = process.env.ORCA_KEEPALIVE_INTERVAL_MS ?? process.env.ORCA_HEARTBEAT_INTERVAL_MS
+  const raw = process.env.BOTMUX_KEEPALIVE_INTERVAL_MS ?? process.env.BOTMUX_HEARTBEAT_INTERVAL_MS
   if (!raw) {
     return DEFAULT_KEEPALIVE_INTERVAL_MS
   }
@@ -149,10 +149,10 @@ async function resolveOrchestrationTerminalHandle(
   if (explicit) {
     return explicit
   }
-  const envHandle = process.env.ORCA_TERMINAL_HANDLE
+  const envHandle = process.env.BOTMUX_TERMINAL_HANDLE
   if (envHandle && envHandle.length > 0) {
     if (flagName === 'from' && options.validateEnvHandle) {
-      // Why: long-lived shells can retain an ORCA_TERMINAL_HANDLE after the
+      // Why: long-lived shells can retain an BOTMUX_TERMINAL_HANDLE after the
       // runtime remints the pane handle; do not bake that stale id into
       // coordinator preambles.
       const live = await isLiveTerminalHandle(envHandle, client)
@@ -175,7 +175,7 @@ async function resolveOrchestrationTerminalHandle(
 async function resolveTaskCreatorTerminalHandle(
   client: Parameters<CommandHandler>[0]['client']
 ): Promise<string | undefined> {
-  const envHandle = process.env.ORCA_TERMINAL_HANDLE
+  const envHandle = process.env.BOTMUX_TERMINAL_HANDLE
   if (!envHandle || envHandle.length === 0) {
     return undefined
   }
@@ -237,7 +237,7 @@ async function resolveOrchestrationPaneTerminalHandle(
   client: Parameters<CommandHandler>[0]['client'],
   options: { optional?: boolean } = {}
 ): Promise<string | undefined> {
-  const paneKey = process.env.ORCA_PANE_KEY
+  const paneKey = process.env.BOTMUX_PANE_KEY
   if (!paneKey || paneKey.length === 0) {
     return undefined
   }
@@ -316,12 +316,12 @@ function throwNoActiveSenderTerminal(): never {
   throw new RuntimeClientError(
     'no_active_sender_terminal',
     'Could not determine the sender terminal for this orchestration command. ' +
-      'Pass --from <terminal-handle> or run the command inside a live OrcaBotmux terminal with ORCA_TERMINAL_HANDLE set.'
+      'Pass --from <terminal-handle> or run the command inside a live Botmux terminal with BOTMUX_TERMINAL_HANDLE set.'
   )
 }
 
 function isDevCliInvocation(): boolean {
-  return process.env.ORCA_USER_DATA_PATH?.includes('orca-botmux-desktop-dev') ?? false
+  return process.env.BOTMUX_USER_DATA_PATH?.includes('botmux-desktop-dev') ?? false
 }
 
 function getOptionalPositiveIntegerValueFlag(
@@ -360,14 +360,14 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
     if (
       (type === 'worker_done' || type === 'heartbeat') &&
       !getOptionalStringFlag(flags, 'from') &&
-      !process.env.ORCA_TERMINAL_HANDLE
+      !process.env.BOTMUX_TERMINAL_HANDLE
     ) {
       // Why: focus is not lifecycle authority; injected dispatches carry an
       // explicit worker handle so an identity-less subprocess must fail closed.
       throwNoActiveSenderTerminal()
     }
 
-    // Why: lifecycle senders keep ORCA_TERMINAL_HANDLE verbatim — no liveness
+    // Why: lifecycle senders keep BOTMUX_TERMINAL_HANDLE verbatim — no liveness
     // probe (terminal.show throws runtime_unavailable in the exact mid-restart
     // window worker_done must survive) and no pane remint (pre-payload-
     // authority runtimes require from === the equally stale assignee_handle,
@@ -385,7 +385,7 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
       payload: getOptionalStructuredMessagePayload(flags),
       // Why: the pane key is the remint-stable sender identity the runtime
       // verifies lifecycle ownership against; older runtimes strip it.
-      senderPaneKey: process.env.ORCA_PANE_KEY || undefined,
+      senderPaneKey: process.env.BOTMUX_PANE_KEY || undefined,
       devMode: isDevCliInvocation()
     })
     if ('message' in result.result && result.result.lifecycle?.action === 'rejected') {
@@ -679,7 +679,7 @@ export const ORCHESTRATION_HANDLERS: Record<string, CommandHandler> = {
     )
     // Why: deliberate bypass of `printResult`. `--json` on `ask` emits a
     // single-line bare JSON object (no RPC envelope, no multi-line pretty-
-    // print) so workers can pipe `orca_botmux orchestration ask … --json | jq -r
+    // print) so workers can pipe `botmux orchestration ask … --json | jq -r
     // .answer` without reaching into a `result` envelope. This diverges from
     // every other orchestration verb; called out in the commit message and
     // guarded by a unit test in orchestration.test.ts.

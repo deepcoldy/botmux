@@ -37,10 +37,10 @@ import {
 } from '@/lib/source-control-remote-error'
 import { useRepoById, useWorktreeMap } from '@/store/selectors'
 import {
-  buildOrcaBotmuxEphemeralRepo,
-  resolveOrcaBotmuxToolingContext,
+  buildBotmuxEphemeralRepo,
+  resolveBotmuxToolingContext,
   resolveRightSidebarToolingPath
-} from '@/lib/orca-botmux-tooling-context'
+} from '@/lib/botmux-tooling-context'
 import { getHostedReviewCacheKey } from '@/store/slices/hosted-review'
 import { getGitHubPRCacheKey } from '@/store/slices/github-cache-key'
 import { detectLanguage } from '@/lib/language-detect'
@@ -829,21 +829,21 @@ function SourceControlInner(): React.JSX.Element {
   // Why: on botmux session hosts bind SC to matched project worktree, or the
   // synthetic host itself when session cwd is only available over remote FS.
   const activeWorktreeId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).toolingWorktreeId
+    (s) => resolveBotmuxToolingContext(s).toolingWorktreeId
   )
   const isEphemeralBotmuxGit = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).isEphemeralGitSurface
+    (s) => resolveBotmuxToolingContext(s).isEphemeralGitSurface
   )
   const botmuxFilesystemConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
   const toolingSurfacePath = useAppStore((s) => resolveRightSidebarToolingPath(s))
   const activeWorktree = useAppStore((s) => {
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const botmuxHostWithoutPath = useAppStore((s) => {
-    const ctx = resolveOrcaBotmuxToolingContext(s)
+    const ctx = resolveBotmuxToolingContext(s)
     return ctx.isBotmuxHost && !ctx.toolingWorktreeId
   })
   const activeWorktreeInstanceId = activeWorktree?.instanceId
@@ -858,7 +858,7 @@ function SourceControlInner(): React.JSX.Element {
   const activeRepo = useMemo(() => {
     if (registeredRepo) return registeredRepo
     if (!isEphemeralBotmuxGit || !activeWorktree || !toolingSurfacePath) return null
-    return buildOrcaBotmuxEphemeralRepo({
+    return buildBotmuxEphemeralRepo({
       worktree: activeWorktree,
       connectionId: botmuxFilesystemConnectionId,
       surfaceCwd: toolingSurfacePath
@@ -2964,7 +2964,7 @@ function SourceControlInner(): React.JSX.Element {
         toast.warning(
           translate(
             'auto.components.right.sidebar.SourceControl.0453ca3a9a',
-            '{{value0}} created, but OrcaBotmux could not refresh it yet.',
+            '{{value0}} created, but Botmux could not refresh it yet.',
             { value0: copy.titleLabel }
           ),
           {

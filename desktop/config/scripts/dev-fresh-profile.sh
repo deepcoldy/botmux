@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Launch `pn dev` with a fresh, isolated userData profile so the app behaves
 # like a first-time install (onboarding overlay paints, no persisted repos,
-# no saved sessions). Your real `orca_botmux-dev` profile is left untouched.
+# no saved sessions). Your real `botmux-dev` profile is left untouched.
 #
 # Usage:
 #   ./config/scripts/dev-fresh-profile.sh           # ephemeral temp profile, deleted on exit
 #   ./config/scripts/dev-fresh-profile.sh --keep    # keep the profile dir after exit
-#   ORCA_FRESH_PROFILE_DIR=/some/path ./config/scripts/dev-fresh-profile.sh   # use a fixed dir
+#   BOTMUX_FRESH_PROFILE_DIR=/some/path ./config/scripts/dev-fresh-profile.sh   # use a fixed dir
 set -euo pipefail
 
 KEEP=0
@@ -23,13 +23,13 @@ for arg in "$@"; do
   esac
 done
 
-PROFILE_DIR="${ORCA_FRESH_PROFILE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/orca_botmux-fresh-profile.XXXXXXXX")}"
+PROFILE_DIR="${BOTMUX_FRESH_PROFILE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/botmux-fresh-profile.XXXXXXXX")}"
 mkdir -p "$PROFILE_DIR"
 
 cleanup() {
-  if [[ "$KEEP" -eq 0 && -z "${ORCA_FRESH_PROFILE_DIR:-}" ]]; then
+  if [[ "$KEEP" -eq 0 && -z "${BOTMUX_FRESH_PROFILE_DIR:-}" ]]; then
     # Guard rm -rf against accidental empty/unrelated PROFILE_DIR.
-    [[ -n "${PROFILE_DIR:-}" && -d "$PROFILE_DIR" && "$PROFILE_DIR" == */orca_botmux-fresh-profile* ]] || return 0
+    [[ -n "${PROFILE_DIR:-}" && -d "$PROFILE_DIR" && "$PROFILE_DIR" == */botmux-fresh-profile* ]] || return 0
     rm -rf "$PROFILE_DIR"
     echo "[dev-fresh-profile] removed $PROFILE_DIR"
   else
@@ -40,4 +40,4 @@ trap cleanup EXIT
 
 echo "[dev-fresh-profile] using userData=$PROFILE_DIR"
 # Don't exec — we need the EXIT trap to fire so the temp profile gets cleaned up.
-ORCA_DEV_USER_DATA_PATH="$PROFILE_DIR" ORCA_DEV_SHOW_FIRST_RUN_EDUCATION=1 pnpm dev
+BOTMUX_DEV_USER_DATA_PATH="$PROFILE_DIR" BOTMUX_DEV_SHOW_FIRST_RUN_EDUCATION=1 pnpm dev

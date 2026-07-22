@@ -95,5 +95,5 @@ export async function collectAutomationRunUsage({
       completedAt: collectedAt
     })
   }
-  return unavailable(null, 'provider_unsupported', 'This agent does not report usage to OrcaBotmux yet.')
+  return unavailable(null, 'provider_unsupported', 'This agent does not report usage to Botmux yet.')
 }

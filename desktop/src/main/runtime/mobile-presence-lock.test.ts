@@ -14,7 +14,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import type * as GitUsernameModule from '../git/git-username'
-import { OrcaRuntimeService } from './orca-botmux-runtime'
+import { BotmuxRuntimeService } from './botmux-runtime'
 
 vi.mock('../git/worktree', () => ({
   listWorktrees: vi.fn().mockResolvedValue([]),
@@ -82,7 +82,7 @@ function createRuntime(mobileAutoRestoreFitMs: number | null = 5_000) {
     ...store,
     getSettings: () => ({ ...store.getSettings(), mobileAutoRestoreFitMs })
   }
-  const runtime = new OrcaRuntimeService(effectiveStore)
+  const runtime = new BotmuxRuntimeService(effectiveStore)
   const ptySizes = new Map<string, { cols: number; rows: number }>([
     ['pty-1', { cols: 150, rows: 40 }]
   ])
@@ -616,7 +616,7 @@ describe('mobile presence lock — multi-mobile semantics', () => {
 // This is the state where the desktop "Your phone left this at phone size"
 // modal's Restore buttons used to silently no-op.
 async function reachHeldModalWithNullViewportResubscribe(
-  runtime: OrcaRuntimeService
+  runtime: BotmuxRuntimeService
 ): Promise<void> {
   await runtime.handleMobileSubscribe('pty-1', 'phone-A', { cols: 45, rows: 20 })
   runtime.handleMobileUnsubscribe('pty-1', 'phone-A')

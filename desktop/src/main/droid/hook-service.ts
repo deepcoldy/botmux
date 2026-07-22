@@ -81,7 +81,7 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
     return [
       '@echo off',
       'setlocal',
-      'if defined ORCA_AGENT_HOOK_ENDPOINT if exist "%ORCA_AGENT_HOOK_ENDPOINT%" call "%ORCA_AGENT_HOOK_ENDPOINT%" 2>nul',
+      'if defined BOTMUX_AGENT_HOOK_ENDPOINT if exist "%BOTMUX_AGENT_HOOK_ENDPOINT%" call "%BOTMUX_AGENT_HOOK_ENDPOINT%" 2>nul',
       ...buildWindowsHookEnvironmentGuardLines(),
       buildWindowsAgentHookPostCommand('droid'),
       'exit /b 0',
@@ -93,26 +93,26 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
   return [
     '#!/bin/sh',
     ...buildPosixHookPayloadCapture(),
-    'if [ -n "$ORCA_AGENT_HOOK_ENDPOINT" ] && [ -r "$ORCA_AGENT_HOOK_ENDPOINT" ]; then',
-    '  . "$ORCA_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
+    'if [ -n "$BOTMUX_AGENT_HOOK_ENDPOINT" ] && [ -r "$BOTMUX_AGENT_HOOK_ENDPOINT" ]; then',
+    '  . "$BOTMUX_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
     'fi',
-    'if [ -z "$ORCA_AGENT_HOOK_PORT" ] || [ -z "$ORCA_AGENT_HOOK_TOKEN" ] || [ -z "$ORCA_PANE_KEY" ]; then',
+    'if [ -z "$BOTMUX_AGENT_HOOK_PORT" ] || [ -z "$BOTMUX_AGENT_HOOK_TOKEN" ] || [ -z "$BOTMUX_PANE_KEY" ]; then',
     '  exit 0',
     'fi',
     // Timeout caps best-effort hook posts if the local listener stalls.
     // Why: pipe payload to curl's stdin (`payload@-`) instead of an inline
     // `payload=$VALUE` arg, so tens-of-KB tool output stays off the curl
     // command line (EDR command-line false positives). Wire body is identical.
-    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${ORCA_AGENT_HOOK_PORT}/hook/droid" \\',
+    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${BOTMUX_AGENT_HOOK_PORT}/hook/droid" \\',
     '  --connect-timeout 0.5 --max-time 1.5 \\',
     '  -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '  -H "X-OrcaBotmux-Agent-Hook-Token: ${ORCA_AGENT_HOOK_TOKEN}" \\',
-    '  --data-urlencode "paneKey=${ORCA_PANE_KEY}" \\',
-    '  --data-urlencode "tabId=${ORCA_TAB_ID}" \\',
-    '  --data-urlencode "launchToken=${ORCA_AGENT_LAUNCH_TOKEN}" \\',
-    '  --data-urlencode "worktreeId=${ORCA_WORKTREE_ID}" \\',
-    '  --data-urlencode "env=${ORCA_AGENT_HOOK_ENV}" \\',
-    '  --data-urlencode "version=${ORCA_AGENT_HOOK_VERSION}" \\',
+    '  -H "X-Botmux-Agent-Hook-Token: ${BOTMUX_AGENT_HOOK_TOKEN}" \\',
+    '  --data-urlencode "paneKey=${BOTMUX_PANE_KEY}" \\',
+    '  --data-urlencode "tabId=${BOTMUX_TAB_ID}" \\',
+    '  --data-urlencode "launchToken=${BOTMUX_AGENT_LAUNCH_TOKEN}" \\',
+    '  --data-urlencode "worktreeId=${BOTMUX_WORKTREE_ID}" \\',
+    '  --data-urlencode "env=${BOTMUX_AGENT_HOOK_ENV}" \\',
+    '  --data-urlencode "version=${BOTMUX_AGENT_HOOK_VERSION}" \\',
     '  --data-urlencode "payload@-" >/dev/null 2>&1 || true',
     'exit 0',
     ''
@@ -243,14 +243,14 @@ export class DroidHookService {
   }
 
   // Why: SSH remotes run the Droid CLI on the remote host, so its hook config
-  // and managed script must be written into the remote ~/.factory + ~/.orca_botmux via
+  // and managed script must be written into the remote ~/.factory + ~/.botmux via
   // SFTP. Without this, Droid never fires the managed hook over SSH and its
   // status row is absent from the task tree (issue #7253). Mirrors the local
   // install() but always emits POSIX script/paths — even from a Windows host.
   async installRemote(sftp: SFTPWrapper, remoteHome: string): Promise<AgentHookInstallStatus> {
     const home = remoteHome.replace(/\/$/, '')
     const remoteConfigPath = `${home}/.factory/settings.json`
-    const remoteScriptPath = `${home}/.orca_botmux/agent-hooks/droid-hook.sh`
+    const remoteScriptPath = `${home}/.botmux/agent-hooks/droid-hook.sh`
     try {
       const config = await readHooksJsonRemote(sftp, remoteConfigPath)
       if (!config) {

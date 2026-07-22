@@ -161,7 +161,7 @@ describe('WebRuntimeClient', () => {
 
       client.close()
 
-      await expect(callPromise).rejects.toThrow('Remote OrcaBotmux runtime connection closed.')
+      await expect(callPromise).rejects.toThrow('Remote Botmux runtime connection closed.')
       expect(vi.getTimerCount()).toBe(0)
     } finally {
       vi.useRealTimers()

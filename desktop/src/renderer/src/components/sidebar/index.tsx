@@ -6,7 +6,7 @@ import SidebarHeader from './SidebarHeader'
 import SidebarNav from './SidebarNav'
 import SetupScriptPromptCard from './SetupScriptPromptCard'
 import WorktreeList from './WorktreeList'
-import OrcaBotmuxSessionsTree from './OrcaBotmuxSessionsTree'
+import BotmuxSessionsTree from './BotmuxSessionsTree'
 import SidebarToolbar from './SidebarToolbar'
 import WorkspaceKanbanDrawer from './WorkspaceKanbanDrawer'
 import type { VirtualizedScrollAnchor } from '@/hooks/useVirtualizedScrollAnchor'
@@ -21,7 +21,7 @@ import { lazyWithRetry } from '@/lib/lazy-with-retry'
 const WorktreeMetaDialog = lazyWithRetry(() => import('./WorktreeMetaDialog'))
 const RemoveFolderDialog = lazyWithRetry(() => import('./RemoveFolderDialog'))
 const WorktreeVisibilityDialog = lazyWithRetry(() => import('./WorktreeVisibilityDialog'))
-const OrcaYamlTrustDialog = lazyWithRetry(() => import('./OrcaBotmuxYamlTrustDialog'))
+const BotmuxYamlTrustDialog = lazyWithRetry(() => import('./BotmuxYamlTrustDialog'))
 const ForgetSshWorkspaceDialog = lazyWithRetry(() => import('./ForgetSshWorkspaceDialog'))
 
 const MIN_WIDTH = 220
@@ -146,8 +146,8 @@ function Sidebar({
             <SidebarNav />
             <SidebarHeader onWorkspaceBoardMenuOpenChange={setWorkspaceBoardMenuOpen} />
 
-            {/* OrcaBotmux: host → sessions, flat + activity-sorted (session-first control plane) */}
-            <OrcaBotmuxSessionsTree />
+            {/* Botmux: host → sessions, flat + activity-sorted (session-first control plane) */}
+            <BotmuxSessionsTree />
 
             <WorktreeList
               scrollOffsetRef={worktreeScrollOffsetRef}
@@ -211,7 +211,7 @@ function Sidebar({
         {activeModal === 'edit-meta' ? <WorktreeMetaDialog /> : null}
         {activeModal === 'confirm-remove-folder' ? <RemoveFolderDialog /> : null}
         {activeModal === 'worktree-visibility' ? <WorktreeVisibilityDialog /> : null}
-        {activeModal === 'confirm-orca-botmux-yaml-hooks' ? <OrcaYamlTrustDialog /> : null}
+        {activeModal === 'confirm-botmux-yaml-hooks' ? <BotmuxYamlTrustDialog /> : null}
         {activeModal === 'forget-ssh-workspace' ? <ForgetSshWorkspaceDialog /> : null}
       </React.Suspense>
       {sidebarOpen ? (

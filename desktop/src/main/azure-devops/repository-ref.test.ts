@@ -98,7 +98,7 @@ describe('parseAzureDevOpsRepoRef', () => {
   })
 
   it('ignores non-Azure remotes', () => {
-    expect(parseAzureDevOpsRepoRef('git@github.com:stablyai/orca_botmux.git')).toBeNull()
+    expect(parseAzureDevOpsRepoRef('git@github.com:stablyai/botmux.git')).toBeNull()
   })
 
   it('resolves repository refs through the SSH git provider for connected repos', async () => {

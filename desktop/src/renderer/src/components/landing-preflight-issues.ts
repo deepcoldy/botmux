@@ -58,7 +58,7 @@ export function getLandingPreflightIssues(
       title: translate('auto.components.Landing.5beaef5f9e', 'GitHub CLI is not installed'),
       description: translate(
         'auto.components.Landing.73e1ad4282',
-        'OrcaBotmux uses the GitHub CLI (gh) to show pull requests, issues, and checks.'
+        'Botmux uses the GitHub CLI (gh) to show pull requests, issues, and checks.'
       ),
       fixLabel: 'Install GitHub CLI',
       fixUrl: 'https://cli.github.com',

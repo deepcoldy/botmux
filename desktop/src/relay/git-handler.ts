@@ -1040,7 +1040,7 @@ export class GitHandler {
       }
       const upstream = await resolveEffectiveGitUpstream((args) => this.git(args, worktreePath))
       if (upstream && !upstream.isConfiguredUpstream) {
-        // Why: legacy OrcaBotmux branches may still track origin/main while pushes
+        // Why: legacy Botmux branches may still track origin/main while pushes
         // target origin/<branch>. Pull the same effective branch the UI reports.
         await this.git(
           ['pull', ...effectiveArgs, upstream.remoteName, upstream.branchName],

@@ -1,7 +1,7 @@
 /**
  * End-to-end agent-status-over-SSH integration test.
  *
- * Wires OrcaBotmux's main-side SshChannelMultiplexer to the relay-side
+ * Wires Botmux's main-side SshChannelMultiplexer to the relay-side
  * RelayDispatcher through an in-memory pipe and starts a real
  * RelayAgentHookServer. POSTs a hook event to the relay's loopback HTTP
  * receiver and asserts the parsed payload arrives in `agentHookServer`'s
@@ -36,7 +36,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
   let mux: SshChannelMultiplexer
   let dispatcher: RelayDispatcher
   let hookServer: RelayAgentHookServer
-  let orcaServer: AgentHookServer
+  let botmuxServer: AgentHookServer
 
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 'agent-hook-e2e-'))
@@ -84,15 +84,15 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
 
     mux = new SshChannelMultiplexer(clientTransport)
 
-    orcaServer = new AgentHookServer()
-    // Why: OrcaBotmux-side never starts an HTTP server in this test — `ingestRemote`
+    botmuxServer = new AgentHookServer()
+    // Why: Botmux-side never starts an HTTP server in this test — `ingestRemote`
     // is the entry point we exercise. setListener registers the IPC fanout
     // sink we assert against. Server is otherwise inert.
     mux.onNotification((method, params) => {
       if (method === AGENT_HOOK_NOTIFICATION_METHOD) {
         // Why: `connectionId` is normally derived from the mux identity at
         // the call site. For the in-memory test we use a fixed string.
-        orcaServer.ingestRemote(
+        botmuxServer.ingestRemote(
           params as unknown as {
             paneKey: string
             tabId?: string
@@ -109,13 +109,13 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
     mux.dispose()
     dispatcher.dispose()
     hookServer.stop()
-    orcaServer.stop()
+    botmuxServer.stop()
     rmSync(tmpDir, { recursive: true, force: true })
   })
 
   it('forwards a Claude UserPromptSubmit POST through to ingestRemote', async () => {
     const events: { paneKey: string; payload: unknown; connectionId: string | null }[] = []
-    orcaServer.setListener((event) => {
+    botmuxServer.setListener((event) => {
       events.push({
         paneKey: event.paneKey,
         payload: event.payload,
@@ -128,7 +128,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-OrcaBotmux-Agent-Hook-Token': token
+        'X-Botmux-Agent-Hook-Token': token
       },
       body: JSON.stringify({
         paneKey: `tab-7:${LEAF_7}`,
@@ -164,7 +164,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-OrcaBotmux-Agent-Hook-Token': token
+          'X-Botmux-Agent-Hook-Token': token
         },
         body: JSON.stringify({
           paneKey: `tab-7:${LEAF_7}`,
@@ -197,10 +197,10 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
     ).resolves.toMatchObject({ status: 204 })
 
     const start = Date.now()
-    while (orcaServer.getStatusSnapshot()[0]?.state !== 'working' && Date.now() - start < 1500) {
+    while (botmuxServer.getStatusSnapshot()[0]?.state !== 'working' && Date.now() - start < 1500) {
       await new Promise((r) => setImmediate(r))
     }
-    expect(orcaServer.getStatusSnapshot()).toEqual([
+    expect(botmuxServer.getStatusSnapshot()).toEqual([
       expect.objectContaining({
         paneKey: `tab-7:${LEAF_7}`,
         connectionId: 'conn-test',
@@ -219,7 +219,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-OrcaBotmux-Agent-Hook-Token': token
+          'X-Botmux-Agent-Hook-Token': token
         },
         body: JSON.stringify({
           paneKey: `tab-7:${LEAF_7}`,
@@ -235,7 +235,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
       postClaude({
         hook_event_name: 'PreToolUse',
         tool_name: 'Bash',
-        tool_input: { command: 'rm -rf /tmp/orca-botmux-2824-permission-target' },
+        tool_input: { command: 'rm -rf /tmp/botmux-2824-permission-target' },
         tool_use_id: 'toolu-approved-remote-post'
       })
     ).resolves.toMatchObject({ status: 204 })
@@ -243,30 +243,30 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
       postClaude({
         hook_event_name: 'PermissionRequest',
         tool_name: 'Bash',
-        tool_input: { command: 'rm -rf /tmp/orca-botmux-2824-permission-target' }
+        tool_input: { command: 'rm -rf /tmp/botmux-2824-permission-target' }
       })
     ).resolves.toMatchObject({ status: 204 })
     await expect(
       postClaude({
         hook_event_name: 'PostToolUse',
         tool_name: 'Bash',
-        tool_input: { command: 'rm -rf /tmp/orca-botmux-2824-permission-target' },
+        tool_input: { command: 'rm -rf /tmp/botmux-2824-permission-target' },
         tool_use_id: 'toolu-approved-remote-post'
       })
     ).resolves.toMatchObject({ status: 204 })
 
     const start = Date.now()
-    while (orcaServer.getStatusSnapshot()[0]?.state !== 'working' && Date.now() - start < 1500) {
+    while (botmuxServer.getStatusSnapshot()[0]?.state !== 'working' && Date.now() - start < 1500) {
       await new Promise((r) => setImmediate(r))
     }
-    expect(orcaServer.getStatusSnapshot()).toEqual([
+    expect(botmuxServer.getStatusSnapshot()).toEqual([
       expect.objectContaining({
         paneKey: `tab-7:${LEAF_7}`,
         connectionId: 'conn-test',
         state: 'working',
         agentType: 'claude',
         toolName: 'Bash',
-        toolInput: 'rm -rf /tmp/orca-botmux-2824-permission-target'
+        toolInput: 'rm -rf /tmp/botmux-2824-permission-target'
       })
     ])
   })
@@ -277,7 +277,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
     // synchronously; if we set it AFTER the POST drains, the assertion below
     // would pass without the relay's replay actually crossing the wire.
     const events: { paneKey: string; payload: unknown }[] = []
-    orcaServer.setListener((event) => {
+    botmuxServer.setListener((event) => {
       events.push({ paneKey: event.paneKey, payload: event.payload })
     })
 
@@ -286,7 +286,7 @@ describe('Integration: relay hook server → mux → AgentHookServer.ingestRemot
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'X-OrcaBotmux-Agent-Hook-Token': token
+        'X-Botmux-Agent-Hook-Token': token
       },
       body: JSON.stringify({
         paneKey: `tab-9:${LEAF_9}`,

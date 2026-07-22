@@ -358,7 +358,7 @@ function makeFile(overrides: Partial<OpenFile> = {}): OpenFile {
   const id = overrides.id ?? 'file-1'
   return {
     id,
-    filePath: overrides.filePath ?? `/tmp/orca_botmux/${id}.md`,
+    filePath: overrides.filePath ?? `/tmp/botmux/${id}.md`,
     relativePath: overrides.relativePath ?? `${id}.md`,
     worktreeId: overrides.worktreeId ?? FLOATING_TERMINAL_WORKTREE_ID,
     language: overrides.language ?? 'markdown',
@@ -747,8 +747,8 @@ describe('FloatingTerminalPanel close behavior', () => {
     mocks.createTab.mockReturnValue(makeTab({ id: 'created-tab' }))
     mocks.createWebRuntimeSessionBrowserTab.mockResolvedValue(false)
     mocks.createWebRuntimeSessionTerminal.mockResolvedValue(false)
-    mocks.getFloatingMarkdownDirectory.mockResolvedValue('/tmp/orca_botmux/floating-notes')
-    mocks.getFloatingTerminalCwd.mockResolvedValue('/tmp/orca_botmux')
+    mocks.getFloatingMarkdownDirectory.mockResolvedValue('/tmp/botmux/floating-notes')
+    mocks.getFloatingTerminalCwd.mockResolvedValue('/tmp/botmux')
     mocks.getInstallStatus.mockResolvedValue({ state: 'installed', pathConfigured: true })
     mocks.isTerminalImeInputContextRefreshing.mockReturnValue(false)
     mocks.isWebRuntimeSessionActive.mockReturnValue(false)
@@ -1353,7 +1353,7 @@ describe('FloatingTerminalPanel close behavior', () => {
           canGoForward: false,
           loadError: null,
           sessionProfileId: 'profile-1',
-          sessionPartition: 'persist:orca-botmux-browser-session-profile-1',
+          sessionPartition: 'persist:botmux-browser-session-profile-1',
           createdAt: 1
         }
       ]
@@ -1385,7 +1385,7 @@ describe('FloatingTerminalPanel close behavior', () => {
       {
         title: 'Example',
         sessionProfileId: 'profile-1',
-        sessionPartition: 'persist:orca-botmux-browser-session-profile-1',
+        sessionPartition: 'persist:botmux-browser-session-profile-1',
         targetGroupId: 'floating-group',
         browserRuntimeEnvironmentId: null
       }
@@ -2236,7 +2236,7 @@ describe('FloatingTerminalPanel close behavior', () => {
   it('creates floating markdown files in local filesystem mode', async () => {
     setFloatingTabs([makeTab({ id: 'tab-1' })])
     vi.mocked(createUntitledMarkdownFileWithTemplateSelection).mockResolvedValue({
-      filePath: '/tmp/orca_botmux/floating-notes/untitled.md',
+      filePath: '/tmp/botmux/floating-notes/untitled.md',
       relativePath: 'untitled.md',
       worktreeId: FLOATING_TERMINAL_WORKTREE_ID,
       language: 'markdown',
@@ -2253,13 +2253,13 @@ describe('FloatingTerminalPanel close behavior', () => {
     await flushAsyncWork()
 
     expect(createUntitledMarkdownFileWithTemplateSelection).toHaveBeenCalledWith(
-      '/tmp/orca_botmux/floating-notes',
+      '/tmp/botmux/floating-notes',
       FLOATING_TERMINAL_WORKTREE_ID,
       undefined,
       { activeRuntimeEnvironmentId: null }
     )
     expect(mocks.openFile).toHaveBeenCalledWith(
-      expect.objectContaining({ filePath: '/tmp/orca_botmux/floating-notes/untitled.md' }),
+      expect.objectContaining({ filePath: '/tmp/botmux/floating-notes/untitled.md' }),
       expect.objectContaining({ suppressActiveRuntimeFallback: true })
     )
   })
@@ -2267,7 +2267,7 @@ describe('FloatingTerminalPanel close behavior', () => {
   it('opens existing markdown documents through the floating picker', async () => {
     setFloatingTabs([makeTab({ id: 'tab-1' })])
     mocks.pickFloatingMarkdownDocument.mockResolvedValue({
-      filePath: '/tmp/orca_botmux/notes.md',
+      filePath: '/tmp/botmux/notes.md',
       relativePath: 'notes.md',
       basename: 'notes.md',
       name: 'notes'
@@ -2281,7 +2281,7 @@ describe('FloatingTerminalPanel close behavior', () => {
     expect(mocks.pickFloatingMarkdownDocument).toHaveBeenCalledWith()
     expect(mocks.openFile).toHaveBeenCalledWith(
       expect.objectContaining({
-        filePath: '/tmp/orca_botmux/notes.md',
+        filePath: '/tmp/botmux/notes.md',
         relativePath: 'notes.md',
         runtimeEnvironmentId: null,
         worktreeId: FLOATING_TERMINAL_WORKTREE_ID

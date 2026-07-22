@@ -270,7 +270,7 @@ function isAiVaultSessionInWorkspacePath(workspacePath: string, sessionCwd: stri
     return false
   }
 
-  // WSL agent transcripts record Linux cwd values even when OrcaBotmux stores the
+  // WSL agent transcripts record Linux cwd values even when Botmux stores the
   // active worktree as a Windows UNC path.
   return isPathInsideOrEqual(workspaceWslPath.linuxPath, sessionCwd)
 }

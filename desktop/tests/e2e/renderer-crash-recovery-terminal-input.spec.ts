@@ -16,7 +16,7 @@
  */
 
 import type { ElectronApplication } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   discoverActivePtyId,
@@ -98,23 +98,23 @@ async function waitForRendererRecovery(electronApp: ElectronApplication): Promis
 
 test.describe('Renderer crash recovery keeps terminal input alive', () => {
   test('typing still reaches the PTY after forced renderer crash + auto-reload', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     test.setTimeout(300_000)
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
 
     // Baseline: both the DOM keyboard layer (Playwright-driven, only possible
     // pre-crash) and the PTY roundtrip must work before we crash anything,
     // otherwise a post-crash failure would be uninterpretable.
-    const baselinePtyId = await discoverActivePtyId(orcaBotmuxPage)
+    const baselinePtyId = await discoverActivePtyId(botmuxPage)
     expect(
-      await probeKeyboardType(orcaBotmuxPage, 'KB_BASELINE_OK'),
+      await probeKeyboardType(botmuxPage, 'KB_BASELINE_OK'),
       'baseline keyboard input must reach the PTY before any crash is forced'
     ).toBe(true)
 

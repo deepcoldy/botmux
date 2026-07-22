@@ -8,8 +8,8 @@ import {
   type MobileRelayPairingJournalMetadata
 } from './mobile-relay-pairing-journal'
 
-const JOURNAL_STORAGE_KEY = 'orca:mobile-relay:pairing-journal:v1'
-const JOURNAL_SECRET_KEY = 'orca.mobile-relay.pairing-journal.v1'
+const JOURNAL_STORAGE_KEY = 'botmux:mobile-relay:pairing-journal:v1'
+const JOURNAL_SECRET_KEY = 'botmux.mobile-relay.pairing-journal.v1'
 const KEYCHAIN_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY
 }
@@ -140,7 +140,7 @@ function parseSecrets(raw: string) {
 
 function requireNativeSecretStore(): void {
   if (Platform.OS === 'web') {
-    throw new Error('Orca Relay pairing requires a native secret store')
+    throw new Error('Botmux Relay pairing requires a native secret store')
   }
 }
 

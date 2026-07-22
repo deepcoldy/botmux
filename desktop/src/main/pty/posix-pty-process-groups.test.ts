@@ -18,7 +18,7 @@ describe('POSIX PTY process-group termination', () => {
     expect(getPosixPtyProcessGroups(TABLE, 100, 999)).toEqual([101, 103, 100])
   })
 
-  it('refuses an unbound root or a PTY shared with OrcaBotmux itself', () => {
+  it('refuses an unbound root or a PTY shared with Botmux itself', () => {
     expect(getPosixPtyProcessGroups(TABLE, 300, 999)).toBeNull()
     expect(getPosixPtyProcessGroups(TABLE, 100, 102)).toBeNull()
     expect(getPosixPtyProcessGroups(TABLE, 999, 998)).toBeNull()

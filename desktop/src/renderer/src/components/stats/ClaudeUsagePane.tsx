@@ -33,9 +33,9 @@ import { translate } from '@/i18n/i18n'
 const RANGE_OPTIONS: ClaudeUsageRange[] = ['7d', '30d', '90d', 'all']
 const SCOPE_OPTIONS: { value: ClaudeUsageScope; label: string }[] = [
   {
-    value: 'orca_botmux',
+    value: 'botmux',
     get label() {
-      return translate('auto.components.stats.ClaudeUsagePane.4f8368c272', 'OrcaBotmux worktrees only')
+      return translate('auto.components.stats.ClaudeUsagePane.4f8368c272', 'Botmux worktrees only')
     }
   },
   {

@@ -24,16 +24,16 @@ describe('resolveWindowsShellLaunchArgs', () => {
   let userDataPath: string
 
   beforeEach(() => {
-    previousUserDataPath = process.env.ORCA_USER_DATA_PATH
+    previousUserDataPath = process.env.BOTMUX_USER_DATA_PATH
     userDataPath = mkdtempSync(join(tmpdir(), 'windows-shell-args-test-'))
-    process.env.ORCA_USER_DATA_PATH = userDataPath
+    process.env.BOTMUX_USER_DATA_PATH = userDataPath
   })
 
   afterEach(() => {
     if (previousUserDataPath === undefined) {
-      delete process.env.ORCA_USER_DATA_PATH
+      delete process.env.BOTMUX_USER_DATA_PATH
     } else {
-      process.env.ORCA_USER_DATA_PATH = previousUserDataPath
+      process.env.BOTMUX_USER_DATA_PATH = previousUserDataPath
     }
     rmSync(userDataPath, { recursive: true, force: true })
   })
@@ -100,17 +100,17 @@ describe('resolveWindowsShellLaunchArgs', () => {
     const command = Buffer.from(result.shellArgs[3] ?? '', 'base64').toString('utf16le')
     const outputEncodingIndex = command.indexOf('[Console]::OutputEncoding')
     const opencodeRestoreIndex = command.indexOf(
-      '$env:OPENCODE_CONFIG_DIR = $env:ORCA_OPENCODE_CONFIG_DIR'
+      '$env:OPENCODE_CONFIG_DIR = $env:BOTMUX_OPENCODE_CONFIG_DIR'
     )
     const ompWrapperIndex = command.indexOf('function Global:omp')
-    const ompExtensionIndex = command.indexOf('--extension $env:ORCA_OMP_STATUS_EXTENSION')
-    const codexRestoreIndex = command.indexOf('$env:CODEX_HOME = $env:ORCA_CODEX_HOME')
+    const ompExtensionIndex = command.indexOf('--extension $env:BOTMUX_OMP_STATUS_EXTENSION')
+    const codexRestoreIndex = command.indexOf('$env:CODEX_HOME = $env:BOTMUX_CODEX_HOME')
     const promptIndex = command.indexOf('function Global:prompt')
 
     expect(command).not.toContain('$PROFILE')
-    expect(command).not.toContain('ORCA_PI_CODING_AGENT_DIR')
-    expect(command).not.toContain('ORCA_OMP_CODING_AGENT_DIR')
-    expect(command).not.toContain('$env:PI_CODING_AGENT_DIR = $env:ORCA_OMP_SOURCE_AGENT_DIR')
+    expect(command).not.toContain('BOTMUX_PI_CODING_AGENT_DIR')
+    expect(command).not.toContain('BOTMUX_OMP_CODING_AGENT_DIR')
+    expect(command).not.toContain('$env:PI_CODING_AGENT_DIR = $env:BOTMUX_OMP_SOURCE_AGENT_DIR')
     expect(outputEncodingIndex).toBeGreaterThanOrEqual(0)
     expect(opencodeRestoreIndex).toBeGreaterThan(outputEncodingIndex)
     expect(ompWrapperIndex).toBeGreaterThan(opencodeRestoreIndex)
@@ -153,7 +153,7 @@ describe('resolveWindowsShellLaunchArgs', () => {
 
   it('preserves complex PowerShell startup command text through EncodedCommand', () => {
     const startupCommand =
-      '& "C:\\Program Files\\OrcaBotmux CLI\\orca_botmux.exe" "--label" "quoted value"; $env:ORCA_VALUE = "nested"'
+      '& "C:\\Program Files\\Botmux CLI\\botmux.exe" "--label" "quoted value"; $env:BOTMUX_VALUE = "nested"'
     const result = resolveWindowsShellLaunchArgs(
       'powershell.exe',
       'C:\\Users\\alice',
@@ -174,7 +174,7 @@ describe('resolveWindowsShellLaunchArgs', () => {
       'C:\\Users\\alice',
       'C:\\Users\\alice',
       undefined,
-      `orca_botmux ${'x'.repeat(7000)}`
+      `botmux ${'x'.repeat(7000)}`
     )
 
     expect(result.startupCommandDeliveredInShellArgs).toBeUndefined()
@@ -261,12 +261,12 @@ describe('resolveWindowsShellLaunchArgs', () => {
     expect(existsSync(join(userDataPath, 'shell-ready', 'zsh', '.zshenv'))).toBe(true)
 
     // Why: the point of materializing wrappers for WSL is that a typed `omp`
-    // picks up OrcaBotmux's status extension; pin that shim end to end.
+    // picks up Botmux's status extension; pin that shim end to end.
     const bashRcfile = readFileSync(join(userDataPath, 'shell-ready', 'bash', 'rcfile'), 'utf8')
     const zshLogin = readFileSync(join(userDataPath, 'shell-ready', 'zsh', '.zlogin'), 'utf8')
     for (const wrapperFile of [bashRcfile, zshLogin]) {
-      expect(wrapperFile).toContain('command omp --extension "${ORCA_OMP_STATUS_EXTENSION}" "$@"')
-      expect(wrapperFile).toContain('omp() { __orca_omp "$@"; }')
+      expect(wrapperFile).toContain('command omp --extension "${BOTMUX_OMP_STATUS_EXTENSION}" "$@"')
+      expect(wrapperFile).toContain('omp() { __botmux_omp "$@"; }')
     }
   })
 
@@ -302,7 +302,7 @@ describe('resolveWindowsShellLaunchArgs', () => {
     // The injected sh cmd must not break out of the surrounding single quotes
     // when the path contains a ' character.
     expect(result.shellArgs[3]).toContain("cd '/mnt/c/weird'\\''path'")
-    expect(result.shellArgs[3]).toContain('exec "\\$_orca_wsl_shell" -l')
+    expect(result.shellArgs[3]).toContain('exec "\\$_botmux_wsl_shell" -l')
   })
 
   it('falls back to /mnt/c when cwd is not a drive-letter path', () => {
@@ -379,7 +379,7 @@ describe('resolveWindowsShellLaunchArgs', () => {
 // never be re-parsed as an open string.
 describe('issue #7236: PowerShell setup-runner command delivery', () => {
   // git rev-parse hands back a forward-slash Windows-absolute path for the runner.
-  const runnerPath = 'C:/Users/alice/repo/.git/orca_botmux/setup-runner.cmd'
+  const runnerPath = 'C:/Users/alice/repo/.git/botmux/setup-runner.cmd'
 
   it('wraps the setup runner in balanced double quotes', () => {
     const { command } = resolveSetupRunnerCommand(runnerPath, 'windows')

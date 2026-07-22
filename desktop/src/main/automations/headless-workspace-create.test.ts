@@ -4,12 +4,12 @@ import type { Automation } from '../../shared/automations-types'
 import type { Repo } from '../../shared/types'
 import { buildHeadlessAutomationWorktreeCreateArgs } from './headless-workspace-create'
 
-const repoPath = path.join('tmp', 'orca_botmux')
+const repoPath = path.join('tmp', 'botmux')
 
 const repo: Repo = {
   id: 'repo-1',
   path: repoPath,
-  displayName: 'orca_botmux',
+  displayName: 'botmux',
   badgeColor: '#000',
   addedAt: 1,
   kind: 'git',

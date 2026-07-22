@@ -92,7 +92,7 @@ describe('MacOSNativeProviderClient', () => {
     providers.length = 0
     mkdtempSyncMock.mockImplementation((prefix: string) => `${prefix}${sockets.length}`)
     resolveMacOSComputerUseExecutablePathMock.mockReturnValue(
-      '/Applications/OrcaBotmux Computer Use.app/Contents/MacOS/orca-botmux-computer-use-macos'
+      '/Applications/Botmux Computer Use.app/Contents/MacOS/botmux-computer-use-macos'
     )
     spawnMock.mockImplementation(() => {
       const provider = new FakeProvider()
@@ -424,7 +424,7 @@ describe('MacOSNativeProviderClient', () => {
     await expect(client.capabilities()).rejects.toThrow('socket did not open')
 
     expect(providerKill).toHaveBeenCalledWith('SIGTERM')
-    expect(rmSyncMock).toHaveBeenCalledWith(expect.stringContaining('orca-botmux-computer-use-'), {
+    expect(rmSyncMock).toHaveBeenCalledWith(expect.stringContaining('botmux-computer-use-'), {
       recursive: true,
       force: true
     })
@@ -474,7 +474,7 @@ describe('MacOSNativeProviderClient', () => {
 function macOSProviderCapabilities(actions: Partial<Record<string, boolean>> = {}) {
   return {
     platform: 'darwin',
-    provider: 'orca-botmux-computer-use-macos',
+    provider: 'botmux-computer-use-macos',
     providerVersion: '1.0.0',
     protocolVersion: 1,
     supports: {

@@ -28,10 +28,10 @@ const LINEAR_ITEM = {
   }
 }
 const PRODUCT_WORKFLOW_PHRASES = [
-  'orca_botmux linear',
+  'botmux linear',
   'meta.partial',
   'install',
-  'enable it from OrcaBotmux Settings',
+  'enable it from Botmux Settings',
   'Before planning or editing',
   'Full Linear context was not loaded',
   'linear-tickets completion flow',

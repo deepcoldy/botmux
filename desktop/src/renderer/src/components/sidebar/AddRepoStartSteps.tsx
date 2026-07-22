@@ -160,7 +160,7 @@ export function AddRepoLocalStartStep({
           <DialogDescription>
             {translate(
               'auto.components.sidebar.AddRepoStartSteps.acf895cb42',
-              'Add a project to get started with OrcaBotmux.'
+              'Add a project to get started with Botmux.'
             )}
           </DialogDescription>
         ) : null}

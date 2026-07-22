@@ -14,7 +14,7 @@ function buildAtomFeed(tags: string[]): string {
   const entries = tags
     .map(
       (tag) =>
-        `<entry><link rel="alternate" type="text/html" href="https://github.com/stablyai/orca_botmux/releases/tag/${tag}"/><title>${tag}</title></entry>`
+        `<entry><link rel="alternate" type="text/html" href="https://github.com/stablyai/botmux/releases/tag/${tag}"/><title>${tag}</title></entry>`
     )
     .join('')
   return `<?xml version="1.0" encoding="UTF-8"?><feed>${entries}</feed>`
@@ -25,9 +25,9 @@ function buildManifest(tag: string): string {
   return [
     `version: ${version}`,
     'files:',
-    `  - url: OrcaBotmux-${version}-arm64-mac.zip`,
+    `  - url: Botmux-${version}-arm64-mac.zip`,
     '    sha512: test',
-    `path: OrcaBotmux-${version}-arm64-mac.zip`
+    `path: Botmux-${version}-arm64-mac.zip`
   ].join('\n')
 }
 
@@ -39,7 +39,7 @@ function respondWithAtom(
   const missingManifests = new Set(missingManifestTags)
   const missingAssets = new Set(missingAssetTags)
   netFetchMock.mockImplementation((url: string, init?: { method?: string }) => {
-    if (url === 'https://github.com/stablyai/orca_botmux/releases.atom') {
+    if (url === 'https://github.com/stablyai/botmux/releases.atom') {
       return Promise.resolve({
         ok: true,
         text: () => Promise.resolve(buildAtomFeed(tags))
@@ -114,7 +114,7 @@ describe('fetchNewerReleaseTag', () => {
       const assetUrls: string[] = []
 
       netFetchMock.mockImplementation((url: string, init?: { method?: string }) => {
-        if (url === 'https://github.com/stablyai/orca_botmux/releases.atom') {
+        if (url === 'https://github.com/stablyai/botmux/releases.atom') {
           return Promise.resolve({
             ok: true,
             text: () => Promise.resolve(buildAtomFeed(['v1.4.1']))
@@ -142,10 +142,10 @@ describe('fetchNewerReleaseTag', () => {
 
       expect(await fetchNewerReleaseTag('1.4.0')).toBe('v1.4.1')
       expect(manifestUrls).toEqual([
-        `https://github.com/stablyai/orca_botmux/releases/download/v1.4.1/${manifestName}`
+        `https://github.com/stablyai/botmux/releases/download/v1.4.1/${manifestName}`
       ])
       expect(assetUrls).toEqual([
-        'https://github.com/stablyai/orca_botmux/releases/download/v1.4.1/OrcaBotmux-1.4.1-arm64-mac.zip'
+        'https://github.com/stablyai/botmux/releases/download/v1.4.1/Botmux-1.4.1-arm64-mac.zip'
       ])
     }
   )
@@ -337,7 +337,7 @@ describe('fetchNewerReleaseTag', () => {
     const manifestResolvers: (() => void)[] = []
 
     netFetchMock.mockImplementation((url: string) => {
-      if (url === 'https://github.com/stablyai/orca_botmux/releases.atom') {
+      if (url === 'https://github.com/stablyai/botmux/releases.atom') {
         return Promise.resolve({
           ok: true,
           text: () => Promise.resolve(buildAtomFeed(feedTags))

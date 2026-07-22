@@ -263,7 +263,7 @@ describe('large git response vs pty.data echo head-of-line blocking', () => {
       harness.startAutoDeliver()
       const streamed = (await diffPromise) as Record<string, unknown>
       expect(typeof streamed).toBe('object')
-      expect(streamed).not.toHaveProperty('__orcaGitResponseStream')
+      expect(streamed).not.toHaveProperty('__botmuxGitResponseStream')
     } finally {
       harness.dispose()
     }

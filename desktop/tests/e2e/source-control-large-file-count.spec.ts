@@ -13,12 +13,12 @@
  *   - heap growth      JS heap across repeated poll cycles (leak signal)
  *
  * Run a single scenario at a custom scale:
- *   ORCA_LARGE_FILE_COUNT=9500 npx playwright test \
+ *   BOTMUX_LARGE_FILE_COUNT=9500 npx playwright test \
  *     tests/e2e/source-control-large-file-count.spec.ts \
  *     --config tests/playwright.config.ts --project electron-headless
  */
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 import { createLargeFileCountRepo, removeLargeFileCountRepo } from './large-file-count-fixtures'
 import { DEFAULT_GIT_STATUS_LIMIT } from '../../src/shared/git-status-limit'
@@ -50,8 +50,8 @@ type LoadMeasurement = {
   cycleMaxLagMs: number[]
 }
 
-async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promise<string> {
-  const repoId = await orcaBotmuxPage.evaluate(async (pathToRepo: string) => {
+async function addAndActivateRepo(botmuxPage: Page, repoPath: string): Promise<string> {
+  const repoId = await botmuxPage.evaluate(async (pathToRepo: string) => {
     const store = window.__store
     if (!store) {
       throw new Error('window.__store is not available')
@@ -68,7 +68,7 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
   await expect
     .poll(
       () =>
-        orcaBotmuxPage.evaluate(async (targetRepoId: string) => {
+        botmuxPage.evaluate(async (targetRepoId: string) => {
           const store = window.__store
           if (!store) {
             return 0
@@ -80,7 +80,7 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
     )
     .toBeGreaterThan(0)
 
-  const worktreeId = await orcaBotmuxPage.evaluate(
+  const worktreeId = await botmuxPage.evaluate(
     ({ targetRepoId, pathToRepo }) => {
       const store = window.__store
       if (!store) {
@@ -105,24 +105,24 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
   // assert the user-visible panel before timing its render. Clicking the
   // already-active activity button races the first cold status scan and tests
   // Playwright's two-frame actionability window instead of panel readiness.
-  const sourceControlButton = orcaBotmuxPage.getByRole('button', { name: /^Source Control/ })
+  const sourceControlButton = botmuxPage.getByRole('button', { name: /^Source Control/ })
   await expect(sourceControlButton).toBeVisible()
   await expect
-    .poll(() => orcaBotmuxPage.evaluate(() => window.__store?.getState().rightSidebarTab))
+    .poll(() => botmuxPage.evaluate(() => window.__store?.getState().rightSidebarTab))
     .toBe('source-control')
-  await expect(orcaBotmuxPage.getByRole('button', { name: 'Filter files by name' })).toBeVisible()
+  await expect(botmuxPage.getByRole('button', { name: 'Filter files by name' })).toBeVisible()
 
   return worktreeId
 }
 
 async function unregisterLargeFileCountRepos(
-  orcaBotmuxPage: Page,
+  botmuxPage: Page,
   repoPaths: readonly string[]
 ): Promise<void> {
   // Why: remove disposable projects through the product so their terminals
   // and watcher subscriptions begin shutting down before Electron teardown.
   for (const repoPath of repoPaths) {
-    await orcaBotmuxPage.evaluate(async (pathToRepo) => {
+    await botmuxPage.evaluate(async (pathToRepo) => {
       const store = window.__store
       const repo = store?.getState().repos.find((entry) => entry.path === pathToRepo)
       if (repo) {
@@ -139,10 +139,10 @@ async function unregisterLargeFileCountRepos(
  * dedupes.
  */
 async function measureSourceControlLoad(
-  orcaBotmuxPage: Page,
+  botmuxPage: Page,
   args: { worktreeId: string; repoPath: string; expectedRows: number; pollCycles: number }
 ): Promise<LoadMeasurement> {
-  return await orcaBotmuxPage.evaluate(async ({ worktreeId, repoPath, expectedRows, pollCycles }) => {
+  return await botmuxPage.evaluate(async ({ worktreeId, repoPath, expectedRows, pollCycles }) => {
     const store = window.__store
     if (!store) {
       throw new Error('window.__store is not available')
@@ -260,16 +260,16 @@ test.describe('Source Control large file count (#8013)', () => {
   test.use({ seedTestRepo: false })
 
   test('thousands of untracked files under the status cap stay responsive', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp,
     registerPostElectronShutdownCleanup
   }) => {
     test.setTimeout(600_000)
-    const untrackedFiles = Number(process.env.ORCA_LARGE_FILE_COUNT ?? '9500')
-    // Why: ORCA_LARGE_FILE_BYTES gives untracked files realistic sizes so the
+    const untrackedFiles = Number(process.env.BOTMUX_LARGE_FILE_COUNT ?? '9500')
+    // Why: BOTMUX_LARGE_FILE_BYTES gives untracked files realistic sizes so the
     // per-poll line-stat reads (cache-capped at 2,048 entries) become visible
     // in rescanMs instead of hiding behind ~30-byte fixture files.
-    const untrackedFileBytes = Number(process.env.ORCA_LARGE_FILE_BYTES ?? '0')
+    const untrackedFileBytes = Number(process.env.BOTMUX_LARGE_FILE_BYTES ?? '0')
     const fixture = createLargeFileCountRepo({
       trackedFiles: 100,
       untrackedFiles,
@@ -277,10 +277,10 @@ test.describe('Source Control large file count (#8013)', () => {
     })
     registerPostElectronShutdownCleanup(() => removeLargeFileCountRepo(fixture.repoPath))
     try {
-      await waitForSessionReady(orcaBotmuxPage)
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
+      await waitForSessionReady(botmuxPage)
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
       const workingSetBeforeMb = await readRendererWorkingSetMb(electronApp)
-      const measurement = await measureSourceControlLoad(orcaBotmuxPage, {
+      const measurement = await measureSourceControlLoad(botmuxPage, {
         worktreeId,
         repoPath: fixture.repoPath,
         expectedRows: untrackedFiles,
@@ -307,24 +307,24 @@ test.describe('Source Control large file count (#8013)', () => {
         )
       }
     } finally {
-      await unregisterLargeFileCountRepos(orcaBotmuxPage, [fixture.repoPath])
+      await unregisterLargeFileCountRepos(botmuxPage, [fixture.repoPath])
     }
   })
 
   test('thousands of modified tracked files under the status cap stay responsive', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp,
     registerPostElectronShutdownCleanup
   }) => {
     test.setTimeout(600_000)
-    const modifiedFiles = Number(process.env.ORCA_LARGE_FILE_COUNT ?? '5000')
+    const modifiedFiles = Number(process.env.BOTMUX_LARGE_FILE_COUNT ?? '5000')
     const fixture = createLargeFileCountRepo({ trackedFiles: modifiedFiles, modifiedFiles })
     registerPostElectronShutdownCleanup(() => removeLargeFileCountRepo(fixture.repoPath))
     try {
-      await waitForSessionReady(orcaBotmuxPage)
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
+      await waitForSessionReady(botmuxPage)
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
       const workingSetBeforeMb = await readRendererWorkingSetMb(electronApp)
-      const measurement = await measureSourceControlLoad(orcaBotmuxPage, {
+      const measurement = await measureSourceControlLoad(botmuxPage, {
         worktreeId,
         repoPath: fixture.repoPath,
         expectedRows: modifiedFiles,
@@ -342,12 +342,12 @@ test.describe('Source Control large file count (#8013)', () => {
       expect(measurement.renderedRows).toBeLessThan(MAX_MOUNTED_ROWS)
       expect(measurement.maxLagMs).toBeLessThan(MAX_EVENT_LOOP_LAG_MS)
     } finally {
-      await unregisterLargeFileCountRepos(orcaBotmuxPage, [fixture.repoPath])
+      await unregisterLargeFileCountRepos(botmuxPage, [fixture.repoPath])
     }
   })
 
   test('a change set over the status cap degrades to the too-many-changes state', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp,
     registerPostElectronShutdownCleanup
   }) => {
@@ -356,10 +356,10 @@ test.describe('Source Control large file count (#8013)', () => {
     const fixture = createLargeFileCountRepo({ trackedFiles: 100, untrackedFiles })
     registerPostElectronShutdownCleanup(() => removeLargeFileCountRepo(fixture.repoPath))
     try {
-      await waitForSessionReady(orcaBotmuxPage)
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
+      await waitForSessionReady(botmuxPage)
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
       const workingSetBeforeMb = await readRendererWorkingSetMb(electronApp)
-      const measurement = await measureSourceControlLoad(orcaBotmuxPage, {
+      const measurement = await measureSourceControlLoad(botmuxPage, {
         worktreeId,
         repoPath: fixture.repoPath,
         // The capped payload still carries DEFAULT_GIT_STATUS_LIMIT entries;
@@ -380,18 +380,18 @@ test.describe('Source Control large file count (#8013)', () => {
 
       // Why: didHitLimit must park the worktree in the huge-status state so
       // background polling stops re-running tens-of-seconds git scans.
-      const hugeState = await orcaBotmuxPage.evaluate(
+      const hugeState = await botmuxPage.evaluate(
         (wId) => window.__store?.getState().gitStatusHugeByWorktree?.[wId] ?? null,
         worktreeId
       )
       expect(hugeState).not.toBeNull()
     } finally {
-      await unregisterLargeFileCountRepos(orcaBotmuxPage, [fixture.repoPath])
+      await unregisterLargeFileCountRepos(botmuxPage, [fixture.repoPath])
     }
   })
 
   test('untracked line-stat cache stays effective above 2,048 files', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     registerPostElectronShutdownCleanup
   }) => {
     test.setTimeout(600_000)
@@ -418,11 +418,11 @@ test.describe('Source Control large file count (#8013)', () => {
       })
       const largeRepoPath = largeRepo.repoPath
       registerPostElectronShutdownCleanup(() => removeLargeFileCountRepo(largeRepoPath))
-      await waitForSessionReady(orcaBotmuxPage)
+      await waitForSessionReady(botmuxPage)
 
       const warmRescanPerFileMs = async (repoPath: string, files: number): Promise<number> => {
-        const worktreeId = await addAndActivateRepo(orcaBotmuxPage, repoPath)
-        const measurement = await measureSourceControlLoad(orcaBotmuxPage, {
+        const worktreeId = await addAndActivateRepo(botmuxPage, repoPath)
+        const measurement = await measureSourceControlLoad(botmuxPage, {
           worktreeId,
           repoPath,
           expectedRows: files,
@@ -438,7 +438,7 @@ test.describe('Source Control large file count (#8013)', () => {
       )
       expect(largePerFileMs).toBeLessThan(smallPerFileMs * 2)
     } finally {
-      await unregisterLargeFileCountRepos(orcaBotmuxPage, [
+      await unregisterLargeFileCountRepos(botmuxPage, [
         smallRepo.repoPath,
         ...(largeRepo ? [largeRepo.repoPath] : [])
       ])
@@ -446,19 +446,19 @@ test.describe('Source Control large file count (#8013)', () => {
   })
 
   test('a large clean repo (tracked files only) loads instantly', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp,
     registerPostElectronShutdownCleanup
   }) => {
     test.setTimeout(600_000)
-    const trackedFiles = Number(process.env.ORCA_LARGE_FILE_COUNT ?? '15000')
+    const trackedFiles = Number(process.env.BOTMUX_LARGE_FILE_COUNT ?? '15000')
     const fixture = createLargeFileCountRepo({ trackedFiles })
     registerPostElectronShutdownCleanup(() => removeLargeFileCountRepo(fixture.repoPath))
     try {
-      await waitForSessionReady(orcaBotmuxPage)
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
+      await waitForSessionReady(botmuxPage)
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
       const workingSetBeforeMb = await readRendererWorkingSetMb(electronApp)
-      const measurement = await measureSourceControlLoad(orcaBotmuxPage, {
+      const measurement = await measureSourceControlLoad(botmuxPage, {
         worktreeId,
         repoPath: fixture.repoPath,
         expectedRows: 0,
@@ -473,7 +473,7 @@ test.describe('Source Control large file count (#8013)', () => {
       expect(measurement.entryCount).toBe(0)
       expect(measurement.maxLagMs).toBeLessThan(MAX_EVENT_LOOP_LAG_MS)
     } finally {
-      await unregisterLargeFileCountRepos(orcaBotmuxPage, [fixture.repoPath])
+      await unregisterLargeFileCountRepos(botmuxPage, [fixture.repoPath])
     }
   })
 })

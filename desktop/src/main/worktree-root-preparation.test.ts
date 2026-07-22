@@ -34,7 +34,7 @@ describe('prepareLocalWorktreeRootForRepo', () => {
     mkdirMock.mockReset().mockResolvedValue(undefined)
     authorizeExternalPathMock.mockReset()
     store.getSettings.mockReset().mockReturnValue({
-      workspaceDir: '/Users/alice/orca_botmux/workspaces',
+      workspaceDir: '/Users/alice/botmux/workspaces',
       nestWorkspaces: false
     })
   })
@@ -42,7 +42,7 @@ describe('prepareLocalWorktreeRootForRepo', () => {
   it('creates the effective worktree root for local git repos', async () => {
     await prepareLocalWorktreeRootForRepo(store as never, repo)
 
-    expect(mkdirMock).toHaveBeenCalledWith('/Users/alice/orca_botmux/workspaces', { recursive: true })
+    expect(mkdirMock).toHaveBeenCalledWith('/Users/alice/botmux/workspaces', { recursive: true })
   })
 
   it('uses repo-specific worktree base paths', async () => {

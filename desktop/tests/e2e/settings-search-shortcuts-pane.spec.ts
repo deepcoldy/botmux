@@ -1,11 +1,11 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 
 test.describe('Settings sidebar search on the Shortcuts pane', () => {
-  test('pane-title-only query keeps rows visible and local search usable', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test('pane-title-only query keeps rows visible and local search usable', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
 
-    await orcaBotmuxPage.evaluate(async () => {
+    await botmuxPage.evaluate(async () => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -16,28 +16,28 @@ test.describe('Settings sidebar search on the Shortcuts pane', () => {
       store.getState().openSettingsPage()
     })
 
-    const searchInput = orcaBotmuxPage.getByPlaceholder('Search settings')
+    const searchInput = botmuxPage.getByPlaceholder('Search settings')
     await expect(searchInput).toBeVisible()
     await searchInput.fill('shortcuts')
 
     // The query matches the pane title, so the Shortcuts pane auto-activates.
-    await expect(orcaBotmuxPage.getByRole('heading', { name: 'Shortcuts', exact: true })).toBeVisible()
+    await expect(botmuxPage.getByRole('heading', { name: 'Shortcuts', exact: true })).toBeVisible()
 
     // Regression: a pane-title-only query used to blank the whole list (0/112).
-    await expect(orcaBotmuxPage.getByText('Go to File', { exact: true })).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('No shortcuts match those filters.')).not.toBeVisible()
+    await expect(botmuxPage.getByText('Go to File', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('No shortcuts match those filters.')).not.toBeVisible()
 
     // Regression: the pane's own search was dead while the global query was
     // active, because it intersected with an already-empty base list.
-    const localSearch = orcaBotmuxPage.getByPlaceholder('Search command or keys')
+    const localSearch = botmuxPage.getByPlaceholder('Search command or keys')
     await localSearch.fill('go to')
-    await expect(orcaBotmuxPage.getByText('Go to File', { exact: true })).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Force Reload', { exact: true })).not.toBeVisible()
+    await expect(botmuxPage.getByText('Go to File', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Force Reload', { exact: true })).not.toBeVisible()
 
     // A row-matching global query still narrows the list as before.
     await localSearch.clear()
     await searchInput.fill('worktree')
-    await expect(orcaBotmuxPage.getByText('Create worktree', { exact: true })).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Go to File', { exact: true })).not.toBeVisible()
+    await expect(botmuxPage.getByText('Create worktree', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Go to File', { exact: true })).not.toBeVisible()
   })
 })

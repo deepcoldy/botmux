@@ -122,12 +122,12 @@ describe('wsl path helpers', () => {
   })
 
   it('converts Windows drive paths to /mnt paths for WSL commands', () => {
-    expect(toLinuxPath('C:\\Users\\jinwo\\git\\orca_botmux')).toBe('/mnt/c/Users/jinwo/git/orca_botmux')
+    expect(toLinuxPath('C:\\Users\\jinwo\\git\\botmux')).toBe('/mnt/c/Users/jinwo/git/botmux')
   })
 
   it('converts /mnt drive paths back to native Windows form', () => {
-    expect(toWindowsWslPath('/mnt/c/Users/jinwo/git/orca_botmux', 'Ubuntu')).toBe(
-      'C:\\Users\\jinwo\\git\\orca_botmux'
+    expect(toWindowsWslPath('/mnt/c/Users/jinwo/git/botmux', 'Ubuntu')).toBe(
+      'C:\\Users\\jinwo\\git\\botmux'
     )
   })
 })

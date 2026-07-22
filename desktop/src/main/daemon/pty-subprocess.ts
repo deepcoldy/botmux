@@ -40,7 +40,7 @@ import {
 } from '../../shared/git-credential-prompt-env'
 import { TERMINAL_GIT_CREDENTIAL_GUARD_POLICY_ENV } from '../../shared/terminal-git-credential-guard'
 import { resolveWslSessionContext } from './wsl-session-context'
-import { addOrcaWslInteropEnv } from '../pty/wsl-orca-botmux-env'
+import { addBotmuxWslInteropEnv } from '../pty/wsl-botmux-env'
 import {
   POWERLEVEL10K_WIZARD_DISABLE_ENV,
   seedPowerlevel10kWizardEnv
@@ -62,15 +62,15 @@ import { isShellProcess } from '../../shared/shell-process-detection'
 import { parsePtySessionId } from './pty-session-id'
 import { getAgentForegroundContextPaths } from '../providers/agent-foreground-context-paths'
 import { assertSafeAgentStartupCwd, resolveSafePtyDefaultCwd } from '../providers/pty-default-cwd'
-import { ORCA_HERMES_STARTUP_QUERY_ENV } from '../../shared/hermes-startup-query'
+import { BOTMUX_HERMES_STARTUP_QUERY_ENV } from '../../shared/hermes-startup-query'
 import type { TuiAgent } from '../../shared/types'
 import { forceKillPosixPtyProcessGroups } from '../pty/posix-pty-process-groups'
 
 const PANE_IDENTITY_ENV_KEYS = [
-  'ORCA_PANE_KEY',
-  'ORCA_TAB_ID',
-  'ORCA_WORKTREE_ID',
-  'ORCA_AGENT_LAUNCH_TOKEN'
+  'BOTMUX_PANE_KEY',
+  'BOTMUX_TAB_ID',
+  'BOTMUX_WORKTREE_ID',
+  'BOTMUX_AGENT_LAUNCH_TOKEN'
 ] as const
 const FOREGROUND_AGENT_CACHE_TTL_MS = 1000
 const SHELL_FOREGROUND_REFRESH_RETRY_MS = 5_000
@@ -151,7 +151,7 @@ function promoteAgentTeamsShimPath(
   env: Record<string, string>,
   requestedPath: string | undefined
 ): void {
-  if (!env.ORCA_AGENT_TEAMS_TEAM_ID || !requestedPath) {
+  if (!env.BOTMUX_AGENT_TEAMS_TEAM_ID || !requestedPath) {
     return
   }
   const shimDir = requestedPath.split(delimiter)[0]
@@ -169,11 +169,11 @@ function removeInheritedDevAgentHookEndpoint(
   env: Record<string, string>,
   explicitEnv: Record<string, string> | undefined
 ): void {
-  if (explicitEnv?.ORCA_AGENT_HOOK_ENV === 'development' && !explicitEnv.ORCA_AGENT_HOOK_ENDPOINT) {
+  if (explicitEnv?.BOTMUX_AGENT_HOOK_ENV === 'development' && !explicitEnv.BOTMUX_AGENT_HOOK_ENDPOINT) {
     // Why: the daemon inherits the app process env before per-PTY env is
     // merged. Strip only stale parent endpoints; a fresh explicit endpoint is
     // needed by hooks whose runners scrub token-like env vars before exec.
-    delete env.ORCA_AGENT_HOOK_ENDPOINT
+    delete env.BOTMUX_AGENT_HOOK_ENDPOINT
   }
 }
 
@@ -194,7 +194,7 @@ function formatMissingDaemonPathError(kind: 'helper' | 'cwd', path: string): Dae
   const step = kind === 'helper' ? 'posix_spawn' : 'daemon_cwd'
   return new DaemonProtocolError(
     `Daemon's ${kind === 'helper' ? 'node-pty install' : 'working directory'} is gone ` +
-      `(worktree deleted?). Restart OrcaBotmux. node-pty: ${step} failed: ENOENT ` +
+      `(worktree deleted?). Restart Botmux. node-pty: ${step} failed: ENOENT ` +
       `(errno 2, No such file or directory) - ${detailName}='${path}'`
   )
 }
@@ -217,7 +217,7 @@ function isExistingDirectory(path: string | undefined): path is string {
  * Moves the daemon process to a stable cwd after its original cwd disappears.
  */
 function repairDaemonCwd(): string | null {
-  const candidates = [process.env.ORCA_USER_DATA_PATH]
+  const candidates = [process.env.BOTMUX_USER_DATA_PATH]
   try {
     candidates.push(getDefaultCwd())
   } catch {
@@ -355,8 +355,8 @@ function formatPtySpawnError(err: unknown, shellPath: string, spawnCwd: string):
  * Runs one short native PTY spawn probe (spawn `/bin/sh -c 'exit 0'`).
  */
 function runSinglePtySpawnHealthProbe(): Promise<void> {
-  const cwd = isExistingDirectory(process.env.ORCA_USER_DATA_PATH)
-    ? process.env.ORCA_USER_DATA_PATH
+  const cwd = isExistingDirectory(process.env.BOTMUX_USER_DATA_PATH)
+    ? process.env.BOTMUX_USER_DATA_PATH
     : getDefaultCwd()
 
   let proc: pty.IPty
@@ -560,16 +560,16 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
     ...mergeGitConfigEnvProtocol(process.env, opts.env),
     TERM: 'xterm-256color',
     COLORTERM: 'truecolor',
-    TERM_PROGRAM: 'orca_botmux',
+    TERM_PROGRAM: 'botmux',
     // Why: TUIs feature-gate on TERM_PROGRAM_VERSION. The daemon is forked
-    // by main (daemon-init.ts:93) with the parent's env, so ORCA_APP_VERSION
+    // by main (daemon-init.ts:93) with the parent's env, so BOTMUX_APP_VERSION
     // — set in src/main/index.ts from app.getVersion() — is inherited here.
-    TERM_PROGRAM_VERSION: process.env.ORCA_APP_VERSION ?? '0.0.0-dev',
+    TERM_PROGRAM_VERSION: process.env.BOTMUX_APP_VERSION ?? '0.0.0-dev',
     // Why: opt tools (Claude Code, ls --hyperlink, etc.) into emitting OSC 8
     // hyperlinks. The `supports-hyperlinks` npm package gates on a hard-coded
     // TERM_PROGRAM allowlist (iTerm.app / WezTerm / vscode) and returns false
-    // for TERM_PROGRAM=OrcaBotmux, so callers drop OSC 8 output entirely and emit
-    // bare text instead. xterm.js in OrcaBotmux parses OSC 8 and the pane's
+    // for TERM_PROGRAM=Botmux, so callers drop OSC 8 output entirely and emit
+    // bare text instead. xterm.js in Botmux parses OSC 8 and the pane's
     // linkHandler routes clicks, so forcing the advertisement is safe and
     // restores clickable refs like `owner/repo#123` / `PR#123`.
     FORCE_HYPERLINK: '1'
@@ -689,12 +689,12 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
         const launchWslDistro = resolvedWslContext?.distro
         if (launchWslDistro && launchWslDistro !== codexHomeWslInfo.distro) {
           delete env.CODEX_HOME
-          delete env.ORCA_CODEX_HOME
+          delete env.BOTMUX_CODEX_HOME
         } else {
           env.CODEX_HOME = codexHomeWslInfo.linuxPath
-          env.ORCA_CODEX_HOME = codexHomeWslInfo.linuxPath
+          env.BOTMUX_CODEX_HOME = codexHomeWslInfo.linuxPath
           // Why: wsl.exe only imports non-default env vars named in WSLENV.
-          addWslEnvKeys(env, ['CODEX_HOME', 'ORCA_CODEX_HOME'])
+          addWslEnvKeys(env, ['CODEX_HOME', 'BOTMUX_CODEX_HOME'])
           if (!launchWslDistro) {
             const resolved = resolveWindowsShellLaunchArgs(
               shellPath,
@@ -713,32 +713,32 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
           }
         }
       } else if (isHostCodexHomeForWsl(env.CODEX_HOME)) {
-        // Why: OrcaBotmux's selected Codex runtime home is host-local. WSL Codex
+        // Why: Botmux's selected Codex runtime home is host-local. WSL Codex
         // must use its Linux-side ~/.codex instead of a Windows path.
         delete env.CODEX_HOME
-        delete env.ORCA_CODEX_HOME
+        delete env.BOTMUX_CODEX_HOME
       } else if (env.CODEX_HOME) {
-        addWslEnvKeys(env, ['CODEX_HOME', 'ORCA_CODEX_HOME'])
+        addWslEnvKeys(env, ['CODEX_HOME', 'BOTMUX_CODEX_HOME'])
       }
       if (env.CLAUDE_CONFIG_DIR) {
         // Why: managed WSL Claude accounts pass a Linux CLAUDE_CONFIG_DIR
         // through Windows wsl.exe; non-default env vars need WSLENV import.
         addWslEnvKeys(env, ['CLAUDE_CONFIG_DIR'])
       }
-      if (env[ORCA_HERMES_STARTUP_QUERY_ENV] !== undefined) {
+      if (env[BOTMUX_HERMES_STARTUP_QUERY_ENV] !== undefined) {
         // Why: the startup wrapper expands this only inside WSL; wsl.exe
         // otherwise drops custom Windows environment variables.
-        addWslEnvKeys(env, [ORCA_HERMES_STARTUP_QUERY_ENV])
+        addWslEnvKeys(env, [BOTMUX_HERMES_STARTUP_QUERY_ENV])
       }
     } else if (codexHomeWslInfo || isWslCodexHomeForHost(env.CODEX_HOME)) {
       // Why: WSL-managed Codex homes are Linux paths. Windows Codex cannot use
-      // them. ORCA_CODEX_HOME must go too because shell-ready scripts restore
+      // them. BOTMUX_CODEX_HOME must go too because shell-ready scripts restore
       // CODEX_HOME from it after user profiles run.
       delete env.CODEX_HOME
-      delete env.ORCA_CODEX_HOME
+      delete env.BOTMUX_CODEX_HOME
     }
     if (pathWin32.basename(shellPath).toLowerCase() === 'wsl.exe') {
-      addOrcaWslInteropEnv(env)
+      addBotmuxWslInteropEnv(env)
     }
   } else {
     // Why: relay-side launch modes can ask for host defaults to stay scrubbed
@@ -777,12 +777,12 @@ export function createPtySubprocess(opts: PtySubprocessOptions): SubprocessHandl
       shellLaunch = getShellReadyLaunchConfig(shellPath)
     } else {
       shellLaunch =
-        env.ORCA_ATTRIBUTION_SHIM_DIR ||
-        env.ORCA_OPENCODE_CONFIG_DIR ||
-        env.ORCA_MIMOCODE_HOME ||
-        env.ORCA_OMP_STATUS_EXTENSION ||
-        env.ORCA_CODEX_HOME ||
-        env.ORCA_AGENT_TEAMS_SHIM_DIR
+        env.BOTMUX_ATTRIBUTION_SHIM_DIR ||
+        env.BOTMUX_OPENCODE_CONFIG_DIR ||
+        env.BOTMUX_MIMOCODE_HOME ||
+        env.BOTMUX_OMP_STATUS_EXTENSION ||
+        env.BOTMUX_CODEX_HOME ||
+        env.BOTMUX_AGENT_TEAMS_SHIM_DIR
           ? getAttributionShellLaunchConfig(shellPath)
           : null
     }

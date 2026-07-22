@@ -1,10 +1,10 @@
-import type { OrcaRuntimeService } from '../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../botmux-runtime'
 
 const AGENT_STATUS_RECHECK_INTERVAL_MS = 150
 const AGENT_STATUS_RECHECK_TIMEOUT_MS = 1_050
 
 type AssertTerminalAgentSendableOptions = {
-  runtime: OrcaRuntimeService
+  runtime: BotmuxRuntimeService
   handle: string
   assertWritable: () => void
 }

@@ -43,7 +43,7 @@ const KEYCHAIN_OPTIONS: SecureStore.SecureStoreOptions = {
 }
 
 function credentialKey(hostId: string): string {
-  return `orca.mobile-relay.credentials.${hostId}`
+  return `botmux.mobile-relay.credentials.${hostId}`
 }
 
 export function promotePairingJournalCredential(args: {
@@ -107,6 +107,6 @@ export async function deleteMobileRelayCredentialBundle(hostId: string): Promise
 
 function requireNativeSecretStore(): void {
   if (Platform.OS === 'web') {
-    throw new Error('Orca Relay credentials require a native secret store')
+    throw new Error('Botmux Relay credentials require a native secret store')
   }
 }

@@ -63,7 +63,7 @@ function makeGitHubReview(title: string): HostedReviewInfo {
     provider: 'github',
     number: 42,
     title,
-    url: 'https://github.com/acme/orca_botmux/pull/42'
+    url: 'https://github.com/acme/botmux/pull/42'
   }
 }
 

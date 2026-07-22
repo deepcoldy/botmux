@@ -38,14 +38,14 @@ import type {
   WorkspaceVisibleTabType
 } from '../../../../shared/types'
 import {
-  ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
+  BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
   FLOATING_TERMINAL_WORKTREE_ID
 } from '../../../../shared/constants'
-import { isOrcaBotmuxControlPlaneHostId } from '../../../../shared/orca-botmux-main-terminal-host'
+import { isBotmuxControlPlaneHostId } from '../../../../shared/botmux-main-terminal-host'
 import {
-  resolveOrcaBotmuxSurfaceForOpenFile,
-  stampFromOrcaBotmuxHostSurface
-} from '@/lib/orca-botmux-open-file-surface'
+  resolveBotmuxSurfaceForOpenFile,
+  stampFromBotmuxHostSurface
+} from '@/lib/botmux-open-file-surface'
 import { clampMarkdownTocPanelWidth } from '../../../../shared/markdown-toc-panel-width'
 import { folderWorkspaceKey } from '../../../../shared/workspace-scope'
 import type { RemoteOpKind } from '@/components/right-sidebar/source-control-primary-action'
@@ -229,13 +229,13 @@ export type OpenFile = {
   language: string
   isDirty: boolean
   /**
-   * OrcaBotmux session that owned the explorer when this file was opened. Activating
+   * Botmux session that owned the explorer when this file was opened. Activating
    * the file tab restores FileExplorer path + session highlight (terminal tabs
    * already do this via setActiveTab).
    */
-  orcaBotmuxSessionId?: string | null
+  botmuxSessionId?: string | null
   /** Session cwd stamped at open time for explorer root restore. */
-  orcaBotmuxSurfaceCwd?: string | null
+  botmuxSurfaceCwd?: string | null
   // Why: remote untitled cleanup must target the environment that created the
   // file, even if the user switches to Local or another runtime before closing.
   runtimeEnvironmentId?: string | null
@@ -1855,11 +1855,11 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         tabBarUpdate.tabBarOrderByWorktree = { ...s.tabBarOrderByWorktree, [worktreeId]: base }
       }
 
-      // Why: stamp the active orca_botmux session so re-activating this editor tab
+      // Why: stamp the active botmux session so re-activating this editor tab
       // restores FileExplorer + session highlight after terminal tab switches.
-      const botmuxStamp = stampFromOrcaBotmuxHostSurface({
+      const botmuxStamp = stampFromBotmuxHostSurface({
         worktreeId,
-        surface: s.orcaBotmuxSurfaceByHostId?.[worktreeId] ?? null
+        surface: s.botmuxSurfaceByHostId?.[worktreeId] ?? null
       })
       return {
         openFiles: [
@@ -1877,30 +1877,30 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         ...activeResult
       }
     })
-    // If we reactivated an existing file under a orca_botmux host, refresh its stamp
+    // If we reactivated an existing file under a botmux host, refresh its stamp
     // when the current surface is known (new open from a different session cwd).
     {
       const st = get()
       const f = st.openFiles.find((x) => x.id === editorItemFileId)
-      if (f && isOrcaBotmuxControlPlaneHostId(f.worktreeId)) {
-        const surface = st.orcaBotmuxSurfaceByHostId?.[f.worktreeId]
+      if (f && isBotmuxControlPlaneHostId(f.worktreeId)) {
+        const surface = st.botmuxSurfaceByHostId?.[f.worktreeId]
         if (surface?.sessionId) {
-          const stamp = stampFromOrcaBotmuxHostSurface({
+          const stamp = stampFromBotmuxHostSurface({
             worktreeId: f.worktreeId,
             surface
           })
           if (
-            stamp.orcaBotmuxSessionId &&
-            (f.orcaBotmuxSessionId !== stamp.orcaBotmuxSessionId ||
-              f.orcaBotmuxSurfaceCwd !== stamp.orcaBotmuxSurfaceCwd)
+            stamp.botmuxSessionId &&
+            (f.botmuxSessionId !== stamp.botmuxSessionId ||
+              f.botmuxSurfaceCwd !== stamp.botmuxSurfaceCwd)
           ) {
             set((s) => ({
               openFiles: s.openFiles.map((of) =>
                 of.id === f.id
                   ? {
                       ...of,
-                      orcaBotmuxSessionId: stamp.orcaBotmuxSessionId,
-                      orcaBotmuxSurfaceCwd: stamp.orcaBotmuxSurfaceCwd
+                      botmuxSessionId: stamp.botmuxSessionId,
+                      botmuxSurfaceCwd: stamp.botmuxSurfaceCwd
                     }
                   : of
               )
@@ -2242,7 +2242,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
         activeFileId: newActiveId,
         // Why: if closing the last editor also leaves the worktree without any
         // browser or terminal surface, keep parity with the terminal/browser
-        // close handlers and return to the OrcaBotmux landing state instead of
+        // close handlers and return to the Botmux landing state instead of
         // leaving an active worktree selected with nothing renderable.
         activeWorktreeId: shouldDeactivateWorktree ? null : s.activeWorktreeId,
         activeBrowserTabId: shouldDeactivateWorktree
@@ -2494,12 +2494,12 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
     })
     const state = get()
     const file = state.openFiles.find((f) => f.id === fileId)
-    // Why: clicking an editor tab after terminal tabs must retarget orca_botmux
+    // Why: clicking an editor tab after terminal tabs must retarget botmux
     // FileExplorer path + session highlight to the session that owned the file.
-    if (file && isOrcaBotmuxControlPlaneHostId(file.worktreeId)) {
-      const resolved = resolveOrcaBotmuxSurfaceForOpenFile({ file })
+    if (file && isBotmuxControlPlaneHostId(file.worktreeId)) {
+      const resolved = resolveBotmuxSurfaceForOpenFile({ file })
       if (resolved) {
-        state.setOrcaBotmuxHostSurface?.(file.worktreeId, {
+        state.setBotmuxHostSurface?.(file.worktreeId, {
           sessionId: resolved.sessionId,
           cwd: resolved.cwd || null
         })
@@ -3774,7 +3774,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
       remoteOperationDepth: s.remoteOperationDepth + 1,
       isRemoteOperationActive: true,
       // Why: last-write-wins. The UI disables every action entry while busy,
-      // so a second remote op can't be started from inside OrcaBotmux. If a
+      // so a second remote op can't be started from inside Botmux. If a
       // background caller (future) triggers one, surfacing the most recent
       // kind matches "what the user is currently watching".
       inFlightRemoteOpKind: kind ?? s.inFlightRemoteOpKind
@@ -4333,7 +4333,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
           return
         }
         // Why: terminal file links already authorize clicked external paths
-        // before opening them in OrcaBotmux. Markdown file:// links need the same
+        // before opening them in Botmux. Markdown file:// links need the same
         // user-gesture authorization so /tmp screenshots can use ImageViewer.
         await window.api.fs.authorizeExternalPath({ targetPath: target.absolutePath })
       } else {
@@ -4447,7 +4447,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
           .map((w) => w.id)
       )
       validWorktreeIds.add(FLOATING_TERMINAL_WORKTREE_ID)
-      validWorktreeIds.add(ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
+      validWorktreeIds.add(BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
       for (const workspace of s.folderWorkspaces) {
         validWorktreeIds.add(folderWorkspaceKey(workspace.id))
       }
@@ -4500,7 +4500,7 @@ export const createEditorSlice: StateCreator<AppState, [], [], EditorSlice> = (s
             filePath: pf.filePath,
             relativePath: pf.relativePath,
             worktreeId,
-            // Why: sessions can contain language ids from older OrcaBotmux builds.
+            // Why: sessions can contain language ids from older Botmux builds.
             // Re-detect on hydrate so newly-supported extensions like .ipynb
             // stop reopening as raw JSON/plain text after the upgrade.
             language: detectLanguage(pf.relativePath || pf.filePath),

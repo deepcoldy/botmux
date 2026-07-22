@@ -49,7 +49,7 @@ describe('BrowserLoadFailureOverlay', () => {
     expect(screen.getByText("Connection isn't secure")).toBeInTheDocument()
     expect(
       screen.getByText(
-        "OrcaBotmux doesn't trust the authority that issued the certificate for localhost:3443."
+        "Botmux doesn't trust the authority that issued the certificate for localhost:3443."
       )
     ).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Proceed Anyway (Unsafe)' })).toBeNull()

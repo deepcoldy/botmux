@@ -74,7 +74,7 @@
   content: '';
   position: absolute;
   border-radius: 1px;
-  background: var(--orca-botmux-terminal-divider-color, transparent);
+  background: var(--botmux-terminal-divider-color, transparent);
   transition: background 100ms ease;
 }
 
@@ -101,8 +101,8 @@
 .pane-divider.is-horizontal:hover::after,
 .pane-divider.is-horizontal.is-dragging::after {
   background: var(
-    --orca-botmux-terminal-divider-color-strong,
-    var(--orca-botmux-terminal-divider-color, transparent)
+    --botmux-terminal-divider-color-strong,
+    var(--botmux-terminal-divider-color, transparent)
   );
 }
 
@@ -234,24 +234,24 @@
 /* ── Pane title bar ──────────────────────────────────── */
 
 :root {
-  --orca-botmux-pane-title-height: 24px;
-  --orca-botmux-pane-title-fg: var(--terminal-pane-title-on-dark-fg);
-  --orca-botmux-pane-title-input-fg: var(--terminal-pane-title-on-dark-input-fg);
-  --orca-botmux-pane-title-placeholder: var(--terminal-pane-title-on-dark-placeholder);
-  --orca-botmux-pane-title-button-fg: var(--terminal-pane-title-on-dark-button-fg);
-  --orca-botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-dark-button-hover-fg);
-  --orca-botmux-pane-title-input-bg: var(--terminal-pane-title-on-dark-input-bg);
-  --orca-botmux-pane-title-separator: var(--terminal-pane-title-on-dark-separator);
+  --botmux-pane-title-height: 24px;
+  --botmux-pane-title-fg: var(--terminal-pane-title-on-dark-fg);
+  --botmux-pane-title-input-fg: var(--terminal-pane-title-on-dark-input-fg);
+  --botmux-pane-title-placeholder: var(--terminal-pane-title-on-dark-placeholder);
+  --botmux-pane-title-button-fg: var(--terminal-pane-title-on-dark-button-fg);
+  --botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-dark-button-hover-fg);
+  --botmux-pane-title-input-bg: var(--terminal-pane-title-on-dark-input-bg);
+  --botmux-pane-title-separator: var(--terminal-pane-title-on-dark-separator);
 }
 
 [data-pane-title-surface='light'] {
-  --orca-botmux-pane-title-fg: var(--terminal-pane-title-on-light-fg);
-  --orca-botmux-pane-title-input-fg: var(--terminal-pane-title-on-light-input-fg);
-  --orca-botmux-pane-title-placeholder: var(--terminal-pane-title-on-light-placeholder);
-  --orca-botmux-pane-title-button-fg: var(--terminal-pane-title-on-light-button-fg);
-  --orca-botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-light-button-hover-fg);
-  --orca-botmux-pane-title-input-bg: var(--terminal-pane-title-on-light-input-bg);
-  --orca-botmux-pane-title-separator: var(--terminal-pane-title-on-light-separator);
+  --botmux-pane-title-fg: var(--terminal-pane-title-on-light-fg);
+  --botmux-pane-title-input-fg: var(--terminal-pane-title-on-light-input-fg);
+  --botmux-pane-title-placeholder: var(--terminal-pane-title-on-light-placeholder);
+  --botmux-pane-title-button-fg: var(--terminal-pane-title-on-light-button-fg);
+  --botmux-pane-title-button-hover-fg: var(--terminal-pane-title-on-light-button-hover-fg);
+  --botmux-pane-title-input-bg: var(--terminal-pane-title-on-light-input-bg);
+  --botmux-pane-title-separator: var(--terminal-pane-title-on-light-separator);
 }
 
 /* Floating title overlay. The title owns the top strip of the pane, while titled
@@ -268,16 +268,16 @@
   top: 0;
   left: 0;
   width: 100%;
-  height: var(--orca-botmux-pane-title-height);
+  height: var(--botmux-pane-title-height);
   box-sizing: border-box;
   display: flex;
   align-items: center;
   padding: 0 8px;
   font-size: 13px;
   font-family: var(--font-mono);
-  color: var(--orca-botmux-pane-title-fg, rgb(255 255 255 / 0.52));
-  background: var(--orca-botmux-pane-title-bg, #000);
-  border-bottom: 1px solid var(--orca-botmux-pane-title-separator, rgb(255 255 255 / 0.06));
+  color: var(--botmux-pane-title-fg, rgb(255 255 255 / 0.52));
+  background: var(--botmux-pane-title-bg, #000);
+  border-bottom: 1px solid var(--botmux-pane-title-separator, rgb(255 255 255 / 0.06));
   pointer-events: auto;
   user-select: none;
 }
@@ -287,14 +287,14 @@
   top: 0;
   left: 50%;
   width: 32px;
-  height: var(--orca-botmux-pane-title-height);
+  height: var(--botmux-pane-title-height);
   z-index: 2;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: grab;
   opacity: 0;
-  background: color-mix(in srgb, var(--orca-botmux-pane-title-fg) 36%, transparent);
+  background: color-mix(in srgb, var(--botmux-pane-title-fg) 36%, transparent);
   transform: translateX(-50%);
   transition: opacity 150ms ease;
 }
@@ -304,7 +304,7 @@
   font-size: 10px;
   line-height: 1;
   letter-spacing: 0;
-  color: var(--orca-botmux-pane-title-button-hover-fg);
+  color: var(--botmux-pane-title-button-hover-fg);
 }
 
 .pane-title-drag-handle:hover {
@@ -320,12 +320,12 @@
   top: 0;
   left: 8px;
   z-index: 5;
-  height: var(--orca-botmux-pane-title-height);
+  height: var(--botmux-pane-title-height);
   display: flex;
   align-items: center;
   font-family: var(--font-mono);
   font-size: 12px;
-  color: var(--orca-botmux-pane-title-fg);
+  color: var(--botmux-pane-title-fg);
   background: transparent;
   user-select: none;
   pointer-events: none;
@@ -347,7 +347,7 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
-  line-height: var(--orca-botmux-pane-title-height);
+  line-height: var(--botmux-pane-title-height);
 }
 
 .pane-title-text:focus-visible {
@@ -371,7 +371,7 @@
   position: relative;
   width: 18px;
   min-width: 18px;
-  height: var(--orca-botmux-pane-title-height);
+  height: var(--botmux-pane-title-height);
   padding: 0;
 }
 
@@ -389,8 +389,8 @@
   height: 23px;
   background: radial-gradient(
     circle,
-    var(--orca-botmux-pane-title-bg, var(--background)) 0 44%,
-    color-mix(in srgb, var(--orca-botmux-pane-title-bg, var(--background)) 74%, transparent) 62%,
+    var(--botmux-pane-title-bg, var(--background)) 0 44%,
+    color-mix(in srgb, var(--botmux-pane-title-bg, var(--background)) 74%, transparent) 62%,
     transparent 100%
   );
   border-radius: 9999px;
@@ -400,7 +400,7 @@
 .pane-title-close {
   flex-shrink: 0;
   margin-left: auto;
-  color: var(--orca-botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
+  color: var(--botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
   background: transparent;
   opacity: 0;
   transition:
@@ -414,7 +414,7 @@
 }
 
 .pane-title-split-trigger {
-  color: var(--orca-botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
+  color: var(--botmux-pane-title-button-fg, rgb(255 255 255 / 0.3));
   opacity: 0;
   transition: opacity 120ms ease;
 }
@@ -449,7 +449,7 @@
 .pane-title-split-trigger[data-state='delayed-open'],
 .pane-title-split-trigger[data-state='instant-open'] {
   background: transparent;
-  color: var(--orca-botmux-pane-title-button-hover-fg, rgb(255 255 255 / 0.8));
+  color: var(--botmux-pane-title-button-hover-fg, rgb(255 255 255 / 0.8));
 }
 
 /* Inline edit input — matches the title text styling exactly to prevent
@@ -464,23 +464,23 @@
   flex: 1;
   min-width: 0;
   width: 100%;
-  height: var(--orca-botmux-pane-title-height);
+  height: var(--botmux-pane-title-height);
   box-sizing: border-box;
   padding: 0 8px;
   margin: 0;
   border: 1px solid transparent;
   border-radius: 0;
-  background: var(--orca-botmux-pane-title-input-bg, rgb(255 255 255 / 0.04));
+  background: var(--botmux-pane-title-input-bg, rgb(255 255 255 / 0.04));
   outline: none;
   font-size: 13px;
   line-height: 20px;
   font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
-  color: var(--orca-botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
-  caret-color: var(--orca-botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
+  color: var(--botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
+  caret-color: var(--botmux-pane-title-input-fg, rgb(255 255 255 / 0.7));
 }
 
 .pane-title-input::placeholder {
-  color: var(--orca-botmux-pane-title-placeholder, rgb(255 255 255 / 0.38));
+  color: var(--botmux-pane-title-placeholder, rgb(255 255 255 / 0.38));
 }
 
 .pane-title-input:focus-visible {
@@ -503,6 +503,6 @@
    title bar occupies the top title-height pixels. Height is reduced by the
    same amount to prevent overflow/clipping. */
 .pane[data-has-title] .xterm-container {
-  margin-top: var(--orca-botmux-pane-title-height);
-  height: calc(100% - var(--orca-botmux-pane-title-height)); /* match margin-top */
+  margin-top: var(--botmux-pane-title-height);
+  height: calc(100% - var(--botmux-pane-title-height)); /* match margin-top */
 }

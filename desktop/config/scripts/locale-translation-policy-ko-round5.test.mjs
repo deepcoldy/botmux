@@ -41,11 +41,11 @@ describe('locale-translation-policy ko round 5', () => {
     expect(
       repairTranslatedValue({
         key: 'auto.components.settings.general.search.244e3fb4c8',
-        enValue: 'Install the OrcaBotmux skill so agents know to use the OrcaBotmux CLI.',
-        localeValue: '에이전트가 OrcaBotmux CLI 사용 방법을 알 수 있도록 OrcaBotmux 기술을 설치합니다.',
+        enValue: 'Install the Botmux skill so agents know to use the Botmux CLI.',
+        localeValue: '에이전트가 Botmux CLI 사용 방법을 알 수 있도록 Botmux 기술을 설치합니다.',
         locale: 'ko'
       })
-    ).toBe('agents가 OrcaBotmux CLI를 사용하도록 OrcaBotmux 스킬을 설치하세요.')
+    ).toBe('agents가 Botmux CLI를 사용하도록 Botmux 스킬을 설치하세요.')
     expect(
       repairTranslatedValue({
         key: 'auto.components.editor.MarkdownPreview.322afab6ff',

@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveTerminalManager } from './helpers/terminal'
 
 type AtlasPage = {
@@ -432,11 +432,11 @@ test.describe('terminal WebGL atlas budget', () => {
   test.describe.configure({ timeout: 120_000 })
 
   test('keeps shared glyph pages bindable through overflow and recovery @terminal-rendering-golden', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForActiveTerminalManager(orcaBotmuxPage)
-    test.skip(!(await forceActivePaneWebgl(orcaBotmuxPage)), 'WebGL unavailable in this environment')
-    const result = await runAtlasBudgetScenario(orcaBotmuxPage)
+    await waitForActiveTerminalManager(botmuxPage)
+    test.skip(!(await forceActivePaneWebgl(botmuxPage)), 'WebGL unavailable in this environment')
+    const result = await runAtlasBudgetScenario(botmuxPage)
 
     expect(result.realBudget).toBeGreaterThanOrEqual(result.budget)
     expect(result.shared).toBe(true)
@@ -452,11 +452,11 @@ test.describe('terminal WebGL atlas budget', () => {
   })
 
   test('rebuilds cached vertices after attaching a different shared atlas @terminal-rendering-golden', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForActiveTerminalManager(orcaBotmuxPage)
-    test.skip(!(await forceActivePaneWebgl(orcaBotmuxPage)), 'WebGL unavailable in this environment')
-    const result = await runAtlasReplacementScenario(orcaBotmuxPage)
+    await waitForActiveTerminalManager(botmuxPage)
+    test.skip(!(await forceActivePaneWebgl(botmuxPage)), 'WebGL unavailable in this environment')
+    const result = await runAtlasReplacementScenario(botmuxPage)
 
     expect(result.distinctAtlases).toBe(true)
     expect(result.baselineInkPixels).toBeGreaterThan(1000)

@@ -69,9 +69,9 @@ vi.mock('./SshDisconnectedDialog', () => ({
 
 vi.mock('./WorktreeContextMenu', () => ({
   default: ({ children }: { children: ReactNode }) => <>{children}</>,
-  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'orca_botmux:test-close-context-menus',
+  CLOSE_ALL_CONTEXT_MENUS_EVENT: 'botmux:test-close-context-menus',
   WORKTREE_NATIVE_CONTEXT_MENU_ATTR: 'data-worktree-native-context-menu',
-  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-orca-botmux-context-menu-scope'
+  WORKTREE_CONTEXT_MENU_SCOPE_ATTR: 'data-botmux-context-menu-scope'
 }))
 
 vi.mock('./use-worktree-activity-status', () => ({
@@ -82,7 +82,7 @@ function makeRepo(): Repo {
   return {
     id: 'repo-1',
     path: '/repo',
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#999999',
     addedAt: 1
   }

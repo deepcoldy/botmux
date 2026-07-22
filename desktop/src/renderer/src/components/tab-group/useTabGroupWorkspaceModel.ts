@@ -230,7 +230,7 @@ export function useTabGroupWorkspaceModel({
     // that used to deselect the worktree when its final visible surface
     // closed. Without the same guard here, the renderer keeps an empty
     // worktree selected and TabGroupPanel has nothing to render, producing a
-    // blank workspace instead of OrcaBotmux's landing screen.
+    // blank workspace instead of Botmux's landing screen.
     const { renderableTabCount } = state.reconcileWorktreeTabModel(worktreeId)
     if (renderableTabCount === 0) {
       setActiveWorktree(null)

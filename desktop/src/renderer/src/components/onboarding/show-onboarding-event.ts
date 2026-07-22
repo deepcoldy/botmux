@@ -1,6 +1,6 @@
 import type { OnboardingState } from '../../../../shared/types'
 
-const ONBOARDING_REOPENED_EVENT = 'orca_botmux:onboarding-reopened'
+const ONBOARDING_REOPENED_EVENT = 'botmux:onboarding-reopened'
 
 export async function showOnboardingFromRenderer(): Promise<void> {
   const nextOnboarding = await window.api.onboarding.update({

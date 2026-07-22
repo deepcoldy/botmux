@@ -22,7 +22,7 @@ describe('detectRemoteHostPlatform', () => {
   })
 
   it('detects POSIX hosts from uname output', async () => {
-    execCommandMock.mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Linux   x86_64\n')
+    execCommandMock.mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Linux   x86_64\n')
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toMatchObject({
       relayPlatform: 'linux-x64',
@@ -32,14 +32,14 @@ describe('detectRemoteHostPlatform', () => {
     })
     expect(execCommandMock).toHaveBeenCalledWith(
       conn,
-      "printf '\\n%s ' '__ORCA_REMOTE_PLATFORM__'; uname -sm"
+      "printf '\\n%s ' '__BOTMUX_REMOTE_PLATFORM__'; uname -sm"
     )
   })
 
   it('falls back to PowerShell detection for Windows remotes', async () => {
     execCommandMock
       .mockRejectedValueOnce(new Error('uname unavailable'))
-      .mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Windows AMD64\r\n')
+      .mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Windows AMD64\r\n')
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toMatchObject({
       relayPlatform: 'win32-x64',
@@ -55,7 +55,7 @@ describe('detectRemoteHostPlatform', () => {
     )
     const command = execCommandMock.mock.calls[1]?.[1] ?? ''
     expect(decodePowerShellCommand(command)).toContain(
-      'Write-Output ("`n__ORCA_REMOTE_PLATFORM__ Windows " + $arch)'
+      'Write-Output ("`n__BOTMUX_REMOTE_PLATFORM__ Windows " + $arch)'
     )
   })
 
@@ -64,7 +64,7 @@ describe('detectRemoteHostPlatform', () => {
       .mockRejectedValueOnce(new Error('uname unavailable'))
       .mockResolvedValueOnce(
         'Linux x86_64\r\nWindows AMD64\r\n#< CLIXML\r\n' +
-          '__ORCA_REMOTE_PLATFORM__ Windows ARM64\r\n'
+          '__BOTMUX_REMOTE_PLATFORM__ Windows ARM64\r\n'
       )
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toMatchObject({
@@ -77,8 +77,8 @@ describe('detectRemoteHostPlatform', () => {
 
   it('ignores a marker concatenated to unterminated startup noise', async () => {
     execCommandMock.mockResolvedValueOnce(
-      'startup noise__ORCA_REMOTE_PLATFORM__ Linux x86_64\n' +
-        '__ORCA_REMOTE_PLATFORM__ Linux arm64\n'
+      'startup noise__BOTMUX_REMOTE_PLATFORM__ Linux x86_64\n' +
+        '__BOTMUX_REMOTE_PLATFORM__ Linux arm64\n'
     )
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toMatchObject({
@@ -88,15 +88,15 @@ describe('detectRemoteHostPlatform', () => {
 
   it('returns null when neither probe yields a supported platform', async () => {
     execCommandMock
-      .mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Linux')
-      .mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ FreeBSD x86_64')
+      .mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Linux')
+      .mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ FreeBSD x86_64')
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toBeNull()
   })
 
   it('does not use whitespace regex splitting for remote platform output', async () => {
     const splitSpy = vi.spyOn(String.prototype, 'split')
-    execCommandMock.mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Darwin      arm64 extra')
+    execCommandMock.mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Darwin      arm64 extra')
 
     await expect(detectRemoteHostPlatform(conn)).resolves.toMatchObject({
       relayPlatform: 'darwin-arm64'

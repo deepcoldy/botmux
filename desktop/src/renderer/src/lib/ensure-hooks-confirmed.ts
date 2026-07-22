@@ -1,7 +1,7 @@
 import type { AppState } from '@/store/types'
-import type { OrcaHooks } from '../../../shared/types'
+import type { BotmuxHooks } from '../../../shared/types'
 import { resolveHookCommandSourcePolicy } from '../../../shared/hook-command-source-policy'
-import { hashOrcaHookScript, type OrcaHookScriptKind } from './orca-botmux-hook-trust'
+import { hashBotmuxHookScript, type BotmuxHookScriptKind } from './botmux-hook-trust'
 import { checkRuntimeHooks, readRuntimeIssueCommand } from '@/runtime/runtime-hooks-client'
 import { getRuntimeEnvironmentIdForRepo } from './repo-runtime-owner'
 import {
@@ -10,7 +10,7 @@ import {
   type ExecutionHostId
 } from '../../../shared/execution-host'
 
-export type HookScriptKind = OrcaHookScriptKind
+export type HookScriptKind = BotmuxHookScriptKind
 
 // Serialize the singleton modal callback so overlapping worktree actions cannot replace it.
 let trustPromptChain: Promise<unknown> = Promise.resolve()
@@ -25,7 +25,7 @@ export function __resetTrustPromptChainForTests(): void {
   trustPromptChain = Promise.resolve()
 }
 
-function getSetupTrustContent(yamlHooks: OrcaHooks | null): string {
+function getSetupTrustContent(yamlHooks: BotmuxHooks | null): string {
   const defaultTabCommands = (yamlHooks?.defaultTabs ?? [])
     .map((tab, index) => {
       const command = tab.command?.trim()
@@ -39,7 +39,7 @@ function getSetupTrustContent(yamlHooks: OrcaHooks | null): string {
   return [yamlHooks?.scripts?.setup?.trim(), ...defaultTabCommands].filter(Boolean).join('\n\n')
 }
 
-function getVmRecipeTrustContent(yamlHooks: OrcaHooks | null): string {
+function getVmRecipeTrustContent(yamlHooks: BotmuxHooks | null): string {
   return (yamlHooks?.environmentRecipes ?? [])
     .map((recipe) =>
       [
@@ -93,14 +93,14 @@ export async function ensureHooksConfirmed(
 ): Promise<'run' | 'skip'> {
   return enqueueTrustPrompt(async () => {
     const hasDuplicateRepoId = state.repos.filter((repo) => repo.id === repoId).length > 1
-    if (state.trustedOrcaHooks[repoId]?.all && !(hostId && hasDuplicateRepoId)) {
+    if (state.trustedBotmuxHooks[repoId]?.all && !(hostId && hasDuplicateRepoId)) {
       return 'run'
     }
 
     let scriptContent = ''
     try {
       if (scriptKind === 'issueCommand') {
-        // Local overrides are user-owned; only shared orca_botmux.yaml commands need repo trust.
+        // Local overrides are user-owned; only shared botmux.yaml commands need repo trust.
         // Why: hostId disambiguates duplicate repo ids on the local IPC path,
         // matching the checkRuntimeHooks call below.
         const result = await readRuntimeIssueCommand(
@@ -138,7 +138,7 @@ export async function ensureHooksConfirmed(
         if (result.status === 'error') {
           return 'skip'
         }
-        const yamlHooks = (result.hooks as OrcaHooks | null) ?? null
+        const yamlHooks = (result.hooks as BotmuxHooks | null) ?? null
         scriptContent =
           scriptKind === 'setup'
             ? getSetupTrustContent(yamlHooks)
@@ -155,8 +155,8 @@ export async function ensureHooksConfirmed(
       return 'run'
     }
 
-    const contentHash = await hashOrcaHookScript(scriptContent)
-    const existingHash = state.trustedOrcaHooks[repoId]?.[scriptKind]?.contentHash
+    const contentHash = await hashBotmuxHookScript(scriptContent)
+    const existingHash = state.trustedBotmuxHooks[repoId]?.[scriptKind]?.contentHash
     if (existingHash === contentHash) {
       return 'run'
     }
@@ -164,11 +164,11 @@ export async function ensureHooksConfirmed(
     const repo = findHookRepo(state, repoId, hostId)
     const repoName = repo?.displayName ?? 'this repository'
     // A non-empty existingHash that didn't match means the user approved a previous
-    // version of this script; the prompt is reappearing because orca_botmux.yaml changed.
+    // version of this script; the prompt is reappearing because botmux.yaml changed.
     const previouslyApproved = Boolean(existingHash)
 
     return new Promise<'run' | 'skip'>((resolve) => {
-      state.openModal('confirm-orca-botmux-yaml-hooks', {
+      state.openModal('confirm-botmux-yaml-hooks', {
         repoId,
         repoName,
         scriptKind,

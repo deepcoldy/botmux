@@ -44,8 +44,8 @@ function getDialogTitle(report: CrashReportRecord | null): string {
     return 'Report a crash'
   }
   return report && isReactErrorBoundaryReport(report)
-    ? 'OrcaBotmux hit a recoverable UI error'
-    : 'OrcaBotmux closed unexpectedly'
+    ? 'Botmux hit a recoverable UI error'
+    : 'Botmux closed unexpectedly'
 }
 
 function getDialogDescription(report: CrashReportRecord | null): string {
@@ -63,7 +63,7 @@ function getNotesPlaceholder(report: CrashReportRecord | null): string {
   }
   return report && isReactErrorBoundaryReport(report)
     ? 'Optional: what were you doing before this UI error?'
-    : 'Optional: what were you doing before OrcaBotmux closed?'
+    : 'Optional: what were you doing before Botmux closed?'
 }
 
 type CrashReportDialogSurfaceProps = {
@@ -248,7 +248,7 @@ export function CrashReportDialogSurface({
                 <div className="font-medium text-foreground">{formatSummary(report)}</div>
                 <div className="mt-1 text-muted-foreground">
                   {new Date(report.createdAt).toLocaleString()} · {report.platform} {report.arch} ·
-                  {translate('auto.components.crash.report.CrashReportDialog.835037edc9', 'orca_botmux')}{' '}
+                  {translate('auto.components.crash.report.CrashReportDialog.835037edc9', 'botmux')}{' '}
                   {report.appVersion}
                 </div>
               </div>

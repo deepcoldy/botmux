@@ -22,7 +22,7 @@ import {
   type DockerSshRelayTarget
 } from './helpers/docker-ssh-relay-target'
 import { openFileExplorer } from './helpers/file-explorer'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   execInTerminal,
@@ -30,7 +30,7 @@ import {
   waitForActiveTerminalManager
 } from './helpers/terminal'
 
-const RUN_DOCKER_SSH = process.env.ORCA_E2E_SSH_DOCKER === '1'
+const RUN_DOCKER_SSH = process.env.BOTMUX_E2E_SSH_DOCKER === '1'
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`
@@ -65,7 +65,7 @@ async function waitForRelayWatcherProcessGroup(
 
 async function openRemoteFileExplorer(page: Page, target: DockerSshRelayTarget): Promise<void> {
   await openFileExplorer(page)
-  await expect(page.locator('[data-orca-botmux-explorer-shell]')).toBeVisible({ timeout: 15_000 })
+  await expect(page.locator('[data-botmux-explorer-shell]')).toBeVisible({ timeout: 15_000 })
   await expect(fileExplorerRow(page, 'README.md')).toBeVisible({ timeout: 30_000 })
   // Why: the child appears only after the real explorer watch subscribes, so
   // external file creation below cannot race the initial watch registration.
@@ -101,28 +101,28 @@ async function enableTerminalAccessibilityDom(page: Page, ptyId: string): Promis
 }
 
 test.describe('Docker SSH relay watcher isolation', () => {
-  test.skip(!RUN_DOCKER_SSH, 'Set ORCA_E2E_SSH_DOCKER=1 to run Docker-backed SSH tests.')
+  test.skip(!RUN_DOCKER_SSH, 'Set BOTMUX_E2E_SSH_DOCKER=1 to run Docker-backed SSH tests.')
   test.skip(process.platform === 'win32', 'Docker SSH watcher isolation uses POSIX tooling.')
 
   test('keeps the relay, terminal, and explorer alive when only relay-watcher.js crashes', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const ptyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
-      await enableTerminalAccessibilityDom(orcaBotmuxPage, ptyId)
-      await openRemoteFileExplorer(orcaBotmuxPage, target)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerSshRelayTarget(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const ptyId = await waitForActivePanePtyId(botmuxPage, 60_000)
+      await enableTerminalAccessibilityDom(botmuxPage, ptyId)
+      await openRemoteFileExplorer(botmuxPage, target)
 
       const beforeFile = 'before-crash.txt'
       writeDockerSshRelayTargetFile(target, remoteRepoFile(beforeFile), 'before watcher crash\n')
-      await expect(fileExplorerRow(orcaBotmuxPage, beforeFile)).toBeVisible({ timeout: 30_000 })
+      await expect(fileExplorerRow(botmuxPage, beforeFile)).toBeVisible({ timeout: 30_000 })
 
       const beforeCrash = await waitForRelayWatcherProcessGroup(target)
       // Why: the relay shards roots across bounded watcher children. Crashing
@@ -155,12 +155,12 @@ test.describe('Docker SSH relay watcher isolation', () => {
       const terminalMarkerBase64 = Buffer.from(terminalMarker).toString('base64')
       const afterFile = 'after-crash.txt'
       await execInTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         ptyId,
         `printf '%s' ${shellQuote(terminalMarkerBase64)} | base64 -d && printf '\\n' && ` +
           `printf '%s\\n' 'after watcher crash' > ${shellQuote(remoteRepoFile(afterFile))}`
       )
-      const terminalDom = orcaBotmuxPage.locator(
+      const terminalDom = botmuxPage.locator(
         `[data-pty-id=${JSON.stringify(ptyId)}] .xterm-accessibility-tree`
       )
       await expect(terminalDom).toContainText(terminalMarker, { timeout: 30_000 })
@@ -179,23 +179,23 @@ test.describe('Docker SSH relay watcher isolation', () => {
           `watcherPids=${beforeCrash.watcherPids.join(',')}->${finalProcesses.watcherPids.join(',')} ` +
           `pty=${ptyId}`
       })
-      await expect(fileExplorerRow(orcaBotmuxPage, afterFile)).toBeVisible({ timeout: 30_000 })
+      await expect(fileExplorerRow(botmuxPage, afterFile)).toBeVisible({ timeout: 30_000 })
     } finally {
       cleanupDockerSshRelayTarget(target)
     }
   })
 
   test('repairs a missing deployed relay-watcher.js on reconnect', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await openRemoteFileExplorer(orcaBotmuxPage, target)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerSshRelayTarget(botmuxPage, target)
+      await openRemoteFileExplorer(botmuxPage, target)
 
       const beforeRepair = await waitForRelayWatcherProcessGroup(target)
       expect(readDockerSshRelayArtifactState(target, beforeRepair.relayDir)).toEqual({
@@ -208,8 +208,8 @@ test.describe('Docker SSH relay watcher isolation', () => {
         relayWatcher: false
       })
 
-      await closeRemoteFileExplorer(orcaBotmuxPage)
-      await disconnectDockerSshRelayTarget(orcaBotmuxPage, remote.targetId)
+      await closeRemoteFileExplorer(botmuxPage)
+      await disconnectDockerSshRelayTarget(botmuxPage, remote.targetId)
       // Why: normal relays deliberately retain PTYs for the reconnect grace
       // window. Stop this disconnected instance so reconnect must deploy anew.
       terminateDockerSshRelay(target, beforeRepair)
@@ -219,9 +219,9 @@ test.describe('Docker SSH relay watcher isolation', () => {
           message: 'disconnected relay did not exit after explicit termination'
         })
         .toBe(false)
-      await reconnectDisconnectedDockerSshRelayTarget(orcaBotmuxPage, remote.targetId)
+      await reconnectDisconnectedDockerSshRelayTarget(botmuxPage, remote.targetId)
 
-      await openRemoteFileExplorer(orcaBotmuxPage, target)
+      await openRemoteFileExplorer(botmuxPage, target)
       const afterRepair = await waitForRelayWatcherProcessGroup(target)
       expect(afterRepair.relayPid).not.toBe(beforeRepair.relayPid)
       expect(readDockerSshRelayArtifactState(target, afterRepair.relayDir)).toEqual({
@@ -230,7 +230,7 @@ test.describe('Docker SSH relay watcher isolation', () => {
       })
       const repairedFile = 'after-artifact-repair.txt'
       writeDockerSshRelayTargetFile(target, remoteRepoFile(repairedFile), 'artifact repaired\n')
-      await expect(fileExplorerRow(orcaBotmuxPage, repairedFile)).toBeVisible({ timeout: 30_000 })
+      await expect(fileExplorerRow(botmuxPage, repairedFile)).toBeVisible({ timeout: 30_000 })
     } finally {
       cleanupDockerSshRelayTarget(target)
     }

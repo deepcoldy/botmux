@@ -918,7 +918,7 @@ describe('agent status PR refresh handoff', () => {
       state: 'done',
       prompt: 'create a PR',
       agentType: 'codex',
-      lastAssistantMessage: 'Opened https://github.com/acme/orca_botmux/pull/42'
+      lastAssistantMessage: 'Opened https://github.com/acme/botmux/pull/42'
     })
 
     await flushMicrotasks()

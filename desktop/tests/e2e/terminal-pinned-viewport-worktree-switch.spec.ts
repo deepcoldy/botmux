@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { expect, test } from './helpers/orca-botmux-app'
+import { expect, test } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -39,7 +39,7 @@ await writeStdout('PINNED_VIEWPORT_SWITCH_${runId}_DONE\\n')
 async function closeFeatureTips(page: Page): Promise<void> {
   await page.evaluate(() => {
     const store = window.__store
-    store?.getState().markFeatureTipsSeen(['orca-botmux-cli', 'cmd-j-palette', 'voice-dictation'])
+    store?.getState().markFeatureTipsSeen(['botmux-cli', 'cmd-j-palette', 'voice-dictation'])
     if (store?.getState().activeModal === 'feature-tips') {
       store.getState().closeModal()
     }
@@ -120,13 +120,13 @@ async function sampleTerminalViewportDuringReturn(
 
 test.describe('Terminal pinned viewport worktree switch', () => {
   test('does not jump or flash when returning to a viewport pinned just above bottom', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await closeFeatureTips(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    await closeFeatureTips(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'pinned viewport repro needs the seeded secondary worktree')
@@ -134,34 +134,34 @@ test.describe('Terminal pinned viewport worktree switch', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-pinned-viewport-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-pinned-viewport-${runId}.mjs`)
     writeFileSync(scriptPath, scrollbackFixtureScript(runId))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `${nodeTerminalCommand([scriptPath])}\r`)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 30_000), {
+        .poll(() => getTerminalContent(botmuxPage, 30_000), {
           timeout: 10_000,
           message: 'pinned viewport fixture did not reach terminal scrollback'
         })
         .toContain(`PINNED_VIEWPORT_SWITCH_${runId}_DONE`)
 
-      const pinned = await pinActiveTerminalNearBottom(orcaBotmuxPage)
+      const pinned = await pinActiveTerminalNearBottom(botmuxPage)
       expect(pinned.baseY).toBeGreaterThan(20)
-      await orcaBotmuxPage.waitForTimeout(50)
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await orcaBotmuxPage.waitForTimeout(250)
+      await botmuxPage.waitForTimeout(50)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await botmuxPage.waitForTimeout(250)
 
-      const samplesPromise = sampleTerminalViewportDuringReturn(orcaBotmuxPage, pinned.tabId, 450)
-      await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      const samplesPromise = sampleTerminalViewportDuringReturn(botmuxPage, pinned.tabId, 450)
+      await switchToWorktree(botmuxPage, firstWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
       const samples = await samplesPromise
       expect(samples.length).toBeGreaterThan(0)
       expect(samples.filter((sample) => sample.viewportY <= 1)).toEqual([])

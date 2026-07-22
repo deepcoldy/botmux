@@ -3,7 +3,7 @@
  *
  * Why: polling \\wsl.localhost from Windows keeps waking the distro after
  * `wsl --shutdown`, which can make WSL look wedged. Keep the polling process
- * inside the distro so shutdown kills it instead of OrcaBotmux restarting WSL.
+ * inside the distro so shutdown kills it instead of Botmux restarting WSL.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { StringDecoder } from 'node:string_decoder'

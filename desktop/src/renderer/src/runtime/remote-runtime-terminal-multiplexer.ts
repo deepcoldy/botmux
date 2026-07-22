@@ -341,7 +341,7 @@ class RemoteRuntimeTerminalMultiplexer {
             onResponse: (response) => this.handleResponse(response),
             onBinary: (bytes) => this.handleBinary(bytes),
             onError: (error) => this.failConnection(new Error(error.message)),
-            onClose: () => this.handleClose('Remote OrcaBotmux runtime closed the connection.')
+            onClose: () => this.handleClose('Remote Botmux runtime closed the connection.')
           }
         )
         .then((subscription) => {

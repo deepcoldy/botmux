@@ -6,7 +6,7 @@ import { cn } from '@/lib/utils'
 // meaning reads instantly as a single mark — quieter than a looping demo.
 // Each compresses its step to one recognizable idea drawn from the old animation.
 
-// Mac-style terminal traffic-light dots — the signature of an OrcaBotmux terminal pane.
+// Mac-style terminal traffic-light dots — the signature of an Botmux terminal pane.
 function TerminalDots(): JSX.Element {
   return (
     <span className="flex gap-[3px]">
@@ -45,7 +45,7 @@ function WorktreeGlyphPanel(props: { className?: string }): JSX.Element {
   )
 }
 
-// Use OrcaBotmux's browser: a browser pane with a cursor grabbing one highlighted
+// Use Botmux's browser: a browser pane with a cursor grabbing one highlighted
 // element — the point-and-send-to-agent idea compressed into a single mark.
 export function SetupBrowserVisual(): JSX.Element {
   return (

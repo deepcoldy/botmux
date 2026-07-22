@@ -38,7 +38,7 @@ describe('runtime environment store', () => {
   })
 
   it('rejects duplicate server names instead of silently replacing the saved server', () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-env-store-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-env-store-'))
     tempDirs.push(userDataPath)
 
     const first = addEnvironmentFromPairingCode(userDataPath, {
@@ -56,7 +56,7 @@ describe('runtime environment store', () => {
   })
 
   it('throttles lastUsedAt writes so it does not rewrite the store on every runtime call', () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-env-store-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-env-store-'))
     tempDirs.push(userDataPath)
     const env = addEnvironmentFromPairingCode(userDataPath, {
       name: 'dev box',
@@ -80,7 +80,7 @@ describe('runtime environment store', () => {
   })
 
   it('persists immediately when the runtimeId changes within the throttle window', () => {
-    const userDataPath = mkdtempSync(join(tmpdir(), 'orca-botmux-runtime-env-store-'))
+    const userDataPath = mkdtempSync(join(tmpdir(), 'botmux-runtime-env-store-'))
     tempDirs.push(userDataPath)
     const env = addEnvironmentFromPairingCode(userDataPath, {
       name: 'dev box',

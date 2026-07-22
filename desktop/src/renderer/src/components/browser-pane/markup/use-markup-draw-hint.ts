@@ -9,7 +9,7 @@ import { useAppStore } from '@/store'
 //
 // Stays open until the user dismisses it (outside click / Escape / blur), clicks
 // Draw, or the button stops being eligible. No auto-timeout.
-const MARKUP_DRAW_HINT_SEEN_KEY = 'orca_botmux.browser.markup-draw-hint-seen'
+const MARKUP_DRAW_HINT_SEEN_KEY = 'botmux.browser.markup-draw-hint-seen'
 
 // Records the first-ever view and returns whether this call is that first view.
 // Returns false when storage is unavailable so a private-mode session never

@@ -1,5 +1,5 @@
 /* eslint-disable max-lines -- Why: this service owns the single runtime-home
-contract for Codex inside OrcaBotmux. Keeping path resolution, system-default
+contract for Codex inside Botmux. Keeping path resolution, system-default
 snapshots, auth materialization, and recovery together prevents account-switch
 semantics from drifting across PTY launch, login, and quota fetch paths. */
 import {
@@ -36,7 +36,7 @@ import type { Store } from '../persistence'
 import { WSL_CODEX_RUNTIME_HOME_SEGMENTS } from '../pty/codex-home-wsl-env'
 import { writeFileAtomically } from './fs-utils'
 import {
-  getOrcaManagedCodexHomePath,
+  getBotmuxManagedCodexHomePath,
   getSystemCodexHomePath,
   syncCodexGlobalInstructionsIntoManagedHome,
   syncSystemCodexResourcesIntoManagedHome
@@ -96,11 +96,11 @@ export class CodexRuntimeHomeService {
   // account. When null, runtime auth follows the user's system-default
   // ~/.codex/auth.json instead of being written back to a managed account.
   private lastSyncedAccountId: string | null = null
-  // Why: tracks the auth.json content OrcaBotmux last wrote to the runtime CODEX_HOME.
+  // Why: tracks the auth.json content Botmux last wrote to the runtime CODEX_HOME.
   // Between syncs, if the file differs, Codex CLI refreshed the token — so
-  // OrcaBotmux writes back the refreshed token to managed storage before overwriting.
+  // Botmux writes back the refreshed token to managed storage before overwriting.
   // On managed→system-default transition, if the file differs, an external
-  // login (e.g. `codex auth login`) overwrote it — so OrcaBotmux adopts the file as
+  // login (e.g. `codex auth login`) overwrote it — so Botmux adopts the file as
   // the new system default instead of restoring a stale snapshot.
   private lastWrittenAuthJson: string | null = null
   // Why: WSL terminals have their own stable runtime homes per distro. They
@@ -126,7 +126,7 @@ export class CodexRuntimeHomeService {
     )
     // Why: WSL-managed homes are never materialized into host ~/.codex.
     // Treating one as "last synced" makes cold start look like a host-account
-    // transition and can restore/delete host auth that OrcaBotmux never touched.
+    // transition and can restore/delete host auth that Botmux never touched.
     this.lastSyncedAccountId = this.getWslManagedHomePath(activeAccount)
       ? null
       : normalizeCodexRuntimeSelection(settings).host
@@ -338,9 +338,9 @@ export class CodexRuntimeHomeService {
           this.persistRuntimeLogoutMarker(null)
           this.lastWrittenAuthJson = null
         } else if (this.lastWrittenAuthJson === null) {
-          // Why: OrcaBotmux-launched Codex sessions now use an OrcaBotmux-owned CODEX_HOME
+          // Why: Botmux-launched Codex sessions now use an Botmux-owned CODEX_HOME
           // even when no managed account is selected. Seed that runtime home
-          // from the user's current system-default auth once so dev/prod OrcaBotmux
+          // from the user's current system-default auth once so dev/prod Botmux
           // terminals stay logged in without mutating ~/.codex on startup.
           this.restoreSystemDefaultSnapshot({ detectExternalLogin: false })
         } else {
@@ -377,7 +377,7 @@ export class CodexRuntimeHomeService {
     }
 
     // Why: Codex CLI refreshes expired OAuth tokens in CODEX_HOME/auth.json.
-    // If we detect the runtime file differs from what OrcaBotmux last wrote, the CLI
+    // If we detect the runtime file differs from what Botmux last wrote, the CLI
     // must have refreshed — so we preserve those tokens back to managed
     // storage before overwriting runtime with managed state.
     if (this.lastSyncedAccountId === activeAccount.id) {
@@ -463,7 +463,7 @@ export class CodexRuntimeHomeService {
         }
         return 'rejected'
       }
-      // Why: after app restart, OrcaBotmux has no last-written baseline. Identity
+      // Why: after app restart, Botmux has no last-written baseline. Identity
       // alone cannot prove runtime auth is newer than managed storage.
       if (
         lastWrittenAuthJson === null &&
@@ -534,7 +534,7 @@ export class CodexRuntimeHomeService {
       const settings = this.store.getSettings()
       const selectedAccountId = getSelectedCodexAccountIdForTarget(settings, target)
       if (selectedAccountId === null) {
-        // Why: the system-default account changes outside OrcaBotmux (login, logout,
+        // Why: the system-default account changes outside Botmux (login, logout,
         // token refresh). Read its real home directly so a cached runtime copy
         // cannot stay stale; filesystem probing in the fetcher is asynchronous.
         return this.getWslSystemCodexHomePath(target)
@@ -847,7 +847,7 @@ export class CodexRuntimeHomeService {
     // Why: old live Codex PTYs can still write refreshed tokens into the
     // shared runtime home after the user switches accounts. Never persist
     // that write into the newly active managed account unless the auth claims
-    // still match the account OrcaBotmux believes is selected.
+    // still match the account Botmux believes is selected.
     const selectedEmail = this.firstNonNull(
       this.normalizeField(activeAccount.email),
       managedIdentity?.email
@@ -895,7 +895,7 @@ export class CodexRuntimeHomeService {
 
     // Why: stale managed Codex PTYs share the same runtime home. Only read a
     // runtime refresh back into ~/.codex when the auth still claims the same
-    // system-default identity OrcaBotmux mirrored earlier.
+    // system-default identity Botmux mirrored earlier.
     if (
       systemDefaultIdentity.email &&
       runtimeIdentity.email &&
@@ -1085,7 +1085,7 @@ export class CodexRuntimeHomeService {
   }
 
   private getRuntimeHomePath(): string {
-    return getOrcaManagedCodexHomePath()
+    return getBotmuxManagedCodexHomePath()
   }
 
   private getRuntimeAuthPath(): string {
@@ -1260,7 +1260,7 @@ export class CodexRuntimeHomeService {
         continue
       }
       const managedHomePath = join(managedAccountsRoot, entry.name, 'home')
-      if (existsSync(join(managedHomePath, '.orca-botmux-managed-home'))) {
+      if (existsSync(join(managedHomePath, '.botmux-managed-home'))) {
         managedHomes.push(managedHomePath)
       }
     }
@@ -1358,7 +1358,7 @@ export class CodexRuntimeHomeService {
   private getPreservedLegacySessionPath(runtimeFilePath: string, accountId: string): string {
     const extension = extname(runtimeFilePath)
     const basename = runtimeFilePath.slice(0, runtimeFilePath.length - extension.length)
-    return `${basename}.orca-botmux-legacy-${accountId}${extension}`
+    return `${basename}.botmux-legacy-${accountId}${extension}`
   }
 
   private appendMigrationDiagnostic(record: Record<string, string>): void {
@@ -1418,7 +1418,7 @@ export class CodexRuntimeHomeService {
           systemDefaultAuth === mirroredSystemDefaultAuth &&
           this.runtimeAuthMatchesSystemDefaultIdentity(runtimeAuth, mirroredSystemDefaultAuth)
         ) {
-          // Why: system-default Codex now refreshes tokens inside OrcaBotmux's
+          // Why: system-default Codex now refreshes tokens inside Botmux's
           // runtime CODEX_HOME. Read that refresh back to ~/.codex so the next
           // sync does not overwrite fresh runtime credentials with stale ones.
           this.writeSystemDefaultAuth(runtimeAuth)
@@ -1427,7 +1427,7 @@ export class CodexRuntimeHomeService {
           return
         }
         // Why: the unmanaged path used to read ~/.codex directly. Mirror later
-        // external logins/logouts into OrcaBotmux's runtime home so ordinary OrcaBotmux
+        // external logins/logouts into Botmux's runtime home so ordinary Botmux
         // Codex sessions keep matching the user's current system-default state.
         this.captureSystemDefaultSnapshot({ force: true })
         this.writeRuntimeAuth(systemDefaultAuth)
@@ -1449,8 +1449,8 @@ export class CodexRuntimeHomeService {
     }
 
     if (options.detectExternalLogin && !existsSync(runtimeAuthPath)) {
-      // Why: once OrcaBotmux owns the runtime CODEX_HOME, deleting auth.json there is
-      // a local logout signal for OrcaBotmux-launched Codex sessions, not a reason to
+      // Why: once Botmux owns the runtime CODEX_HOME, deleting auth.json there is
+      // a local logout signal for Botmux-launched Codex sessions, not a reason to
       // rewrite the user's real ~/.codex snapshot back into place.
       this.persistRuntimeLogoutMarker()
       this.lastWrittenAuthJson = null
@@ -1507,9 +1507,9 @@ export class CodexRuntimeHomeService {
   }
 
   private clearRuntimeAuthAfterSystemDefaultLogout(runtimeAuthPath: string): void {
-    // Why: when the real ~/.codex auth disappears, OrcaBotmux should treat that as an
+    // Why: when the real ~/.codex auth disappears, Botmux should treat that as an
     // external logout for unmanaged sessions, even if runtime auth had already
-    // refreshed inside OrcaBotmux's CODEX_HOME.
+    // refreshed inside Botmux's CODEX_HOME.
     rmSync(runtimeAuthPath, { force: true })
     this.captureSystemDefaultSnapshot({ force: true })
     this.persistRuntimeLogoutMarker()

@@ -14,8 +14,8 @@ import {
   writeTextFileRemoteAtomic
 } from '../agent-hooks/installer-utils-remote'
 
-const AMP_PLUGIN_FILE = 'orca-botmux-agent-status.ts'
-const AMP_PLUGIN_MARKER = 'Managed by OrcaBotmux. Do not edit; changes may be overwritten.'
+const AMP_PLUGIN_FILE = 'botmux-agent-status.ts'
+const AMP_PLUGIN_MARKER = 'Managed by Botmux. Do not edit; changes may be overwritten.'
 
 type PluginFileState =
   | { kind: 'absent' }
@@ -87,7 +87,7 @@ function statusFromState(pluginPath: string, state: PluginFileState): AgentHookI
         state: 'partial',
         configPath: pluginPath,
         managedHooksPresent: false,
-        detail: 'Amp OrcaBotmux status plugin exists but is not OrcaBotmux-managed'
+        detail: 'Amp Botmux status plugin exists but is not Botmux-managed'
       }
     case 'error':
       return {
@@ -141,7 +141,7 @@ function getAmpPluginSource(): string {
     'let cachedEndpointValues: HookCoords | null = null',
     '',
     'function readEndpointFile(): HookCoords | null {',
-    '  const endpointPath = process.env.ORCA_AGENT_HOOK_ENDPOINT',
+    '  const endpointPath = process.env.BOTMUX_AGENT_HOOK_ENDPOINT',
     '  if (!endpointPath) return null',
     '  try {',
     '    const stat = statSync(endpointPath)',
@@ -155,10 +155,10 @@ function getAmpPluginSource(): string {
     '      const match = line.match(/^(?:set\\s+)?([A-Z0-9_]+)=(.*)$/)',
     '      if (!match) continue',
     '      const value = match[2].replace(/\\r$/, "")',
-    "      if (match[1] === 'ORCA_AGENT_HOOK_PORT') out.port = value",
-    "      if (match[1] === 'ORCA_AGENT_HOOK_TOKEN') out.token = value",
-    "      if (match[1] === 'ORCA_AGENT_HOOK_ENV') out.env = value",
-    "      if (match[1] === 'ORCA_AGENT_HOOK_VERSION') out.version = value",
+    "      if (match[1] === 'BOTMUX_AGENT_HOOK_PORT') out.port = value",
+    "      if (match[1] === 'BOTMUX_AGENT_HOOK_TOKEN') out.token = value",
+    "      if (match[1] === 'BOTMUX_AGENT_HOOK_ENV') out.env = value",
+    "      if (match[1] === 'BOTMUX_AGENT_HOOK_VERSION') out.version = value",
     '    }',
     '    cachedEndpointKey = cacheKey',
     '    cachedEndpointValues = out',
@@ -168,21 +168,21 @@ function getAmpPluginSource(): string {
     '    cachedEndpointValues = null',
     '    if ((error as { code?: unknown })?.code !== "ENOENT" && !warnedBadEndpoint) {',
     '      warnedBadEndpoint = true',
-    "      console.warn('[orca-botmux-hook] failed to parse Amp endpoint file:', (error as Error).message)",
+    "      console.warn('[botmux-hook] failed to parse Amp endpoint file:', (error as Error).message)",
     '    }',
     '    return null',
     '  }',
     '}',
     '',
     'function resolveHookCoords(): HookCoords {',
-    '  // Why: Amp sessions can outlive an OrcaBotmux restart; the endpoint file is',
+    '  // Why: Amp sessions can outlive an Botmux restart; the endpoint file is',
     '  // rewritten on each start, so read it per event before falling back to env.',
     '  const fileEnv = readEndpointFile() ?? {}',
     '  return {',
-    '    port: fileEnv.port || process.env.ORCA_AGENT_HOOK_PORT,',
-    '    token: fileEnv.token || process.env.ORCA_AGENT_HOOK_TOKEN,',
-    '    env: fileEnv.env || process.env.ORCA_AGENT_HOOK_ENV || "",',
-    '    version: fileEnv.version || process.env.ORCA_AGENT_HOOK_VERSION || ""',
+    '    port: fileEnv.port || process.env.BOTMUX_AGENT_HOOK_PORT,',
+    '    token: fileEnv.token || process.env.BOTMUX_AGENT_HOOK_TOKEN,',
+    '    env: fileEnv.env || process.env.BOTMUX_AGENT_HOOK_ENV || "",',
+    '    version: fileEnv.version || process.env.BOTMUX_AGENT_HOOK_VERSION || ""',
     '  }',
     '}',
     '',
@@ -218,7 +218,7 @@ function getAmpPluginSource(): string {
     '',
     'async function post(hookEventName: string, payload: Record<string, unknown>): Promise<void> {',
     '  const coords = resolveHookCoords()',
-    '  const paneKey = process.env.ORCA_PANE_KEY',
+    '  const paneKey = process.env.BOTMUX_PANE_KEY',
     '  if (!coords.port || !coords.token || !paneKey) return',
     '  const controller = new AbortController()',
     '  const timeout = setTimeout(() => controller.abort(), 1000)',
@@ -228,13 +228,13 @@ function getAmpPluginSource(): string {
     '      signal: controller.signal,',
     '      headers: {',
     '        "Content-Type": "application/json",',
-    '        "X-OrcaBotmux-Agent-Hook-Token": coords.token',
+    '        "X-Botmux-Agent-Hook-Token": coords.token',
     '      },',
     '      body: JSON.stringify({',
     '        paneKey,',
-    '        launchToken: process.env.ORCA_AGENT_LAUNCH_TOKEN || "",',
-    '        tabId: process.env.ORCA_TAB_ID || "",',
-    '        worktreeId: process.env.ORCA_WORKTREE_ID || "",',
+    '        launchToken: process.env.BOTMUX_AGENT_LAUNCH_TOKEN || "",',
+    '        tabId: process.env.BOTMUX_TAB_ID || "",',
+    '        worktreeId: process.env.BOTMUX_WORKTREE_ID || "",',
     '        env: coords.env,',
     '        version: coords.version,',
     '        hook_event_name: hookEventName,',
@@ -242,7 +242,7 @@ function getAmpPluginSource(): string {
     '      })',
     '    })',
     '  } catch {',
-    '    // Why: OrcaBotmux status reporting must never affect the Amp run.',
+    '    // Why: Botmux status reporting must never affect the Amp run.',
     '  } finally {',
     '    clearTimeout(timeout)',
     '  }',
@@ -271,7 +271,7 @@ function getAmpPluginSource(): string {
     '}',
     'function enqueuePost(hookEventName: string, payload: Record<string, unknown>): void {',
     '  // Why: keep hook callbacks non-blocking without retaining unbounded',
-    '  // payload closures when OrcaBotmux is down and each POST waits for timeout.',
+    '  // payload closures when Botmux is down and each POST waits for timeout.',
     '  if (postQueue.length >= MAX_PENDING_POSTS) {',
     '    postQueue.shift()',
     '  }',

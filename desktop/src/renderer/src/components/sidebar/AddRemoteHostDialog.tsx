@@ -234,7 +234,7 @@ export function AddRemoteHostDialog({
             {mode === 'server'
               ? translate(
                   'auto.components.sidebar.AddRemoteHostDialog.serverDescription',
-                  'Pair with OrcaBotmux running on another computer.'
+                  'Pair with Botmux running on another computer.'
                 )
               : translate(
                   'auto.components.sidebar.AddRemoteHostDialog.sshDescription',

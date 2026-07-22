@@ -43,19 +43,19 @@ async function makeFixture(): Promise<{
   userDataPath: string
   appPath: string
 }> {
-  const root = await mkdtemp(join(tmpdir(), 'orca-botmux-cli-installer-'))
+  const root = await mkdtemp(join(tmpdir(), 'botmux-cli-installer-'))
   const userDataPath = join(root, 'userData')
   const appPath = join(root, 'app')
   const cliEntryPath = join(appPath, 'out', 'cli', 'index.js')
   await mkdir(join(appPath, 'out', 'cli'), { recursive: true })
-  await writeFile(cliEntryPath, 'console.log("orca_botmux")\n', 'utf8')
+  await writeFile(cliEntryPath, 'console.log("botmux")\n', 'utf8')
   return { root, userDataPath, appPath }
 }
 
 async function createPackagedMacLauncher(root: string): Promise<string> {
   const resourcesPath = join(root, 'resources')
   await mkdir(join(resourcesPath, 'bin'), { recursive: true })
-  await writeFile(join(resourcesPath, 'bin', 'orca_botmux'), '#!/usr/bin/env bash\necho orca_botmux\n', {
+  await writeFile(join(resourcesPath, 'bin', 'botmux'), '#!/usr/bin/env bash\necho botmux\n', {
     encoding: 'utf8',
     mode: 0o755
   })
@@ -77,12 +77,12 @@ describe('CliInstaller', () => {
     'creates a dev launcher and installs a macOS symlink in the requested path',
     async () => {
       const fixture = await makeFixture()
-      const installPath = join(fixture.root, 'bin', 'orca_botmux')
+      const installPath = join(fixture.root, 'bin', 'botmux')
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         commandPathOverride: installPath,
         processPathEnv: join(fixture.root, 'bin')
@@ -90,7 +90,7 @@ describe('CliInstaller', () => {
 
       const initial = await installer.getStatus()
       expect(initial.state).toBe('not_installed')
-      expect(initial.launcherPath).toContain(join('userData', 'cli', 'bin', 'orca_botmux'))
+      expect(initial.launcherPath).toContain(join('userData', 'cli', 'bin', 'botmux'))
 
       const installed = await installer.install()
       expect(installed.state).toBe('installed')
@@ -98,8 +98,8 @@ describe('CliInstaller', () => {
 
       const launcherContent = await readFile(installed.launcherPath as string, 'utf8')
       expect(launcherContent).toContain('ELECTRON_RUN_AS_NODE=1')
-      expect(launcherContent).toContain(`export ORCA_USER_DATA_PATH='${fixture.userDataPath}'`)
-      expect(launcherContent).toContain('export ORCA_APP_EXECUTABLE="$ELECTRON"')
+      expect(launcherContent).toContain(`export BOTMUX_USER_DATA_PATH='${fixture.userDataPath}'`)
+      expect(launcherContent).toContain('export BOTMUX_APP_EXECUTABLE="$ELECTRON"')
       expect(launcherContent).toContain(join(fixture.appPath, 'out', 'cli', 'index.js'))
 
       const removed = await installer.remove()
@@ -112,12 +112,12 @@ describe('CliInstaller', () => {
     'creates a linux symlink under the requested path and warns when PATH is missing',
     async () => {
       const fixture = await makeFixture()
-      const installPath = join(fixture.root, '.local', 'bin', 'orca-botmux-ide')
+      const installPath = join(fixture.root, '.local', 'bin', 'botmux-ide')
       const installer = new CliInstaller({
         platform: 'linux',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: '/opt/OrcaBotmux/orca-botmux-ide',
+        execPath: '/opt/Botmux/botmux-ide',
         appPath: fixture.appPath,
         commandPathOverride: installPath,
         processPathEnv: '/usr/bin'
@@ -125,13 +125,13 @@ describe('CliInstaller', () => {
 
       const installed = await installer.install()
       expect(installed.state).toBe('installed')
-      expect(installed.commandName).toBe('orca-botmux-ide')
+      expect(installed.commandName).toBe('botmux-ide')
       expect(installed.pathConfigured).toBe(false)
       expect(installed.detail).toContain('.local')
 
       const launcherContent = await readFile(installed.launcherPath as string, 'utf8')
       expect(launcherContent).toContain('ELECTRON_RUN_AS_NODE=1')
-      expect(launcherContent).toContain(`export ORCA_USER_DATA_PATH='${fixture.userDataPath}'`)
+      expect(launcherContent).toContain(`export BOTMUX_USER_DATA_PATH='${fixture.userDataPath}'`)
 
       const removed = await installer.remove()
       expect(removed.state).toBe('not_installed')
@@ -139,9 +139,9 @@ describe('CliInstaller', () => {
   )
 
   // Why: dev installs are useful for validation, but they must not replace the
-  // packaged `orca_botmux` / `orca-botmux-ide` commands developers rely on day to day.
+  // packaged `botmux` / `botmux-ide` commands developers rely on day to day.
   it.skipIf(process.platform === 'win32')(
-    'uses a separate orca-botmux-desktop-dev command for default development installs',
+    'uses a separate botmux-desktop-dev command for default development installs',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
@@ -150,7 +150,7 @@ describe('CliInstaller', () => {
         platform: 'linux',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: '/opt/OrcaBotmux/orca-botmux-ide',
+        execPath: '/opt/Botmux/botmux-ide',
         appPath: fixture.appPath,
         homePath,
         processPathEnv: commandDir
@@ -158,12 +158,12 @@ describe('CliInstaller', () => {
 
       const installed = await installer.install()
       expect(installed.state).toBe('installed')
-      expect(installed.commandName).toBe('orca-botmux-desktop-dev')
-      expect(installed.commandPath).toBe(join(commandDir, 'orca-botmux-desktop-dev'))
-      expect(installed.launcherPath).toBe(join(fixture.userDataPath, 'cli', 'bin', 'orca-botmux-desktop-dev'))
+      expect(installed.commandName).toBe('botmux-desktop-dev')
+      expect(installed.commandPath).toBe(join(commandDir, 'botmux-desktop-dev'))
+      expect(installed.launcherPath).toBe(join(fixture.userDataPath, 'cli', 'bin', 'botmux-desktop-dev'))
       await expect(readlink(installed.commandPath as string)).resolves.toBe(installed.launcherPath)
       await expect(
-        readFile(join(fixture.userDataPath, 'cli', 'bin', 'orca_botmux'), 'utf8')
+        readFile(join(fixture.userDataPath, 'cli', 'bin', 'botmux'), 'utf8')
       ).resolves.toBe(await readFile(installed.launcherPath as string, 'utf8'))
     }
   )
@@ -175,8 +175,8 @@ describe('CliInstaller', () => {
     async () => {
       const fixture = await makeFixture()
       const commandDir = join(fixture.root, '.local', 'bin')
-      const installPath = join(commandDir, 'orca-botmux-ide')
-      const appImagePath = join(fixture.root, 'OrcaBotmux.AppImage')
+      const installPath = join(commandDir, 'botmux-ide')
+      const appImagePath = join(fixture.root, 'Botmux.AppImage')
       await writeFile(appImagePath, '#!/usr/bin/env bash\n', {
         encoding: 'utf8',
         mode: 0o755
@@ -200,7 +200,7 @@ describe('CliInstaller', () => {
       const installed = await installer.install()
       expect(installed).toMatchObject({
         state: 'installed',
-        commandName: 'orca-botmux-ide',
+        commandName: 'botmux-ide',
         installMethod: 'wrapper',
         launcherPath: appImagePath,
         currentTarget: appImagePath,
@@ -225,9 +225,9 @@ describe('CliInstaller', () => {
     async () => {
       const fixture = await makeFixture()
       const commandDir = join(fixture.root, '.local', 'bin')
-      const installPath = join(commandDir, 'orca-botmux-ide')
-      const oldAppImagePath = join(fixture.root, 'Old-OrcaBotmux.AppImage')
-      const newAppImagePath = join(fixture.root, 'OrcaBotmux.AppImage')
+      const installPath = join(commandDir, 'botmux-ide')
+      const oldAppImagePath = join(fixture.root, 'Old-Botmux.AppImage')
+      const newAppImagePath = join(fixture.root, 'Botmux.AppImage')
       await mkdir(commandDir, { recursive: true })
       await writeFile(installPath, buildAppImageCliWrapper(oldAppImagePath), {
         encoding: 'utf8',
@@ -259,18 +259,18 @@ describe('CliInstaller', () => {
     }
   )
 
-  // Why: Linux renamed the public command to avoid shadowing GNOME OrcaBotmux, so
-  // upgrading must clean up only the old symlink owned by prior OrcaBotmux installs.
+  // Why: Linux packaged public command is botmux-ide, so
+  // upgrading must clean up only the old symlink owned by prior Botmux installs.
   it.skipIf(process.platform === 'win32')(
-    'removes the old managed linux orca_botmux symlink when installing orca-botmux-ide',
+    'removes the old managed linux botmux symlink when installing botmux-ide',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const commandDir = join(homePath, '.local', 'bin')
       const resourcesPath = join(fixture.root, 'resources')
-      const launcherPath = join(resourcesPath, 'bin', 'orca-botmux-ide')
-      const oldLauncherPath = join(resourcesPath, 'bin', 'orca_botmux')
-      const legacyCommandPath = join(commandDir, 'orca_botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux-ide')
+      const oldLauncherPath = join(resourcesPath, 'bin', 'botmux')
+      const legacyCommandPath = join(commandDir, 'botmux')
       await mkdir(commandDir, { recursive: true })
       await mkdir(join(resourcesPath, 'bin'), { recursive: true })
       await writeFile(launcherPath, '#!/usr/bin/env bash\n', 'utf8')
@@ -286,25 +286,25 @@ describe('CliInstaller', () => {
       })
 
       const installed = await installer.install()
-      expect(installed.commandPath).toBe(join(commandDir, 'orca-botmux-ide'))
+      expect(installed.commandPath).toBe(join(commandDir, 'botmux-ide'))
       await expect(lstat(legacyCommandPath)).rejects.toMatchObject({ code: 'ENOENT' })
     }
   )
 
   it.skipIf(process.platform === 'win32')(
-    'removes a legacy linux orca_botmux symlink when installing an AppImage wrapper',
+    'removes a legacy linux botmux symlink when installing an AppImage wrapper',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const commandDir = join(homePath, '.local', 'bin')
-      const legacyCommandPath = join(commandDir, 'orca_botmux')
-      const appImagePath = join(fixture.root, 'OrcaBotmux.AppImage')
+      const legacyCommandPath = join(commandDir, 'botmux')
+      const appImagePath = join(fixture.root, 'Botmux.AppImage')
       await mkdir(commandDir, { recursive: true })
       await writeFile(appImagePath, '#!/usr/bin/env bash\n', {
         encoding: 'utf8',
         mode: 0o755
       })
-      await symlink(join('/tmp', '.mount_Orca1234', 'resources', 'bin', 'orca_botmux'), legacyCommandPath)
+      await symlink(join('/tmp', '.mount_Botmux1234', 'resources', 'bin', 'botmux'), legacyCommandPath)
 
       const installer = new CliInstaller({
         platform: 'linux',
@@ -315,20 +315,20 @@ describe('CliInstaller', () => {
       })
 
       const installed = await installer.install()
-      expect(installed.commandPath).toBe(join(commandDir, 'orca-botmux-ide'))
+      expect(installed.commandPath).toBe(join(commandDir, 'botmux-ide'))
       await expect(lstat(legacyCommandPath)).rejects.toMatchObject({ code: 'ENOENT' })
     }
   )
 
   it('creates a windows wrapper and updates the user PATH', async () => {
     const fixture = await makeFixture()
-    const installPath = join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+    const installPath = join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd')
     let userPath = 'C:\\Windows\\System32'
     const installer = new CliInstaller({
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
       commandPathOverride: installPath,
       userPathReader: async () => userPathRead(userPath),
@@ -340,30 +340,30 @@ describe('CliInstaller', () => {
     const installed = await installer.install()
     expect(installed.state).toBe('installed')
     expect(installed.pathConfigured).toBe(true)
-    expect(userPath).toContain(join(fixture.root, 'Programs', 'orca_botmux', 'bin'))
+    expect(userPath).toContain(join(fixture.root, 'Programs', 'botmux', 'bin'))
 
     const wrapperContent = await readFile(installPath, 'utf8')
-    expect(wrapperContent).toContain('ORCA_LAUNCHER=')
-    expect(wrapperContent).toContain('orca_botmux.cmd')
+    expect(wrapperContent).toContain('BOTMUX_LAUNCHER=')
+    expect(wrapperContent).toContain('botmux.cmd')
     const launcherContent = await readFile(installed.launcherPath as string, 'utf8')
-    expect(launcherContent).toContain(`set "ORCA_USER_DATA_PATH=${fixture.userDataPath}"`)
-    expect(launcherContent).toContain('set "ORCA_APP_EXECUTABLE=%ELECTRON%"')
+    expect(launcherContent).toContain(`set "BOTMUX_USER_DATA_PATH=${fixture.userDataPath}"`)
+    expect(launcherContent).toContain('set "BOTMUX_APP_EXECUTABLE=%ELECTRON%"')
 
     const removed = await installer.remove()
     expect(removed.state).toBe('not_installed')
-    expect(userPath).not.toContain(join(fixture.root, 'Programs', 'orca_botmux', 'bin'))
+    expect(userPath).not.toContain(join(fixture.root, 'Programs', 'botmux', 'bin'))
   })
 
   it.each(['UnauthorizedAccessException', 'SecurityException'])(
     'rejects with a friendly message for Windows PATH denial: %s',
     async (permissionMarker) => {
       const fixture = await makeFixture()
-      const installPath = join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+      const installPath = join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd')
       const installer = new CliInstaller({
         platform: 'win32',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+        execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
         appPath: fixture.appPath,
         commandPathOverride: installPath,
         userPathReader: async () => userPathRead('C:\\Windows\\System32'),
@@ -395,9 +395,9 @@ describe('CliInstaller', () => {
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
-      commandPathOverride: join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd'),
+      commandPathOverride: join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd'),
       userPathReader: async () => userPathRead('C:\\Windows\\System32'),
       userPathWriter
     })
@@ -416,12 +416,12 @@ describe('CliInstaller', () => {
     'propagates a non-permission Windows PATH write error unchanged: %s',
     async (_name, message) => {
       const fixture = await makeFixture()
-      const installPath = join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+      const installPath = join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd')
       const installer = new CliInstaller({
         platform: 'win32',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+        execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
         appPath: fixture.appPath,
         commandPathOverride: installPath,
         userPathReader: async () => userPathRead('C:\\Windows\\System32'),
@@ -438,17 +438,17 @@ describe('CliInstaller', () => {
 
   it('reports an unknown Windows PATH without spawning PowerShell', async () => {
     const fixture = await makeFixture()
-    const installPath = join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+    const installPath = join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd')
     const installer = new CliInstaller({
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
       commandPathOverride: installPath,
       userPathReader: async () => ({
         state: 'unknown',
-        detail: 'OrcaBotmux could not read the Windows user PATH registry value.'
+        detail: 'Botmux could not read the Windows user PATH registry value.'
       })
     })
 
@@ -467,12 +467,12 @@ describe('CliInstaller', () => {
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
-      commandPathOverride: join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd'),
+      commandPathOverride: join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd'),
       userPathReader: async () => ({
         state: 'unknown',
-        detail: 'OrcaBotmux could not read the Windows user PATH registry value.'
+        detail: 'Botmux could not read the Windows user PATH registry value.'
       }),
       userPathWriter
     })
@@ -483,7 +483,7 @@ describe('CliInstaller', () => {
 
   it('bypasses cached status data before a Windows PATH mutation', async () => {
     const fixture = await makeFixture()
-    const installPath = join(fixture.root, 'Programs', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+    const installPath = join(fixture.root, 'Programs', 'botmux', 'bin', 'botmux.cmd')
     const pathDirectory = dirname(installPath)
     let registryPath = 'C:\\Tools'
     const registryReader = new WindowsUserPathRegistryReader({
@@ -502,7 +502,7 @@ describe('CliInstaller', () => {
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
       commandPathOverride: installPath,
       userPathReader: () => registryReader.read(),
@@ -522,17 +522,17 @@ describe('CliInstaller', () => {
 
   it('matches expandable Windows PATH entries case-insensitively without rewriting them', async () => {
     const fixture = await makeFixture()
-    const installPath = join(fixture.root, 'Local App Data', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+    const installPath = join(fixture.root, 'Local App Data', 'botmux', 'bin', 'botmux.cmd')
     const userPathWriter = vi.fn()
     const installer = new CliInstaller({
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
       commandPathOverride: installPath,
       windowsEnvironment: { LOCALAPPDATA: join(fixture.root, 'Local App Data') },
-      userPathReader: async () => userPathRead('%localappdata%\\OrcaBotmux\\bin\\', true),
+      userPathReader: async () => userPathRead('%localappdata%\\Botmux\\bin\\', true),
       userPathWriter
     })
 
@@ -545,33 +545,33 @@ describe('CliInstaller', () => {
 
   it('does not expand environment variables stored in a REG_SZ Windows PATH', async () => {
     const fixture = await makeFixture()
-    const installPath = join(fixture.root, 'Local App Data', 'orca_botmux', 'bin', 'orca_botmux.cmd')
+    const installPath = join(fixture.root, 'Local App Data', 'botmux', 'bin', 'botmux.cmd')
     const pathDirectory = dirname(installPath)
     const userPathWriter = vi.fn()
     const installer = new CliInstaller({
       platform: 'win32',
       isPackaged: false,
       userDataPath: fixture.userDataPath,
-      execPath: 'C:\\Users\\me\\AppData\\Local\\OrcaBotmux\\OrcaBotmux.exe',
+      execPath: 'C:\\Users\\me\\AppData\\Local\\Botmux\\Botmux.exe',
       appPath: fixture.appPath,
       commandPathOverride: installPath,
       windowsEnvironment: { LOCALAPPDATA: join(fixture.root, 'Local App Data') },
-      userPathReader: async () => userPathRead('%LOCALAPPDATA%\\OrcaBotmux\\bin'),
+      userPathReader: async () => userPathRead('%LOCALAPPDATA%\\Botmux\\bin'),
       userPathWriter
     })
 
     await installer.install()
 
-    expect(userPathWriter).toHaveBeenCalledWith(`%LOCALAPPDATA%\\OrcaBotmux\\bin;${pathDirectory}`)
+    expect(userPathWriter).toHaveBeenCalledWith(`%LOCALAPPDATA%\\Botmux\\bin;${pathDirectory}`)
   })
 
-  // Why: this test creates a Unix symlink to /tmp/not-orca_botmux, which only applies on macOS/Linux.
+  // Why: this test creates a Unix symlink to /tmp/not-botmux, which only applies on macOS/Linux.
   it.skipIf(process.platform === 'win32')(
     'refuses to replace an unknown symlink at the command path',
     async () => {
       const fixture = await makeFixture()
-      const installPath = join(fixture.root, 'bin', 'orca_botmux')
-      const existingTarget = '/tmp/not-orca_botmux'
+      const installPath = join(fixture.root, 'bin', 'botmux')
+      const existingTarget = '/tmp/not-botmux'
       await mkdir(join(fixture.root, 'bin'), { recursive: true })
       await symlink(existingTarget, installPath)
 
@@ -579,7 +579,7 @@ describe('CliInstaller', () => {
         platform: 'darwin',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         commandPathOverride: installPath
       })
@@ -588,22 +588,22 @@ describe('CliInstaller', () => {
         state: 'conflict',
         supported: true
       })
-      await expect(installer.install()).rejects.toThrow('Refusing to replace non-OrcaBotmux command')
+      await expect(installer.install()).rejects.toThrow('Refusing to replace non-Botmux command')
       await expect(readlink(installPath)).resolves.toBe(existingTarget)
     }
   )
 
-  // Why: packaged app moves can leave a symlink to an older OrcaBotmux-owned launcher;
+  // Why: packaged app moves can leave a symlink to an older Botmux-owned launcher;
   // those are safe to refresh, unlike arbitrary user symlinks.
   it.skipIf(process.platform === 'win32')(
-    'replaces stale packaged OrcaBotmux launcher symlinks',
+    'replaces stale packaged Botmux launcher symlinks',
     async () => {
       const fixture = await makeFixture()
       const commandDir = join(fixture.root, 'bin')
-      const installPath = join(commandDir, 'orca_botmux')
+      const installPath = join(commandDir, 'botmux')
       const resourcesPath = join(fixture.root, 'Current.app', 'Contents', 'Resources')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
-      const oldLauncherPath = join(fixture.root, 'Old.app', 'Contents', 'Resources', 'bin', 'orca_botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
+      const oldLauncherPath = join(fixture.root, 'Old.app', 'Contents', 'Resources', 'bin', 'botmux')
       await mkdir(commandDir, { recursive: true })
       await mkdir(join(resourcesPath, 'bin'), { recursive: true })
       await writeFile(launcherPath, '#!/usr/bin/env bash\n', 'utf8')
@@ -626,17 +626,17 @@ describe('CliInstaller', () => {
     }
   )
 
-  // Why: old dev/package experiments wrote a generated OrcaBotmux launcher file
-  // directly into /usr/local/bin/orca_botmux. That broke profiling because Settings
+  // Why: old dev/package experiments wrote a generated Botmux launcher file
+  // directly into /usr/local/bin/botmux. That broke profiling because Settings
   // treated the regular file as a hard conflict and would not self-heal it.
   it.skipIf(process.platform === 'win32')(
     'replaces stale generated Unix launcher files',
     async () => {
       const fixture = await makeFixture()
       const commandDir = join(fixture.root, 'bin')
-      const installPath = join(commandDir, 'orca_botmux')
+      const installPath = join(commandDir, 'botmux')
       const resourcesPath = join(fixture.root, 'Current.app', 'Contents', 'Resources')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       const oldCliPath = join(fixture.root, 'OldWorktree', 'out', 'cli', 'index.js')
       await mkdir(commandDir, { recursive: true })
       await mkdir(join(resourcesPath, 'bin'), { recursive: true })
@@ -648,8 +648,8 @@ describe('CliInstaller', () => {
           'set -euo pipefail',
           "ELECTRON='/tmp/Old.app/Contents/MacOS/Electron'",
           `CLI='${oldCliPath}'`,
-          'export ORCA_NODE_OPTIONS="${NODE_OPTIONS-}"',
-          'export ORCA_NODE_REPL_EXTERNAL_MODULE="${NODE_REPL_EXTERNAL_MODULE-}"',
+          'export BOTMUX_NODE_OPTIONS="${NODE_OPTIONS-}"',
+          'export BOTMUX_NODE_REPL_EXTERNAL_MODULE="${NODE_REPL_EXTERNAL_MODULE-}"',
           'unset NODE_OPTIONS',
           'unset NODE_REPL_EXTERNAL_MODULE',
           'ELECTRON_RUN_AS_NODE=1 "$ELECTRON" "$CLI" "$@"',
@@ -680,12 +680,12 @@ describe('CliInstaller', () => {
     async () => {
       const fixture = await makeFixture()
       const commandDir = join(fixture.root, 'bin')
-      const installPath = join(commandDir, 'orca_botmux')
+      const installPath = join(commandDir, 'botmux')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       await mkdir(commandDir, { recursive: true })
       await writeFile(
         installPath,
-        '#!/usr/bin/env bash\nELECTRON_RUN_AS_NODE=1 /tmp/not-orca_botmux "$@"\n',
+        '#!/usr/bin/env bash\nELECTRON_RUN_AS_NODE=1 /tmp/not-botmux "$@"\n',
         'utf8'
       )
 
@@ -701,24 +701,24 @@ describe('CliInstaller', () => {
         state: 'conflict',
         currentTarget: null
       })
-      await expect(installer.install()).rejects.toThrow('Refusing to replace non-OrcaBotmux command')
-      await expect(readFile(installPath, 'utf8')).resolves.toContain('/tmp/not-orca_botmux')
+      await expect(installer.install()).rejects.toThrow('Refusing to replace non-Botmux command')
+      await expect(readFile(installPath, 'utf8')).resolves.toContain('/tmp/not-botmux')
     }
   )
 
   // Why: a dev build can temporarily own the public command on developer
-  // machines; packaged OrcaBotmux should treat that as stale, not a hard conflict.
+  // machines; packaged Botmux should treat that as stale, not a hard conflict.
   it.skipIf(process.platform === 'win32')(
     'replaces stale sibling dev launcher symlinks from packaged installs',
     async () => {
       const fixture = await makeFixture()
-      for (const devLauncherName of ['orca_botmux', 'orca-botmux-desktop-dev']) {
+      for (const devLauncherName of ['botmux', 'botmux-desktop-dev']) {
         const caseRoot = join(fixture.root, devLauncherName)
         const commandDir = join(caseRoot, 'bin')
-        const installPath = join(commandDir, 'orca_botmux')
-        const userDataPath = join(caseRoot, 'orca_botmux')
+        const installPath = join(commandDir, 'botmux')
+        const userDataPath = join(caseRoot, 'botmux')
         const resourcesPath = join(caseRoot, 'Current.app', 'Contents', 'Resources')
-        const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+        const launcherPath = join(resourcesPath, 'bin', 'botmux')
         const devLauncherPath = join(`${userDataPath}-dev`, 'cli', 'bin', devLauncherName)
         await mkdir(commandDir, { recursive: true })
         await mkdir(join(resourcesPath, 'bin'), { recursive: true })
@@ -750,20 +750,20 @@ describe('CliInstaller', () => {
   // must fall back to ~/.local/bin (user-writable, no sudo) rather than failing
   // silently when the parent directory is absent.
   it.skipIf(process.platform === 'win32')(
-    'falls back to ~/.local/bin/orca_botmux on macOS when /usr/local/bin does not exist',
+    'falls back to ~/.local/bin/botmux on macOS when /usr/local/bin does not exist',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       // Simulate arm64: point defaultMacCommandPath at a dir that does not exist
       // in the fixture so existsSync(dirname(...)) returns false.
-      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'orca_botmux')
+      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'botmux')
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: absentUsrLocalBin,
@@ -771,13 +771,13 @@ describe('CliInstaller', () => {
       })
 
       const status = await installer.getStatus()
-      expect(status.commandPath).toBe(join(homePath, '.local', 'bin', 'orca_botmux'))
+      expect(status.commandPath).toBe(join(homePath, '.local', 'bin', 'botmux'))
       expect(status.state).toBe('not_installed')
       expect(status.supported).toBe(true)
 
       const installed = await installer.install()
       expect(installed.state).toBe('installed')
-      expect(installed.commandPath).toBe(join(homePath, '.local', 'bin', 'orca_botmux'))
+      expect(installed.commandPath).toBe(join(homePath, '.local', 'bin', 'botmux'))
       expect(installed.pathConfigured).toBe(true)
     }
   )
@@ -785,20 +785,20 @@ describe('CliInstaller', () => {
   // Why: on Intel Macs /usr/local/bin exists, so the installer must keep using
   // it as the canonical path and not regress to ~/.local/bin.
   it.skipIf(process.platform === 'win32')(
-    'uses /usr/local/bin/orca_botmux on macOS when /usr/local/bin exists',
+    'uses /usr/local/bin/botmux on macOS when /usr/local/bin exists',
     async () => {
       const fixture = await makeFixture()
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       await mkdir(usrLocalBin, { recursive: true })
 
-      const installPath = join(usrLocalBin, 'orca_botmux')
+      const installPath = join(usrLocalBin, 'botmux')
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         defaultMacCommandPath: installPath,
         processPathEnv: usrLocalBin
@@ -811,19 +811,19 @@ describe('CliInstaller', () => {
     }
   )
 
-  // Why: users can have a managed OrcaBotmux command in ~/.local/bin even when
+  // Why: users can have a managed Botmux command in ~/.local/bin even when
   // /usr/local/bin exists; Settings must follow the shell-visible command.
   it.skipIf(process.platform === 'win32')(
-    'uses an existing managed macOS orca_botmux command from the shell PATH before /usr/local/bin',
+    'uses an existing managed macOS botmux command from the shell PATH before /usr/local/bin',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
       await symlink(launcherPath, userInstallPath)
@@ -833,7 +833,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -855,17 +855,17 @@ describe('CliInstaller', () => {
   // Why: POSIX command lookup skips broken symlinks and keeps searching PATH,
   // so a stale earlier artifact must not steal status from the install path.
   it.skipIf(process.platform === 'win32')(
-    'skips a broken managed macOS orca_botmux symlink before /usr/local/bin',
+    'skips a broken managed macOS botmux symlink before /usr/local/bin',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
-      const oldLauncherPath = join(fixture.root, 'Old.app', 'Contents', 'Resources', 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
+      const oldLauncherPath = join(fixture.root, 'Old.app', 'Contents', 'Resources', 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
       await symlink(oldLauncherPath, userInstallPath)
@@ -875,7 +875,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -898,18 +898,18 @@ describe('CliInstaller', () => {
   )
 
   // Why: PATH lookup stops at the first existing command; a later managed
-  // ~/.local/bin/orca_botmux must not steal status from /usr/local/bin/orca_botmux.
+  // ~/.local/bin/botmux must not steal status from /usr/local/bin/botmux.
   it.skipIf(process.platform === 'win32')(
-    'keeps the default macOS command when a managed orca_botmux appears later on PATH',
+    'keeps the default macOS command when a managed botmux appears later on PATH',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
       await symlink(launcherPath, defaultInstallPath)
@@ -920,7 +920,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -934,18 +934,18 @@ describe('CliInstaller', () => {
   )
 
   // Why: shells skip missing PATH entries, so a managed command later in PATH
-  // is still the shell-visible OrcaBotmux command until the default path is installed.
+  // is still the shell-visible Botmux command until the default path is installed.
   it.skipIf(process.platform === 'win32')(
-    'uses a later managed macOS orca_botmux command when the default command is missing',
+    'uses a later managed macOS botmux command when the default command is missing',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
       await symlink(launcherPath, userInstallPath)
@@ -955,7 +955,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -972,22 +972,22 @@ describe('CliInstaller', () => {
     }
   )
 
-  // Why: bash/zsh skip non-executable PATH entries even at OrcaBotmux's configured
+  // Why: bash/zsh skip non-executable PATH entries even at Botmux's configured
   // install slot, then keep looking for a runnable command later in PATH.
   it.skipIf(process.platform === 'win32')(
-    'uses a later managed macOS orca_botmux command when the default command is not executable',
+    'uses a later managed macOS botmux command when the default command is not executable',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
-      await writeFile(defaultInstallPath, '#!/usr/bin/env bash\necho other-orca_botmux\n', 'utf8')
+      await writeFile(defaultInstallPath, '#!/usr/bin/env bash\necho other-botmux\n', 'utf8')
       await symlink(launcherPath, userInstallPath)
 
       const installer = new CliInstaller({
@@ -995,7 +995,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -1008,11 +1008,11 @@ describe('CliInstaller', () => {
 
       const installed = await installer.install()
       expect(installed.commandPath).toBe(userInstallPath)
-      await expect(readFile(defaultInstallPath, 'utf8')).resolves.toContain('other-orca_botmux')
+      await expect(readFile(defaultInstallPath, 'utf8')).resolves.toContain('other-botmux')
     }
   )
 
-  // Why: a non-OrcaBotmux command after an empty default install slot can be shadowed
+  // Why: a non-Botmux command after an empty default install slot can be shadowed
   // by installing the default path without replacing the user's command.
   it.skipIf(process.platform === 'win32')(
     'installs the default macOS command instead of replacing an unmanaged later command',
@@ -1022,12 +1022,12 @@ describe('CliInstaller', () => {
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
-      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-orca_botmux\n', {
+      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-botmux\n', {
         encoding: 'utf8',
         mode: 0o755
       })
@@ -1037,7 +1037,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -1052,23 +1052,23 @@ describe('CliInstaller', () => {
       expect(installed.commandPath).toBe(defaultInstallPath)
       expect(installed.state).toBe('installed')
       await expect(readlink(defaultInstallPath)).resolves.toBe(launcherPath)
-      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-orca_botmux')
+      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-botmux')
     }
   )
 
-  // Why: an off-PATH ~/.local/bin/orca_botmux must not hijack CLI registration and
+  // Why: an off-PATH ~/.local/bin/botmux must not hijack CLI registration and
   // leave the shell-visible /usr/local/bin command missing.
   it.skipIf(process.platform === 'win32')(
-    'ignores managed macOS orca_botmux commands that are not visible on the shell PATH',
+    'ignores managed macOS botmux commands that are not visible on the shell PATH',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
       await symlink(launcherPath, userInstallPath)
@@ -1078,7 +1078,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -1099,18 +1099,18 @@ describe('CliInstaller', () => {
   )
 
   it.skipIf(process.platform === 'win32')(
-    'reports a conflict for an unmanaged macOS orca_botmux that shadows the install path',
+    'reports a conflict for an unmanaged macOS botmux that shadows the install path',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
-      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-orca_botmux\n', {
+      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-botmux\n', {
         encoding: 'utf8',
         mode: 0o755
       })
@@ -1120,7 +1120,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -1130,35 +1130,35 @@ describe('CliInstaller', () => {
       const status = await installer.getStatus()
       expect(status.commandPath).toBe(userInstallPath)
       expect(status.state).toBe('conflict')
-      await expect(installer.install()).rejects.toThrow('Refusing to replace non-OrcaBotmux command')
+      await expect(installer.install()).rejects.toThrow('Refusing to replace non-Botmux command')
       await expect(lstat(defaultInstallPath)).rejects.toMatchObject({ code: 'ENOENT' })
-      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-orca_botmux')
+      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-botmux')
     }
   )
 
   // Why: bash/zsh skip non-executable PATH entries, so reporting them as a
   // conflict would block a valid later install path the shell would use.
   it.skipIf(process.platform === 'win32')(
-    'skips a non-executable unmanaged macOS orca_botmux before the install path',
+    'skips a non-executable unmanaged macOS botmux before the install path',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
       const usrLocalBin = join(fixture.root, 'usr', 'local', 'bin')
       const userLocalBin = join(homePath, '.local', 'bin')
-      const defaultInstallPath = join(usrLocalBin, 'orca_botmux')
-      const userInstallPath = join(userLocalBin, 'orca_botmux')
-      const launcherPath = join(resourcesPath, 'bin', 'orca_botmux')
+      const defaultInstallPath = join(usrLocalBin, 'botmux')
+      const userInstallPath = join(userLocalBin, 'botmux')
+      const launcherPath = join(resourcesPath, 'bin', 'botmux')
       await mkdir(usrLocalBin, { recursive: true })
       await mkdir(userLocalBin, { recursive: true })
-      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-orca_botmux\n', 'utf8')
+      await writeFile(userInstallPath, '#!/usr/bin/env bash\necho other-botmux\n', 'utf8')
 
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: defaultInstallPath,
@@ -1173,25 +1173,25 @@ describe('CliInstaller', () => {
       expect(installed.commandPath).toBe(defaultInstallPath)
       expect(installed.state).toBe('installed')
       await expect(readlink(defaultInstallPath)).resolves.toBe(launcherPath)
-      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-orca_botmux')
+      await expect(readFile(userInstallPath, 'utf8')).resolves.toContain('other-botmux')
     }
   )
 
-  // Why: when macCommandPath falls back to ~/.local/bin/orca_botmux on arm64, commandName
-  // must still be 'orca_botmux' (not 'orca-botmux-ide' which is Linux-only).
+  // Why: when macCommandPath falls back to ~/.local/bin/botmux on arm64, commandName
+  // must still be 'botmux' (not 'botmux-ide' which is Linux-only).
   it.skipIf(process.platform === 'win32')(
-    'reports commandName as orca_botmux (not orca-botmux-ide) when falling back to ~/.local/bin on macOS',
+    'reports commandName as botmux (not botmux-ide) when falling back to ~/.local/bin on macOS',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
-      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'orca_botmux')
+      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'botmux')
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: absentUsrLocalBin,
@@ -1199,7 +1199,7 @@ describe('CliInstaller', () => {
       })
 
       const status = await installer.getStatus()
-      expect(status.commandName).toBe('orca_botmux')
+      expect(status.commandName).toBe('botmux')
     }
   )
 
@@ -1213,13 +1213,13 @@ describe('CliInstaller', () => {
       await mkdir(protectedDir)
       await chmod(protectedDir, 0o500)
 
-      const installPath = join(protectedDir, 'bin', 'orca_botmux')
+      const installPath = join(protectedDir, 'bin', 'botmux')
       const privilegedCommands: string[] = []
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: false,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         commandPathOverride: installPath,
         privilegedRunner: async (command: string) => {
@@ -1255,13 +1255,13 @@ describe('CliInstaller', () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
       const resourcesPath = await createPackagedMacLauncher(fixture.root)
-      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'orca_botmux')
+      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'botmux')
       const installer = new CliInstaller({
         platform: 'darwin',
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: absentUsrLocalBin,
@@ -1275,16 +1275,16 @@ describe('CliInstaller', () => {
 
       expect(s1.commandPath).toBe(s2.commandPath)
       expect(s2.commandPath).toBe(s3.commandPath)
-      expect(s1.commandPath).toBe(join(homePath, '.local', 'bin', 'orca_botmux'))
+      expect(s1.commandPath).toBe(join(homePath, '.local', 'bin', 'botmux'))
     }
   )
 
   it('resolves custom-install packaged Windows command path from resourcesPath', async () => {
     const fixture = await makeFixture()
     const localAppDataPath = join(fixture.root, 'AppData', 'Local')
-    const resourcesPath = join(fixture.root, 'D Custom OrcaBotmux', 'resources')
+    const resourcesPath = join(fixture.root, 'D Custom Botmux', 'resources')
     await mkdir(join(resourcesPath, 'bin'), { recursive: true })
-    await writeFile(join(resourcesPath, 'bin', 'orca_botmux.exe'), 'native launcher', 'utf8')
+    await writeFile(join(resourcesPath, 'bin', 'botmux.exe'), 'native launcher', 'utf8')
 
     const installer = new CliInstaller({
       platform: 'win32',
@@ -1292,20 +1292,20 @@ describe('CliInstaller', () => {
       resourcesPath,
       localAppDataPath,
       userDataPath: fixture.userDataPath,
-      execPath: join(fixture.root, 'D Custom OrcaBotmux', 'OrcaBotmux.exe'),
+      execPath: join(fixture.root, 'D Custom Botmux', 'Botmux.exe'),
       appPath: fixture.appPath,
       userPathReader: async () => userPathRead(null),
       userPathWriter: async () => {}
     })
 
     const status = await installer.getStatus()
-    expect(status.commandPath).toBe(join(resourcesPath, 'bin', 'orca_botmux.exe'))
+    expect(status.commandPath).toBe(join(resourcesPath, 'bin', 'botmux.exe'))
   })
 
   it('keeps a bundled Windows launcher installed when the user PATH read is unknown', async () => {
     const fixture = await makeFixture()
     const resourcesPath = join(fixture.root, 'resources')
-    const bundledLauncher = join(resourcesPath, 'bin', 'orca_botmux.exe')
+    const bundledLauncher = join(resourcesPath, 'bin', 'botmux.exe')
     await mkdir(dirname(bundledLauncher), { recursive: true })
     await writeFile(bundledLauncher, 'native launcher', 'utf8')
 
@@ -1314,11 +1314,11 @@ describe('CliInstaller', () => {
       isPackaged: true,
       resourcesPath,
       userDataPath: fixture.userDataPath,
-      execPath: join(fixture.root, 'OrcaBotmux.exe'),
+      execPath: join(fixture.root, 'Botmux.exe'),
       appPath: fixture.appPath,
       userPathReader: async () => ({
         state: 'unknown',
-        detail: 'OrcaBotmux could not read the Windows user PATH registry value.'
+        detail: 'Botmux could not read the Windows user PATH registry value.'
       })
     })
 
@@ -1332,8 +1332,8 @@ describe('CliInstaller', () => {
   it('does not overwrite the packaged Windows launcher while registering PATH', async () => {
     const fixture = await makeFixture()
     const localAppDataPath = join(fixture.root, 'AppData', 'Local')
-    const resourcesPath = join(fixture.root, 'D Custom OrcaBotmux', 'resources')
-    const bundledLauncher = join(resourcesPath, 'bin', 'orca_botmux.exe')
+    const resourcesPath = join(fixture.root, 'D Custom Botmux', 'resources')
+    const bundledLauncher = join(resourcesPath, 'bin', 'botmux.exe')
     const bundledContent = 'native launcher'
     await mkdir(dirname(bundledLauncher), { recursive: true })
     await writeFile(bundledLauncher, bundledContent, 'utf8')
@@ -1345,7 +1345,7 @@ describe('CliInstaller', () => {
       resourcesPath,
       localAppDataPath,
       userDataPath: fixture.userDataPath,
-      execPath: join(fixture.root, 'D Custom OrcaBotmux', 'OrcaBotmux.exe'),
+      execPath: join(fixture.root, 'D Custom Botmux', 'Botmux.exe'),
       appPath: fixture.appPath,
       userPathReader: async () => userPathRead(userPath),
       userPathWriter: async (value) => {
@@ -1371,15 +1371,15 @@ describe('CliInstaller', () => {
 
   // Why: the arm64 fallback must apply for packaged builds, not just dev launchers.
   it.skipIf(process.platform === 'win32')(
-    'resolves to ~/.local/bin/orca_botmux on arm64 even when isPackaged is true',
+    'resolves to ~/.local/bin/botmux on arm64 even when isPackaged is true',
     async () => {
       const fixture = await makeFixture()
       const homePath = join(fixture.root, 'home')
-      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'orca_botmux')
+      const absentUsrLocalBin = join(fixture.root, 'usr', 'local', 'bin', 'botmux')
       const resourcesPath = join(fixture.root, 'resources')
-      const bundledLauncher = join(resourcesPath, 'bin', 'orca_botmux')
+      const bundledLauncher = join(resourcesPath, 'bin', 'botmux')
       await mkdir(join(resourcesPath, 'bin'), { recursive: true })
-      await writeFile(bundledLauncher, '#!/usr/bin/env bash\necho orca_botmux\n', {
+      await writeFile(bundledLauncher, '#!/usr/bin/env bash\necho botmux\n', {
         encoding: 'utf8',
         mode: 0o755
       })
@@ -1389,7 +1389,7 @@ describe('CliInstaller', () => {
         isPackaged: true,
         resourcesPath,
         userDataPath: fixture.userDataPath,
-        execPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+        execPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
         appPath: fixture.appPath,
         homePath,
         defaultMacCommandPath: absentUsrLocalBin,
@@ -1397,7 +1397,7 @@ describe('CliInstaller', () => {
       })
 
       const status = await installer.getStatus()
-      expect(status.commandPath).toBe(join(homePath, '.local', 'bin', 'orca_botmux'))
+      expect(status.commandPath).toBe(join(homePath, '.local', 'bin', 'botmux'))
       expect(status.supported).toBe(true)
     }
   )

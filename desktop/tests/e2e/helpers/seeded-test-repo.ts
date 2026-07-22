@@ -1,5 +1,5 @@
 /**
- * Seeded git repo for OrcaBotmux E2E fixtures: creation and validity checks for the
+ * Seeded git repo for Botmux E2E fixtures: creation and validity checks for the
  * disposable test repo (plus its secondary worktree) that specs operate on.
  */
 
@@ -32,7 +32,7 @@ export function createSeededTestRepo(): string {
   // Why: realpathSync so the seeded path matches the store's repo.path on
   // macOS, where os.tmpdir() (/var/...) symlinks to /private/var/... and the
   // app canonicalizes repo.path via `git rev-parse --show-toplevel` on add.
-  const testRepoDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-e2e-repo-')))
+  const testRepoDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'botmux-e2e-repo-')))
 
   execSync('git init', { cwd: testRepoDir, stdio: 'pipe' })
   execSync('git config user.email "e2e@test.local"', { cwd: testRepoDir, stdio: 'pipe' })
@@ -40,12 +40,12 @@ export function createSeededTestRepo(): string {
 
   writeFileSync(
     path.join(testRepoDir, 'README.md'),
-    '# OrcaBotmux E2E Test Repo\n\nThis repo was created automatically for Playwright tests.\n'
+    '# Botmux E2E Test Repo\n\nThis repo was created automatically for Playwright tests.\n'
   )
   writeFileSync(path.join(testRepoDir, 'CLAUDE.md'), '# CLAUDE.md\n\nTest instructions for E2E.\n')
   writeFileSync(
     path.join(testRepoDir, 'package.json'),
-    `${JSON.stringify({ name: 'orca-botmux-e2e-test', version: '0.0.0', private: true }, null, 2)}\n`
+    `${JSON.stringify({ name: 'botmux-e2e-test', version: '0.0.0', private: true }, null, 2)}\n`
   )
   writeFileSync(path.join(testRepoDir, '.gitignore'), 'node_modules/\n')
   mkdirSync(path.join(testRepoDir, 'src'), { recursive: true })
@@ -56,7 +56,7 @@ export function createSeededTestRepo(): string {
 
   // Why: worker-scoped fixture fallbacks can run in parallel; UUIDs avoid
   // colliding on the same temp repo/worktree when workers start together.
-  const worktreeDir = path.join(testRepoDir, '..', `orca-botmux-e2e-worktree-${randomUUID()}`)
+  const worktreeDir = path.join(testRepoDir, '..', `botmux-e2e-worktree-${randomUUID()}`)
   execSync(`git worktree add "${worktreeDir}" -b e2e-secondary`, {
     cwd: testRepoDir,
     stdio: 'pipe'

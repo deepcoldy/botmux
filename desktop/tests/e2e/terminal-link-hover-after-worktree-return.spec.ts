@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { expect, test } from './helpers/orca-botmux-app'
+import { expect, test } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getAllWorktreeIds,
@@ -81,7 +81,7 @@ async function locateHoverProbe(page: Page, needle: string): Promise<HoverProbe>
 /**
  * Dispatch a hover mousemove at the probe coordinates and return the text of
  * the link the linkifier considers active (or null). Callers poll this because
- * OrcaBotmux's file-path provider resolves link candidates asynchronously.
+ * Botmux's file-path provider resolves link candidates asynchronously.
  */
 async function hoverAndReadActiveLinkText(page: Page, probe: HoverProbe): Promise<string | null> {
   await page.evaluate(({ col, row, tabId }) => {
@@ -237,15 +237,15 @@ async function assertLinkRecoversAfterReturn(
 }
 
 test.describe('Terminal link hover after worktree return', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
   })
 
   test('re-establishes a file-path link on hover after switching worktrees and back', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'link-hover repro needs the seeded secondary worktree')
@@ -253,40 +253,40 @@ test.describe('Terminal link hover after worktree return', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
 
-    const worktreePath = await activeWorktreePath(orcaBotmuxPage)
-    const fileName = `orca-botmux-linkfile-${randomUUID().slice(0, 8)}.txt`
+    const worktreePath = await activeWorktreePath(botmuxPage)
+    const fileName = `botmux-linkfile-${randomUUID().slice(0, 8)}.txt`
     const filePath = path.join(worktreePath, fileName)
-    writeFileSync(filePath, 'orca_botmux file link target\n')
+    writeFileSync(filePath, 'botmux file link target\n')
     const needle = `./${fileName}`
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `echo ${needle}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `echo ${needle}\r`)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 4000), {
+        .poll(() => getTerminalContent(botmuxPage, 4000), {
           timeout: 10_000,
           message: 'file-link fixture did not reach the terminal buffer'
         })
         .toContain(fileName)
 
-      const probe = await assertLinkRecoversAfterReturn(orcaBotmuxPage, {
+      const probe = await assertLinkRecoversAfterReturn(botmuxPage, {
         firstWorktreeId,
         secondWorktreeId,
         needle,
         expectContains: fileName
       })
-      await activateHoveredLink(orcaBotmuxPage, probe)
+      await activateHoveredLink(botmuxPage, probe)
       // The editor header is the user-visible result of a successful terminal
       // link activation; store state alone could pass with a blank editor.
-      await expect(orcaBotmuxPage.locator('.editor-header-path').first()).toContainText(fileName, {
+      await expect(botmuxPage.locator('.editor-header-path').first()).toContainText(fileName, {
         timeout: 20_000
       })
     } finally {
-      await orcaBotmuxPage.evaluate((filePath) => {
+      await botmuxPage.evaluate((filePath) => {
         const state = window.__store?.getState()
         if (state?.openFiles.some((file) => file.filePath === filePath)) {
           state.closeFile(filePath)
@@ -297,10 +297,10 @@ test.describe('Terminal link hover after worktree return', () => {
   })
 
   test('re-establishes a URL link on hover after switching worktrees and back', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'link-hover repro needs the seeded secondary worktree')
@@ -308,21 +308,21 @@ test.describe('Terminal link hover after worktree return', () => {
       return
     }
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
-    await waitForPtyShellEcho(orcaBotmuxPage, ptyId, 15_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
+    await waitForPtyShellEcho(botmuxPage, ptyId, 15_000)
 
-    const url = `https://example.com/orca-botmux-link-${randomUUID()}`
-    await sendToTerminal(orcaBotmuxPage, ptyId, `echo ${url}\r`)
+    const url = `https://example.com/botmux-link-${randomUUID()}`
+    await sendToTerminal(botmuxPage, ptyId, `echo ${url}\r`)
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 4000), {
+      .poll(() => getTerminalContent(botmuxPage, 4000), {
         timeout: 10_000,
         message: 'URL fixture did not reach the terminal buffer'
       })
       .toContain(url)
 
-    await assertLinkRecoversAfterReturn(orcaBotmuxPage, {
+    await assertLinkRecoversAfterReturn(botmuxPage, {
       firstWorktreeId,
       secondWorktreeId,
       needle: url,

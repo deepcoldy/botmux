@@ -17,23 +17,23 @@
  * store list is empty and the DOM zone is gone.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree } from './helpers/store'
 
 test.describe('Diff note delete', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('clicking the trash button removes the saved note', async ({ orcaBotmuxPage }) => {
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+  test('clicking the trash button removes the saved note', async ({ botmuxPage }) => {
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
 
     // Why: modify a tracked file so opening a diff shows real added/removed
     // content rather than an empty "no changes" state. `src/index.ts` is
     // seeded by global-setup with a single line, so rewriting it produces a
     // diff the modified Monaco editor will render against.
-    const { relativePath } = await orcaBotmuxPage.evaluate(async (wId) => {
+    const { relativePath } = await botmuxPage.evaluate(async (wId) => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available — is the app in dev mode?')
@@ -58,7 +58,7 @@ test.describe('Diff note delete', () => {
     // Seed a diff comment directly through the store. This avoids depending
     // on the hover-to-"+" interaction (a separate code path) so this spec
     // stays focused on the delete affordance.
-    const addResult = await orcaBotmuxPage.evaluate(
+    const addResult = await botmuxPage.evaluate(
       async ({ wId, rel }) => {
         const store = window.__store
         if (!store) {
@@ -81,7 +81,7 @@ test.describe('Diff note delete', () => {
 
     // Open the diff tab for this file so the decorator mounts a view zone
     // for the seeded note.
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ wId, rel }) => {
         const store = window.__store
         if (!store) {
@@ -103,7 +103,7 @@ test.describe('Diff note delete', () => {
     // The note card is rendered into a Monaco view zone. Wait for the
     // trash button itself rather than any parent container so we know the
     // React root inside the zone has actually mounted.
-    const deleteButton = orcaBotmuxPage.getByTitle('Delete note').first()
+    const deleteButton = botmuxPage.getByTitle('Delete note').first()
     await expect(deleteButton).toBeVisible({ timeout: 15_000 })
 
     await deleteButton.click()
@@ -112,7 +112,7 @@ test.describe('Diff note delete', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate((id: string) => {
+          botmuxPage.evaluate((id: string) => {
             const store = window.__store
             if (!store) {
               return null
@@ -132,7 +132,7 @@ test.describe('Diff note delete', () => {
     // …and the view zone must be unmounted, proving the click actually
     // reached the React handler (not just some other listener that
     // happened to mutate the store).
-    await expect(orcaBotmuxPage.getByTitle('Delete note')).toHaveCount(0, {
+    await expect(botmuxPage.getByTitle('Delete note')).toHaveCount(0, {
       timeout: 5_000
     })
   })

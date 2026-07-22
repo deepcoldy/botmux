@@ -1,7 +1,7 @@
-// Why: the WebSocket transport enables mobile clients to connect to the OrcaBotmux
+// Why: the WebSocket transport enables mobile clients to connect to the Botmux
 // runtime over the local network. When TLS cert/key are provided it uses wss://
 // to prevent passive sniffing; otherwise it falls back to plain ws://. Per-device
-// tokens (validated by the message handler in OrcaRuntimeRpcServer) provide auth
+// tokens (validated by the message handler in BotmuxRuntimeRpcServer) provide auth
 // regardless of transport encryption.
 import { createServer as createHttpsServer, type Server as HttpsServer } from 'node:https'
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
@@ -59,7 +59,7 @@ export type WebSocketTransportOptions = {
   // the (now free) preferred port instead would strand those pairings
   // (STA-1511). Callers pass the previously assigned fallback port here.
   fallbackPort?: number
-  // Why: `orca-botmux-desktop serve --port <P>` clients dial the pinned port. Prefer that port
+  // Why: `botmux-desktop serve --port <P>` clients dial the pinned port. Prefer that port
   // first (fallback second) so a stale mobile-ws-fallback-port.json cannot
   // silently steal the pin (issue #8535). Default auto/desktop keeps
   // fallback-first for STA-1511 pairing stability.
@@ -350,7 +350,7 @@ export class WebSocketTransport implements RpcTransport {
   // Why: WebSocket connections are long-lived (unlike Unix socket which is
   // one-per-request). Multiple requests can be multiplexed on the same
   // connection via the RPC `id` field. The transport delegates all auth
-  // and dispatch logic to the message handler set by OrcaRuntimeRpcServer.
+  // and dispatch logic to the message handler set by BotmuxRuntimeRpcServer.
   private handleConnection(ws: WebSocket): void {
     let finalized = false
     const onPong = (): void => {

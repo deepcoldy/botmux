@@ -179,7 +179,7 @@ export function registerAutoUpdaterHandlers({
     }
 
     // Why: fetching changelog in the main process avoids CORS issues that
-    // would block a renderer-side fetch to onorca.dev, and ensures the
+    // would block a renderer-side fetch to example.test, and ensures the
     // card can render immediately without an async loading gap.
     markUpdateAvailableEventPending(attemptId)
     void (async () => {

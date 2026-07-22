@@ -30,6 +30,11 @@ import type { PtyBufferSnapshot, PtyConnectResult } from './pty-transport'
 import { createIpcPtyTransport } from './pty-transport'
 import { createRemoteRuntimePtyTransport } from './remote-runtime-pty-transport'
 import { getPtyConnectionId } from '@/lib/connection-context'
+import { isBotmuxControlPlaneHostId } from '../../../../shared/botmux-main-terminal-host'
+import {
+  ensureBotmuxBridgeEndpointConnected,
+  recoverBotmuxAttachOnReconnect
+} from '@/lib/recover-botmux-attach-on-reconnect'
 import { getLocalProjectExecutionRuntimeContext } from '@/lib/local-preflight-context'
 import {
   getCachedWindowsTerminalCapabilities,
@@ -282,7 +287,7 @@ const STARTUP_DRAFT_PASTE_QUIET_MS = 1500
 // Why: the notice deliberately omits the rejected path — saved cwds can
 // contain private repo/user names; the terminal itself shows where it opened.
 export const STARTUP_CWD_FALLBACK_NOTICE =
-  '\r\n[OrcaBotmux opened this terminal at the workspace root because its saved start folder no longer exists.]\r\n'
+  '\r\n[Botmux opened this terminal at the workspace root because its saved start folder no longer exists.]\r\n'
 const STARTUP_DRAFT_PASTE_TIMEOUT_MS = 8000
 const HIDDEN_OUTPUT_RESTORE_PENDING_CHARS = 512 * 1024
 const HIDDEN_OUTPUT_RESTORE_DEFERRED_RETRY_MS = 50
@@ -329,7 +334,7 @@ const FOREGROUND_GRID_DRIFT_CHECK_MIN_MS = 250
 // Why: this is only shown if hidden renderer output was skipped and main-owned
 // terminal state is unavailable, so the user has an explicit loss signal.
 const HIDDEN_OUTPUT_RESTORE_UNAVAILABLE_WARNING =
-  '\x18\x1b[0m\r\n[OrcaBotmux skipped hidden terminal output because main recovery was unavailable.]\r\n'
+  '\x18\x1b[0m\r\n[Botmux skipped hidden terminal output because main recovery was unavailable.]\r\n'
 type E2eTerminalPtyDataInjectionApi = {
   inject: (paneKey: string, data: string, meta?: PtyDataMeta) => boolean
   keys: () => string[]
@@ -1203,7 +1208,7 @@ export function connectPanePty(
   ): void => {
     if (!effectiveLaunchConfig) {
       if (metadata?.launchAgent) {
-        // Why: daemon launch identity can outlive the process while OrcaBotmux is
+        // Why: daemon launch identity can outlive the process while Botmux is
         // closed. Use it to request confirmation, never as current byte authority.
         useAppStore.getState().setPaneForegroundAgent(cacheKey, {
           agent: metadata.launchAgent,
@@ -1746,7 +1751,7 @@ export function connectPanePty(
       }
       // Why: restored idle agent TUIs can repaint after reattach SIGWINCH and
       // reapply DECSCUSR steady-bar; the normal working→idle reset will not
-      // fire because the agent was already idle before OrcaBotmux restarted.
+      // fire because the agent was already idle before Botmux restarted.
       queueAgentIdleTerminalModeReset()
     }, REATTACH_IDLE_AGENT_CURSOR_RESET_DELAY_MS)
   }
@@ -1786,7 +1791,7 @@ export function connectPanePty(
   ): void => {
     const state = useAppStore.getState()
     if (!entry) {
-      // Why: an OrcaBotmux-started agent can exit before its first hook status. The
+      // Why: an Botmux-started agent can exit before its first hook status. The
       // launch registry was still created up front, so clear it on command exit.
       state.clearAgentLaunchConfig(cacheKey)
       return
@@ -2146,7 +2151,7 @@ export function connectPanePty(
     ) {
       return
     }
-    // Why: user shell frameworks (bash-preexec/iTerm2) can replace OrcaBotmux's
+    // Why: user shell frameworks (bash-preexec/iTerm2) can replace Botmux's
     // OSC 133;C hook, so a manually launched agent produces no command-start
     // signal at all. Enter at a shell-foreground prompt is the user-side
     // equivalent; the sample is gated to panes with no live agent identity
@@ -2849,7 +2854,7 @@ export function connectPanePty(
   // underneath. See POST_REPLAY_MODE_RESET in layout-serialization.ts.
   const onBell = (): void => {
     // Why: restored Claude Code sessions have been observed to emit a real
-    // standalone BEL some time after daemon snapshot reattach, even when OrcaBotmux
+    // standalone BEL some time after daemon snapshot reattach, even when Botmux
     // did not just forward focus/control input. Treat the BEL as authoritative
     // PTY output here; any product-side suppression should be an explicit UX
     // decision higher up, not a transport-layer guess.
@@ -3136,10 +3141,10 @@ export function connectPanePty(
     // Why: title reversion alone is not process death. The process/PTY tracker
     // owns removing agent rows when the TUI actually exits.
   }
-  // Why: inject ORCA_PANE_KEY so global Claude/Codex hooks can attribute their
-  // callbacks to the correct OrcaBotmux pane without resolving worktrees from cwd.
+  // Why: inject BOTMUX_PANE_KEY so global Claude/Codex hooks can attribute their
+  // callbacks to the correct Botmux pane without resolving worktrees from cwd.
   // The key matches the `${tabId}:${leafId}` composite used for cacheTimerByKey
-  // and agentStatusByPaneKey. Treat it as opaque outside OrcaBotmux.
+  // and agentStatusByPaneKey. Treat it as opaque outside Botmux.
   const state = useAppStore.getState()
   const parsedWorkspaceKey = parseWorkspaceKey(deps.worktreeId)
   const folderWorkspace =
@@ -3148,17 +3153,17 @@ export function connectPanePty(
           (workspace) => workspace.id === parsedWorkspaceKey.folderWorkspaceId
         )
       : null
-  const workspaceEnv: Record<string, string> = { ORCA_WORKSPACE_ID: deps.worktreeId }
+  const workspaceEnv: Record<string, string> = { BOTMUX_WORKSPACE_ID: deps.worktreeId }
   if (folderWorkspace) {
-    workspaceEnv.ORCA_PROJECT_GROUP_ID = folderWorkspace.projectGroupId
-    workspaceEnv.ORCA_WORKSPACE_ROOT = folderWorkspace.folderPath
+    workspaceEnv.BOTMUX_PROJECT_GROUP_ID = folderWorkspace.projectGroupId
+    workspaceEnv.BOTMUX_WORKSPACE_ROOT = folderWorkspace.folderPath
   }
   const paneIdentityEnv = {
     ...workspaceEnv,
-    ORCA_PANE_KEY: cacheKey,
-    ORCA_TAB_ID: deps.tabId,
-    ORCA_WORKTREE_ID: deps.worktreeId,
-    ...(launchToken ? { ORCA_AGENT_LAUNCH_TOKEN: launchToken } : {})
+    BOTMUX_PANE_KEY: cacheKey,
+    BOTMUX_TAB_ID: deps.tabId,
+    BOTMUX_WORKTREE_ID: deps.worktreeId,
+    ...(launchToken ? { BOTMUX_AGENT_LAUNCH_TOKEN: launchToken } : {})
   }
   const paneEnv = {
     ...paneStartup?.env,
@@ -3361,7 +3366,7 @@ export function connectPanePty(
           onAgentBecameWorking,
           onAgentExited
         }),
-    // Why: local IPC terminals are now model-owned in main: OrcaRuntimeService
+    // Why: local IPC terminals are now model-owned in main: BotmuxRuntimeService
     // parses OSC 9999 before renderer delivery and forwards through the hook
     // server with local/SSH identity. Remote-runtime streams do not pass through
     // local main, so the renderer remains their status owner for now.
@@ -4482,7 +4487,7 @@ export function connectPanePty(
         command: startupPlan.launchCommand,
         env: {
           ...startupPlan.env,
-          ORCA_AGENT_LAUNCH_TOKEN: coldRestoreLaunchToken
+          BOTMUX_AGENT_LAUNCH_TOKEN: coldRestoreLaunchToken
         },
         launchConfig: startupPlan.launchConfig,
         launchToken: coldRestoreLaunchToken,
@@ -4520,8 +4525,8 @@ export function connectPanePty(
         ? {
             ...env,
             ...paneIdentityEnv,
-            ...(env.ORCA_AGENT_LAUNCH_TOKEN
-              ? { ORCA_AGENT_LAUNCH_TOKEN: env.ORCA_AGENT_LAUNCH_TOKEN }
+            ...(env.BOTMUX_AGENT_LAUNCH_TOKEN
+              ? { BOTMUX_AGENT_LAUNCH_TOKEN: env.BOTMUX_AGENT_LAUNCH_TOKEN }
               : {})
           }
         : undefined
@@ -4567,7 +4572,7 @@ export function connectPanePty(
       }
       if (!sshStartupShellReady) {
         if (sshShellReadyFallbackTimer === null) {
-          // Why: some SSH shells cannot emit OrcaBotmux's ready marker. Prefer the
+          // Why: some SSH shells cannot emit Botmux's ready marker. Prefer the
           // marker when available, but fall back to the old renderer delivery
           // behavior instead of dropping the startup command forever.
           sshShellReadyFallbackTimer = setTimeout(() => {
@@ -7993,13 +7998,30 @@ export function connectPanePty(
     // cause a tab in workspace A to hold a ptyId from workspace B. Restoring
     // that session would paint the wrong terminal content in this pane. Drop
     // the reattach and spawn a fresh session instead.
+    //
+    // Botmux control-plane tabs always use local PTY + one-shot `ssh/tmux
+    // attach`. Reattaching the daemon session after app restart only restores
+    // a bare local shell (startup line is not re-queued). Force fresh spawn
+    // with attach recovery instead.
+    const botmuxControlPlaneHost = isBotmuxControlPlaneHostId(deps.worktreeId)
     const deferredReattachSessionId =
+      !botmuxControlPlaneHost &&
       candidateReattachSessionId &&
       !isRemoteRuntimePtyId(candidateReattachSessionId) &&
       !candidateHasEagerBuffer &&
       isSessionOwnedByWorktree(candidateReattachSessionId, deps.worktreeId)
         ? candidateReattachSessionId
         : null
+    if (botmuxControlPlaneHost && (restoredPtyId || existingPtyId)) {
+      const staleId = restoredPtyId ?? existingPtyId
+      if (staleId) {
+        deps.clearExitedPanePtyLayoutBinding(pane.id, staleId)
+        deps.clearTabPtyId(deps.tabId, staleId)
+      }
+      recordPtyConnectDiagnostic(
+        `pane=${pane.id} botmux control-plane skip reattach stale=${staleId}`
+      )
+    }
     recordPtyConnectDiagnostic(
       `pane=${pane.id} tab=${deps.tabId} restored=${restoredPtyId} existing=${existingPtyId} detached=${detachedRemoteLeafPtyId ?? detachedLivePtyId} reattach=${deferredReattachSessionId} hasTransport=${hadExistingPaneTransportAtConnect} pendingKey=${pendingSpawnKey}`
     )
@@ -8233,6 +8255,49 @@ export function connectPanePty(
         recordPtyConnectDiagnostic(`pane=${pane.id} -> FRESH SPAWN`)
         if (sleptRemoteColdRestoreStartup || hasSleepingAgentSession) {
           startFreshColdRestoreAgentResume(sleptRemoteColdRestoreStartup ?? undefined)
+        } else if (botmuxControlPlaneHost) {
+          // Why: after restart, attach shell may not be in pendingStartup yet
+          // (reconnect race) or was never re-queued. Recover via tmuxAttachSpec
+          // then spawn with the ssh/tmux line so we do not land on bare local.
+          void (async () => {
+            let attachCommand = paneStartup?.command?.replace(/[\r\n]+$/g, '') ?? null
+            if (!attachCommand) {
+              const tab = useAppStore
+                .getState()
+                .tabsByWorktree[deps.worktreeId]?.find((t) => t.id === deps.tabId)
+              const tmuxAttachSpec =
+                window.api?.botmuxBridge?.tmuxAttachSpec ?? window.api?.tmuxAttachSpec
+              if (tab && typeof tmuxAttachSpec === 'function') {
+                await recoverBotmuxAttachOnReconnect({
+                  worktreeId: deps.worktreeId,
+                  tabs: [tab],
+                  deps: {
+                    queueTabStartupCommand: (tabId, startup) => {
+                      useAppStore.getState().queueTabStartupCommand(tabId, startup)
+                    },
+                    tmuxAttachSpec,
+                    ensureBridgeEndpoint: ensureBotmuxBridgeEndpointConnected
+                  }
+                })
+                const pending = useAppStore.getState().consumeTabStartupCommand(deps.tabId)
+                attachCommand = pending?.command?.replace(/[\r\n]+$/g, '') ?? null
+              }
+            }
+            if (disposed) {
+              return
+            }
+            if (attachCommand) {
+              recordPtyConnectDiagnostic(
+                `pane=${pane.id} -> FRESH SPAWN botmux attach len=${attachCommand.length}`
+              )
+              startFreshSpawn({ command: attachCommand })
+            } else {
+              console.warn(
+                `[pty-connection] botmux control-plane tab=${deps.tabId} spawn without attach command`
+              )
+              startFreshSpawn()
+            }
+          })()
         } else {
           startFreshSpawn()
         }

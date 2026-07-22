@@ -189,7 +189,7 @@ export const useWorktreeById = (worktreeId: string | null) =>
   )
 export const useActiveWorktree = () => {
   const activeWorktreeId = useActiveWorktreeId()
-  // Why: getKnownWorktreeById for orca_botmux synthetics must return a stable
+  // Why: getKnownWorktreeById for botmux synthetics must return a stable
   // reference; still use Object.is via default equality. Do not allocate in
   // the selector (that caused Maximum update depth in FileExplorer).
   return useAppStore((s) =>

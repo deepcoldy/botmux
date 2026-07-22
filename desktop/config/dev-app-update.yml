@@ -1,4 +1,4 @@
 provider: github
 owner: stablyai
-repo: orca_botmux
-updaterCacheDirName: orca_botmux-updater
+repo: botmux
+updaterCacheDirName: botmux-updater

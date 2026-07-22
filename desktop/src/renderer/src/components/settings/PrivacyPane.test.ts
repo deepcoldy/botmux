@@ -91,8 +91,8 @@ describe('PrivacyPane — isEnvBlocked', () => {
     expect(isEnvBlocked({ effective: 'disabled', reason: 'do_not_track' })).toBe(true)
   })
 
-  it('returns true for ORCA_TELEMETRY_DISABLED', () => {
-    expect(isEnvBlocked({ effective: 'disabled', reason: 'orca_botmux_disabled' })).toBe(true)
+  it('returns true for BOTMUX_TELEMETRY_DISABLED', () => {
+    expect(isEnvBlocked({ effective: 'disabled', reason: 'botmux_disabled' })).toBe(true)
   })
 
   it('returns true for CI', () => {
@@ -124,8 +124,8 @@ describe('PrivacyPane — envVarNameForReason', () => {
     expect(envVarNameForReason('do_not_track')).toBe('DO_NOT_TRACK')
   })
 
-  it('maps orca_botmux_disabled to ORCA_TELEMETRY_DISABLED', () => {
-    expect(envVarNameForReason('orca_botmux_disabled')).toBe('ORCA_TELEMETRY_DISABLED')
+  it('maps botmux_disabled to BOTMUX_TELEMETRY_DISABLED', () => {
+    expect(envVarNameForReason('botmux_disabled')).toBe('BOTMUX_TELEMETRY_DISABLED')
   })
 
   it('maps ci to CI', () => {
@@ -154,9 +154,9 @@ describe('PrivacyPane — computeBlockedReason', () => {
     expect(result).toEqual({ kind: 'env', reason: 'do_not_track' })
   })
 
-  it('names ORCA_TELEMETRY_DISABLED as the env reason when set', () => {
-    const result = computeBlockedReason({ effective: 'disabled', reason: 'orca_botmux_disabled' })
-    expect(result).toEqual({ kind: 'env', reason: 'orca_botmux_disabled' })
+  it('names BOTMUX_TELEMETRY_DISABLED as the env reason when set', () => {
+    const result = computeBlockedReason({ effective: 'disabled', reason: 'botmux_disabled' })
+    expect(result).toEqual({ kind: 'env', reason: 'botmux_disabled' })
   })
 
   it('names CI as the env reason when set', () => {

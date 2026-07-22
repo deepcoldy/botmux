@@ -9,7 +9,7 @@
  * - Maturity: experimental pending CI soak history.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   cleanupMarkdownFixture,
@@ -33,12 +33,12 @@ type OverlapHitTest = {
 }
 
 test.describe('Rich markdown link bubble stacking', () => {
-  test('link actions stay above the right Explorer', async ({ orcaBotmuxPage }, testInfo) => {
-    await orcaBotmuxPage.setViewportSize({ width: 1920, height: 1080 })
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test('link actions stay above the right Explorer', async ({ botmuxPage }, testInfo) => {
+    await botmuxPage.setViewportSize({ width: 1920, height: 1080 })
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
 
-    const context = await getActiveWorktreeContext(orcaBotmuxPage)
+    const context = await getActiveWorktreeContext(botmuxPage)
     let filePath: string | null = null
 
     try {
@@ -48,10 +48,10 @@ test.describe('Rich markdown link bubble stacking', () => {
         testInfo.workerIndex,
         MARKDOWN
       )
-      await openMarkdownFixture(orcaBotmuxPage, context, filePath)
-      await waitForRichMarkdownEditor(orcaBotmuxPage)
+      await openMarkdownFixture(botmuxPage, context, filePath)
+      await waitForRichMarkdownEditor(botmuxPage)
 
-      await orcaBotmuxPage.evaluate(() => {
+      await botmuxPage.evaluate(() => {
         const store = window.__store
         if (!store) {
           throw new Error('window.__store is not available — is the app in dev mode?')
@@ -63,20 +63,20 @@ test.describe('Rich markdown link bubble stacking', () => {
         })
       })
 
-      const explorer = orcaBotmuxPage.locator('[data-orca-botmux-explorer-shell]')
-      const link = orcaBotmuxPage.locator(`.rich-markdown-editor a[href="${LINK_HREF}"]`)
+      const explorer = botmuxPage.locator('[data-botmux-explorer-shell]')
+      const link = botmuxPage.locator(`.rich-markdown-editor a[href="${LINK_HREF}"]`)
       await expect(explorer).toBeVisible()
       await expect(link).toBeVisible()
 
       await link.click()
 
-      const bubble = orcaBotmuxPage.locator('.rich-markdown-link-bubble')
+      const bubble = botmuxPage.locator('.rich-markdown-link-bubble')
       await expect(bubble).toBeVisible()
       await expect(bubble.locator('.rich-markdown-link-url')).toContainText('https://example.com')
 
-      const overlap = await orcaBotmuxPage.evaluate((): OverlapHitTest => {
+      const overlap = await botmuxPage.evaluate((): OverlapHitTest => {
         const bubble = document.querySelector<HTMLElement>('.rich-markdown-link-bubble')
-        const explorer = document.querySelector<HTMLElement>('[data-orca-botmux-explorer-shell]')
+        const explorer = document.querySelector<HTMLElement>('[data-botmux-explorer-shell]')
         if (!bubble || !explorer) {
           throw new Error('Link bubble or Explorer was not rendered')
         }
@@ -118,16 +118,16 @@ test.describe('Rich markdown link bubble stacking', () => {
       expect(await input.evaluate((element) => element.scrollLeft)).toBeGreaterThan(0)
       await expect(input).toBeFocused()
       await expect(bubble).toBeVisible()
-      await orcaBotmuxPage.keyboard.press('Escape')
+      await botmuxPage.keyboard.press('Escape')
       await expect(bubble.locator('.rich-markdown-link-url')).toBeVisible()
 
       await explorer.getByPlaceholder('Find files').click()
       await expect(bubble).toHaveCount(0)
 
-      await orcaBotmuxPage.getByRole('heading', { name: 'Rich markdown link overlay repro' }).click()
+      await botmuxPage.getByRole('heading', { name: 'Rich markdown link overlay repro' }).click()
       await link.click()
       await expect(bubble).toBeVisible()
-      const originalEditorZoom = await orcaBotmuxPage.evaluate(() => {
+      const originalEditorZoom = await botmuxPage.evaluate(() => {
         const store = window.__store
         if (!store) {
           throw new Error('window.__store is not available — is the app in dev mode?')
@@ -137,14 +137,14 @@ test.describe('Rich markdown link bubble stacking', () => {
         return zoom
       })
       await expect(bubble).toHaveCount(0)
-      await orcaBotmuxPage.evaluate((zoom) => {
+      await botmuxPage.evaluate((zoom) => {
         window.__store?.getState().setEditorFontZoomLevel(zoom)
       }, originalEditorZoom)
 
-      await orcaBotmuxPage.getByRole('heading', { name: 'Rich markdown link overlay repro' }).click()
+      await botmuxPage.getByRole('heading', { name: 'Rich markdown link overlay repro' }).click()
       await link.click()
       await expect(bubble).toBeVisible()
-      await orcaBotmuxPage.evaluate(() => {
+      await botmuxPage.evaluate(() => {
         const store = window.__store
         if (!store) {
           throw new Error('window.__store is not available — is the app in dev mode?')

@@ -15,13 +15,13 @@ import {
   writeFileSync
 } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { ORCA_BROWSER_PARTITION } from '../../shared/constants'
+import { BOTMUX_BROWSER_PARTITION } from '../../shared/constants'
 import {
-  DEFAULT_LOCAL_ORCA_PROFILE_ID,
-  getOrcaProfileBrowserDefaultPartition,
-  getOrcaProfileBrowserPartitionSegment,
-  getOrcaProfileBrowserSessionPartition
-} from '../../shared/orca-botmux-profiles'
+  DEFAULT_LOCAL_BOTMUX_PROFILE_ID,
+  getBotmuxProfileBrowserDefaultPartition,
+  getBotmuxProfileBrowserPartitionSegment,
+  getBotmuxProfileBrowserSessionPartition
+} from '../../shared/botmux-profiles'
 import type { BrowserSessionProfile, BrowserSessionProfileScope } from '../../shared/types'
 import { browserManager } from './browser-manager'
 import { hasSystemMediaAccess, requestSystemMediaAccess } from './browser-media-access'
@@ -44,13 +44,13 @@ type BrowserSessionMeta = {
 }
 
 export type BrowserSessionRegistryProfileOptions = {
-  orcaProfileId: string
+  botmuxProfileId: string
   profileDirectory: string
 }
 
 const BROWSER_SESSION_META_FILE_NAME = 'browser-session-meta.json'
 const LEGACY_BROWSER_SESSION_PARTITION_RE =
-  /^persist:orca-botmux-browser-session-[\da-f-]{8}-[\da-f-]{4}-[\da-f-]{4}-[\da-f-]{4}-[\da-f-]{12}$/
+  /^persist:botmux-browser-session-[\da-f-]{8}-[\da-f-]{4}-[\da-f-]{4}-[\da-f-]{4}-[\da-f-]{12}$/
 
 // Why: the registry is the single source of truth for which Electron partitions
 // are valid. will-attach-webview consults it to decide whether a guest's
@@ -59,18 +59,18 @@ const LEGACY_BROWSER_SESSION_PARTITION_RE =
 
 class BrowserSessionRegistry {
   private readonly profiles = new Map<string, BrowserSessionProfile>()
-  private activeOrcaProfileId = DEFAULT_LOCAL_ORCA_PROFILE_ID
+  private activeBotmuxProfileId = DEFAULT_LOCAL_BOTMUX_PROFILE_ID
   private metadataPathOverride: string | null = null
-  private defaultPartition = ORCA_BROWSER_PARTITION
+  private defaultPartition = BOTMUX_BROWSER_PARTITION
 
   constructor() {
     this.resetDefaultProfile()
   }
 
-  configureForOrcaProfile(options: BrowserSessionRegistryProfileOptions): void {
-    this.activeOrcaProfileId = options.orcaProfileId
+  configureForBotmuxProfile(options: BrowserSessionRegistryProfileOptions): void {
+    this.activeBotmuxProfileId = options.botmuxProfileId
     this.metadataPathOverride = join(options.profileDirectory, BROWSER_SESSION_META_FILE_NAME)
-    this.defaultPartition = getOrcaProfileBrowserDefaultPartition(options.orcaProfileId)
+    this.defaultPartition = getBotmuxProfileBrowserDefaultPartition(options.botmuxProfileId)
     this.profiles.clear()
     this.resetDefaultProfile()
   }
@@ -365,7 +365,7 @@ class BrowserSessionRegistry {
 
   resolveKnownPartition(profileId: string | null | undefined): string | null {
     if (!profileId) {
-      // Why: must track the active OrcaBotmux profile's default partition, not the
+      // Why: must track the active Botmux profile's default partition, not the
       // legacy constant, or non-default profiles would resolve local-default's
       // cookie jar.
       return this.defaultPartition
@@ -385,7 +385,7 @@ class BrowserSessionRegistry {
     // Why: partition names are deterministic from the profile id so main can
     // reconstruct the allowlist on restart from persisted profile metadata
     // without needing a separate partition→profile mapping.
-    const partition = getOrcaProfileBrowserSessionPartition(this.activeOrcaProfileId, id)
+    const partition = getBotmuxProfileBrowserSessionPartition(this.activeBotmuxProfileId, id)
     const profile: BrowserSessionProfile = {
       id,
       scope,
@@ -506,14 +506,14 @@ class BrowserSessionRegistry {
 
   private isProfileOwnedSessionPartition(partition: string): boolean {
     if (
-      this.activeOrcaProfileId === DEFAULT_LOCAL_ORCA_PROFILE_ID &&
+      this.activeBotmuxProfileId === DEFAULT_LOCAL_BOTMUX_PROFILE_ID &&
       LEGACY_BROWSER_SESSION_PARTITION_RE.test(partition)
     ) {
       return true
     }
 
-    const segment = getOrcaProfileBrowserPartitionSegment(this.activeOrcaProfileId)
-    const prefix = `persist:orca-botmux-profile-${segment}-browser-session-`
+    const segment = getBotmuxProfileBrowserPartitionSegment(this.activeBotmuxProfileId)
+    const prefix = `persist:botmux-profile-${segment}-browser-session-`
     if (!partition.startsWith(prefix)) {
       return false
     }
@@ -561,7 +561,7 @@ class BrowserSessionRegistry {
       // Why: `media` (camera/mic) must defer to macOS TCC instead of being
       // denied outright. Denying at the session layer would make pages inside
       // isolated browser profiles throw NotAllowedError even after the user
-      // granted Camera/Microphone to OrcaBotmux — the same bug we fixed for the
+      // granted Camera/Microphone to Botmux — the same bug we fixed for the
       // default partition. macOS TCC still gates the actual stream, so
       // granting here only forwards what the OS has already authorized.
       if (permission === 'media') {

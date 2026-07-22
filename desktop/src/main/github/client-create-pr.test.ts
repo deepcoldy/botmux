@@ -139,13 +139,13 @@ describe('createGitHubPullRequest', () => {
     // run with --repo <fork> even though PR reads prefer upstream since #7331.
     getOwnerRepoForRemoteMock.mockImplementation(async (_repoPath: string, remoteName: string) =>
       remoteName === 'origin'
-        ? { owner: 'fsdwen', repo: 'orca_botmux' }
-        : { owner: 'stablyai', repo: 'orca_botmux' }
+        ? { owner: 'fsdwen', repo: 'botmux' }
+        : { owner: 'stablyai', repo: 'botmux' }
     )
     ghExecFileAsyncMock.mockResolvedValueOnce({
       stdout: JSON.stringify({
         number: 5,
-        url: 'https://github.com/fsdwen/orca_botmux/pull/5'
+        url: 'https://github.com/fsdwen/botmux/pull/5'
       })
     })
 
@@ -159,11 +159,11 @@ describe('createGitHubPullRequest', () => {
     ).resolves.toEqual({
       ok: true,
       number: 5,
-      url: 'https://github.com/fsdwen/orca_botmux/pull/5'
+      url: 'https://github.com/fsdwen/botmux/pull/5'
     })
 
     const [args] = ghExecFileAsyncMock.mock.calls[0]
-    expect(args[args.indexOf('--repo') + 1]).toBe('fsdwen/orca_botmux')
+    expect(args[args.indexOf('--repo') + 1]).toBe('fsdwen/botmux')
     expect(args[args.indexOf('--head') + 1]).toBe('my-branch')
   })
 
@@ -173,12 +173,12 @@ describe('createGitHubPullRequest', () => {
     getOwnerRepoMock.mockResolvedValueOnce(null)
     getEnterpriseGitHubRepoSlugMock.mockResolvedValueOnce({
       owner: 'team',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       host: 'github.acme-corp.com'
     })
     // gh prints the PR URL (not JSON); the GHES host must still parse directly.
     ghExecFileAsyncMock.mockResolvedValueOnce({
-      stdout: 'https://github.acme-corp.com/team/orca_botmux/pull/7\n'
+      stdout: 'https://github.acme-corp.com/team/botmux/pull/7\n'
     })
 
     await expect(
@@ -191,20 +191,20 @@ describe('createGitHubPullRequest', () => {
     ).resolves.toEqual({
       ok: true,
       number: 7,
-      url: 'https://github.acme-corp.com/team/orca_botmux/pull/7'
+      url: 'https://github.acme-corp.com/team/botmux/pull/7'
     })
 
     const [args] = ghExecFileAsyncMock.mock.calls[0]
-    // Bare "team/orca_botmux" would resolve against gh's default host (github.com);
+    // Bare "team/botmux" would resolve against gh's default host (github.com);
     // the host prefix pins the command to the Enterprise server.
-    expect(args[args.indexOf('--repo') + 1]).toBe('github.acme-corp.com/team/orca_botmux')
+    expect(args[args.indexOf('--repo') + 1]).toBe('github.acme-corp.com/team/botmux')
   })
 
   it('host-qualifies --repo for the GHES existing-PR fallback lookup (#8312)', async () => {
     getOwnerRepoMock.mockResolvedValue(null)
     getEnterpriseGitHubRepoSlugMock.mockResolvedValue({
       owner: 'team',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       host: 'github.acme-corp.com'
     })
     // Create reports "already exists", forcing the pr-list fallback.
@@ -217,7 +217,7 @@ describe('createGitHubPullRequest', () => {
       )
       .mockResolvedValueOnce({
         stdout: JSON.stringify([
-          { number: 9, url: 'https://github.acme-corp.com/team/orca_botmux/pull/9' }
+          { number: 9, url: 'https://github.acme-corp.com/team/botmux/pull/9' }
         ])
       })
 
@@ -231,12 +231,12 @@ describe('createGitHubPullRequest', () => {
     ).resolves.toMatchObject({
       ok: false,
       code: 'already_exists',
-      existingReview: { number: 9, url: 'https://github.acme-corp.com/team/orca_botmux/pull/9' }
+      existingReview: { number: 9, url: 'https://github.acme-corp.com/team/botmux/pull/9' }
     })
 
     const [listArgs] = ghExecFileAsyncMock.mock.calls[1]
     expect(listArgs).toEqual(expect.arrayContaining(['pr', 'list']))
-    expect(listArgs[listArgs.indexOf('--repo') + 1]).toBe('github.acme-corp.com/team/orca_botmux')
+    expect(listArgs[listArgs.indexOf('--repo') + 1]).toBe('github.acme-corp.com/team/botmux')
   })
 
   it('runs local WSL project pull request creation through the selected distro', async () => {

@@ -31,6 +31,7 @@ import type { MobileChatPermission } from './mobile-native-chat-permission'
 import { MobileNativeChatQuestion } from './MobileNativeChatQuestion'
 import { mobileChatQuestionKey, type MobileChatQuestion } from './mobile-native-chat-question'
 import type { MobileNativeChatStatus } from './use-mobile-native-chat-session'
+import { useMobileI18n } from '../i18n/mobile-i18n'
 
 /** Why the composer input is locked: the transport is disconnected, or the
  *  terminal subscription has not acknowledged its input lease yet. */
@@ -123,6 +124,7 @@ export function MobileNativeChatView({
   keyboardInset = 0
 }: Props): React.JSX.Element {
   const insets = useSafeAreaInsets()
+  const { t } = useMobileI18n()
   const listRef = useRef<FlatList<NativeChatMessage>>(null)
   const [toolsExpanded, setToolsExpanded] = useState(false)
   // Dismiss the question card as soon as it's answered; the live status lingers
@@ -297,7 +299,7 @@ export function MobileNativeChatView({
                     {loadingEarlier ? (
                       <ActivityIndicator size="small" color={colors.textMuted} />
                     ) : (
-                      <Text style={styles.loadEarlierText}>Load earlier messages</Text>
+                      <Text style={styles.loadEarlierText}>{t('Load earlier messages')}</Text>
                     )}
                   </Pressable>
                 ) : null
@@ -305,8 +307,8 @@ export function MobileNativeChatView({
               ListEmptyComponent={
                 emptyState ? (
                   <View style={styles.center}>
-                    <Text style={styles.emptyTitle}>{emptyState.title}</Text>
-                    <Text style={styles.emptySubtitle}>{emptyState.subtitle}</Text>
+                    <Text style={styles.emptyTitle}>{t(emptyState.title)}</Text>
+                    <Text style={styles.emptySubtitle}>{t(emptyState.subtitle)}</Text>
                   </View>
                 ) : null
               }
@@ -316,7 +318,7 @@ export function MobileNativeChatView({
               per-message (the up-arrow in each agent message's controls). */}
           {!atBottom ? (
             <Pressable
-              accessibilityLabel="Scroll to latest"
+              accessibilityLabel={t('Scroll to latest')}
               style={[styles.fab, styles.fabBottom]}
               onPress={() => listRef.current?.scrollToEnd({ animated: true })}
             >
@@ -374,7 +376,7 @@ export function MobileNativeChatView({
             ) : (
               <ChevronsUpDown size={14} color={colors.textMuted} strokeWidth={2} />
             )}
-            <Text style={styles.chromeToggleLabel}>{toolsExpanded ? 'Collapse' : 'Tools'}</Text>
+            <Text style={styles.chromeToggleLabel}>{t(toolsExpanded ? 'Collapse' : 'Tools')}</Text>
           </Pressable>
         </View>
         {agentWorking ? (
@@ -382,10 +384,10 @@ export function MobileNativeChatView({
             style={({ pressed }) => [styles.stopButton, pressed && styles.pressed]}
             onPress={onStop}
             hitSlop={8}
-            accessibilityLabel="Stop the agent"
+            accessibilityLabel={t('Stop the agent')}
           >
             <Square size={13} color={colors.statusRed} strokeWidth={2.4} fill={colors.statusRed} />
-            <Text style={styles.stopLabel}>Stop</Text>
+            <Text style={styles.stopLabel}>{t('Stop')}</Text>
           </Pressable>
         ) : null}
       </View>
@@ -393,8 +395,8 @@ export function MobileNativeChatView({
         <View style={styles.sendError}>
           <Text style={styles.sendErrorText}>
             {rawLockReason === 'disconnected'
-              ? 'Message not sent — reconnecting…'
-              : 'Message not sent'}
+              ? t('Message not sent — reconnecting…')
+              : t('Message not sent')}
           </Text>
         </View>
       ) : null}
@@ -412,10 +414,10 @@ export function MobileNativeChatView({
         disabled={lockReason !== null}
         placeholder={
           lockReason === 'disconnected'
-            ? 'Reconnecting…'
+            ? t('Reconnecting…')
             : lockReason === 'waiting'
-              ? 'Waiting for terminal…'
-              : 'Message, @files, /commands'
+              ? t('Waiting for terminal…')
+              : t('Message, @files, /commands')
         }
         filePaths={filePaths}
         onNeedFiles={onNeedFiles}

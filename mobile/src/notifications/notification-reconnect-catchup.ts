@@ -9,7 +9,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage'
 // notification we already delivered. The in-memory seen-set is a second guard
 // against double-delivery for events that arrive on both the live stream and a
 // replay (e.g. a brief liveness spell before a reap).
-const LAST_SEQ_STORAGE_KEY_PREFIX = 'orca:mobileNotificationsLastSeq:'
+const LAST_SEQ_STORAGE_KEY_PREFIX = 'botmux:mobileNotificationsLastSeq:'
 
 function lastSeqStorageKey(hostId: string): string {
   return LAST_SEQ_STORAGE_KEY_PREFIX + encodeURIComponent(hostId)

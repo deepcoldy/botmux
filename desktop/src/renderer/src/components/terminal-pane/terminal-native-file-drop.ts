@@ -41,7 +41,7 @@ export type NativeTerminalFileDropArgs = {
  * Handle a native file drop targeted at a terminal pane.
  *
  * Local worktrees: paste the local absolute path (reference-in-place; no copy
- * or IPC). SSH worktrees: upload each file into `${worktreePath}/.orca_botmux/drops`
+ * or IPC). SSH worktrees: upload each file into `${worktreePath}/.botmux/drops`
  * and paste the remote path so the remote agent can read it. See
  * docs/terminal-drop-ssh.md.
  */

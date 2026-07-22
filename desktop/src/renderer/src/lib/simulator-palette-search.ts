@@ -200,7 +200,7 @@ export function searchSimulatorTabs(
         repoRange: null,
         worktreeRange: null,
         // Why: simulator tabs follow browser-tab Cmd+J ordering: deterministic
-        // and context-first until OrcaBotmux tracks per-tab recency for this surface.
+        // and context-first until Botmux tracks per-tab recency for this surface.
         score: entry.isCurrentTab
           ? -2
           : entry.isCurrentWorktree

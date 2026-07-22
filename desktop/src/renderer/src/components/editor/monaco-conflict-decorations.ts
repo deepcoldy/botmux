@@ -47,14 +47,14 @@ function makeMarkerDecoration(
     range: makeMarkerRange(lineNumber, line),
     options: {
       isWholeLine: true,
-      className: 'orca-botmux-conflict-marker-line',
-      linesDecorationsClassName: 'orca-botmux-conflict-line-decoration',
-      marginClassName: 'orca-botmux-conflict-margin',
+      className: 'botmux-conflict-marker-line',
+      linesDecorationsClassName: 'botmux-conflict-line-decoration',
+      marginClassName: 'botmux-conflict-margin',
       hoverMessage: { value: label },
       linesDecorationsTooltip: label,
       after: {
         content: ` ${label}`,
-        inlineClassName: 'orca-botmux-conflict-marker-label'
+        inlineClassName: 'botmux-conflict-marker-label'
       }
     }
   }
@@ -73,7 +73,7 @@ function makeSectionDecoration(
     range: makeWholeLineRange(startLineNumber, endLineNumber),
     options: {
       isWholeLine: true,
-      className: `orca-botmux-conflict-section-line orca-botmux-conflict-${section}-line`
+      className: `botmux-conflict-section-line botmux-conflict-${section}-line`
     }
   }
 }

@@ -3,7 +3,7 @@ import type { GitHubRepoContext } from './github-repository-identity'
 
 /**
  * Negative cache for repos where gh's cwd-based repo resolution fails
- * ("no git remotes found" etc). OrcaBotmux only falls back to cwd resolution when
+ * ("no git remotes found" etc). Botmux only falls back to cwd resolution when
  * it could not resolve an owner/repo itself, so for a remote-less repo the
  * failure is deterministic — yet the Tasks page re-spawned gh for every such
  * repo on every refresh (×90 repos in the reported storm). Remember the

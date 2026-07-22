@@ -12,8 +12,8 @@ import { buildAgentFeatureSkillInstallCommand } from '../../../../shared/agent-f
 import { toast } from 'sonner'
 import type { CliInstallStatus } from '../../../../shared/cli-install-types'
 import {
-  isOrcaCliAvailableOnPath,
-  showOrcaCliRegistrationPromptToast
+  isBotmuxCliAvailableOnPath,
+  showBotmuxCliRegistrationPromptToast
 } from '@/lib/agent-skill-cli-prerequisite'
 import { translate } from '@/i18n/i18n'
 
@@ -204,9 +204,9 @@ export async function ensureWslCliAvailableForAgentSkillTerminal(
       return status
     }
     if (status.state !== 'installed' || status.pathConfigured === false) {
-      await showOrcaCliRegistrationPromptToast()
+      await showBotmuxCliRegistrationPromptToast()
       const next = await window.api.cli.installWsl(args)
-      if (!isOrcaCliAvailableOnPath(next)) {
+      if (!isBotmuxCliAvailableOnPath(next)) {
         toast.warning(
           translate(
             'auto.components.settings.CliSkillRuntimeSetup.3728a94fb6',

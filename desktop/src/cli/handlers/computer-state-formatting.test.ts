@@ -6,7 +6,7 @@ vi.mock('../runtime-client', () => {
   class RuntimeClient {
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
   }
 
   class RuntimeClientError extends Error {
@@ -37,7 +37,7 @@ vi.mock('../runtime-client', () => {
 import { main } from '../index'
 import { okFixture, queueFixtures } from '../test-fixtures'
 
-describe('orca_botmux computer get-app-state formatting', () => {
+describe('botmux computer get-app-state formatting', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     callMock.mockReset()
@@ -74,7 +74,7 @@ describe('orca_botmux computer get-app-state formatting', () => {
       expiresAt: expect.any(String)
     })
     expect(String(parsed.result.screenshot.path).replaceAll('\\', '/')).toContain(
-      'orca-botmux-computer-use/req_state-screenshot.png'
+      'botmux-computer-use/req_state-screenshot.png'
     )
   })
 

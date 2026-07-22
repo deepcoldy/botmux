@@ -16,7 +16,7 @@ describe('pairing offer', () => {
 
   it('encode then decode round-trips correctly', () => {
     const url = encodePairingOffer(offer)
-    expect(url).toMatch(/^orca_botmux:\/\/pair\?code=/)
+    expect(url).toMatch(/^botmux:\/\/pair\?code=/)
 
     const decoded = decodePairingOffer(url)
     expect(decoded).toEqual(offer)
@@ -37,41 +37,41 @@ describe('pairing offer', () => {
     expect(() => decodePairingOffer('https://example.com#abc')).toThrow('Invalid pairing URL')
   })
 
-  it('rejects orca_botmux URLs outside the exact pairing route', () => {
+  it('rejects botmux URLs outside the exact pairing route', () => {
     const url = encodePairingOffer(offer)
     const code = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('code')!
 
-    expect(parsePairingCode(`orca_botmux://pairing?code=${code}`)).toBeNull()
-    expect(parsePairingCode(`orca_botmux://pair-extra?code=${code}`)).toBeNull()
-    expect(() => decodePairingOffer(`orca_botmux://pairing?code=${code}`)).toThrow('Invalid pairing URL')
+    expect(parsePairingCode(`botmux://pairing?code=${code}`)).toBeNull()
+    expect(parsePairingCode(`botmux://pair-extra?code=${code}`)).toBeNull()
+    expect(() => decodePairingOffer(`botmux://pairing?code=${code}`)).toThrow('Invalid pairing URL')
   })
 
   it('rejects URLs without a pairing code', () => {
-    expect(() => decodePairingOffer('orca_botmux://pair')).toThrow('Invalid pairing URL')
+    expect(() => decodePairingOffer('botmux://pair')).toThrow('Invalid pairing URL')
   })
 
   it('decodes legacy hash URLs', () => {
     const url = encodePairingOffer(offer)
     const code = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('code')!
-    expect(decodePairingOffer(`orca_botmux://pair#${code}`)).toEqual(offer)
+    expect(decodePairingOffer(`botmux://pair#${code}`)).toEqual(offer)
   })
 
   it('rejects payloads with missing fields', () => {
     const partial = { v: 2, endpoint: 'ws://host:1234' }
     const base64 = Buffer.from(JSON.stringify(partial)).toString('base64')
-    expect(() => decodePairingOffer(`orca_botmux://pair#${base64}`)).toThrow()
+    expect(() => decodePairingOffer(`botmux://pair#${base64}`)).toThrow()
   })
 
   it('rejects payloads with wrong version', () => {
     const wrong = { ...offer, v: 1 }
     const base64 = Buffer.from(JSON.stringify(wrong)).toString('base64')
-    expect(() => decodePairingOffer(`orca_botmux://pair#${base64}`)).toThrow()
+    expect(() => decodePairingOffer(`botmux://pair#${base64}`)).toThrow()
   })
 
   it('rejects payloads with missing publicKeyB64', () => {
     const wrong = { v: 2, endpoint: 'ws://host:1234', deviceToken: 'tok' }
     const base64 = Buffer.from(JSON.stringify(wrong)).toString('base64')
-    expect(() => decodePairingOffer(`orca_botmux://pair#${base64}`)).toThrow()
+    expect(() => decodePairingOffer(`botmux://pair#${base64}`)).toThrow()
   })
 })
 
@@ -83,7 +83,7 @@ describe('parsePairingCode', () => {
     publicKeyB64: 'pubkey-xyz'
   }
 
-  it('parses a full orca_botmux://pair# URL', () => {
+  it('parses a full botmux://pair# URL', () => {
     const url = encodePairingOffer(offer)
     expect(parsePairingCode(url)).toEqual(offer)
   })

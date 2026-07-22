@@ -12,7 +12,7 @@ describe('writeFileAtomically', () => {
   let dir: string
 
   function setup(): string {
-    dir = mkdtempSync(join(tmpdir(), 'orca-botmux-fs-utils-'))
+    dir = mkdtempSync(join(tmpdir(), 'botmux-fs-utils-'))
     return dir
   }
 
@@ -87,7 +87,7 @@ describe('retrying file operations', () => {
   let dir: string
 
   function setup(): string {
-    dir = mkdtempSync(join(tmpdir(), 'orca-botmux-fs-utils-'))
+    dir = mkdtempSync(join(tmpdir(), 'botmux-fs-utils-'))
     return dir
   }
 

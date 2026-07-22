@@ -37,7 +37,7 @@ export default function MobilePage(): React.JSX.Element {
   const [encodedConnectionMode, setEncodedConnectionMode] =
     useState<MobilePairingConnectionMode | null>(null)
   const [pairLoading, setPairLoading] = useState(false)
-  const signedIn = useAppStore((state) => state.orcaProfileAuthStatus?.state === 'connected')
+  const signedIn = useAppStore((state) => state.botmuxProfileAuthStatus?.state === 'connected')
   const [connectionMode, setConnectionMode] = useMobilePairingConnectionMode()
   const [networkInterfaces, setNetworkInterfaces] = useState<MobileNetworkInterface[]>([])
   const [selectedAddress, setSelectedAddress] = useState<string | undefined>(undefined)

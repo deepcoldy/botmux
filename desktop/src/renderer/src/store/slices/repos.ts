@@ -286,12 +286,12 @@ function formatProjectPresenceProfileNames(profileNames: readonly string[]): str
 
 async function warnIfProjectKnownInAnotherProfile(
   repo: Repo,
-  activeOrcaProfileId: string | null
+  activeBotmuxProfileId: string | null
 ): Promise<void> {
-  const findProjectProfiles = window.api.orcaBotmuxProfiles?.findProjectProfiles
+  const findProjectProfiles = window.api.botmuxProfiles?.findProjectProfiles
   // Why: without a loaded active profile ID the scan cannot exclude the
   // current profile and would false-positive on the project just added.
-  if (!findProjectProfiles || !activeOrcaProfileId) {
+  if (!findProjectProfiles || !activeBotmuxProfileId) {
     return
   }
   try {
@@ -299,7 +299,7 @@ async function warnIfProjectKnownInAnotherProfile(
       path: repo.path,
       connectionId: repo.connectionId ?? null,
       executionHostId: getRepoExecutionHostId(repo),
-      excludeProfileId: activeOrcaProfileId
+      excludeProfileId: activeBotmuxProfileId
     })
     const description = formatProjectPresenceProfileNames(
       result.projects.map((project) => project.profileName)
@@ -446,7 +446,7 @@ async function assertProjectHostSetupRuntimeCapability(
   await assertRuntimeEnvironmentCapability(
     target.environmentId,
     PROJECT_HOST_SETUP_RUNTIME_CAPABILITY,
-    'The selected OrcaBotmux server does not support project host setup yet. Update OrcaBotmux on the server and try again.',
+    'The selected Botmux server does not support project host setup yet. Update Botmux on the server and try again.',
     15_000
   )
 }
@@ -461,7 +461,7 @@ async function assertProjectHostSetupMutationRuntimeCapabilities(
   await assertRuntimeEnvironmentCapability(
     target.environmentId,
     WORKSPACE_RUN_CONTEXT_RUNTIME_CAPABILITY,
-    'The selected OrcaBotmux server does not support explicit workspace run hosts yet. Update OrcaBotmux on the server and try again.',
+    'The selected Botmux server does not support explicit workspace run hosts yet. Update Botmux on the server and try again.',
     15_000
   )
 }
@@ -714,7 +714,7 @@ function mergeFetchedProjectCompatibilityForHost({
     }
     const owner = parseExecutionHostId(setup.hostId)
     // Why: desktop persistence owns local and direct-SSH setups; runtime setups
-    // remain authoritative on their remote OrcaBotmux server.
+    // remain authoritative on their remote Botmux server.
     return setup.hostId === LOCAL_EXECUTION_HOST_ID || owner?.kind === 'ssh'
   }
   const fetchedSetupsForHost = fetched.projectHostSetups.filter(setupBelongsToFetchedCatalog)
@@ -1016,11 +1016,11 @@ function projectCompatibilityForReconciledRepos(
   return mergeProjectHostSetupCompatibility(projectCompatibilityFromRepos(repos), fetched)
 }
 
-function filterTrustedOrcaHooksToValidRepos(
-  trust: AppState['trustedOrcaHooks'],
+function filterTrustedBotmuxHooksToValidRepos(
+  trust: AppState['trustedBotmuxHooks'],
   validRepoIds: Set<string>
-): AppState['trustedOrcaHooks'] {
-  const next: AppState['trustedOrcaHooks'] = {}
+): AppState['trustedBotmuxHooks'] {
+  const next: AppState['trustedBotmuxHooks'] = {}
   for (const [repoId, entry] of Object.entries(trust)) {
     if (validRepoIds.has(repoId)) {
       next[repoId] = entry
@@ -1235,7 +1235,7 @@ async function fetchRuntimeAddProjectPathStatus(args: {
     FOLDER_WORKSPACE_PATH_STATUS_RUNTIME_CAPABILITY,
     translate(
       'auto.store.slices.repos.2975400634',
-      'Update OrcaBotmux server to open non-Git folders on this runtime.'
+      'Update Botmux server to open non-Git folders on this runtime.'
     ),
     15_000
   )
@@ -1748,7 +1748,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
             s.setupScriptPromptDismissedRepoIds,
             validRepoIds
           ),
-          trustedOrcaHooks: filterTrustedOrcaHooksToValidRepos(s.trustedOrcaHooks, validRepoIds)
+          trustedBotmuxHooks: filterTrustedBotmuxHooksToValidRepos(s.trustedBotmuxHooks, validRepoIds)
         }
       })
     }
@@ -2291,7 +2291,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
       if (stillExists) {
         failedProjectRemovals.push({
           projectId,
-          reason: 'Project remained in OrcaBotmux after removeProject completed.'
+          reason: 'Project remained in Botmux after removeProject completed.'
         })
       } else {
         removedProjectIds.push(projectId)
@@ -2416,7 +2416,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
       const repoIdentity = getRepoHostIdentity(repo)
       const alreadyAdded = get().repos.some((r) => getRepoHostIdentity(r) === repoIdentity)
       if (alreadyAdded) {
-        get().clearOrcaHookTrustForRepo(repo.id)
+        get().clearBotmuxHookTrustForRepo(repo.id)
       }
       set((s) => {
         if (s.repos.some((r) => getRepoHostIdentity(r) === repoIdentity)) {
@@ -2449,7 +2449,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
         )
         // Why: the design requires the cross-profile advisory for SSH-added
         // projects too — the presence lookup already keys on connection/host.
-        await warnIfProjectKnownInAnotherProfile(repo, get().activeOrcaProfileId)
+        await warnIfProjectKnownInAnotherProfile(repo, get().activeBotmuxProfileId)
       }
       return repo
     } catch (err) {
@@ -2809,7 +2809,7 @@ export const createRepoSlice: StateCreator<AppState, [], [], RepoSlice> = (set, 
           : window.api.repos.remove({ repoId: projectId })
         : callRuntimeRpc(target, 'repo.rm', { repo: projectId }, { timeoutMs: 15_000 }))
 
-      get().clearOrcaHookTrustForRepo(projectId)
+      get().clearBotmuxHookTrustForRepo(projectId)
       const repoPath = get().repos.find((repo) =>
         repoMatchesHostIdentity(repo, projectId, ownerHostId)
       )?.path

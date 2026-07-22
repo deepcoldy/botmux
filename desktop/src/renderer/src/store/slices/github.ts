@@ -2535,7 +2535,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
     // PRs goes through updatePullRequestBySlug; for issues through
     // updateIssueBySlug. We dispatch both as needed.
     let envelope: GitHubProjectMutationResult = { ok: true }
-    // Why: Project rows may be slug-only and have no registered OrcaBotmux repo.
+    // Why: Project rows may be slug-only and have no registered Botmux repo.
     // Fall back to the view source encoded in the cache key, not focused host.
     const target = getActiveRuntimeTarget(
       settingsForProjectRowOwner(
@@ -2826,7 +2826,7 @@ export const createGitHubSlice: StateCreator<AppState, [], [], GitHubSlice> = (s
         })
         // Why: stamp repoId at the renderer fetch boundary so every downstream
         // consumer (cross-repo merge, row rendering, drawer) can rely on the
-        // field being present. Main doesn't know OrcaBotmux's Repo.id.
+        // field being present. Main doesn't know Botmux's Repo.id.
         const items: GitHubWorkItem[] = envelope.items.map((item) => ({ ...item, repoId }))
         // Why: only surface the issues-side error in the cache entry. The
         // parent design doc §2 scopes feature 1 to the new class of silent

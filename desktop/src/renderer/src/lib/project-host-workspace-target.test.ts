@@ -57,27 +57,27 @@ function makeSetup(
 
 describe('project-host workspace target resolution', () => {
   it('falls back to a local setup for a local-only repo', () => {
-    const repo = makeRepo('orca_botmux')
+    const repo = makeRepo('botmux')
 
     const resolution = resolveWorkspaceCreationTarget({ eligibleRepos: [repo] })
 
     expect(resolution).toMatchObject({
       status: 'ready',
       target: {
-        projectId: 'repo:orca_botmux',
+        projectId: 'repo:botmux',
         hostId: 'local',
-        projectHostSetupId: 'orca_botmux',
-        repoId: 'orca_botmux'
+        projectHostSetupId: 'botmux',
+        repoId: 'botmux'
       }
     })
   })
 
   it('chooses the focused host setup when one project exists on multiple hosts', () => {
-    const repos = [makeRepo('orca-botmux-local'), makeRepo('orca-botmux-ssh', { connectionId: 'openclaw-2' })]
-    const projects = [makeProject('github:stablyai/orca_botmux', ['orca-botmux-local', 'orca-botmux-ssh'])]
+    const repos = [makeRepo('botmux-local'), makeRepo('botmux-ssh', { connectionId: 'openclaw-2' })]
+    const projects = [makeProject('github:stablyai/botmux', ['botmux-local', 'botmux-ssh'])]
     const projectHostSetups = [
-      makeSetup('orca-botmux-local', 'github:stablyai/orca_botmux', 'local', 'orca-botmux-local'),
-      makeSetup('orca-botmux-ssh', 'github:stablyai/orca_botmux', 'ssh:openclaw-2', 'orca-botmux-ssh')
+      makeSetup('botmux-local', 'github:stablyai/botmux', 'local', 'botmux-local'),
+      makeSetup('botmux-ssh', 'github:stablyai/botmux', 'ssh:openclaw-2', 'botmux-ssh')
     ]
 
     expect(
@@ -85,68 +85,68 @@ describe('project-host workspace target resolution', () => {
         eligibleRepos: repos,
         projects,
         projectHostSetups,
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         focusedHostScope: 'ssh:openclaw-2'
       })
-    ).toBe('orca-botmux-ssh')
+    ).toBe('botmux-ssh')
   })
 
   it('resolves an explicit project and host to the matching setup', () => {
     const repos = [
-      makeRepo('orca-botmux-local'),
-      makeRepo('orca-botmux-runtime', { executionHostId: 'runtime:gpu-1' })
+      makeRepo('botmux-local'),
+      makeRepo('botmux-runtime', { executionHostId: 'runtime:gpu-1' })
     ]
-    const projects = [makeProject('github:stablyai/orca_botmux', ['orca-botmux-local', 'orca-botmux-runtime'])]
+    const projects = [makeProject('github:stablyai/botmux', ['botmux-local', 'botmux-runtime'])]
     const projectHostSetups = [
-      makeSetup('orca-botmux-local', 'github:stablyai/orca_botmux', 'local', 'orca-botmux-local'),
-      makeSetup('orca-botmux-runtime', 'github:stablyai/orca_botmux', 'runtime:gpu-1', 'orca-botmux-runtime')
+      makeSetup('botmux-local', 'github:stablyai/botmux', 'local', 'botmux-local'),
+      makeSetup('botmux-runtime', 'github:stablyai/botmux', 'runtime:gpu-1', 'botmux-runtime')
     ]
 
     const resolution = resolveWorkspaceCreationTarget({
       eligibleRepos: repos,
       projects,
       projectHostSetups,
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu-1'
     })
 
     expect(resolution).toMatchObject({
       status: 'ready',
       target: {
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'runtime:gpu-1',
-        projectHostSetupId: 'orca-botmux-runtime',
-        repoId: 'orca-botmux-runtime'
+        projectHostSetupId: 'botmux-runtime',
+        repoId: 'botmux-runtime'
       }
     })
   })
 
   it('does not merge same-name repos without shared project identity', () => {
     const repos = [
-      makeRepo('personal-orca_botmux', { displayName: 'orca_botmux' }),
-      makeRepo('work-orca_botmux', { displayName: 'orca_botmux', connectionId: 'work-linux' })
+      makeRepo('personal-botmux', { displayName: 'botmux' }),
+      makeRepo('work-botmux', { displayName: 'botmux', connectionId: 'work-linux' })
     ]
 
     expect(
       resolveWorkspaceCreationRepoId({
         eligibleRepos: repos,
-        projectId: 'repo:personal-orca_botmux',
+        projectId: 'repo:personal-botmux',
         focusedHostScope: 'ssh:work-linux'
       })
-    ).toBe('personal-orca_botmux')
+    ).toBe('personal-botmux')
   })
 
   it('reports unavailable when the project is not set up on the selected host', () => {
-    const repo = makeRepo('orca_botmux')
-    const projects = [makeProject('github:stablyai/orca_botmux', ['orca_botmux'])]
-    const projectHostSetups = [makeSetup('orca_botmux', 'github:stablyai/orca_botmux', 'local', 'orca_botmux')]
+    const repo = makeRepo('botmux')
+    const projects = [makeProject('github:stablyai/botmux', ['botmux'])]
+    const projectHostSetups = [makeSetup('botmux', 'github:stablyai/botmux', 'local', 'botmux')]
 
     expect(
       resolveWorkspaceCreationTarget({
         eligibleRepos: [repo],
         projects,
         projectHostSetups,
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:openclaw-2'
       })
     ).toEqual({
@@ -156,11 +156,11 @@ describe('project-host workspace target resolution', () => {
   })
 
   it('reports setup-not-ready when the selected host has pending setup metadata', () => {
-    const repo = makeRepo('orca_botmux')
-    const projects = [makeProject('github:stablyai/orca_botmux', ['orca_botmux'])]
+    const repo = makeRepo('botmux')
+    const projects = [makeProject('github:stablyai/botmux', ['botmux'])]
     const projectHostSetups = [
-      makeSetup('orca_botmux', 'github:stablyai/orca_botmux', 'local', 'orca_botmux'),
-      makeSetup('gpu-pending', 'github:stablyai/orca_botmux', 'runtime:gpu', '', {
+      makeSetup('botmux', 'github:stablyai/botmux', 'local', 'botmux'),
+      makeSetup('gpu-pending', 'github:stablyai/botmux', 'runtime:gpu', '', {
         path: '',
         setupState: 'setting-up',
         setupMethod: 'provisioned'
@@ -172,7 +172,7 @@ describe('project-host workspace target resolution', () => {
         eligibleRepos: [repo],
         projects,
         projectHostSetups,
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'runtime:gpu'
       })
     ).toEqual({
@@ -182,10 +182,10 @@ describe('project-host workspace target resolution', () => {
   })
 
   it('reports unavailable when an explicit setup is not ready', () => {
-    const repo = makeRepo('orca_botmux')
-    const projects = [makeProject('github:stablyai/orca_botmux', ['orca_botmux'])]
+    const repo = makeRepo('botmux')
+    const projects = [makeProject('github:stablyai/botmux', ['botmux'])]
     const projectHostSetups = [
-      makeSetup('orca_botmux', 'github:stablyai/orca_botmux', 'local', 'orca_botmux', { setupState: 'setting-up' })
+      makeSetup('botmux', 'github:stablyai/botmux', 'local', 'botmux', { setupState: 'setting-up' })
     ]
 
     expect(
@@ -193,7 +193,7 @@ describe('project-host workspace target resolution', () => {
         eligibleRepos: [repo],
         projects,
         projectHostSetups,
-        projectHostSetupId: 'orca_botmux'
+        projectHostSetupId: 'botmux'
       })
     ).toEqual({
       status: 'unavailable',

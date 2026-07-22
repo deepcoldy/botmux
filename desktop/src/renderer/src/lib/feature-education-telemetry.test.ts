@@ -117,7 +117,7 @@ describe('feature education telemetry helpers', () => {
     const storage = createMemoryStorage()
     vi.stubGlobal('localStorage', storage)
     storage.setItem(
-      'orca_botmux.setupGuideTelemetryCompletedSteps.v1',
+      'botmux.setupGuideTelemetryCompletedSteps.v1',
       JSON.stringify(['split-terminal', 'two-worktrees'])
     )
 

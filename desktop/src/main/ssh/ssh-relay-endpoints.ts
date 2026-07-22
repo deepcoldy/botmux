@@ -20,7 +20,7 @@ export function relayEndpointForHost(
     .update(`${remoteDir}\0${sockName}`)
     .digest('hex')
     .slice(0, 20)
-  return `\\\\.\\pipe\\orca-botmux-relay-${endpointHash}`
+  return `\\\\.\\pipe\\botmux-relay-${endpointHash}`
 }
 
 export function relayHookEndpointDirForHost(
@@ -64,5 +64,5 @@ export function windowsActivePipeMarkerPath(
 }
 
 export function isWindowsRelayPipePath(value: string): boolean {
-  return /^\\\\[.?]\\pipe\\orca-botmux-relay-[0-9a-f]{20}$/i.test(value)
+  return /^\\\\[.?]\\pipe\\botmux-relay-[0-9a-f]{20}$/i.test(value)
 }

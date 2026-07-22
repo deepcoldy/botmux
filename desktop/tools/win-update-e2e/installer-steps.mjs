@@ -1,10 +1,10 @@
 // Silent NSIS install / update / uninstall and installed-app discovery.
 //
-// OrcaBotmux ships a per-user oneClick NSIS installer (electron-builder defaults:
-// oneClick=true, perMachine=false) named orca-botmux-windows-setup.exe. One-click
+// Botmux ships a per-user oneClick NSIS installer (electron-builder defaults:
+// oneClick=true, perMachine=false) named botmux-windows-setup.exe. One-click
 // silent mode is `<setup.exe> /S`; the app installs under
-// %LOCALAPPDATA%\Programs\<dir> and the exe is OrcaBotmux.exe. The install dir casing
-// is not guaranteed (observed lowercase "orca_botmux" on a dev box), so the exe is
+// %LOCALAPPDATA%\Programs\<dir> and the exe is Botmux.exe. The install dir casing
+// is not guaranteed (observed lowercase "botmux" on a dev box), so the exe is
 // located by search, never by a hard-coded path.
 
 import { existsSync, mkdtempSync } from 'node:fs'
@@ -14,8 +14,8 @@ import { spawnSync } from 'node:child_process'
 import { assertWin32 } from './platform-guard.mjs'
 import { runCommandSync } from './powershell-runner.mjs'
 
-const PRODUCT_NAME = 'orca_botmux'
-const EXE_NAME = 'OrcaBotmux.exe'
+const PRODUCT_NAME = 'botmux'
+const EXE_NAME = 'Botmux.exe'
 
 /** Programs root that per-user oneClick NSIS installs into. */
 function programsRoot() {
@@ -39,7 +39,7 @@ export function resolveInstaller({ localPath, releaseTag, assetPattern }) {
   if (!releaseTag) {
     throw new Error('resolveInstaller: neither localPath nor releaseTag provided')
   }
-  const outDir = mkdtempSync(path.join(tmpdir(), 'orca-botmux-e2e-installer-'))
+  const outDir = mkdtempSync(path.join(tmpdir(), 'botmux-e2e-installer-'))
   const result = spawnSync(
     'gh',
     ['release', 'download', releaseTag, '--pattern', assetPattern, '--dir', outDir],
@@ -92,7 +92,7 @@ export function silentInstall(setupExe, { timeoutMs = 180_000, installDir = null
     throw new Error(`Failed to launch installer ${setupExe}: ${proc.error.message}`)
   }
 
-  // On update runs the old OrcaBotmux.exe already exists, so wait for the exe whose
+  // On update runs the old Botmux.exe already exists, so wait for the exe whose
   // version matches this installer — not just any exe the installer hasn't yet
   // overwritten — to avoid reading the pre-update binary mid-copy.
   const targetVersion = getExeVersion(setupExe)
@@ -142,8 +142,8 @@ function waitForInstalledExe(timeoutMs, installDir = null, expectedVersion = nul
 }
 
 /**
- * Locate the installed OrcaBotmux.exe. In isolated mode (`installDir` set), the exe is
- * at a known fixed path (<installDir>\OrcaBotmux.exe). Otherwise it is discovered
+ * Locate the installed Botmux.exe. In isolated mode (`installDir` set), the exe is
+ * at a known fixed path (<installDir>\Botmux.exe). Otherwise it is discovered
  * under %LOCALAPPDATA%\Programs (case-tolerant — casing is not guaranteed).
  */
 export function locateInstalledExe(installDir = null) {
@@ -178,7 +178,7 @@ export function getExeVersion(exePath) {
  * SAFETY: `installDir` is REQUIRED and must be the exact directory the harness
  * installed into this run — there is deliberately no scan-and-discover fallback,
  * because a `null` default once made this function locate and uninstall the
- * developer's REAL OrcaBotmux. It additionally refuses to run against the default
+ * developer's REAL Botmux. It additionally refuses to run against the default
  * per-user install location unless `allowDefaultLocation` is explicitly set (only
  * the owns-the-install non-isolated teardown may do so).
  */
@@ -191,7 +191,7 @@ export function silentUninstall(installDir, { allowDefaultLocation = false } = {
   if (!allowDefaultLocation && pathsEqual(resolved, path.join(programsRoot(), PRODUCT_NAME))) {
     throw new Error(
       `Refusing to uninstall the default install location "${resolved}" — this is where a ` +
-        `developer's REAL OrcaBotmux lives. Isolated mode must target a separate --install-dir.`
+        `developer's REAL Botmux lives. Isolated mode must target a separate --install-dir.`
     )
   }
   const exe = path.join(resolved, EXE_NAME)

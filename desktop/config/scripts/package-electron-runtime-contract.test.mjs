@@ -136,10 +136,10 @@ describe('Electron runtime package contract', () => {
         command.indexOf('electron-builder')
       )
     }
-    expect(macReleaseCommand).toContain(' && ORCA_MAC_RELEASE=1 ')
+    expect(macReleaseCommand).toContain(' && BOTMUX_MAC_RELEASE=1 ')
     expect(releaseCommands.get('linux-x64')).toContain(' && pnpm exec electron-builder ')
     expect(releaseCommands.get('linux-x64')).toContain('--linux AppImage deb rpm --x64')
-    expect(releaseCommands.get('linux-arm64')).toContain('ORCA_LINUX_ARM64_RELEASE=1')
+    expect(releaseCommands.get('linux-arm64')).toContain('BOTMUX_LINUX_ARM64_RELEASE=1')
     expect(releaseCommands.get('linux-arm64')).toContain('--linux AppImage deb rpm --arm64')
     expect(releaseCommands.get('win')).toContain(
       '; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm exec electron-builder '
@@ -273,7 +273,7 @@ describe('Electron runtime package contract', () => {
     expect(releaseMacWorkflow.on.workflow_dispatch.inputs.release_run_id.required).toBe(true)
     expect(buildMacJob['runs-on']).toBe('blacksmith-6vcpu-macos-15')
     expect(checkoutStep.with.ref).toBe('refs/tags/${{ inputs.tag }}')
-    expect(publishStep.with.command).toContain('ORCA_MAC_RELEASE=1')
+    expect(publishStep.with.command).toContain('BOTMUX_MAC_RELEASE=1')
     expect(publishStep.with.command).toContain('electron-builder')
     expect(publishStep.with.command).toContain('--mac --publish always')
     expect(releaseMacWorkflowText).not.toContain('signpath/')
@@ -368,7 +368,7 @@ describe('Electron runtime package contract', () => {
     // Why fail-open: unsigned inner binaries must warn, not block, until the
     // flow is proven on a real release (issue #7785). Flip this to 'true'
     // together with the workflow env to make the gate required.
-    expect(steps[innerVerifyIndex].env.ORCA_WINDOWS_INNER_SIGNATURE_REQUIRED).toBe('false')
+    expect(steps[innerVerifyIndex].env.BOTMUX_WINDOWS_INNER_SIGNATURE_REQUIRED).toBe('false')
 
     // Why: every step in the inner-signing chain must be unable to fail the
     // release — a SignPath outage or timeout falls through to today's
@@ -483,8 +483,8 @@ describe('Electron runtime package contract', () => {
       (step) => step.name === 'Copy cask into tap and open PR'
     )
 
-    expect(resolveCaskStep.run).toContain('token="orca_botmux@rc"')
-    expect(resolveCaskStep.run).toContain('token="orca_botmux"')
+    expect(resolveCaskStep.run).toContain('token="botmux@rc"')
+    expect(resolveCaskStep.run).toContain('token="botmux"')
     expect(renderStep.env.CASK_PATH).toBe('${{ steps.cask.outputs.path }}')
     expect(copyStep.run).toContain('cp "$CASK_PATH" "tap/$CASK_PATH"')
     expect(copyStep.run).toContain('git add "$CASK_PATH"')
@@ -527,32 +527,32 @@ describe('Electron runtime package contract', () => {
     expect(runStep.run).toContain('pnpm run test:e2e:terminal-perf:scale:report')
     expect(runStep.run).toContain('xvfb-run --auto-servernum')
     const manualProfileKnobs = [
-      ['ORCA_TERMINAL_PERF_FRAME_COUNT', 'frame_count', 'ORCA_E2E_OPENCODE_FRAME_COUNT'],
+      ['BOTMUX_TERMINAL_PERF_FRAME_COUNT', 'frame_count', 'BOTMUX_E2E_OPENCODE_FRAME_COUNT'],
       [
-        'ORCA_TERMINAL_PERF_FRAME_INTERVAL_MS',
+        'BOTMUX_TERMINAL_PERF_FRAME_INTERVAL_MS',
         'frame_interval_ms',
-        'ORCA_E2E_OPENCODE_FRAME_INTERVAL_MS'
+        'BOTMUX_E2E_OPENCODE_FRAME_INTERVAL_MS'
       ],
       [
-        'ORCA_TERMINAL_PERF_PRESSURE_OUTPUT_CHARS',
+        'BOTMUX_TERMINAL_PERF_PRESSURE_OUTPUT_CHARS',
         'pressure_output_chars',
-        'ORCA_E2E_OPENCODE_PRESSURE_OUTPUT_CHARS'
+        'BOTMUX_E2E_OPENCODE_PRESSURE_OUTPUT_CHARS'
       ],
-      ['ORCA_TERMINAL_PERF_SCALE_PANES', 'scale_panes', 'ORCA_E2E_OPENCODE_SCALE_PANES'],
+      ['BOTMUX_TERMINAL_PERF_SCALE_PANES', 'scale_panes', 'BOTMUX_E2E_OPENCODE_SCALE_PANES'],
       [
-        'ORCA_TERMINAL_PERF_SCALE_CROSS_WORKSPACE_PANES',
+        'BOTMUX_TERMINAL_PERF_SCALE_CROSS_WORKSPACE_PANES',
         'scale_cross_workspace_panes',
-        'ORCA_E2E_OPENCODE_SCALE_CROSS_WORKSPACE_PANES'
+        'BOTMUX_E2E_OPENCODE_SCALE_CROSS_WORKSPACE_PANES'
       ],
       [
-        'ORCA_TERMINAL_PERF_SCALE_PRESSURE_PANES',
+        'BOTMUX_TERMINAL_PERF_SCALE_PRESSURE_PANES',
         'scale_pressure_panes',
-        'ORCA_E2E_OPENCODE_SCALE_PRESSURE_PANES'
+        'BOTMUX_E2E_OPENCODE_SCALE_PRESSURE_PANES'
       ],
       [
-        'ORCA_TERMINAL_PERF_SCALE_HIDDEN_PRESSURE_PANES',
+        'BOTMUX_TERMINAL_PERF_SCALE_HIDDEN_PRESSURE_PANES',
         'scale_hidden_pressure_panes',
-        'ORCA_E2E_OPENCODE_SCALE_HIDDEN_PRESSURE_PANES'
+        'BOTMUX_E2E_OPENCODE_SCALE_HIDDEN_PRESSURE_PANES'
       ]
     ]
     for (const [workflowEnv, inputName, runnerEnv] of manualProfileKnobs) {
@@ -560,7 +560,7 @@ describe('Electron runtime package contract', () => {
       expect(runStep.run).toContain(runnerEnv)
     }
     expect(uploadStep.uses).toBe('actions/upload-artifact@v7')
-    expect(uploadStep.with.path).toBe('${{ env.ORCA_E2E_TERMINAL_PERF_REPORT_PATH }}')
+    expect(uploadStep.with.path).toBe('${{ env.BOTMUX_E2E_TERMINAL_PERF_REPORT_PATH }}')
   })
 
   it('keeps terminal rendering regressions in the fast golden E2E gate', () => {
@@ -631,14 +631,14 @@ describe('Electron runtime package contract', () => {
       goldenPlatforms
     )
     expect(releaseGoldenJob.steps.map((step) => step.run ?? '')).toContain(
-      'xvfb-run --auto-servernum env SKIP_BUILD=1 ORCA_E2E_FORWARD_APP_LOGS=1 pnpm run test:e2e:terminal-rendering-golden'
+      'xvfb-run --auto-servernum env SKIP_BUILD=1 BOTMUX_E2E_FORWARD_APP_LOGS=1 pnpm run test:e2e:terminal-rendering-golden'
     )
     expect(releaseEvidenceJob['continue-on-error']).toBe(true)
     expect(
       releaseEvidenceJob.strategy.matrix.include.map(({ platform }) => platform).sort()
     ).toEqual(releaseEvidencePlatforms)
     expect(releaseEvidenceJob.steps.map((step) => step.run ?? '')).toContain(
-      'xvfb-run --auto-servernum env SKIP_BUILD=1 ORCA_E2E_FORWARD_APP_LOGS=1 pnpm run test:e2e:terminal-rendering-release-evidence'
+      'xvfb-run --auto-servernum env SKIP_BUILD=1 BOTMUX_E2E_FORWARD_APP_LOGS=1 pnpm run test:e2e:terminal-rendering-release-evidence'
     )
   })
 })

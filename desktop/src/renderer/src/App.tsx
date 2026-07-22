@@ -64,7 +64,7 @@ import { onOnboardingReopened } from './components/onboarding/show-onboarding-ev
 import { shouldShowOnboarding } from './components/onboarding/should-show-onboarding'
 import { MarkdownTemplatePicker } from './components/editor/MarkdownTemplatePicker'
 import { FloatingTerminalToggleButton } from './components/floating-terminal/FloatingTerminalToggleButton'
-import { OrcaProfileSwitcher } from './components/orca-botmux-profiles/OrcaBotmuxProfileSwitcher'
+import { BotmuxProfileSwitcher } from './components/botmux-profiles/BotmuxProfileSwitcher'
 import {
   TOGGLE_FLOATING_TERMINAL_EVENT,
   requestFloatingTerminalOpenMaximized
@@ -73,7 +73,7 @@ import {
 // with useEffect referencing OPEN_FLOATING_TERMINAL_EVENT before the import
 // rebinds — that race crashed as ReferenceError at app.root.
 // Must match OPEN_FLOATING_TERMINAL_EVENT in @/lib/floating-terminal.
-const OPEN_FLOATING_TERMINAL_EVENT = 'orca-botmux-open-floating-terminal'
+const OPEN_FLOATING_TERMINAL_EVENT = 'botmux-open-floating-terminal'
 import {
   isFloatingWorkspacePanelFocused,
   isFloatingWorkspacePanelShortcut,
@@ -160,7 +160,7 @@ import {
 } from './components/feature-tips/feature-tip-startup-gate'
 import {
   trackCmdJPaletteFeatureTipShown,
-  trackOrcaCliFeatureTipShown
+  trackBotmuxCliFeatureTipShown
 } from './components/feature-tips/feature-tip-telemetry'
 import {
   keybindingMatchesAction,
@@ -329,7 +329,7 @@ const StatusBar = lazy(() =>
   import('./components/status-bar/StatusBar').then((module) => ({ default: module.StatusBar }))
 )
 const SetupGuideModal = lazy(() => import('./components/setup-guide/SetupGuideModal'))
-// Feature wall (product UG/promo) removed for orca_botmux.
+// Feature wall (product UG/promo) removed for botmux.
 const FeatureTipsModal = lazy(() => import('./components/feature-tips/FeatureTipsModal'))
 const AddRepoDialog = lazy(() => import('./components/sidebar/AddRepoDialog'))
 const NonGitFolderDialog = lazy(() => import('./components/sidebar/NonGitFolderDialog'))
@@ -440,7 +440,7 @@ function App(): React.JSX.Element {
       fetchFolderWorkspacesForAllHosts: s.fetchFolderWorkspacesForAllHosts,
       fetchAllWorktrees: s.fetchAllWorktrees,
       fetchWorktreeLineage: s.fetchWorktreeLineage,
-      fetchOrcaProfiles: s.fetchOrcaProfiles,
+      fetchBotmuxProfiles: s.fetchBotmuxProfiles,
       fetchSettings: s.fetchSettings,
       fetchKeybindings: s.fetchKeybindings,
       initGitHubCache: s.initGitHubCache,
@@ -840,8 +840,8 @@ function App(): React.JSX.Element {
     }
 
     featureTipsPromptedThisSessionRef.current = true
-    if (featureTipsDecision.tipId === 'orca-botmux-cli') {
-      trackOrcaCliFeatureTipShown('app_open')
+    if (featureTipsDecision.tipId === 'botmux-cli') {
+      trackBotmuxCliFeatureTipShown('app_open')
     } else if (featureTipsDecision.tipId === 'cmd-j-palette') {
       trackCmdJPaletteFeatureTipShown('app_open')
     }
@@ -906,7 +906,7 @@ function App(): React.JSX.Element {
         // Why: profile state only feeds the switcher and the add-project
         // advisory — nothing in the hydration chain reads it synchronously,
         // so it must not add a serial IPC round-trip before fetchSettings.
-        void actions.fetchOrcaProfiles()
+        void actions.fetchBotmuxProfiles()
         // Why: repo/worktree hydration routes through settings.activeRuntimeEnvironmentId.
         // Load settings first so a persisted remote runtime does not boot against
         // the local filesystem and then hydrate stale local workspace state.
@@ -1027,7 +1027,10 @@ function App(): React.JSX.Element {
           )
           if (connectionIds.length > 0) {
             try {
-              const SSH_RECONNECT_TIMEOUT_MS = 15_000
+              // Why: relay deploy + botmux-bridge endpoint can exceed 15s on
+              // cold start; too-short timeout runs terminal reconnect before
+              // attach recovery can call tmuxAttachSpec.
+              const SSH_RECONNECT_TIMEOUT_MS = 45_000
               const allTargets = await timeRendererStartupStep('ssh-list-targets', () =>
                 window.api.ssh.listTargets()
               )
@@ -1152,7 +1155,7 @@ function App(): React.JSX.Element {
         // Why (issue #1158): previously this catch called hydrateWorkspaceSession
         // with empty defaults, which overwrote the in-memory tab map. The
         // debounced session writer then serialized that empty state back to
-        // orca-botmux-data.json, silently erasing the user's saved tabs. The fix is
+        // botmux-data.json, silently erasing the user's saved tabs. The fix is
         // to leave in-memory state untouched and keep hydrationSucceeded
         // false so the writer stays gated. We still ensure persistedUIReady and
         // workspaceSessionReady flip so the UI can mount without a session.
@@ -1655,7 +1658,7 @@ function App(): React.JSX.Element {
           terminalShortcutPolicy
         })
       const notifyTerminalCapture = (actionId: KeybindingActionId): void => {
-        if (context !== 'terminal' || (terminalShortcutPolicy ?? 'orca-botmux-first') !== 'orca-botmux-first') {
+        if (context !== 'terminal' || (terminalShortcutPolicy ?? 'botmux-first') !== 'botmux-first') {
           return
         }
         showTerminalShortcutCaptureNotification({
@@ -2048,7 +2051,7 @@ function App(): React.JSX.Element {
           <div className="titlebar-traffic-light-pad" />
         ) : hasCustomTitleBar ? (
           /* Why: on Windows/Linux the native title bar is removed, so we render
-             the OrcaBotmux logo as a non-interactive identity anchor and a ··· button
+             the Botmux logo as a non-interactive identity anchor and a ··· button
              that pops up the application menu (the same menu revealed by Alt
              on the default autoHideMenuBar). */
           <>
@@ -2078,10 +2081,10 @@ function App(): React.JSX.Element {
                 <ContextMenuTrigger asChild>
                   <div
                     className="titlebar-app-name"
-                    aria-label={translate('auto.App.5096cbbc86', 'orca_botmux')}
+                    aria-label={translate('auto.App.5096cbbc86', 'botmux')}
                   >
                     <span className="titlebar-app-name-main">
-                      {translate('auto.App.5096cbbc86', 'orca_botmux')}
+                      {translate('auto.App.5096cbbc86', 'botmux')}
                     </span>
                   </div>
                 </ContextMenuTrigger>
@@ -2209,7 +2212,7 @@ function App(): React.JSX.Element {
           </TooltipContent>
         </Tooltip>
       )}
-      {showProfileSwitcherInTopRight ? <OrcaProfileSwitcher /> : null}
+      {showProfileSwitcherInTopRight ? <BotmuxProfileSwitcher /> : null}
       {/* Why: when the right sidebar is open, its own header renders
       an identical close button — hide this copy so only one is
       visible at a time. */}
@@ -2235,7 +2238,7 @@ function App(): React.JSX.Element {
           } as React.CSSProperties
         }
       >
-        <OrcaProfileSwitcher />
+        <BotmuxProfileSwitcher />
       </div>
     ) : null
 
@@ -2299,7 +2302,7 @@ function App(): React.JSX.Element {
                       leftTitlebarChromeLayout.shouldMount ? (
                         /* Why: left column wraps the sidebar with a titlebar-height
                      header above it. The header holds the same controls
-                     (traffic lights, sidebar toggle, "orca_botmux" title, agent badge)
+                     (traffic lights, sidebar toggle, "botmux" title, agent badge)
                      that the full-width titlebar held while the center and right
                      columns keep their own top strips at the same 36px height.
                      When the sidebar is collapsed, take this header out of flex
@@ -2452,7 +2455,7 @@ function App(): React.JSX.Element {
                               title={translate('auto.App.b7a714db1e', 'This page hit an error.')}
                               description={translate(
                                 'auto.App.03a14f6b5b',
-                                'Retry the page or navigate to another OrcaBotmux surface.'
+                                'Retry the page or navigate to another Botmux surface.'
                               )}
                             >
                               {activeView === 'settings' ? <Settings /> : null}

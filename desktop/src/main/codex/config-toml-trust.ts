@@ -209,7 +209,7 @@ function usesWindowsPathSeparators(sourcePath: string): boolean {
   )
 }
 
-// Why: Codex and OrcaBotmux can disagree on quote style, separators, and casing for
+// Why: Codex and Botmux can disagree on quote style, separators, and casing for
 // the same Windows project, including when the caller targets a remote host.
 export function normalizeCodexProjectPathForLookup(projectPath: string): string {
   if (!usesWindowsPathSeparators(projectPath)) {
@@ -480,7 +480,7 @@ function upsertTrustBlocks(
   // silently re-enabled by the next auto-install on app start.
   // If duplicate blocks already exist, treat any disabled copy as authoritative
   // while collapsing the malformed TOML back to one table.
-  // An explicit enabled state (write-back promotion of an in-OrcaBotmux /hooks
+  // An explicit enabled state (write-back promotion of an in-Botmux /hooks
   // toggle) overrides that preservation: it IS the user's latest decision.
   const enabled =
     explicitEnabled ??
@@ -534,12 +534,12 @@ type TrustBlockRange = {
 }
 
 // Why: separator and casing drift between Codex-written keys (raw backslash,
-// potentially lowercased) and OrcaBotmux-built keys (forward-slash, realpathSync.native
+// potentially lowercased) and Botmux-built keys (forward-slash, realpathSync.native
 // casing) must not prevent findTrustBlockRanges from matching an existing block.
 export function normalizeHookTrustKeyForLookup(key: string): string {
   const parsed = parseTrustKey(key)
   // Why: fold by path shape, not host platform — hook sources on WSL and SSH
-  // Windows remotes need the same folding when OrcaBotmux runs on macOS or Linux.
+  // Windows remotes need the same folding when Botmux runs on macOS or Linux.
   const foldedPath = normalizeCodexProjectPathForLookup(parsed ? parsed.sourcePath : key)
   return parsed
     ? `${foldedPath}:${parsed.eventLabel}:${parsed.groupIndex}:${parsed.handlerIndex}`

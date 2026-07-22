@@ -161,7 +161,7 @@ function renderBlock(node: unknown): MarkdownBlock {
     return { kind: 'block', text: `${prefix} ${renderInline(record.content).trim()}`.trim() }
   }
   if (type === 'bulletList') {
-    // Why: OrcaBotmux renders Jira bodies as Markdown, so ADF list containers need
+    // Why: Botmux renders Jira bodies as Markdown, so ADF list containers need
     // concrete list markers instead of newline-only flattened text.
     return { kind: 'list', text: renderList(record, false) }
   }

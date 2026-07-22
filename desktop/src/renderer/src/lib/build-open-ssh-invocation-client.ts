@@ -1,6 +1,6 @@
 /**
  * Renderer-side mirror of main `buildOpenSshInvocation` for display labels.
- * Keep in sync with `src/main/orca-botmux-bridge/ssh-target-destination.ts`.
+ * Keep in sync with `src/main/botmux-bridge/ssh-target-destination.ts`.
  */
 import type { SshTarget } from '../../../shared/ssh-types'
 

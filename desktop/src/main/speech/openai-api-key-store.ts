@@ -10,19 +10,19 @@ type StoredOpenAiKey = {
 const OPENAI_SPEECH_TOKEN_FILE = 'openai-speech-token.enc'
 let cachedOpenAiSpeechApiKey: string | null = null
 
-function getOrcaDir(): string {
-  return join(homedir(), '.orca_botmux')
+function getBotmuxDir(): string {
+  return join(homedir(), '.botmux')
 }
 
-function ensureOrcaDir(): void {
-  const dir = getOrcaDir()
+function ensureBotmuxDir(): void {
+  const dir = getBotmuxDir()
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true })
   }
 }
 
 function getOpenAiKeyPath(): string {
-  return join(getOrcaDir(), OPENAI_SPEECH_TOKEN_FILE)
+  return join(getBotmuxDir(), OPENAI_SPEECH_TOKEN_FILE)
 }
 
 function readLegacyJsonStoredOpenAiKey(): StoredOpenAiKey | null {
@@ -52,7 +52,7 @@ export function saveOpenAiSpeechApiKey(apiKey: string): void {
   if (!trimmed) {
     throw new Error('OpenAI API key is required')
   }
-  ensureOrcaDir()
+  ensureBotmuxDir()
   if (safeStorage.isEncryptionAvailable()) {
     writeFileSync(getOpenAiKeyPath(), safeStorage.encryptString(trimmed), { mode: 0o600 })
     cachedOpenAiSpeechApiKey = trimmed

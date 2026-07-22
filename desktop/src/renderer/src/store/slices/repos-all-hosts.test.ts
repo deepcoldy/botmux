@@ -198,21 +198,21 @@ function configureSharedProjectCompatibilityMocks(
   sharedProjectId: string
   sharedRemoteProject: Project
 } {
-  const sharedProjectId = 'github:stablyai/orca_botmux'
+  const sharedProjectId = 'github:stablyai/botmux'
   const localRepoForSharedProject: Repo =
     options.localRepoHasProviderIdentity === false
       ? localRepo
       : {
           ...localRepo,
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         }
   const remoteRepoWithIdentity: Repo = {
     ...remoteRepo,
-    upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+    upstream: { owner: 'stablyai', repo: 'botmux' }
   }
   const sharedLocalProject: Project = {
     id: sharedProjectId,
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#000',
     sourceRepoIds: ['local-repo'],
     localWindowsRuntimePreference: { kind: 'windows-host' },
@@ -221,7 +221,7 @@ function configureSharedProjectCompatibilityMocks(
   }
   const sharedRemoteProject: Project = {
     id: sharedProjectId,
-    displayName: 'orca_botmux',
+    displayName: 'botmux',
     badgeColor: '#111',
     sourceRepoIds: ['remote-repo'],
     ...(options.remoteProjectRuntimePreference
@@ -682,7 +682,7 @@ describe('fetchReposForAllHosts', () => {
         .getState()
         .projects.map((project) => project.id)
         .sort()
-    ).toEqual(['github:stablyai/orca_botmux', 'repo:remote-repo'])
+    ).toEqual(['github:stablyai/botmux', 'repo:remote-repo'])
     expect(store.getState().projectHostSetups).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -789,7 +789,7 @@ describe('fetchReposForAllHosts', () => {
       activeRepoId: 'remote-repo',
       filterRepoIds: ['remote-repo', 'stale-repo'],
       setupScriptPromptDismissedRepoIds: [remoteDismissalKey, staleDismissalKey],
-      trustedOrcaHooks: {
+      trustedBotmuxHooks: {
         'remote-repo': { all: { approvedAt: 1 } },
         'stale-repo': { all: { approvedAt: 2 } }
       }
@@ -803,7 +803,7 @@ describe('fetchReposForAllHosts', () => {
       remoteDismissalKey,
       staleDismissalKey
     ])
-    expect(store.getState().trustedOrcaHooks).toEqual({
+    expect(store.getState().trustedBotmuxHooks).toEqual({
       'remote-repo': { all: { approvedAt: 1 } },
       'stale-repo': { all: { approvedAt: 2 } }
     })
@@ -813,7 +813,7 @@ describe('fetchReposForAllHosts', () => {
     expect(store.getState().activeRepoId).toBe('remote-repo')
     expect(store.getState().filterRepoIds).toEqual(['remote-repo'])
     expect(store.getState().setupScriptPromptDismissedRepoIds).toEqual([remoteDismissalKey])
-    expect(store.getState().trustedOrcaHooks).toEqual({
+    expect(store.getState().trustedBotmuxHooks).toEqual({
       'remote-repo': { all: { approvedAt: 1 } }
     })
   })

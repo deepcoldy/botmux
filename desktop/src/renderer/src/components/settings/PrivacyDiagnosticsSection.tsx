@@ -288,15 +288,15 @@ function DiagnosticsDisabledStateNote({
           'auto.components.settings.PrivacyDiagnosticsRows.5a7cbe069a',
           'DO_NOT_TRACK=1 is set — creating and sending diagnostic files is disabled.'
         )
-      : reason === 'orca_botmux_telemetry_disabled'
+      : reason === 'botmux_telemetry_disabled'
         ? translate(
             'auto.components.settings.PrivacyDiagnosticsRows.63d03261d1',
-            'ORCA_TELEMETRY_DISABLED=1 is set — creating and sending diagnostic files is disabled.'
+            'BOTMUX_TELEMETRY_DISABLED=1 is set — creating and sending diagnostic files is disabled.'
           )
-        : reason === 'orca_botmux_diagnostics_disabled'
+        : reason === 'botmux_diagnostics_disabled'
           ? translate(
               'auto.components.settings.PrivacyDiagnosticsRows.d37e92a06b',
-              'ORCA_DIAGNOSTICS_DISABLED=1 is set — app diagnostics are off.'
+              'BOTMUX_DIAGNOSTICS_DISABLED=1 is set — app diagnostics are off.'
             )
           : reason === 'ci'
             ? translate(

@@ -96,10 +96,10 @@ function totalOnlyUsageRecord(timestamp: string, totalInputTokens: number): stri
 
 beforeEach(() => {
   delete process.env.CODEX_HOME
-  fakeHomeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-usage-home-'))
-  userDataDir = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-usage-user-data-'))
-  previousUserDataPath = process.env.ORCA_USER_DATA_PATH
-  process.env.ORCA_USER_DATA_PATH = userDataDir
+  fakeHomeDir = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-home-'))
+  userDataDir = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-user-data-'))
+  previousUserDataPath = process.env.BOTMUX_USER_DATA_PATH
+  process.env.BOTMUX_USER_DATA_PATH = userDataDir
   homedirMock.mockReturnValue(fakeHomeDir)
   getPathMock.mockImplementation((name: string) => {
     if (name === 'userData') {
@@ -118,15 +118,15 @@ afterEach(() => {
     process.env.CODEX_HOME = originalCodexHome
   }
   if (previousUserDataPath === undefined) {
-    delete process.env.ORCA_USER_DATA_PATH
+    delete process.env.BOTMUX_USER_DATA_PATH
   } else {
-    process.env.ORCA_USER_DATA_PATH = previousUserDataPath
+    process.env.BOTMUX_USER_DATA_PATH = previousUserDataPath
   }
   vi.clearAllMocks()
 })
 
 describe('getCodexSessionsDirectory', () => {
-  it('defaults to OrcaBotmux-managed Codex runtime sessions', () => {
+  it('defaults to Botmux-managed Codex runtime sessions', () => {
     expect(getCodexSessionsDirectory()).toBe(
       join(userDataDir, 'codex-runtime-home', 'home', 'sessions')
     )
@@ -142,7 +142,7 @@ describe('getCodexSessionsDirectory', () => {
 })
 
 describe('listCodexSessionFiles', () => {
-  it('scans both OrcaBotmux-managed and system Codex session homes', async () => {
+  it('scans both Botmux-managed and system Codex session homes', async () => {
     const runtimeSessionsDir = join(userDataDir, 'codex-runtime-home', 'home', 'sessions')
     const systemSessionsDir = join(fakeHomeDir, '.codex', 'sessions')
     mkdirSync(runtimeSessionsDir, { recursive: true })
@@ -178,7 +178,7 @@ describe('listCodexSessionFiles', () => {
       userDataDir,
       'codex-runtime-home',
       'home',
-      '.orca-botmux-session-copies'
+      '.botmux-session-copies'
     )
     const systemSessionsDir = join(fakeHomeDir, '.codex', 'sessions')
     mkdirSync(runtimeSessionsDir, { recursive: true })
@@ -216,7 +216,7 @@ describe('listCodexSessionFiles', () => {
       userDataDir,
       'codex-runtime-home',
       'home',
-      '.orca-botmux-session-copies'
+      '.botmux-session-copies'
     )
     const systemSessionsDir = join(fakeHomeDir, '.codex', 'sessions')
     mkdirSync(runtimeSessionsDir, { recursive: true })
@@ -255,7 +255,7 @@ describe('listCodexSessionFiles', () => {
       userDataDir,
       'codex-runtime-home',
       'home',
-      '.orca-botmux-session-copies'
+      '.botmux-session-copies'
     )
     const systemSessionsDir = join(fakeHomeDir, '.codex', 'sessions')
     mkdirSync(runtimeSessionsDir, { recursive: true })
@@ -524,7 +524,7 @@ describe('listCodexSessionFiles', () => {
       userDataDir,
       'codex-runtime-home',
       'home',
-      '.orca-botmux-session-copies'
+      '.botmux-session-copies'
     )
     const systemSessionsDir = join(fakeHomeDir, '.codex', 'sessions')
     mkdirSync(runtimeSessionsDir, { recursive: true })

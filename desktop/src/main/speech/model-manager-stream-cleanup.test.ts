@@ -11,7 +11,7 @@ const { netRequestMock } = vi.hoisted(() => ({
 
 vi.mock('electron', () => ({
   app: {
-    getPath: () => '/tmp/orca-botmux-speech-models-test'
+    getPath: () => '/tmp/botmux-speech-models-test'
   },
   net: {
     request: netRequestMock
@@ -35,7 +35,7 @@ describe('ModelManager stream cleanup', () => {
   })
 
   it('removes response progress listeners after a model download finishes', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const response = new PassThrough() as PassThrough & {
         statusCode: number

@@ -44,7 +44,7 @@ describe('worktree git-common narrow watch (darwin)', () => {
   }
 
   async function makeCommonDir(withWorktrees: boolean): Promise<string> {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-git-common-watch-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-git-common-watch-'))
     cleanups.push(() => rm(root, { recursive: true, force: true }))
     const commonDir = await realpath(root)
     if (withWorktrees) {

@@ -201,7 +201,7 @@ export function useDiffCommentDecorator({
     const zones = zonesRef.current
     const plus = document.createElement('button')
     plus.type = 'button'
-    plus.className = 'orca-botmux-diff-comment-add-btn'
+    plus.className = 'botmux-diff-comment-add-btn'
     plus.title = addButtonLabel
     plus.setAttribute('aria-label', addButtonLabel)
     plus.innerHTML =
@@ -252,7 +252,7 @@ export function useDiffCommentDecorator({
           range: new monaco.Range(from, 1, to, 1),
           options: {
             isWholeLine: true,
-            className: 'orca-botmux-diff-comment-range-highlight'
+            className: 'botmux-diff-comment-range-highlight'
           }
         }
       ])
@@ -555,7 +555,7 @@ export function useDiffCommentDecorator({
                   modeIdParts={['diff-comment-note', worktreeId, filePath, comment.id]}
                   scopes={getSingleCommentSendScopes(comment, formatCommentPrompt)}
                   targetModeLabel="This note"
-                  triggerClassName="orca-botmux-diff-comment-edit"
+                  triggerClassName="botmux-diff-comment-edit"
                   disabledTooltip="Note already sent"
                   onDelivered={(notes) => void clearDeliveredDiffComments(worktreeId, notes)}
                 />
@@ -591,7 +591,7 @@ export function useDiffCommentDecorator({
           continue
         }
         const dom = document.createElement('div')
-        dom.className = 'orca-botmux-diff-comment-inline'
+        dom.className = 'botmux-diff-comment-inline'
         // Why: swallow mousedown on the whole zone so the editor does not
         // steal focus (or start a selection drag) when the user interacts
         // with anything inside the card. Delete still fires because click is

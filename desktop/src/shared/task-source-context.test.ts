@@ -19,7 +19,7 @@ describe('task source context', () => {
       normalizeTaskSourceContext({
         provider: 'github',
         projectId: ' project-1 ',
-        providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+        providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
       })
     ).toEqual({
       kind: 'task-source',
@@ -28,7 +28,7 @@ describe('task source context', () => {
       hostId: 'local',
       projectHostSetupId: null,
       repoId: null,
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' },
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' },
       accountLabel: null
     })
   })
@@ -79,21 +79,21 @@ describe('task source context', () => {
       projectId: 'project-1',
       hostId: 'local',
       repoId: 'repo-1',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
     const ssh = getTaskSourceCacheScope({
       provider: 'github',
       projectId: 'project-1',
       hostId: toSshExecutionHostId('builder'),
       repoId: 'repo-1',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
     const differentRepo = getTaskSourceCacheScope({
       provider: 'github',
       projectId: 'project-1',
       hostId: 'local',
       repoId: 'repo-1',
-      providerIdentity: { provider: 'github', owner: 'other', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'other', repo: 'botmux' }
     })
 
     expect(local).not.toBe(ssh)
@@ -111,9 +111,9 @@ describe('task source context', () => {
       getTaskSourceCacheScope({
         ...base,
         provider: 'gitlab',
-        providerIdentity: { provider: 'gitlab', namespace: 'stably', project: 'orca_botmux' }
+        providerIdentity: { provider: 'gitlab', namespace: 'stably', project: 'botmux' }
       })
-    ).toContain(encodeURIComponent('stably/orca_botmux'))
+    ).toContain(encodeURIComponent('stably/botmux'))
     expect(
       getTaskSourceCacheScope({
         ...base,
@@ -139,7 +139,7 @@ describe('task source context', () => {
       normalizeTaskSourceContext({
         provider: 'gitlab',
         projectId: 'project-1',
-        providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+        providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
       })?.providerIdentity
     ).toBeNull()
   })

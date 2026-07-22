@@ -3,7 +3,7 @@ const APPIMAGE_CLI_SCRIPT = [
   'try{',
   'const path=require("path");',
   'const appDir=process.env.APPDIR;',
-  'if(!appDir){console.error("OrcaBotmux AppImage runtime did not set APPDIR.");process.exit(1);}',
+  'if(!appDir){console.error("Botmux AppImage runtime did not set APPDIR.");process.exit(1);}',
   'const cli=path.join(appDir,"resources","app.asar.unpacked","out","cli","index.js");',
   'await Promise.resolve(require(cli).main(process.argv.slice(1)));',
   '}catch(error){',
@@ -19,12 +19,12 @@ export function buildAppImageCliWrapper(appImagePath: string): string {
 set -euo pipefail
 APPIMAGE=${quoteShell(appImagePath)}
 if [ ! -f "$APPIMAGE" ]; then
-  echo "OrcaBotmux AppImage not found at $APPIMAGE" >&2
-  echo "If you moved the AppImage, re-run CLI registration from OrcaBotmux Settings." >&2
+  echo "Botmux AppImage not found at $APPIMAGE" >&2
+  echo "If you moved the AppImage, re-run CLI registration from Botmux Settings." >&2
   exit 1
 fi
-export ORCA_NODE_OPTIONS="\${NODE_OPTIONS-}"
-export ORCA_NODE_REPL_EXTERNAL_MODULE="\${NODE_REPL_EXTERNAL_MODULE-}"
+export BOTMUX_NODE_OPTIONS="\${NODE_OPTIONS-}"
+export BOTMUX_NODE_REPL_EXTERNAL_MODULE="\${NODE_REPL_EXTERNAL_MODULE-}"
 unset NODE_OPTIONS
 unset NODE_REPL_EXTERNAL_MODULE
 # Why: AppImage mount paths change on each launch; $APPDIR is the runtime mount.

@@ -219,9 +219,9 @@ export function LinearRow(props: { compact?: boolean } = {}): React.JSX.Element 
 
 const CAPABILITIES = [
   'Start a workspace from any GitHub issue or pull request, prefilled with its title and context',
-  'Browse GitHub issues and pull requests in the Tasks view without leaving OrcaBotmux',
+  'Browse GitHub issues and pull requests in the Tasks view without leaving Botmux',
   'See issue state, review status, and CI checks on every worktree',
-  'Read, comment on, and merge pull requests without leaving OrcaBotmux'
+  'Read, comment on, and merge pull requests without leaving Botmux'
 ] as const
 
 export function IntegrationsStep(): React.JSX.Element {

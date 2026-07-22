@@ -210,7 +210,7 @@ describe('dispatcher → transport → onTitleChange for Pi spinner', () => {
 
   // Why: regression test for the cursor spinner "solid after 500ms" bug.
   // cursor-agent re-emits its native `OSC 0: "Cursor Agent"` title on every
-  // internal redraw mid-turn. OrcaBotmux's main process injects synthesized
+  // internal redraw mid-turn. Botmux's main process injects synthesized
   // "⠋ Cursor Agent" spinner frames from the hook server; the renderer must
   // drop cursor's bare native title so it cannot overwrite the synthesized
   // working title in `runtimePaneTitlesByTabId` (which drives `getWorktreeStatus`'s
@@ -225,8 +225,8 @@ describe('dispatcher → transport → onTitleChange for Pi spinner', () => {
     const transport = createIpcPtyTransport({ onTitleChange })
     await transport.connect({ url: '', callbacks: {} })
 
-    // Simulate the realistic interleave: OrcaBotmux injects a synthesized working
-    // frame, cursor-agent re-emits its bare native title shortly after, OrcaBotmux
+    // Simulate the realistic interleave: Botmux injects a synthesized working
+    // frame, cursor-agent re-emits its bare native title shortly after, Botmux
     // injects the next spinner frame, etc.
     dispatcherCallback?.({ id: 'pty-pi', data: `${ESC}]0;⠋ Cursor Agent${BEL}` })
     dispatcherCallback?.({ id: 'pty-pi', data: `${ESC}]0;Cursor Agent${BEL}` })
@@ -246,7 +246,7 @@ describe('dispatcher → transport → onTitleChange for Pi spinner', () => {
 
   it('still surfaces the synthesized "Cursor ready" idle title after working', async () => {
     // Why: make sure the bare-title drop does not accidentally catch the
-    // decorated "Cursor ready" done frame OrcaBotmux synthesizes on the `stop` hook.
+    // decorated "Cursor ready" done frame Botmux synthesizes on the `stop` hook.
     const { createIpcPtyTransport } = await import('./pty-transport')
     const onTitleChange = vi.fn()
 

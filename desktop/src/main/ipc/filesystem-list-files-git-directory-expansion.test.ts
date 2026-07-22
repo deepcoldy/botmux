@@ -47,7 +47,7 @@ afterEach(async () => {
 
 describe('main Quick Open git directory expansion', () => {
   it('expands placeholders emitted by both directory-collapsing passes', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-main-git-ignored-dir-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-main-git-ignored-dir-'))
     tempDirs.push(root)
     await writeRel(root, 'dist/generated.js')
     await writeRel(root, 'scratch/notes.txt')
@@ -80,7 +80,7 @@ describe('main Quick Open git directory expansion', () => {
   })
 
   it('cancels both local Git passes when Quick Open abandons the request', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-main-git-cancel-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-main-git-cancel-'))
     tempDirs.push(root)
     const revParse = createMockProcess()
     const primary = createMockProcess()

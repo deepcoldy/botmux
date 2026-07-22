@@ -32,14 +32,14 @@ import {
 // Codex changes its serialization or normalization rules, this test fails
 // loudly instead of silently shipping bad trust entries that put hooks back
 // into the review pile.
-const REAL_APPROVED_COMMAND = '/bin/sh "/tmp/orca-botmux-case-b-mCmCe6/agent-hooks/codex-hook.sh"'
+const REAL_APPROVED_COMMAND = '/bin/sh "/tmp/botmux-case-b-mCmCe6/agent-hooks/codex-hook.sh"'
 const REAL_APPROVED_HASH = 'sha256:bc013489dba495431d3790fda62ee5a7d907a7c491e29ad26238c3a5d6d2b163'
 
 let tmpDir: string
 let configPath: string
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-trust-test-'))
+  tmpDir = mkdtempSync(join(tmpdir(), 'botmux-codex-trust-test-'))
   configPath = join(tmpDir, 'config.toml')
 })
 
@@ -293,7 +293,7 @@ describe('computeTrustKey', () => {
   it('uses native Windows backslashes in the trust key Codex looks up', () => {
     // Why: Codex 0.140 writes approved Windows hook trust keys as raw native
     // paths under [hooks.state].
-    const winPath = 'C:\\Users\\Rod\\AppData\\Roaming\\orca_botmux\\hooks.json'
+    const winPath = 'C:\\Users\\Rod\\AppData\\Roaming\\botmux\\hooks.json'
     const key = computeTrustKey({
       sourcePath: winPath,
       eventLabel: 'session_start',
@@ -302,7 +302,7 @@ describe('computeTrustKey', () => {
       command: 'echo'
     })
     expect(key).toContain('\\')
-    expect(key.startsWith('C:\\Users\\Rod\\AppData\\Roaming\\orca_botmux\\hooks.json:')).toBe(true)
+    expect(key.startsWith('C:\\Users\\Rod\\AppData\\Roaming\\botmux\\hooks.json:')).toBe(true)
   })
 
   it('preserves literal backslashes in non-Windows-style fallback paths', () => {
@@ -410,10 +410,10 @@ describe('upsertHookTrustEntries', () => {
   })
 
   it('collapses duplicate blocks for the same hook key while preserving unrelated hook state', () => {
-    const sourcePath = 'C:\\Users\\me\\AppData\\Roaming\\orca_botmux\\codex-runtime-home\\home\\hooks.json'
+    const sourcePath = 'C:\\Users\\me\\AppData\\Roaming\\botmux\\codex-runtime-home\\home\\hooks.json'
     const key = `${sourcePath}:session_start:0:0`
     const unrelatedSourcePath =
-      'C:\\Users\\me\\AppData\\Roaming\\orca_botmux\\codex-runtime-home\\home\\hooks.json'
+      'C:\\Users\\me\\AppData\\Roaming\\botmux\\codex-runtime-home\\home\\hooks.json'
     const unrelatedKey = `${unrelatedSourcePath}:stop:0:0`
     const original = [
       `[hooks.state."${escapeTomlString(key)}"]`,
@@ -455,7 +455,7 @@ describe('upsertHookTrustEntries', () => {
   })
 
   it('collapses a literal-string hook table before writing the canonical Codex literal table', () => {
-    const sourcePath = 'C:\\Users\\me\\AppData\\Roaming\\orca_botmux\\codex-runtime-home\\home\\hooks.json'
+    const sourcePath = 'C:\\Users\\me\\AppData\\Roaming\\botmux\\codex-runtime-home\\home\\hooks.json'
     const key = `${sourcePath}:session_start:0:0`
     const original = [
       `[hooks.state.'${key}']`,
@@ -823,7 +823,7 @@ describe('upsertHookTrustEntries', () => {
   it('preserves `enabled = false` when the user hand-edited it before reinstall', () => {
     // Why: regression — auto-install on app start used to clobber a
     // hand-disabled hook back to enabled = true, removing the only way to
-    // mute OrcaBotmux's hook short of full uninstall.
+    // mute Botmux's hook short of full uninstall.
     const key = '/x/hooks.json:pre_tool_use:0:0'
     const original = `[hooks.state."${key}"]\nenabled = false\ntrusted_hash = "sha256:OLD"\n`
     writeFileSync(configPath, original, 'utf-8')
@@ -892,10 +892,10 @@ describe('upsertHookTrustEntries', () => {
     expect(written).not.toContain('sha256:OLD')
   })
 
-  it('finds and replaces a legacy forward-slash block when OrcaBotmux upserts with native backslash key', () => {
+  it('finds and replaces a legacy forward-slash block when Botmux upserts with native backslash key', () => {
     // Why: Codex 0.140 can expose Windows trust keys with either separator
-    // shape depending on startup cwd, so OrcaBotmux replaces stale blocks with both.
-    const backslashPath = 'C:\\Users\\Rod\\AppData\\Roaming\\orca_botmux\\hooks.json'
+    // shape depending on startup cwd, so Botmux replaces stale blocks with both.
+    const backslashPath = 'C:\\Users\\Rod\\AppData\\Roaming\\botmux\\hooks.json'
     const legacyKey = `${backslashPath.replace(/\\/g, '/')}:session_start:0:0`
     const original = [
       `[hooks.state."${legacyKey}"]`,
@@ -926,7 +926,7 @@ describe('upsertHookTrustEntries', () => {
     // Why: idempotency guard — repeated auto-install on app start must not
     // accumulate duplicate trust blocks and produce invalid TOML.
     const entry: CodexTrustEntry = {
-      sourcePath: 'C:\\Users\\Rod\\AppData\\Roaming\\orca_botmux\\hooks.json',
+      sourcePath: 'C:\\Users\\Rod\\AppData\\Roaming\\botmux\\hooks.json',
       eventLabel: 'session_start',
       groupIndex: 0,
       handlerIndex: 0,
@@ -944,7 +944,7 @@ describe('upsertHookTrustEntries', () => {
     // Why: TOML literal-string table keys cannot contain apostrophes, but
     // Windows user/profile paths can.
     const entry: CodexTrustEntry = {
-      sourcePath: "C:\\Users\\O'Connor\\AppData\\Roaming\\orca_botmux\\hooks.json",
+      sourcePath: "C:\\Users\\O'Connor\\AppData\\Roaming\\botmux\\hooks.json",
       eventLabel: 'session_start',
       groupIndex: 0,
       handlerIndex: 0,
@@ -955,21 +955,21 @@ describe('upsertHookTrustEntries', () => {
     const written = readFileSync(configPath, 'utf-8')
     expect((written.match(/\[hooks\.state\."/g) ?? []).length).toBe(2)
     expect(written).toContain(
-      `[hooks.state."C:\\\\Users\\\\O'Connor\\\\AppData\\\\Roaming\\\\orca_botmux\\\\hooks.json:session_start:0:0"]`
+      `[hooks.state."C:\\\\Users\\\\O'Connor\\\\AppData\\\\Roaming\\\\botmux\\\\hooks.json:session_start:0:0"]`
     )
     expect(written).toContain(
-      `[hooks.state."C:/Users/O'Connor/AppData/Roaming/orca_botmux/hooks.json:session_start:0:0"]`
+      `[hooks.state."C:/Users/O'Connor/AppData/Roaming/botmux/hooks.json:session_start:0:0"]`
     )
     expect(written).not.toContain(`[hooks.state.'C:\\Users\\O'Connor`)
   })
 
-  it('finds a Codex-written block with lowercased username when OrcaBotmux key has mixed-case username', () => {
+  it('finds a Codex-written block with lowercased username when Botmux key has mixed-case username', () => {
     // Why: realpathSync.native casing can differ between what Codex wrote
-    // (C:\Users\rod\...) and what OrcaBotmux resolves (C:\Users\Rod\...).
+    // (C:\Users\rod\...) and what Botmux resolves (C:\Users\Rod\...).
     // normalizeHookTrustKeyForLookup case-folds Windows-shaped paths so the
     // existing block is replaced rather than a duplicate appended.
-    const lowercasePath = 'C:\\Users\\rod\\AppData\\Roaming\\orca_botmux\\hooks.json'
-    const mixedCasePath = 'C:\\Users\\Rod\\AppData\\Roaming\\orca_botmux\\hooks.json'
+    const lowercasePath = 'C:\\Users\\rod\\AppData\\Roaming\\botmux\\hooks.json'
+    const mixedCasePath = 'C:\\Users\\Rod\\AppData\\Roaming\\botmux\\hooks.json'
     const literalKey = `${lowercasePath}:session_start:0:0`
     const original = [
       `[hooks.state.'${literalKey}']`,
@@ -1089,7 +1089,7 @@ describe('upsertProjectTrustLevel', () => {
   })
 
   it('updates an existing legacy Windows forward-slash project block', () => {
-    // Why: older OrcaBotmux builds normalized Windows project paths to forward
+    // Why: older Botmux builds normalized Windows project paths to forward
     // slashes; native-backslash hook fixes must not duplicate those blocks.
     const original = [
       '[projects."C:/Users/nw/repo"]',
@@ -1610,8 +1610,8 @@ describe('readHookTrustEntries', () => {
   it('supports case-insensitive lookups for Windows hook trust keys read from config', () => {
     // Why: Codex and realpathSync.native can disagree on user-path casing;
     // status checks still need Map.get(computeTrustKey(...)) to find the row.
-    const rawKey = 'C:\\Users\\rod\\AppData\\Roaming\\orca_botmux\\hooks.json:session_start:0:0'
-    const lookupKey = 'C:/Users/Rod/AppData/Roaming/orca_botmux/hooks.json:session_start:0:0'
+    const rawKey = 'C:\\Users\\rod\\AppData\\Roaming\\botmux\\hooks.json:session_start:0:0'
+    const lookupKey = 'C:/Users/Rod/AppData/Roaming/botmux/hooks.json:session_start:0:0'
     const original = [
       `[hooks.state.'${rawKey}']`,
       'enabled = true',

@@ -1,20 +1,20 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { shapeBotmuxBridgeListSessionsResult } from './botmux-bridge'
-import type { OrcaBotmuxBridgeListResult } from '../../../orca-botmux-bridge/types'
+import type { BotmuxBridgeListResult } from '../../../botmux-bridge/types'
 
-vi.mock('../../../orca-botmux-bridge/orca-botmux-bridge-service', () => ({
-  getOrcaBotmuxBridgeStatus: vi.fn(),
-  listOrcaBotmuxBridgeEndpoints: vi.fn(),
-  listOrcaBotmuxBridgeSessions: vi.fn(),
-  getOrcaBotmuxBridgeNativeTerminalSpec: vi.fn(),
-  getOrcaBotmuxBridgeTmuxAttachSpec: vi.fn(),
-  openOrcaBotmuxBridgeTerminal: vi.fn()
+vi.mock('../../../botmux-bridge/botmux-bridge-service', () => ({
+  getBotmuxBridgeStatus: vi.fn(),
+  listBotmuxBridgeEndpoints: vi.fn(),
+  listBotmuxBridgeSessions: vi.fn(),
+  getBotmuxBridgeNativeTerminalSpec: vi.fn(),
+  getBotmuxBridgeTmuxAttachSpec: vi.fn(),
+  openBotmuxBridgeTerminal: vi.fn()
 }))
 
 import {
-  getOrcaBotmuxBridgeNativeTerminalSpec,
-  listOrcaBotmuxBridgeSessions
-} from '../../../orca-botmux-bridge/orca-botmux-bridge-service'
+  getBotmuxBridgeNativeTerminalSpec,
+  listBotmuxBridgeSessions
+} from '../../../botmux-bridge/botmux-bridge-service'
 import { BOTMUX_BRIDGE_METHODS } from './botmux-bridge'
 
 function findHandler(name: string) {
@@ -29,7 +29,7 @@ describe('botmuxBridge RPC methods', () => {
   })
 
   it('shapeBotmuxBridgeListSessionsResult filters by worktree path on real shape', () => {
-    const list: OrcaBotmuxBridgeListResult = {
+    const list: BotmuxBridgeListResult = {
       ok: true,
       endpoints: [{ id: 'ssh:t1', label: 'd2', baseUrl: 'http://127.0.0.1:1', ok: true }],
       sessions: [
@@ -51,7 +51,7 @@ describe('botmuxBridge RPC methods', () => {
     }
     const shaped = shapeBotmuxBridgeListSessionsResult(list, {
       worktreePath: '/root/workspace/botmux',
-      orcaBotmuxHostId: 'ssh:t1'
+      botmuxHostId: 'ssh:t1'
     })
     expect(shaped.ok).toBe(true)
     if (!shaped.ok) return
@@ -61,7 +61,7 @@ describe('botmuxBridge RPC methods', () => {
   })
 
   it('listSessions handler delegates to bridge service and applies scope', async () => {
-    vi.mocked(listOrcaBotmuxBridgeSessions).mockResolvedValue({
+    vi.mocked(listBotmuxBridgeSessions).mockResolvedValue({
       ok: true,
       endpoints: [{ id: 'local', label: 'Local', baseUrl: 'http://127.0.0.1:2', ok: true }],
       sessions: [
@@ -84,12 +84,12 @@ describe('botmuxBridge RPC methods', () => {
     const method = findHandler('botmuxBridge.listSessions')
     const params = method.params?.parse({
       worktreePath: '/Users/me/proj',
-      orcaBotmuxHostId: 'local'
+      botmuxHostId: 'local'
     })
     const result = (await method.handler(params, {
       runtime: {} as never
-    })) as OrcaBotmuxBridgeListResult
-    expect(listOrcaBotmuxBridgeSessions).toHaveBeenCalledTimes(1)
+    })) as BotmuxBridgeListResult
+    expect(listBotmuxBridgeSessions).toHaveBeenCalledTimes(1)
     expect(result.ok).toBe(true)
     if (!result.ok) return
     expect(result.sessions).toHaveLength(1)
@@ -99,18 +99,18 @@ describe('botmuxBridge RPC methods', () => {
   })
 
   it('nativeTerminalSpec handler returns attach payload from bridge service', async () => {
-    vi.mocked(getOrcaBotmuxBridgeNativeTerminalSpec).mockResolvedValue({
+    vi.mocked(getBotmuxBridgeNativeTerminalSpec).mockResolvedValue({
       ok: true,
       command: 'node',
       args: ['relay.js'],
-      title: 'OrcaBotmux · abc',
+      title: 'Botmux · abc',
       writeLinkUrl: 'http://127.0.0.1/write',
       electronRunAsNode: true
     })
     const method = findHandler('botmuxBridge.nativeTerminalSpec')
     const params = method.params?.parse({ sessionId: 'sess-1', hostId: 'local' })
     const result = await method.handler(params, { runtime: {} as never })
-    expect(getOrcaBotmuxBridgeNativeTerminalSpec).toHaveBeenCalledWith({
+    expect(getBotmuxBridgeNativeTerminalSpec).toHaveBeenCalledWith({
       sessionId: 'sess-1',
       hostId: 'local'
     })

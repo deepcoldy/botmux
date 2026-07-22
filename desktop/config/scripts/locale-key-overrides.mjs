@@ -14,9 +14,9 @@ const BASE_LOCALE_KEY_OVERRIDES = {
   'auto.components.onboarding.ThemeStep.ab2a583a97': { ja: 'カーソル' },
   'menu.reportCrash': { ko: '크래시 신고...', zh: '报告崩溃...', ja: 'クラッシュを報告...' },
   'menu.showMobileButton': {
-    ko: 'OrcaBotmux 모바일 버튼 표시',
-    zh: '显示 OrcaBotmux Mobile 按钮',
-    ja: 'OrcaBotmux モバイル ボタンを表示'
+    ko: 'Botmux 모바일 버튼 표시',
+    zh: '显示 Botmux Mobile 按钮',
+    ja: 'Botmux モバイル ボタンを表示'
   },
   'menu.toggleLeftSidebar': {
     ko: '왼쪽 사이드바 표시/숨기기',
@@ -33,7 +33,7 @@ const BASE_LOCALE_KEY_OVERRIDES = {
     zh: '打开工作树面板',
     ja: 'ワークツリーパレットを開く'
   },
-  'menu.exploreOrca': { ko: 'OrcaBotmux 둘러보기', zh: '探索 OrcaBotmux', ja: 'OrcaBotmux を探索' },
+  'menu.exploreBotmux': { ko: 'Botmux 둘러보기', zh: '探索 Botmux', ja: 'Botmux を探索' },
   'worktreeJumpPalette.matchLabel.issue': { ko: '이슈', zh: '议题', ja: 'Issue' },
   'worktreeJumpPalette.matchLabel.comment': { ko: '댓글', zh: '评论', ja: 'コメント' },
   'auto.hooks.useSettingsNavigationMetadata.13241992bd': {
@@ -187,9 +187,9 @@ const BASE_LOCALE_KEY_OVERRIDES = {
     ja: 'Discord'
   },
   'auto.components.sidebar.SidebarSettingsHelpMenu.ad3d3ed7f1': {
-    ko: 'OrcaBotmux 재시작',
-    zh: '重启 OrcaBotmux',
-    ja: 'OrcaBotmux を再起動'
+    ko: 'Botmux 재시작',
+    zh: '重启 Botmux',
+    ja: 'Botmux を再起動'
   },
   'auto.components.sidebar.workspace.status.5f9ca31a84': {
     ko: '대기 중',
@@ -212,9 +212,9 @@ const BASE_LOCALE_KEY_OVERRIDES = {
     ja: '終了中…'
   },
   'auto.components.status.bar.ResourceUsageStatusSegment.53dd5560ae': {
-    ko: 'OrcaBotmux 접기',
-    zh: '折叠 OrcaBotmux',
-    ja: 'OrcaBotmux を折りたたむ'
+    ko: 'Botmux 접기',
+    zh: '折叠 Botmux',
+    ja: 'Botmux を折りたたむ'
   },
   'auto.components.settings.ManageSessionsSection.a06ababda0': {
     ko: '모두 강제 종료',
@@ -327,9 +327,9 @@ const BASE_LOCALE_KEY_OVERRIDES = {
     ja: 'Linear イシューを検索...'
   },
   'auto.web.WebConnect.e3bcd082ac': {
-    ko: 'OrcaBotmux에 연결',
-    zh: '连接到 OrcaBotmux',
-    ja: 'OrcaBotmux に接続'
+    ko: 'Botmux에 연결',
+    zh: '连接到 Botmux',
+    ja: 'Botmux に接続'
   },
   'auto.App.caea5b51b9': {
     ko: '지금 재시작',

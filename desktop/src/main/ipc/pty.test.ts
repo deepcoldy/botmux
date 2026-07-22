@@ -18,12 +18,12 @@ const posixOnlyIt = isWindowsHost ? it.skip : it
 const expectedOmpStatusExtension = posix.join(
   '/tmp/default-omp-agent',
   'extensions',
-  'orca-botmux-agent-status.ts'
+  'botmux-agent-status.ts'
 )
 function expectedAttributionShimDir(): string {
   return join(
-    '/tmp/orca-botmux-user-data',
-    'orca-botmux-terminal-attribution',
+    '/tmp/botmux-user-data',
+    'botmux-terminal-attribution',
     process.platform === 'win32' ? 'win32' : 'posix'
   )
 }
@@ -181,9 +181,9 @@ vi.mock('../telemetry/classify-error', () => ({
 
 // Why: the real ensure writes to disk from process.resourcesPath, which does
 // not exist under vitest; env assembly only needs the returned dir path.
-vi.mock('../cli/linux-terminal-orca-botmux-cli-shim', () => ({
-  ensureLinuxTerminalOrcaCliShimDir: (options: { userDataPath: string }) =>
-    join(options.userDataPath, 'linux-orca-botmux-cli-shim')
+vi.mock('../cli/linux-terminal-botmux-cli-shim', () => ({
+  ensureLinuxTerminalBotmuxCliShimDir: (options: { userDataPath: string }) =>
+    join(options.userDataPath, 'linux-botmux-cli-shim')
 }))
 
 vi.mock('../memory/pty-registry', () => ({
@@ -220,7 +220,7 @@ import {
   _resetHiddenRendererPtyDeliveryGateForTest,
   isHiddenRendererPty
 } from './pty-hidden-delivery-gate'
-import { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
+import { BotmuxRuntimeService } from '../runtime/botmux-runtime'
 import { hasLiveClaudePtys, markClaudePtySpawned } from '../claude-accounts/live-pty-gate'
 import * as livePtyGate from '../claude-accounts/live-pty-gate'
 import {
@@ -248,8 +248,8 @@ const RESOLVED_WINDOWS_POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v
 const RESOLVED_PWSH7 = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
 const TEST_CODEX_HOME =
   process.platform === 'win32'
-    ? 'C:\\Users\\test\\AppData\\Roaming\\orca_botmux\\codex-runtime-home\\home'
-    : '/tmp/orca-botmux-codex-home'
+    ? 'C:\\Users\\test\\AppData\\Roaming\\botmux\\codex-runtime-home\\home'
+    : '/tmp/botmux-codex-home'
 
 function makeDisposable() {
   return { dispose: vi.fn() }
@@ -286,19 +286,19 @@ describe('registerPtyHandlers', () => {
   }
 
   const savedOpenCodeConfigDir = process.env.OPENCODE_CONFIG_DIR
-  const savedOrcaOpenCodeConfigDir = process.env.ORCA_OPENCODE_CONFIG_DIR
-  const savedOrcaOpenCodeSourceConfigDir = process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR
+  const savedBotmuxOpenCodeConfigDir = process.env.BOTMUX_OPENCODE_CONFIG_DIR
+  const savedBotmuxOpenCodeSourceConfigDir = process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
   const savedPiAgentDir = process.env.PI_CODING_AGENT_DIR
-  const savedOrcaPiAgentDir = process.env.ORCA_PI_CODING_AGENT_DIR
-  const savedOrcaPiSourceAgentDir = process.env.ORCA_PI_SOURCE_AGENT_DIR
-  const savedOrcaCodexHome = process.env.ORCA_CODEX_HOME
-  const savedOrcaOmpAgentDir = process.env.ORCA_OMP_CODING_AGENT_DIR
-  const savedOrcaOmpSourceAgentDir = process.env.ORCA_OMP_SOURCE_AGENT_DIR
-  const savedOrcaOmpStatusExtension = process.env.ORCA_OMP_STATUS_EXTENSION
-  const savedOrcaClaudeAgentStatusSettings = process.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS
+  const savedBotmuxPiAgentDir = process.env.BOTMUX_PI_CODING_AGENT_DIR
+  const savedBotmuxPiSourceAgentDir = process.env.BOTMUX_PI_SOURCE_AGENT_DIR
+  const savedBotmuxCodexHome = process.env.BOTMUX_CODEX_HOME
+  const savedBotmuxOmpAgentDir = process.env.BOTMUX_OMP_CODING_AGENT_DIR
+  const savedBotmuxOmpSourceAgentDir = process.env.BOTMUX_OMP_SOURCE_AGENT_DIR
+  const savedBotmuxOmpStatusExtension = process.env.BOTMUX_OMP_STATUS_EXTENSION
+  const savedBotmuxClaudeAgentStatusSettings = process.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS
   const savedProcessPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
-  const savedDisableMacosLoginShell = process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
-  const savedOrcaUserDataPath = process.env.ORCA_USER_DATA_PATH
+  const savedDisableMacosLoginShell = process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
+  const savedBotmuxUserDataPath = process.env.BOTMUX_USER_DATA_PATH
 
   beforeEach(() => {
     // Why: most PTY spawn tests assert POSIX shell behavior; Windows-specific
@@ -310,19 +310,19 @@ describe('registerPtyHandlers', () => {
     // Why: with platform forced to darwin, the TCC login(1) wrapper would
     // rewrite every spawn argv these tests assert. Its own integration test
     // below re-enables it.
-    process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL = '1'
+    process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL = '1'
     delete process.env.OPENCODE_CONFIG_DIR
-    delete process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR
-    delete process.env.ORCA_OPENCODE_CONFIG_DIR
-    delete process.env.ORCA_AGENT_HOOK_ENDPOINT
-    delete process.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS
+    delete process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
+    delete process.env.BOTMUX_OPENCODE_CONFIG_DIR
+    delete process.env.BOTMUX_AGENT_HOOK_ENDPOINT
+    delete process.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS
     delete process.env.PI_CODING_AGENT_DIR
-    delete process.env.ORCA_PI_SOURCE_AGENT_DIR
-    delete process.env.ORCA_PI_CODING_AGENT_DIR
-    delete process.env.ORCA_CODEX_HOME
-    delete process.env.ORCA_OMP_SOURCE_AGENT_DIR
-    delete process.env.ORCA_OMP_CODING_AGENT_DIR
-    delete process.env.ORCA_OMP_STATUS_EXTENSION
+    delete process.env.BOTMUX_PI_SOURCE_AGENT_DIR
+    delete process.env.BOTMUX_PI_CODING_AGENT_DIR
+    delete process.env.BOTMUX_CODEX_HOME
+    delete process.env.BOTMUX_OMP_SOURCE_AGENT_DIR
+    delete process.env.BOTMUX_OMP_CODING_AGENT_DIR
+    delete process.env.BOTMUX_OMP_STATUS_EXTENSION
     handlers.clear()
     handleMock.mockReset()
     onMock.mockReset()
@@ -389,38 +389,38 @@ describe('registerPtyHandlers', () => {
         }
       }
     })
-    getPathMock.mockReturnValue('/tmp/orca-botmux-user-data')
-    // Why: shell-ready wrapper roots resolve from ORCA_USER_DATA_PATH (main
+    getPathMock.mockReturnValue('/tmp/botmux-user-data')
+    // Why: shell-ready wrapper roots resolve from BOTMUX_USER_DATA_PATH (main
     // canonicalizes it to app.getPath('userData') at startup before any spawn);
     // mirror that here so ZDOTDIR/wrapper assertions match the mocked userData.
-    process.env.ORCA_USER_DATA_PATH = '/tmp/orca-botmux-user-data'
+    process.env.BOTMUX_USER_DATA_PATH = '/tmp/botmux-user-data'
     existsSyncMock.mockReturnValue(true)
     statSyncMock.mockReturnValue({ isDirectory: () => true, mode: 0o755 })
     readFileSyncMock.mockReturnValue('')
     openCodeBuildPtyEnvMock.mockImplementation((_ptyId: string, existingConfigDir?: string) => ({
-      ORCA_OPENCODE_HOOK_PORT: '4567',
-      ORCA_OPENCODE_HOOK_TOKEN: 'opencode-token',
-      ORCA_OPENCODE_PTY_ID: 'test-pty',
+      BOTMUX_OPENCODE_HOOK_PORT: '4567',
+      BOTMUX_OPENCODE_HOOK_TOKEN: 'opencode-token',
+      BOTMUX_OPENCODE_PTY_ID: 'test-pty',
       OPENCODE_CONFIG_DIR: existingConfigDir
-        ? '/tmp/orca-botmux-opencode-overlay'
-        : '/tmp/orca-botmux-opencode-config'
+        ? '/tmp/botmux-opencode-overlay'
+        : '/tmp/botmux-opencode-config'
     }))
     mimoCodeBuildPtyEnvMock.mockImplementation((_ptyId: string, existingHome?: string) => ({
-      MIMOCODE_HOME: existingHome ? '/tmp/orca-botmux-mimocode-overlay' : '/tmp/orca-botmux-mimocode-shared'
+      MIMOCODE_HOME: existingHome ? '/tmp/botmux-mimocode-overlay' : '/tmp/botmux-mimocode-shared'
     }))
     buildAgentHookEnvMock.mockReturnValue({
-      ORCA_AGENT_HOOK_PORT: '5678',
-      ORCA_AGENT_HOOK_TOKEN: 'agent-token'
+      BOTMUX_AGENT_HOOK_PORT: '5678',
+      BOTMUX_AGENT_HOOK_TOKEN: 'agent-token'
     })
     piBuildPtyEnvMock.mockImplementation(
       (_ptyId: string, existingAgentDir?: string, kind?: string) =>
         kind === 'omp'
           ? {
-              ORCA_OMP_SOURCE_AGENT_DIR: existingAgentDir ?? '/tmp/default-omp-agent',
-              ORCA_OMP_STATUS_EXTENSION: `${existingAgentDir ?? '/tmp/default-omp-agent'}/extensions/orca-botmux-agent-status.ts`
+              BOTMUX_OMP_SOURCE_AGENT_DIR: existingAgentDir ?? '/tmp/default-omp-agent',
+              BOTMUX_OMP_STATUS_EXTENSION: `${existingAgentDir ?? '/tmp/default-omp-agent'}/extensions/botmux-agent-status.ts`
             }
           : {
-              ORCA_PI_SOURCE_AGENT_DIR: existingAgentDir ?? '/tmp/default-pi-agent'
+              BOTMUX_PI_SOURCE_AGENT_DIR: existingAgentDir ?? '/tmp/default-pi-agent'
             }
     )
     isPwshAvailableMock.mockReturnValue(false)
@@ -459,69 +459,69 @@ describe('registerPtyHandlers', () => {
       Object.defineProperty(process, 'platform', savedProcessPlatform)
     }
     if (savedDisableMacosLoginShell !== undefined) {
-      process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL = savedDisableMacosLoginShell
+      process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL = savedDisableMacosLoginShell
     } else {
-      delete process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
+      delete process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
     }
-    if (savedOrcaUserDataPath !== undefined) {
-      process.env.ORCA_USER_DATA_PATH = savedOrcaUserDataPath
+    if (savedBotmuxUserDataPath !== undefined) {
+      process.env.BOTMUX_USER_DATA_PATH = savedBotmuxUserDataPath
     } else {
-      delete process.env.ORCA_USER_DATA_PATH
+      delete process.env.BOTMUX_USER_DATA_PATH
     }
     if (savedOpenCodeConfigDir !== undefined) {
       process.env.OPENCODE_CONFIG_DIR = savedOpenCodeConfigDir
     } else {
       delete process.env.OPENCODE_CONFIG_DIR
     }
-    if (savedOrcaOpenCodeConfigDir !== undefined) {
-      process.env.ORCA_OPENCODE_CONFIG_DIR = savedOrcaOpenCodeConfigDir
+    if (savedBotmuxOpenCodeConfigDir !== undefined) {
+      process.env.BOTMUX_OPENCODE_CONFIG_DIR = savedBotmuxOpenCodeConfigDir
     } else {
-      delete process.env.ORCA_OPENCODE_CONFIG_DIR
+      delete process.env.BOTMUX_OPENCODE_CONFIG_DIR
     }
-    if (savedOrcaOpenCodeSourceConfigDir !== undefined) {
-      process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR = savedOrcaOpenCodeSourceConfigDir
+    if (savedBotmuxOpenCodeSourceConfigDir !== undefined) {
+      process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR = savedBotmuxOpenCodeSourceConfigDir
     } else {
-      delete process.env.ORCA_OPENCODE_SOURCE_CONFIG_DIR
+      delete process.env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR
     }
     if (savedPiAgentDir !== undefined) {
       process.env.PI_CODING_AGENT_DIR = savedPiAgentDir
     } else {
       delete process.env.PI_CODING_AGENT_DIR
     }
-    if (savedOrcaPiAgentDir !== undefined) {
-      process.env.ORCA_PI_CODING_AGENT_DIR = savedOrcaPiAgentDir
+    if (savedBotmuxPiAgentDir !== undefined) {
+      process.env.BOTMUX_PI_CODING_AGENT_DIR = savedBotmuxPiAgentDir
     } else {
-      delete process.env.ORCA_PI_CODING_AGENT_DIR
+      delete process.env.BOTMUX_PI_CODING_AGENT_DIR
     }
-    if (savedOrcaPiSourceAgentDir === undefined) {
-      delete process.env.ORCA_PI_SOURCE_AGENT_DIR
+    if (savedBotmuxPiSourceAgentDir === undefined) {
+      delete process.env.BOTMUX_PI_SOURCE_AGENT_DIR
     } else {
-      process.env.ORCA_PI_SOURCE_AGENT_DIR = savedOrcaPiSourceAgentDir
+      process.env.BOTMUX_PI_SOURCE_AGENT_DIR = savedBotmuxPiSourceAgentDir
     }
-    if (savedOrcaCodexHome === undefined) {
-      delete process.env.ORCA_CODEX_HOME
+    if (savedBotmuxCodexHome === undefined) {
+      delete process.env.BOTMUX_CODEX_HOME
     } else {
-      process.env.ORCA_CODEX_HOME = savedOrcaCodexHome
+      process.env.BOTMUX_CODEX_HOME = savedBotmuxCodexHome
     }
-    if (savedOrcaOmpAgentDir !== undefined) {
-      process.env.ORCA_OMP_CODING_AGENT_DIR = savedOrcaOmpAgentDir
+    if (savedBotmuxOmpAgentDir !== undefined) {
+      process.env.BOTMUX_OMP_CODING_AGENT_DIR = savedBotmuxOmpAgentDir
     } else {
-      delete process.env.ORCA_OMP_CODING_AGENT_DIR
+      delete process.env.BOTMUX_OMP_CODING_AGENT_DIR
     }
-    if (savedOrcaOmpSourceAgentDir !== undefined) {
-      process.env.ORCA_OMP_SOURCE_AGENT_DIR = savedOrcaOmpSourceAgentDir
+    if (savedBotmuxOmpSourceAgentDir !== undefined) {
+      process.env.BOTMUX_OMP_SOURCE_AGENT_DIR = savedBotmuxOmpSourceAgentDir
     } else {
-      delete process.env.ORCA_OMP_SOURCE_AGENT_DIR
+      delete process.env.BOTMUX_OMP_SOURCE_AGENT_DIR
     }
-    if (savedOrcaOmpStatusExtension !== undefined) {
-      process.env.ORCA_OMP_STATUS_EXTENSION = savedOrcaOmpStatusExtension
+    if (savedBotmuxOmpStatusExtension !== undefined) {
+      process.env.BOTMUX_OMP_STATUS_EXTENSION = savedBotmuxOmpStatusExtension
     } else {
-      delete process.env.ORCA_OMP_STATUS_EXTENSION
+      delete process.env.BOTMUX_OMP_STATUS_EXTENSION
     }
-    if (savedOrcaClaudeAgentStatusSettings === undefined) {
-      delete process.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS
+    if (savedBotmuxClaudeAgentStatusSettings === undefined) {
+      delete process.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS
     } else {
-      process.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS = savedOrcaClaudeAgentStatusSettings
+      process.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS = savedBotmuxClaudeAgentStatusSettings
     }
   })
 
@@ -905,7 +905,7 @@ describe('registerPtyHandlers', () => {
       const env = await spawnAndGetEnv()
       expect(env.TERM).toBe('xterm-256color')
       expect(env.COLORTERM).toBe('truecolor')
-      expect(env.TERM_PROGRAM).toBe('orca_botmux')
+      expect(env.TERM_PROGRAM).toBe('botmux')
     })
 
     it('keeps indexed Git prompt guards in a local agent terminal env', async () => {
@@ -932,73 +932,73 @@ describe('registerPtyHandlers', () => {
     it('advertises OSC 8 hyperlink support via FORCE_HYPERLINK', async () => {
       // Why: the supports-hyperlinks npm package hard-codes a TERM_PROGRAM
       // allowlist (iTerm.app / WezTerm / vscode) and reports false for
-      // TERM_PROGRAM=OrcaBotmux, so tools like Claude Code emit plain text instead
+      // TERM_PROGRAM=Botmux, so tools like Claude Code emit plain text instead
       // of ESC]8;; wrappers. Setting FORCE_HYPERLINK=1 forces the detector to
       // return true; xterm.js + our linkHandler handle the sequences natively.
       const env = await spawnAndGetEnv()
       expect(env.FORCE_HYPERLINK).toBe('1')
     })
 
-    it('surfaces ORCA_APP_VERSION as TERM_PROGRAM_VERSION for TUI feature gating', async () => {
-      const env = await spawnAndGetEnv(undefined, { ORCA_APP_VERSION: '1.2.3-test' })
+    it('surfaces BOTMUX_APP_VERSION as TERM_PROGRAM_VERSION for TUI feature gating', async () => {
+      const env = await spawnAndGetEnv(undefined, { BOTMUX_APP_VERSION: '1.2.3-test' })
       expect(env.TERM_PROGRAM_VERSION).toBe('1.2.3-test')
     })
 
-    it('falls back to a placeholder version when ORCA_APP_VERSION is unset', async () => {
-      const env = await spawnAndGetEnv(undefined, { ORCA_APP_VERSION: undefined })
+    it('falls back to a placeholder version when BOTMUX_APP_VERSION is unset', async () => {
+      const env = await spawnAndGetEnv(undefined, { BOTMUX_APP_VERSION: undefined })
       expect(env.TERM_PROGRAM_VERSION).toBe('0.0.0-dev')
     })
 
-    it('injects the selected Codex home into OrcaBotmux terminal PTYs', async () => {
+    it('injects the selected Codex home into Botmux terminal PTYs', async () => {
       const env = await spawnAndGetEnv(undefined, undefined, () => TEST_CODEX_HOME)
       expect(env.CODEX_HOME).toBe(TEST_CODEX_HOME)
-      expect(env.ORCA_CODEX_HOME).toBe(TEST_CODEX_HOME)
+      expect(env.BOTMUX_CODEX_HOME).toBe(TEST_CODEX_HOME)
     })
 
-    it('injects the OpenCode hook env into OrcaBotmux terminal PTYs', async () => {
+    it('injects the OpenCode hook env into Botmux terminal PTYs', async () => {
       // Why: clear any ambient OPENCODE_CONFIG_DIR so the mock's value is used
       const env = await spawnAndGetEnv(undefined, { OPENCODE_CONFIG_DIR: undefined })
       expect(openCodeBuildPtyEnvMock).toHaveBeenCalledTimes(1)
       expect(openCodeBuildPtyEnvMock.mock.calls[0]?.[0]).toEqual(expect.any(String))
-      expect(env.ORCA_OPENCODE_HOOK_PORT).toBe('4567')
-      expect(env.ORCA_OPENCODE_HOOK_TOKEN).toBe('opencode-token')
-      expect(env.ORCA_OPENCODE_PTY_ID).toBe('test-pty')
+      expect(env.BOTMUX_OPENCODE_HOOK_PORT).toBe('4567')
+      expect(env.BOTMUX_OPENCODE_HOOK_TOKEN).toBe('opencode-token')
+      expect(env.BOTMUX_OPENCODE_PTY_ID).toBe('test-pty')
       expect(env.OPENCODE_CONFIG_DIR).toEqual(expect.any(String))
-      expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe(env.OPENCODE_CONFIG_DIR)
+      expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe(env.OPENCODE_CONFIG_DIR)
     })
 
-    it('mirrors the original OpenCode source dir when launched from an OrcaBotmux overlay shell', async () => {
+    it('mirrors the original OpenCode source dir when launched from an Botmux overlay shell', async () => {
       const env = await spawnAndGetEnv({
-        OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-        ORCA_OPENCODE_SOURCE_CONFIG_DIR: '/tmp/user-opencode-config'
+        OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+        BOTMUX_OPENCODE_SOURCE_CONFIG_DIR: '/tmp/user-opencode-config'
       })
       expect(openCodeBuildPtyEnvMock).toHaveBeenCalledWith(
         expect.any(String),
         '/tmp/user-opencode-config'
       )
-      expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-      expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-      expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBe('/tmp/user-opencode-config')
+      expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+      expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+      expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBe('/tmp/user-opencode-config')
     })
 
-    it('does not treat inherited OrcaBotmux OpenCode config as user config without a source dir', async () => {
+    it('does not treat inherited Botmux OpenCode config as user config without a source dir', async () => {
       const env = await spawnAndGetEnv({
-        OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-        ORCA_OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay'
+        OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+        BOTMUX_OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay'
       })
 
       expect(openCodeBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), undefined)
-      expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-config')
-      expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-config')
-      expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
+      expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-config')
+      expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-config')
+      expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
     })
 
-    it('restores user OpenCode config when agent status hooks are disabled in a nested OrcaBotmux shell', async () => {
+    it('restores user OpenCode config when agent status hooks are disabled in a nested Botmux shell', async () => {
       const env = await spawnAndGetEnv(
         {
-          OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-          ORCA_OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-          ORCA_OPENCODE_SOURCE_CONFIG_DIR: '/tmp/user-opencode-config'
+          OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+          BOTMUX_OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+          BOTMUX_OPENCODE_SOURCE_CONFIG_DIR: '/tmp/user-opencode-config'
         },
         undefined,
         undefined,
@@ -1007,15 +1007,15 @@ describe('registerPtyHandlers', () => {
 
       expect(openCodeBuildPtyEnvMock).not.toHaveBeenCalled()
       expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/user-opencode-config')
-      expect(env.ORCA_OPENCODE_CONFIG_DIR).toBeUndefined()
-      expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
+      expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBeUndefined()
+      expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
     })
 
     it('strips inherited OpenCode overlay env when agent status hooks are disabled without a source dir', async () => {
       const env = await spawnAndGetEnv(
         {
-          OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-          ORCA_OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay'
+          OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+          BOTMUX_OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay'
         },
         undefined,
         undefined,
@@ -1024,17 +1024,17 @@ describe('registerPtyHandlers', () => {
 
       expect(openCodeBuildPtyEnvMock).not.toHaveBeenCalled()
       expect(env.OPENCODE_CONFIG_DIR).toBeUndefined()
-      expect(env.ORCA_OPENCODE_CONFIG_DIR).toBeUndefined()
-      expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
+      expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBeUndefined()
+      expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
     })
 
     it('injects MiMo overlay env only when launch command is mimo', async () => {
       const env = await spawnAndGetEnv(undefined, undefined, undefined, undefined, 'mimo')
 
       expect(mimoCodeBuildPtyEnvMock).toHaveBeenCalledTimes(1)
-      expect(env.MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
-      expect(env.ORCA_MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
-      expect(env.ORCA_MIMOCODE_SOURCE_HOME).toBeUndefined()
+      expect(env.MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
+      expect(env.BOTMUX_MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
+      expect(env.BOTMUX_MIMOCODE_SOURCE_HOME).toBeUndefined()
     })
 
     it.each(['/usr/local/bin/mimo --prompt hi', '"C:\\Program Files\\MiMo\\mimo.cmd" --prompt hi'])(
@@ -1043,8 +1043,8 @@ describe('registerPtyHandlers', () => {
         const env = await spawnAndGetEnv(undefined, undefined, undefined, undefined, launchCommand)
 
         expect(mimoCodeBuildPtyEnvMock).toHaveBeenCalledTimes(1)
-        expect(env.MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
-        expect(env.ORCA_MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
+        expect(env.MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
+        expect(env.BOTMUX_MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
       }
     )
 
@@ -1058,8 +1058,8 @@ describe('registerPtyHandlers', () => {
       )
 
       expect(mimoCodeBuildPtyEnvMock).toHaveBeenCalledTimes(1)
-      expect(env.MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
-      expect(env.ORCA_MIMOCODE_HOME).toBe('/tmp/orca-botmux-mimocode-shared')
+      expect(env.MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
+      expect(env.BOTMUX_MIMOCODE_HOME).toBe('/tmp/botmux-mimocode-shared')
     })
 
     it('does not inject MiMo overlay for non-mimo launches', async () => {
@@ -1068,12 +1068,12 @@ describe('registerPtyHandlers', () => {
       expect(mimoCodeBuildPtyEnvMock).not.toHaveBeenCalled()
     })
 
-    it('restores user MiMo home when agent status hooks are disabled in a nested OrcaBotmux shell', async () => {
+    it('restores user MiMo home when agent status hooks are disabled in a nested Botmux shell', async () => {
       const env = await spawnAndGetEnv(
         {
-          MIMOCODE_HOME: '/tmp/parent-orca-botmux-mimocode-overlay',
-          ORCA_MIMOCODE_HOME: '/tmp/parent-orca-botmux-mimocode-overlay',
-          ORCA_MIMOCODE_SOURCE_HOME: '/tmp/user-mimocode-home'
+          MIMOCODE_HOME: '/tmp/parent-botmux-mimocode-overlay',
+          BOTMUX_MIMOCODE_HOME: '/tmp/parent-botmux-mimocode-overlay',
+          BOTMUX_MIMOCODE_SOURCE_HOME: '/tmp/user-mimocode-home'
         },
         undefined,
         undefined,
@@ -1083,12 +1083,12 @@ describe('registerPtyHandlers', () => {
 
       expect(mimoCodeBuildPtyEnvMock).not.toHaveBeenCalled()
       expect(env.MIMOCODE_HOME).toBe('/tmp/user-mimocode-home')
-      expect(env.ORCA_MIMOCODE_HOME).toBeUndefined()
-      expect(env.ORCA_MIMOCODE_SOURCE_HOME).toBeUndefined()
+      expect(env.BOTMUX_MIMOCODE_HOME).toBeUndefined()
+      expect(env.BOTMUX_MIMOCODE_SOURCE_HOME).toBeUndefined()
     })
 
     posixOnlyIt(
-      'reproduces issue #1534: GUI-launched OrcaBotmux mirrors zshrc-only OpenCode config',
+      'reproduces issue #1534: GUI-launched Botmux mirrors zshrc-only OpenCode config',
       async () => {
         // Why: the reporter's app process did not inherit OPENCODE_CONFIG_DIR;
         // their interactive zsh startup later exported a company config repo.
@@ -1107,38 +1107,38 @@ describe('registerPtyHandlers', () => {
           HOME: '/home/pim',
           SHELL: '/bin/zsh',
           OPENCODE_CONFIG_DIR: undefined,
-          ORCA_OPENCODE_SOURCE_CONFIG_DIR: undefined
+          BOTMUX_OPENCODE_SOURCE_CONFIG_DIR: undefined
         })
 
         expect(openCodeBuildPtyEnvMock).toHaveBeenCalledWith(
           expect.any(String),
           '/home/pim/company/opencode-config'
         )
-        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBe('/home/pim/company/opencode-config')
-        expect(env.OPENCODE_CONFIG_DIR).not.toBe(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR)
+        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBe('/home/pim/company/opencode-config')
+        expect(env.OPENCODE_CONFIG_DIR).not.toBe(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR)
       }
     )
 
-    it('installs Pi managed extensions without redirecting OrcaBotmux terminal PTY homes', async () => {
+    it('installs Pi managed extensions without redirecting Botmux terminal PTY homes', async () => {
       const env = await spawnAndGetEnv(undefined, { PI_CODING_AGENT_DIR: '/tmp/user-pi-agent' })
       expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), '/tmp/user-pi-agent', 'pi')
       expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), undefined, 'omp')
       expect(env.PI_CODING_AGENT_DIR).toBe('/tmp/user-pi-agent')
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
-      expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(
-        '/tmp/default-omp-agent/extensions/orca-botmux-agent-status.ts'
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
+      expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(
+        '/tmp/default-omp-agent/extensions/botmux-agent-status.ts'
       )
     })
 
     it('threads command: "omp" through to piBuildPtyEnv and emits OMP status metadata', async () => {
-      // Why: OMP launches must emit OMP-named OrcaBotmux shadow vars (ORCA_OMP_*),
+      // Why: OMP launches must emit OMP-named Botmux shadow vars (BOTMUX_OMP_*),
       // not Pi-named ones. The PI_CODING_AGENT_DIR binary var is unavoidable
       // (OMP's own binary reads it — see C:\tmp\pr-workspace\oh-my-pi
-      // packages/utils/src/dirs.ts), but every other OrcaBotmux-owned env name
+      // packages/utils/src/dirs.ts), but every other Botmux-owned env name
       // stays kind-scoped so an OMP PTY never accumulates Pi shadow state.
       const env = await spawnAndGetEnv(
         undefined,
@@ -1153,14 +1153,14 @@ describe('registerPtyHandlers', () => {
         'omp'
       )
       expect(env.PI_CODING_AGENT_DIR).toBe('/tmp/user-omp-agent')
-      expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(
-        '/tmp/user-omp-agent/extensions/orca-botmux-agent-status.ts'
+      expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(
+        '/tmp/user-omp-agent/extensions/botmux-agent-status.ts'
       )
-      expect(env.ORCA_OMP_SOURCE_AGENT_DIR).toBe('/tmp/user-omp-agent')
+      expect(env.BOTMUX_OMP_SOURCE_AGENT_DIR).toBe('/tmp/user-omp-agent')
       // CRITICAL: a Pi-named shadow MUST NOT leak into an OMP PTY env.
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
     })
 
     it('uses sequenced startup env as the OMP launch hint when command is a wrapper', async () => {
@@ -1180,29 +1180,29 @@ describe('registerPtyHandlers', () => {
         '/tmp/user-omp-agent',
         'omp'
       )
-      expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(
-        '/tmp/user-omp-agent/extensions/orca-botmux-agent-status.ts'
+      expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(
+        '/tmp/user-omp-agent/extensions/botmux-agent-status.ts'
       )
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
     })
 
-    it('mirrors the original Pi source dir when launched from an OrcaBotmux overlay shell', async () => {
+    it('mirrors the original Pi source dir when launched from an Botmux overlay shell', async () => {
       const env = await spawnAndGetEnv({
-        PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-pi-overlay',
-        ORCA_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
+        PI_CODING_AGENT_DIR: '/tmp/parent-botmux-pi-overlay',
+        BOTMUX_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
       })
       expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), '/tmp/user-pi-agent', 'pi')
-      expect(env.PI_CODING_AGENT_DIR).toBe('/tmp/parent-orca-botmux-pi-overlay')
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
+      expect(env.PI_CODING_AGENT_DIR).toBe('/tmp/parent-botmux-pi-overlay')
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
     })
 
     it('does not use an inherited Pi overlay source for an OMP launch', async () => {
       const env = await spawnAndGetEnv(
         {
-          PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-pi-overlay',
-          ORCA_PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-pi-overlay',
-          ORCA_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
+          PI_CODING_AGENT_DIR: '/tmp/parent-botmux-pi-overlay',
+          BOTMUX_PI_CODING_AGENT_DIR: '/tmp/parent-botmux-pi-overlay',
+          BOTMUX_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
         },
         undefined,
         undefined,
@@ -1211,18 +1211,18 @@ describe('registerPtyHandlers', () => {
       )
 
       expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), undefined, 'omp')
-      expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_OMP_SOURCE_AGENT_DIR).toBe('/tmp/default-omp-agent')
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_SOURCE_AGENT_DIR).toBe('/tmp/default-omp-agent')
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
     })
 
     it('does not use an inherited OMP overlay source for an explicit Pi launch', async () => {
       const env = await spawnAndGetEnv(
         {
-          PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-omp-overlay',
-          ORCA_OMP_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-omp-overlay',
-          ORCA_OMP_SOURCE_AGENT_DIR: '/tmp/user-omp-agent'
+          PI_CODING_AGENT_DIR: '/tmp/parent-botmux-omp-overlay',
+          BOTMUX_OMP_CODING_AGENT_DIR: '/tmp/parent-botmux-omp-overlay',
+          BOTMUX_OMP_SOURCE_AGENT_DIR: '/tmp/user-omp-agent'
         },
         undefined,
         undefined,
@@ -1231,19 +1231,19 @@ describe('registerPtyHandlers', () => {
       )
 
       expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), undefined, 'pi')
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/tmp/default-pi-agent')
-      expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_OMP_SOURCE_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_OMP_STATUS_EXTENSION).toBeUndefined()
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/tmp/default-pi-agent')
+      expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_SOURCE_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBeUndefined()
     })
 
-    it('restores user Pi config when agent status hooks are disabled in a nested OrcaBotmux shell', async () => {
+    it('restores user Pi config when agent status hooks are disabled in a nested Botmux shell', async () => {
       const env = await spawnAndGetEnv(
         {
-          PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-pi-overlay',
-          ORCA_PI_CODING_AGENT_DIR: '/tmp/parent-orca-botmux-pi-overlay',
-          ORCA_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
+          PI_CODING_AGENT_DIR: '/tmp/parent-botmux-pi-overlay',
+          BOTMUX_PI_CODING_AGENT_DIR: '/tmp/parent-botmux-pi-overlay',
+          BOTMUX_PI_SOURCE_AGENT_DIR: '/tmp/user-pi-agent'
         },
         undefined,
         undefined,
@@ -1252,8 +1252,8 @@ describe('registerPtyHandlers', () => {
 
       expect(piBuildPtyEnvMock).not.toHaveBeenCalled()
       expect(env.PI_CODING_AGENT_DIR).toBe('/tmp/user-pi-agent')
-      expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
     })
 
     posixOnlyIt(
@@ -1275,12 +1275,12 @@ describe('registerPtyHandlers', () => {
           'pi'
         )
         expect(env.PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/home/tester/.config/pi-agent')
+        expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/home/tester/.config/pi-agent')
       }
     )
 
-    it('injects the agent hook receiver env into OrcaBotmux terminal PTYs', async () => {
+    it('injects the agent hook receiver env into Botmux terminal PTYs', async () => {
       const env = await spawnAndGetEnv()
       // Why: after the daemon-parity refactor, buildAgentHookEnv runs exactly
       // once for a local spawn — inside the shared buildPtyHostEnv helper,
@@ -1288,46 +1288,46 @@ describe('registerPtyHandlers', () => {
       // both route through. The handler's separate ad-hoc injection (which
       // used to cause a double-call for local spawns) is gone.
       expect(buildAgentHookEnvMock).toHaveBeenCalledTimes(1)
-      expect(env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-      expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
+      expect(env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+      expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
     })
 
     it('strips stale inherited hook receiver env before injecting this runtime', async () => {
       const env = await spawnAndGetEnv({
-        ORCA_AGENT_HOOK_PORT: '1111',
-        ORCA_AGENT_HOOK_TOKEN: 'stale-token',
-        ORCA_AGENT_HOOK_ENV: 'production',
-        ORCA_AGENT_HOOK_VERSION: 'stale-version',
-        ORCA_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env',
-        ORCA_CLAUDE_AGENT_STATUS_SETTINGS: '/tmp/orca_botmux/agent-hooks/claude-agent-status-settings.json'
+        BOTMUX_AGENT_HOOK_PORT: '1111',
+        BOTMUX_AGENT_HOOK_TOKEN: 'stale-token',
+        BOTMUX_AGENT_HOOK_ENV: 'production',
+        BOTMUX_AGENT_HOOK_VERSION: 'stale-version',
+        BOTMUX_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env',
+        BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS: '/tmp/botmux/agent-hooks/claude-agent-status-settings.json'
       })
 
-      expect(env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-      expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
-      expect(env.ORCA_AGENT_HOOK_ENV).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_VERSION).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
-      expect(env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+      expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
+      expect(env.BOTMUX_AGENT_HOOK_ENV).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_VERSION).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_ENDPOINT).toBeUndefined()
+      expect(env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
     })
 
     it('does not leak inherited hook receiver env if the hook server is unavailable', async () => {
       buildAgentHookEnvMock.mockReturnValueOnce({})
 
       const env = await spawnAndGetEnv({
-        ORCA_AGENT_HOOK_PORT: '1111',
-        ORCA_AGENT_HOOK_TOKEN: 'stale-token',
-        ORCA_AGENT_HOOK_ENV: 'production',
-        ORCA_AGENT_HOOK_VERSION: 'stale-version',
-        ORCA_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env',
-        ORCA_CLAUDE_AGENT_STATUS_SETTINGS: '/tmp/orca_botmux/agent-hooks/claude-agent-status-settings.json'
+        BOTMUX_AGENT_HOOK_PORT: '1111',
+        BOTMUX_AGENT_HOOK_TOKEN: 'stale-token',
+        BOTMUX_AGENT_HOOK_ENV: 'production',
+        BOTMUX_AGENT_HOOK_VERSION: 'stale-version',
+        BOTMUX_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env',
+        BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS: '/tmp/botmux/agent-hooks/claude-agent-status-settings.json'
       })
 
-      expect(env.ORCA_AGENT_HOOK_PORT).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_TOKEN).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_ENV).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_VERSION).toBeUndefined()
-      expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
-      expect(env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_PORT).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_ENV).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_VERSION).toBeUndefined()
+      expect(env.BOTMUX_AGENT_HOOK_ENDPOINT).toBeUndefined()
+      expect(env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
     })
 
     it('prepends local git/gh attribution shims when attribution is enabled', async () => {
@@ -1335,10 +1335,10 @@ describe('registerPtyHandlers', () => {
         enableGitHubAttribution: true
       }))
 
-      expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBe('1')
-      expect(env.ORCA_GIT_COMMIT_TRAILER).toBe('Co-authored-by: OrcaBotmux <help@stably.ai>')
-      expect(env.ORCA_GH_PR_FOOTER).toBe('Made with [OrcaBotmux](https://github.com/stablyai/orca_botmux) 🐋')
-      expect(env.ORCA_GH_ISSUE_FOOTER).toBe('Made with [OrcaBotmux](https://github.com/stablyai/orca_botmux) 🐋')
+      expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBe('1')
+      expect(env.BOTMUX_GIT_COMMIT_TRAILER).toBe('Co-authored-by: Botmux <help@stably.ai>')
+      expect(env.BOTMUX_GH_PR_FOOTER).toBe('Made with [Botmux](https://github.com/stablyai/botmux) 🐋')
+      expect(env.BOTMUX_GH_ISSUE_FOOTER).toBe('Made with [Botmux](https://github.com/stablyai/botmux) 🐋')
       expect(env.PATH).toContain(expectedAttributionShimDir())
     })
 
@@ -1347,10 +1347,10 @@ describe('registerPtyHandlers', () => {
         enableGitHubAttribution: false
       }))
 
-      expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
-      expect(env.ORCA_GIT_COMMIT_TRAILER).toBeUndefined()
-      expect(env.ORCA_GH_PR_FOOTER).toBeUndefined()
-      expect(env.ORCA_GH_ISSUE_FOOTER).toBeUndefined()
+      expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
+      expect(env.BOTMUX_GIT_COMMIT_TRAILER).toBeUndefined()
+      expect(env.BOTMUX_GH_PR_FOOTER).toBeUndefined()
+      expect(env.BOTMUX_GH_ISSUE_FOOTER).toBeUndefined()
       expect(env.PATH ?? '').not.toContain(expectedAttributionShimDir())
     })
 
@@ -1379,18 +1379,18 @@ describe('registerPtyHandlers', () => {
       })
 
       const env = daemonSpawn.mock.calls.at(-1)![0].env
-      expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBe('1')
+      expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBe('1')
       expect(env.PATH).toContain(expectedAttributionShimDir())
     })
 
-    it('overrides ambient CODEX_HOME with the OrcaBotmux-managed home for system default', async () => {
+    it('overrides ambient CODEX_HOME with the Botmux-managed home for system default', async () => {
       const env = await spawnAndGetEnv(
         undefined,
         { CODEX_HOME: '/tmp/system-codex-home' },
         () => TEST_CODEX_HOME
       )
       expect(env.CODEX_HOME).toBe(TEST_CODEX_HOME)
-      expect(env.ORCA_CODEX_HOME).toBe(TEST_CODEX_HOME)
+      expect(env.BOTMUX_CODEX_HOME).toBe(TEST_CODEX_HOME)
     })
 
     it('injects explicit proxy settings into local PTY env', async () => {
@@ -1577,8 +1577,8 @@ describe('registerPtyHandlers', () => {
           OPENCODE_CONFIG_DIR: undefined
         })
         expect(openCodeBuildPtyEnvMock).toHaveBeenCalled()
-        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-config')
-        expect(env.ORCA_OPENCODE_HOOK_PORT).toBe('4567')
+        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-config')
+        expect(env.BOTMUX_OPENCODE_HOOK_PORT).toBe('4567')
       })
 
       it('mirrors a user-provided OPENCODE_CONFIG_DIR into a source-scoped overlay on the daemon path', async () => {
@@ -1589,23 +1589,23 @@ describe('registerPtyHandlers', () => {
           expect.any(String),
           '/user/custom/opencode'
         )
-        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBe('/user/custom/opencode')
+        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBe('/user/custom/opencode')
       })
 
       it('uses source OpenCode config env instead of remirroring a parent overlay', async () => {
         const env = await daemonSpawnAndGetEnv({
-          OPENCODE_CONFIG_DIR: '/tmp/parent-orca-botmux-opencode-overlay',
-          ORCA_OPENCODE_SOURCE_CONFIG_DIR: '/user/custom/opencode'
+          OPENCODE_CONFIG_DIR: '/tmp/parent-botmux-opencode-overlay',
+          BOTMUX_OPENCODE_SOURCE_CONFIG_DIR: '/user/custom/opencode'
         })
         expect(openCodeBuildPtyEnvMock).toHaveBeenCalledWith(
           expect.any(String),
           '/user/custom/opencode'
         )
-        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-overlay')
-        expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBe('/user/custom/opencode')
+        expect(env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-overlay')
+        expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBe('/user/custom/opencode')
       })
 
       it('installs Pi managed extensions without redirecting homes on the daemon path', async () => {
@@ -1613,10 +1613,10 @@ describe('registerPtyHandlers', () => {
         expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), '/user/.pi/agent', 'pi')
         expect(piBuildPtyEnvMock).toHaveBeenCalledWith(expect.any(String), undefined, 'omp')
         expect(env.PI_CODING_AGENT_DIR).toBe('/user/.pi/agent')
-        expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/user/.pi/agent')
-        expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(expectedOmpStatusExtension)
+        expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/user/.pi/agent')
+        expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(expectedOmpStatusExtension)
       })
 
       it('threads command: "omp" through to piBuildPtyEnv on the daemon path with OMP status metadata', async () => {
@@ -1636,13 +1636,13 @@ describe('registerPtyHandlers', () => {
           'omp'
         )
         expect(env.PI_CODING_AGENT_DIR).toBe('/user/.omp/agent')
-        expect(env.ORCA_OMP_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(
-          '/user/.omp/agent/extensions/orca-botmux-agent-status.ts'
+        expect(env.BOTMUX_OMP_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(
+          '/user/.omp/agent/extensions/botmux-agent-status.ts'
         )
-        expect(env.ORCA_OMP_SOURCE_AGENT_DIR).toBe('/user/.omp/agent')
-        expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_OMP_SOURCE_AGENT_DIR).toBe('/user/.omp/agent')
+        expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
       })
 
       it('uses sequenced startup env as the daemon OMP launch hint when command is a wrapper', async () => {
@@ -1662,16 +1662,16 @@ describe('registerPtyHandlers', () => {
           '/user/.omp/agent',
           'omp'
         )
-        expect(env.ORCA_OMP_STATUS_EXTENSION).toBe(
-          '/user/.omp/agent/extensions/orca-botmux-agent-status.ts'
+        expect(env.BOTMUX_OMP_STATUS_EXTENSION).toBe(
+          '/user/.omp/agent/extensions/botmux-agent-status.ts'
         )
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
       })
 
       it('injects the selected Codex home on the daemon path', async () => {
         const env = await daemonSpawnAndGetEnv({}, () => TEST_CODEX_HOME)
         expect(env.CODEX_HOME).toBe(TEST_CODEX_HOME)
-        expect(env.ORCA_CODEX_HOME).toBe(TEST_CODEX_HOME)
+        expect(env.BOTMUX_CODEX_HOME).toBe(TEST_CODEX_HOME)
       })
 
       it('injects explicit proxy settings on the daemon path', async () => {
@@ -1694,11 +1694,11 @@ describe('registerPtyHandlers', () => {
         try {
           const spawnOptions = await daemonSpawnAndGetOptions(
             {},
-            () => 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home',
+            () => 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home',
             undefined,
             {
-              CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home',
-              ORCA_CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home'
+              CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home',
+              BOTMUX_CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home'
             },
             {
               cwd: '\\\\wsl.localhost\\Ubuntu\\home\\test\\repo',
@@ -1707,9 +1707,9 @@ describe('registerPtyHandlers', () => {
           )
           const { env } = spawnOptions
           expect(env.CODEX_HOME).toBeUndefined()
-          expect(env.ORCA_CODEX_HOME).toBeUndefined()
+          expect(env.BOTMUX_CODEX_HOME).toBeUndefined()
           expect(spawnOptions.envToDelete).toEqual(
-            expect.arrayContaining(['CODEX_HOME', 'ORCA_CODEX_HOME'])
+            expect.arrayContaining(['CODEX_HOME', 'BOTMUX_CODEX_HOME'])
           )
         } finally {
           Object.defineProperty(process, 'platform', {
@@ -1728,18 +1728,18 @@ describe('registerPtyHandlers', () => {
         try {
           const spawnOptions = await daemonSpawnAndGetOptions(
             {},
-            () => 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home',
+            () => 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home',
             undefined,
             {
               CODEX_HOME: 'C:\\Users\\test\\.codex',
-              ORCA_CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home'
+              BOTMUX_CODEX_HOME: 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home'
             },
             { shellOverride: 'wsl.exe' }
           )
           expect(spawnOptions.env.CODEX_HOME).toBeUndefined()
-          expect(spawnOptions.env.ORCA_CODEX_HOME).toBeUndefined()
+          expect(spawnOptions.env.BOTMUX_CODEX_HOME).toBeUndefined()
           expect(spawnOptions.envToDelete).toEqual(
-            expect.arrayContaining(['CODEX_HOME', 'ORCA_CODEX_HOME'])
+            expect.arrayContaining(['CODEX_HOME', 'BOTMUX_CODEX_HOME'])
           )
         } finally {
           Object.defineProperty(process, 'platform', {
@@ -1749,7 +1749,7 @@ describe('registerPtyHandlers', () => {
         }
       })
 
-      it('prepends the bare-orca_botmux CLI shim dir to PATH for packaged Linux spawns', async () => {
+      it('prepends the bare-botmux CLI shim dir to PATH for packaged Linux spawns', async () => {
         const originalPlatform = process.platform
         Object.defineProperty(process, 'platform', {
           configurable: true,
@@ -1762,12 +1762,12 @@ describe('registerPtyHandlers', () => {
             PATH: ['/usr/local/bin', '/usr/bin'].join(delimiter)
           })
           const entries = env.PATH.split(delimiter)
-          const shimDir = join('/tmp/orca-botmux-user-data', 'linux-orca-botmux-cli-shim')
-          // Why: bare `orca_botmux` must resolve to the OrcaBotmux CLI before /usr/bin/orca_botmux
-          // (the GNOME screen reader) inside OrcaBotmux-managed terminals (#7904).
+          const shimDir = join('/tmp/botmux-user-data', 'linux-botmux-cli-shim')
+          // Why: bare `botmux` must resolve to the Botmux CLI before /usr/bin/botmux
+          // inside Botmux-managed terminals (#7904).
           expect(entries.indexOf(shimDir)).toBeGreaterThanOrEqual(0)
           expect(entries.indexOf(shimDir)).toBeLessThan(entries.indexOf('/usr/bin'))
-          expect(env.ORCA_CLI_COMMAND).toBeUndefined()
+          expect(env.BOTMUX_CLI_COMMAND).toBeUndefined()
         } finally {
           Object.defineProperty(process, 'platform', {
             configurable: true,
@@ -1778,21 +1778,21 @@ describe('registerPtyHandlers', () => {
 
       it('injects the agent-hook receiver env on the daemon path', async () => {
         const env = await daemonSpawnAndGetEnv({})
-        expect(env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-        expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
+        expect(env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+        expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
       })
 
       it('deletes stale Claude scoped settings env from daemon-hosted PTYs', async () => {
         const spawnOptions = await daemonSpawnAndGetOptions({}, undefined, undefined, {
-          ORCA_CLAUDE_AGENT_STATUS_SETTINGS:
-            '/tmp/orca_botmux/agent-hooks/claude-agent-status-settings.json'
+          BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS:
+            '/tmp/botmux/agent-hooks/claude-agent-status-settings.json'
         })
-        expect(spawnOptions.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
+        expect(spawnOptions.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
         expect(spawnOptions.envToDelete).toEqual(
-          expect.arrayContaining(['ORCA_CLAUDE_AGENT_STATUS_SETTINGS'])
+          expect.arrayContaining(['BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS'])
         )
-        expect(spawnOptions.env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-        expect(spawnOptions.env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
+        expect(spawnOptions.env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+        expect(spawnOptions.env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
       })
 
       it('deletes stale Claude scoped settings env from runtime-created daemon PTYs', async () => {
@@ -1815,8 +1815,8 @@ describe('registerPtyHandlers', () => {
           onPtyExit: vi.fn(),
           onPtyData: vi.fn()
         }
-        process.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS =
-          '/tmp/orca_botmux/agent-hooks/claude-agent-status-settings.json'
+        process.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS =
+          '/tmp/botmux/agent-hooks/claude-agent-status-settings.json'
         handlers.clear()
         registerPtyHandlers(mainWindow as never, runtime as never)
         const controller = runtime.setPtyController.mock.calls[0]?.[0] as RuntimeSpawnController
@@ -1824,12 +1824,12 @@ describe('registerPtyHandlers', () => {
         await controller.spawn({ cols: 80, rows: 24, worktreeId: 'wt-runtime', env: {} })
 
         const spawnOptions = daemonSpawn.mock.calls.at(-1)?.[0] as DaemonSpawnCall
-        expect(spawnOptions.env.ORCA_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
+        expect(spawnOptions.env.BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS).toBeUndefined()
         expect(spawnOptions.envToDelete).toEqual(
-          expect.arrayContaining(['ORCA_CLAUDE_AGENT_STATUS_SETTINGS'])
+          expect.arrayContaining(['BOTMUX_CLAUDE_AGENT_STATUS_SETTINGS'])
         )
-        expect(spawnOptions.env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-        expect(spawnOptions.env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
+        expect(spawnOptions.env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+        expect(spawnOptions.env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
       })
 
       it('threads the validated pane identity into registerPty for a runtime-created daemon PTY (#7587)', async () => {
@@ -2084,21 +2084,21 @@ describe('registerPtyHandlers', () => {
           worktreeId: 'wt-runtime',
           command: 'claude',
           env: {
-            PATH: `/tmp/orca-botmux-agent-teams-bin${delimiter}/usr/bin`,
-            ORCA_AGENT_TEAMS_TEAM_ID: 'team-test',
-            TERM_PROGRAM: 'orca_botmux',
-            ORCA_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
+            PATH: `/tmp/botmux-agent-teams-bin${delimiter}/usr/bin`,
+            BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-test',
+            TERM_PROGRAM: 'botmux',
+            BOTMUX_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
           },
-          envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+          envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
         })
 
         const spawnOptions = daemonSpawn.mock.calls.at(-1)?.[0] as DaemonSpawnCall
-        expect(spawnOptions.env.PATH.split(delimiter)[0]).toBe('/tmp/orca-botmux-agent-teams-bin')
+        expect(spawnOptions.env.PATH.split(delimiter)[0]).toBe('/tmp/botmux-agent-teams-bin')
         expect(spawnOptions.env.PATH).toContain(expectedAttributionShimDir())
         expect(spawnOptions.env.TERM_PROGRAM).toBeUndefined()
-        expect(spawnOptions.env.ORCA_ATTRIBUTION_SHIM_DIR).toBeUndefined()
+        expect(spawnOptions.env.BOTMUX_ATTRIBUTION_SHIM_DIR).toBeUndefined()
         expect(spawnOptions.envToDelete).toEqual(
-          expect.arrayContaining(['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR'])
+          expect.arrayContaining(['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR'])
         )
       })
 
@@ -2109,11 +2109,11 @@ describe('registerPtyHandlers', () => {
         mockedApp.isPackaged = false
         try {
           const env = await daemonSpawnAndGetEnv({}, undefined, undefined, {
-            ORCA_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env'
+            BOTMUX_AGENT_HOOK_ENDPOINT: '/tmp/stale-endpoint.env'
           })
-          expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
-          expect(env.ORCA_AGENT_HOOK_PORT).toBe('5678')
-          expect(env.ORCA_AGENT_HOOK_TOKEN).toBe('agent-token')
+          expect(env.BOTMUX_AGENT_HOOK_ENDPOINT).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
+          expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBe('agent-token')
         } finally {
           mockedApp.isPackaged = prev
         }
@@ -2123,37 +2123,37 @@ describe('registerPtyHandlers', () => {
         const env = await daemonSpawnAndGetEnv({}, undefined, () => ({
           enableGitHubAttribution: true
         }))
-        expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBe('1')
+        expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBe('1')
         expect(env.PATH).toContain(expectedAttributionShimDir())
       })
 
       it('keeps the Agent Teams tmux shim ahead of host PATH shims on daemon pty:spawn', async () => {
         const spawnOptions = await daemonSpawnAndGetOptions(
           {
-            PATH: `/tmp/orca-botmux-agent-teams-bin${delimiter}/usr/bin`,
-            ORCA_AGENT_TEAMS_TEAM_ID: 'team-test',
-            TERM_PROGRAM: 'orca_botmux',
-            ORCA_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
+            PATH: `/tmp/botmux-agent-teams-bin${delimiter}/usr/bin`,
+            BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-test',
+            TERM_PROGRAM: 'botmux',
+            BOTMUX_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
           },
           undefined,
           () => ({ enableGitHubAttribution: true }),
           undefined,
           {
             command: 'claude',
-            envToDelete: ['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR']
+            envToDelete: ['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR']
           }
         )
 
-        expect(spawnOptions.env.PATH.split(delimiter)[0]).toBe('/tmp/orca-botmux-agent-teams-bin')
+        expect(spawnOptions.env.PATH.split(delimiter)[0]).toBe('/tmp/botmux-agent-teams-bin')
         expect(spawnOptions.env.PATH).toContain(expectedAttributionShimDir())
         expect(spawnOptions.env.TERM_PROGRAM).toBeUndefined()
-        expect(spawnOptions.env.ORCA_ATTRIBUTION_SHIM_DIR).toBeUndefined()
+        expect(spawnOptions.env.BOTMUX_ATTRIBUTION_SHIM_DIR).toBeUndefined()
         expect(spawnOptions.envToDelete).toEqual(
-          expect.arrayContaining(['TERM_PROGRAM', 'ORCA_ATTRIBUTION_SHIM_DIR'])
+          expect.arrayContaining(['TERM_PROGRAM', 'BOTMUX_ATTRIBUTION_SHIM_DIR'])
         )
       })
 
-      it('injects dev-mode ORCA_USER_DATA_PATH + dev CLI PATH on the daemon path', async () => {
+      it('injects dev-mode BOTMUX_USER_DATA_PATH + dev CLI PATH on the daemon path', async () => {
         // Why: the mocked `app` (see vi.mock at the top of the file) is a
         // plain object, so we can flip isPackaged for the scope of the test.
         const { app } = await import('electron')
@@ -2162,8 +2162,8 @@ describe('registerPtyHandlers', () => {
         mockedApp.isPackaged = false
         try {
           const env = await daemonSpawnAndGetEnv({ PATH: '/usr/bin' })
-          expect(env.ORCA_USER_DATA_PATH).toBe('/tmp/orca-botmux-user-data')
-          expect(env.PATH).toContain(join('/tmp/orca-botmux-user-data', 'cli', 'bin'))
+          expect(env.BOTMUX_USER_DATA_PATH).toBe('/tmp/botmux-user-data')
+          expect(env.PATH).toContain(join('/tmp/botmux-user-data', 'cli', 'bin'))
         } finally {
           mockedApp.isPackaged = prev
         }
@@ -2178,9 +2178,9 @@ describe('registerPtyHandlers', () => {
           const env = await daemonSpawnAndGetEnv({}, undefined, undefined, {
             PATH: '/system/bin'
           })
-          expect(env.ORCA_USER_DATA_PATH).toBe('/tmp/orca-botmux-user-data')
+          expect(env.BOTMUX_USER_DATA_PATH).toBe('/tmp/botmux-user-data')
           expect(env.PATH).toContain(
-            `${join('/tmp/orca-botmux-user-data', 'cli', 'bin')}${delimiter}/system/bin`
+            `${join('/tmp/botmux-user-data', 'cli', 'bin')}${delimiter}/system/bin`
           )
         } finally {
           mockedApp.isPackaged = prev
@@ -2284,7 +2284,7 @@ describe('registerPtyHandlers', () => {
         // existing-agent-dir guard stays consistent whether Pi's env was
         // carried on the IPC wire or inherited by the daemon via fork. The
         // fallback must reach piTitlebarExtensionService.buildPtyEnv as the
-        // second arg so OrcaBotmux installs managed extensions in the user's root.
+        // second arg so Botmux installs managed extensions in the user's root.
         const env = await daemonSpawnAndGetEnv({}, undefined, undefined, {
           PI_CODING_AGENT_DIR: '/ambient/pi/agent'
         })
@@ -2294,22 +2294,22 @@ describe('registerPtyHandlers', () => {
           'pi'
         )
         expect(env.PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/ambient/pi/agent')
+        expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/ambient/pi/agent')
       })
 
       it('skips attribution shims on the daemon path when the setting is disabled', async () => {
         const env = await daemonSpawnAndGetEnv({ PATH: '/usr/bin' }, undefined, () => ({
           enableGitHubAttribution: false
         }))
-        expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
+        expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
         expect(env.PATH ?? '').not.toContain(expectedAttributionShimDir())
       })
 
       it('does not mutate the caller-provided args.env on the daemon path', async () => {
         // Why: the handler clones baseEnv before calling buildPtyHostEnv so
         // IPC-provided env stays pristine. A regression would silently leak
-        // OrcaBotmux host env (hook tokens, overlay paths) back into the renderer's
+        // Botmux host env (hook tokens, overlay paths) back into the renderer's
         // copy of the object, which it may reuse for unrelated IPC calls.
         const daemonSpawn = setupDaemonAdapter()
         const argsEnv: Record<string, string> = { FOO: 'bar' }
@@ -2324,7 +2324,7 @@ describe('registerPtyHandlers', () => {
         // Sanity: the spawn did receive the injected env, proving the test
         // isn't passing because buildPtyHostEnv never ran.
         const spawnEnv = daemonSpawn.mock.calls.at(-1)![0].env
-        expect(spawnEnv.ORCA_AGENT_HOOK_PORT).toBe('5678')
+        expect(spawnEnv.BOTMUX_AGENT_HOOK_PORT).toBe('5678')
         expect(spawnEnv).not.toBe(argsEnv)
       })
 
@@ -2478,7 +2478,7 @@ describe('registerPtyHandlers', () => {
         await handlers.get('pty:spawn')!(null, {
           cols: 80,
           rows: 24,
-          env: { FOO: 'bar', ORCA_PANE_KEY: makePaneKey('tab-1', leafId) },
+          env: { FOO: 'bar', BOTMUX_PANE_KEY: makePaneKey('tab-1', leafId) },
           connectionId: 'ssh-1',
           worktreeId: 'wt-1',
           tabId: 'tab-1',
@@ -2487,22 +2487,22 @@ describe('registerPtyHandlers', () => {
         const spawnOptions = sshSpawn.mock.calls.at(-1)![0]
         const env = spawnOptions.env
         // Why: every host-local var must be absent over SSH — the hook
-        // server is on the OrcaBotmux host's 127.0.0.1, dev CLI / attribution /
+        // server is on the Botmux host's 127.0.0.1, dev CLI / attribution /
         // overlay / plugin-dir paths only exist on the local disk, so
         // shipping any of them to a remote shell is at best useless and at
         // worst a credential leak.
-        expect(env.ORCA_AGENT_HOOK_PORT).toBeUndefined()
-        expect(env.ORCA_AGENT_HOOK_TOKEN).toBeUndefined()
-        expect(env.ORCA_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
+        expect(env.BOTMUX_AGENT_HOOK_PORT).toBeUndefined()
+        expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBeUndefined()
+        expect(env.BOTMUX_ENABLE_GIT_ATTRIBUTION).toBeUndefined()
         expect(env.OPENCODE_CONFIG_DIR).toBeUndefined()
-        expect(env.ORCA_OPENCODE_CONFIG_DIR).toBeUndefined()
-        expect(env.ORCA_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
+        expect(env.BOTMUX_OPENCODE_CONFIG_DIR).toBeUndefined()
+        expect(env.BOTMUX_OPENCODE_SOURCE_CONFIG_DIR).toBeUndefined()
         expect(env.MIMOCODE_HOME).toBeUndefined()
-        expect(env.ORCA_MIMOCODE_HOME).toBeUndefined()
-        expect(env.ORCA_MIMOCODE_SOURCE_HOME).toBeUndefined()
+        expect(env.BOTMUX_MIMOCODE_HOME).toBeUndefined()
+        expect(env.BOTMUX_MIMOCODE_SOURCE_HOME).toBeUndefined()
         expect(env.PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-        expect(env.ORCA_PI_SOURCE_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+        expect(env.BOTMUX_PI_SOURCE_AGENT_DIR).toBeUndefined()
         expect(env.CODEX_HOME).toBeUndefined()
         expect(env.HTTP_PROXY).toBeUndefined()
         expect(env.HTTPS_PROXY).toBeUndefined()
@@ -2534,7 +2534,7 @@ describe('registerPtyHandlers', () => {
         await handlers.get('pty:spawn')!(null, {
           cols: 80,
           rows: 24,
-          env: { ORCA_PANE_KEY: 'tab-1:pane:1' },
+          env: { BOTMUX_PANE_KEY: 'tab-1:pane:1' },
           connectionId: 'ssh-1',
           worktreeId: 'wt-1',
           tabId: 'tab-1',
@@ -2542,7 +2542,7 @@ describe('registerPtyHandlers', () => {
         })
         expect(store.upsertSshRemotePtyLease).toHaveBeenCalledTimes(1)
         const legacySpawnOptions = sshSpawn.mock.calls.at(-1)?.[0]
-        expect(legacySpawnOptions?.env.ORCA_PANE_KEY).toBeUndefined()
+        expect(legacySpawnOptions?.env.BOTMUX_PANE_KEY).toBeUndefined()
         expect(legacySpawnOptions?.paneKey).toBeUndefined()
         expect(legacySpawnOptions?.tabId).toBe('tab-1')
         expect(store.upsertSshRemotePtyLease.mock.calls[0]?.[0]).not.toHaveProperty('leafId')
@@ -3392,7 +3392,7 @@ describe('registerPtyHandlers', () => {
         expect(runtime.onPtyExit).toHaveBeenCalledWith('remote-pty', -1)
       })
 
-      it('strips ORCA_PANE_KEY/TAB_ID/WORKTREE_ID from SSH spawn env when remote agent hooks are disabled', async () => {
+      it('strips BOTMUX_PANE_KEY/TAB_ID/WORKTREE_ID from SSH spawn env when remote agent hooks are disabled', async () => {
         const sshSpawn = vi.fn(async (_opts: { env: Record<string, string> }) => ({
           id: 'ssh-pty'
         }))
@@ -3420,39 +3420,39 @@ describe('registerPtyHandlers', () => {
         } as never)
         handlers.clear()
         registerPtyHandlers(mainWindow as never)
-        const prevFlag = process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
-        process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '0'
+        const prevFlag = process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
+        process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '0'
         try {
           await handlers.get('pty:spawn')!(null, {
             cols: 80,
             rows: 24,
             env: {
               FOO: 'bar',
-              ORCA_PANE_KEY: 'tab-1:0',
-              ORCA_TAB_ID: 'tab-1',
-              ORCA_WORKTREE_ID: 'wt-1'
+              BOTMUX_PANE_KEY: 'tab-1:0',
+              BOTMUX_TAB_ID: 'tab-1',
+              BOTMUX_WORKTREE_ID: 'wt-1'
             },
             connectionId: 'ssh-1'
           })
           const env = sshSpawn.mock.calls.at(-1)![0].env
           expect(env.FOO).toBe('bar')
-          expect(env.ORCA_PANE_KEY).toBeUndefined()
-          expect(env.ORCA_TAB_ID).toBeUndefined()
-          expect(env.ORCA_WORKTREE_ID).toBeUndefined()
-          expect(env.ORCA_AGENT_HOOK_TOKEN).toBeUndefined()
+          expect(env.BOTMUX_PANE_KEY).toBeUndefined()
+          expect(env.BOTMUX_TAB_ID).toBeUndefined()
+          expect(env.BOTMUX_WORKTREE_ID).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBeUndefined()
           // Why: the local hook server's userData-relative endpoint file path
           // is meaningless on the remote box; assert it does not leak.
-          expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_ENDPOINT).toBeUndefined()
         } finally {
           if (prevFlag === undefined) {
-            delete process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
+            delete process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
           } else {
-            process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = prevFlag
+            process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = prevFlag
           }
         }
       })
 
-      it('forwards ORCA_PANE_KEY/TAB_ID/WORKTREE_ID over SSH by default', async () => {
+      it('forwards BOTMUX_PANE_KEY/TAB_ID/WORKTREE_ID over SSH by default', async () => {
         const sshSpawn = vi.fn(async (_opts: { env: Record<string, string> }) => ({
           id: 'ssh-pty'
         }))
@@ -3480,8 +3480,8 @@ describe('registerPtyHandlers', () => {
         } as never)
         handlers.clear()
         registerPtyHandlers(mainWindow as never)
-        const prevFlag = process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
-        delete process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
+        const prevFlag = process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
+        delete process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
         try {
           const leafId = '22222222-2222-4222-8222-222222222222'
           const paneKey = makePaneKey('tab-2', leafId)
@@ -3490,28 +3490,28 @@ describe('registerPtyHandlers', () => {
             rows: 24,
             env: {
               FOO: 'bar',
-              ORCA_PANE_KEY: paneKey,
-              ORCA_TAB_ID: 'tab-2',
-              ORCA_WORKTREE_ID: 'wt-2'
+              BOTMUX_PANE_KEY: paneKey,
+              BOTMUX_TAB_ID: 'tab-2',
+              BOTMUX_WORKTREE_ID: 'wt-2'
             },
             connectionId: 'ssh-1',
             tabId: 'tab-2',
             leafId
           })
           const env = sshSpawn.mock.calls.at(-1)![0].env
-          expect(env.ORCA_PANE_KEY).toBe(paneKey)
-          expect(env.ORCA_TAB_ID).toBe('tab-2')
-          expect(env.ORCA_WORKTREE_ID).toBe('wt-2')
+          expect(env.BOTMUX_PANE_KEY).toBe(paneKey)
+          expect(env.BOTMUX_TAB_ID).toBe('tab-2')
+          expect(env.BOTMUX_WORKTREE_ID).toBe('wt-2')
           // Local hook server coords still must NOT cross the wire — the
           // relay is the source of truth for those.
-          expect(env.ORCA_AGENT_HOOK_TOKEN).toBeUndefined()
-          expect(env.ORCA_AGENT_HOOK_PORT).toBeUndefined()
-          expect(env.ORCA_AGENT_HOOK_ENDPOINT).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_TOKEN).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_PORT).toBeUndefined()
+          expect(env.BOTMUX_AGENT_HOOK_ENDPOINT).toBeUndefined()
         } finally {
           if (prevFlag === undefined) {
-            delete process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
+            delete process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
           } else {
-            process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = prevFlag
+            process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = prevFlag
           }
         }
       })
@@ -4808,7 +4808,7 @@ describe('registerPtyHandlers', () => {
     })
   })
 
-  it('injects ORCA_TERMINAL_HANDLE for non-local PTY providers', async () => {
+  it('injects BOTMUX_TERMINAL_HANDLE for non-local PTY providers', async () => {
     const spawn = vi.fn(async () => ({ id: 'remote-pty' }))
     registerSshPtyProvider('ssh-1', {
       spawn,
@@ -4850,7 +4850,7 @@ describe('registerPtyHandlers', () => {
       expect.objectContaining({
         env: expect.objectContaining({
           EXISTING: '1',
-          ORCA_TERMINAL_HANDLE: 'term_remote'
+          BOTMUX_TERMINAL_HANDLE: 'term_remote'
         })
       })
     )
@@ -4869,10 +4869,10 @@ describe('registerPtyHandlers', () => {
         env: {
           CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
           PATH: `/tmp/fresh-agent-teams${delimiter}/usr/bin`,
-          TMUX: '/tmp/orca-botmux-claude-agent-teams/team-fresh,0,1',
+          TMUX: '/tmp/botmux-claude-agent-teams/team-fresh,0,1',
           TMUX_PANE: '%1',
-          ORCA_AGENT_TEAMS_TEAM_ID: 'team-fresh',
-          ORCA_AGENT_TEAMS_TOKEN: 'fresh-token'
+          BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-fresh',
+          BOTMUX_AGENT_TEAMS_TOKEN: 'fresh-token'
         }
       })),
       registerPreAllocatedHandleForPty: vi.fn(),
@@ -4893,24 +4893,24 @@ describe('registerPtyHandlers', () => {
       leafId,
       worktreeId: 'wt-1',
       env: {
-        ORCA_PANE_KEY: `tab-1:${leafId}`,
-        ORCA_TAB_ID: 'tab-1',
-        ORCA_WORKTREE_ID: 'wt-1',
+        BOTMUX_PANE_KEY: `tab-1:${leafId}`,
+        BOTMUX_TAB_ID: 'tab-1',
+        BOTMUX_WORKTREE_ID: 'wt-1',
         CLAUDE_PROFILE: 'captured',
         PATH: `/tmp/stale-agent-teams${delimiter}/usr/bin`,
-        TMUX: '/tmp/orca-botmux-claude-agent-teams/team-stale,0,1',
-        ORCA_AGENT_TEAMS_TEAM_ID: 'team-stale',
-        ORCA_AGENT_TEAMS_TOKEN: 'stale-token',
-        TERM_PROGRAM: 'orca_botmux',
-        ORCA_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
+        TMUX: '/tmp/botmux-claude-agent-teams/team-stale,0,1',
+        BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-stale',
+        BOTMUX_AGENT_TEAMS_TOKEN: 'stale-token',
+        TERM_PROGRAM: 'botmux',
+        BOTMUX_ATTRIBUTION_SHIM_DIR: '/tmp/stale-attribution'
       },
       launchConfig: {
         agentCommand: 'claude --teammate-mode auto',
         agentArgs: '',
         agentEnv: {
           CLAUDE_PROFILE: 'captured',
-          ORCA_AGENT_TEAMS_TEAM_ID: 'team-stale',
-          ORCA_AGENT_TEAMS_TOKEN: 'stale-token'
+          BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-stale',
+          BOTMUX_AGENT_TEAMS_TOKEN: 'stale-token'
         }
       },
       launchAgent: 'claude'
@@ -4921,27 +4921,27 @@ describe('registerPtyHandlers', () => {
       handle: 'term_agent_teams',
       baseEnv: expect.objectContaining({
         CLAUDE_PROFILE: 'captured',
-        ORCA_AGENT_TEAMS_TEAM_ID: 'team-stale'
+        BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-stale'
       })
     })
     expect(spawnOptions.env).toMatchObject({
       CLAUDE_PROFILE: 'captured',
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-      ORCA_TERMINAL_HANDLE: 'term_agent_teams',
-      ORCA_AGENT_TEAMS_TEAM_ID: 'team-fresh',
-      ORCA_AGENT_TEAMS_TOKEN: 'fresh-token',
-      TMUX: '/tmp/orca-botmux-claude-agent-teams/team-fresh,0,1',
+      BOTMUX_TERMINAL_HANDLE: 'term_agent_teams',
+      BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-fresh',
+      BOTMUX_AGENT_TEAMS_TOKEN: 'fresh-token',
+      TMUX: '/tmp/botmux-claude-agent-teams/team-fresh,0,1',
       TMUX_PANE: '%1'
     })
     expect(spawnOptions.env.PATH.split(delimiter)[0]).toBe('/tmp/fresh-agent-teams')
     expect(spawnOptions.env.TERM_PROGRAM).toBeUndefined()
-    expect(spawnOptions.env.ORCA_ATTRIBUTION_SHIM_DIR).toBeUndefined()
+    expect(spawnOptions.env.BOTMUX_ATTRIBUTION_SHIM_DIR).toBeUndefined()
     expect(result.launchConfig?.agentEnv).toMatchObject({
       CLAUDE_PROFILE: 'captured',
       CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-      ORCA_AGENT_TEAMS_TEAM_ID: 'team-fresh',
-      ORCA_AGENT_TEAMS_TOKEN: 'fresh-token',
-      TMUX: '/tmp/orca-botmux-claude-agent-teams/team-fresh,0,1'
+      BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-fresh',
+      BOTMUX_AGENT_TEAMS_TOKEN: 'fresh-token',
+      TMUX: '/tmp/botmux-claude-agent-teams/team-fresh,0,1'
     })
     expect(runtime.registerPreAllocatedHandleForPty).toHaveBeenCalledWith(
       expect.any(String),
@@ -5027,8 +5027,8 @@ describe('registerPtyHandlers', () => {
       prepareClaudeAgentTeamsLeaderForHandle: vi.fn(async () => ({
         env: {
           CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-          ORCA_AGENT_TEAMS_TEAM_ID: 'team-fresh',
-          ORCA_AGENT_TEAMS_TOKEN: 'fresh-token'
+          BOTMUX_AGENT_TEAMS_TEAM_ID: 'team-fresh',
+          BOTMUX_AGENT_TEAMS_TOKEN: 'fresh-token'
         }
       })),
       registerPreAllocatedHandleForPty: vi.fn(),
@@ -5049,9 +5049,9 @@ describe('registerPtyHandlers', () => {
       leafId,
       worktreeId: 'wt-1',
       env: {
-        ORCA_PANE_KEY: `tab-1:${leafId}`,
-        ORCA_TAB_ID: 'tab-1',
-        ORCA_WORKTREE_ID: 'wt-1'
+        BOTMUX_PANE_KEY: `tab-1:${leafId}`,
+        BOTMUX_TAB_ID: 'tab-1',
+        BOTMUX_WORKTREE_ID: 'wt-1'
       },
       launchConfig: {
         agentCommand: 'claude',
@@ -5148,7 +5148,7 @@ describe('registerPtyHandlers', () => {
 
     const spawnCall = spawnMock.mock.calls.at(-1)!
     const env = spawnCall[2].env as Record<string, string>
-    expect(env.ORCA_TERMINAL_HANDLE).toBe('term_expected')
+    expect(env.BOTMUX_TERMINAL_HANDLE).toBe('term_expected')
     expect(runtime.preAllocateHandleForPty).not.toHaveBeenCalled()
     expect(runtime.registerPreAllocatedHandleForPty).toHaveBeenCalledWith(
       expect.any(String),
@@ -5243,7 +5243,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-headless',
       leafId,
-      env: { ORCA_PANE_KEY: makePaneKey('tab-headless', leafId) },
+      env: { BOTMUX_PANE_KEY: makePaneKey('tab-headless', leafId) },
       persistHostSessionBinding: true
     })
 
@@ -5333,12 +5333,12 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'repo-1::/tmp',
       tabId: 'tab-race',
       leafId,
-      env: { ORCA_PANE_KEY: paneKey },
+      env: { BOTMUX_PANE_KEY: paneKey },
       persistHostSessionBinding: true
     })
     await Promise.resolve()
 
-    // Why: SSH can strip ORCA_PANE_KEY before spawn; tab/leaf metadata must
+    // Why: SSH can strip BOTMUX_PANE_KEY before spawn; tab/leaf metadata must
     // still dedupe against runtime materialization.
     const rendererSpawn = handlers.get('pty:spawn')!(null, {
       cols: 80,
@@ -5348,8 +5348,8 @@ describe('registerPtyHandlers', () => {
       tabId: 'tab-race',
       leafId,
       env: {
-        ORCA_TAB_ID: 'tab-race',
-        ORCA_WORKTREE_ID: 'repo-1::/tmp'
+        BOTMUX_TAB_ID: 'tab-race',
+        BOTMUX_WORKTREE_ID: 'repo-1::/tmp'
       }
     }) as Promise<{ id: string }>
     await Promise.resolve()
@@ -5448,9 +5448,9 @@ describe('registerPtyHandlers', () => {
       tabId: 'tab-race',
       leafId,
       env: {
-        ORCA_PANE_KEY: paneKey,
-        ORCA_TAB_ID: 'tab-race',
-        ORCA_WORKTREE_ID: 'repo-1::/tmp'
+        BOTMUX_PANE_KEY: paneKey,
+        BOTMUX_TAB_ID: 'tab-race',
+        BOTMUX_WORKTREE_ID: 'repo-1::/tmp'
       }
     }) as Promise<{ id: string }>
     await Promise.resolve()
@@ -5463,7 +5463,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'repo-1::/tmp',
       tabId: 'tab-race',
       leafId,
-      env: { ORCA_PANE_KEY: paneKey },
+      env: { BOTMUX_PANE_KEY: paneKey },
       persistHostSessionBinding: true
     })
     await Promise.resolve()
@@ -5597,7 +5597,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-runtime-reservation',
       leafId,
-      env: { ORCA_PANE_KEY: paneKey },
+      env: { BOTMUX_PANE_KEY: paneKey },
       persistHostSessionBinding: true
     }
 
@@ -5888,8 +5888,8 @@ describe('registerPtyHandlers', () => {
         persistHostSessionBinding?: boolean
       }): Promise<{ id: string }>
     }
-    const savedRemoteHooks = process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = '0'
+    const savedRemoteHooks = process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = '0'
     const remoteSpawn = vi.fn(async (_opts: { env?: Record<string, string> }) => ({
       id: 'ssh:ssh-runtime-env@@relay-pty'
     }))
@@ -5949,9 +5949,9 @@ describe('registerPtyHandlers', () => {
         rows: 24,
         env: {
           FOO: 'bar',
-          ORCA_PANE_KEY: makePaneKey('tab-remote', leafId),
-          ORCA_TAB_ID: 'tab-remote',
-          ORCA_WORKTREE_ID: 'wt-remote'
+          BOTMUX_PANE_KEY: makePaneKey('tab-remote', leafId),
+          BOTMUX_TAB_ID: 'tab-remote',
+          BOTMUX_WORKTREE_ID: 'wt-remote'
         },
         connectionId: 'ssh-runtime-env',
         worktreeId: 'wt-remote',
@@ -5962,9 +5962,9 @@ describe('registerPtyHandlers', () => {
 
       const env = remoteSpawn.mock.calls[0]?.[0].env
       expect(env).toMatchObject({ FOO: 'bar' })
-      expect(env?.ORCA_PANE_KEY).toBeUndefined()
-      expect(env?.ORCA_TAB_ID).toBeUndefined()
-      expect(env?.ORCA_WORKTREE_ID).toBeUndefined()
+      expect(env?.BOTMUX_PANE_KEY).toBeUndefined()
+      expect(env?.BOTMUX_TAB_ID).toBeUndefined()
+      expect(env?.BOTMUX_WORKTREE_ID).toBeUndefined()
       expect(store.upsertSshRemotePtyLease).toHaveBeenCalledWith(
         expect.objectContaining({
           targetId: 'ssh-runtime-env',
@@ -5975,9 +5975,9 @@ describe('registerPtyHandlers', () => {
       )
     } finally {
       if (savedRemoteHooks === undefined) {
-        delete process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS
+        delete process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS
       } else {
-        process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS = savedRemoteHooks
+        process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS = savedRemoteHooks
       }
       unregisterSshPtyProvider('ssh-runtime-env')
     }
@@ -6064,7 +6064,7 @@ describe('registerPtyHandlers', () => {
         sessionId: 'ssh:ssh-reattach-fail@@relay-pty',
         persistHostSessionBinding: true
       })
-    ).rejects.toThrow(/ORCA_TERMINAL_SESSION_STATE_SAVE_FAILED/)
+    ).rejects.toThrow(/BOTMUX_TERMINAL_SESSION_STATE_SAVE_FAILED/)
 
     expect(store.upsertSshRemotePtyLease).not.toHaveBeenCalled()
     expect(store.removeSshRemotePtyLease).not.toHaveBeenCalled()
@@ -6364,7 +6364,7 @@ describe('registerPtyHandlers', () => {
           sessionId: appPtyId,
           persistHostSessionBinding: true
         })
-      ).rejects.toThrow(/ORCA_TERMINAL_SESSION_STATE_SAVE_FAILED/)
+      ).rejects.toThrow(/BOTMUX_TERMINAL_SESSION_STATE_SAVE_FAILED/)
 
       expect(remoteShutdown).toHaveBeenCalledWith(appPtyId, { immediate: true })
       expect(store.upsertSshRemotePtyLease).not.toHaveBeenCalled()
@@ -6411,7 +6411,7 @@ describe('registerPtyHandlers', () => {
       cols: 80,
       rows: 24,
       worktreeId: 'wt-1',
-      env: { ORCA_PANE_KEY: ` ${paneKey} ` }
+      env: { BOTMUX_PANE_KEY: ` ${paneKey} ` }
     })
     const replacementGen = (await handlers.get('pty:declarePendingPaneSerializer')!(null, {
       paneKey
@@ -6474,7 +6474,7 @@ describe('registerPtyHandlers', () => {
         cols: 80,
         rows: 24,
         worktreeId: 'wt-1',
-        env: { ORCA_PANE_KEY: paneKey }
+        env: { BOTMUX_PANE_KEY: paneKey }
       })
     }
 
@@ -6543,7 +6543,7 @@ describe('registerPtyHandlers', () => {
     expect(hasPendingRendererSerializerForPaneKey(paneKey)).toBe(false)
   })
 
-  it('ignores renderer-provided ORCA_TERMINAL_HANDLE for local PTY spawns', async () => {
+  it('ignores renderer-provided BOTMUX_TERMINAL_HANDLE for local PTY spawns', async () => {
     const runtime = {
       setPtyController: vi.fn(),
       noteTerminalSpawnCommand: vi.fn(),
@@ -6557,16 +6557,16 @@ describe('registerPtyHandlers', () => {
     await handlers.get('pty:spawn')!(null, {
       cols: 80,
       rows: 24,
-      env: { ORCA_TERMINAL_HANDLE: 'term_untrusted' }
+      env: { BOTMUX_TERMINAL_HANDLE: 'term_untrusted' }
     })
 
     const spawnCall = spawnMock.mock.calls.at(-1)!
     const env = spawnCall[2].env as Record<string, string>
-    expect(env.ORCA_TERMINAL_HANDLE).toBe('term_trusted')
+    expect(env.BOTMUX_TERMINAL_HANDLE).toBe('term_trusted')
     expect(runtime.preAllocateHandleForPty).toHaveBeenCalledWith(expect.any(String))
   })
 
-  it('forwards the trusted OrcaBotmux terminal handle into managed WSL terminals', async () => {
+  it('forwards the trusted Botmux terminal handle into managed WSL terminals', async () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')
     Object.defineProperty(process, 'platform', {
       configurable: true,
@@ -6597,24 +6597,24 @@ describe('registerPtyHandlers', () => {
     const spawnCall = spawnMock.mock.calls.at(-1)!
     const env = spawnCall[2].env as Record<string, string>
     expect(spawnCall[0]).toBe('wsl.exe')
-    expect(env.ORCA_TERMINAL_HANDLE).toBe('term_wsl')
-    expect(env.ORCA_USER_DATA_PATH).toBe('/tmp/orca-botmux-user-data')
-    expect(env.ORCA_CLI_COMMAND).toBe('orca-botmux-ide')
+    expect(env.BOTMUX_TERMINAL_HANDLE).toBe('term_wsl')
+    expect(env.BOTMUX_USER_DATA_PATH).toBe('/tmp/botmux-user-data')
+    expect(env.BOTMUX_CLI_COMMAND).toBe('botmux-ide')
     expect(env.WSLENV?.split(':')).toEqual(
       expect.arrayContaining([
-        'ORCA_TERMINAL_HANDLE/u',
-        'ORCA_USER_DATA_PATH/p',
-        'ORCA_CLI_COMMAND/u',
-        'ORCA_AGENT_HOOK_PORT/u',
-        'ORCA_AGENT_HOOK_TOKEN/u',
-        'ORCA_OMP_SOURCE_AGENT_DIR/p',
-        'ORCA_OMP_STATUS_EXTENSION/p',
+        'BOTMUX_TERMINAL_HANDLE/u',
+        'BOTMUX_USER_DATA_PATH/p',
+        'BOTMUX_CLI_COMMAND/u',
+        'BOTMUX_AGENT_HOOK_PORT/u',
+        'BOTMUX_AGENT_HOOK_TOKEN/u',
+        'BOTMUX_OMP_SOURCE_AGENT_DIR/p',
+        'BOTMUX_OMP_STATUS_EXTENSION/p',
         'POWERLEVEL9K_DISABLE_CONFIGURATION_WIZARD'
       ])
     )
   })
 
-  it('forces managed ORCA_USER_DATA_PATH for WSL spawns even when the caller provides a stale root', async () => {
+  it('forces managed BOTMUX_USER_DATA_PATH for WSL spawns even when the caller provides a stale root', async () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')
     Object.defineProperty(process, 'platform', {
       configurable: true,
@@ -6635,7 +6635,7 @@ describe('registerPtyHandlers', () => {
         rows: 24,
         shellOverride: 'wsl.exe',
         env: {
-          ORCA_USER_DATA_PATH: '/tmp/stale-orca-botmux-user-data'
+          BOTMUX_USER_DATA_PATH: '/tmp/stale-botmux-user-data'
         }
       })
     } finally {
@@ -6647,7 +6647,7 @@ describe('registerPtyHandlers', () => {
     const spawnCall = spawnMock.mock.calls.at(-1)!
     const env = spawnCall[2].env as Record<string, string>
     expect(spawnCall[0]).toBe('wsl.exe')
-    expect(env.ORCA_USER_DATA_PATH).toBe('/tmp/orca-botmux-user-data')
+    expect(env.BOTMUX_USER_DATA_PATH).toBe('/tmp/botmux-user-data')
   })
 
   describe('Windows UTF-8 code page', () => {
@@ -7036,7 +7036,7 @@ describe('registerPtyHandlers', () => {
       registerPtyHandlers(
         mainWindow as never,
         undefined,
-        () => 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home',
+        () => 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home',
         () =>
           ({
             terminalWindowsShell: 'wsl.exe',
@@ -7048,7 +7048,7 @@ describe('registerPtyHandlers', () => {
       const spawnOptions = spawnMock.mock.calls.at(-1)?.[2] as { env: Record<string, string> }
       expect(spawnMock).toHaveBeenCalledWith('wsl.exe', expect.any(Array), expect.any(Object))
       expect(spawnOptions.env.CODEX_HOME).toBeUndefined()
-      expect(spawnOptions.env.ORCA_CODEX_HOME).toBeUndefined()
+      expect(spawnOptions.env.BOTMUX_CODEX_HOME).toBeUndefined()
     })
 
     it('keeps shellOverride priority for one-off tabs', async () => {
@@ -7058,7 +7058,7 @@ describe('registerPtyHandlers', () => {
       registerPtyHandlers(
         mainWindow as never,
         undefined,
-        () => 'C:\\Users\\test\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home',
+        () => 'C:\\Users\\test\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home',
         () =>
           ({
             terminalWindowsShell: 'powershell.exe',
@@ -7074,7 +7074,7 @@ describe('registerPtyHandlers', () => {
       const spawnOptions = spawnMock.mock.calls.at(-1)?.[2] as { env: Record<string, string> }
       expect(spawnMock).toHaveBeenCalledWith('wsl.exe', expect.any(Array), expect.any(Object))
       expect(spawnOptions.env.CODEX_HOME).toBeUndefined()
-      expect(spawnOptions.env.ORCA_CODEX_HOME).toBeUndefined()
+      expect(spawnOptions.env.BOTMUX_CODEX_HOME).toBeUndefined()
     })
   })
 
@@ -7177,7 +7177,7 @@ describe('registerPtyHandlers', () => {
     registerPtyHandlers(mainWindow as never)
     // Why: issue #7239 reproduced in a Japanese-named worktree; the fallback
     // must return the selected worktree path verbatim.
-    const worktreePath = '/Users/motoki/orca_botmux/workspaces/nakamuramotoki/Fableと議論'
+    const worktreePath = '/Users/motoki/botmux/workspaces/nakamuramotoki/Fableと議論'
     const missingCwd = `${worktreePath}/deleted-folder`
     statSyncMock.mockImplementation((target: string) => {
       if (target === missingCwd) {
@@ -7314,7 +7314,7 @@ describe('registerPtyHandlers', () => {
   it('spawns a plain POSIX login shell and queues startup commands for the live session', async () => {
     const originalPlatform = process.platform
     const originalHome = process.env.HOME
-    const originalOrcaOrigZdotdir = process.env.ORCA_ORIG_ZDOTDIR
+    const originalBotmuxOrigZdotdir = process.env.BOTMUX_ORIG_ZDOTDIR
     const originalShell = process.env.SHELL
     const originalZdotdir = process.env.ZDOTDIR
 
@@ -7324,7 +7324,7 @@ describe('registerPtyHandlers', () => {
     })
     // Why: this test simulates macOS even when Vitest runs on a Windows host.
     process.env.HOME = '/Users/test'
-    delete process.env.ORCA_ORIG_ZDOTDIR
+    delete process.env.BOTMUX_ORIG_ZDOTDIR
     process.env.SHELL = '/bin/zsh'
     delete process.env.ZDOTDIR
 
@@ -7335,8 +7335,8 @@ describe('registerPtyHandlers', () => {
       })
       expect(shell).toBe('/bin/zsh')
       expect(args).toEqual(['-l'])
-      expect(options.env.ZDOTDIR).toBe('/tmp/orca-botmux-user-data/shell-ready/zsh')
-      expect(options.env.ORCA_ORIG_ZDOTDIR).toBe(process.env.HOME)
+      expect(options.env.ZDOTDIR).toBe('/tmp/botmux-user-data/shell-ready/zsh')
+      expect(options.env.BOTMUX_ORIG_ZDOTDIR).toBe(process.env.HOME)
     } finally {
       Object.defineProperty(process, 'platform', {
         configurable: true,
@@ -7347,10 +7347,10 @@ describe('registerPtyHandlers', () => {
       } else {
         process.env.HOME = originalHome
       }
-      if (originalOrcaOrigZdotdir === undefined) {
-        delete process.env.ORCA_ORIG_ZDOTDIR
+      if (originalBotmuxOrigZdotdir === undefined) {
+        delete process.env.BOTMUX_ORIG_ZDOTDIR
       } else {
-        process.env.ORCA_ORIG_ZDOTDIR = originalOrcaOrigZdotdir
+        process.env.BOTMUX_ORIG_ZDOTDIR = originalBotmuxOrigZdotdir
       }
       if (originalShell === undefined) {
         delete process.env.SHELL
@@ -7368,7 +7368,7 @@ describe('registerPtyHandlers', () => {
   posixOnlyIt('wraps macOS spawns in login(1) with SHELL re-asserted via env(1)', async () => {
     const originalShell = process.env.SHELL
     // Re-enable the TCC login wrapper the suite-level beforeEach disables.
-    delete process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL
+    delete process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL
     process.env.SHELL = '/bin/zsh'
     loginPreflightExecFileMock.mockImplementation(
       (
@@ -7377,7 +7377,7 @@ describe('registerPtyHandlers', () => {
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void
       ) => {
-        callback(null, 'ORCA_LOGIN_PREFLIGHT_OK', '')
+        callback(null, 'BOTMUX_LOGIN_PREFLIGHT_OK', '')
         return { stdin: { end: vi.fn() } }
       }
     )
@@ -7398,7 +7398,7 @@ describe('registerPtyHandlers', () => {
       expect(options.env.SHELL).toBe('/bin/zsh')
     } finally {
       resetMacosLoginShellPreflightForTests()
-      process.env.ORCA_DISABLE_MACOS_LOGIN_SHELL = '1'
+      process.env.BOTMUX_DISABLE_MACOS_LOGIN_SHELL = '1'
       if (originalShell === undefined) {
         delete process.env.SHELL
       } else {
@@ -7421,10 +7421,10 @@ describe('registerPtyHandlers', () => {
       const [shell, args, options] = await spawnAndGetCall({ cwd: '/tmp' })
       expect(shell).toBe('/bin/zsh')
       expect(args).toEqual(['-l'])
-      expect(options.env.OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-config')
-      expect(options.env.ORCA_OPENCODE_CONFIG_DIR).toBe('/tmp/orca-botmux-opencode-config')
-      expect(options.env.ZDOTDIR).toBe('/tmp/orca-botmux-user-data/shell-ready/zsh')
-      expect(options.env.ORCA_SHELL_READY_MARKER).toBe('0')
+      expect(options.env.OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-config')
+      expect(options.env.BOTMUX_OPENCODE_CONFIG_DIR).toBe('/tmp/botmux-opencode-config')
+      expect(options.env.ZDOTDIR).toBe('/tmp/botmux-user-data/shell-ready/zsh')
+      expect(options.env.BOTMUX_SHELL_READY_MARKER).toBe('0')
     } finally {
       Object.defineProperty(process, 'platform', {
         configurable: true,
@@ -7448,9 +7448,9 @@ describe('registerPtyHandlers', () => {
     })
     process.env.SHELL = '/bin/zsh'
     openCodeBuildPtyEnvMock.mockImplementationOnce(() => ({
-      ORCA_OPENCODE_HOOK_PORT: '4567',
-      ORCA_OPENCODE_HOOK_TOKEN: 'opencode-token',
-      ORCA_OPENCODE_PTY_ID: 'test-pty'
+      BOTMUX_OPENCODE_HOOK_PORT: '4567',
+      BOTMUX_OPENCODE_HOOK_TOKEN: 'opencode-token',
+      BOTMUX_OPENCODE_PTY_ID: 'test-pty'
     }))
 
     try {
@@ -7461,12 +7461,12 @@ describe('registerPtyHandlers', () => {
       expect(shell).toBe('/bin/zsh')
       expect(args).toEqual(['-l'])
       expect(options.env.OPENCODE_CONFIG_DIR).toBeUndefined()
-      expect(options.env.ORCA_OPENCODE_CONFIG_DIR).toBeUndefined()
+      expect(options.env.BOTMUX_OPENCODE_CONFIG_DIR).toBeUndefined()
       expect(options.env.PI_CODING_AGENT_DIR).toBe('/tmp/user-pi-agent')
-      expect(options.env.ORCA_PI_CODING_AGENT_DIR).toBeUndefined()
-      expect(options.env.ORCA_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
-      expect(options.env.ZDOTDIR).toBe('/tmp/orca-botmux-user-data/shell-ready/zsh')
-      expect(options.env.ORCA_SHELL_READY_MARKER).toBe('0')
+      expect(options.env.BOTMUX_PI_CODING_AGENT_DIR).toBeUndefined()
+      expect(options.env.BOTMUX_PI_SOURCE_AGENT_DIR).toBe('/tmp/user-pi-agent')
+      expect(options.env.ZDOTDIR).toBe('/tmp/botmux-user-data/shell-ready/zsh')
+      expect(options.env.BOTMUX_SHELL_READY_MARKER).toBe('0')
     } finally {
       Object.defineProperty(process, 'platform', {
         configurable: true,
@@ -7559,7 +7559,7 @@ describe('registerPtyHandlers', () => {
         })
 
         const [, , options] = spawnMock.mock.calls[0]!
-        expect(options.env.ORCA_SHELL_READY_MARKER).toBe('0')
+        expect(options.env.BOTMUX_SHELL_READY_MARKER).toBe('0')
 
         await Promise.resolve()
         vi.advanceTimersByTime(49)
@@ -7592,7 +7592,7 @@ describe('registerPtyHandlers', () => {
       })
 
       const [, , options] = spawnMock.mock.calls[0]!
-      expect(options.env.ORCA_SHELL_READY_MARKER).toBe('1')
+      expect(options.env.BOTMUX_SHELL_READY_MARKER).toBe('1')
       expect(mockProc.proc.write).not.toHaveBeenCalled()
 
       mockProc.emitData('last login: today\r\n')
@@ -7600,7 +7600,7 @@ describe('registerPtyHandlers', () => {
       await Promise.resolve()
       expect(mockProc.proc.write).not.toHaveBeenCalled()
 
-      mockProc.emitData('\x1b]777;orca-botmux-shell-ready\x07')
+      mockProc.emitData('\x1b]777;botmux-shell-ready\x07')
       await Promise.resolve()
       vi.advanceTimersByTime(50)
       await Promise.resolve()
@@ -7631,7 +7631,7 @@ describe('registerPtyHandlers', () => {
           startupCommandDelivery: 'shell-ready'
         })
 
-        mockProc.emitData('\x1b]777;orca-botmux-shell-ready\x07\r\nuser@host % ')
+        mockProc.emitData('\x1b]777;botmux-shell-ready\x07\r\nuser@host % ')
         await Promise.resolve()
         vi.advanceTimersByTime(29)
         await Promise.resolve()
@@ -7661,10 +7661,10 @@ describe('registerPtyHandlers', () => {
       })
 
       const [, , options] = spawnMock.mock.calls[0]!
-      expect(options.env.ORCA_SHELL_READY_MARKER).toBe('1')
+      expect(options.env.BOTMUX_SHELL_READY_MARKER).toBe('1')
       expect(mockProc.proc.write).not.toHaveBeenCalled()
 
-      mockProc.emitData('\x1b]777;orca-botmux-shell-ready\x07')
+      mockProc.emitData('\x1b]777;botmux-shell-ready\x07')
       await Promise.resolve()
       vi.runAllTimers()
       await Promise.resolve()
@@ -10696,7 +10696,7 @@ describe('registerPtyHandlers', () => {
       // → runtime emulator parses the query → reply written to the provider
       // input path (the renderer never saw the bytes; main is the answerer).
       const daemon = installObservableDaemonTestProvider()
-      const runtime = new OrcaRuntimeService({
+      const runtime = new BotmuxRuntimeService({
         getRepo: () => undefined,
         getRepos: () => [],
         addRepo: () => {},
@@ -10919,9 +10919,9 @@ describe('registerPtyHandlers', () => {
         expect.objectContaining({
           cwd: '/tmp',
           env: expect.objectContaining({
-            ORCA_OPENCODE_CONFIG_DIR: '/tmp/orca-botmux-opencode-config',
-            ORCA_SHELL_READY_MARKER: '0',
-            ZDOTDIR: '/tmp/orca-botmux-user-data/shell-ready/zsh'
+            BOTMUX_OPENCODE_CONFIG_DIR: '/tmp/botmux-opencode-config',
+            BOTMUX_SHELL_READY_MARKER: '0',
+            ZDOTDIR: '/tmp/botmux-user-data/shell-ready/zsh'
           })
         })
       )
@@ -11189,7 +11189,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: 'tab-1:0' }
+      env: { BOTMUX_PANE_KEY: 'tab-1:0' }
     })
 
     expect(registerPtyMock).toHaveBeenLastCalledWith(
@@ -11213,7 +11213,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: stablePaneKey }
+      env: { BOTMUX_PANE_KEY: stablePaneKey }
     })
 
     expect(registerPtyMock).toHaveBeenLastCalledWith(
@@ -11229,7 +11229,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: makePaneKey('tab-2', leafId) }
+      env: { BOTMUX_PANE_KEY: makePaneKey('tab-2', leafId) }
     })
 
     expect(registerPtyMock).toHaveBeenLastCalledWith(
@@ -11250,7 +11250,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: stablePaneKey }
+      env: { BOTMUX_PANE_KEY: stablePaneKey }
     })) as { id: string }
     const second = (await handlers.get('pty:spawn')!(null, {
       cols: 80,
@@ -11258,7 +11258,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: stablePaneKey }
+      env: { BOTMUX_PANE_KEY: stablePaneKey }
     })) as { id: string }
 
     expect(getPtyIdForPaneKey(stablePaneKey)).toBe(second.id)
@@ -11284,7 +11284,7 @@ describe('registerPtyHandlers', () => {
       worktreeId: 'wt-1',
       tabId: 'tab-1',
       leafId,
-      env: { ORCA_PANE_KEY: stablePaneKey }
+      env: { BOTMUX_PANE_KEY: stablePaneKey }
     })) as { id: string }
 
     expect(getPtyIdForPaneKey(stablePaneKey)).toBe(current.id)
@@ -11326,9 +11326,9 @@ describe('registerPtyHandlers', () => {
           cwd: '/tmp',
           env: expect.objectContaining({
             SHELL: '/bin/zsh',
-            ORCA_OPENCODE_CONFIG_DIR: '/tmp/orca-botmux-opencode-config',
-            ORCA_SHELL_READY_MARKER: '0',
-            ZDOTDIR: '/tmp/orca-botmux-user-data/shell-ready/zsh'
+            BOTMUX_OPENCODE_CONFIG_DIR: '/tmp/botmux-opencode-config',
+            BOTMUX_SHELL_READY_MARKER: '0',
+            ZDOTDIR: '/tmp/botmux-user-data/shell-ready/zsh'
           })
         })
       )

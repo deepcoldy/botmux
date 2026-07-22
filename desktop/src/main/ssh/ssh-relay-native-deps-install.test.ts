@@ -17,9 +17,9 @@ vi.mock('fs', () => ({
 
 vi.mock('./relay-protocol', () => ({
   RELAY_VERSION: '0.1.0',
-  RELAY_REMOTE_DIR: '.orca-botmux-remote',
+  RELAY_REMOTE_DIR: '.botmux-remote',
   parseUnameToRelayPlatform: vi.fn().mockReturnValue('linux-x64'),
-  RELAY_SENTINEL: 'ORCA-RELAY v0.1.0 READY\n',
+  RELAY_SENTINEL: 'BOTMUX-RELAY v0.1.0 READY\n',
   RELAY_SENTINEL_TIMEOUT_MS: 10_000
 }))
 
@@ -42,7 +42,7 @@ vi.mock('./ssh-remote-node-resolution', () => ({
 
 vi.mock('./ssh-relay-versioned-install', () => ({
   readLocalFullVersion: vi.fn().mockReturnValue('0.1.0+testhash'),
-  computeRemoteRelayDir: (home: string, v: string) => `${home}/.orca-botmux-remote/relay-${v}`,
+  computeRemoteRelayDir: (home: string, v: string) => `${home}/.botmux-remote/relay-${v}`,
   isRelayAlreadyInstalled: vi.fn().mockResolvedValue(false),
   finalizeInstall: vi.fn().mockResolvedValue(undefined),
   abandonInstall: vi.fn().mockResolvedValue(undefined),
@@ -174,7 +174,7 @@ function makeExecResponses(opts: {
   // build toolchain — no chmod/probe/launch slots are reached.
   if (opts.npmInstall !== 'ok') {
     return [
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
       '/home/u',
       '', // mkdir remoteDir (uploadRelay)
       '', // chmod +x node
@@ -186,14 +186,14 @@ function makeExecResponses(opts: {
     opts.probeStdoutOverride !== undefined
       ? opts.probeStdoutOverride
       : opts.probe === 'ok'
-        ? 'ORCA-NPTY-PROBE-OK\n'
+        ? 'BOTMUX-NPTY-PROBE-OK\n'
         : opts.probe === 'missing'
           ? 'MISSING\n' // shell-level `|| echo MISSING` after require throw
           : opts.probe === 'dir-gone'
             ? { reject: 'cd: no such file or directory' }
             : opts.probe
   const slots: ExecResponse[] = [
-    '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+    '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
     '/home/u',
     '', // mkdir remoteDir (uploadRelay)
     '', // chmod +x node
@@ -204,7 +204,7 @@ function makeExecResponses(opts: {
   // Cleanup execs only run when the probe resolved (not when it rejected).
   const probeResolved = typeof probeSlot === 'string'
   if (probeResolved) {
-    const probeOk = probeSlot.includes('ORCA-NPTY-PROBE-OK')
+    const probeOk = probeSlot.includes('BOTMUX-NPTY-PROBE-OK')
     if (!probeOk) {
       slots.push('') // cat stderr (graceful failure path captures detail)
     }
@@ -212,9 +212,9 @@ function makeExecResponses(opts: {
     if (!probeOk) {
       slots.push('') // npm rebuild with lifecycle scripts explicitly enabled
       slots.push('') // chmod prebuilds after rebuild
-      const repairProbe = opts.repairProbe === 'ok' ? 'ORCA-NPTY-PROBE-OK\n' : 'MISSING\n'
+      const repairProbe = opts.repairProbe === 'ok' ? 'BOTMUX-NPTY-PROBE-OK\n' : 'MISSING\n'
       slots.push(repairProbe)
-      if (!repairProbe.includes('ORCA-NPTY-PROBE-OK')) {
+      if (!repairProbe.includes('BOTMUX-NPTY-PROBE-OK')) {
         slots.push('') // cat stderr after unsuccessful rebuild
       }
       slots.push('') // rm -f stderr after rebuild probe
@@ -282,7 +282,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     const written = sftpCapture.contents[pkgPath as string]
     expect(written).toBeTruthy()
     const parsed = JSON.parse(written) as Record<string, unknown>
-    expect(parsed.name).toBe('orca-botmux-relay')
+    expect(parsed.name).toBe('botmux-relay')
     expect(parsed.version).toBe('1.0.0')
     expect(parsed.private).toBe(true)
     // Why: pin commonjs so a future Node default flip doesn't silently
@@ -384,7 +384,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
       makeExecResponses({
         npmInstall: {
           reject:
-            'Command "export PATH=/usr/bin:$PATH && cd /home/u/.orca-botmux-remote/relay && npm install node-pty@1.1.0 2>&1" failed (exit 1): npm ERR! network ETIMEDOUT'
+            'Command "export PATH=/usr/bin:$PATH && cd /home/u/.botmux-remote/relay && npm install node-pty@1.1.0 2>&1" failed (exit 1): npm ERR! network ETIMEDOUT'
         },
         probe: 'ok',
         toolchainProbe: 'PKG apt-get'
@@ -444,7 +444,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     // with "native deps missing" would finalize a half-repaired install.
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64', // uname
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64', // uname
       '/home/u', // $HOME
       '', // mkdir remoteDir (uploadRelay)
       '', // chmod +x node
@@ -472,7 +472,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     try {
       const conn = makeMockConnection(sftpCapture)
       feed([
-        '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+        '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
         '/home/u',
         '', // mkdir remoteDir
         '' // chmod +x node
@@ -621,7 +621,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
       makeExecResponses({
         npmInstall: 'ok',
         probe: 'ok',
-        probeStdoutOverride: 'Welcome to Acme Corp\nLast login: ...\nORCA-NPTY-PROBE-OK\n'
+        probeStdoutOverride: 'Welcome to Acme Corp\nLast login: ...\nBOTMUX-NPTY-PROBE-OK\n'
       })
     )
 
@@ -657,7 +657,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(resolveRemoteNodePath).mockResolvedValueOnce('C:/Program Files/nodejs/node.exe')
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Windows AMD64',
+      '__BOTMUX_REMOTE_PLATFORM__ Windows AMD64',
       'C:\\Users\\u',
       '', // mkdir remoteDir
       '', // npm install native deps
@@ -751,13 +751,13 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
       '/home/u',
-      'ORCA-NATIVE-DEPS-MISSING:@parcel/watcher\nMISSING', // first probe before lock
-      'ORCA-NATIVE-DEPS-MISSING:@parcel/watcher\nMISSING', // re-probe after lock
+      'BOTMUX-NATIVE-DEPS-MISSING:@parcel/watcher\nMISSING', // first probe before lock
+      'BOTMUX-NATIVE-DEPS-MISSING:@parcel/watcher\nMISSING', // re-probe after lock
       '', // npm install native deps
       '', // chmod prebuilds
-      'ORCA-NPTY-PROBE-OK\n',
+      'BOTMUX-NPTY-PROBE-OK\n',
       '', // rm probe stderr
       'DEAD',
       'READY'
@@ -790,7 +790,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
       '/home/u',
       'MISSING', // health probe: require() fails
       'MISSING', // re-probe after lock
@@ -812,7 +812,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     const conn = makeMockConnection(sftpCapture)
     vi.mocked(execCommand)
-      .mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Linux x86_64')
+      .mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Linux x86_64')
       .mockResolvedValueOnce('/home/u')
       .mockResolvedValueOnce('MISSING')
       .mockResolvedValueOnce('MISSING')
@@ -836,7 +836,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     try {
       const conn = makeMockConnection(sftpCapture)
       feed([
-        '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+        '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
         '/home/u',
         '', // mkdir remoteDir
         '' // chmod +x node
@@ -884,7 +884,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
   it('does not finalize or release a first-install lock after unconfirmed rebuild teardown', async () => {
     const conn = makeMockConnection(sftpCapture)
     vi.mocked(execCommand)
-      .mockResolvedValueOnce('__ORCA_REMOTE_PLATFORM__ Linux x86_64')
+      .mockResolvedValueOnce('__BOTMUX_REMOTE_PLATFORM__ Linux x86_64')
       .mockResolvedValueOnce('/home/u')
       .mockResolvedValueOnce('')
       .mockResolvedValueOnce('')
@@ -911,7 +911,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     try {
       const conn = makeMockConnection(sftpCapture)
       feed([
-        '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+        '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
         '/home/u',
         '', // mkdir remoteDir
         '', // chmod +x node
@@ -965,7 +965,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     vi.mocked(tryAcquireRelayRepairLock).mockResolvedValueOnce(lockResult)
     const conn = makeMockConnection(sftpCapture)
-    feed(['__ORCA_REMOTE_PLATFORM__ Linux x86_64', '/home/u', 'MISSING', 'DEAD', 'READY'])
+    feed(['__BOTMUX_REMOTE_PLATFORM__ Linux x86_64', '/home/u', 'MISSING', 'DEAD', 'READY'])
 
     await deployAndLaunchRelay(conn)
 
@@ -981,9 +981,9 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
       '/home/u',
-      'ORCA-NATIVE-DEPS-OK',
+      'BOTMUX-NATIVE-DEPS-OK',
       'DEAD',
       'READY'
     ])
@@ -993,7 +993,7 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     const healthProbe = vi
       .mocked(execCommand)
       .mock.calls.map(([, c]) => c)
-      .find((c) => c.includes('ORCA-NATIVE-DEPS-OK'))
+      .find((c) => c.includes('BOTMUX-NATIVE-DEPS-OK'))
     expect(healthProbe).toContain('require("node-pty")')
     expect(healthProbe).toContain('loadNativeModule')
     expect(healthProbe).toContain('require("@parcel/watcher")')
@@ -1004,9 +1004,9 @@ describe('installNativeDeps (via deployAndLaunchRelay)', () => {
     vi.mocked(isRelayAlreadyInstalled).mockResolvedValue(true)
     const conn = makeMockConnection(sftpCapture)
     feed([
-      '__ORCA_REMOTE_PLATFORM__ Linux x86_64',
+      '__BOTMUX_REMOTE_PLATFORM__ Linux x86_64',
       '/home/u',
-      'ORCA-NATIVE-DEPS-OK',
+      'BOTMUX-NATIVE-DEPS-OK',
       'DEAD',
       'READY'
     ])

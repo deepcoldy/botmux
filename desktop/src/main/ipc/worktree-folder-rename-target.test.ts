@@ -4,7 +4,7 @@ import { planWorktreeFolderRename } from './worktree-folder-rename-target'
 describe('planWorktreeFolderRename', () => {
   const base = {
     repoId: 'repo1',
-    repoPath: '/repos/orca_botmux',
+    repoPath: '/repos/botmux',
     settings: { nestWorkspaces: false, workspaceDir: '/ws' },
     platform: 'darwin' as NodeJS.Platform,
     isRemote: false

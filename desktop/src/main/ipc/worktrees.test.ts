@@ -43,7 +43,7 @@ const {
   createSetupRunnerScriptMock,
   getEffectiveHooksFromConfigMock,
   getDefaultTabsLaunchMock,
-  parseOrcaYamlMock,
+  parseBotmuxYamlMock,
   shouldRunSetupForCreateMock,
   buildPosixRunnerScriptMock,
   buildWindowsRunnerScriptMock,
@@ -93,7 +93,7 @@ const {
   createSetupRunnerScriptMock: vi.fn(),
   getEffectiveHooksFromConfigMock: vi.fn(),
   getDefaultTabsLaunchMock: vi.fn(),
-  parseOrcaYamlMock: vi.fn(),
+  parseBotmuxYamlMock: vi.fn(),
   shouldRunSetupForCreateMock: vi.fn(),
   buildPosixRunnerScriptMock: vi.fn(),
   buildWindowsRunnerScriptMock: vi.fn(),
@@ -194,7 +194,7 @@ vi.mock('../hooks', () => ({
   getDefaultTabsLaunch: getDefaultTabsLaunchMock,
   getSetupRunnerEnvVars: getSetupRunnerEnvVarsMock,
   loadHooks: loadHooksMock,
-  parseOrcaYaml: parseOrcaYamlMock,
+  parseBotmuxYaml: parseBotmuxYamlMock,
   runHook: runHookMock,
   hasHooksFile: hasHooksFileMock,
   shouldRunSetupForCreate: shouldRunSetupForCreateMock
@@ -329,7 +329,7 @@ describe('registerWorktreeHandlers', () => {
       getEffectiveHooksMock,
       getEffectiveHooksFromConfigMock,
       getDefaultTabsLaunchMock,
-      parseOrcaYamlMock,
+      parseBotmuxYamlMock,
       createIssueCommandRunnerScriptMock,
       createSetupRunnerScriptMock,
       buildPosixRunnerScriptMock,
@@ -439,7 +439,7 @@ describe('registerWorktreeHandlers', () => {
     getEffectiveHooksMock.mockReturnValue(null)
     getEffectiveHooksFromConfigMock.mockImplementation(() => getEffectiveHooksMock())
     getDefaultTabsLaunchMock.mockReturnValue(undefined)
-    parseOrcaYamlMock.mockReturnValue(null)
+    parseBotmuxYamlMock.mockReturnValue(null)
     shouldRunSetupForCreateMock.mockReturnValue(false)
     buildPosixRunnerScriptMock.mockImplementation(
       (script: string) => `#!/usr/bin/env bash\nset -e\n${script.replace(/\r\n/g, '\n')}\n`
@@ -447,25 +447,25 @@ describe('registerWorktreeHandlers', () => {
     buildWindowsRunnerScriptMock.mockImplementation((script: string) => script)
     getSetupRunnerEnvVarsMock.mockImplementation(
       (repoArg: { path: string }, worktreePath: string) => ({
-        ORCA_ROOT_PATH: repoArg.path,
-        ORCA_WORKTREE_PATH: worktreePath,
-        ORCA_WORKSPACE_NAME: worktreePath.split('/').at(-1) ?? '',
+        BOTMUX_ROOT_PATH: repoArg.path,
+        BOTMUX_WORKTREE_PATH: worktreePath,
+        BOTMUX_WORKSPACE_NAME: worktreePath.split('/').at(-1) ?? '',
         CONDUCTOR_ROOT_PATH: repoArg.path,
         GHOSTX_ROOT_PATH: repoArg.path
       })
     )
     createSetupRunnerScriptMock.mockReturnValue({
-      runnerScriptPath: '/workspace/repo/.git/orca_botmux/setup-runner.sh',
+      runnerScriptPath: '/workspace/repo/.git/botmux/setup-runner.sh',
       envVars: {
-        ORCA_ROOT_PATH: '/workspace/repo',
-        ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+        BOTMUX_ROOT_PATH: '/workspace/repo',
+        BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
       }
     })
     createIssueCommandRunnerScriptMock.mockReturnValue({
-      runnerScriptPath: '/workspace/repo/.git/orca_botmux/issue-command-runner.sh',
+      runnerScriptPath: '/workspace/repo/.git/botmux/issue-command-runner.sh',
       envVars: {
-        ORCA_ROOT_PATH: '/workspace/repo',
-        ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+        BOTMUX_ROOT_PATH: '/workspace/repo',
+        BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
       }
     })
     computeWorktreePathMock.mockImplementation(
@@ -767,7 +767,7 @@ describe('registerWorktreeHandlers', () => {
     ])
   }
 
-  it('strips OrcaBotmux provenance fields from renderer metadata updates', () => {
+  it('strips Botmux provenance fields from renderer metadata updates', () => {
     store.setWorktreeMeta.mockImplementation((_worktreeId, meta) => meta)
 
     const result = handlers['worktrees:updateMeta'](null, {
@@ -775,9 +775,9 @@ describe('registerWorktreeHandlers', () => {
       updates: {
         comment: 'keep me',
         isPinned: true,
-        orcaCreatedAt: 123,
-        orcaCreationSource: 'desktop',
-        orcaCreationWorkspaceLayout: { path: '/workspace', nestWorkspaces: false }
+        botmuxCreatedAt: 123,
+        botmuxCreationSource: 'desktop',
+        botmuxCreationWorkspaceLayout: { path: '/workspace', nestWorkspaces: false }
       }
     })
 
@@ -792,12 +792,12 @@ describe('registerWorktreeHandlers', () => {
     store.setWorktreeMeta.mockImplementation((_worktreeId, meta) => meta)
 
     handlers['worktrees:updateMeta'](null, {
-      worktreeId: 'orca_botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
+      worktreeId: 'botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
       updates: { displayName: 'should not notify', lastActivityAt: 1 }
     })
 
     expect(store.setWorktreeMeta).toHaveBeenCalledWith(
-      'orca_botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
+      'botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
       {}
     )
     expect(runtimeStub.notifyWorktreesChangedForRemoteClients).not.toHaveBeenCalled()
@@ -931,7 +931,7 @@ describe('registerWorktreeHandlers', () => {
     expect(store.setWorktreeMeta).toHaveBeenCalledWith(
       'repo-1::../worktrees/feature',
       expect.objectContaining({
-        orcaCreationWorkspaceLayout: { path: '../worktrees', nestWorkspaces: false }
+        botmuxCreationWorkspaceLayout: { path: '../worktrees', nestWorkspaces: false }
       })
     )
   })
@@ -1078,7 +1078,7 @@ describe('registerWorktreeHandlers', () => {
       createdWithAgent: 'claude',
       startup: {
         command: 'claude --prefill test',
-        env: { ORCA_AGENT_MODE: 'direct' },
+        env: { BOTMUX_AGENT_MODE: 'direct' },
         telemetry: {
           agent_kind: 'claude',
           launch_source: 'new_workspace_composer',
@@ -1097,7 +1097,7 @@ describe('registerWorktreeHandlers', () => {
       {
         claudeAgentTeamsSourceCommand: 'claude --prefill test',
         command: 'claude --prefill test',
-        env: { ORCA_AGENT_MODE: 'direct' },
+        env: { BOTMUX_AGENT_MODE: 'direct' },
         launchAgent: 'claude',
         startupCommandDelivery: undefined,
         telemetry: {
@@ -1113,10 +1113,10 @@ describe('registerWorktreeHandlers', () => {
       'id:repo-1::/workspace/improve-dashboard',
       {
         title: 'Setup',
-        command: expect.stringContaining('bash /workspace/repo/.git/orca_botmux/setup-runner.sh'),
+        command: expect.stringContaining('bash /workspace/repo/.git/botmux/setup-runner.sh'),
         env: {
-          ORCA_ROOT_PATH: '/workspace/repo',
-          ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+          BOTMUX_ROOT_PATH: '/workspace/repo',
+          BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
         },
         activate: false
       }
@@ -1129,7 +1129,7 @@ describe('registerWorktreeHandlers', () => {
     const startupCommand = (startupCreateCall[1] as { command: string }).command
     const setupCommand = (setupCreateCall[1] as { command: string }).command
     expect(startupCommand).toBe('claude --prefill test')
-    expect(setupCommand).toBe('bash /workspace/repo/.git/orca_botmux/setup-runner.sh')
+    expect(setupCommand).toBe('bash /workspace/repo/.git/botmux/setup-runner.sh')
     expect(result.setup).toBeUndefined()
     expect(result.startupTerminal).toEqual({ spawned: true, surface: 'visible' })
     expect(result.timing?.phases.map((phase) => phase.phase)).toEqual(
@@ -1158,10 +1158,10 @@ describe('registerWorktreeHandlers', () => {
     getEffectiveHooksFromConfigMock.mockReturnValue({ scripts: { setup: 'pnpm install' } })
     shouldRunSetupForCreateMock.mockReturnValue(true)
     createSetupRunnerScriptMock.mockReturnValueOnce({
-      runnerScriptPath: '/workspace/repo/.git/orca_botmux/setup-runner.sh',
+      runnerScriptPath: '/workspace/repo/.git/botmux/setup-runner.sh',
       envVars: {
-        ORCA_ROOT_PATH: '/workspace/repo',
-        ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+        BOTMUX_ROOT_PATH: '/workspace/repo',
+        BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
       },
       waitForAgentStartup: true
     })
@@ -1175,7 +1175,7 @@ describe('registerWorktreeHandlers', () => {
       createdWithAgent: 'claude',
       startup: {
         command: 'claude --prefill test',
-        env: { ORCA_AGENT_MODE: 'direct' },
+        env: { BOTMUX_AGENT_MODE: 'direct' },
         telemetry: {
           agent_kind: 'claude',
           launch_source: 'new_workspace_composer',
@@ -1186,8 +1186,8 @@ describe('registerWorktreeHandlers', () => {
 
     expect(result.setup).toEqual(
       expect.objectContaining({
-        runnerScriptPath: '/workspace/repo/.git/orca_botmux/setup-runner.sh',
-        command: expect.stringContaining('bash /workspace/repo/.git/orca_botmux/setup-runner.sh')
+        runnerScriptPath: '/workspace/repo/.git/botmux/setup-runner.sh',
+        command: expect.stringContaining('bash /workspace/repo/.git/botmux/setup-runner.sh')
       })
     )
     expect(result.setup?.command).toContain('printf')
@@ -1938,21 +1938,21 @@ describe('registerWorktreeHandlers', () => {
       repoId: 'repo-1',
       name: 'improve-dashboard',
       pushTarget: {
-        remoteName: 'pr-prateek-orca_botmux',
+        remoteName: 'pr-prateek-botmux',
         branchName: 'prateek/fix-sidebar-agents-toggle',
-        remoteUrl: 'git@github.com:prateek/orca_botmux.git'
+        remoteUrl: 'git@github.com:prateek/botmux.git'
       }
     })
 
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
-      ['remote', 'add', 'pr-prateek-orca_botmux', 'git@github.com:prateek/orca_botmux.git'],
+      ['remote', 'add', 'pr-prateek-botmux', 'git@github.com:prateek/botmux.git'],
       { cwd: '/workspace/repo' }
     )
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
       [
         'fetch',
-        'pr-prateek-orca_botmux',
-        '+refs/heads/prateek/fix-sidebar-agents-toggle:refs/remotes/pr-prateek-orca_botmux/prateek/fix-sidebar-agents-toggle'
+        'pr-prateek-botmux',
+        '+refs/heads/prateek/fix-sidebar-agents-toggle:refs/remotes/pr-prateek-botmux/prateek/fix-sidebar-agents-toggle'
       ],
       { cwd: '/workspace/repo' }
     )
@@ -1960,7 +1960,7 @@ describe('registerWorktreeHandlers', () => {
       [
         'branch',
         '--set-upstream-to',
-        'pr-prateek-orca_botmux/prateek/fix-sidebar-agents-toggle',
+        'pr-prateek-botmux/prateek/fix-sidebar-agents-toggle',
         'improve-dashboard'
       ],
       { cwd: '/workspace/improve-dashboard' }
@@ -1969,16 +1969,16 @@ describe('registerWorktreeHandlers', () => {
       'repo-1::/workspace/improve-dashboard',
       expect.objectContaining({
         pushTarget: expect.objectContaining({
-          remoteName: 'pr-prateek-orca_botmux',
+          remoteName: 'pr-prateek-botmux',
           branchName: 'prateek/fix-sidebar-agents-toggle',
-          remoteUrl: 'git@github.com:prateek/orca_botmux.git',
+          remoteUrl: 'git@github.com:prateek/botmux.git',
           remoteCreated: true
         })
       })
     )
   })
 
-  it('keeps the OrcaBotmux-created marker when a new worktree reuses an OrcaBotmux-created fork remote', async () => {
+  it('keeps the Botmux-created marker when a new worktree reuses an Botmux-created fork remote', async () => {
     listWorktreesMock.mockResolvedValue([
       {
         path: '/workspace/improve-dashboard',
@@ -1989,9 +1989,9 @@ describe('registerWorktreeHandlers', () => {
       }
     ])
     const existingPushTarget = {
-      remoteName: 'pr-contributor-orca_botmux',
+      remoteName: 'pr-contributor-botmux',
       branchName: 'contributor/previous-fix',
-      remoteUrl: 'https://github.com/contributor/orca_botmux.git',
+      remoteUrl: 'https://github.com/contributor/botmux.git',
       remoteCreated: true
     }
     store.getAllWorktreeMeta.mockReturnValue({
@@ -2000,10 +2000,10 @@ describe('registerWorktreeHandlers', () => {
     store.setWorktreeMeta.mockImplementation((_worktreeId, meta) => meta)
     gitExecFileAsyncMock.mockImplementation(async (args: string[]) => {
       if (args[0] === 'remote' && args.length === 1) {
-        return { stdout: 'pr-contributor-orca_botmux\n', stderr: '' }
+        return { stdout: 'pr-contributor-botmux\n', stderr: '' }
       }
       if (args[0] === 'remote' && args[1] === 'get-url') {
-        return { stdout: 'https://github.com/contributor/orca_botmux.git\n', stderr: '' }
+        return { stdout: 'https://github.com/contributor/botmux.git\n', stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -2012,9 +2012,9 @@ describe('registerWorktreeHandlers', () => {
       repoId: 'repo-1',
       name: 'improve-dashboard',
       pushTarget: {
-        remoteName: 'pr-contributor-orca_botmux',
+        remoteName: 'pr-contributor-botmux',
         branchName: 'contributor/new-fix',
-        remoteUrl: 'https://github.com/contributor/orca_botmux.git'
+        remoteUrl: 'https://github.com/contributor/botmux.git'
       }
     })
 
@@ -2026,9 +2026,9 @@ describe('registerWorktreeHandlers', () => {
       'repo-1::/workspace/improve-dashboard',
       expect.objectContaining({
         pushTarget: expect.objectContaining({
-          remoteName: 'pr-contributor-orca_botmux',
+          remoteName: 'pr-contributor-botmux',
           branchName: 'contributor/new-fix',
-          remoteUrl: 'https://github.com/contributor/orca_botmux.git',
+          remoteUrl: 'https://github.com/contributor/botmux.git',
           remoteCreated: true
         })
       })
@@ -2038,9 +2038,9 @@ describe('registerWorktreeHandlers', () => {
   it('returns the PR head push target when resolving a fork PR base', async () => {
     getPullRequestPushTargetMock.mockResolvedValue({
       pushTarget: {
-        remoteName: 'pr-prateek-orca_botmux',
+        remoteName: 'pr-prateek-botmux',
         branchName: 'prateek/fix-sidebar-agents-toggle',
-        remoteUrl: 'git@github.com:prateek/orca_botmux.git'
+        remoteUrl: 'git@github.com:prateek/botmux.git'
       }
     })
     gitExecFileAsyncMock.mockImplementation(async (args: string[]) => {
@@ -2065,9 +2065,9 @@ describe('registerWorktreeHandlers', () => {
       headSha: 'abc123',
       branchNameOverride: 'prateek/fix-sidebar-agents-toggle',
       pushTarget: {
-        remoteName: 'pr-prateek-orca_botmux',
+        remoteName: 'pr-prateek-botmux',
         branchName: 'prateek/fix-sidebar-agents-toggle',
-        remoteUrl: 'git@github.com:prateek/orca_botmux.git'
+        remoteUrl: 'git@github.com:prateek/botmux.git'
       }
     })
   })
@@ -2170,9 +2170,9 @@ describe('registerWorktreeHandlers', () => {
       repoId: 'repo-1',
       name: 'wsl-fork',
       pushTarget: {
-        remoteName: 'pr-contributor-orca_botmux',
+        remoteName: 'pr-contributor-botmux',
         branchName: 'contributor/wsl-fork',
-        remoteUrl: 'git@github.com:contributor/orca_botmux.git'
+        remoteUrl: 'git@github.com:contributor/botmux.git'
       }
     })
 
@@ -2181,19 +2181,19 @@ describe('registerWorktreeHandlers', () => {
       { cwd: '/workspace/repo', wslDistro: 'Ubuntu' }
     )
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
-      ['remote', 'add', 'pr-contributor-orca_botmux', 'git@github.com:contributor/orca_botmux.git'],
+      ['remote', 'add', 'pr-contributor-botmux', 'git@github.com:contributor/botmux.git'],
       { cwd: '/workspace/repo', wslDistro: 'Ubuntu' }
     )
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
       [
         'fetch',
-        'pr-contributor-orca_botmux',
-        '+refs/heads/contributor/wsl-fork:refs/remotes/pr-contributor-orca_botmux/contributor/wsl-fork'
+        'pr-contributor-botmux',
+        '+refs/heads/contributor/wsl-fork:refs/remotes/pr-contributor-botmux/contributor/wsl-fork'
       ],
       { cwd: '/workspace/repo', wslDistro: 'Ubuntu' }
     )
     expect(gitExecFileAsyncMock).toHaveBeenCalledWith(
-      ['branch', '--set-upstream-to', 'pr-contributor-orca_botmux/contributor/wsl-fork', 'wsl-fork'],
+      ['branch', '--set-upstream-to', 'pr-contributor-botmux/contributor/wsl-fork', 'wsl-fork'],
       { cwd: '/workspace/wsl-fork', wslDistro: 'Ubuntu' }
     )
   })
@@ -3519,7 +3519,7 @@ describe('registerWorktreeHandlers', () => {
     expect(result.localBaseRefUpdateSuggestion).toBeUndefined()
   })
 
-  it('reads remote orca_botmux.yaml and returns a setup launch payload during SSH create', async () => {
+  it('reads remote botmux.yaml and returns a setup launch payload during SSH create', async () => {
     const repo = {
       id: 'repo-ssh',
       path: '/remote/repo',
@@ -3536,7 +3536,7 @@ describe('registerWorktreeHandlers', () => {
         }
         if (args[0] === 'rev-parse' && args[1] === '--git-path') {
           return {
-            stdout: '/remote/repo/.git/worktrees/improve-dashboard/orca_botmux/setup-runner.sh\n',
+            stdout: '/remote/repo/.git/worktrees/improve-dashboard/botmux/setup-runner.sh\n',
             stderr: ''
           }
         }
@@ -3575,7 +3575,7 @@ describe('registerWorktreeHandlers', () => {
     getSshFilesystemProviderMock.mockReturnValue(fsProvider)
     getActiveMultiplexerMock.mockReturnValue(mux)
     store.setWorktreeMeta.mockImplementation((_worktreeId, meta) => meta)
-    parseOrcaYamlMock.mockReturnValue({ scripts: { setup: 'pnpm install' } })
+    parseBotmuxYamlMock.mockReturnValue({ scripts: { setup: 'pnpm install' } })
     getEffectiveHooksFromConfigMock.mockReturnValue({ scripts: { setup: 'pnpm install' } })
     shouldRunSetupForCreateMock.mockReturnValue(true)
 
@@ -3585,26 +3585,26 @@ describe('registerWorktreeHandlers', () => {
       setupDecision: 'run'
     })
 
-    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/orca_botmux.yaml')
-    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/improve-dashboard/orca_botmux.yaml')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/botmux.yaml')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/improve-dashboard/botmux.yaml')
     expect(provider.exec).toHaveBeenCalledWith(
-      ['rev-parse', '--git-path', 'orca_botmux/setup-runner.sh'],
+      ['rev-parse', '--git-path', 'botmux/setup-runner.sh'],
       '/remote/improve-dashboard'
     )
     expect(fsProvider.createDir).toHaveBeenCalledWith(
-      '/remote/repo/.git/worktrees/improve-dashboard/orca_botmux'
+      '/remote/repo/.git/worktrees/improve-dashboard/botmux'
     )
     expect(fsProvider.writeFile).toHaveBeenCalledWith(
-      '/remote/repo/.git/worktrees/improve-dashboard/orca_botmux/setup-runner.sh',
+      '/remote/repo/.git/worktrees/improve-dashboard/botmux/setup-runner.sh',
       '#!/usr/bin/env bash\nset -e\npnpm install\n'
     )
     expect(result).toEqual(
       expect.objectContaining({
         setup: {
-          runnerScriptPath: '/remote/repo/.git/worktrees/improve-dashboard/orca_botmux/setup-runner.sh',
+          runnerScriptPath: '/remote/repo/.git/worktrees/improve-dashboard/botmux/setup-runner.sh',
           envVars: expect.objectContaining({
-            ORCA_ROOT_PATH: '/remote/repo',
-            ORCA_WORKTREE_PATH: '/remote/improve-dashboard'
+            BOTMUX_ROOT_PATH: '/remote/repo',
+            BOTMUX_WORKTREE_PATH: '/remote/improve-dashboard'
           })
         }
       })
@@ -5259,10 +5259,10 @@ describe('registerWorktreeHandlers', () => {
       {}
     )
     expect(result).toMatchObject({
-      runnerScriptPath: '/workspace/repo/.git/orca_botmux/issue-command-runner.sh',
+      runnerScriptPath: '/workspace/repo/.git/botmux/issue-command-runner.sh',
       envVars: {
-        ORCA_ROOT_PATH: '/workspace/repo',
-        ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+        BOTMUX_ROOT_PATH: '/workspace/repo',
+        BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
       }
     })
   })
@@ -5715,7 +5715,7 @@ describe('registerWorktreeHandlers', () => {
     store.getProjectHostSetups.mockReturnValue([
       {
         id: 'repo-1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'local',
         repoId: 'repo-1',
         path: '/workspace/repo',
@@ -5743,7 +5743,7 @@ describe('registerWorktreeHandlers', () => {
     })
     store.setWorktreeMeta.mockReturnValue({
       instanceId: 'existing-instance',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'local',
       projectHostSetupId: 'repo-1',
       lastActivityAt: 42
@@ -5758,11 +5758,11 @@ describe('registerWorktreeHandlers', () => {
     }[]
 
     expect(store.setWorktreeMeta).toHaveBeenCalledWith('repo-1::/workspace/existing-wt', {
-      projectId: 'github:stablyai/orca_botmux'
+      projectId: 'github:stablyai/botmux'
     })
     expect(listed[0]).toMatchObject({
       id: 'repo-1::/workspace/existing-wt',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'local',
       projectHostSetupId: 'repo-1',
       lastActivityAt: 42
@@ -5782,7 +5782,7 @@ describe('registerWorktreeHandlers', () => {
     store.getProjectHostSetups.mockReturnValue([
       {
         id: 'repo-1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'local',
         repoId: 'repo-1',
         path: '/workspace/repo',
@@ -5817,15 +5817,15 @@ describe('registerWorktreeHandlers', () => {
   it('repairs legacy project ids when SSH worktree listing falls back to persisted metadata', async () => {
     const repo = {
       id: 'repo-ssh',
-      path: '/remote/orca_botmux',
-      displayName: 'orca_botmux',
+      path: '/remote/botmux',
+      displayName: 'botmux',
       badgeColor: '#000',
       addedAt: 0,
       connectionId: 'ssh-target-1'
     }
     store.getRepo.mockReturnValue(repo)
     store.getAllWorktreeMeta.mockReturnValue({
-      'repo-ssh::/remote/orca_botmux': makeWorktreeMeta({
+      'repo-ssh::/remote/botmux': makeWorktreeMeta({
         instanceId: 'existing-instance',
         projectId: 'repo:repo-ssh',
         hostId: 'ssh:ssh-target-1',
@@ -5836,11 +5836,11 @@ describe('registerWorktreeHandlers', () => {
     store.getProjectHostSetups.mockReturnValue([
       {
         id: 'repo-ssh',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:ssh-target-1',
         repoId: 'repo-ssh',
-        path: '/remote/orca_botmux',
-        displayName: 'orca_botmux',
+        path: '/remote/botmux',
+        displayName: 'botmux',
         setupState: 'ready',
         setupMethod: 'imported-existing-folder',
         createdAt: 0,
@@ -5850,7 +5850,7 @@ describe('registerWorktreeHandlers', () => {
     store.setWorktreeMeta.mockReturnValue(
       makeWorktreeMeta({
         instanceId: 'existing-instance',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:ssh-target-1',
         projectHostSetupId: 'repo-ssh',
         lastActivityAt: 42
@@ -5866,13 +5866,13 @@ describe('registerWorktreeHandlers', () => {
     }[]
 
     expect(getSshGitProviderMock).toHaveBeenCalledWith('ssh-target-1')
-    expect(store.setWorktreeMeta).toHaveBeenCalledWith('repo-ssh::/remote/orca_botmux', {
-      projectId: 'github:stablyai/orca_botmux'
+    expect(store.setWorktreeMeta).toHaveBeenCalledWith('repo-ssh::/remote/botmux', {
+      projectId: 'github:stablyai/botmux'
     })
     expect(listed).toEqual([
       expect.objectContaining({
-        id: 'repo-ssh::/remote/orca_botmux',
-        projectId: 'github:stablyai/orca_botmux',
+        id: 'repo-ssh::/remote/botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:ssh-target-1',
         projectHostSetupId: 'repo-ssh',
         lastActivityAt: 42
@@ -6266,10 +6266,10 @@ describe('registerWorktreeHandlers', () => {
         branch: 'improve-dashboard'
       }),
       setup: {
-        runnerScriptPath: '/workspace/repo/.git/orca_botmux/setup-runner.sh',
+        runnerScriptPath: '/workspace/repo/.git/botmux/setup-runner.sh',
         envVars: {
-          ORCA_ROOT_PATH: '/workspace/repo',
-          ORCA_WORKTREE_PATH: '/workspace/improve-dashboard'
+          BOTMUX_ROOT_PATH: '/workspace/repo',
+          BOTMUX_WORKTREE_PATH: '/workspace/improve-dashboard'
         }
       }
     })
@@ -6331,7 +6331,7 @@ describe('registerWorktreeHandlers', () => {
     )
   })
 
-  it('launches setup even when primary and worktree orca_botmux.yaml scripts diverge', async () => {
+  it('launches setup even when primary and worktree botmux.yaml scripts diverge', async () => {
     // Why: regression for a silent skip introduced by the #1280 content-equality
     // gate. Benign divergence (whitespace, comments, or any setup edit that
     // landed on the base branch but not yet in the primary checkout) must not
@@ -6363,7 +6363,7 @@ describe('registerWorktreeHandlers', () => {
     expect(result).toEqual(
       expect.objectContaining({
         setup: expect.objectContaining({
-          runnerScriptPath: '/workspace/repo/.git/orca_botmux/setup-runner.sh'
+          runnerScriptPath: '/workspace/repo/.git/botmux/setup-runner.sh'
         })
       })
     )
@@ -6592,7 +6592,7 @@ describe('registerWorktreeHandlers', () => {
 
   it('recovers forced Windows long-path worktree removal through local deletion and prune', async () => {
     setPlatform('win32')
-    const parentDir = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-long-path-'))
+    const parentDir = await mkdtemp(join(tmpdir(), 'botmux-ipc-long-path-'))
     const repoPath = join(parentDir, 'repo')
     const worktreePath = join(parentDir, 'feature-wt')
     await mkdir(worktreePath, { recursive: true })
@@ -6993,7 +6993,7 @@ describe('registerWorktreeHandlers', () => {
       worktreeId: 'repo-ssh::/remote/feature-wt'
     })
 
-    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/orca_botmux.yaml')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/botmux.yaml')
     expect(provider.execNonInteractive).toHaveBeenCalledWith(
       '/bin/bash',
       ['-lc', 'echo archived'],
@@ -7001,8 +7001,8 @@ describe('registerWorktreeHandlers', () => {
       120_000,
       undefined,
       expect.objectContaining({
-        ORCA_ROOT_PATH: '/remote/repo',
-        ORCA_WORKTREE_PATH: '/remote/feature-wt'
+        BOTMUX_ROOT_PATH: '/remote/repo',
+        BOTMUX_WORKTREE_PATH: '/remote/feature-wt'
       })
     )
     expect(provider.removeWorktree).toHaveBeenCalledWith('/remote/feature-wt', undefined)
@@ -7307,7 +7307,7 @@ describe('registerWorktreeHandlers', () => {
       worktreeId: 'repo-ssh::C:\\remote\\feature-wt'
     })
 
-    expect(fsProvider.readFile).toHaveBeenCalledWith('C:\\remote\\repo\\orca_botmux.yaml')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('C:\\remote\\repo\\botmux.yaml')
     expect(provider.execNonInteractive).toHaveBeenCalledWith(
       'cmd.exe',
       ['/d', '/s', '/c', 'echo archived'],
@@ -7315,8 +7315,8 @@ describe('registerWorktreeHandlers', () => {
       120_000,
       undefined,
       expect.objectContaining({
-        ORCA_ROOT_PATH: 'C:\\remote\\repo',
-        ORCA_WORKTREE_PATH: 'C:\\remote\\feature-wt'
+        BOTMUX_ROOT_PATH: 'C:\\remote\\repo',
+        BOTMUX_WORKTREE_PATH: 'C:\\remote\\feature-wt'
       })
     )
   })
@@ -7459,7 +7459,7 @@ describe('registerWorktreeHandlers', () => {
     }
     store.getRepos.mockReturnValue([localRepo, sshRepo])
     getSshFilesystemProviderMock.mockReturnValue(fsProvider)
-    parseOrcaYamlMock.mockReturnValue({ scripts: { archive: 'remote-cleanup' } })
+    parseBotmuxYamlMock.mockReturnValue({ scripts: { archive: 'remote-cleanup' } })
 
     await expect(
       handlers['hooks:check'](null, {
@@ -7472,7 +7472,7 @@ describe('registerWorktreeHandlers', () => {
       hooks: { scripts: { archive: 'remote-cleanup' } },
       mayNeedUpdate: false
     })
-    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/orca_botmux.yaml')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/botmux.yaml')
     expect(hasHooksFileMock).not.toHaveBeenCalled()
   })
 
@@ -7659,13 +7659,13 @@ describe('registerWorktreeHandlers', () => {
     expect(forceDeleteLocalBranchMock).not.toHaveBeenCalled()
   })
 
-  it('removes an unused OrcaBotmux-created fork remote after deleting its worktree', async () => {
+  it('removes an unused Botmux-created fork remote after deleting its worktree', async () => {
     mockKnownFeatureWorktree()
     removeWorktreeMock.mockResolvedValue(undefined)
     const pushTarget = {
-      remoteName: 'pr-contributor-orca_botmux',
+      remoteName: 'pr-contributor-botmux',
       branchName: 'feature/from-fork',
-      remoteUrl: 'https://github.com/contributor/orca_botmux.git',
+      remoteUrl: 'https://github.com/contributor/botmux.git',
       remoteCreated: true
     }
     store.getWorktreeMeta.mockReturnValue(makeWorktreeMeta({ pushTarget }))
@@ -7677,7 +7677,7 @@ describe('registerWorktreeHandlers', () => {
         throw new Error('no branch config')
       }
       if (args[0] === 'remote' && args[1] === 'get-url') {
-        return { stdout: 'https://github.com/contributor/orca_botmux.git\n', stderr: '' }
+        return { stdout: 'https://github.com/contributor/botmux.git\n', stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -7686,18 +7686,18 @@ describe('registerWorktreeHandlers', () => {
       worktreeId: 'repo-1::/workspace/feature-wt'
     })
 
-    expect(gitExecFileAsyncMock).toHaveBeenCalledWith(['remote', 'remove', 'pr-contributor-orca_botmux'], {
+    expect(gitExecFileAsyncMock).toHaveBeenCalledWith(['remote', 'remove', 'pr-contributor-botmux'], {
       cwd: '/workspace/repo'
     })
   })
 
-  it('keeps an OrcaBotmux-created fork remote while another worktree still uses it', async () => {
+  it('keeps an Botmux-created fork remote while another worktree still uses it', async () => {
     mockKnownFeatureWorktree()
     removeWorktreeMock.mockResolvedValue(undefined)
     const pushTarget = {
-      remoteName: 'pr-contributor-orca_botmux',
+      remoteName: 'pr-contributor-botmux',
       branchName: 'feature/from-fork',
-      remoteUrl: 'https://github.com/contributor/orca_botmux.git',
+      remoteUrl: 'https://github.com/contributor/botmux.git',
       remoteCreated: true
     }
     store.getWorktreeMeta.mockReturnValue(makeWorktreeMeta({ pushTarget }))
@@ -7716,7 +7716,7 @@ describe('registerWorktreeHandlers', () => {
     })
 
     expect(gitExecFileAsyncMock).not.toHaveBeenCalledWith(
-      ['remote', 'remove', 'pr-contributor-orca_botmux'],
+      ['remote', 'remove', 'pr-contributor-botmux'],
       expect.any(Object)
     )
   })
@@ -7725,9 +7725,9 @@ describe('registerWorktreeHandlers', () => {
     mockKnownFeatureWorktree()
     removeWorktreeMock.mockResolvedValue(undefined)
     const pushTarget = {
-      remoteName: 'pr-contributor-orca_botmux',
+      remoteName: 'pr-contributor-botmux',
       branchName: 'feature/from-fork',
-      remoteUrl: 'https://github.com/contributor/orca_botmux.git',
+      remoteUrl: 'https://github.com/contributor/botmux.git',
       remoteCreated: true
     }
     store.getWorktreeMeta.mockReturnValue(makeWorktreeMeta({ pushTarget }))
@@ -7745,7 +7745,7 @@ describe('registerWorktreeHandlers', () => {
         throw new Error('no branch config')
       }
       if (args[0] === 'remote' && args[1] === 'get-url') {
-        return { stdout: 'https://github.com/contributor/orca_botmux.git\n', stderr: '' }
+        return { stdout: 'https://github.com/contributor/botmux.git\n', stderr: '' }
       }
       return { stdout: '', stderr: '' }
     })
@@ -7754,7 +7754,7 @@ describe('registerWorktreeHandlers', () => {
       worktreeId: 'repo-1::/workspace/feature-wt'
     })
 
-    expect(gitExecFileAsyncMock).toHaveBeenCalledWith(['remote', 'remove', 'pr-contributor-orca_botmux'], {
+    expect(gitExecFileAsyncMock).toHaveBeenCalledWith(['remote', 'remove', 'pr-contributor-botmux'], {
       cwd: '/workspace/repo'
     })
   })
@@ -7848,8 +7848,8 @@ describe('registerWorktreeHandlers', () => {
     })
   })
 
-  it('force-removes a legacy OrcaBotmux-created orphaned worktree directory after Git tracking is gone', async () => {
-    const parentDir = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-orphan-'))
+  it('force-removes a legacy Botmux-created orphaned worktree directory after Git tracking is gone', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'botmux-ipc-orphan-'))
     const repoPath = join(parentDir, 'repo')
     const orphanPath = join(parentDir, 'orphan')
     const adminWorktreePath = join(repoPath, '.git', 'worktrees', 'orphan')
@@ -7895,8 +7895,8 @@ describe('registerWorktreeHandlers', () => {
     }
   })
 
-  it('prompts for force before removing an OrcaBotmux-created orphaned worktree directory', async () => {
-    const parentDir = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-orphan-'))
+  it('prompts for force before removing an Botmux-created orphaned worktree directory', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'botmux-ipc-orphan-'))
     const repoPath = join(parentDir, 'repo')
     const orphanPath = join(parentDir, 'orphan')
     const adminWorktreePath = join(repoPath, '.git', 'worktrees', 'orphan')
@@ -7916,7 +7916,7 @@ describe('registerWorktreeHandlers', () => {
     store.getRepos.mockReturnValue([repo])
     mockKnownFeatureWorktree(join(parentDir, 'real-feature'), repoPath)
     store.getWorktreeMeta.mockReturnValue(
-      makeWorktreeMeta({ orcaCreatedAt: Date.now(), orcaCreationSource: 'runtime' })
+      makeWorktreeMeta({ botmuxCreatedAt: Date.now(), botmuxCreationSource: 'runtime' })
     )
 
     try {
@@ -7934,8 +7934,8 @@ describe('registerWorktreeHandlers', () => {
     }
   })
 
-  it('prompts then force-removes an OrcaBotmux-created unregistered leftover directory with no git marker', async () => {
-    const parentDir = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-leftover-'))
+  it('prompts then force-removes an Botmux-created unregistered leftover directory with no git marker', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'botmux-ipc-leftover-'))
     const repoPath = join(parentDir, 'repo')
     const leftoverPath = join(parentDir, 'leftover')
     const worktreeId = `repo-1::${leftoverPath}`
@@ -7951,7 +7951,7 @@ describe('registerWorktreeHandlers', () => {
     })
     mockKnownFeatureWorktree(join(parentDir, 'real-feature'), repoPath)
     store.getWorktreeMeta.mockReturnValue(
-      makeWorktreeMeta({ orcaCreatedAt: Date.now(), orcaCreationSource: 'runtime' })
+      makeWorktreeMeta({ botmuxCreatedAt: Date.now(), botmuxCreationSource: 'runtime' })
     )
     gitExecFileAsyncMock.mockImplementation(async (args: string[]) => {
       if (args[0] === 'status') {
@@ -7990,8 +7990,8 @@ describe('registerWorktreeHandlers', () => {
     }
   })
 
-  it('rejects an OrcaBotmux-created unregistered local directory with a git directory', async () => {
-    const parentDir = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-standalone-'))
+  it('rejects an Botmux-created unregistered local directory with a git directory', async () => {
+    const parentDir = await mkdtemp(join(tmpdir(), 'botmux-ipc-standalone-'))
     const repoPath = join(parentDir, 'repo')
     const standalonePath = join(parentDir, 'standalone')
     await mkdir(join(standalonePath, '.git'), { recursive: true })
@@ -8005,7 +8005,7 @@ describe('registerWorktreeHandlers', () => {
     })
     mockKnownFeatureWorktree(join(parentDir, 'real-feature'), repoPath)
     store.getWorktreeMeta.mockReturnValue(
-      makeWorktreeMeta({ orcaCreatedAt: Date.now(), orcaCreationSource: 'runtime' })
+      makeWorktreeMeta({ botmuxCreatedAt: Date.now(), botmuxCreationSource: 'runtime' })
     )
 
     try {
@@ -8025,7 +8025,7 @@ describe('registerWorktreeHandlers', () => {
   })
 
   it('does not inspect or delete a local path when SSH orphan cleanup has no filesystem provider', async () => {
-    const localPath = await mkdtemp(join(tmpdir(), 'orca-botmux-ipc-ssh-missing-fs-'))
+    const localPath = await mkdtemp(join(tmpdir(), 'botmux-ipc-ssh-missing-fs-'))
     const repo = {
       id: 'repo-ssh-missing-fs',
       path: '/remote/repo',
@@ -8048,7 +8048,7 @@ describe('registerWorktreeHandlers', () => {
     }
     store.getRepo.mockReturnValue(repo)
     store.getWorktreeMeta.mockReturnValue(
-      makeWorktreeMeta({ orcaCreatedAt: Date.now(), orcaCreationSource: 'ssh' })
+      makeWorktreeMeta({ botmuxCreatedAt: Date.now(), botmuxCreationSource: 'ssh' })
     )
     getSshGitProviderMock.mockReturnValue(provider)
     getSshFilesystemProviderMock.mockReturnValue(undefined)
@@ -8099,7 +8099,7 @@ describe('registerWorktreeHandlers', () => {
     }
     store.getRepo.mockReturnValue(repo)
     store.getWorktreeMeta.mockReturnValue(
-      makeWorktreeMeta({ orcaCreatedAt: Date.now(), orcaCreationSource: 'ssh' })
+      makeWorktreeMeta({ botmuxCreatedAt: Date.now(), botmuxCreationSource: 'ssh' })
     )
     getSshGitProviderMock.mockReturnValue(provider)
     getSshFilesystemProviderMock.mockReturnValue(fsProvider)
@@ -8582,7 +8582,7 @@ describe('registerWorktreeHandlers', () => {
     }
     const fsProvider = {
       readFile: vi.fn(async (filePath: string) => {
-        if (filePath.endsWith('/.orca_botmux/issue-command')) {
+        if (filePath.endsWith('/.botmux/issue-command')) {
           return { content: 'local command\n', isBinary: false }
         }
         throw new Error('shared read failed')
@@ -8626,7 +8626,7 @@ describe('registerWorktreeHandlers', () => {
     await expect(
       handlers['hooks:writeIssueCommand'](null, {
         repoId: 'repo-ssh',
-        content: 'orca_botmux issue command'
+        content: 'botmux issue command'
       })
     ).rejects.toThrow('ssh read failed')
 
@@ -8649,7 +8649,7 @@ describe('registerWorktreeHandlers', () => {
     }
     const fsProvider = {
       readFile: vi.fn(async (filePath: string) => {
-        if (filePath.endsWith('/.orca_botmux/issue-command')) {
+        if (filePath.endsWith('/.botmux/issue-command')) {
           return { content: 'remote command\n', isBinary: false }
         }
         throw Object.assign(new Error('missing'), { code: 'ENOENT' })
@@ -8669,7 +8669,7 @@ describe('registerWorktreeHandlers', () => {
       effectiveContent: 'remote command',
       source: 'local'
     })
-    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/.orca_botmux/issue-command')
+    expect(fsProvider.readFile).toHaveBeenCalledWith('/remote/repo/.botmux/issue-command')
   })
 
   it('creates remote .gitignore only when it is missing while writing SSH issue commands', async () => {
@@ -8694,14 +8694,14 @@ describe('registerWorktreeHandlers', () => {
 
     await handlers['hooks:writeIssueCommand'](null, {
       repoId: 'repo-ssh',
-      content: 'orca_botmux issue command'
+      content: 'botmux issue command'
     })
 
-    expect(fsProvider.writeFile).toHaveBeenNthCalledWith(1, '/remote/repo/.gitignore', '.orca_botmux\n')
+    expect(fsProvider.writeFile).toHaveBeenNthCalledWith(1, '/remote/repo/.gitignore', '.botmux\n')
     expect(fsProvider.writeFile).toHaveBeenNthCalledWith(
       2,
-      '/remote/repo/.orca_botmux/issue-command',
-      'orca_botmux issue command\n'
+      '/remote/repo/.botmux/issue-command',
+      'botmux issue command\n'
     )
   })
 
@@ -8721,7 +8721,7 @@ describe('registerWorktreeHandlers', () => {
     await expect(
       handlers['hooks:writeIssueCommand'](null, {
         repoId: 'repo-ssh',
-        content: 'orca_botmux issue command'
+        content: 'botmux issue command'
       })
     ).rejects.toThrow('Remote filesystem unavailable')
   })

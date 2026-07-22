@@ -35,8 +35,8 @@ export function buildNotificationOptions(args: NotificationDispatchRequest): {
 
   if (args.source === 'test') {
     return {
-      title: 'OrcaBotmux notifications are on',
-      body: 'This is a test notification from OrcaBotmux.'
+      title: 'Botmux notifications are on',
+      body: 'This is a test notification from Botmux.'
     }
   }
 

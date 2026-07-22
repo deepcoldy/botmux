@@ -1,5 +1,5 @@
-export const ORCA_EDITOR_SAVE_DIRTY_FILES_EVENT = 'orca_botmux:editor-save-dirty-files'
-export const ORCA_EDITOR_PREPARE_HOT_EXIT_EVENT = 'orca_botmux:editor-prepare-hot-exit'
+export const BOTMUX_EDITOR_SAVE_DIRTY_FILES_EVENT = 'botmux:editor-save-dirty-files'
+export const BOTMUX_EDITOR_PREPARE_HOT_EXIT_EVENT = 'botmux:editor-prepare-hot-exit'
 
 export type EditorSaveDirtyFilesDetail = {
   claim: () => void

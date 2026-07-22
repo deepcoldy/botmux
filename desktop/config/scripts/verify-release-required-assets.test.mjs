@@ -37,10 +37,10 @@ describe('getRequiredReleaseAssetNames', () => {
   it('includes both mac updater ZIP names for the tag version', () => {
     expect(getRequiredReleaseAssetNames('v1.4.27')).toEqual(
       expect.arrayContaining([
-        'OrcaBotmux-1.4.27-mac.zip',
-        'OrcaBotmux-1.4.27-mac.zip.blockmap',
-        'OrcaBotmux-1.4.27-arm64-mac.zip',
-        'OrcaBotmux-1.4.27-arm64-mac.zip.blockmap'
+        'Botmux-1.4.27-mac.zip',
+        'Botmux-1.4.27-mac.zip.blockmap',
+        'Botmux-1.4.27-arm64-mac.zip',
+        'Botmux-1.4.27-arm64-mac.zip.blockmap'
       ])
     )
   })
@@ -49,12 +49,12 @@ describe('getRequiredReleaseAssetNames', () => {
     expect(getRequiredReleaseAssetNames('v1.4.27')).toEqual(
       expect.arrayContaining([
         'latest-linux-arm64.yml',
-        'orca-botmux-linux.AppImage',
-        'orca-botmux-linux-arm64.AppImage',
-        'orca-botmux-ide_1.4.27_amd64.deb',
-        'orca-botmux-ide_1.4.27_arm64.deb',
-        'orca-botmux-ide-1.4.27.x86_64.rpm',
-        'orca-botmux-ide-1.4.27.aarch64.rpm'
+        'botmux-linux.AppImage',
+        'botmux-linux-arm64.AppImage',
+        'botmux-ide_1.4.27_amd64.deb',
+        'botmux-ide_1.4.27_arm64.deb',
+        'botmux-ide-1.4.27.x86_64.rpm',
+        'botmux-ide-1.4.27.aarch64.rpm'
       ])
     )
   })
@@ -66,12 +66,12 @@ describe('extractManifestAssetNames', () => {
       extractManifestAssetNames(
         [
           'files:',
-          '  - url: OrcaBotmux-1.4.27-arm64-mac.zip',
-          '  - url: https://example.com/downloads/orca_botmux-windows-setup.exe',
-          'path: orca_botmux-linux.AppImage'
+          '  - url: Botmux-1.4.27-arm64-mac.zip',
+          '  - url: https://example.com/downloads/botmux-windows-setup.exe',
+          'path: botmux-linux.AppImage'
         ].join('\n')
       )
-    ).toEqual(['OrcaBotmux-1.4.27-arm64-mac.zip', 'orca-botmux-windows-setup.exe', 'orca-botmux-linux.AppImage'])
+    ).toEqual(['Botmux-1.4.27-arm64-mac.zip', 'botmux-windows-setup.exe', 'botmux-linux.AppImage'])
   })
 })
 
@@ -79,7 +79,7 @@ describe('verifyRequiredReleaseAssets', () => {
   it('fails when a manifest-referenced asset has not been uploaded', async () => {
     const tag = 'v1.4.27'
     const required = getRequiredReleaseAssetNames(tag)
-    const assets = required.filter((name) => name !== 'OrcaBotmux-1.4.27-arm64-mac.zip')
+    const assets = required.filter((name) => name !== 'Botmux-1.4.27-arm64-mac.zip')
     const release = releaseWithAssets(tag, assets)
     const latestMacAsset = release.assets.find((asset) => asset.name === 'latest-mac.yml')
     const fetchMock = vi
@@ -90,9 +90,9 @@ describe('verifyRequiredReleaseAssets', () => {
           [
             'version: 1.4.27',
             'files:',
-            '  - url: OrcaBotmux-1.4.27-arm64-mac.zip',
+            '  - url: Botmux-1.4.27-arm64-mac.zip',
             '    sha512: test',
-            'path: OrcaBotmux-1.4.27-arm64-mac.zip'
+            'path: Botmux-1.4.27-arm64-mac.zip'
           ].join('\n')
         )
       )
@@ -100,8 +100,8 @@ describe('verifyRequiredReleaseAssets', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(
-      verifyRequiredReleaseAssets({ repo: 'stablyai/orca_botmux', tag, token: 'token' })
-    ).rejects.toThrow('Missing: OrcaBotmux-1.4.27-arm64-mac.zip')
+      verifyRequiredReleaseAssets({ repo: 'stablyai/botmux', tag, token: 'token' })
+    ).rejects.toThrow('Missing: Botmux-1.4.27-arm64-mac.zip')
     expect(latestMacAsset).toBeTruthy()
   })
 
@@ -119,8 +119,8 @@ describe('verifyRequiredReleaseAssets', () => {
           [
             'version: 1.4.27',
             'files:',
-            '  - url: orca_botmux-linux-arm64.AppImage.blockmap',
-            'path: orca_botmux-linux-arm64.AppImage'
+            '  - url: botmux-linux-arm64.AppImage.blockmap',
+            'path: botmux-linux-arm64.AppImage'
           ].join('\n')
         )
       )
@@ -128,8 +128,8 @@ describe('verifyRequiredReleaseAssets', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     await expect(
-      verifyRequiredReleaseAssets({ repo: 'stablyai/orca_botmux', tag, token: 'token' })
-    ).rejects.toThrow('Missing: orca_botmux-linux-arm64.AppImage.blockmap')
+      verifyRequiredReleaseAssets({ repo: 'stablyai/botmux', tag, token: 'token' })
+    ).rejects.toThrow('Missing: botmux-linux-arm64.AppImage.blockmap')
     expect(arm64Manifest).toBeTruthy()
   })
 })

@@ -33,19 +33,19 @@ vi.mock('../../resources/icon-dev.png?asset', () => ({
   default: 'classic-dev-icon'
 }))
 
-vi.mock('../../resources/app-icons/orca-botmux-watercolor.png?asset', () => ({
+vi.mock('../../resources/app-icons/botmux-watercolor.png?asset', () => ({
   default: 'watercolor-icon'
 }))
 
-vi.mock('../../resources/app-icons/orca-botmux-watercolor.png?asset&asarUnpack', () => ({
+vi.mock('../../resources/app-icons/botmux-watercolor.png?asset&asarUnpack', () => ({
   default: 'watercolor-icon-unpacked'
 }))
 
-vi.mock('../../resources/app-icons/orca-botmux-blue.png?asset', () => ({
+vi.mock('../../resources/app-icons/botmux-blue.png?asset', () => ({
   default: 'blue-icon'
 }))
 
-vi.mock('../../resources/app-icons/orca-botmux-blue.png?asset&asarUnpack', () => ({
+vi.mock('../../resources/app-icons/botmux-blue.png?asset&asarUnpack', () => ({
   default: 'blue-icon-unpacked'
 }))
 
@@ -125,7 +125,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('watercolor', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -137,8 +137,8 @@ describe('app icon selection', () => {
       expect.arrayContaining(['-e', expect.stringContaining('setIcon:image forFile:appPath')]),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_BUNDLE_PATH: '/Applications/OrcaBotmux.app',
-          ORCA_APP_ICON_PATH: 'watercolor-icon-unpacked'
+          BOTMUX_APP_BUNDLE_PATH: '/Applications/Botmux.app',
+          BOTMUX_APP_ICON_PATH: 'watercolor-icon-unpacked'
         })
       }),
       expect.any(Function)
@@ -162,7 +162,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('classic', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -178,7 +178,7 @@ describe('app icon selection', () => {
       ]),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_BUNDLE_PATH: '/Applications/OrcaBotmux.app'
+          BOTMUX_APP_BUNDLE_PATH: '/Applications/Botmux.app'
         }),
         timeout: 10_000
       }),
@@ -186,7 +186,7 @@ describe('app icon selection', () => {
     )
     expect(execFile).toHaveBeenCalledWith(
       '/usr/bin/xattr',
-      ['-d', 'com.apple.FinderInfo', '/Applications/OrcaBotmux.app'],
+      ['-d', 'com.apple.FinderInfo', '/Applications/Botmux.app'],
       expect.objectContaining({
         timeout: 10_000
       }),
@@ -194,7 +194,7 @@ describe('app icon selection', () => {
     )
     expect(execFile).toHaveBeenCalledWith(
       '/usr/bin/xattr',
-      ['-d', 'com.apple.ResourceFork', '/Applications/OrcaBotmux.app'],
+      ['-d', 'com.apple.ResourceFork', '/Applications/Botmux.app'],
       expect.objectContaining({
         timeout: 10_000
       }),
@@ -224,7 +224,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('classic', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -258,7 +258,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('classic', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -291,7 +291,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('watercolor', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -299,13 +299,13 @@ describe('app icon selection', () => {
     await waitForQueuedPersistence()
 
     persistMacDockIcon('blue', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
     })
     persistMacDockIcon('classic', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -317,7 +317,7 @@ describe('app icon selection', () => {
       expect.any(Array),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_ICON_PATH: 'watercolor-icon-unpacked'
+          BOTMUX_APP_ICON_PATH: 'watercolor-icon-unpacked'
         })
       }),
       expect.any(Function)
@@ -332,7 +332,7 @@ describe('app icon selection', () => {
       expect.any(Array),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_ICON_PATH: 'blue-icon-unpacked'
+          BOTMUX_APP_ICON_PATH: 'blue-icon-unpacked'
         })
       }),
       expect.any(Function)
@@ -346,7 +346,7 @@ describe('app icon selection', () => {
       ]),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_BUNDLE_PATH: '/Applications/OrcaBotmux.app'
+          BOTMUX_APP_BUNDLE_PATH: '/Applications/Botmux.app'
         }),
         timeout: 10_000
       }),
@@ -359,7 +359,7 @@ describe('app icon selection', () => {
     expect(execFile).toHaveBeenNthCalledWith(
       3,
       '/usr/bin/xattr',
-      ['-d', 'com.apple.FinderInfo', '/Applications/OrcaBotmux.app'],
+      ['-d', 'com.apple.FinderInfo', '/Applications/Botmux.app'],
       expect.objectContaining({
         timeout: 10_000
       }),
@@ -368,7 +368,7 @@ describe('app icon selection', () => {
     expect(execFile).toHaveBeenNthCalledWith(
       4,
       '/usr/bin/xattr',
-      ['-d', 'com.apple.ResourceFork', '/Applications/OrcaBotmux.app'],
+      ['-d', 'com.apple.ResourceFork', '/Applications/Botmux.app'],
       expect.objectContaining({
         timeout: 10_000
       }),
@@ -405,7 +405,7 @@ describe('app icon selection', () => {
     )
 
     persistMacDockIcon('watercolor', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -413,7 +413,7 @@ describe('app icon selection', () => {
     await waitForQueuedPersistenceMicrotasks()
 
     persistMacDockIcon('blue', {
-      appBundlePath: '/Applications/OrcaBotmux.app',
+      appBundlePath: '/Applications/Botmux.app',
       execFile,
       isDevApp: false,
       platform: 'darwin'
@@ -439,7 +439,7 @@ describe('app icon selection', () => {
       expect.any(Array),
       expect.objectContaining({
         env: expect.objectContaining({
-          ORCA_APP_ICON_PATH: 'blue-icon-unpacked'
+          BOTMUX_APP_ICON_PATH: 'blue-icon-unpacked'
         }),
         timeout: 10_000
       }),

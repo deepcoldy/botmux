@@ -16,7 +16,7 @@ import {
 } from './linear-agent-skill-setup-reminder-toast'
 import { getExistingLinearAgentSkillSetupReminderState } from './linear-agent-skill-setup-reminders'
 
-const HOST_DISMISS_STORAGE_KEY = 'orca_botmux.linearTicketsSkill.setupDismissed.host'
+const HOST_DISMISS_STORAGE_KEY = 'botmux.linearTicketsSkill.setupDismissed.host'
 
 const mocks = vi.hoisted(() => ({
   skillState: {
@@ -50,8 +50,8 @@ vi.mock('@/hooks/useInstalledAgentSkills', async (importOriginal) => ({
 
 vi.mock('@/lib/agent-skill-cli-prerequisite', () => ({
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE: 'CLI registration notice',
-  ensureOrcaCliAvailableForAgentSkillTerminal: mocks.ensureCli,
-  isOrcaCliAvailableOnPath: (status: CliInstallStatus | null | undefined) =>
+  ensureBotmuxCliAvailableForAgentSkillTerminal: mocks.ensureCli,
+  isBotmuxCliAvailableOnPath: (status: CliInstallStatus | null | undefined) =>
     status?.state === 'installed' && status.pathConfigured
 }))
 
@@ -95,15 +95,15 @@ let container: HTMLDivElement | null = null
 function cliStatus(overrides: Partial<CliInstallStatus>): CliInstallStatus {
   return {
     platform: 'darwin',
-    commandName: 'orca_botmux',
-    commandPath: '/usr/local/bin/orca_botmux',
+    commandName: 'botmux',
+    commandPath: '/usr/local/bin/botmux',
     pathDirectory: '/usr/local/bin',
     pathConfigured: true,
-    launcherPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+    launcherPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
     installMethod: 'symlink',
     supported: true,
     state: 'installed',
-    currentTarget: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+    currentTarget: '/Applications/Botmux.app/Contents/MacOS/Botmux',
     unsupportedReason: null,
     detail: null,
     ...overrides
@@ -215,11 +215,11 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
       'Enable agents to read and edit the attached Linear ticket.'
     )
     expect(toast.warning).toHaveBeenCalledWith(
-      'OrcaBotmux CLI and Linear skill are missing',
+      'Botmux CLI and Linear skill are missing',
       expect.objectContaining({
-        id: 'linear-agent-skill-setup-orca_botmux.linearTicketsSkill.setupDismissed.host',
+        id: 'linear-agent-skill-setup-botmux.linearTicketsSkill.setupDismissed.host',
         description:
-          'Install the OrcaBotmux CLI and the Linear skill to enable your agents to read and edit Linear tasks.',
+          'Install the Botmux CLI and the Linear skill to enable your agents to read and edit Linear tasks.',
         action: {
           label: 'Set up',
           onClick: expect.any(Function)
@@ -228,15 +228,15 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
     )
   })
 
-  it('does not repeat the OrcaBotmux CLI in CLI-only reminder toast copy', async () => {
+  it('does not repeat the Botmux CLI in CLI-only reminder toast copy', async () => {
     mocks.skillState.installed = true
     await snoozeInitialModal({ linked: true, remote: false, surface: 'modal' })
     await renderPrompt({ linked: true, remote: false, surface: 'modal' })
 
     expect(toast.warning).toHaveBeenCalledWith(
-      'OrcaBotmux CLI is missing',
+      'Botmux CLI is missing',
       expect.objectContaining({
-        description: 'Install the OrcaBotmux CLI to enable your agents to read and edit Linear tasks.'
+        description: 'Install the Botmux CLI to enable your agents to read and edit Linear tasks.'
       })
     )
   })
@@ -246,10 +246,10 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
     await renderPrompt({ linked: true, remote: true, surface: 'modal' })
 
     expect(toast.warning).toHaveBeenCalledWith(
-      'OrcaBotmux CLI and Linear skill are missing',
+      'Botmux CLI and Linear skill are missing',
       expect.objectContaining({
         description:
-          'Install the OrcaBotmux CLI and the Linear skill to enable your agents to read and edit Linear tasks. Remote agent environments may need their own setup.'
+          'Install the Botmux CLI and the Linear skill to enable your agents to read and edit Linear tasks. Remote agent environments may need their own setup.'
       })
     )
   })
@@ -271,10 +271,10 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
     await renderPrompt(wslProps)
 
     expect(toast.warning).toHaveBeenCalledWith(
-      'OrcaBotmux CLI and Linear skill are missing',
+      'Botmux CLI and Linear skill are missing',
       expect.objectContaining({
         description:
-          'Install the OrcaBotmux CLI and the Linear skill to enable your agents to read and edit Linear tasks. This setup runs in the selected WSL agent runtime.'
+          'Install the Botmux CLI and the Linear skill to enable your agents to read and edit Linear tasks. This setup runs in the selected WSL agent runtime.'
       })
     )
   })
@@ -295,7 +295,7 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
     )
     expect(document.body.textContent).toContain('Mock install')
     expect(toast.dismiss).toHaveBeenCalledWith(
-      'linear-agent-skill-setup-orca_botmux.linearTicketsSkill.setupDismissed.host'
+      'linear-agent-skill-setup-botmux.linearTicketsSkill.setupDismissed.host'
     )
   })
 
@@ -321,7 +321,7 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
 
     expect(getExistingLinearAgentSkillSetupReminderState(HOST_DISMISS_STORAGE_KEY)).toBeUndefined()
     expect(toast.dismiss).toHaveBeenCalledWith(
-      'linear-agent-skill-setup-orca_botmux.linearTicketsSkill.setupDismissed.host'
+      'linear-agent-skill-setup-botmux.linearTicketsSkill.setupDismissed.host'
     )
   })
 
@@ -348,7 +348,7 @@ describe('LinearAgentSkillSetupPrompt reminder toast', () => {
 
     expect(window.localStorage.getItem(HOST_DISMISS_STORAGE_KEY)).toBe('1')
     expect(toast.dismiss).toHaveBeenCalledWith(
-      'linear-agent-skill-setup-orca_botmux.linearTicketsSkill.setupDismissed.host'
+      'linear-agent-skill-setup-botmux.linearTicketsSkill.setupDismissed.host'
     )
   })
 })

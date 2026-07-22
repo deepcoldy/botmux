@@ -9,7 +9,7 @@ import { FeatureWallClickRing } from './FeatureWallClickRing'
 import { CodexInlineIcon } from './feature-tour-preview-glyphs'
 import { translate } from '@/i18n/i18n'
 
-// Why: the right-click menu needs the same icons as the real OrcaBotmux menu so the
+// Why: the right-click menu needs the same icons as the real Botmux menu so the
 // visual reads as the actual product, not a generic terminal mockup.
 function SplitRightIcon(): JSX.Element {
   return (

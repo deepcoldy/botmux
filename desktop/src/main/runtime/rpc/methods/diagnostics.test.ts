@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import { DIAGNOSTICS_METHODS } from './diagnostics'
 
 function makeRequest(method: string, params?: unknown): RpcRequest {
@@ -35,7 +35,7 @@ describe('diagnostics RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       getMemorySnapshot: vi.fn().mockResolvedValue(snapshot)
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: DIAGNOSTICS_METHODS })
 
     const response = await dispatcher.dispatch(makeRequest('diagnostics.memory'))

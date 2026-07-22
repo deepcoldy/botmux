@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   focusActiveTerminalInput,
@@ -55,20 +55,20 @@ function countOccurrences(value: string, needle: string): number {
 test.describe('split terminal pane paste ownership', () => {
   test('keyboard paste writes only to the active split pane PTY', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await focusLastTerminalPane(orcaBotmuxPage)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await focusLastTerminalPane(botmuxPage)
 
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const activePane = snapshot.panes.find((pane) => pane.leafId === snapshot.activeLeafId)
     const inactivePane = snapshot.panes.find((pane) => pane.leafId !== snapshot.activeLeafId)
     if (!activePane?.ptyId || !inactivePane?.ptyId) {
@@ -76,23 +76,23 @@ test.describe('split terminal pane paste ownership', () => {
     }
 
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-split-paste-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-split-paste-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, activePane.ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, activePane.ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `SPLIT_PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `SPLIT_PASTE_READY_${runId}`, 10_000)
 
-      const payload = `ORCA_E2E_SPLIT_PASTE_${runId}`
+      const payload = `BOTMUX_E2E_SPLIT_PASTE_${runId}`
       const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
       await clearTerminalPtyWriteLog(electronApp)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await focusActiveTerminalInput(botmuxPage)
 
-      await orcaBotmuxPage.keyboard.press(keyboardPasteChord())
-      await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+      await botmuxPage.keyboard.press(keyboardPasteChord())
+      await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
       const writes = await readTerminalPtyWriteEntries(electronApp)
       const activeWrites = writes
@@ -107,7 +107,7 @@ test.describe('split terminal pane paste ownership', () => {
       expect(inactiveWrites).not.toContain(payload)
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, activePane.ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, activePane.ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -115,20 +115,20 @@ test.describe('split terminal pane paste ownership', () => {
 
   test('internal file drop writes only to the pane under the drop target', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    await focusLastTerminalPane(orcaBotmuxPage)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    await focusLastTerminalPane(botmuxPage)
 
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     const activePane = snapshot.panes.find((pane) => pane.leafId === snapshot.activeLeafId)
     const dropPane = snapshot.panes.find((pane) => pane.leafId !== snapshot.activeLeafId)
     if (!activePane?.ptyId || !dropPane?.ptyId) {
@@ -140,7 +140,7 @@ test.describe('split terminal pane paste ownership', () => {
     const dropMarker = path.basename(dropPath)
 
     await clearTerminalPtyWriteLog(electronApp)
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ leafId, pathValue }) => {
         const state = window.__store?.getState()
         const tabId =
@@ -155,7 +155,7 @@ test.describe('split terminal pane paste ownership', () => {
           throw new Error('Drop target pane not found')
         }
         const dataTransfer = new DataTransfer()
-        dataTransfer.setData('text/x-orca-botmux-file-path', pathValue)
+        dataTransfer.setData('text/x-botmux-file-path', pathValue)
         const target = pane.container.querySelector('.xterm-screen, textarea') ?? pane.container
         for (const eventType of ['dragenter', 'dragover', 'drop']) {
           target.dispatchEvent(

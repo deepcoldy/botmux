@@ -2,20 +2,20 @@ import type { BrowserGrabRect, BrowserGrabScreenshot } from '../../shared/browse
 import { GRAB_BUDGET } from '../../shared/browser-grab-types'
 
 const HIDE_BROWSER_GRAB_OVERLAY_SCRIPT = `(function(){
-  var g = window.__orcaGrab;
+  var g = window.__botmuxGrab;
   if (g && g.host) g.host.style.display = 'none';
-  document.querySelectorAll('[data-orca-botmux-browser-annotation-overlay]').forEach(function(el) {
-    el.setAttribute('data-orca-botmux-previous-display', el.style.display || '');
+  document.querySelectorAll('[data-botmux-browser-annotation-overlay]').forEach(function(el) {
+    el.setAttribute('data-botmux-previous-display', el.style.display || '');
     el.style.display = 'none';
   });
 })()`
 
 const RESTORE_BROWSER_GRAB_OVERLAY_SCRIPT = `(function(){
-  var g = window.__orcaGrab;
+  var g = window.__botmuxGrab;
   if (g && g.host) g.host.style.display = '';
-  document.querySelectorAll('[data-orca-botmux-browser-annotation-overlay]').forEach(function(el) {
-    el.style.display = el.getAttribute('data-orca-botmux-previous-display') || '';
-    el.removeAttribute('data-orca-botmux-previous-display');
+  document.querySelectorAll('[data-botmux-browser-annotation-overlay]').forEach(function(el) {
+    el.style.display = el.getAttribute('data-botmux-previous-display') || '';
+    el.removeAttribute('data-botmux-previous-display');
   });
 })()`
 

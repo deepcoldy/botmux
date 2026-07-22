@@ -1,4 +1,4 @@
-import type { OrcaVmRecipe } from '../shared/types'
+import type { BotmuxVmRecipe } from '../shared/types'
 import {
   listEphemeralVmRuntimes,
   updateEphemeralVmRuntimeStatus,
@@ -19,7 +19,7 @@ import {
 export type ProvisionEphemeralVmRuntimeArgs = {
   userDataPath: string
   repoPath: string
-  recipe: OrcaVmRecipe
+  recipe: BotmuxVmRecipe
   repoId?: string
   projectId?: string
   workspaceId?: string
@@ -27,7 +27,7 @@ export type ProvisionEphemeralVmRuntimeArgs = {
   repoUrl?: string
   branch?: string
   ref?: string
-  orcaVersion?: string
+  botmuxVersion?: string
   now?: number
   signal?: AbortSignal
   onStdout?: (chunk: string) => void
@@ -48,7 +48,7 @@ export type ProvisionEphemeralVmRuntimeResult =
 export type CleanupEphemeralVmRuntimeArgs = {
   userDataPath: string
   repoPath: string
-  recipe: OrcaVmRecipe
+  recipe: BotmuxVmRecipe
   runtimeId: string
   now?: number
   signal?: AbortSignal
@@ -105,7 +105,7 @@ export async function provisionEphemeralVmRuntime(
       repoUrl: args.repoUrl,
       branch: args.branch,
       ref: args.ref,
-      orcaVersion: args.orcaVersion
+      botmuxVersion: args.botmuxVersion
     },
     signal: args.signal,
     onStdout: args.onStdout,

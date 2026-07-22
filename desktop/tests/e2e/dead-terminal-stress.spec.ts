@@ -8,7 +8,7 @@
  * All tests require @headful mode for WebGL to be active.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   waitForSessionReady,
   waitForActiveWorktree,
@@ -28,12 +28,12 @@ const STRESS_ITERATIONS = 5
 test.describe('Dead Terminal Stress @headful', () => {
   const createdWorktreeIds: string[] = []
 
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
 
-    await orcaBotmuxPage.evaluate(async () => {
+    await botmuxPage.evaluate(async () => {
       const state = window.__store?.getState()
       if (!state) {
         return
@@ -42,9 +42,9 @@ test.describe('Dead Terminal Stress @headful', () => {
     })
   })
 
-  test.afterEach(async ({ orcaBotmuxPage }) => {
+  test.afterEach(async ({ botmuxPage }) => {
     for (const id of createdWorktreeIds) {
-      await removeWorktreeViaStore(orcaBotmuxPage, id)
+      await removeWorktreeViaStore(botmuxPage, id)
     }
     createdWorktreeIds.length = 0
   })
@@ -55,21 +55,21 @@ test.describe('Dead Terminal Stress @headful', () => {
    * pressure — especially with many worktrees open. The recovery path is:
    * onContextLoss → dispose WebGL → DOM fallback → rAF → fit + refresh.
    */
-  test('@headful setup-split with forced WebGL context loss recovers', async ({ orcaBotmuxPage }) => {
+  test('@headful setup-split with forced WebGL context loss recovers', async ({ botmuxPage }) => {
     test.setTimeout(120_000)
-    const homeWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    const homeWorktreeId = await waitForActiveWorktree(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     for (let i = 0; i < STRESS_ITERATIONS; i++) {
-      const newId = await createAndActivateWorktreeWithSetup(orcaBotmuxPage, `ctxloss-${i}`, 'vertical')
+      const newId = await createAndActivateWorktreeWithSetup(botmuxPage, `ctxloss-${i}`, 'vertical')
       createdWorktreeIds.push(newId)
 
-      await expect.poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 10_000 }).toBe(newId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await waitForPaneCount(orcaBotmuxPage, 2, 15_000)
+      await expect.poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 10_000 }).toBe(newId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await waitForPaneCount(botmuxPage, 2, 15_000)
 
-      const lostCount = await orcaBotmuxPage.evaluate(() => {
+      const lostCount = await botmuxPage.evaluate(() => {
         const canvases = document.querySelectorAll('.pane canvas:not(.xterm-link-layer)')
         let lost = 0
         for (const canvas of canvases) {
@@ -90,14 +90,14 @@ test.describe('Dead Terminal Stress @headful', () => {
         console.log(`[ctxloss-${i}] Forced context loss on ${lostCount} canvases`)
       }
 
-      await orcaBotmuxPage.waitForTimeout(500)
-      await waitForAllPanesToHaveContent(orcaBotmuxPage, `ctxloss-${i} after context loss`)
+      await botmuxPage.waitForTimeout(500)
+      await waitForAllPanesToHaveContent(botmuxPage, `ctxloss-${i} after context loss`)
 
-      await switchToWorktree(orcaBotmuxPage, homeWorktreeId)
+      await switchToWorktree(botmuxPage, homeWorktreeId)
       await expect
-        .poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 10_000 })
+        .poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 10_000 })
         .toBe(homeWorktreeId)
-      await removeWorktreeViaStore(orcaBotmuxPage, newId)
+      await removeWorktreeViaStore(botmuxPage, newId)
       createdWorktreeIds.pop()
     }
   })
@@ -107,33 +107,33 @@ test.describe('Dead Terminal Stress @headful', () => {
    * race between wrapInSplit() reparenting, WebGL context creation during
    * resumeRendering(), and the scheduleSplitScrollRestore 200ms timer.
    */
-  test('@headful rapid worktree switching during setup-split lifecycle', async ({ orcaBotmuxPage }) => {
+  test('@headful rapid worktree switching during setup-split lifecycle', async ({ botmuxPage }) => {
     test.setTimeout(120_000)
-    const homeWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    const homeWorktreeId = await waitForActiveWorktree(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     for (let i = 0; i < 3; i++) {
-      const newId = await createAndActivateWorktreeWithSetup(orcaBotmuxPage, `rapid-${i}`, 'vertical')
+      const newId = await createAndActivateWorktreeWithSetup(botmuxPage, `rapid-${i}`, 'vertical')
       createdWorktreeIds.push(newId)
 
       // Switch away during the ~200ms scheduleSplitScrollRestore window
-      await orcaBotmuxPage.waitForTimeout(50)
-      await switchToWorktree(orcaBotmuxPage, homeWorktreeId)
-      await orcaBotmuxPage.waitForTimeout(50)
+      await botmuxPage.waitForTimeout(50)
+      await switchToWorktree(botmuxPage, homeWorktreeId)
+      await botmuxPage.waitForTimeout(50)
 
       // Switch back — triggers resumeRendering on partially-initialized panes
-      await switchToWorktree(orcaBotmuxPage, newId)
-      await expect.poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 10_000 }).toBe(newId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      await waitForPaneCount(orcaBotmuxPage, 2, 15_000)
-      await waitForAllPanesToHaveContent(orcaBotmuxPage, `rapid-${i} after return`)
+      await switchToWorktree(botmuxPage, newId)
+      await expect.poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 10_000 }).toBe(newId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      await waitForPaneCount(botmuxPage, 2, 15_000)
+      await waitForAllPanesToHaveContent(botmuxPage, `rapid-${i} after return`)
 
-      await switchToWorktree(orcaBotmuxPage, homeWorktreeId)
+      await switchToWorktree(botmuxPage, homeWorktreeId)
       await expect
-        .poll(async () => getActiveWorktreeId(orcaBotmuxPage), { timeout: 10_000 })
+        .poll(async () => getActiveWorktreeId(botmuxPage), { timeout: 10_000 })
         .toBe(homeWorktreeId)
-      await removeWorktreeViaStore(orcaBotmuxPage, newId)
+      await removeWorktreeViaStore(botmuxPage, newId)
       createdWorktreeIds.pop()
     }
   })

@@ -16,7 +16,7 @@
 }
 
 @font-face {
-  font-family: 'OrcaBotmux Nerd Font Symbols';
+  font-family: 'Botmux Nerd Font Symbols';
   src: url('./fonts/SymbolsNerdFontMono-Regular.woff2') format('woff2');
   font-weight: 400;
   font-style: normal;
@@ -357,7 +357,7 @@
 
 [data-sonner-toaster] [data-sonner-toast][data-styled='true'] [data-close-button] {
   /* Why: Sonner's dark-theme defaults can resolve the close icon and button
-     background to the same color; keep the X readable on both OrcaBotmux themes. */
+     background to the same color; keep the X readable on both Botmux themes. */
   color: var(--popover-foreground);
   background: var(--popover);
   border-color: rgb(0 0 0 / 0.14);
@@ -1132,6 +1132,149 @@
 
 .worktree-agent-row-hover:hover {
   background: color-mix(in srgb, var(--sidebar-foreground) 1.25%, transparent);
+}
+
+/* ── Apple-style app-wide motion (WWDC "Designing Fluid Interfaces") ───────
+   Spring curve (damping≈1.0, response 0.3–0.4) for shared overlay primitives;
+   exits stay quick. Unlayered rules intentionally beat the tailwindcss-animate
+   defaults in the cascade. */
+:root {
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-press: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+[data-slot='dropdown-menu-content'][data-state='open'],
+[data-slot='dropdown-menu-sub-content'][data-state='open'],
+[data-slot='context-menu-content'][data-state='open'],
+[data-slot='context-menu-sub-content'][data-state='open'],
+[data-slot='popover-content'][data-state='open'],
+[data-slot='tooltip-content'][data-state='open'] {
+  animation-duration: 220ms;
+  animation-timing-function: var(--ease-spring);
+}
+[data-slot='dropdown-menu-content'][data-state='closed'],
+[data-slot='dropdown-menu-sub-content'][data-state='closed'],
+[data-slot='context-menu-content'][data-state='closed'],
+[data-slot='context-menu-sub-content'][data-state='closed'],
+[data-slot='popover-content'][data-state='closed'],
+[data-slot='tooltip-content'][data-state='closed'] {
+  animation-duration: 120ms;
+}
+[data-slot='dialog-content'][data-state='open'] {
+  animation-duration: 260ms;
+  animation-timing-function: var(--ease-spring);
+}
+[data-slot='dialog-content'][data-state='closed'],
+[data-slot='dialog-overlay'][data-state='closed'] {
+  animation-duration: 140ms;
+}
+
+/* Apple "kill latency": every Button gives press feedback on pointer-down
+   (fast ease-out into 3% squash, spring back on release). The `scale`
+   independent property composes with Tailwind v4 transform utilities. */
+[data-slot='button'] {
+  transition-timing-function: var(--ease-spring);
+}
+[data-slot='button']:not(:disabled):active {
+  scale: 0.97;
+  transition-duration: 80ms;
+  transition-timing-function: var(--ease-press);
+}
+
+/* ── Apple-style motion for the Botmux sidebar section ─────────────────────
+   WWDC "Designing Fluid Interfaces" translated: spring curves (damping≈1.0,
+   response 0.3–0.4) over duration easings; press feedback on pointer-down;
+   expand/collapse that telegraphs the destination; scroll-edge fades over
+   hard dividers; reduced-motion fallbacks. Scoped to botmux-* so the vendored
+   worktree UI keeps its own motion. */
+:root {
+  /* damping 1.0 / response ~0.35 — the everyday iOS spring approximation */
+  --botmux-ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
+  /* press feedback: fast ease-out on pointer-down */
+  --botmux-ease-press: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+/* Collapsible region: grid-rows 0fr→1fr keeps content mounted, so the
+   animation is interruptible mid-flight and needs no JS measurement. */
+.botmux-collapsible {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.35s var(--botmux-ease-spring);
+}
+.botmux-collapsible[data-open='true'] {
+  grid-template-rows: 1fr;
+}
+.botmux-collapsible > .botmux-collapsible-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+
+/* "Materialize, don't just fade": blur + rise + fade together for the
+   pinned worktree group appearing on top of the tree. */
+@keyframes botmux-materialize {
+  from {
+    opacity: 0;
+    transform: translateY(-3px) scale(0.995);
+    filter: blur(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+.botmux-materialize {
+  animation: botmux-materialize 0.32s var(--botmux-ease-spring) both;
+}
+
+/* Scroll-edge fades instead of hard dividers. Direction-aware (component
+   tracks scroll position): an edge fades only when more content lies beyond
+   it, so the topmost row never looks clipped at rest. */
+.botmux-scroll-fade[data-fade-top='true'][data-fade-bottom='true'] {
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0,
+    black 10px,
+    black calc(100% - 10px),
+    transparent 100%
+  );
+}
+.botmux-scroll-fade[data-fade-top='true']:not([data-fade-bottom='true']) {
+  mask-image: linear-gradient(to bottom, transparent 0, black 10px);
+}
+.botmux-scroll-fade[data-fade-bottom='true']:not([data-fade-top='true']) {
+  mask-image: linear-gradient(to top, transparent 0, black 10px);
+}
+
+/* Spring-tuned dropdown entrance: keeps the primitive's enter/exit keyframes,
+   swaps in the spring curve + longer response on open. */
+.botmux-menu-content[data-state='open'] {
+  animation-duration: 220ms;
+  animation-timing-function: var(--botmux-ease-spring);
+}
+.botmux-menu-content[data-state='closed'] {
+  animation-duration: 120ms;
+}
+
+/* Botmux session row selection: soft accent wash à la macOS sidebar
+   (scoped — the vendored worktree cards keep their own active style). */
+.botmux-session-row[data-worktree-card-active='primary'] {
+  border-color: color-mix(in srgb, var(--primary) 22%, transparent);
+  background: color-mix(in srgb, var(--primary) 9%, transparent);
+  box-shadow: none;
+}
+.dark .botmux-session-row[data-worktree-card-active='primary'] {
+  border-color: color-mix(in srgb, var(--primary) 30%, transparent);
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .botmux-collapsible {
+    transition: none;
+  }
+  .botmux-materialize {
+    animation: none;
+  }
 }
 
 .worktree-agent-row-hover[data-focused-agent-pane='true'] {
@@ -2023,41 +2166,41 @@
 
 /* ── Git conflict decorations ───────────────────────────────────── */
 
-.monaco-editor .orca-botmux-conflict-marker-line {
+.monaco-editor .botmux-conflict-marker-line {
   background: color-mix(in srgb, var(--destructive) 12%, transparent);
 }
 
-.monaco-editor .orca-botmux-conflict-section-line {
+.monaco-editor .botmux-conflict-section-line {
   border-left: 3px solid transparent;
 }
 
-.monaco-editor .orca-botmux-conflict-current-line {
+.monaco-editor .botmux-conflict-current-line {
   background: color-mix(in srgb, var(--git-decoration-modified) 12%, transparent);
   border-left-color: color-mix(in srgb, var(--git-decoration-modified) 72%, transparent);
 }
 
-.monaco-editor .orca-botmux-conflict-base-line {
+.monaco-editor .botmux-conflict-base-line {
   background: color-mix(in srgb, var(--muted-foreground) 7%, transparent);
   border-left-color: color-mix(in srgb, var(--muted-foreground) 36%, transparent);
 }
 
-.monaco-editor .orca-botmux-conflict-incoming-line {
+.monaco-editor .botmux-conflict-incoming-line {
   background: color-mix(in srgb, var(--git-decoration-renamed) 11%, transparent);
   border-left-color: color-mix(in srgb, var(--git-decoration-renamed) 68%, transparent);
 }
 
-.monaco-editor .orca-botmux-conflict-line-decoration {
+.monaco-editor .botmux-conflict-line-decoration {
   width: 4px !important;
   margin-left: 3px;
   background: var(--destructive);
   border-radius: 999px;
 }
 
-.monaco-editor .orca-botmux-conflict-margin {
+.monaco-editor .botmux-conflict-margin {
   background: color-mix(in srgb, var(--destructive) 8%, transparent);
 }
 
-.monaco-editor .orca-botmux-conflict-marker-label {
+.monaco-editor .botmux-conflict-marker-label {
   color: var(--destructive);
   font-family: var(--font-sans, system-ui, sans-serif);
   font-size: 11px;
@@ -2585,12 +2728,12 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
   }
 }
 
-.orca-botmux-contextual-tour-target-rings {
+.botmux-contextual-tour-target-rings {
   border-radius: 9999px;
   pointer-events: none;
 }
 
-.orca-botmux-contextual-tour-target-rings::before {
+.botmux-contextual-tour-target-rings::before {
   content: '';
   position: absolute;
   inset: -2px;
@@ -2615,7 +2758,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .orca-botmux-contextual-tour-target-rings::before {
+  .botmux-contextual-tour-target-rings::before {
     animation: none;
     opacity: 0.72;
     transform: scale(1.28);
@@ -3142,7 +3285,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
    useDiffCommentDecorator. Keep it visually subtle until hovered so it does
    not distract from the diff itself. Left position overlaps the glyph margin
    so the affordance reads as "add comment on this line". */
-.orca-botmux-diff-comment-add-btn {
+.botmux-diff-comment-add-btn {
   position: absolute;
   left: 4px;
   width: 18px;
@@ -3166,27 +3309,27 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     box-shadow 100ms ease;
 }
 
-.orca-botmux-diff-comment-add-btn:hover {
+.botmux-diff-comment-add-btn:hover {
   color: var(--primary);
   border-color: color-mix(in srgb, var(--primary) 52%, var(--border));
   background: color-mix(in srgb, var(--primary) 12%, var(--background));
   box-shadow: 0 1px 4px color-mix(in srgb, var(--foreground) 16%, transparent);
 }
 
-.orca-botmux-diff-comment-add-btn:focus-visible {
+.botmux-diff-comment-add-btn:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 1px;
 }
 
-.orca-botmux-diff-comment-range-highlight {
+.botmux-diff-comment-range-highlight {
   background: rgba(59, 130, 246, 0.14);
 }
 
-.dark .orca-botmux-diff-comment-range-highlight {
+.dark .botmux-diff-comment-range-highlight {
   background: rgba(96, 165, 250, 0.18);
 }
 
-.orca-botmux-diff-comment-inline {
+.botmux-diff-comment-inline {
   width: 100%;
   /* Why: Monaco's view-zone node already starts after the diff gutter. Avoid
      adding a second left inset so saved notes sit flush with the code column. */
@@ -3194,7 +3337,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
   box-sizing: border-box;
 }
 
-.orca-botmux-diff-comment-inline > .orca-botmux-diff-comment-card {
+.botmux-diff-comment-inline > .botmux-diff-comment-card {
   max-width: 420px;
 }
 
@@ -3206,7 +3349,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
    to produce roughly the same absolute luminance delta above its editor
    surface — the foreground color is different (white vs black) so equal
    percentages would not give equal contrast. Override lives in `.dark`. */
-.orca-botmux-diff-comment-card {
+.botmux-diff-comment-card {
   position: relative;
   /* Why: Monaco's view-lines overlay (data-mprt=8) is positioned absolutely on
      top of view-zone DOM. Without an explicit z-index here, clicks on
@@ -3230,7 +3373,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     background-color 150ms ease;
 }
 
-.dark .orca-botmux-diff-comment-card {
+.dark .botmux-diff-comment-card {
   border-color: color-mix(in srgb, var(--foreground) 12%, var(--border));
   background: color-mix(in srgb, var(--foreground) 2%, var(--editor-surface));
   box-shadow:
@@ -3239,7 +3382,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Content Column */
-.orca-botmux-diff-comment-content-col {
+.botmux-diff-comment-content-col {
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
@@ -3248,7 +3391,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Header Row */
-.orca-botmux-diff-comment-header {
+.botmux-diff-comment-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3257,7 +3400,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Meta Group (Name, line, timestamp) */
-.orca-botmux-diff-comment-meta-group {
+.botmux-diff-comment-meta-group {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -3270,7 +3413,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Action button pill: segmented control like Notion's Resolve / ... */
-.orca-botmux-diff-comment-actions-pill {
+.botmux-diff-comment-actions-pill {
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -3282,12 +3425,12 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
 }
 
-.dark .orca-botmux-diff-comment-actions-pill {
+.dark .botmux-diff-comment-actions-pill {
   border-color: color-mix(in srgb, var(--foreground) 14%, var(--border));
   background: color-mix(in srgb, var(--foreground) 4%, var(--editor-surface));
 }
 
-.orca-botmux-diff-comment-pill-btn {
+.botmux-diff-comment-pill-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3305,24 +3448,24 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     color 100ms ease;
 }
 
-.orca-botmux-diff-comment-edit {
+.botmux-diff-comment-edit {
   min-width: 28px;
   height: 24px;
   padding: 4px 7px;
   border-radius: 4px;
 }
 
-.orca-botmux-diff-comment-pill-btn:hover {
+.botmux-diff-comment-pill-btn:hover {
   background: color-mix(in srgb, var(--foreground) 6%, transparent);
   color: var(--foreground);
 }
 
-.orca-botmux-diff-comment-pill-btn-danger:hover {
+.botmux-diff-comment-pill-btn-danger:hover {
   background: color-mix(in srgb, var(--destructive) 10%, transparent);
   color: var(--destructive);
 }
 
-.orca-botmux-diff-comment-pill-divider {
+.botmux-diff-comment-pill-divider {
   width: 1px;
   height: 12px;
   background: color-mix(in srgb, var(--foreground) 12%, var(--border));
@@ -3330,7 +3473,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Quote/Reference block: Warm, gorgeous Notion-like callout */
-.orca-botmux-diff-comment-quote {
+.botmux-diff-comment-quote {
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -3342,7 +3485,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
   line-height: 1.35;
 }
 
-.orca-botmux-diff-comment-quote-text {
+.botmux-diff-comment-quote-text {
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -3351,7 +3494,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Comment Body */
-.orca-botmux-diff-comment-body {
+.botmux-diff-comment-body {
   font-size: 13.5px;
   line-height: 1.5;
   color: var(--foreground);
@@ -3361,7 +3504,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Popover for adding new comment */
-.orca-botmux-diff-comment-popover {
+.botmux-diff-comment-popover {
   position: absolute;
   left: 56px;
   right: 24px;
@@ -3377,7 +3520,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     0 4px 12px rgba(0, 0, 0, 0.08);
 }
 
-.dark .orca-botmux-diff-comment-popover {
+.dark .botmux-diff-comment-popover {
   border-color: color-mix(in srgb, var(--foreground) 14%, var(--border));
   background: color-mix(in srgb, var(--foreground) 2%, var(--editor-surface));
   box-shadow:
@@ -3385,7 +3528,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     0 4px 16px rgba(0, 0, 0, 0.2);
 }
 
-.orca-botmux-diff-comment-popover-label {
+.botmux-diff-comment-popover-label {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
@@ -3394,7 +3537,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
   margin-bottom: 2px;
 }
 
-.orca-botmux-diff-comment-popover-textarea {
+.botmux-diff-comment-popover-textarea {
   width: 100%;
   min-height: 56px;
   max-height: 240px;
@@ -3414,36 +3557,36 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     box-shadow 150ms ease;
 }
 
-.dark .orca-botmux-diff-comment-popover-textarea {
+.dark .botmux-diff-comment-popover-textarea {
   border-color: color-mix(in srgb, var(--foreground) 10%, var(--border));
   background: color-mix(in srgb, var(--foreground) 3%, var(--editor-surface));
 }
 
-.orca-botmux-diff-comment-popover-textarea:focus {
+.botmux-diff-comment-popover-textarea:focus {
   border-color: color-mix(in srgb, var(--ring) 70%, var(--border));
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 18%, transparent);
 }
 
-.dark .orca-botmux-diff-comment-popover-textarea:focus {
+.dark .botmux-diff-comment-popover-textarea:focus {
   border-color: color-mix(in srgb, var(--ring) 70%, var(--border));
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 12%, transparent);
 }
 
-.orca-botmux-diff-comment-popover-textarea::-webkit-scrollbar {
+.botmux-diff-comment-popover-textarea::-webkit-scrollbar {
   width: 12px;
 }
 
-.orca-botmux-diff-comment-popover-textarea::-webkit-scrollbar-track {
+.botmux-diff-comment-popover-textarea::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.orca-botmux-diff-comment-popover-textarea::-webkit-scrollbar-thumb {
+.botmux-diff-comment-popover-textarea::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--muted-foreground, #737373) 28%, transparent);
   border: 3px solid transparent;
   background-clip: padding-box;
 }
 
-.orca-botmux-diff-comment-popover-footer {
+.botmux-diff-comment-popover-footer {
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -3452,7 +3595,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
 }
 
 /* Why: tours need a distinct item surface without highlighting the underlying target. */
-.orca-botmux-contextual-tour-panel {
+.botmux-contextual-tour-panel {
   --contextual-tour-panel-surface: color-mix(in srgb, var(--foreground) 7%, var(--popover));
   --contextual-tour-panel-border: color-mix(in srgb, var(--foreground) 14%, var(--border));
   background: var(--contextual-tour-panel-surface);
@@ -3462,7 +3605,7 @@ html.onboarding-tour-start-transition::view-transition-new(root) {
     0 10px 24px rgba(0, 0, 0, 0.18);
 }
 
-.dark .orca-botmux-contextual-tour-panel {
+.dark .botmux-contextual-tour-panel {
   --contextual-tour-panel-surface: color-mix(in srgb, var(--foreground) 10%, var(--popover));
   --contextual-tour-panel-border: color-mix(in srgb, var(--foreground) 16%, var(--border));
   box-shadow:

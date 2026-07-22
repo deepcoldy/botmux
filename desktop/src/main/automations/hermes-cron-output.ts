@@ -637,7 +637,7 @@ async function readHermesCronOutputRunCount(jobId: string): Promise<number> {
   if (cached) {
     hermesRunCountCache.delete(jobId)
   }
-  // Why: external Hermes jobs can be created/removed outside OrcaBotmux; without a
+  // Why: external Hermes jobs can be created/removed outside Botmux; without a
   // size bound and expired sweep, a long session can pin stale job ids forever.
   pruneHermesRunCountCache(now)
   const entry: HermesRunCountCacheEntry = {

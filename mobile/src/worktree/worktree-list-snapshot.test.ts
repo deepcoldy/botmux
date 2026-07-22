@@ -22,11 +22,11 @@ function agent(overrides: Partial<RuntimeWorktreeAgentRow> = {}): RuntimeWorktre
 }
 
 function worktree(overrides: Partial<Worktree> = {}): Worktree {
-  const worktreePath = join('/tmp', 'orca', 'worktrees', 'manta')
+  const worktreePath = join('/tmp', 'botmux-app', 'worktrees', 'manta')
   return {
     worktreeId: `repo-1::${worktreePath}`,
     repoId: 'repo-1',
-    repo: 'orca',
+    repo: 'botmux-app',
     branch: 'feature/mobile-lag',
     displayName: 'manta',
     workspaceStatus: 'in-progress',

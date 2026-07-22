@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 // Why: standalone mock WebSocket server for developing the mobile app without
-// a running Orca desktop instance. Responds to the same RPC methods the real
+// a running Botmux desktop instance. Responds to the same RPC methods the real
 // runtime exposes, with realistic fake data. Supports E2EE handshake.
 import { WebSocketServer, type WebSocket } from 'ws'
 import nacl from 'tweetnacl'
@@ -127,7 +127,7 @@ wss.on('connection', (ws) => {
   })
 })
 
-console.log(`[mock] Orca mock server listening on ws://localhost:${PORT}`)
+console.log(`[mock] Botmux mock server listening on ws://localhost:${PORT}`)
 console.log(`[mock] Auth token: ${AUTH_TOKEN}`)
 console.log(`[mock] Server public key (base64): ${serverPublicKeyB64}`)
 console.log(

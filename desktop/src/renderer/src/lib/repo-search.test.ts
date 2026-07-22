@@ -5,8 +5,8 @@ import type { Repo } from '../../../shared/types'
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-1',
-    path: '/Users/test/src/orca_botmux',
-    displayName: 'stablyai/orca_botmux',
+    path: '/Users/test/src/botmux',
+    displayName: 'stablyai/botmux',
     badgeColor: '#22c55e',
     addedAt: 0,
     ...overrides
@@ -34,16 +34,16 @@ describe('repo-search', () => {
 
   it('matches display names case-insensitively', () => {
     const repos = [
-      makeRepo({ id: '1', displayName: 'stablyai/orca_botmux', path: '/repos/orca_botmux' }),
+      makeRepo({ id: '1', displayName: 'stablyai/botmux', path: '/repos/botmux' }),
       makeRepo({ id: '2', displayName: 'stablyai/noqa', path: '/repos/noqa' })
     ]
 
-    expect(searchRepos(repos, 'ORCA').map((repo) => repo.id)).toEqual(['1'])
+    expect(searchRepos(repos, 'BMUX').map((repo) => repo.id)).toEqual(['1'])
   })
 
   it('falls back to matching repo paths', () => {
     const repos = [
-      makeRepo({ id: '1', displayName: 'frontend', path: '/src/team-a/orca_botmux' }),
+      makeRepo({ id: '1', displayName: 'frontend', path: '/src/team-a/botmux' }),
       makeRepo({ id: '2', displayName: 'backend', path: '/src/team-b/noqa' })
     ]
 
@@ -52,11 +52,11 @@ describe('repo-search', () => {
 
   it('keeps display-name matches ahead of path-only matches', () => {
     const repos = [
-      makeRepo({ id: '1', displayName: 'misc', path: '/src/orca-botmux-tools/misc' }),
-      makeRepo({ id: '2', displayName: 'orca_botmux', path: '/src/team-a/project' })
+      makeRepo({ id: '1', displayName: 'misc', path: '/src/botmux-tools/misc' }),
+      makeRepo({ id: '2', displayName: 'botmux', path: '/src/team-a/project' })
     ]
 
-    expect(searchRepos(repos, 'orca_botmux').map((repo) => repo.id)).toEqual(['2', '1'])
+    expect(searchRepos(repos, 'botmux').map((repo) => repo.id)).toEqual(['2', '1'])
   })
 
   it('rejects oversized pasted queries before reading repo names or paths', () => {

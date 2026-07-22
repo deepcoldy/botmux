@@ -18,7 +18,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree } from './helpers/store'
 
 async function addFolderRepo(page: Page, folderPath: string): Promise<string> {
@@ -60,22 +60,22 @@ test.describe('Worktree Recent Sort', () => {
   const createdFolderFixtures: string[] = []
 
   function createFolderFixture(): string {
-    const dir = mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-e2e-folder-'))
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'botmux-e2e-folder-'))
     createdFolderFixtures.push(dir)
     mkdirSync(path.join(dir, 'src'), { recursive: true })
     writeFileSync(path.join(dir, 'README.md'), '# folder fixture\n')
     return dir
   }
 
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
   test.afterEach(() => {
     // Why: mkdtempSync fixtures leak unless we clean them up explicitly —
-    // matches the mkdtempSync/rmSync pairing used in helpers/orca-botmux-app.ts
-    // and helpers/orca-botmux-restart.ts.
+    // matches the mkdtempSync/rmSync pairing used in helpers/botmux-app.ts
+    // and helpers/botmux-restart.ts.
     while (createdFolderFixtures.length) {
       const dir = createdFolderFixtures.pop()
       if (dir) {
@@ -85,12 +85,12 @@ test.describe('Worktree Recent Sort', () => {
   })
 
   test('stamps lastActivityAt on a newly-added folder repo so it sorts to the top of Recent', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const folderPath = createFolderFixture()
 
-    const repoId = await addFolderRepo(orcaBotmuxPage, folderPath)
-    const lastActivityAt = await readFolderWorktreeLastActivity(orcaBotmuxPage, repoId)
+    const repoId = await addFolderRepo(botmuxPage, folderPath)
+    const lastActivityAt = await readFolderWorktreeLastActivity(botmuxPage, repoId)
 
     // Why: the exact failure mode before the fix was `lastActivityAt === 0`
     // (the fallback in mergeWorktree when meta is undefined). Asserting
@@ -100,20 +100,20 @@ test.describe('Worktree Recent Sort', () => {
     expect(lastActivityAt).toBeGreaterThan(0)
   })
 
-  test('leaves lastActivityAt stable across repeated list refreshes', async ({ orcaBotmuxPage }) => {
+  test('leaves lastActivityAt stable across repeated list refreshes', async ({ botmuxPage }) => {
     // Why: the stamp fires only on *first* discovery. Re-fetching must not
     // overwrite it, or every sidebar refresh would reshuffle Recent order.
     const folderPath = createFolderFixture()
-    const repoId = await addFolderRepo(orcaBotmuxPage, folderPath)
+    const repoId = await addFolderRepo(botmuxPage, folderPath)
 
-    const first = await readFolderWorktreeLastActivity(orcaBotmuxPage, repoId)
+    const first = await readFolderWorktreeLastActivity(botmuxPage, repoId)
 
-    await orcaBotmuxPage.evaluate(async (id) => {
+    await botmuxPage.evaluate(async (id) => {
       await window.__store?.getState().fetchWorktrees(id)
       await window.__store?.getState().fetchWorktrees(id)
     }, repoId)
 
-    const second = await readFolderWorktreeLastActivity(orcaBotmuxPage, repoId)
+    const second = await readFolderWorktreeLastActivity(botmuxPage, repoId)
     expect(second).toBe(first)
   })
 })

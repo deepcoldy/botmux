@@ -118,7 +118,7 @@ export function useDetectedAgents(
         retriedEmptyTargetRef.current = emptyRetryKey
         void ensureRuntime(targetId)
       } else if (detectedIds.length === 0 && retriedEmptyTargetRef.current !== emptyRetryKey) {
-        // Why: remote `orca-botmux-desktop serve` users can install/fix PATH without reconnecting;
+        // Why: remote `botmux-desktop serve` users can install/fix PATH without reconnecting;
         // retry once per mounted surface so the menu can pick that up.
         retriedEmptyTargetRef.current = emptyRetryKey
         void ensureRuntime(targetId)

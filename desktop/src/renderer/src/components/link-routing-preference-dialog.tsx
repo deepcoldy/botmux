@@ -24,14 +24,14 @@ type LinkRoutingPreferenceDialogOptions = {
 type LinkRoutingPreferenceDialogRequest = {
   id: number
   options: LinkRoutingPreferenceDialogOptions
-  resolve: (openInOrca: boolean) => void
+  resolve: (openInBotmux: boolean) => void
 }
 
 type LinkRoutingPreferenceDialogContextValue = (
   options?: LinkRoutingPreferenceDialogOptions
 ) => Promise<boolean>
 
-const PREVIEW_STORAGE_KEY = 'orca_botmux.previewLinkRoutingPreferenceDialog'
+const PREVIEW_STORAGE_KEY = 'botmux.previewLinkRoutingPreferenceDialog'
 const PREVIEW_DEFAULT_STORAGE_KEY = `${PREVIEW_STORAGE_KEY}.default`
 const LinkRoutingPreferenceDialogContext =
   createContext<LinkRoutingPreferenceDialogContextValue | null>(null)
@@ -99,18 +99,18 @@ export function LinkRoutingPreferenceDialogProvider({
     window.sessionStorage.removeItem(PREVIEW_STORAGE_KEY)
     window.sessionStorage.removeItem(PREVIEW_DEFAULT_STORAGE_KEY)
     void requestPreference({
-      openLinksInAppDefault: previewDefault === 'orca_botmux',
+      openLinksInAppDefault: previewDefault === 'botmux',
       preview: true,
-      url: 'https://github.com/stablyai/orca_botmux/pull/1234'
+      url: 'https://github.com/stablyai/botmux/pull/1234'
     })
   }, [requestPreference])
 
-  const settleActiveRequest = useCallback((openInOrca: boolean) => {
+  const settleActiveRequest = useCallback((openInBotmux: boolean) => {
     const request = activeRequestRef.current
     if (!request) {
       return
     }
-    request.resolve(openInOrca)
+    request.resolve(openInBotmux)
     setQueue((currentQueue) => {
       if (currentQueue[0]?.id === request.id) {
         return currentQueue.slice(1)
@@ -151,11 +151,11 @@ export function LinkRoutingPreferenceDialogProvider({
                   {openLinksInAppDefault
                     ? translate(
                         'auto.components.link.routing.preference.dialog.keep.title',
-                        "Keep terminal links in OrcaBotmux's browser?"
+                        "Keep terminal links in Botmux's browser?"
                       )
                     : translate(
                         'auto.components.link.routing.preference.dialog.title',
-                        "Open terminal links in OrcaBotmux's browser?"
+                        "Open terminal links in Botmux's browser?"
                       )}
                 </DialogTitle>
                 <DialogDescription className="text-sm leading-relaxed">
@@ -166,7 +166,7 @@ export function LinkRoutingPreferenceDialogProvider({
                       )
                     : translate(
                         'auto.components.link.routing.preference.dialog.description',
-                        "Use OrcaBotmux's browser for terminal links, or keep your system browser."
+                        "Use Botmux's browser for terminal links, or keep your system browser."
                       )}
                 </DialogDescription>
               </div>
@@ -190,8 +190,8 @@ export function LinkRoutingPreferenceDialogProvider({
               <div className="space-y-1">
                 <p>
                   {translate(
-                    'auto.components.link.routing.preference.dialog.orca_botmux.note',
-                    'OrcaBotmux can use imported cookies for logged-in sites.'
+                    'auto.components.link.routing.preference.dialog.botmux.note',
+                    'Botmux can use imported cookies for logged-in sites.'
                   )}
                 </p>
                 <p>
@@ -204,7 +204,7 @@ export function LinkRoutingPreferenceDialogProvider({
                   <span>
                     {translate(
                       'auto.components.link.routing.preference.dialog.shortcut.note.prefix',
-                      'When links open in OrcaBotmux,'
+                      'When links open in Botmux,'
                     )}
                   </span>
                   <ShortcutKeyCombo
@@ -234,12 +234,12 @@ export function LinkRoutingPreferenceDialogProvider({
             <Button autoFocus onClick={() => settleActiveRequest(true)}>
               {openLinksInAppDefault
                 ? translate(
-                    'auto.components.link.routing.preference.dialog.keep.orca_botmux.button',
-                    'Keep OrcaBotmux'
+                    'auto.components.link.routing.preference.dialog.keep.botmux.button',
+                    'Keep Botmux'
                   )
                 : translate(
-                    'auto.components.link.routing.preference.dialog.orca_botmux.button',
-                    'Open in OrcaBotmux'
+                    'auto.components.link.routing.preference.dialog.botmux.button',
+                    'Open in Botmux'
                   )}
             </Button>
           </DialogFooter>

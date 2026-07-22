@@ -5,7 +5,7 @@ import {
 } from './terminal-hidden-view-parking'
 import { getParkedTerminalWatcherTabIds } from './terminal-parked-tab-watchers'
 
-// Why: ORCA_E2E_TERMINAL_PARKING_DELAY_MS must shrink BOTH the cold-park
+// Why: BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS must shrink BOTH the cold-park
 // hysteresis and the hot-retain window — recently hidden tabs otherwise sit
 // in the hot-retain working set for 5 minutes and never park within a test
 // run. Gated on exposeStore so packaged builds ignore stray env vars.

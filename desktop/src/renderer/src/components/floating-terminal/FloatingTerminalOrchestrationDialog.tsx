@@ -11,7 +11,7 @@ import { IntegrationStatusPill } from '@/components/integration-status-pill'
 import { ORCHESTRATION_SKILL_NAME } from '@/lib/agent-feature-install-commands'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  ensureOrcaCliAvailableForAgentSkillTerminal
+  ensureBotmuxCliAvailableForAgentSkillTerminal
 } from '@/lib/agent-skill-cli-prerequisite'
 import {
   ORCHESTRATION_SKILL_INSTALL_COMMAND,
@@ -112,7 +112,7 @@ export function FloatingTerminalOrchestrationDialog({
           <DialogDescription className="sr-only">
             {translate(
               'auto.components.floating.terminal.FloatingTerminalOrchestrationDialog.6f0aed26b8',
-              'Install the OrcaBotmux CLI and orchestration skill so agents can coordinate through OrcaBotmux.'
+              'Install the Botmux CLI and orchestration skill so agents can coordinate through Botmux.'
             )}
           </DialogDescription>
         </DialogHeader>
@@ -124,7 +124,7 @@ export function FloatingTerminalOrchestrationDialog({
           )}
           description={translate(
             'auto.components.floating.terminal.FloatingTerminalOrchestrationDialog.f726054620',
-            'Enables agents to hand off context and coordinate work through OrcaBotmux.'
+            'Enables agents to hand off context and coordinate work through Botmux.'
           )}
           command={installCommand}
           installedCommand={updateCommand}
@@ -151,7 +151,7 @@ export function FloatingTerminalOrchestrationDialog({
             useAppStore.getState().recordFeatureInteraction('agent-orchestration-setup')
             await (activeSkillRuntime.agentRuntime?.runtime === 'wsl'
               ? ensureWslCliAvailableForAgentSkillTerminal(activeSkillRuntime.agentRuntime)
-              : ensureOrcaCliAvailableForAgentSkillTerminal())
+              : ensureBotmuxCliAvailableForAgentSkillTerminal())
           }}
           onRecheck={refreshOrchestrationSkill}
         />

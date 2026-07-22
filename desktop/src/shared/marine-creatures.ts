@@ -1,6 +1,6 @@
 /* eslint-disable max-lines -- Curated marine-creature name corpus; one entry per line is the readable format for a flat data list. */
 // Why: the auto-generated workspace name pool lives in shared (not renderer)
-// so the main process can recognize an OrcaBotmux-generated branch name when deciding
+// so the main process can recognize an Botmux-generated branch name when deciding
 // whether auto-rename-from-work is allowed to overwrite it.
 export const MARINE_CREATURES = [
   'Nautilus',
@@ -263,7 +263,7 @@ export const MARINE_CREATURES = [
   'Wolffish',
   'Wreckfish',
   'Horseshoe',
-  'orca_botmux',
+  'botmux',
   'Cachalot',
   'Rorqual',
   'Grampus',

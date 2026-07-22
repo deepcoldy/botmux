@@ -10,7 +10,7 @@ import {
   type EphemeralVmRuntimeStore
 } from './ephemeral-vm-runtimes'
 
-const EPHEMERAL_VM_RUNTIMES_FILE = 'orca-botmux-ephemeral-vm-runtimes.json'
+const EPHEMERAL_VM_RUNTIMES_FILE = 'botmux-ephemeral-vm-runtimes.json'
 
 export type EphemeralVmRuntimeStoreErrorCode = 'invalid_argument' | 'runtime_error'
 
@@ -146,7 +146,7 @@ function readEphemeralVmRuntimeStore(userDataPath: string): EphemeralVmRuntimeSt
   } catch {
     throw new EphemeralVmRuntimeStoreError(
       'runtime_error',
-      `Could not read OrcaBotmux ephemeral VM runtimes at ${path}; the file is invalid.`
+      `Could not read Botmux ephemeral VM runtimes at ${path}; the file is invalid.`
     )
   }
 }

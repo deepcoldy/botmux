@@ -31,8 +31,8 @@ vi.mock('@/hooks/useInstalledAgentSkills', async (importOriginal) => ({
 
 vi.mock('@/lib/agent-skill-cli-prerequisite', () => ({
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE: 'CLI registration notice',
-  ensureOrcaCliAvailableForAgentSkillTerminal: vi.fn(async () => null),
-  isOrcaCliAvailableOnPath: (status: CliInstallStatus | null | undefined) =>
+  ensureBotmuxCliAvailableForAgentSkillTerminal: vi.fn(async () => null),
+  isBotmuxCliAvailableOnPath: (status: CliInstallStatus | null | undefined) =>
     status?.state === 'installed' && status.pathConfigured
 }))
 
@@ -55,11 +55,11 @@ let container: HTMLDivElement | null = null
 function cliStatus(): CliInstallStatus {
   return {
     platform: 'darwin',
-    commandName: 'orca_botmux',
+    commandName: 'botmux',
     commandPath: null,
     pathDirectory: null,
     pathConfigured: false,
-    launcherPath: '/Applications/OrcaBotmux.app/Contents/MacOS/OrcaBotmux',
+    launcherPath: '/Applications/Botmux.app/Contents/MacOS/Botmux',
     installMethod: null,
     supported: true,
     state: 'not_installed',
@@ -72,14 +72,14 @@ function cliStatus(): CliInstallStatus {
 function discoveredSkill(overrides: Partial<DiscoveredSkill>): DiscoveredSkill {
   return {
     id: 'skill-1',
-    name: 'orca-botmux-linear',
+    name: 'botmux-linear',
     description: null,
     providers: ['agent-skills'],
     sourceKind: 'home',
     sourceLabel: 'Agent skills home',
     rootPath: '/Users/test/.agents/skills',
-    directoryPath: '/Users/test/.agents/skills/orca-botmux-linear',
-    skillFilePath: '/Users/test/.agents/skills/orca-botmux-linear/SKILL.md',
+    directoryPath: '/Users/test/.agents/skills/botmux-linear',
+    skillFilePath: '/Users/test/.agents/skills/botmux-linear/SKILL.md',
     installed: true,
     fileCount: 1,
     updatedAt: null,
@@ -151,12 +151,12 @@ describe('LinearAgentSkillSetupPrompt update command', () => {
   })
 
   it('uses the canonical update command when the canonical Linear skill is installed', async () => {
-    mocks.skillState.skills = [discoveredSkill({ name: 'orca-botmux-linear' })]
+    mocks.skillState.skills = [discoveredSkill({ name: 'botmux-linear' })]
 
     await renderPrompt()
 
     expect(mocks.panelProps.at(-1)).toEqual(
-      expect.objectContaining({ installedCommand: 'npx skills update orca-botmux-linear --global' })
+      expect.objectContaining({ installedCommand: 'npx skills update botmux-linear --global' })
     )
   })
 
@@ -171,12 +171,12 @@ describe('LinearAgentSkillSetupPrompt update command', () => {
   })
 
   it('prefers the canonical update command when both Linear skill names are installed', async () => {
-    mocks.skillState.skills = [discoveredSkill({ name: 'orca-botmux-linear' }), legacyLinearSkillPath()]
+    mocks.skillState.skills = [discoveredSkill({ name: 'botmux-linear' }), legacyLinearSkillPath()]
 
     await renderPrompt()
 
     expect(mocks.panelProps.at(-1)).toEqual(
-      expect.objectContaining({ installedCommand: 'npx skills update orca-botmux-linear --global' })
+      expect.objectContaining({ installedCommand: 'npx skills update botmux-linear --global' })
     )
   })
 })

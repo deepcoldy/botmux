@@ -6,14 +6,14 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MobileRelayStatus } from '../../../../shared/mobile-relay-status'
-import type { OrcaProfileAuthStatus } from '../../../../shared/orca-botmux-profiles'
+import type { BotmuxProfileAuthStatus } from '../../../../shared/botmux-profiles'
 import { MobilePairingConnectionOptions } from './MobilePairingConnectionOptions'
 
 type MobileRelayStoreState = {
-  orcaProfileAuthStatus: OrcaProfileAuthStatus | null
-  orcaProfileConnecting: boolean
-  connectCurrentOrcaProfile: () => Promise<null>
-  fetchOrcaProfileAuthStatus: () => Promise<OrcaProfileAuthStatus | null>
+  botmuxProfileAuthStatus: BotmuxProfileAuthStatus | null
+  botmuxProfileConnecting: boolean
+  connectCurrentBotmuxProfile: () => Promise<null>
+  fetchBotmuxProfileAuthStatus: () => Promise<BotmuxProfileAuthStatus | null>
 }
 
 const mocks = vi.hoisted(() => ({
@@ -51,27 +51,27 @@ describe('MobilePairingConnectionOptions', () => {
       }
     })
     mocks.state = {
-      orcaProfileAuthStatus: {
+      botmuxProfileAuthStatus: {
         activeProfileId: 'profile-1',
         configured: true,
         state: 'local',
         persistence: 'none'
       },
-      orcaProfileConnecting: false,
-      connectCurrentOrcaProfile: connect,
-      fetchOrcaProfileAuthStatus: fetchAuthStatus
+      botmuxProfileConnecting: false,
+      connectCurrentBotmuxProfile: connect,
+      fetchBotmuxProfileAuthStatus: fetchAuthStatus
     }
   })
 
   afterEach(() => cleanup())
 
-  it('shows a compact Sign in row when OrcaBotmux Relay is selected and signed out', async () => {
+  it('shows a compact Sign in row when Botmux Relay is selected and signed out', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
     render(<MobilePairingConnectionOptions value="automatic" onChange={onChange} />)
 
     expect(screen.getByTestId('anywhere-sign-in-panel')).toBeVisible()
-    expect(screen.getByText('Sign in to use OrcaBotmux Mobile Relay.')).toBeVisible()
+    expect(screen.getByText('Sign in to use Botmux Mobile Relay.')).toBeVisible()
     // Why: do not surface build-setup diagnostics in the pairing flow.
     expect(screen.queryByText(/not configured for this build/i)).toBeNull()
 
@@ -88,7 +88,7 @@ describe('MobilePairingConnectionOptions', () => {
   it('shows Unavailable instead of a dead Sign in on unconfigured builds', () => {
     mocks.state = {
       ...mocks.state,
-      orcaProfileAuthStatus: {
+      botmuxProfileAuthStatus: {
         activeProfileId: 'profile-1',
         configured: false,
         state: 'unconfigured',
@@ -109,7 +109,7 @@ describe('MobilePairingConnectionOptions', () => {
     const onChange = vi.fn()
     render(<MobilePairingConnectionOptions value="automatic" onChange={onChange} />)
 
-    screen.getByRole('radio', { name: /OrcaBotmux Relay/i }).focus()
+    screen.getByRole('radio', { name: /Botmux Relay/i }).focus()
     await user.keyboard('{ArrowDown}')
     expect(onChange).toHaveBeenCalledWith('local-only')
   })
@@ -126,31 +126,31 @@ describe('MobilePairingConnectionOptions', () => {
       screen.getByText('Phone must be on this Wi‑Fi or your Tailscale. No sign-in.')
     ).toBeVisible()
 
-    await user.click(screen.getByRole('radio', { name: /OrcaBotmux Relay/i }))
+    await user.click(screen.getByRole('radio', { name: /Botmux Relay/i }))
     expect(onChange).toHaveBeenCalledWith('automatic')
   })
 
   it('refreshes auth status when it is missing on mount', () => {
     mocks.state = {
       ...mocks.state,
-      orcaProfileAuthStatus: null
+      botmuxProfileAuthStatus: null
     }
     render(<MobilePairingConnectionOptions value="automatic" onChange={vi.fn()} />)
     expect(fetchAuthStatus).toHaveBeenCalledOnce()
     expect(screen.getByTestId('anywhere-sign-in-panel')).toBeVisible()
   })
 
-  it('shows relay status when signed in on OrcaBotmux Relay', async () => {
+  it('shows relay status when signed in on Botmux Relay', async () => {
     mocks.state = {
-      orcaProfileAuthStatus: {
+      botmuxProfileAuthStatus: {
         activeProfileId: 'profile-1',
         configured: true,
         state: 'connected',
         persistence: 'encrypted'
       },
-      orcaProfileConnecting: false,
-      connectCurrentOrcaProfile: connect,
-      fetchOrcaProfileAuthStatus: fetchAuthStatus
+      botmuxProfileConnecting: false,
+      connectCurrentBotmuxProfile: connect,
+      fetchBotmuxProfileAuthStatus: fetchAuthStatus
     }
     const onChange = vi.fn()
     const user = userEvent.setup()

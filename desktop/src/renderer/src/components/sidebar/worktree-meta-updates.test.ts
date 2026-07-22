@@ -8,7 +8,7 @@ describe('buildWorktreeMetaUpdates', () => {
         displayNameInput: 'Workspace',
         currentDisplayName: 'Workspace',
         issueInput: '',
-        prInput: 'https://github.com/stablyai/orca_botmux/issues/6933',
+        prInput: 'https://github.com/stablyai/botmux/issues/6933',
         commentInput: ''
       })
     ).toEqual({
@@ -23,7 +23,7 @@ describe('buildWorktreeMetaUpdates', () => {
         displayNameInput: 'Workspace',
         currentDisplayName: 'Workspace',
         issueInput: '',
-        prInput: 'https://github.com/stablyai/orca_botmux/pull/6934',
+        prInput: 'https://github.com/stablyai/botmux/pull/6934',
         commentInput: ''
       })
     ).toEqual({
@@ -38,7 +38,7 @@ describe('buildWorktreeMetaUpdates', () => {
       buildWorktreeMetaUpdates({
         displayNameInput: 'Workspace',
         currentDisplayName: 'Workspace',
-        issueInput: 'https://github.com/stablyai/orca_botmux/issues/6933',
+        issueInput: 'https://github.com/stablyai/botmux/issues/6933',
         prInput: '',
         commentInput: ''
       })
@@ -54,7 +54,7 @@ describe('buildWorktreeMetaUpdates', () => {
       buildWorktreeMetaUpdates({
         displayNameInput: 'Workspace',
         currentDisplayName: 'Workspace',
-        issueInput: 'https://github.com/stablyai/orca_botmux/pull/6934',
+        issueInput: 'https://github.com/stablyai/botmux/pull/6934',
         prInput: '',
         commentInput: ''
       })

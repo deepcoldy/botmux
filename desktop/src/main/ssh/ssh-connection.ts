@@ -5,7 +5,7 @@ import type { ChildProcess } from 'node:child_process'
 import type { ClientChannel, ConnectConfig, SFTPWrapper } from 'ssh2'
 import type { SshTarget, SshConnectionState, SshConnectionStatus } from '../../shared/ssh-types'
 import {
-  getOrcaControlSocketPath,
+  getBotmuxControlSocketPath,
   spawnSystemSsh,
   spawnSystemSshCommand,
   downloadFileViaSystemSsh,
@@ -115,7 +115,7 @@ export class SshConnection {
       return true
     }
     return (
-      getOrcaControlSocketPath(this.target, {
+      getBotmuxControlSocketPath(this.target, {
         ...this.getSystemSshBuildArgsOptions()
       }) !== null
     )
@@ -633,7 +633,7 @@ export class SshConnection {
     // Why: ssh2 has no gssapi-with-mic support, so hosts that explicitly
     // request GSSAPIAuthentication try Kerberos SSO via the system OpenSSH
     // binary first. Restrict the probe to GSSAPI so missing tickets fall through
-    // to OrcaBotmux's existing key and credential-prompt path.
+    // to Botmux's existing key and credential-prompt path.
     if (this.target.gssapiAuthentication === true) {
       try {
         await this.doSystemSshProbeWithControlMasterRetry(connectGeneration, resolved, true)
@@ -683,7 +683,7 @@ export class SshConnection {
         this.proxyProcess?.kill()
         this.proxyProcess = null
         try {
-          // Why: on macOS, per-app network policy can block OrcaBotmux's direct
+          // Why: on macOS, per-app network policy can block Botmux's direct
           // TCP socket while the system OpenSSH binary is still allowed.
           await this.doSystemSshProbeWithControlMasterRetry(connectGeneration, resolved)
           return
@@ -845,7 +845,7 @@ export class SshConnection {
 
     // Why: this probe runs before remote platform detection. A raw echo works
     // under POSIX shells, cmd.exe, and PowerShell; `/bin/sh` wrapping does not.
-    const channel = this.spawnTrackedSystemSshCommand('echo ORCA-SYSTEM-SSH-OK', {
+    const channel = this.spawnTrackedSystemSshCommand('echo BOTMUX-SYSTEM-SSH-OK', {
       wrapCommand: false
     })
     try {
@@ -884,7 +884,7 @@ export class SshConnection {
               reject(new Error('SSH connection attempt was cancelled'))
               return
             }
-            if (code !== 0 || !stdout.includes('ORCA-SYSTEM-SSH-OK')) {
+            if (code !== 0 || !stdout.includes('BOTMUX-SYSTEM-SSH-OK')) {
               reject(
                 new Error(
                   `System SSH probe failed${code != null ? ` (exit ${code})` : ''}.${stderr ? ` stderr: ${stderr.trim()}` : ''}`
@@ -923,7 +923,7 @@ export class SshConnection {
     this.systemSshResolvedConfig = cloneResolvedConfig(resolved)
     this.systemSshControlMasterDisabledForSession = false
     this.systemSshGssapiOnlyForSession = gssapiOnly
-    const controlPath = getOrcaControlSocketPath(this.target, {
+    const controlPath = getBotmuxControlSocketPath(this.target, {
       resolvedConfig: this.systemSshResolvedConfig,
       gssapiOnly: this.systemSshGssapiOnlyForSession
     })
@@ -1302,7 +1302,7 @@ export class SshConnection {
         throw this.createCancelledConnectAttemptError()
       }
       this.systemSshResolvedConfig = cloneResolvedConfig(resolved)
-      const controlPath = getOrcaControlSocketPath(this.target, {
+      const controlPath = getBotmuxControlSocketPath(this.target, {
         resolvedConfig: this.systemSshResolvedConfig
       })
       const proc = await this.spawnSystemSshWithControlMasterRetry(controlPath, connectGeneration)
@@ -1383,7 +1383,7 @@ export function shouldUseSystemSshTransport(
   resolved: Pick<SshResolvedConfig, 'proxyUseFdpass' | 'proxyCommand' | 'proxyJump'> | null
 ): boolean {
   return (
-    process.env.ORCA_SSH_FORCE_SYSTEM_TRANSPORT === '1' ||
+    process.env.BOTMUX_SSH_FORCE_SYSTEM_TRANSPORT === '1' ||
     target.proxyCommand != null ||
     target.jumpHost != null ||
     resolved?.proxyUseFdpass === true ||

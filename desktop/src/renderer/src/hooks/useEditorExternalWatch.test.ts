@@ -361,7 +361,7 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
     vi.stubGlobal('window', { api: { fs: { readFile } } })
     const { handleFsChanged, dispose } = createExternalWatchEventHandler(findTarget)
 
-    recordSelfWrite('/repo/notes.md', 'orca_botmux save')
+    recordSelfWrite('/repo/notes.md', 'botmux save')
     handleFsChanged(payload([{ kind: 'update', absolutePath: '/repo/notes.md' }]))
     await vi.advanceTimersByTimeAsync(100)
 
@@ -374,17 +374,17 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
     dispose()
   })
 
-  it('still suppresses the watcher echo from OrcaBotmux self-writes', async () => {
+  it('still suppresses the watcher echo from Botmux self-writes', async () => {
     vi.mocked(useAppStore.getState).mockReturnValue({
       openFiles: [fileNotes],
       setExternalMutation
     } as never)
     vi.mocked(getOpenFilesForExternalFileChange).mockReturnValue([fileNotes] as never)
-    const readFile = vi.fn().mockResolvedValue({ content: 'orca_botmux save', isBinary: false })
+    const readFile = vi.fn().mockResolvedValue({ content: 'botmux save', isBinary: false })
     vi.stubGlobal('window', { api: { fs: { readFile } } })
     const { handleFsChanged, dispose } = createExternalWatchEventHandler(findTarget)
 
-    recordSelfWrite('/repo/notes.md', 'orca_botmux save')
+    recordSelfWrite('/repo/notes.md', 'botmux save')
     handleFsChanged(payload([{ kind: 'update', absolutePath: '/repo/notes.md' }]))
     await vi.advanceTimersByTimeAsync(100)
 
@@ -576,7 +576,7 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
     dispose()
   })
 
-  it('does not mark a dirty tab for the echo of OrcaBotmux’s own save', async () => {
+  it('does not mark a dirty tab for the echo of Botmux’s own save', async () => {
     const dirtyFile = {
       ...fileNotes,
       isDirty: true
@@ -586,11 +586,11 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
       setExternalMutation
     } as never)
     vi.mocked(getOpenFilesForExternalFileChange).mockReturnValue([dirtyFile] as never)
-    const readFile = vi.fn().mockResolvedValue({ content: 'orca_botmux save', isBinary: false })
+    const readFile = vi.fn().mockResolvedValue({ content: 'botmux save', isBinary: false })
     vi.stubGlobal('window', { api: { fs: { readFile } } })
     const { handleFsChanged, dispose } = createExternalWatchEventHandler(findTarget)
 
-    recordSelfWrite('/repo/notes.md', 'orca_botmux save')
+    recordSelfWrite('/repo/notes.md', 'botmux save')
     handleFsChanged(payload([{ kind: 'update', absolutePath: '/repo/notes.md' }]))
     await vi.advanceTimersByTimeAsync(100)
 
@@ -612,7 +612,7 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
     vi.stubGlobal('window', { api: { fs: { readFile } } })
     const { handleFsChanged, dispose } = createExternalWatchEventHandler(findTarget)
 
-    recordSelfWrite('/repo/notes.md', 'orca_botmux save')
+    recordSelfWrite('/repo/notes.md', 'botmux save')
     handleFsChanged(payload([{ kind: 'update', absolutePath: '/repo/notes.md' }]))
     await vi.advanceTimersByTimeAsync(100)
 
@@ -634,7 +634,7 @@ describe('createExternalWatchEventHandler tombstone coalescing', () => {
     vi.stubGlobal('window', { api: { fs: { readFile } } })
     const { handleFsChanged, dispose } = createExternalWatchEventHandler(findTarget)
 
-    recordSelfWrite('/repo/notes.md', 'orca_botmux save')
+    recordSelfWrite('/repo/notes.md', 'botmux save')
     // Why: SSH poll + event streams can deliver several payloads for one
     // write; each verification is a full-file read, so a burst must share
     // the in-flight read instead of stacking network round-trips.

@@ -6,8 +6,8 @@
 
 import {
   compactDispatchPromptForStatus,
-  isOrcaDispatchStatusPrompt
-} from './orca-botmux-dispatch-status-prompt'
+  isBotmuxDispatchStatusPrompt
+} from './botmux-dispatch-status-prompt'
 
 /** Maximum character length for the prompt field. Truncated on parse. */
 export const AGENT_STATUS_MAX_FIELD_LENGTH = 200
@@ -40,12 +40,12 @@ function normalizeField(value: unknown, maxLength: number = AGENT_STATUS_MAX_FIE
   return normalizeSingleLinePreview(value, maxLength)
 }
 
-/** Normalize the agent prompt field, compacting OrcaBotmux dispatch preambles. */
+/** Normalize the agent prompt field, compacting Botmux dispatch preambles. */
 export function normalizePromptField(value: unknown): string {
   if (typeof value !== 'string') {
     return ''
   }
-  if (isOrcaDispatchStatusPrompt(value)) {
+  if (isBotmuxDispatchStatusPrompt(value)) {
     return compactDispatchPromptForStatus(
       value,
       AGENT_STATUS_MAX_FIELD_LENGTH,

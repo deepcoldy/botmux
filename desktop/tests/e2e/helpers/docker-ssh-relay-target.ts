@@ -5,7 +5,7 @@ import path from 'node:path'
 
 import type { TestInfo } from '@stablyai/playwright-test'
 
-export const DOCKER_SSH_RELAY_REMOTE_REPO_PATH = '/tmp/orca-botmux-docker-relay-perf-repo'
+export const DOCKER_SSH_RELAY_REMOTE_REPO_PATH = '/tmp/botmux-docker-relay-perf-repo'
 
 export type DockerSshRelayTarget = {
   containerName: string
@@ -14,7 +14,7 @@ export type DockerSshRelayTarget = {
   tempDir: string
 }
 
-const CONTAINER_IMAGE = process.env.ORCA_E2E_SSH_DOCKER_IMAGE ?? 'node:22-bookworm'
+const CONTAINER_IMAGE = process.env.BOTMUX_E2E_SSH_DOCKER_IMAGE ?? 'node:22-bookworm'
 
 function run(command: string, args: string[], opts: { timeoutMs?: number } = {}): string {
   return execFileSync(command, args, {
@@ -85,7 +85,7 @@ function seedRemoteRepo(target: DockerSshRelayTarget): void {
       `cd ${shellQuote(DOCKER_SSH_RELAY_REMOTE_REPO_PATH)}`,
       'git init',
       'git config user.email e2e@test.local',
-      'git config user.name "OrcaBotmux Docker SSH E2E"',
+      'git config user.name "Botmux Docker SSH E2E"',
       'printf "remote relay perf\\n" > README.md',
       'git add README.md',
       'git commit -m initial'
@@ -105,11 +105,11 @@ export function writeDockerSshRelayTargetFile(
 }
 
 export function startDockerSshRelayTarget(testInfo: TestInfo): DockerSshRelayTarget {
-  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-ssh-docker-'))
+  const tempDir = mkdtempSync(path.join(os.tmpdir(), 'botmux-ssh-docker-'))
   const identityFile = path.join(tempDir, 'id_ed25519')
   run('ssh-keygen', ['-t', 'ed25519', '-N', '', '-f', identityFile, '-q'])
   const publicKey = readFileSync(`${identityFile}.pub`, 'utf8').trim()
-  const containerName = `orca-botmux-ssh-e2e-${testInfo.workerIndex}-${Date.now()}`
+  const containerName = `botmux-ssh-e2e-${testInfo.workerIndex}-${Date.now()}`
   let target: DockerSshRelayTarget | null = null
 
   try {
@@ -136,7 +136,7 @@ export function startDockerSshRelayTarget(testInfo: TestInfo): DockerSshRelayTar
           'printf "%s\\n" "$AUTHORIZED_KEY" > /root/.ssh/authorized_keys',
           'chmod 600 /root/.ssh/authorized_keys',
           'git config --global user.email e2e@test.local',
-          'git config --global user.name "OrcaBotmux Docker SSH E2E"',
+          'git config --global user.name "Botmux Docker SSH E2E"',
           'exec /usr/sbin/sshd -D -e'
         ].join(' && ')
       ],

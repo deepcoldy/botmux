@@ -10,8 +10,8 @@ import {
 type ExecMock = Mock<GitRemoteExec>
 
 const REPO_PATH = '/repo-root'
-const FORK_URL = 'git@github.com:contributor/orca_botmux.git'
-const FORK_REMOTE = 'pr-contributor-orca_botmux'
+const FORK_URL = 'git@github.com:contributor/botmux.git'
+const FORK_REMOTE = 'pr-contributor-botmux'
 
 function forkTarget(overrides: Partial<GitPushTarget> = {}): GitPushTarget {
   return {
@@ -68,7 +68,7 @@ function removeCalls(exec: ExecMock): string[][] {
 }
 
 describe('cleanupUnusedWorktreePushTargetRemoteWithExec', () => {
-  it('removes an OrcaBotmux-created fork remote that nothing else uses', async () => {
+  it('removes an Botmux-created fork remote that nothing else uses', async () => {
     const exec = makeExec()
     await cleanupUnusedWorktreePushTargetRemoteWithExec(
       REPO_PATH,
@@ -80,7 +80,7 @@ describe('cleanupUnusedWorktreePushTargetRemoteWithExec', () => {
     expect(removeCalls(exec)).toEqual([['remote', 'remove', FORK_REMOTE]])
   })
 
-  it('keeps a remote OrcaBotmux did not create (remoteCreated falsy)', async () => {
+  it('keeps a remote Botmux did not create (remoteCreated falsy)', async () => {
     const exec = makeExec()
     await cleanupUnusedWorktreePushTargetRemoteWithExec(
       REPO_PATH,
@@ -146,7 +146,7 @@ describe('cleanupUnusedWorktreePushTargetRemoteWithExec', () => {
         // Same fork URL (https form), different sanitized remote name.
         'repo-1::/wt/b': forkTarget({
           remoteName: 'fork-2',
-          remoteUrl: 'https://github.com/contributor/orca_botmux.git'
+          remoteUrl: 'https://github.com/contributor/botmux.git'
         })
       }),
       exec
@@ -213,7 +213,7 @@ describe('cleanupUnusedWorktreePushTargetRemoteWithExec', () => {
   })
 
   it('keeps the remote when its URL no longer matches the fork (repurposed by the user)', async () => {
-    const exec = makeExec({ getUrl: 'git@github.com:someone-else/orca_botmux.git' })
+    const exec = makeExec({ getUrl: 'git@github.com:someone-else/botmux.git' })
     await cleanupUnusedWorktreePushTargetRemoteWithExec(
       REPO_PATH,
       'repo-1::/wt/a',
@@ -241,8 +241,8 @@ describe('sameGitHubRemoteUrl', () => {
   it('matches SSH and HTTPS forms of the same GitHub fork', () => {
     expect(
       sameGitHubRemoteUrl(
-        'git@github.com:contributor/orca_botmux.git',
-        'https://github.com/contributor/orca_botmux.git'
+        'git@github.com:contributor/botmux.git',
+        'https://github.com/contributor/botmux.git'
       )
     ).toBe(true)
   })
@@ -250,8 +250,8 @@ describe('sameGitHubRemoteUrl', () => {
   it('is case-insensitive on owner/repo', () => {
     expect(
       sameGitHubRemoteUrl(
-        'git@github.com:Contributor/OrcaBotmux.git',
-        'git@github.com:contributor/orca_botmux.git'
+        'git@github.com:Contributor/Botmux.git',
+        'git@github.com:contributor/botmux.git'
       )
     ).toBe(true)
   })
@@ -259,8 +259,8 @@ describe('sameGitHubRemoteUrl', () => {
   it('does not match different forks', () => {
     expect(
       sameGitHubRemoteUrl(
-        'git@github.com:contributor/orca_botmux.git',
-        'git@github.com:someone-else/orca_botmux.git'
+        'git@github.com:contributor/botmux.git',
+        'git@github.com:someone-else/botmux.git'
       )
     ).toBe(false)
   })
@@ -268,14 +268,14 @@ describe('sameGitHubRemoteUrl', () => {
   it('falls back to exact equality for non-GitHub hosts', () => {
     expect(
       sameGitHubRemoteUrl(
-        'git@gitlab.com:contributor/orca_botmux.git',
-        'git@gitlab.com:contributor/orca_botmux.git'
+        'git@gitlab.com:contributor/botmux.git',
+        'git@gitlab.com:contributor/botmux.git'
       )
     ).toBe(true)
     expect(
       sameGitHubRemoteUrl(
-        'git@gitlab.com:contributor/orca_botmux.git',
-        'https://gitlab.com/contributor/orca_botmux.git'
+        'git@gitlab.com:contributor/botmux.git',
+        'https://gitlab.com/contributor/botmux.git'
       )
     ).toBe(false)
   })

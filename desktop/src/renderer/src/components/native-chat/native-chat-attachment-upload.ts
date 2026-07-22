@@ -72,7 +72,7 @@ export function nativeChatWorktreeNotReadyNotice(): string {
 }
 
 /**
- * Upload client-local paths into `${worktreePath}/.orca_botmux/drops` on the SSH
+ * Upload client-local paths into `${worktreePath}/.botmux/drops` on the SSH
  * remote and return the remote paths the agent can read (input order
  * preserved). Returns null when the upload IPC itself failed; per-file
  * skips/failures surface through the shared drop toasts.

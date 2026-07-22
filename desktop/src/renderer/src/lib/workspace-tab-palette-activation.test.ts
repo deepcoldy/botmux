@@ -102,7 +102,7 @@ function makeResult(
     contentType: 'terminal',
     title: 'Terminal',
     secondaryText: 'Terminal tab',
-    repoName: 'repo/orca_botmux',
+    repoName: 'repo/botmux',
     worktreeName: 'Palette Worktree',
     titleRange: null,
     secondaryRange: null,

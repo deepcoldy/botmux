@@ -7,7 +7,7 @@ import type { StatsEvent, StatsAggregates, StatsFile } from './types'
 const STATS_SCHEMA_VERSION = 1
 const MAX_EVENTS = 10_000
 // Why: countedPRs is a deduplication registry that grows with every PR created
-// through OrcaBotmux. Without a cap, a heavily-used instance accumulates thousands of
+// through Botmux. Without a cap, a heavily-used instance accumulates thousands of
 // URL strings across months. 2000 entries is about 6-12 months of active use
 // for a power user, and at ~50 chars per URL the overhead is ~100KB max.
 const MAX_COUNTED_PRS = 2_000
@@ -16,18 +16,18 @@ const MAX_COUNTED_PRS = 2_000
 const DEBOUNCE_MS = 5_000
 
 // Why: same timing constraint as persistence.ts — the path must be captured
-// after configureDevUserDataPath() but before app.setName('orca_botmux'). See the
+// after configureDevUserDataPath() but before app.setName('botmux'). See the
 // comment block in persistence.ts:20-28 for the full explanation.
 let _statsFile: string | null = null
 
 export function initStatsPath(): void {
-  _statsFile = join(app.getPath('userData'), 'orca-botmux-stats.json')
+  _statsFile = join(app.getPath('userData'), 'botmux-stats.json')
 }
 
 function getStatsFile(): string {
   if (!_statsFile) {
     // Safety fallback — should not be hit in normal startup.
-    _statsFile = join(app.getPath('userData'), 'orca-botmux-stats.json')
+    _statsFile = join(app.getPath('userData'), 'botmux-stats.json')
   }
   return _statsFile
 }
@@ -55,9 +55,8 @@ export class StatsCollector {
   private aggregates: StatsAggregates
   private liveAgents = new Map<string, number>() // ptyId → startTimestamp
   private writeTimer: ReturnType<typeof setTimeout> | null = null
-  // Why: star-nag lives in its own service but needs to observe the running
-  // agent-spawned counter. A lightweight listener avoids cyclic imports and
-  // keeps StatsCollector unaware of how the counter is consumed.
+  // Why: optional listeners (e.g. legacy growth hooks) observe agent-spawn
+  // totals without coupling StatsCollector to those consumers.
   private agentStartListeners: ((totalAgentsSpawned: number) => void)[] = []
 
   constructor() {

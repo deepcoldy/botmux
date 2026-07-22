@@ -45,7 +45,7 @@ export function isLazyChunkLoadError(error: unknown): error is LazyChunkLoadErro
 // (not localStorage) gives exactly that lifetime; it is never cleared mid-session,
 // otherwise a sibling chunk's healthy load would re-arm the reload and an
 // auto-mounted corrupt chunk would loop.
-const RELOAD_GUARD_KEY = 'orca_botmux:lazy-chunk-reload-attempted'
+const RELOAD_GUARD_KEY = 'botmux:lazy-chunk-reload-attempted'
 const DEFAULT_RETRIES = 2
 const DEFAULT_BASE_DELAY_MS = 250
 

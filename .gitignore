@@ -47,3 +47,7 @@ mobile/web-build/
 mobile/.env
 mobile/.env.*
 !mobile/.env.example
+
+# Desktop CDP dogfood / debug userData (local only — never commit)
+desktop/.cdp-debug-userdata/
+desktop/undefined/

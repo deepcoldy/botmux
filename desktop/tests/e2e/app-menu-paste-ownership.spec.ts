@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveTabId,
@@ -81,44 +81,44 @@ function tabLocatorByTitle(page: Page, title: string): ReturnType<Page['locator'
 }
 
 test.describe('app menu paste ownership', () => {
-  test.beforeEach(async ({ electronApp, orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  test.beforeEach(async ({ electronApp, botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
   })
 
   test('Edit > Paste sends clipboard text to the focused terminal exactly once', async ({
     electronApp,
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const runId = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-app-menu-paste-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-app-menu-paste-${runId}.mjs`)
     writeFileSync(scriptPath, pasteEchoScript(runId))
     let scriptStarted = false
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
       scriptStarted = true
-      await waitForTerminalOutput(orcaBotmuxPage, `APP_MENU_PASTE_READY_${runId}`, 10_000)
+      await waitForTerminalOutput(botmuxPage, `APP_MENU_PASTE_READY_${runId}`, 10_000)
 
-      const payload = `ORCA_E2E_APP_MENU_TERMINAL_${runId}`
+      const payload = `BOTMUX_E2E_APP_MENU_TERMINAL_${runId}`
       const encodedPayload = Buffer.from(payload, 'utf8').toString('base64')
-      await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+      await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
       await clearTerminalPtyWriteLog(electronApp)
-      await focusActiveTerminalInput(orcaBotmuxPage)
+      await focusActiveTerminalInput(botmuxPage)
 
       await dispatchAppMenuPasteFromMain(electronApp)
-      await waitForTerminalOutput(orcaBotmuxPage, encodedPayload, 10_000, 12_000)
+      await waitForTerminalOutput(botmuxPage, encodedPayload, 10_000, 12_000)
 
       const writes = (await readTerminalPtyWrites(electronApp)).join('')
       expect(countOccurrences(writes, payload)).toBe(1)
     } finally {
       if (scriptStarted) {
-        await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+        await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       }
       rmSync(scriptPath, { force: true })
     }
@@ -126,21 +126,21 @@ test.describe('app menu paste ownership', () => {
 
   test('Edit > Paste into a rename textbox does not also write to the active terminal', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    const originalTitle = await getActiveTabTitle(orcaBotmuxPage, worktreeId)
-    await tabLocatorByTitle(orcaBotmuxPage, originalTitle).dblclick()
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    const originalTitle = await getActiveTabTitle(botmuxPage, worktreeId)
+    await tabLocatorByTitle(botmuxPage, originalTitle).dblclick()
 
-    const renameInput = orcaBotmuxPage.getByRole('textbox', {
+    const renameInput = botmuxPage.getByRole('textbox', {
       name: `Rename tab ${originalTitle}`,
       exact: true
     })
     await expect(renameInput).toBeVisible()
     await renameInput.fill('')
 
-    const payload = `ORCA_E2E_APP_MENU_TEXTBOX_${randomUUID()}`
-    await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+    const payload = `BOTMUX_E2E_APP_MENU_TEXTBOX_${randomUUID()}`
+    await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
     await clearTerminalPtyWriteLog(electronApp)
     await expect(renameInput).toBeFocused()
 
@@ -151,6 +151,6 @@ test.describe('app menu paste ownership', () => {
     expect((await readTerminalPtyWrites(electronApp)).join('')).not.toContain(payload)
 
     await renameInput.press('Escape')
-    await expect(tabLocatorByTitle(orcaBotmuxPage, originalTitle)).toBeVisible()
+    await expect(tabLocatorByTitle(botmuxPage, originalTitle)).toBeVisible()
   })
 })

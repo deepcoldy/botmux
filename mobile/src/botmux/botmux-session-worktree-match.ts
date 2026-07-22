@@ -11,7 +11,7 @@ export type BotmuxSessionPathHost = {
 
 export type BotmuxWorktreeScope = {
   path: string
-  orcaBotmuxHostId: string
+  botmuxHostId: string
 }
 
 export function normalizeBotmuxMatchPath(path: string): string {
@@ -26,7 +26,7 @@ export function normalizeBotmuxMatchPath(path: string): string {
   return p
 }
 
-export function orcaBotmuxHostIdForRepoConnection(connectionId?: string | null): string {
+export function botmuxHostIdForRepoConnection(connectionId?: string | null): string {
   const id = connectionId?.trim()
   if (id) {
     return `ssh:${id}`
@@ -35,12 +35,12 @@ export function orcaBotmuxHostIdForRepoConnection(connectionId?: string | null):
 }
 
 /** Map mobile ExecutionHostId (`local` | `ssh:…`) to bridge endpoint host id. */
-export function orcaBotmuxHostIdFromExecutionHost(
+export function botmuxHostIdFromExecutionHost(
   hostId?: string | null,
   connectionId?: string | null
 ): string {
   if (connectionId?.trim()) {
-    return orcaBotmuxHostIdForRepoConnection(connectionId)
+    return botmuxHostIdForRepoConnection(connectionId)
   }
   const h = hostId?.trim()
   if (!h || h === 'local') {
@@ -49,7 +49,7 @@ export function orcaBotmuxHostIdFromExecutionHost(
   if (h.startsWith('ssh:')) {
     return h
   }
-  return orcaBotmuxHostIdForRepoConnection(h)
+  return botmuxHostIdForRepoConnection(h)
 }
 
 export function isBotmuxPathInsideOrEqual(child: string, parent: string): boolean {
@@ -68,7 +68,7 @@ export function botmuxSessionBelongsToWorktree(
   session: BotmuxSessionPathHost,
   worktree: BotmuxWorktreeScope
 ): boolean {
-  if (session.hostId !== worktree.orcaBotmuxHostId) {
+  if (session.hostId !== worktree.botmuxHostId) {
     return false
   }
   const cwd = session.cwd?.trim()

@@ -669,7 +669,7 @@ export const COMMIT_MESSAGE_AGENT_SPECS: Partial<Record<TuiAgent, CommitMessageA
 
 export const DEFAULT_COMMIT_MESSAGE_AGENT_ID: TuiAgent = 'claude'
 
-// Why: the "custom" choice is not a TuiAgent — it lets the user point OrcaBotmux
+// Why: the "custom" choice is not a TuiAgent — it lets the user point Botmux
 // at any CLI by typing a command template (see customAgentCommand setting +
 // planCustomCommand in commit-message-prompt.ts). Keeping it as its own
 // sentinel avoids polluting TuiAgent (which is shared with PTY launch /

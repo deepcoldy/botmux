@@ -4,7 +4,7 @@ import {
   withRemoteRuntimeTailscaleHint
 } from './remote-runtime-tailscale-hint'
 
-const UNREACHABLE = 'Could not connect to the remote OrcaBotmux runtime.'
+const UNREACHABLE = 'Could not connect to the remote Botmux runtime.'
 
 describe('isTailscaleEndpoint', () => {
   it('matches MagicDNS hostnames', () => {
@@ -27,7 +27,7 @@ describe('isTailscaleEndpoint', () => {
 
   it('rejects non-Tailscale hosts and the surrounding 100.x space', () => {
     expect(isTailscaleEndpoint('ws://192.168.1.10:6768')).toBe(false)
-    expect(isTailscaleEndpoint('wss://orca_botmux.example.com')).toBe(false)
+    expect(isTailscaleEndpoint('wss://botmux.example.com')).toBe(false)
     expect(isTailscaleEndpoint('ws://100.63.0.1:6768')).toBe(false)
     expect(isTailscaleEndpoint('ws://100.128.0.1:6768')).toBe(false)
     expect(isTailscaleEndpoint('ws://notts.net.evil.com')).toBe(false)
@@ -63,20 +63,20 @@ describe('withRemoteRuntimeTailscaleHint', () => {
   it('covers the close and timeout failure variants', () => {
     expect(
       withRemoteRuntimeTailscaleHint(
-        'Remote OrcaBotmux runtime closed the connection.',
+        'Remote Botmux runtime closed the connection.',
         'ws://192.168.1.10:6768'
       )
     ).toContain('connect both devices to Tailscale')
     expect(
       withRemoteRuntimeTailscaleHint(
-        'Timed out while connecting to the remote OrcaBotmux runtime.',
+        'Timed out while connecting to the remote Botmux runtime.',
         'wss://host.ts.net'
       )
     ).toContain('Funnel reverted to tailnet-only')
   })
 
   it('leaves non-connectivity errors untouched', () => {
-    const auth = 'Remote OrcaBotmux runtime rejected the pairing token.'
+    const auth = 'Remote Botmux runtime rejected the pairing token.'
     expect(withRemoteRuntimeTailscaleHint(auth, 'ws://192.168.1.10:6768')).toBe(auth)
   })
 

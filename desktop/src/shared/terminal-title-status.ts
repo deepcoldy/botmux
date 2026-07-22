@@ -39,7 +39,7 @@ const STRONG_WORKING_KEYWORDS = ['working', 'thinking', 'running'] as const
 //   - LEFT: reject `[\w./\\-]` so path fragments like `~/codex/ready`,
 //     Windows `C:\codex\ready`, and `codex.ready` cannot mint a strong idle
 //     signal by having the agent name sit earlier in the same path and the
-//     keyword land right after a path separator. OrcaBotmux is a cross-platform
+//     keyword land right after a path separator. Botmux is a cross-platform
 //     Electron app, so Windows path separators must be handled too.
 //   - RIGHT: reject only `[\w\-]` so legitimate sentence-style titles like
 //     "Codex done." / "Aider idle." / "OpenCode ready!" still match — path
@@ -128,7 +128,7 @@ export function createAgentStatusTracker(
 }
 
 // Why: cursor-agent's native OSC title is the literal string "Cursor Agent"
-// across the entire turn — it carries zero working/idle information. OrcaBotmux
+// across the entire turn — it carries zero working/idle information. Botmux
 // synthesizes its own titles ("⠋ Cursor Agent" for working, "Cursor -
 // action required" for permission) from cursor's hook events; the bare
 // native title must be a no-op so cursor's per-turn re-emissions cannot
@@ -144,7 +144,7 @@ export function detectAgentStatusFromTitle(title: string): AgentStatus | null {
   }
   // Why: "Cursor Agent" exactly (case-insensitive, no prefix/suffix) is cursor's
   // native title. Anything with additional tokens ("⠋ Cursor Agent", "Cursor -
-  // action required") is either an OrcaBotmux-synthesized working/permission title
+  // action required") is either an Botmux-synthesized working/permission title
   // or a tighter match worth classifying.
   if (title.trim().toLowerCase() === CURSOR_NATIVE_TITLE_LOWER) {
     return null

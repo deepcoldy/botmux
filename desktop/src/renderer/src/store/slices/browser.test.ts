@@ -518,7 +518,7 @@ describe('createBrowserSlice runtime guard', () => {
           {
             id: 'default',
             scope: 'default',
-            partition: 'persist:orca-botmux-default',
+            partition: 'persist:botmux-default',
             label: 'Default',
             source: null
           }
@@ -544,7 +544,7 @@ describe('createBrowserSlice runtime guard', () => {
       {
         id: 'default',
         scope: 'default',
-        partition: 'persist:orca-botmux-default',
+        partition: 'persist:botmux-default',
         label: 'Default',
         source: null
       }
@@ -553,7 +553,7 @@ describe('createBrowserSlice runtime guard', () => {
       {
         id: 'default',
         scope: 'default',
-        partition: 'persist:orca-botmux-default',
+        partition: 'persist:botmux-default',
         label: 'Default',
         source: null
       }
@@ -570,7 +570,7 @@ describe('createBrowserSlice runtime guard', () => {
           {
             id: 'remote-default',
             scope: 'default',
-            partition: 'persist:orca-botmux-remote',
+            partition: 'persist:botmux-remote',
             label: 'Remote Default',
             source: null
           }
@@ -586,7 +586,7 @@ describe('createBrowserSlice runtime guard', () => {
       {
         id: 'local-default',
         scope: 'default',
-        partition: 'persist:orca-botmux-local',
+        partition: 'persist:botmux-local',
         label: 'Local Default',
         source: null
       }
@@ -658,13 +658,13 @@ describe('createBrowserSlice runtime guard', () => {
 
     const tab = store.getState().createBrowserTab('wt-1', 'https://example.com', {
       sessionProfileId: 'profile-isolated',
-      sessionPartition: 'persist:orca-botmux-browser-session-profile-isolated'
+      sessionPartition: 'persist:botmux-browser-session-profile-isolated'
     })
 
     expect(tab.sessionProfileId).toBe('profile-isolated')
-    expect(tab.sessionPartition).toBe('persist:orca-botmux-browser-session-profile-isolated')
+    expect(tab.sessionPartition).toBe('persist:botmux-browser-session-profile-isolated')
     expect(store.getState().browserTabsByWorktree['wt-1']?.[0]?.sessionPartition).toBe(
-      'persist:orca-botmux-browser-session-profile-isolated'
+      'persist:botmux-browser-session-profile-isolated'
     )
   })
 
@@ -672,7 +672,7 @@ describe('createBrowserSlice runtime guard', () => {
     const store = createTestStore()
     const tab = store.getState().createBrowserTab('wt-1', 'https://example.com', {
       sessionProfileId: null,
-      sessionPartition: 'persist:orca-botmux-browser'
+      sessionPartition: 'persist:botmux-browser'
     })
 
     store
@@ -680,13 +680,13 @@ describe('createBrowserSlice runtime guard', () => {
       .switchBrowserTabProfile(
         tab.id,
         'profile-isolated',
-        'persist:orca-botmux-browser-session-profile-isolated'
+        'persist:botmux-browser-session-profile-isolated'
       )
 
     expect(store.getState().browserTabsByWorktree['wt-1']?.[0]).toEqual(
       expect.objectContaining({
         sessionProfileId: 'profile-isolated',
-        sessionPartition: 'persist:orca-botmux-browser-session-profile-isolated'
+        sessionPartition: 'persist:botmux-browser-session-profile-isolated'
       })
     )
   })
@@ -807,7 +807,7 @@ describe('createBrowserSlice runtime guard', () => {
       {
         id: 'default',
         scope: 'default',
-        partition: 'persist:orca-botmux-default',
+        partition: 'persist:botmux-default',
         label: 'Default',
         source: null
       }
@@ -820,7 +820,7 @@ describe('createBrowserSlice runtime guard', () => {
       {
         id: 'default',
         scope: 'default',
-        partition: 'persist:orca-botmux-default',
+        partition: 'persist:botmux-default',
         label: 'Default',
         source: null
       }

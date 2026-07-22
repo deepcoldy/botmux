@@ -5,7 +5,7 @@ export type BrowserFocusRequestDetail = {
   target: BrowserFocusTarget
 }
 
-export const ORCA_BROWSER_FOCUS_REQUEST_EVENT = 'orca_botmux:browser-focus-request'
+export const BOTMUX_BROWSER_FOCUS_REQUEST_EVENT = 'botmux:browser-focus-request'
 
 const FOCUS_REQUEST_TTL_MS = 30_000
 

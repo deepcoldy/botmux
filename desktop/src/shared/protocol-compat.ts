@@ -58,9 +58,9 @@ export function describeRuntimeCompatBlock(verdict: RuntimeCompatVerdict): strin
     return 'Runtime client and server are compatible.'
   }
   if (verdict.reason === 'client-too-old') {
-    return `This OrcaBotmux client is too old for the selected server. Update OrcaBotmux on this machine. Client protocol ${verdict.clientProtocolVersion}, server requires client protocol ${verdict.requiredClientProtocolVersion}.`
+    return `This Botmux client is too old for the selected server. Update Botmux on this machine. Client protocol ${verdict.clientProtocolVersion}, server requires client protocol ${verdict.requiredClientProtocolVersion}.`
   }
-  return `The selected OrcaBotmux server is too old for this client. Update OrcaBotmux on the server. Server protocol ${verdict.serverProtocolVersion}, client requires server protocol ${verdict.requiredServerProtocolVersion}.`
+  return `The selected Botmux server is too old for this client. Update Botmux on the server. Server protocol ${verdict.serverProtocolVersion}, client requires server protocol ${verdict.requiredServerProtocolVersion}.`
 }
 
 export type CompatVerdict =

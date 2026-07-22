@@ -93,11 +93,11 @@ export function WarpThemeImportModal({
             {mode === 'yaml'
               ? translate(
                   'auto.components.settings.WarpThemeImportModal.yaml_description',
-                  'Import theme YAML files (Warp format) as OrcaBotmux terminal themes.'
+                  'Import theme YAML files (Warp format) as Botmux terminal themes.'
                 )
               : translate(
                   'auto.components.settings.WarpThemeImportModal.description',
-                  'Import Warp themes as OrcaBotmux terminal themes.'
+                  'Import Warp themes as Botmux terminal themes.'
                 )}
           </DialogDescription>
         </DialogHeader>
@@ -254,7 +254,7 @@ export function WarpThemeImportModal({
                 <p>
                   {translate(
                     'auto.components.settings.WarpThemeImportModal.builtin_themes_hint',
-                    "Warp's preloaded themes are part of the Warp app and can't be read from disk. OrcaBotmux already includes most of them, like Dracula, Gruvbox, Solarized, and Tokyo Night."
+                    "Warp's preloaded themes are part of the Warp app and can't be read from disk. Botmux already includes most of them, like Dracula, Gruvbox, Solarized, and Tokyo Night."
                   )}
                 </p>
               ) : null}

@@ -1,5 +1,5 @@
 // Why: suppress hot-loop failures while still detecting an in-place Git
-// upgrade during a long OrcaBotmux session without requiring a restart.
+// upgrade during a long Botmux session without requiring a restart.
 export const GIT_CAPABILITY_RETRY_INTERVAL_MS = 30 * 60_000
 
 export type GitCapability =

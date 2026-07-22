@@ -15,7 +15,7 @@ afterEach(async () => {
 
 describe('scanAiVaultSessions harness-injected title seeding', () => {
   it('keeps harness-injected Claude turns without isMeta out of session titles', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-ai-vault-claude-injected-title-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-ai-vault-claude-injected-title-'))
     tempRoots.push(root)
     const roots = isolatedScanRoots(root)
     await mkdir(join(roots.claudeProjectsDir, 'project'), { recursive: true })
@@ -55,7 +55,7 @@ describe('scanAiVaultSessions harness-injected title seeding', () => {
   })
 
   it('titles a session from a real first turn that pastes a custom element', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-ai-vault-claude-custom-element-title-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-ai-vault-claude-custom-element-title-'))
     tempRoots.push(root)
     const roots = isolatedScanRoots(root)
     await mkdir(join(roots.claudeProjectsDir, 'project'), { recursive: true })

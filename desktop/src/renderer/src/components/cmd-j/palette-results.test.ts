@@ -89,8 +89,8 @@ const sections: SettingsNavSection[] = [
     icon: Settings,
     searchEntries: [
       {
-        title: 'OrcaBotmux CLI',
-        description: 'Register or remove the orca_botmux shell command.',
+        title: 'Botmux CLI',
+        description: 'Register or remove the botmux shell command.',
         keywords: ['cli', 'path', 'terminal', 'command', 'shell command'],
         cmdJKeywords: ['cli', 'path', 'command', 'shell command'],
         targetSectionId: 'cli'
@@ -116,10 +116,10 @@ const sections: SettingsNavSection[] = [
   },
   {
     id: 'servers',
-    title: 'Remote OrcaBotmux Servers',
-    description: 'Pair remote OrcaBotmux runtimes.',
+    title: 'Remote Botmux Servers',
+    description: 'Pair remote Botmux runtimes.',
     icon: Settings,
-    searchEntries: [{ title: 'Remote OrcaBotmux Servers' }],
+    searchEntries: [{ title: 'Remote Botmux Servers' }],
     group: 'remote'
   },
   {
@@ -189,7 +189,7 @@ describe('Cmd+J palette middle-band ranking', () => {
     ['browser', 'settings:browser'],
     ['quick commands', 'settings:quick-commands'],
     ['add quick command', 'add-quick-command'],
-    ['orca_botmux cli', 'settings:general:cli'],
+    ['botmux cli', 'settings:general:cli'],
     ['shell command', 'settings:general:cli']
   ])('ranks %s first', (query, expectedId) => {
     expect(top(query)).toBe(expectedId)
@@ -201,8 +201,8 @@ describe('Cmd+J palette middle-band ranking', () => {
     )
 
     expect(cliResult).toMatchObject({
-      title: 'OrcaBotmux CLI',
-      description: 'Register or remove the orca_botmux shell command.',
+      title: 'Botmux CLI',
+      description: 'Register or remove the botmux shell command.',
       sectionId: 'general',
       targetSectionId: 'cli'
     })

@@ -5,9 +5,9 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '../ui/
 import { translate } from '@/i18n/i18n'
 
 const EXAMPLE_PROMPTS: string[] = [
-  'Using OrcaBotmux CLI, open https://github.com/notifications and click the first unread pull request.',
-  "Take a screenshot of my open Linear board with the OrcaBotmux CLI and tell me what's blocked.",
-  'With OrcaBotmux CLI, go to our staging app, log in (my cookies are imported), and verify the checkout flow works.'
+  'Using Botmux CLI, open https://github.com/notifications and click the first unread pull request.',
+  "Take a screenshot of my open Linear board with the Botmux CLI and tell me what's blocked.",
+  'With Botmux CLI, go to our staging app, log in (my cookies are imported), and verify the checkout flow works.'
 ]
 
 async function handleCopyText(text: string, label: string): Promise<void> {

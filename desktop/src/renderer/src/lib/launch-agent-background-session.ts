@@ -71,8 +71,8 @@ export async function launchAgentBackgroundSession(
         repo.connectionId ? undefined : getLocalProjectExecutionRuntimeContext(store, worktreeId)
       )
     : CLIENT_PLATFORM
-  // Why: SSH remotes deploy the CLI shim as plain `orca_botmux`, so the Linux-only
-  // `orca-botmux-ide` rename must not be applied for remote launches.
+  // Why: SSH remotes deploy the CLI shim as plain `botmux`, so the Linux-only
+  // `botmux-ide` rename must not be applied for remote launches.
   const isRemote = repo ? repoIsRemote(repo) : false
   const startupShell = resolveLocalWindowsAgentStartupShell({
     platform: launchPlatform,
@@ -127,10 +127,10 @@ export async function launchAgentBackgroundSession(
   store.setTabLayout(tab.id, singlePaneLayoutSnapshot(leafId))
   const paneEnv = {
     ...startupPlan.env,
-    ORCA_PANE_KEY: paneKey,
-    ORCA_TAB_ID: tab.id,
-    ORCA_WORKTREE_ID: worktreeId,
-    ORCA_AGENT_LAUNCH_TOKEN: launchToken
+    BOTMUX_PANE_KEY: paneKey,
+    BOTMUX_TAB_ID: tab.id,
+    BOTMUX_WORKTREE_ID: worktreeId,
+    BOTMUX_AGENT_LAUNCH_TOKEN: launchToken
   }
   const sshConnectionId = repo?.connectionId ?? null
   const sshStartupDelivery = createSshBackgroundStartupDelivery({

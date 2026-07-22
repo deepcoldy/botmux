@@ -6,7 +6,7 @@ import { WATCHER_PROCESS_EXIT_DEADLINE_MS } from './parcel-watcher-child-termina
 const { existsSyncMock, forkMock, mkdtempSyncMock, rmSyncMock } = vi.hoisted(() => ({
   existsSyncMock: vi.fn(),
   forkMock: vi.fn(),
-  mkdtempSyncMock: vi.fn(() => '/tmp/orca-botmux-watcher-disconnect-test'),
+  mkdtempSyncMock: vi.fn(() => '/tmp/botmux-watcher-disconnect-test'),
   rmSyncMock: vi.fn()
 }))
 

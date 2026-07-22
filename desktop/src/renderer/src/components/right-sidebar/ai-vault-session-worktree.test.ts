@@ -20,7 +20,7 @@ const baseSession: AiVaultSession = {
   agent: 'codex',
   sessionId: 'session-1',
   title: 'Find the pane',
-  cwd: '/repo/orca_botmux/src',
+  cwd: '/repo/botmux/src',
   branch: null,
   model: null,
   filePath: '/home/ada/.codex/session-1.jsonl',
@@ -39,10 +39,10 @@ const baseSession: AiVaultSession = {
 
 function makeWorktree(overrides: Partial<Worktree> = {}): Worktree {
   const worktree: Worktree = {
-    id: 'repo-1::/repo/orca_botmux',
+    id: 'repo-1::/repo/botmux',
     repoId: 'repo-1',
-    displayName: 'orca_botmux',
-    path: '/repo/orca_botmux',
+    displayName: 'botmux',
+    path: '/repo/botmux',
     head: 'abc123',
     branch: 'main',
     isBare: false,
@@ -63,8 +63,8 @@ function makeWorktree(overrides: Partial<Worktree> = {}): Worktree {
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-1',
-    path: '/repo/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/repo/botmux',
+    displayName: 'botmux',
     badgeColor: '#737373',
     addedAt: 1,
     connectionId: null,
@@ -85,8 +85,8 @@ describe('resolveAiVaultSessionWorktreeInfo', () => {
       })
     ).toMatchObject({
       status: 'current',
-      label: 'orca_botmux',
-      path: '/repo/orca_botmux'
+      label: 'botmux',
+      path: '/repo/botmux'
     })
   })
 
@@ -104,9 +104,9 @@ describe('resolveAiVaultSessionWorktreeInfo', () => {
 
   it('uses prior worktree paths to identify renamed active worktrees', () => {
     const worktree = makeWorktree({
-      id: 'repo-1::/repo/orca-botmux-renamed',
-      path: '/repo/orca-botmux-renamed',
-      priorWorktreeIds: ['repo-1::/repo/orca_botmux']
+      id: 'repo-1::/repo/botmux-renamed',
+      path: '/repo/botmux-renamed',
+      priorWorktreeIds: ['repo-1::/repo/botmux']
     })
 
     expect(
@@ -117,8 +117,8 @@ describe('resolveAiVaultSessionWorktreeInfo', () => {
       })
     ).toMatchObject({
       status: 'active',
-      label: 'orca_botmux',
-      path: '/repo/orca_botmux'
+      label: 'botmux',
+      path: '/repo/botmux'
     })
   })
 
@@ -131,48 +131,48 @@ describe('resolveAiVaultSessionWorktreeInfo', () => {
       })
     ).toMatchObject({
       status: 'unavailable',
-      label: 'orca_botmux/src',
-      path: '/repo/orca_botmux/src'
+      label: 'botmux/src',
+      path: '/repo/botmux/src'
     })
   })
 
   it('matches WSL UNC worktree paths to Linux transcript cwd values', () => {
     const worktree = makeWorktree({
-      path: '\\\\wsl.localhost\\Ubuntu\\home\\ada\\orca_botmux'
+      path: '\\\\wsl.localhost\\Ubuntu\\home\\ada\\botmux'
     })
 
     expect(
       resolveAiVaultSessionWorktreeInfo({
-        session: { ...baseSession, cwd: '/home/ada/orca_botmux/src' },
+        session: { ...baseSession, cwd: '/home/ada/botmux/src' },
         worktrees: [worktree],
         activeWorktreeId: null
       })
     ).toMatchObject({
       status: 'active',
-      label: 'orca_botmux',
-      path: '\\\\wsl.localhost\\Ubuntu\\home\\ada\\orca_botmux'
+      label: 'botmux',
+      path: '\\\\wsl.localhost\\Ubuntu\\home\\ada\\botmux'
     })
   })
 
   it('uses the session host when multiple worktrees share the same path', () => {
     const localWorktree = makeWorktree({
-      id: 'repo-local::/srv/orca_botmux',
+      id: 'repo-local::/srv/botmux',
       repoId: 'repo-local',
       displayName: 'local',
-      path: '/srv/orca_botmux',
+      path: '/srv/botmux',
       hostId: 'local'
     })
     const sshWorktree = makeWorktree({
-      id: 'repo-ssh::/srv/orca_botmux',
+      id: 'repo-ssh::/srv/botmux',
       repoId: 'repo-ssh',
       displayName: 'ssh',
-      path: '/srv/orca_botmux',
+      path: '/srv/botmux',
       hostId: 'ssh:target-1'
     })
 
     expect(
       resolveAiVaultSessionWorktreeInfo({
-        session: { ...baseSession, cwd: '/srv/orca_botmux/src', executionHostId: 'ssh:target-1' },
+        session: { ...baseSession, cwd: '/srv/botmux/src', executionHostId: 'ssh:target-1' },
         worktrees: [localWorktree, sshWorktree],
         activeWorktreeId: null
       })
@@ -184,15 +184,15 @@ describe('resolveAiVaultSessionWorktreeInfo', () => {
 
   it('uses repo host ownership when a legacy worktree lacks host metadata', () => {
     const worktree = makeWorktree({
-      id: 'repo-ssh::/srv/orca_botmux',
+      id: 'repo-ssh::/srv/botmux',
       repoId: 'repo-ssh',
       displayName: 'ssh',
-      path: '/srv/orca_botmux'
+      path: '/srv/botmux'
     })
 
     expect(
       resolveAiVaultSessionWorktreeInfo({
-        session: { ...baseSession, cwd: '/srv/orca_botmux/src', executionHostId: 'ssh:target-1' },
+        session: { ...baseSession, cwd: '/srv/botmux/src', executionHostId: 'ssh:target-1' },
         repos: [makeRepo({ id: 'repo-ssh', connectionId: 'target-1', executionHostId: null })],
         worktrees: [worktree],
         activeWorktreeId: null
@@ -231,11 +231,11 @@ describe('extractWorktreePathFromSessionTitle', () => {
   it('reads worktree paths embedded in session titles', () => {
     expect(
       extractWorktreePathFromSessionTitle(
-        'Inspect PR #6229 - Worktree: /Users/ada/projects/orca_botmux/fix-tabs'
+        'Inspect PR #6229 - Worktree: /Users/ada/projects/botmux/fix-tabs'
       )
-    ).toBe('/Users/ada/projects/orca_botmux/fix-tabs')
-    expect(extractWorktreePathFromSessionTitle('Worktree: /tmp/orca-botmux-worker')).toBe(
-      '/tmp/orca-botmux-worker'
+    ).toBe('/Users/ada/projects/botmux/fix-tabs')
+    expect(extractWorktreePathFromSessionTitle('Worktree: /tmp/botmux-worker')).toBe(
+      '/tmp/botmux-worker'
     )
   })
 })
@@ -248,12 +248,12 @@ describe('resolveAiVaultSessionWorktreeDisplay', () => {
           ...baseSession,
           cwd: null,
           branch: null,
-          title: 'Fix tabs - Worktree: /Users/ada/projects/orca_botmux/fix-tabs'
+          title: 'Fix tabs - Worktree: /Users/ada/projects/botmux/fix-tabs'
         },
         worktrees: [makeWorktree()],
         activeWorktreeId: null
       })?.path
-    ).toBe('/Users/ada/projects/orca_botmux/fix-tabs')
+    ).toBe('/Users/ada/projects/botmux/fix-tabs')
 
     expect(
       resolveAiVaultSessionWorktreeDisplay({
@@ -267,8 +267,8 @@ describe('resolveAiVaultSessionWorktreeDisplay', () => {
 
 describe('aiVaultWorktreeCompactPath', () => {
   it('keeps the last two path segments for dense detail rows', () => {
-    expect(aiVaultWorktreeCompactPath('/Users/ada/projects/orca_botmux/improve-agent-session')).toBe(
-      'orca_botmux/improve-agent-session'
+    expect(aiVaultWorktreeCompactPath('/Users/ada/projects/botmux/improve-agent-session')).toBe(
+      'botmux/improve-agent-session'
     )
   })
 })
@@ -321,8 +321,8 @@ function makeWorktreeInfo(
 ): AiVaultSessionWorktreeInfo {
   return {
     status,
-    label: 'orca_botmux',
-    path: '/repo/orca_botmux',
-    ...(status === 'unavailable' ? {} : { worktreeId: 'repo-1::/repo/orca_botmux' })
+    label: 'botmux',
+    path: '/repo/botmux',
+    ...(status === 'unavailable' ? {} : { worktreeId: 'repo-1::/repo/botmux' })
   }
 }

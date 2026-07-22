@@ -31,7 +31,7 @@ async function postGrokHook(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-OrcaBotmux-Agent-Hook-Token': endpoint.token
+      'X-Botmux-Agent-Hook-Token': endpoint.token
     },
     body: JSON.stringify(hookBody(payload))
   })
@@ -45,7 +45,7 @@ describe('AgentHookServer Grok discovery retries', () => {
     })
     vi.spyOn(agentHookListener, 'preparePendingGrokResultDiscovery').mockReturnValue(discovery)
     const server = new AgentHookServer()
-    const root = mkdtempSync(join(tmpdir(), 'orca-botmux-grok-delayed-discovery-'))
+    const root = mkdtempSync(join(tmpdir(), 'botmux-grok-delayed-discovery-'))
     const sessionId = '019e37f4-5135-7b63-a4ab-6d13aa6bf532'
     const cwd = join(root, 'workspace')
     const sessionDir = join(root, '.grok', 'sessions', encodeURIComponent(cwd), sessionId)
@@ -57,7 +57,7 @@ describe('AgentHookServer Grok discovery retries', () => {
     await server.start({ env: 'production' })
     try {
       const env = server.buildPtyEnv()
-      const endpoint = { port: env.ORCA_AGENT_HOOK_PORT, token: env.ORCA_AGENT_HOOK_TOKEN }
+      const endpoint = { port: env.BOTMUX_AGENT_HOOK_PORT, token: env.BOTMUX_AGENT_HOOK_TOKEN }
       const listener = vi.fn()
       server.setListener(listener)
 
@@ -90,13 +90,13 @@ describe('AgentHookServer Grok discovery retries', () => {
     })
     vi.spyOn(agentHookListener, 'preparePendingGrokResultDiscovery').mockReturnValue(discovery)
     const server = new AgentHookServer()
-    const root = mkdtempSync(join(tmpdir(), 'orca-botmux-grok-stale-discovery-'))
+    const root = mkdtempSync(join(tmpdir(), 'botmux-grok-stale-discovery-'))
     vi.stubEnv('HOME', root)
     vi.stubEnv('USERPROFILE', root)
     await server.start({ env: 'production' })
     try {
       const env = server.buildPtyEnv()
-      const endpoint = { port: env.ORCA_AGENT_HOOK_PORT, token: env.ORCA_AGENT_HOOK_TOKEN }
+      const endpoint = { port: env.BOTMUX_AGENT_HOOK_PORT, token: env.BOTMUX_AGENT_HOOK_TOKEN }
       await postGrokHook(endpoint, { hookEventName: 'UserPromptSubmit', prompt: 'old prompt' })
       await postGrokHook(endpoint, {
         hookEventName: 'Stop',

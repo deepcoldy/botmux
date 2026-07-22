@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 import type { GlobalSettings } from '../../src/shared/types'
 
@@ -29,14 +29,14 @@ async function openNotificationSettings(
 }
 
 test.describe('Notification settings', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
   })
 
-  test('can be toggled from settings and disables child controls', async ({ orcaBotmuxPage }) => {
-    await openNotificationSettings(orcaBotmuxPage)
+  test('can be toggled from settings and disables child controls', async ({ botmuxPage }) => {
+    await openNotificationSettings(botmuxPage)
 
-    const notificationsSection = orcaBotmuxPage.locator('[data-settings-section="notifications"]')
+    const notificationsSection = botmuxPage.locator('[data-settings-section="notifications"]')
     const enableNotificationsSwitch = notificationsSection.getByRole('switch', {
       name: 'Enable Notifications'
     })
@@ -60,7 +60,7 @@ test.describe('Notification settings', () => {
     await agentTaskCompleteSwitch.click()
     await expect(agentTaskCompleteSwitch).toHaveAttribute('aria-checked', 'false')
     await expect
-      .poll(async () => (await getSettings(orcaBotmuxPage)).notifications.agentTaskComplete, {
+      .poll(async () => (await getSettings(botmuxPage)).notifications.agentTaskComplete, {
         timeout: 5_000,
         message: 'agent task-complete notification setting did not persist after disabling'
       })
@@ -73,7 +73,7 @@ test.describe('Notification settings', () => {
     await expect(suppressWhileFocusedSwitch).toBeDisabled()
     await expect(sendTestButton).toBeDisabled()
     await expect
-      .poll(async () => (await getSettings(orcaBotmuxPage)).notifications.enabled, {
+      .poll(async () => (await getSettings(botmuxPage)).notifications.enabled, {
         timeout: 5_000,
         message: 'master notification setting did not persist after disabling'
       })
@@ -83,7 +83,7 @@ test.describe('Notification settings', () => {
     await agentTaskCompleteSwitch.click()
     await expect
       .poll(async () => {
-        const settings = await getSettings(orcaBotmuxPage)
+        const settings = await getSettings(botmuxPage)
         return {
           enabled: settings.notifications.enabled,
           agentTaskComplete: settings.notifications.agentTaskComplete

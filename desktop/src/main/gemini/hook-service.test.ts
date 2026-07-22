@@ -33,8 +33,8 @@ describe('GeminiHookService', () => {
   let userDataDir: string
 
   beforeAll(() => {
-    homeDir = mkdtempSync(join(tmpdir(), 'orca-botmux-gemini-home-'))
-    userDataDir = mkdtempSync(join(tmpdir(), 'orca-botmux-gemini-userdata-'))
+    homeDir = mkdtempSync(join(tmpdir(), 'botmux-gemini-home-'))
+    userDataDir = mkdtempSync(join(tmpdir(), 'botmux-gemini-userdata-'))
     homedirMock.mockReturnValue(homeDir)
     getPathMock.mockImplementation((name: string) => {
       if (name === 'userData') {
@@ -53,13 +53,13 @@ describe('GeminiHookService', () => {
     const managedHookFileName = process.platform === 'win32' ? 'gemini-hook.cmd' : 'gemini-hook.sh'
     const staleManagedHookPath =
       process.platform === 'win32'
-        ? `C:\\Users\\ramzi\\.orca_botmux\\agent-hooks\\${managedHookFileName}`
-        : `/Users/ramzi/.orca_botmux/agent-hooks/${managedHookFileName}`
+        ? `C:\\Users\\ramzi\\.botmux\\agent-hooks\\${managedHookFileName}`
+        : `/Users/ramzi/.botmux/agent-hooks/${managedHookFileName}`
     const staleManagedCommand =
       process.platform === 'win32'
         ? staleManagedHookPath
         : `if [ -x '${staleManagedHookPath}' ]; then /bin/sh '${staleManagedHookPath}'; fi`
-    const managedHookPath = join(homeDir, '.orca_botmux', 'agent-hooks', managedHookFileName)
+    const managedHookPath = join(homeDir, '.botmux', 'agent-hooks', managedHookFileName)
     const configDir = join(homeDir, '.gemini')
     mkdirSync(configDir, { recursive: true })
     writeFileSync(
@@ -120,7 +120,7 @@ describe('GeminiHookService', () => {
   it.skipIf(process.platform !== 'win32')(
     'wraps the managed hook command to survive spaces in the profile path (#6078)',
     () => {
-      const spaceHome = join(tmpdir(), 'orca_botmux gemini home with spaces')
+      const spaceHome = join(tmpdir(), 'botmux gemini home with spaces')
       mkdirSync(spaceHome, { recursive: true })
       homedirMock.mockReturnValue(spaceHome)
       try {
@@ -145,8 +145,8 @@ describe('GeminiHookService', () => {
     const managedHookFileName = process.platform === 'win32' ? 'gemini-hook.cmd' : 'gemini-hook.sh'
     const staleManagedHookPath =
       process.platform === 'win32'
-        ? `C:\\Users\\ramzi\\.orca_botmux\\agent-hooks\\${managedHookFileName}`
-        : `/Users/ramzi/.orca_botmux/agent-hooks/${managedHookFileName}`
+        ? `C:\\Users\\ramzi\\.botmux\\agent-hooks\\${managedHookFileName}`
+        : `/Users/ramzi/.botmux/agent-hooks/${managedHookFileName}`
     const staleManagedCommand =
       process.platform === 'win32'
         ? staleManagedHookPath

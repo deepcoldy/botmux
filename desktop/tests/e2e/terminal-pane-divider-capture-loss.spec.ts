@@ -1,5 +1,5 @@
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   splitActiveTerminalPane,
   waitForActiveTerminalManager,
@@ -123,17 +123,17 @@ function gridsMatch(geometry: DividerGeometry): boolean {
 
 test('@headful keeps resizing after the divider loses pointer capture', async ({
   electronApp,
-  orcaBotmuxPage,
+  botmuxPage,
   testRepoPath
 }, testInfo) => {
-  await setFullscreen(electronApp, orcaBotmuxPage)
-  await addTestRepo(orcaBotmuxPage, testRepoPath)
-  await ensureTerminalVisible(orcaBotmuxPage, 30_000)
-  await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-  await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-  await waitForPaneCount(orcaBotmuxPage, 2, 30_000)
+  await setFullscreen(electronApp, botmuxPage)
+  await addTestRepo(botmuxPage, testRepoPath)
+  await ensureTerminalVisible(botmuxPage, 30_000)
+  await waitForActiveTerminalManager(botmuxPage, 30_000)
+  await splitActiveTerminalPane(botmuxPage, 'vertical')
+  await waitForPaneCount(botmuxPage, 2, 30_000)
 
-  const divider = orcaBotmuxPage.locator('.pane-divider.is-vertical').first()
+  const divider = botmuxPage.locator('.pane-divider.is-vertical').first()
   await expect(divider).toBeVisible()
   const box = await divider.boundingBox()
   if (!box) {
@@ -149,15 +149,15 @@ test('@headful keeps resizing after the divider loses pointer capture', async ({
     })
   })
 
-  const before = await readDividerGeometry(orcaBotmuxPage)
+  const before = await readDividerGeometry(botmuxPage)
   const startX = box.x + box.width / 2
   const startY = box.y + box.height / 2
-  await orcaBotmuxPage.mouse.move(startX, startY)
-  await orcaBotmuxPage.mouse.down()
-  await orcaBotmuxPage.mouse.move(startX + 140, startY, { steps: 10 })
+  await botmuxPage.mouse.move(startX, startY)
+  await botmuxPage.mouse.down()
+  await botmuxPage.mouse.move(startX + 140, startY, { steps: 10 })
   await expect
     .poll(async () =>
-      Math.abs((await readDividerGeometry(orcaBotmuxPage)).first.width - before.first.width)
+      Math.abs((await readDividerGeometry(botmuxPage)).first.width - before.first.width)
     )
     .toBeGreaterThan(80)
 
@@ -174,10 +174,10 @@ test('@headful keeps resizing after the divider loses pointer capture', async ({
     .poll(() => divider.evaluate((element) => Number(element.dataset.captureLossCount ?? '0')))
     .toBe(1)
 
-  await orcaBotmuxPage.mouse.move(startX + 260, startY, { steps: 10 })
-  await orcaBotmuxPage.mouse.up()
-  await expect.poll(async () => gridsMatch(await readDividerGeometry(orcaBotmuxPage))).toBe(true)
-  const after = await readDividerGeometry(orcaBotmuxPage)
+  await botmuxPage.mouse.move(startX + 260, startY, { steps: 10 })
+  await botmuxPage.mouse.up()
+  await expect.poll(async () => gridsMatch(await readDividerGeometry(botmuxPage))).toBe(true)
+  const after = await readDividerGeometry(botmuxPage)
   await testInfo.attach('divider-capture-loss-geometry', {
     body: Buffer.from(JSON.stringify({ before, after }, null, 2)),
     contentType: 'application/json'

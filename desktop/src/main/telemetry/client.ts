@@ -63,13 +63,13 @@ const TELEMETRY_ENABLED = true
 // in tests — both of which resolve to `IS_OFFICIAL_BUILD === false`, which
 // is the fail-closed default we want anywhere outside an official CI build.
 const BUILD_IDENTITY: 'stable' | 'rc' | null =
-  typeof ORCA_BUILD_IDENTITY !== 'undefined'
-    ? ORCA_BUILD_IDENTITY
-    : ((globalThis as { ORCA_BUILD_IDENTITY?: 'stable' | 'rc' | null }).ORCA_BUILD_IDENTITY ?? null)
+  typeof BOTMUX_BUILD_IDENTITY !== 'undefined'
+    ? BOTMUX_BUILD_IDENTITY
+    : ((globalThis as { BOTMUX_BUILD_IDENTITY?: 'stable' | 'rc' | null }).BOTMUX_BUILD_IDENTITY ?? null)
 const WRITE_KEY: string | null =
-  typeof ORCA_POSTHOG_WRITE_KEY !== 'undefined'
-    ? ORCA_POSTHOG_WRITE_KEY
-    : ((globalThis as { ORCA_POSTHOG_WRITE_KEY?: string | null }).ORCA_POSTHOG_WRITE_KEY ?? null)
+  typeof BOTMUX_POSTHOG_WRITE_KEY !== 'undefined'
+    ? BOTMUX_POSTHOG_WRITE_KEY
+    : ((globalThis as { BOTMUX_POSTHOG_WRITE_KEY?: string | null }).BOTMUX_POSTHOG_WRITE_KEY ?? null)
 const IS_OFFICIAL_BUILD: boolean =
   (BUILD_IDENTITY === 'stable' || BUILD_IDENTITY === 'rc') &&
   typeof WRITE_KEY === 'string' &&
@@ -111,7 +111,7 @@ function buildCommonProps(installId: string, sid: string, channel: 'stable' | 'r
     os_release: osRelease(),
     install_id: installId,
     session_id: sid,
-    orca_botmux_channel: channel
+    botmux_channel: channel
   }
 }
 
@@ -192,7 +192,7 @@ export function initTelemetry(store: Store): void {
  * Decide whether to flip the PostHog SDK's in-memory `optedOut` flag at boot.
  *
  * Applied to DISABLED cohorts only (`user_opt_out` / CI / DO_NOT_TRACK /
- * ORCA_TELEMETRY_DISABLED). The SDK flag does not persist across process
+ * BOTMUX_TELEMETRY_DISABLED). The SDK flag does not persist across process
  * restarts, so we re-apply on every boot as defense-in-depth: any direct
  * `posthog.capture()` that bypasses `track()` (and therefore bypasses the
  * consent gate in this module) must still drop at the SDK boundary for a
@@ -252,8 +252,8 @@ function waitForCaptureEnqueue(client: PostHog, event: EventName, uuid: string):
 // In `pnpm dev` and any contributor / non-official build, `track()` is a
 // no-op: it returns immediately without transmitting, logging, or running
 // the burst-cap / consent / validator pipeline. Telemetry only flows in
-// official stable/rc builds where CI injects `ORCA_BUILD_IDENTITY` and
-// `ORCA_POSTHOG_WRITE_KEY`.
+// official stable/rc builds where CI injects `BOTMUX_BUILD_IDENTITY` and
+// `BOTMUX_POSTHOG_WRITE_KEY`.
 export function track<N extends EventName>(name: N, props: EventProps<N>): void {
   if (!testTransportEnabled && (!IS_OFFICIAL_BUILD || !TELEMETRY_ENABLED)) {
     return

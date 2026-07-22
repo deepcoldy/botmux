@@ -31,7 +31,7 @@ describe('install-electron-package-binary', () => {
 
       expect(result.status, result.stderr).toBe(0)
       expect(readFileSync(join(projectDir, 'electron-get.log'), 'utf8')).toMatch(
-        /cacheRoot=.*orca_botmux-electron-.*cache/
+        /cacheRoot=.*botmux-electron-.*cache/
       )
       expect(readFileSync(join(projectDir, 'node_modules', 'electron', 'path.txt'), 'utf8')).toBe(
         'electron'
@@ -135,7 +135,7 @@ describe('install-electron-package-binary', () => {
 })
 
 function mkTempProject() {
-  const projectDir = mkdtempSync(join(tmpdir(), 'orca-botmux-install-electron-'))
+  const projectDir = mkdtempSync(join(tmpdir(), 'botmux-install-electron-'))
   mkdirSync(join(projectDir, 'config', 'scripts'), { recursive: true })
   copyFileSync(
     sourceScriptPath,
@@ -152,7 +152,7 @@ function runInstallScript(projectDir, extraEnv = {}) {
       ...process.env,
       npm_config_platform: 'linux',
       npm_config_arch: 'x64',
-      ORCA_ELECTRON_PACKAGE_EXTRACTOR: join(projectDir, 'fake-extractor.cjs'),
+      BOTMUX_ELECTRON_PACKAGE_EXTRACTOR: join(projectDir, 'fake-extractor.cjs'),
       ...extraEnv
     }
   })

@@ -59,12 +59,12 @@ export function normalizeAgentActivityDisplayMode(value: unknown): AgentActivity
 export const ONBOARDING_FINAL_STEP = 5
 export const ONBOARDING_FLOW_VERSION = 4
 
-export const ORCA_BROWSER_PARTITION = 'persist:orca-botmux-browser'
+export const BOTMUX_BROWSER_PARTITION = 'persist:botmux-browser'
 // Why: blank browser tabs must start from an inert guest URL that does not
 // navigate the privileged main window to about:blank. Renderer and main both
 // need the exact same value so the attach policy can allow only this one safe
 // data URL while still rejecting arbitrary renderer-provided data URLs.
-export const ORCA_BROWSER_BLANK_URL = 'data:text/html,'
+export const BOTMUX_BROWSER_BLANK_URL = 'data:text/html,'
 
 // Why: Electron's invoke error path preserves message text, not arbitrary
 // custom Error fields. Keep this stable token shared across main/renderer.
@@ -133,13 +133,13 @@ export const ORPHAN_WORKTREE_ID = '__orphan__'
 export const FLOATING_TERMINAL_WORKTREE_ID = 'global-floating-terminal'
 
 /**
- * Main-area host for OrcaBotmux session terminals (control plane attach).
+ * Main-area host for Botmux session terminals (control plane attach).
  *
  * Not a Projects worktree and not the floating panel — a synthetic workspace
  * id so `createTab` has a home while the UI stays in the primary Terminal
  * workbench. Session open must never use FLOATING_TERMINAL_WORKTREE_ID.
  */
-export const ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID = 'global-orca-botmux-terminal'
+export const BOTMUX_MAIN_TERMINAL_WORKTREE_ID = 'global-botmux-terminal'
 
 export const REPO_COLORS = [
   '#737373', // neutral
@@ -192,7 +192,7 @@ export function getDefaultOnboardingState(): OnboardingState {
 function getDefaultWorkspaceDir(homeDir: string): string {
   const separator = homeDir.includes('\\') ? '\\' : '/'
   const trimmedHomeDir = homeDir.replace(/[\\/]+$/, '')
-  return [trimmedHomeDir, 'orca_botmux', 'workspaces'].join(separator)
+  return [trimmedHomeDir, 'botmux', 'workspaces'].join(separator)
 }
 
 export function getDefaultSettings(homedir: string): GlobalSettings {
@@ -309,8 +309,8 @@ export function getDefaultSettings(homedir: string): GlobalSettings {
     showPinnedWorktreesInGroups: false,
     ctrlTabOrderMode: 'mru',
     // Why: switching worktrees and opening command surfaces from a focused
-    // terminal is a core OrcaBotmux workflow; users who prefer TUI ownership opt in.
-    terminalShortcutPolicy: 'orca-botmux-first',
+    // terminal is a core Botmux workflow; users who prefer TUI ownership opt in.
+    terminalShortcutPolicy: 'botmux-first',
     floatingTerminalEnabled: true,
     floatingTerminalDefaultedForAllUsers: true,
     floatingTerminalCwd: '~',
@@ -523,7 +523,7 @@ export function getDefaultUIState(): PersistedUIState {
     usagePercentageDisplay: DEFAULT_USAGE_PERCENTAGE_DISPLAY,
     dismissedUpdateVersion: null,
     lastUpdateCheckAt: null,
-    trustedOrcaHooks: {},
+    trustedBotmuxHooks: {},
     setupScriptPromptDismissedRepoIds: [],
     acknowledgedAgentsByPaneKey: {},
     setupGuideSidebarDismissed: false,

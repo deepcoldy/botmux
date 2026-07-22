@@ -103,7 +103,7 @@ function formatCertificateProceedFailure(
   if (reason === 'request-failed') {
     return translate(
       'browser.loadFailure.certificateProceedFailed',
-      'OrcaBotmux could not approve this certificate request. Retry the page and try again.'
+      'Botmux could not approve this certificate request. Retry the page and try again.'
     )
   }
   return translate(

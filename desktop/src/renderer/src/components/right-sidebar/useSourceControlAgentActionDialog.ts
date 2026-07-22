@@ -179,8 +179,8 @@ export function useSourceControlAgentActionDialog({
       groupId,
       promptDelivery,
       launchPlatform,
-      // Why: an SSH host runs the plain `orca_botmux` shim; keep the previewed command
-      // label aligned with the real remote launch (no `orca-botmux-ide` rename).
+      // Why: an SSH host runs the plain `botmux` shim; keep the previewed command
+      // label aligned with the real remote launch (no `botmux-ide` rename).
       isRemote: typeof connectionId === 'string',
       launchSource,
       connectionUnavailable,

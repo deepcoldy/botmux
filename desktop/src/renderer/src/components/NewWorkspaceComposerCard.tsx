@@ -44,7 +44,7 @@ import type {
   GitLabWorkItem,
   LinearIssue,
   SetupAgentStartupPolicy,
-  OrcaHooks,
+  BotmuxHooks,
   SparsePreset,
   TuiAgent
 } from '../../../shared/types'
@@ -66,7 +66,7 @@ import type { TaskSourceContext } from '../../../shared/task-source-context'
 import { translate } from '@/i18n/i18n'
 
 type RepoOption = React.ComponentProps<typeof RepoCombobox>['repos'][number]
-type EphemeralVmRecipeOption = NonNullable<OrcaHooks['environmentRecipes']>[number]
+type EphemeralVmRecipeOption = NonNullable<BotmuxHooks['environmentRecipes']>[number]
 const EMPTY_PROJECT_OPTIONS: NewWorkspaceProjectOption[] = []
 const EMPTY_PROJECT_HOST_SETUP_OPTIONS: ProjectHostSetupOption[] = []
 const EMPTY_EPHEMERAL_VM_RECIPES: EphemeralVmRecipeOption[] = []
@@ -512,11 +512,11 @@ function SetupCommandPreview({
       <div className="rounded-2xl border border-border/60 bg-muted/40 shadow-inner">
         <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-2.5">
           <div className="font-mono text-[11px] text-muted-foreground">
-            {translate('auto.components.NewWorkspaceComposerCard.23bb365554', 'orca_botmux.yaml')}
+            {translate('auto.components.NewWorkspaceComposerCard.23bb365554', 'botmux.yaml')}
           </div>
           {headerAction}
         </div>
-        {/* Why: long orca_botmux.yaml scripts must not grow the create dialog past the viewport. */}
+        {/* Why: long botmux.yaml scripts must not grow the create dialog past the viewport. */}
         <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words px-4 py-3 font-mono text-[12px] leading-5 text-emerald-700 scrollbar-sleek dark:text-emerald-300/95">
           {setupConfig.command}
         </pre>
@@ -1303,12 +1303,12 @@ export default function NewWorkspaceComposerCard({
                       {setupConfig.source === 'yaml'
                         ? translate(
                             'auto.components.NewWorkspaceComposerCard.23bb365554',
-                            'orca_botmux.yaml'
+                            'botmux.yaml'
                           )
                         : setupConfig.source === 'both'
                           ? translate(
                               'auto.components.NewWorkspaceComposerCard.326a578923',
-                              'orca_botmux.yaml + local'
+                              'botmux.yaml + local'
                             )
                           : translate(
                               'auto.components.NewWorkspaceComposerCard.92e34f0311',
@@ -1317,7 +1317,7 @@ export default function NewWorkspaceComposerCard({
                     </span>
                   </div>
 
-                  {/* Why: `orca_botmux.yaml` is the committed source of truth for shared setup,
+                  {/* Why: `botmux.yaml` is the committed source of truth for shared setup,
                       so the preview reconstructs the real YAML shape instead of showing a raw
                       shell blob that hides where the command came from. */}
                   <SetupCommandPreview

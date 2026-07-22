@@ -36,25 +36,25 @@ function snapshot(releaseRevision: number, markdown: string): SkillKnownSnapshot
 }
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'orca-botmux-skill-inventory-'))
+  const root = await mkdtemp(join(tmpdir(), 'botmux-skill-inventory-'))
   temporaryDirectories.push(root)
   const homeDir = join(root, 'home')
   const resourceRoot = join(root, 'resources')
   const skillResourceRoot = join(resourceRoot, 'skills')
   await mkdir(skillResourceRoot, { recursive: true })
 
-  const oldMarkdown = '---\nname: orca-botmux-cli\ndescription: Old official guide.\n---\n\n# Old\n'
+  const oldMarkdown = '---\nname: botmux-cli\ndescription: Old official guide.\n---\n\n# Old\n'
   const currentMarkdown =
-    '---\nname: orca-botmux-cli\ndescription: Current official guide.\n---\n\n# Current\n'
-  const newerMarkdown = '---\nname: orca-botmux-cli\ndescription: Newer official guide.\n---\n\n# Newer\n'
+    '---\nname: botmux-cli\ndescription: Current official guide.\n---\n\n# Current\n'
+  const newerMarkdown = '---\nname: botmux-cli\ndescription: Newer official guide.\n---\n\n# Newer\n'
   const snapshots = [
     snapshot(1, oldMarkdown),
     snapshot(2, currentMarkdown),
     snapshot(3, newerMarkdown)
   ]
   const current: SkillCurrentBundleEntry = {
-    name: 'orca-botmux-cli',
-    sourcePath: 'skills/orca-botmux-cli',
+    name: 'botmux-cli',
+    sourcePath: 'skills/botmux-cli',
     ...snapshots[1]
   }
   await Promise.all([
@@ -64,7 +64,7 @@ async function fixture() {
     ),
     writeFile(
       join(skillResourceRoot, 'snapshot-registry.json'),
-      `${JSON.stringify({ schemaVersion: 1, skills: { 'orca-botmux-cli': snapshots } }, null, 2)}\n`
+      `${JSON.stringify({ schemaVersion: 1, skills: { 'botmux-cli': snapshots } }, null, 2)}\n`
     ),
     writeFile(
       join(skillResourceRoot, 'release-mapping.json'),
@@ -72,9 +72,9 @@ async function fixture() {
         {
           schemaVersion: 1,
           releases: [
-            { appVersion: '1.0.0', skills: { 'orca-botmux-cli': 1 } },
-            { appVersion: '2.0.0', skills: { 'orca-botmux-cli': 2 } },
-            { appVersion: '3.0.0', skills: { 'orca-botmux-cli': 3 } }
+            { appVersion: '1.0.0', skills: { 'botmux-cli': 1 } },
+            { appVersion: '2.0.0', skills: { 'botmux-cli': 2 } },
+            { appVersion: '3.0.0', skills: { 'botmux-cli': 3 } }
           ]
         },
         null,
@@ -84,7 +84,7 @@ async function fixture() {
   ])
 
   const writeSkill = async (rootPath: string, markdown: string): Promise<string> => {
-    const directory = join(rootPath, 'orca-botmux-cli')
+    const directory = join(rootPath, 'botmux-cli')
     await mkdir(directory, { recursive: true })
     await writeFile(join(directory, 'SKILL.md'), markdown)
     return directory
@@ -118,7 +118,7 @@ describe('read-only skill freshness inventory', () => {
 
     expect(inventory.installations.map((entry) => entry.status)).toEqual(['outdated'])
     expect(inventory.installations[0]?.installedAppVersion).toBe('1.0.0')
-    expect(inventory.eligibleUpdateNames).toEqual(['orca-botmux-cli'])
+    expect(inventory.eligibleUpdateNames).toEqual(['botmux-cli'])
   })
 
   it('labels newer known and unrecognized bytes honestly without calling them modified', async () => {
@@ -126,7 +126,7 @@ describe('read-only skill freshness inventory', () => {
     await test.writeSkill(join(test.homeDir, '.agents', 'skills'), test.newerMarkdown)
     await test.writeSkill(
       join(test.homeDir, '.claude', 'skills'),
-      '---\nname: orca-botmux-cli\ndescription: User copy.\n---\n'
+      '---\nname: botmux-cli\ndescription: User copy.\n---\n'
     )
 
     const inventory = await inventorySkillFreshness({
@@ -175,7 +175,7 @@ describe('read-only skill freshness inventory', () => {
       )
       const claudeRoot = join(test.homeDir, '.claude', 'skills')
       await mkdir(claudeRoot, { recursive: true })
-      await symlink(canonical, join(claudeRoot, 'orca-botmux-cli'))
+      await symlink(canonical, join(claudeRoot, 'botmux-cli'))
 
       const inventory = await inventorySkillFreshness({
         currentAppVersion: '2.0.0',
@@ -187,7 +187,7 @@ describe('read-only skill freshness inventory', () => {
       expect(inventory.installations).toHaveLength(1)
       expect(inventory.installations[0]?.providers).toEqual(['agent-skills', 'claude'])
       expect(inventory.installations[0]?.topology).toBe('canonical-copy')
-      expect(inventory.eligibleUpdateNames).toEqual(['orca-botmux-cli'])
+      expect(inventory.eligibleUpdateNames).toEqual(['botmux-cli'])
     }
   )
 
@@ -202,7 +202,7 @@ describe('read-only skill freshness inventory', () => {
           const repoPath = join(test.root, `repo-${id}`)
           const root = join(repoPath, '.agents', 'skills')
           await mkdir(root, { recursive: true })
-          await symlink(shared, join(root, 'orca-botmux-cli'))
+          await symlink(shared, join(root, 'botmux-cli'))
           return { id, path: repoPath } as unknown as Repo
         })
       )
@@ -224,7 +224,7 @@ describe('read-only skill freshness inventory', () => {
   it('keeps inaccessible placements visible and lets them poison the name', async () => {
     const test = await fixture()
     await test.writeSkill(join(test.homeDir, '.agents', 'skills'), test.oldMarkdown)
-    const inaccessiblePath = join(test.homeDir, '.codex', 'skills', 'orca-botmux-cli')
+    const inaccessiblePath = join(test.homeDir, '.codex', 'skills', 'botmux-cli')
 
     const inventory = await inventorySkillFreshness({
       currentAppVersion: '2.0.0',
@@ -250,7 +250,7 @@ describe('read-only skill freshness inventory', () => {
     const test = await fixture()
     await test.writeSkill(join(test.homeDir, '.agents', 'skills'), test.oldMarkdown)
     const repoPath = join(test.root, 'repo')
-    const inaccessiblePath = join(repoPath, '.agents', 'skills', 'orca-botmux-cli')
+    const inaccessiblePath = join(repoPath, '.agents', 'skills', 'botmux-cli')
 
     const inventory = await inventorySkillFreshness({
       currentAppVersion: '2.0.0',
@@ -330,7 +330,7 @@ describe('read-only skill freshness inventory', () => {
     const resourceRoot = join(test.resourceRoot, 'skills')
     const registryPath = join(resourceRoot, 'snapshot-registry.json')
     const registry = JSON.parse(await readFile(registryPath, 'utf8'))
-    registry.skills['orca-botmux-cli'].push(snapshot(4, test.currentMarkdown))
+    registry.skills['botmux-cli'].push(snapshot(4, test.currentMarkdown))
     await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`)
     await test.writeSkill(join(test.homeDir, '.agents', 'skills'), test.currentMarkdown)
 

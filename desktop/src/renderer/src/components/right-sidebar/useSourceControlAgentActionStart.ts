@@ -27,8 +27,8 @@ type UseSourceControlAgentActionStartArgs = {
   groupId?: string | null
   promptDelivery: 'auto-submit' | 'draft' | 'submit-after-ready'
   launchPlatform?: NodeJS.Platform
-  /** Why: SSH hosts launch the plain `orca_botmux` shim, so the previewed command must
-   * drop the Linux-only `orca-botmux-ide` rename to match the real launch. */
+  /** Why: SSH hosts launch the plain `botmux` shim, so the previewed command must
+   * drop the Linux-only `botmux-ide` rename to match the real launch. */
   isRemote?: boolean
   launchSource: LaunchSource
   connectionUnavailable: boolean

@@ -1,5 +1,5 @@
 import type { IPtyProvider } from '../providers/types'
-import type { OrcaRuntimeService } from './orca-botmux-runtime'
+import type { BotmuxRuntimeService } from './botmux-runtime'
 import { listRegisteredPtys } from '../memory/pty-registry'
 import { isPathInsideOrEqual } from '../../shared/cross-platform-path'
 import { splitWorktreeIdForFilesystem } from '../../shared/worktree-id'
@@ -10,7 +10,7 @@ import { mapWithConcurrency } from '../../shared/map-with-concurrency'
 const WORKTREE_TEARDOWN_CONCURRENCY = 32
 
 export type WorktreeTeardownDeps = {
-  runtime?: OrcaRuntimeService
+  runtime?: BotmuxRuntimeService
   localProvider: IPtyProvider
   onPtyStopped?: (ptyId: string) => void
   timeoutMs?: number

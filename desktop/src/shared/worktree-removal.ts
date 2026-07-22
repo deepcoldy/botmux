@@ -50,7 +50,7 @@ export function classifyWorktreeForceDeleteReason(
 ): WorktreeForceDeleteReason | null {
   if (isLockedWorktreeRemovalError(error)) {
     // Why: a Git lock can represent an external safety contract. It must be
-    // unlocked explicitly rather than folded into OrcaBotmux's dirty-file force path.
+    // unlocked explicitly rather than folded into Botmux's dirty-file force path.
     return null
   }
   if (force) {

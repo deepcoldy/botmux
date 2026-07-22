@@ -1,4 +1,4 @@
-import type { OrcaHooks } from '../../../../shared/types'
+import type { BotmuxHooks } from '../../../../shared/types'
 import { DEFAULT_APP_FONT_FAMILY, getDefaultRepoHookSettings } from '../../../../shared/constants'
 import { DESKTOP_TERMINAL_SCROLLBACK_ROW_PRESETS } from '../../../../shared/terminal-scrollback-policy'
 

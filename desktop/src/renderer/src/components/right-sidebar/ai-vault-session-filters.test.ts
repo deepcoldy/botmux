@@ -69,7 +69,7 @@ describe('filterAiVaultSessions', () => {
       {
         ...baseSession,
         id: 'claude:old-path',
-        cwd: '/Users/ada/workspaces/orca_botmux/bream/src'
+        cwd: '/Users/ada/workspaces/botmux/bream/src'
       },
       {
         ...baseSession,
@@ -85,8 +85,8 @@ describe('filterAiVaultSessions', () => {
         scope: 'workspace',
         sort: 'updated',
         activeWorktreePaths: [
-          '/Users/ada/workspaces/orca_botmux/fix-agent-history',
-          '/Users/ada/workspaces/orca_botmux/bream'
+          '/Users/ada/workspaces/botmux/fix-agent-history',
+          '/Users/ada/workspaces/botmux/bream'
         ],
         hideEmptySessions: true
       }).map((session) => session.id)
@@ -317,7 +317,7 @@ describe('filterAiVaultSessions', () => {
     const projectSession = { ...baseSession, id: 'claude:project', cwd: '/repo/project' }
     const otherSession = { ...baseSession, id: 'claude:other', cwd: '/repo/other' }
     const sessionProjectById = new Map([
-      [projectSession.id, { kind: 'repo' as const, key: 'project:orca_botmux', label: 'orca_botmux' }],
+      [projectSession.id, { kind: 'repo' as const, key: 'project:botmux', label: 'botmux' }],
       [otherSession.id, { kind: 'repo' as const, key: 'project:other', label: 'Other' }]
     ])
 
@@ -328,7 +328,7 @@ describe('filterAiVaultSessions', () => {
         scope: 'project',
         sort: 'updated',
         activeWorktreePaths: [],
-        activeProjectKey: 'project:orca_botmux',
+        activeProjectKey: 'project:botmux',
         sessionProjectById,
         hideEmptySessions: true
       }).map((session) => session.id)
@@ -351,9 +351,9 @@ describe('filterAiVaultSessions', () => {
 
   it('matches repo: queries against resolved project labels before folder fallback', () => {
     const sessionProjectById = new Map([
-      [baseSession.id, { kind: 'repo' as const, key: 'project:orca_botmux', label: 'Canonical OrcaBotmux' }]
+      [baseSession.id, { kind: 'repo' as const, key: 'project:botmux', label: 'Canonical Botmux' }]
     ])
-    const projectLabelByKey = new Map([['project:orca_botmux', 'Canonical OrcaBotmux']])
+    const projectLabelByKey = new Map([['project:botmux', 'Canonical Botmux']])
 
     expect(
       filterAiVaultSessions([baseSession], {
@@ -374,25 +374,25 @@ describe('deriveAiVaultWorkspaceScopePaths', () => {
   it('includes current and same-repo prior filesystem paths', () => {
     expect(
       deriveAiVaultWorkspaceScopePaths({
-        id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+        id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
         repoId: 'repo1',
-        path: '/Users/ada/workspaces/orca_botmux/fix-agent-history',
-        priorWorktreeIds: ['repo1::/Users/ada/workspaces/orca_botmux/bream']
+        path: '/Users/ada/workspaces/botmux/fix-agent-history',
+        priorWorktreeIds: ['repo1::/Users/ada/workspaces/botmux/bream']
       })
-    ).toEqual(['/Users/ada/workspaces/orca_botmux/fix-agent-history', '/Users/ada/workspaces/orca_botmux/bream'])
+    ).toEqual(['/Users/ada/workspaces/botmux/fix-agent-history', '/Users/ada/workspaces/botmux/bream'])
   })
 
   it('strips folder-workspace instance suffixes from prior ids', () => {
     expect(
       deriveAiVaultWorkspaceScopePaths({
-        id: 'repo1::/Users/ada/folders/orca_botmux',
+        id: 'repo1::/Users/ada/folders/botmux',
         repoId: 'repo1',
-        path: '/Users/ada/folders/orca_botmux',
+        path: '/Users/ada/folders/botmux',
         priorWorktreeIds: [
-          'repo1::/Users/ada/folders/old-orca_botmux::workspace:123e4567-e89b-12d3-a456-426614174000'
+          'repo1::/Users/ada/folders/old-botmux::workspace:123e4567-e89b-12d3-a456-426614174000'
         ]
       })
-    ).toEqual(['/Users/ada/folders/orca_botmux', '/Users/ada/folders/old-orca_botmux'])
+    ).toEqual(['/Users/ada/folders/botmux', '/Users/ada/folders/old-botmux'])
   })
 
   it('ignores malformed, different-repo, relative, empty, and duplicate aliases', () => {
@@ -417,30 +417,30 @@ describe('deriveAiVaultWorkspaceScopePaths', () => {
     expect(
       deriveAiVaultWorkspaceScopePaths(
         {
-          id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
           repoId: 'repo1',
-          path: '/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          path: '/Users/ada/workspaces/botmux/fix-agent-history',
           priorWorktreeIds: [
-            'repo1::/Users/ada/workspaces/orca_botmux/bream',
-            'repo1::/Users/ada/workspaces/orca_botmux/unclaimed-old-path'
+            'repo1::/Users/ada/workspaces/botmux/bream',
+            'repo1::/Users/ada/workspaces/botmux/unclaimed-old-path'
           ]
         },
         [
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+            id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/fix-agent-history'
+            path: '/Users/ada/workspaces/botmux/fix-agent-history'
           },
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/bream',
+            id: 'repo1::/Users/ada/workspaces/botmux/bream',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/bream'
+            path: '/Users/ada/workspaces/botmux/bream'
           }
         ]
       )
     ).toEqual([
-      '/Users/ada/workspaces/orca_botmux/fix-agent-history',
-      '/Users/ada/workspaces/orca_botmux/unclaimed-old-path'
+      '/Users/ada/workspaces/botmux/fix-agent-history',
+      '/Users/ada/workspaces/botmux/unclaimed-old-path'
     ])
   })
 
@@ -448,30 +448,30 @@ describe('deriveAiVaultWorkspaceScopePaths', () => {
     expect(
       deriveAiVaultWorkspaceScopePaths(
         {
-          id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
           repoId: 'repo1',
-          path: '/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          path: '/Users/ada/workspaces/botmux/fix-agent-history',
           priorWorktreeIds: [
-            'repo1::/Users/ada/workspaces/orca_botmux/bream',
-            'repo1::/Users/ada/workspaces/orca_botmux/unclaimed-old-path'
+            'repo1::/Users/ada/workspaces/botmux/bream',
+            'repo1::/Users/ada/workspaces/botmux/unclaimed-old-path'
           ]
         },
         [
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+            id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/fix-agent-history'
+            path: '/Users/ada/workspaces/botmux/fix-agent-history'
           },
           {
-            id: 'repo2::/Users/ada/workspaces/orca_botmux/bream',
+            id: 'repo2::/Users/ada/workspaces/botmux/bream',
             repoId: 'repo2',
-            path: '/Users/ada/workspaces/orca_botmux/bream'
+            path: '/Users/ada/workspaces/botmux/bream'
           }
         ]
       )
     ).toEqual([
-      '/Users/ada/workspaces/orca_botmux/fix-agent-history',
-      '/Users/ada/workspaces/orca_botmux/unclaimed-old-path'
+      '/Users/ada/workspaces/botmux/fix-agent-history',
+      '/Users/ada/workspaces/botmux/unclaimed-old-path'
     ])
   })
 })
@@ -481,21 +481,21 @@ describe('deriveAiVaultScopeSessionPaths', () => {
     expect(
       deriveAiVaultScopeSessionPaths(
         {
-          id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
           repoId: 'repo1',
-          path: '/Users/ada/workspaces/orca_botmux/fix-agent-history',
+          path: '/Users/ada/workspaces/botmux/fix-agent-history',
           priorWorktreeIds: []
         },
         [
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/fix-agent-history',
+            id: 'repo1::/Users/ada/workspaces/botmux/fix-agent-history',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/fix-agent-history'
+            path: '/Users/ada/workspaces/botmux/fix-agent-history'
           },
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/sibling',
+            id: 'repo1::/Users/ada/workspaces/botmux/sibling',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/sibling'
+            path: '/Users/ada/workspaces/botmux/sibling'
           },
           {
             id: 'repo2::/Users/ada/workspaces/other/elsewhere',
@@ -505,8 +505,8 @@ describe('deriveAiVaultScopeSessionPaths', () => {
         ]
       )
     ).toEqual([
-      '/Users/ada/workspaces/orca_botmux/fix-agent-history',
-      '/Users/ada/workspaces/orca_botmux/sibling'
+      '/Users/ada/workspaces/botmux/fix-agent-history',
+      '/Users/ada/workspaces/botmux/sibling'
     ])
   })
 
@@ -518,30 +518,30 @@ describe('deriveAiVaultScopeSessionPaths', () => {
     expect(
       deriveAiVaultScopeSessionPaths(
         {
-          id: 'repo1::/Users/ada/workspaces/orca_botmux/app',
+          id: 'repo1::/Users/ada/workspaces/botmux/app',
           repoId: 'repo1',
-          path: '/Users/ada/workspaces/orca_botmux/app',
+          path: '/Users/ada/workspaces/botmux/app',
           priorWorktreeIds: []
         },
         [
           {
-            id: 'repo1::/Users/ada/workspaces/orca_botmux/app',
+            id: 'repo1::/Users/ada/workspaces/botmux/app',
             repoId: 'repo1',
-            path: '/Users/ada/workspaces/orca_botmux/app'
+            path: '/Users/ada/workspaces/botmux/app'
           },
           {
-            id: 'repo2::/Users/ada/workspaces/orca_botmux/docs',
+            id: 'repo2::/Users/ada/workspaces/botmux/docs',
             repoId: 'repo2',
-            path: '/Users/ada/workspaces/orca_botmux/docs'
+            path: '/Users/ada/workspaces/botmux/docs'
           }
         ],
         {
-          activeProjectKey: 'project:orca_botmux',
+          activeProjectKey: 'project:botmux',
           projectHostSetupProjection: {
             projects: [
               {
-                id: 'orca_botmux',
-                displayName: 'orca_botmux',
+                id: 'botmux',
+                displayName: 'botmux',
                 badgeColor: '#2563eb',
                 sourceRepoIds: ['repo1', 'repo2'],
                 createdAt: 1,
@@ -551,11 +551,11 @@ describe('deriveAiVaultScopeSessionPaths', () => {
             setups: [
               {
                 id: 'setup-1',
-                projectId: 'orca_botmux',
+                projectId: 'botmux',
                 hostId: 'local',
                 repoId: 'repo1',
                 displayName: 'App',
-                path: '/Users/ada/workspaces/orca_botmux/app',
+                path: '/Users/ada/workspaces/botmux/app',
                 setupState: 'ready',
                 setupMethod: 'imported-existing-folder',
                 createdAt: 1,
@@ -563,11 +563,11 @@ describe('deriveAiVaultScopeSessionPaths', () => {
               },
               {
                 id: 'setup-2',
-                projectId: 'orca_botmux',
+                projectId: 'botmux',
                 hostId: 'local',
                 repoId: 'repo2',
                 displayName: 'Docs',
-                path: '/Users/ada/workspaces/orca_botmux/docs',
+                path: '/Users/ada/workspaces/botmux/docs',
                 setupState: 'ready',
                 setupMethod: 'imported-existing-folder',
                 createdAt: 1,
@@ -577,32 +577,32 @@ describe('deriveAiVaultScopeSessionPaths', () => {
           }
         }
       )
-    ).toEqual(['/Users/ada/workspaces/orca_botmux/app', '/Users/ada/workspaces/orca_botmux/docs'])
+    ).toEqual(['/Users/ada/workspaces/botmux/app', '/Users/ada/workspaces/botmux/docs'])
   })
 
   it('keeps live worktree paths when another setup shares the repo id', () => {
     expect(
       deriveAiVaultScopeSessionPaths(
         {
-          id: 'repo1::/Users/ada/workspaces/orca_botmux/app',
+          id: 'repo1::/Users/ada/workspaces/botmux/app',
           repoId: 'repo1',
-          path: '/Users/ada/workspaces/orca_botmux/app',
+          path: '/Users/ada/workspaces/botmux/app',
           priorWorktreeIds: []
         },
         [
           {
-            id: 'repo2::/Users/ada/workspaces/orca_botmux/docs-worktree',
+            id: 'repo2::/Users/ada/workspaces/botmux/docs-worktree',
             repoId: 'repo2',
-            path: '/Users/ada/workspaces/orca_botmux/docs-worktree'
+            path: '/Users/ada/workspaces/botmux/docs-worktree'
           }
         ],
         {
-          activeProjectKey: 'project:orca_botmux',
+          activeProjectKey: 'project:botmux',
           projectHostSetupProjection: {
             projects: [
               {
-                id: 'orca_botmux',
-                displayName: 'orca_botmux',
+                id: 'botmux',
+                displayName: 'botmux',
                 badgeColor: '#2563eb',
                 sourceRepoIds: ['repo1', 'repo2'],
                 createdAt: 1,
@@ -612,11 +612,11 @@ describe('deriveAiVaultScopeSessionPaths', () => {
             setups: [
               {
                 id: 'setup-1',
-                projectId: 'orca_botmux',
+                projectId: 'botmux',
                 hostId: 'local',
                 repoId: 'repo2',
                 displayName: 'Docs',
-                path: '/Users/ada/workspaces/orca_botmux/docs',
+                path: '/Users/ada/workspaces/botmux/docs',
                 setupState: 'ready',
                 setupMethod: 'imported-existing-folder',
                 createdAt: 1,
@@ -639,9 +639,9 @@ describe('deriveAiVaultScopeSessionPaths', () => {
         }
       )
     ).toEqual([
-      '/Users/ada/workspaces/orca_botmux/app',
-      '/Users/ada/workspaces/orca_botmux/docs-worktree',
-      '/Users/ada/workspaces/orca_botmux/docs'
+      '/Users/ada/workspaces/botmux/app',
+      '/Users/ada/workspaces/botmux/docs-worktree',
+      '/Users/ada/workspaces/botmux/docs'
     ])
   })
 })
@@ -680,17 +680,17 @@ describe('groupAiVaultSessions', () => {
     const sessionProjectById = new Map(
       sessions.map((session) => [
         session.id,
-        { kind: 'repo' as const, key: 'project:orca_botmux', label: 'orca_botmux' }
+        { kind: 'repo' as const, key: 'project:botmux', label: 'botmux' }
       ])
     )
-    const projectLabelByKey = new Map([['project:orca_botmux', 'Canonical OrcaBotmux']])
+    const projectLabelByKey = new Map([['project:botmux', 'Canonical Botmux']])
 
     expect(
       groupAiVaultSessions(sessions, 'project', {
         sessionProjectById,
         projectLabelByKey
       })
-    ).toEqual([{ key: 'project:orca_botmux', label: 'Canonical OrcaBotmux', sessions }])
+    ).toEqual([{ key: 'project:botmux', label: 'Canonical Botmux', sessions }])
   })
 
   it('falls back to folder grouping when project metadata is unavailable', () => {
@@ -702,9 +702,9 @@ describe('groupAiVaultSessions', () => {
 
 describe('parseVaultQuery', () => {
   it('keeps quoted terms together', () => {
-    expect(parseVaultQuery('"resume picker" repo:orca_botmux path:src')).toEqual({
+    expect(parseVaultQuery('"resume picker" repo:botmux path:src')).toEqual({
       terms: ['resume picker'],
-      repoTerms: ['orca_botmux'],
+      repoTerms: ['botmux'],
       pathTerms: ['src']
     })
   })

@@ -26,7 +26,7 @@ describe('runAutomationPrecheck', () => {
   let cwd = ''
 
   beforeEach(() => {
-    cwd = mkdtempSync(join(tmpdir(), 'orca-botmux-precheck-test-'))
+    cwd = mkdtempSync(join(tmpdir(), 'botmux-precheck-test-'))
     sshManagerState.manager = null
   })
 

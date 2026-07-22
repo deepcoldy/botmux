@@ -798,7 +798,7 @@ describe('connectPanePty', () => {
       worktreesByRepo: {
         repo1: [{ id: 'wt-1', repoId: 'repo1', path: '/tmp/wt-1', displayName: 'feat/notis' }]
       },
-      repos: [{ id: 'repo1', connectionId: null, displayName: 'orca_botmux' }],
+      repos: [{ id: 'repo1', connectionId: null, displayName: 'botmux' }],
       projects: [],
       sshConnectionStates: new Map(),
       transientClearedAgentStatusConnectionIds: {},
@@ -1088,13 +1088,13 @@ describe('connectPanePty', () => {
     connectPanePty(createPane(1) as never, createManager(1) as never, createDeps() as never)
     await flushAsyncTicks()
 
-    capturedDataCallback.current?.('Created https://github.com/acme/orca_botmux/pull/42\r\n')
+    capturedDataCallback.current?.('Created https://github.com/acme/botmux/pull/42\r\n')
 
     expect(mockStoreState.observeTerminalGitHubPullRequestLink).toHaveBeenCalledWith(
       'wt-1',
       expect.objectContaining({
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       })
     )
@@ -4824,7 +4824,7 @@ describe('connectPanePty', () => {
       }
       expect(transport.sendInput).not.toHaveBeenCalled()
 
-      capturedDataCallback.current?.('\x1b]777;orca-botmux-shell-ready\x07user@remote $ ')
+      capturedDataCallback.current?.('\x1b]777;botmux-shell-ready\x07user@remote $ ')
       for (const fn of pendingTimeouts.splice(0)) {
         fn()
       }
@@ -4860,7 +4860,7 @@ describe('connectPanePty', () => {
         launchAgent: 'codex',
         launchConfig: { agentArgs: '', agentEnv: {} },
         launchToken: 'launch-token-1',
-        draftPrompt: 'https://github.com/stablyai/orca_botmux/issues/42'
+        draftPrompt: 'https://github.com/stablyai/botmux/issues/42'
       }
     })
 
@@ -4880,11 +4880,11 @@ describe('connectPanePty', () => {
     await flushAsyncTicks()
 
     expect(transport.sendInputAccepted).toHaveBeenCalledWith(
-      '\x1b[200~https://github.com/stablyai/orca_botmux/issues/42\x1b[201~'
+      '\x1b[200~https://github.com/stablyai/botmux/issues/42\x1b[201~'
     )
     expect(transport.sendInput.mock.calls.map(([data]) => data)).toEqual([
       '\x1b[I',
-      '\x1b[200~https://github.com/stablyai/orca_botmux/issues/42\x1b[201~'
+      '\x1b[200~https://github.com/stablyai/botmux/issues/42\x1b[201~'
     ])
     expect(window.api.pty.writeAccepted).not.toHaveBeenCalled()
     expect(mockStoreState.recordTerminalInput).toHaveBeenCalledOnce()
@@ -4912,7 +4912,7 @@ describe('connectPanePty', () => {
           launchAgent: 'codex',
           launchConfig: { agentArgs: '', agentEnv: {} },
           launchToken: 'launch-token-1',
-          draftPrompt: 'https://github.com/stablyai/orca_botmux/issues/42'
+          draftPrompt: 'https://github.com/stablyai/botmux/issues/42'
         }
       }) as never
     )
@@ -5093,7 +5093,7 @@ describe('connectPanePty', () => {
       }
       expect(transport.sendInput).not.toHaveBeenCalled()
 
-      capturedDataCallback.current?.('\x1b]777;orca-botmux-shell-ready\x07user@remote $ ')
+      capturedDataCallback.current?.('\x1b]777;botmux-shell-ready\x07user@remote $ ')
       for (const fn of pendingTimeouts.splice(0)) {
         fn()
       }
@@ -5155,7 +5155,7 @@ describe('connectPanePty', () => {
       }
       expect(transport.sendInput).not.toHaveBeenCalled()
 
-      capturedDataCallback.current?.('\x1b]777;orca-botmux-shell-ready\x07user@remote $ ')
+      capturedDataCallback.current?.('\x1b]777;botmux-shell-ready\x07user@remote $ ')
       for (const fn of pendingTimeouts.splice(0)) {
         fn()
       }
@@ -5208,7 +5208,7 @@ describe('connectPanePty', () => {
     expect(mockStoreState.removeAgentStatus).not.toHaveBeenCalled()
   })
 
-  it('clears pre-hook launch config when an OrcaBotmux-started command exits', async () => {
+  it('clears pre-hook launch config when an Botmux-started command exits', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout'] })
     const { connectPanePty } = await import('./pty-connection')
     vi.mocked(window.api.pty.confirmForegroundProcess).mockResolvedValue('zsh')
@@ -5337,7 +5337,7 @@ describe('connectPanePty', () => {
     expect(resolveMockPaneWindowsShiftEnterEncoding(mockStoreState, paneKey)).toBe('csi-u')
   })
 
-  it('confirms an OrcaBotmux-launched Droid fresh spawn in a no-OSC shell (Git Bash)', async () => {
+  it('confirms an Botmux-launched Droid fresh spawn in a no-OSC shell (Git Bash)', async () => {
     // Why: PowerShell gets an OSC 133 command-start that triggers the confirming
     // foreground read, but Git Bash / cmd.exe emit no command boundary and the
     // launch command is injected programmatically (no typed inference). Without a
@@ -6347,11 +6347,11 @@ describe('connectPanePty', () => {
         expect.objectContaining({
           command: "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'",
           env: expect.objectContaining({
-            ORCA_PANE_KEY: paneKey,
-            ORCA_TAB_ID: 'tab-1',
-            ORCA_WORKTREE_ID: 'wt-1',
-            ORCA_WORKSPACE_ID: 'wt-1',
-            ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+            BOTMUX_PANE_KEY: paneKey,
+            BOTMUX_TAB_ID: 'tab-1',
+            BOTMUX_WORKTREE_ID: 'wt-1',
+            BOTMUX_WORKSPACE_ID: 'wt-1',
+            BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
           })
         })
       )
@@ -7630,11 +7630,11 @@ describe('connectPanePty', () => {
         sessionId: 'lost-pty',
         command: "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'",
         env: expect.objectContaining({
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -7713,11 +7713,11 @@ describe('connectPanePty', () => {
         command:
           "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'\\''s'",
         env: expect.objectContaining({
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -7790,11 +7790,11 @@ describe('connectPanePty', () => {
         sessionId: 'lost-pty',
         command: "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'",
         env: expect.objectContaining({
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -7969,10 +7969,10 @@ describe('connectPanePty', () => {
       agentArgs: '--model gpt-5 --reasoning-effort high',
       agentEnv: {
         CODEX_PROFILE: 'captured',
-        ORCA_PANE_KEY: 'wrong-pane',
-        ORCA_TAB_ID: 'wrong-tab',
-        ORCA_WORKTREE_ID: 'wrong-worktree',
-        ORCA_WORKSPACE_ID: 'wrong-workspace'
+        BOTMUX_PANE_KEY: 'wrong-pane',
+        BOTMUX_TAB_ID: 'wrong-tab',
+        BOTMUX_WORKTREE_ID: 'wrong-worktree',
+        BOTMUX_WORKSPACE_ID: 'wrong-workspace'
       }
     }
     mockStoreState = {
@@ -8021,11 +8021,11 @@ describe('connectPanePty', () => {
         command: "codex '--model' 'gpt-5' '--reasoning-effort' 'high' 'resume' 'codex-session-1'",
         env: expect.objectContaining({
           CODEX_PROFILE: 'captured',
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -8190,7 +8190,7 @@ describe('connectPanePty', () => {
         sessionId: 'lost-pty',
         command: "codex '--model' 'gpt-5-mini' 'resume' 'codex-session-1'",
         env: expect.objectContaining({
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -8439,11 +8439,11 @@ describe('connectPanePty', () => {
         command: "codex '--dangerously-bypass-approvals-and-sandbox' 'resume' 'codex-session-1'",
         launchAgent: 'codex',
         env: expect.objectContaining({
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -11816,7 +11816,7 @@ describe('connectPanePty', () => {
 
     expect(transport.serializeBuffer).toHaveBeenCalledTimes(1)
     expect(pane.terminal.write).not.toHaveBeenCalledWith(
-      expect.stringContaining('OrcaBotmux skipped hidden terminal output'),
+      expect.stringContaining('Botmux skipped hidden terminal output'),
       expect.any(Function)
     )
     expect(pane.terminal.write).not.toHaveBeenCalledWith(
@@ -12430,7 +12430,7 @@ describe('connectPanePty', () => {
       expect(getMainBufferSnapshot).toHaveBeenCalledTimes(4)
       expect(pane.terminal.write).toHaveBeenCalledWith(
         expect.stringContaining(
-          'OrcaBotmux skipped hidden terminal output because main recovery was unavailable.'
+          'Botmux skipped hidden terminal output because main recovery was unavailable.'
         ),
         expect.any(Function)
       )
@@ -14178,7 +14178,7 @@ describe('connectPanePty', () => {
       connectPanePty(pane as never, createManager(1) as never, createDeps() as never)
       await flushAsyncTicks(6)
 
-      capturedDataCallback.current?.('\r\x1b[Korca % npm test')
+      capturedDataCallback.current?.('\r\x1b[Kbotmux % npm test')
 
       parseCallback?.()
       expect(refresh).toHaveBeenCalledWith(0, 39, true)
@@ -14456,7 +14456,7 @@ describe('connectPanePty', () => {
       // SSH changes where bytes originate, but Windows still paints them locally.
       mockStoreState = {
         ...mockStoreState,
-        repos: [{ id: 'repo1', connectionId: 'conn-1', displayName: 'orca_botmux' }]
+        repos: [{ id: 'repo1', connectionId: 'conn-1', displayName: 'botmux' }]
       }
 
       const pane = createPane(1)
@@ -15080,11 +15080,11 @@ describe('connectPanePty', () => {
         },
         launchToken: expect.stringMatching(new RegExp(`^${UUID_RE}$`)),
         env: expect.objectContaining({
-          ORCA_PANE_KEY: paneKey,
-          ORCA_TAB_ID: 'tab-1',
-          ORCA_WORKTREE_ID: 'wt-1',
-          ORCA_WORKSPACE_ID: 'wt-1',
-          ORCA_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
+          BOTMUX_PANE_KEY: paneKey,
+          BOTMUX_TAB_ID: 'tab-1',
+          BOTMUX_WORKTREE_ID: 'wt-1',
+          BOTMUX_WORKSPACE_ID: 'wt-1',
+          BOTMUX_AGENT_LAUNCH_TOKEN: expect.stringMatching(new RegExp(`^${UUID_RE}$`))
         })
       })
     )
@@ -15145,7 +15145,7 @@ describe('connectPanePty', () => {
         {
           id: 'repo1',
           connectionId: null,
-          displayName: 'orca_botmux',
+          displayName: 'botmux',
           executionHostId: 'runtime:owner-runtime'
         }
       ],
@@ -15185,7 +15185,7 @@ describe('connectPanePty', () => {
         {
           id: 'repo1',
           connectionId: null,
-          displayName: 'orca_botmux',
+          displayName: 'botmux',
           executionHostId: 'local'
         }
       ],
@@ -15638,8 +15638,8 @@ describe('connectPanePty', () => {
       onPtySpawn('pty-fact-pr')
 
       const link = {
-        url: 'https://github.com/acme/orca_botmux/pull/42',
-        slug: { owner: 'acme', repo: 'orca_botmux' },
+        url: 'https://github.com/acme/botmux/pull/42',
+        slug: { owner: 'acme', repo: 'botmux' },
         number: 42
       }
       handler._dispatchTerminalSideEffectBatchForTest({
@@ -15680,7 +15680,7 @@ describe('connectPanePty', () => {
       await flushAsyncTicks()
       expect(capturedDataCallback.current).not.toBeNull()
 
-      capturedDataCallback.current?.('Created https://github.com/acme/orca_botmux/pull/42\r\n')
+      capturedDataCallback.current?.('Created https://github.com/acme/botmux/pull/42\r\n')
       capturedDataCallback.current?.('\x1b]133;D;130\x07prompt $ ')
 
       expect(mockStoreState.observeTerminalGitHubPullRequestLink).not.toHaveBeenCalled()
@@ -17514,7 +17514,7 @@ describe('connectPanePty', () => {
       expect.objectContaining({
         source: 'agent-task-complete',
         worktreeId: 'wt-1',
-        repoLabel: 'orca_botmux',
+        repoLabel: 'botmux',
         worktreeLabel: 'feat/notis',
         hasMultipleActiveRepos: true,
         terminalTitle: '* Claude done',
@@ -18318,7 +18318,7 @@ describe('connectPanePty', () => {
           {
             id: 'repo1',
             connectionId: null,
-            displayName: 'orca_botmux',
+            displayName: 'botmux',
             executionHostId: 'runtime:owner-runtime'
           }
         ]

@@ -94,7 +94,7 @@ function runtimeHostConnectionState({
     return 'disconnected'
   }
   // Why: "connected" means attached/reachable, NOT "is the active default host".
-  // Both surfaces (this status bar and Settings > Remote OrcaBotmux Servers) must agree
+  // Both surfaces (this status bar and Settings > Remote Botmux Servers) must agree
   // on that single definition, or a reachable-but-not-active host reads
   // "Connected" in one place and "Available" in the other. Active/default is a
   // separate concept (surfaced elsewhere), so it must not change this state.

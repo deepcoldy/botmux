@@ -40,7 +40,7 @@ export function getFolderWorkspacePathStatusDescription(
     case 'missing':
       return translate(
         'auto.lib.folderWorkspacePathStatus.description.missing',
-        'OrcaBotmux cannot find {{path}}. Remove and re-import this folder workspace.',
+        'Botmux cannot find {{path}}. Remove and re-import this folder workspace.',
         { path: status.path }
       )
     case 'not-directory':
@@ -52,13 +52,13 @@ export function getFolderWorkspacePathStatusDescription(
     case 'ambiguous-connection':
       return translate(
         'auto.lib.folderWorkspacePathStatus.description.ambiguousConnection',
-        'OrcaBotmux cannot tell which SSH connection owns this folder scope.'
+        'Botmux cannot tell which SSH connection owns this folder scope.'
       )
     case undefined:
     case 'unavailable':
       return translate(
         'auto.lib.folderWorkspacePathStatus.description.unavailable',
-        'OrcaBotmux cannot verify this folder right now. Check the runtime or SSH connection and try again.'
+        'Botmux cannot verify this folder right now. Check the runtime or SSH connection and try again.'
       )
   }
 }
@@ -77,7 +77,7 @@ export function formatFolderWorkspaceCreateError(error: unknown): {
       ),
       description: translate(
         'auto.lib.folderWorkspacePathStatus.createError.description.missing',
-        'OrcaBotmux cannot find {{path}}. Remove and re-import the folder.',
+        'Botmux cannot find {{path}}. Remove and re-import the folder.',
         { path }
       )
     }
@@ -103,7 +103,7 @@ export function formatFolderWorkspaceCreateError(error: unknown): {
       ),
       description: translate(
         'auto.lib.folderWorkspacePathStatus.createError.description.ambiguousConnection',
-        'OrcaBotmux cannot tell which SSH connection owns this folder scope.'
+        'Botmux cannot tell which SSH connection owns this folder scope.'
       )
     }
   }
@@ -115,7 +115,7 @@ export function formatFolderWorkspaceCreateError(error: unknown): {
       ),
       description: translate(
         'auto.lib.folderWorkspacePathStatus.createError.description.unavailable',
-        'OrcaBotmux cannot verify this folder right now. Check the runtime or SSH connection and try again.'
+        'Botmux cannot verify this folder right now. Check the runtime or SSH connection and try again.'
       )
     }
   }

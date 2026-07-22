@@ -305,7 +305,7 @@ describe('AppearancePane', () => {
     expect(container.textContent).toContain('Interface')
     expect(container.textContent).toContain('Terminal')
     expect(container.textContent).toContain('Window & Sidebar')
-    // Code & Markdown is intentionally omitted — OrcaBotmux has no Appearance-level
+    // Code & Markdown is intentionally omitted — Botmux has no Appearance-level
     // code/markdown settings, so the row would be empty.
     expect(container.textContent).not.toContain('Code & Markdown')
   })

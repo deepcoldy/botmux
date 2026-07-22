@@ -113,7 +113,7 @@ function createFakeSftp(): { sftp: SFTPWrapper; fs: FakeFs } {
 
 describe('ClaudeHookService.install', () => {
   it('installs managed hooks into Claude settings and preserves user Bedrock settings', () => {
-    const tmpHome = mkdtempSync(join(tmpdir(), 'orca-botmux-claude-hooks-'))
+    const tmpHome = mkdtempSync(join(tmpdir(), 'botmux-claude-hooks-'))
     vi.stubEnv('HOME', tmpHome)
     vi.stubEnv('USERPROFILE', tmpHome)
     try {
@@ -138,7 +138,7 @@ describe('ClaudeHookService.install', () => {
                 hooks: [
                   {
                     type: 'command',
-                    command: '/Users/old/.orca_botmux/agent-hooks/claude-hook.sh'
+                    command: '/Users/old/.botmux/agent-hooks/claude-hook.sh'
                   }
                 ]
               }
@@ -168,12 +168,12 @@ describe('ClaudeHookService.install', () => {
       expect(legacyCommands.some((command: string) => isClaudeManagedCommand(command))).toBe(true)
       expect(
         legacyCommands.some((command: string) =>
-          command.includes('/Users/old/.orca_botmux/agent-hooks/claude-hook.sh')
+          command.includes('/Users/old/.botmux/agent-hooks/claude-hook.sh')
         )
       ).toBe(false)
       expect(isClaudeManagedCommand(legacy.hooks.StopFailure[0].hooks[0].command)).toBe(true)
       expect(
-        readFileSync(join(tmpHome, '.orca_botmux', 'agent-hooks', CLAUDE_SCRIPT_FILE_NAME), 'utf-8')
+        readFileSync(join(tmpHome, '.botmux', 'agent-hooks', CLAUDE_SCRIPT_FILE_NAME), 'utf-8')
       ).toContain('DEVIN_PROJECT_DIR')
     } finally {
       vi.unstubAllEnvs()
@@ -188,7 +188,7 @@ describe('ClaudeHookService.install', () => {
   it.skipIf(process.platform !== 'win32')(
     'wraps the managed hook command to survive spaces in the profile path (#6078)',
     () => {
-      const tmpHome = mkdtempSync(join(tmpdir(), 'orca_botmux claude home with spaces '))
+      const tmpHome = mkdtempSync(join(tmpdir(), 'botmux claude home with spaces '))
       vi.stubEnv('HOME', tmpHome)
       vi.stubEnv('USERPROFILE', tmpHome)
       try {
@@ -215,13 +215,13 @@ describe('ClaudeHookService.install', () => {
   it.skipIf(process.platform !== 'win32')(
     'posts from the managed .cmd via curl.exe, not a second PowerShell',
     () => {
-      const tmpHome = mkdtempSync(join(tmpdir(), 'orca-botmux-claude-curl-'))
+      const tmpHome = mkdtempSync(join(tmpdir(), 'botmux-claude-curl-'))
       vi.stubEnv('HOME', tmpHome)
       vi.stubEnv('USERPROFILE', tmpHome)
       try {
         expect(new ClaudeHookService().install().state).toBe('installed')
         const script = readFileSync(
-          join(tmpHome, '.orca_botmux', 'agent-hooks', CLAUDE_SCRIPT_FILE_NAME),
+          join(tmpHome, '.botmux', 'agent-hooks', CLAUDE_SCRIPT_FILE_NAME),
           'utf-8'
         )
         expect(script).toContain('%SystemRoot%\\System32\\curl.exe')
@@ -265,11 +265,11 @@ describe('ClaudeHookService.installRemote', () => {
     ]) {
       expect(parsed.hooks[event]).toBeTruthy()
       const cmd = parsed.hooks[event][0].hooks[0].command as string
-      expect(cmd).toContain('/home/dev/.orca_botmux/agent-hooks/claude-hook.sh')
+      expect(cmd).toContain('/home/dev/.botmux/agent-hooks/claude-hook.sh')
       expect(cmd).toMatch(/^if \[ -f /)
     }
     // Managed script body
-    const script = fs.files.get('/home/dev/.orca_botmux/agent-hooks/claude-hook.sh')
+    const script = fs.files.get('/home/dev/.botmux/agent-hooks/claude-hook.sh')
     expect(script).toContain('#!/bin/sh')
     expect(script).toContain('DEVIN_PROJECT_DIR')
     // Why: payload is piped to curl via stdin (`payload@-`) so it never lands
@@ -278,7 +278,7 @@ describe('ClaudeHookService.installRemote', () => {
     expect(script).toContain('printf \'%s\' "$payload" | curl')
     expect(script).toContain('--data-urlencode "payload@-"')
     expect(script).not.toContain('--data-urlencode "payload=${payload}"')
-    expect(fs.modes.get('/home/dev/.orca_botmux/agent-hooks/claude-hook.sh')).toBe(0o755)
+    expect(fs.modes.get('/home/dev/.botmux/agent-hooks/claude-hook.sh')).toBe(0o755)
   })
 
   it('reports parse error when remote settings.json cannot be parsed', async () => {
@@ -307,7 +307,7 @@ describe('ClaudeHookService.installRemote', () => {
                 {
                   type: 'command',
                   command:
-                    'if [ -x /home/dev/.orca_botmux/agent-hooks/claude-hook.sh ]; then /bin/sh /home/dev/.orca_botmux/agent-hooks/claude-hook.sh; fi'
+                    'if [ -x /home/dev/.botmux/agent-hooks/claude-hook.sh ]; then /bin/sh /home/dev/.botmux/agent-hooks/claude-hook.sh; fi'
                 }
               ]
             }
@@ -317,7 +317,7 @@ describe('ClaudeHookService.installRemote', () => {
     )
     await svc.installRemote(sftp, '/home/dev')
     const parsed = JSON.parse(fs.files.get('/home/dev/.claude/settings.json')!)
-    // Original user-authored entry survives, while stale OrcaBotmux entries are
+    // Original user-authored entry survives, while stale Botmux entries are
     // replaced with the current managed hook command.
     const stopDefs = parsed.hooks.Stop as { hooks: { command: string }[] }[]
     const userCmds = stopDefs.flatMap((d) => d.hooks.map((h) => h.command))
@@ -335,7 +335,7 @@ describe('OpenClaudeHookService-compatible install', () => {
     })
 
   it('installs managed hooks into OpenClaude settings without touching Claude settings', () => {
-    const tmpHome = mkdtempSync(join(tmpdir(), 'orca-botmux-openclaude-hooks-'))
+    const tmpHome = mkdtempSync(join(tmpdir(), 'botmux-openclaude-hooks-'))
     vi.stubEnv('HOME', tmpHome)
     vi.stubEnv('USERPROFILE', tmpHome)
     try {
@@ -359,10 +359,10 @@ describe('OpenClaudeHookService-compatible install', () => {
         }
       }
       expect(
-        readFileSync(join(tmpHome, '.orca_botmux', 'agent-hooks', OPENCLAUDE_SCRIPT_FILE_NAME), 'utf-8')
+        readFileSync(join(tmpHome, '.botmux', 'agent-hooks', OPENCLAUDE_SCRIPT_FILE_NAME), 'utf-8')
       ).toContain('/hook/claude')
       expect(
-        readFileSync(join(tmpHome, '.orca_botmux', 'agent-hooks', OPENCLAUDE_SCRIPT_FILE_NAME), 'utf-8')
+        readFileSync(join(tmpHome, '.botmux', 'agent-hooks', OPENCLAUDE_SCRIPT_FILE_NAME), 'utf-8')
       ).not.toContain('DEVIN_PROJECT_DIR')
       expect(existsSync(join(tmpHome, '.claude', 'settings.json'))).toBe(false)
     } finally {
@@ -383,7 +383,7 @@ describe('OpenClaudeHookService-compatible install', () => {
     })
     const parsed = JSON.parse(fs.files.get('/home/dev/.openclaude/settings.json')!)
     const command = parsed.hooks.StopFailure[0].hooks[0].command as string
-    expect(command).toContain('/home/dev/.orca_botmux/agent-hooks/openclaude-hook.sh')
-    expect(fs.files.get('/home/dev/.orca_botmux/agent-hooks/openclaude-hook.sh')).toContain('/hook/claude')
+    expect(command).toContain('/home/dev/.botmux/agent-hooks/openclaude-hook.sh')
+    expect(fs.files.get('/home/dev/.botmux/agent-hooks/openclaude-hook.sh')).toContain('/hook/claude')
   })
 })

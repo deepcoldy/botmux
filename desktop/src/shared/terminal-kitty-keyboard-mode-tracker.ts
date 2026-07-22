@@ -13,7 +13,7 @@ const KITTY_STACK_LIMIT = 16
  * DECSET/DECRST 47/1047/1049, the full reset on RIS, and the soft reset on
  * DECSTR (CSI ! p).
  *
- * Why a mirror instead of reading xterm's internal state: OrcaBotmux defensively
+ * Why a mirror instead of reading xterm's internal state: Botmux defensively
  * wipes the renderer terminal's kitty flags at moments when the TUI may have
  * died (Ctrl+C interrupts, reattach resets) while the TUI is usually still
  * alive and expecting protocol-encoded input. This tracker is fed only by

@@ -155,7 +155,7 @@ export const getExperimentalPaneSearchEntries = createLocalizedCatalog(
       ),
       description: translate(
         'auto.components.settings.experimental.search.agentHibernation.description',
-        'Stops idle background agent terminals after the configured idle window and resumes supported sessions when opened again. Agent sleep preserves launch options for agents started by OrcaBotmux; manually started agents may resume with current OrcaBotmux defaults.'
+        'Stops idle background agent terminals after the configured idle window and resumes supported sessions when opened again. Agent sleep preserves launch options for agents started by Botmux; manually started agents may resume with current Botmux defaults.'
       ),
       keywords: [
         ...translateSearchKeyword(

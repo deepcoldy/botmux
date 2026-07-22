@@ -14,39 +14,39 @@ export const COMPUTER_COMMAND_SPECS: CommandSpec[] = [
   {
     path: ['computer', 'capabilities'],
     summary: 'Show computer-use provider capabilities',
-    usage: 'orca_botmux computer capabilities [--json]',
+    usage: 'botmux computer capabilities [--json]',
     allowedFlags: [...GLOBAL_FLAGS]
   },
   {
     path: ['computer', 'list-apps'],
     summary: 'List running apps available to computer-use',
-    usage: 'orca_botmux computer list-apps [--json]',
+    usage: 'botmux computer list-apps [--json]',
     allowedFlags: [...GLOBAL_FLAGS]
   },
   {
     path: ['computer', 'permissions'],
     summary: 'Open computer-use permission setup',
-    usage: 'orca_botmux computer permissions [--id <accessibility|screenshots>] [--json]',
+    usage: 'botmux computer permissions [--id <accessibility|screenshots>] [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'id']
   },
   {
     path: ['computer', 'list-windows'],
     summary: 'List windows for an app available to computer-use',
-    usage: 'orca_botmux computer list-windows --app <name|bundle|pid:N> [--json]',
+    usage: 'botmux computer list-windows --app <name|bundle|pid:N> [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'app']
   },
   {
     path: ['computer', 'get-app-state'],
     summary: 'Capture a compact accessibility snapshot of an app',
     usage:
-      'orca_botmux computer get-app-state --app <name|bundle|pid:N> [--window-id <id> | --window-index <n>] [--worktree <selector> | --session <id>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer get-app-state --app <name|bundle|pid:N> [--window-id <id> | --window-index <n>] [--worktree <selector> | --session <id>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, ...COMPUTER_WINDOW_TARGET_FLAGS, 'restore-window']
   },
   {
     path: ['computer', 'click'],
     summary: 'Click an app element or window coordinate',
     usage:
-      'orca_botmux computer click --app <app> (--element-index <n> | --x <x> --y <y>) [--window-id <id> | --window-index <n>] [--click-count <n>] [--mouse-button <left|right|middle>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer click --app <app> (--element-index <n> | --x <x> --y <y>) [--window-id <id> | --window-index <n>] [--click-count <n>] [--mouse-button <left|right|middle>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [
       ...COMPUTER_ACTION_FLAGS,
       'element-index',
@@ -60,21 +60,21 @@ export const COMPUTER_COMMAND_SPECS: CommandSpec[] = [
     path: ['computer', 'perform-secondary-action'],
     summary: 'Perform an advertised secondary accessibility action',
     usage:
-      'orca_botmux computer perform-secondary-action --app <app> --element-index <n> --action <name> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer perform-secondary-action --app <app> --element-index <n> --action <name> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'element-index', 'action']
   },
   {
     path: ['computer', 'scroll'],
     summary: 'Scroll an app element or window coordinate',
     usage:
-      'orca_botmux computer scroll --app <app> (--element-index <n> | --x <x> --y <y>) --direction <up|down|left|right> [--window-id <id> | --window-index <n>] [--pages <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer scroll --app <app> (--element-index <n> | --x <x> --y <y>) --direction <up|down|left|right> [--window-id <id> | --window-index <n>] [--pages <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'element-index', 'x', 'y', 'direction', 'pages']
   },
   {
     path: ['computer', 'drag'],
     summary: 'Drag between app elements or window coordinates',
     usage:
-      'orca_botmux computer drag --app <app> (--from-element-index <n> --to-element-index <n> | --from-x <x> --from-y <y> --to-x <x> --to-y <y>) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer drag --app <app> (--from-element-index <n> --to-element-index <n> | --from-x <x> --from-y <y> --to-x <x> --to-y <y>) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [
       ...COMPUTER_ACTION_FLAGS,
       'from-element-index',
@@ -89,35 +89,35 @@ export const COMPUTER_COMMAND_SPECS: CommandSpec[] = [
     path: ['computer', 'type-text'],
     summary: 'Type literal text at the current app focus',
     usage:
-      'orca_botmux computer type-text --app <app> (--text <text> | --text-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer type-text --app <app> (--text <text> | --text-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'text', 'text-stdin']
   },
   {
     path: ['computer', 'press-key'],
     summary: 'Press a single key such as Return or Escape',
     usage:
-      'orca_botmux computer press-key --app <app> --key <key> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer press-key --app <app> --key <key> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'key']
   },
   {
     path: ['computer', 'hotkey'],
     summary: 'Press a platform-aware key combination',
     usage:
-      'orca_botmux computer hotkey --app <app> --key <key-combo> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer hotkey --app <app> --key <key-combo> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'key']
   },
   {
     path: ['computer', 'paste-text'],
     summary: 'Paste exact text at the current app focus',
     usage:
-      'orca_botmux computer paste-text --app <app> (--text <text> | --text-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer paste-text --app <app> (--text <text> | --text-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'text', 'text-stdin']
   },
   {
     path: ['computer', 'set-value'],
     summary: 'Set the value of a settable app element',
     usage:
-      'orca_botmux computer set-value --app <app> --element-index <n> (--value <text> | --value-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
+      'botmux computer set-value --app <app> --element-index <n> (--value <text> | --value-stdin) [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] [--json]',
     allowedFlags: [...COMPUTER_ACTION_FLAGS, 'element-index', 'value', 'value-stdin']
   }
 ]

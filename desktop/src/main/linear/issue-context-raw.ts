@@ -122,7 +122,7 @@ export const ISSUE_FIELDS = `
 `
 
 export const ISSUE_QUERY = `
-  query OrcaAgentLinearIssue($id: String!) {
+  query BotmuxAgentLinearIssue($id: String!) {
     issue(id: $id) {
       ${ISSUE_FIELDS}
     }
@@ -130,7 +130,7 @@ export const ISSUE_QUERY = `
 `
 
 export const SEARCH_QUERY = `
-  query OrcaAgentLinearSearch($term: String!, $first: Int) {
+  query BotmuxAgentLinearSearch($term: String!, $first: Int) {
     searchIssues(term: $term, first: $first) {
       nodes {
         ${ISSUE_FIELDS}
@@ -140,7 +140,7 @@ export const SEARCH_QUERY = `
 `
 
 export const COMMENTS_QUERY = `
-  query OrcaAgentLinearIssueComments($id: String!, $first: Int, $after: String) {
+  query BotmuxAgentLinearIssueComments($id: String!, $first: Int, $after: String) {
     issue(id: $id) {
       comments(first: $first, after: $after) {
         nodes {
@@ -158,7 +158,7 @@ export const COMMENTS_QUERY = `
 `
 
 export const CHILDREN_QUERY = `
-  query OrcaAgentLinearIssueChildren($id: String!, $first: Int, $after: String) {
+  query BotmuxAgentLinearIssueChildren($id: String!, $first: Int, $after: String) {
     issue(id: $id) {
       children(first: $first, after: $after) {
         nodes {
@@ -171,7 +171,7 @@ export const CHILDREN_QUERY = `
 `
 
 export const ATTACHMENTS_QUERY = `
-  query OrcaAgentLinearIssueAttachments($id: String!, $first: Int, $after: String) {
+  query BotmuxAgentLinearIssueAttachments($id: String!, $first: Int, $after: String) {
     issue(id: $id) {
       attachments(first: $first, after: $after) {
         nodes { id title url source subtitle createdAt }
@@ -182,7 +182,7 @@ export const ATTACHMENTS_QUERY = `
 `
 
 export const RELATIONS_QUERY = `
-  query OrcaAgentLinearIssueRelations($id: String!, $first: Int, $after: String) {
+  query BotmuxAgentLinearIssueRelations($id: String!, $first: Int, $after: String) {
     issue(id: $id) {
       relations(first: $first, after: $after) {
         nodes {

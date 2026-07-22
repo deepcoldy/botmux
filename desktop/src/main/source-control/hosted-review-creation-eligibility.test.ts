@@ -144,7 +144,7 @@ function resetMocks(): void {
 
 function mockGitHubProvider(): void {
   getProjectSlugMock.mockResolvedValue(null)
-  getRepoSlugMock.mockResolvedValue({ owner: 'acme', repo: 'orca_botmux' })
+  getRepoSlugMock.mockResolvedValue({ owner: 'acme', repo: 'botmux' })
   getBitbucketRepoSlugMock.mockResolvedValue(null)
   getAzureDevOpsRepoSlugMock.mockResolvedValue(null)
   getGiteaRepoSlugMock.mockResolvedValue(null)
@@ -161,13 +161,13 @@ function mockGitHubEnterpriseProvider(): void {
   getGiteaRepoSlugMock.mockResolvedValue(null)
   getEnterpriseGitHubRepoSlugMock.mockResolvedValue({
     owner: 'acme',
-    repo: 'orca_botmux',
+    repo: 'botmux',
     host: 'github.acme-corp.com'
   })
 }
 
 function mockGitLabProvider(): void {
-  getProjectSlugMock.mockResolvedValue({ host: 'gitlab.com', path: 'acme/orca_botmux' })
+  getProjectSlugMock.mockResolvedValue({ host: 'gitlab.com', path: 'acme/botmux' })
   getRepoSlugMock.mockResolvedValue(null)
   getBitbucketRepoSlugMock.mockResolvedValue(null)
   getAzureDevOpsRepoSlugMock.mockResolvedValue(null)
@@ -181,9 +181,9 @@ function mockAzureDevOpsProvider(): void {
   getAzureDevOpsRepoSlugMock.mockResolvedValue({
     host: 'dev.azure.com',
     project: 'Project',
-    repository: 'orca_botmux',
+    repository: 'botmux',
     apiBaseUrl: 'https://dev.azure.com/acme/Project',
-    webBaseUrl: 'https://dev.azure.com/acme/Project/_git/orca_botmux'
+    webBaseUrl: 'https://dev.azure.com/acme/Project/_git/botmux'
   })
   getGiteaRepoSlugMock.mockResolvedValue(null)
 }
@@ -196,7 +196,7 @@ function mockGiteaProvider(): void {
   getGiteaRepoSlugMock.mockResolvedValue({
     host: 'git.example.com',
     owner: 'acme',
-    repo: 'orca_botmux',
+    repo: 'botmux',
     apiBaseUrl: 'https://git.example.com/api/v1',
     webBaseUrl: 'https://git.example.com'
   })

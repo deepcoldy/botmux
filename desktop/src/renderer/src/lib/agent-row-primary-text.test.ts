@@ -3,15 +3,15 @@ import { normalizeAgentStatusPayload } from '../../../shared/agent-status-types'
 import {
   getAgentRowGeneratedTitleText,
   getAgentRowPrimaryText,
-  getOrcaDispatchTaskId,
-  isOrcaDispatchPrompt
+  getBotmuxDispatchTaskId,
+  isBotmuxDispatchPrompt
 } from './agent-row-primary-text'
 
 describe('getAgentRowPrimaryText', () => {
   it('prefers orchestration display name over the raw hook prompt', () => {
     expect(
       getAgentRowPrimaryText({
-        prompt: 'You are working inside OrcaBotmux, a multi-agent IDE.',
+        prompt: 'You are working inside Botmux, a multi-agent IDE.',
         orchestration: {
           taskId: 'task-1',
           dispatchId: 'ctx-1',
@@ -25,7 +25,7 @@ describe('getAgentRowPrimaryText', () => {
   it('falls back to task title when display name is absent', () => {
     expect(
       getAgentRowPrimaryText({
-        prompt: 'You are working inside OrcaBotmux, a multi-agent IDE.',
+        prompt: 'You are working inside Botmux, a multi-agent IDE.',
         orchestration: {
           taskId: 'task-1',
           dispatchId: 'ctx-1',
@@ -38,7 +38,7 @@ describe('getAgentRowPrimaryText', () => {
   it('ignores sticky orchestration labels that belong to a different task id', () => {
     expect(
       getAgentRowPrimaryText({
-        prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+        prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your task ID is: task_2
 
 === TASK ===
@@ -56,12 +56,12 @@ Review dispatch prompts and make worker labels distinct`,
   it('uses the task block when orchestration metadata has not arrived yet', () => {
     expect(
       getAgentRowPrimaryText({
-        prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+        prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your coordinator's terminal handle is: term_parent
 Your task ID is: task_1
 
 === CLI COMMANDS ===
-orca_botmux orchestration send --to term_parent
+botmux orchestration send --to term_parent
 
 === TASK ===
 Review dispatch prompts and make worker labels distinct
@@ -82,7 +82,7 @@ Keep the raw preamble out of the sidebar.`
   it('matches orchestration labels on a normalized single-line dispatch prompt', () => {
     const normalized = normalizeAgentStatusPayload({
       state: 'working',
-      prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+      prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your coordinator's terminal handle is: term_parent
 Your task ID is: task_9f3ab2
 
@@ -111,13 +111,13 @@ Fix the checkout race condition in payments`
   it('derives a task preview from a normalized 200-char dispatch prompt without labels', () => {
     const longCliNoise = Array.from(
       { length: 40 },
-      (_, i) => `orca_botmux orchestration send --to term_parent --type heartbeat --phase step-${i}`
+      (_, i) => `botmux orchestration send --to term_parent --type heartbeat --phase step-${i}`
     ).join('\n')
     const taskBody =
       'Release-fix task: orchestration fallback task preview for single-line normalization'
     const normalized = normalizeAgentStatusPayload({
       state: 'working',
-      prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+      prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your coordinator's terminal handle is: term_c376f37c-5d28-404b-869f-d0544edf12ff
 Your task ID is: task_bcfc6b64abe3
 
@@ -137,14 +137,14 @@ ${taskBody}`
 
     const preview = getAgentRowPrimaryText({ prompt: normalized!.prompt })
     expect(preview).toContain('orchestration fallback task preview')
-    expect(preview).not.toContain('You are working inside OrcaBotmux')
+    expect(preview).not.toContain('You are working inside Botmux')
     expect(preview).not.toContain('CLI COMMANDS')
   })
 
   it('uses a short single-line task body as the fallback preview', () => {
     const normalized = normalizeAgentStatusPayload({
       state: 'working',
-      prompt: `You are working inside OrcaBotmux, a multi-agent IDE.
+      prompt: `You are working inside Botmux, a multi-agent IDE.
 Your task ID is: task_short
 
 === TASK ===
@@ -156,11 +156,11 @@ Fix login form`
   it('prefers later orchestration labels over the extracted task preview', () => {
     const normalized = normalizeAgentStatusPayload({
       state: 'working',
-      prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+      prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your task ID is: task_label_later
 
 === CLI COMMANDS ===
-${'orca_botmux orchestration check\n'.repeat(30)}
+${'botmux orchestration check\n'.repeat(30)}
 === TASK ===
 Implement the detailed worker instructions that should not stay as the final label`
     })
@@ -187,19 +187,19 @@ Implement the detailed worker instructions that should not stay as the final lab
     expect(
       getAgentRowPrimaryText({
         prompt:
-          'You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker. Your task ID is: task_no_body CLI noise only'
+          'You are working inside Botmux, a multi-agent IDE. You are a dispatched worker. Your task ID is: task_no_body CLI noise only'
       })
     ).toBe('')
   })
 
   // Why: UI helpers still accept raw multi-line preambles (tests, defensive
   // paths). Without the standalone-line marker rule, a base-drift subject that
-  // mentions `=== TASK ===` wins over OrcaBotmux's real separator.
+  // mentions `=== TASK ===` wins over Botmux's real separator.
   it('ignores adversarial === TASK === text in raw multi-line base-drift subjects', () => {
     expect(
       getAgentRowPrimaryText({
         prompt: [
-          'You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.',
+          'You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.',
           'Your task ID is: task_raw_drift',
           '',
           '--- BASE DRIFT ---',
@@ -217,45 +217,45 @@ Implement the detailed worker instructions that should not stay as the final lab
     expect(
       getAgentRowPrimaryText({
         prompt:
-          'You are working inside OrcaBotmux, a multi-agent IDE. Your task ID is: task_inline === TASK === Compact body preview'
+          'You are working inside Botmux, a multi-agent IDE. Your task ID is: task_inline === TASK === Compact body preview'
       })
     ).toBe('Compact body preview')
   })
 })
 
-describe('getOrcaDispatchTaskId', () => {
+describe('getBotmuxDispatchTaskId', () => {
   it('extracts the id when the trailing newline was folded to a space', () => {
     const normalized = normalizeAgentStatusPayload({
       state: 'working',
-      prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+      prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your task ID is: task_9f3ab2
 
 === TASK ===
 body`
     })
-    expect(getOrcaDispatchTaskId(normalized!.prompt)).toBe('task_9f3ab2')
+    expect(getBotmuxDispatchTaskId(normalized!.prompt)).toBe('task_9f3ab2')
   })
 
   it('extracts the id from a raw multi-line prompt', () => {
     expect(
-      getOrcaDispatchTaskId(
-        `You are working inside OrcaBotmux, a multi-agent IDE.\nYour task ID is: task_1\n\n=== TASK ===\nbody`
+      getBotmuxDispatchTaskId(
+        `You are working inside Botmux, a multi-agent IDE.\nYour task ID is: task_1\n\n=== TASK ===\nbody`
       )
     ).toBe('task_1')
   })
 })
 
-describe('isOrcaDispatchPrompt / getAgentRowGeneratedTitleText', () => {
+describe('isBotmuxDispatchPrompt / getAgentRowGeneratedTitleText', () => {
   it('treats leading whitespace as still a dispatch preamble', () => {
     expect(
-      isOrcaDispatchPrompt('  You are working inside OrcaBotmux, a multi-agent IDE. Worker task')
+      isBotmuxDispatchPrompt('  You are working inside Botmux, a multi-agent IDE. Worker task')
     ).toBe(true)
   })
 
   it('uses orchestration labels for generated titles only on matching dispatch prompts', () => {
     expect(
       getAgentRowGeneratedTitleText({
-        prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+        prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your task ID is: task-1
 
 === TASK ===

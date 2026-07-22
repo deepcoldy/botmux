@@ -55,7 +55,7 @@ import type {
   WorkspaceLineage,
   WorkspaceKey,
   GlobalSettings,
-  OrcaWorkspaceLayout,
+  BotmuxWorkspaceLayout,
   NotificationSettings,
   OnboardingChecklistState,
   OnboardingOutcome,
@@ -145,7 +145,7 @@ import {
   getRepoIdFromWorktreeId,
   getWorktreePathBasenameFromId
 } from '../shared/worktree-id'
-import { isSyntheticTerminalHostId } from '../shared/orca-botmux-main-terminal-host'
+import { isSyntheticTerminalHostId } from '../shared/botmux-main-terminal-host'
 import {
   isPathInsideOrEqual,
   isWindowsAbsolutePathLike,
@@ -324,9 +324,9 @@ function retireLegacyInstructionsForClearedTextActionRecipes(
 // path, causing dev and production instances to share the same file and silently
 // overwrite each other.
 //
-// It also must not be resolved lazily on every call, because app.setName('orca_botmux')
+// It also must not be resolved lazily on every call, because app.setName('botmux')
 // runs before the Store constructor and would change the resolved path from
-// lowercase 'orca_botmux' to uppercase 'orca_botmux'. On case-sensitive filesystems (Linux)
+// lowercase 'botmux' to uppercase 'botmux'. On case-sensitive filesystems (Linux)
 // this would look in the wrong directory and lose existing user data.
 //
 // Solution: index.ts calls initDataPath() right after configureDevUserDataPath()
@@ -337,7 +337,7 @@ let _userDataDir: string | null = null
 export function initDataPath(): void {
   const userDataDir = app.getPath('userData')
   _userDataDir = userDataDir
-  _dataFile = join(userDataDir, 'orca-botmux-data.json')
+  _dataFile = join(userDataDir, 'botmux-data.json')
 }
 
 function getDataFile(): string {
@@ -345,22 +345,22 @@ function getDataFile(): string {
     // Safety fallback — should not be hit in normal startup.
     const userDataDir = app.getPath('userData')
     _userDataDir = userDataDir
-    _dataFile = join(userDataDir, 'orca-botmux-data.json')
+    _dataFile = join(userDataDir, 'botmux-data.json')
   }
   return _dataFile
 }
 
 // Why a sidecar: githubCache is a refetchable 5-min-TTL poll cache whose
-// fetchedAt stamps change on every refresh — keeping it inside orca-botmux-data.json
+// fetchedAt stamps change on every refresh — keeping it inside botmux-data.json
 // made every poll cycle rewrite the whole multi-MB durable state (defeating
 // the content-hash guard by design). It lives in memory during the session
 // and is snapshotted here best-effort at quit so PR/issue badges still paint
 // instantly on the next launch. Loss of this file costs nothing.
 function getGithubCacheFile(dataFile = getDataFile()): string {
-  return join(dirname(dataFile), 'orca-botmux-github-cache.json')
+  return join(dirname(dataFile), 'botmux-github-cache.json')
 }
 
-// Why: worktrees deleted outside OrcaBotmux (git CLI worktree remove, rm -rf,
+// Why: worktrees deleted outside Botmux (git CLI worktree remove, rm -rf,
 // agent scripts) purge renderer session state but nothing removed their
 // worktreeMeta, so the map grew monotonically (63% dead entries measured on
 // a heavy install). GC is deliberately narrow: local-host entries only
@@ -379,8 +379,8 @@ function gcStaleWorktreeMeta(state: PersistedState): number {
   const now = Date.now()
   let removed = 0
   for (const key of Object.keys(state.worktreeMeta)) {
-    // Why: orca_botmux control-plane / floating terminal hosts are synthetic
-    // terminal surfaces (orca_botmux:session:*, global-orca-botmux-terminal, floating).
+    // Why: botmux control-plane / floating terminal hosts are synthetic
+    // terminal surfaces (botmux:session:*, global-botmux-terminal, floating).
     // They must never live in worktreeMeta — PTY activity used to stamp them
     // via updateMeta, then SSH worktree indexing logged "malformed" forever
     // because GC skipped keys without `::`.
@@ -470,7 +470,7 @@ function readGithubCacheSnapshot(dataFile: string): PersistedState['githubCache'
  * Return the userData directory captured at initDataPath() time, before
  * app.setName() can change how app.getPath('userData') resolves.
  *
- * Subsystems that must share storage with orca-botmux-data.json (mobile pairing's
+ * Subsystems that must share storage with botmux-data.json (mobile pairing's
  * DeviceRegistry, E2EE keypair, runtime metadata) read this instead of
  * resolving the path late, which on case-sensitive filesystems can land in a
  * different directory and lose paired devices across restarts/updates.
@@ -518,7 +518,7 @@ export function migrateMobilePairingDataToCanonicalUserDataPath(sourceUserDataDi
   }
 }
 
-// Why (issue #1158): keep 5 rolling backups of orca-botmux-data.json so a corrupt or
+// Why (issue #1158): keep 5 rolling backups of botmux-data.json so a corrupt or
 // empty write leaves at least one earlier copy recoverable. Five snapshots at
 // >=1-hour spacing cover recent work without churning disk on every debounce.
 const BACKUP_COUNT = 5
@@ -583,7 +583,7 @@ function backupPath(dataFile: string, index: number): string {
 function buildWorkspaceDirHistoryForUpdate(
   current: GlobalSettings,
   updates: Partial<GlobalSettings>
-): OrcaWorkspaceLayout[] | null {
+): BotmuxWorkspaceLayout[] | null {
   if (!('workspaceDir' in updates) && !('nestWorkspaces' in updates)) {
     return null
   }
@@ -675,7 +675,7 @@ function migrateTerminalTuiScrollSensitivityDefault(settings: GlobalSettings | u
   }
 }
 
-function getWorkspaceLayoutHistoryKey(layout: OrcaWorkspaceLayout): string {
+function getWorkspaceLayoutHistoryKey(layout: BotmuxWorkspaceLayout): string {
   return `${normalizeRuntimePathForComparison(layout.path)}:${layout.nestWorkspaces}`
 }
 
@@ -924,7 +924,7 @@ function normalizeNotificationSettings(value: unknown): NotificationSettings {
     rawSoundId === 'beep' ||
     rawSoundId === 'custom'
       ? rawSoundId
-      : rawSoundId === 'orca_botmux' || rawSoundId === 'chime'
+      : rawSoundId === 'botmux' || rawSoundId === 'chime'
         ? 'two-tone'
         : rawSoundId === 'pop'
           ? 'blop'
@@ -1324,7 +1324,7 @@ function normalizeLoadedOnboardingState(
   input: unknown,
   defaults: OnboardingState
 ): OnboardingState {
-  // Why: if we successfully parsed an existing orca-botmux-data.json that lacks an
+  // Why: if we successfully parsed an existing botmux-data.json that lacks an
   // onboarding block, this is an upgrade-cohort user — backfill as completed
   // (not dismissed) so they don't get dropped into the wizard regardless of
   // whether they currently have repos, SSH targets, or just non-default
@@ -2873,7 +2873,7 @@ export class Store {
 
   private load(allowBackupRecovery = true): PersistedState {
     // Capture once, at the top: this is the unambiguous "has the user run
-    // OrcaBotmux before?" signal used by the telemetry cohort migration below.
+    // Botmux before?" signal used by the telemetry cohort migration below.
     // Field-based inference (e.g., `settings.telemetry` presence) does not
     // work on the telemetry release itself — `telemetry` is new here, so it
     // would be absent on every pre-telemetry install and misclassify existing
@@ -3488,7 +3488,7 @@ export class Store {
 
     // Corrupt-file catch path and "no file on disk" path converge here. The
     // telemetry migration below runs on whichever branch produced `result`,
-    // because a user whose `orca-botmux-data.json` got corrupted is not a fresh
+    // because a user whose `botmux-data.json` got corrupted is not a fresh
     // install of the telemetry release — they still count as existing and
     // must see the opt-in banner, not the default-on toast.
     if (result === null && allowBackupRecovery) {

@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   countVisibleTerminalPanes,
@@ -16,7 +16,7 @@ import {
 
 const tempRoots: string[] = []
 const SORTABLE_TAB = '[data-testid="sortable-tab"]'
-const REPO_STEP_HEADING = /Point OrcaBotmux at some code/i
+const REPO_STEP_HEADING = /Point Botmux at some code/i
 const TASK_SOURCES_HEADING = /Set up GitHub tasks|Connect your task sources/i
 const WINDOWS_TERMINAL_HEADING = /Set Windows terminal defaults/i
 const ONBOARDING_ADVANCE_LABEL = /^Continue\b|^Add your first project\b/
@@ -418,22 +418,22 @@ async function completeWorkspaceCreationTour(page: Page, workspaceName: string):
 test.describe('Existing-user golden core flow', () => {
   test('adds project, creates workspace, opens a terminal tab, and splits a pane', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    const repoPath = await createGitRepo('orca-botmux-e2e-golden-existing-', 'golden-existing-project')
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    const repoPath = await createGitRepo('botmux-e2e-golden-existing-', 'golden-existing-project')
 
-    await addProjectFromSidebar(orcaBotmuxPage, electronApp, repoPath)
+    await addProjectFromSidebar(botmuxPage, electronApp, repoPath)
     const workspaceName = `golden-existing-${Date.now()}`
-    await createWorkspace(orcaBotmuxPage, workspaceName)
-    await expectActiveWorkspaceBelongsToRepo(orcaBotmuxPage, workspaceName, repoPath)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await expectTerminalSurface(orcaBotmuxPage)
-    await waitForTerminalPaneManager(orcaBotmuxPage)
+    await createWorkspace(botmuxPage, workspaceName)
+    await expectActiveWorkspaceBelongsToRepo(botmuxPage, workspaceName, repoPath)
+    await ensureTerminalVisible(botmuxPage)
+    await expectTerminalSurface(botmuxPage)
+    await waitForTerminalPaneManager(botmuxPage)
 
-    await createTerminalTabThroughMenu(orcaBotmuxPage)
-    await splitTerminalPaneAndAssertIdentity(orcaBotmuxPage)
+    await createTerminalTabThroughMenu(botmuxPage)
+    await splitTerminalPaneAndAssertIdentity(botmuxPage)
   })
 })
 
@@ -442,48 +442,48 @@ test.describe('New-user golden core flow', () => {
 
   test('completes onboarding, adds a project, and follows the workspace tour handoff', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await expect(orcaBotmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
+    await waitForSessionReady(botmuxPage)
+    await expect(botmuxPage.getByRole('heading', { name: /Pick your default agent/i })).toBeVisible({
       timeout: 15_000
     })
 
-    await selectCodexAgent(orcaBotmuxPage)
-    await continueOnboarding(orcaBotmuxPage)
-    await expect(orcaBotmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
-    await chooseOppositeTheme(orcaBotmuxPage)
-    await continueOnboarding(orcaBotmuxPage)
-    await continueThroughOptionalSetupToNotifications(orcaBotmuxPage)
-    await expect(orcaBotmuxPage.getByRole('button', { name: /Send Test Notification/i })).toBeVisible()
-    await chooseNotificationSound(orcaBotmuxPage)
-    await continueFromNotificationsToRepo(orcaBotmuxPage)
+    await selectCodexAgent(botmuxPage)
+    await continueOnboarding(botmuxPage)
+    await expect(botmuxPage.getByRole('heading', { name: /Make it feel like home/i })).toBeVisible()
+    await chooseOppositeTheme(botmuxPage)
+    await continueOnboarding(botmuxPage)
+    await continueThroughOptionalSetupToNotifications(botmuxPage)
+    await expect(botmuxPage.getByRole('button', { name: /Send Test Notification/i })).toBeVisible()
+    await chooseNotificationSound(botmuxPage)
+    await continueFromNotificationsToRepo(botmuxPage)
 
-    const repoPath = await createGitRepo('orca-botmux-e2e-golden-new-', 'golden-new-project')
+    const repoPath = await createGitRepo('botmux-e2e-golden-new-', 'golden-new-project')
     await chooseFolderInNativeDialog(electronApp, repoPath)
-    await orcaBotmuxPage
+    await botmuxPage
       .getByRole('button', { name: /Browse for a folder|Open a folder|Browse folder/i })
       .click()
-    await expect(orcaBotmuxPage.getByRole('heading', { name: REPO_STEP_HEADING })).toHaveCount(0, {
+    await expect(botmuxPage.getByRole('heading', { name: REPO_STEP_HEADING })).toHaveCount(0, {
       timeout: 30_000
     })
-    await waitForRepoLoaded(orcaBotmuxPage, repoPath)
-    await expectProjectVisible(orcaBotmuxPage, repoPath)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await expectTerminalSurface(orcaBotmuxPage)
-    await waitForTerminalPaneManager(orcaBotmuxPage)
+    await waitForRepoLoaded(botmuxPage, repoPath)
+    await expectProjectVisible(botmuxPage, repoPath)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await expectTerminalSurface(botmuxPage)
+    await waitForTerminalPaneManager(botmuxPage)
 
-    await requestAgentSessionsTour(orcaBotmuxPage)
-    const paneCountBeforeTourSplit = await countVisibleTerminalPanes(orcaBotmuxPage)
-    await orcaBotmuxPage.getByRole('button', { name: /^Split terminal$/ }).click()
-    await waitForPaneCount(orcaBotmuxPage, paneCountBeforeTourSplit + 1)
-    await waitForPaneIdentitySnapshot(orcaBotmuxPage, paneCountBeforeTourSplit + 1)
+    await requestAgentSessionsTour(botmuxPage)
+    const paneCountBeforeTourSplit = await countVisibleTerminalPanes(botmuxPage)
+    await botmuxPage.getByRole('button', { name: /^Split terminal$/ }).click()
+    await waitForPaneCount(botmuxPage, paneCountBeforeTourSplit + 1)
+    await waitForPaneIdentitySnapshot(botmuxPage, paneCountBeforeTourSplit + 1)
 
     await expect(
-      orcaBotmuxPage.getByRole('dialog', { name: /Start another task in parallel/i })
+      botmuxPage.getByRole('dialog', { name: /Start another task in parallel/i })
     ).toBeVisible()
-    const createControl = orcaBotmuxPage
+    const createControl = botmuxPage
       .locator('[data-contextual-tour-target="workspace-create-control"]')
       .first()
     await expect(createControl).toBeVisible()
@@ -494,7 +494,7 @@ test.describe('New-user golden core flow', () => {
     await createControl.click()
 
     const workspaceName = `golden-new-${Date.now()}`
-    await completeWorkspaceCreationTour(orcaBotmuxPage, workspaceName)
-    await expectActiveWorkspaceBelongsToRepo(orcaBotmuxPage, workspaceName, repoPath)
+    await completeWorkspaceCreationTour(botmuxPage, workspaceName)
+    await expectActiveWorkspaceBelongsToRepo(botmuxPage, workspaceName, repoPath)
   })
 })

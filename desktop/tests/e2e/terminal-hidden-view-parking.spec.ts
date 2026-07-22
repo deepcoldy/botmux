@@ -2,7 +2,7 @@ import type { Page, TestInfo } from '@stablyai/playwright-test'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { runNodeScriptInTerminal } from './helpers/run-node-script-in-terminal'
 import {
   ensureTerminalVisible,
@@ -32,10 +32,10 @@ type ParkingDebugWindow = Window & {
 // window. The fast-park override must be scoped to THIS spec's app launches —
 // mutating process.env at module scope leaked into later specs when a worker
 // reloaded files without replaying this file's afterAll.
-const PARKING_DELAY_MS = Number(process.env.ORCA_E2E_TERMINAL_PARKING_DELAY_MS) || 500
+const PARKING_DELAY_MS = Number(process.env.BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS) || 500
 
 test.use({
-  orcaAppExtraEnv: { ORCA_E2E_TERMINAL_PARKING_DELAY_MS: String(PARKING_DELAY_MS) }
+  botmuxAppExtraEnv: { BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS: String(PARKING_DELAY_MS) }
 })
 
 const PARKED_FRAME_SCRIPT_DELAY_MS = 750
@@ -274,31 +274,31 @@ async function setUpParkableTabA(page: Page): Promise<ParkableTabSetup> {
 
 test.describe('Terminal hidden view parking', () => {
   test('parks a hidden terminal tab and restores rich TUI output on reveal', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const setup = await setUpParkableTabA(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    const setup = await setUpParkableTabA(botmuxPage)
     const { worktreeId, tabAId, tabAPtyId } = setup
 
     const runId = randomUUID()
     const finalMarker = `PARKED_RESTORE_FINAL_${runId}_${PARKED_FRAME_COUNT - 1}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-parked-rich-tui-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-parked-rich-tui-${runId}.mjs`)
     writeParkedFrameScript(scriptPath, runId)
     try {
-      await sendToTerminal(orcaBotmuxPage, tabAPtyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, tabAPtyId, `node ${JSON.stringify(scriptPath)}\r`)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+        .poll(() => getTerminalContent(botmuxPage, 12_000), {
           timeout: 15_000,
           message: 'rich TUI final frame did not render while tab A was visible'
         })
         .toContain(finalMarker)
 
-      const tabBId = await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-      const parkDetectedAfterMs = await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabAId, {
+      const tabBId = await createActiveTerminalTab(botmuxPage, worktreeId)
+      const parkDetectedAfterMs = await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabAId, {
         parkDelayMs: PARKING_DELAY_MS
       })
-      const wiring = await readParkingWiring(orcaBotmuxPage)
+      const wiring = await readParkingWiring(botmuxPage)
       testInfo.annotations.push({
         type: 'terminal-parking',
         description: `parkDelayMs=${wiring.parkDelayMs ?? PARKING_DELAY_MS} parkDetectedAfterMs=${parkDetectedAfterMs}`
@@ -307,49 +307,49 @@ test.describe('Terminal hidden view parking', () => {
       // Why: parking must be scoped to the parked tab — tab B (hidden more
       // recently, so #8262 keeps it warm) still holds a live pane manager and
       // xterm while tab A tore down.
-      const tabBState = await readTerminalTabViewState(orcaBotmuxPage, tabBId)
+      const tabBState = await readTerminalTabViewState(botmuxPage, tabBId)
       expect(tabBState.hasManager).toBe(true)
       expect(tabBState.paneCount).toBeGreaterThan(0)
 
-      await activateTerminalTab(orcaBotmuxPage, tabAId)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-      const revealedSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+      await activateTerminalTab(botmuxPage, tabAId)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
+      const revealedSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
       expect(revealedSnapshot.tabId).toBe(tabAId)
       // Why: parking only tears down the renderer view; the PTY session must
       // survive so reveal reattaches to the same shell.
       expect(revealedSnapshot.panes[0]?.ptyId).toBe(tabAPtyId)
 
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+        .poll(() => getTerminalContent(botmuxPage, 12_000), {
           timeout: 15_000,
           message: 'parked rich TUI frame did not restore when the tab was revealed'
         })
         .toContain(finalMarker)
 
-      const content = await getTerminalContent(orcaBotmuxPage, 12_000)
+      const content = await getTerminalContent(botmuxPage, 12_000)
       expect(content).toContain(`Frame ${String(PARKED_FRAME_COUNT - 1).padStart(3, '0')}`)
       expect(content).toContain('╭')
       expect(content).toContain('├')
       expect(content).toContain('█')
-      expect(content).not.toContain('OrcaBotmux skipped hidden terminal output')
+      expect(content).not.toContain('Botmux skipped hidden terminal output')
 
       // Why: the typed marker only appears joined in command *output*, so this
       // proves the revealed terminal accepts input end-to-end, not just echo.
       const typedMarker = `PARKED_TYPED_OK_${runId}`
       const typedProbeScript = `console.log('PARKED_TYPED_OK_' + '${runId}')`
       // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-      await runNodeScriptInTerminal(orcaBotmuxPage, tabAPtyId, typedProbeScript, {
-        prefix: 'orca-botmux-parked-typed-probe'
+      await runNodeScriptInTerminal(botmuxPage, tabAPtyId, typedProbeScript, {
+        prefix: 'botmux-parked-typed-probe'
       })
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+        .poll(() => getTerminalContent(botmuxPage, 12_000), {
           timeout: 10_000,
           message: 'revealed terminal did not execute and display typed input'
         })
         .toContain(typedMarker)
 
       const screenshotPath = testInfo.outputPath('parked-tab-restore-final.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('parked-tab-restore-final.png', {
         path: screenshotPath,
         contentType: 'image/png'
@@ -359,13 +359,13 @@ test.describe('Terminal hidden view parking', () => {
     }
   })
 
-  test('keeps bell and title side effects live while parked', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const setup = await setUpParkableTabA(orcaBotmuxPage)
+  test('keeps bell and title side effects live while parked', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    const setup = await setUpParkableTabA(botmuxPage)
     const { worktreeId, tabAId, tabAPtyId } = setup
 
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabAId, {
+    await createActiveTerminalTab(botmuxPage, worktreeId)
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabAId, {
       parkDelayMs: PARKING_DELAY_MS
     })
 
@@ -379,24 +379,24 @@ test.describe('Terminal hidden view parking', () => {
     const payload = `\x1b]0;${parkedTitle}\x07\x07${marker}\n`
     const sideEffectScript = `process.stdout.write(${JSON.stringify(payload)}); setTimeout(() => process.exit(0), 30000)`
     // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-    await runNodeScriptInTerminal(orcaBotmuxPage, tabAPtyId, sideEffectScript, {
-      prefix: 'orca-botmux-parked-side-effect'
+    await runNodeScriptInTerminal(botmuxPage, tabAPtyId, sideEffectScript, {
+      prefix: 'botmux-parked-side-effect'
     })
 
     await expect
-      .poll(() => getTerminalTabTitle(orcaBotmuxPage, worktreeId, tabAId), {
+      .poll(() => getTerminalTabTitle(botmuxPage, worktreeId, tabAId), {
         timeout: 10_000,
         message: 'parked OSC 0 title did not update the tab title in the store'
       })
       .toBe(parkedTitle)
     await expect
-      .poll(async () => (await getUnreadTerminalTabIds(orcaBotmuxPage)).includes(tabAId), {
+      .poll(async () => (await getUnreadTerminalTabIds(botmuxPage)).includes(tabAId), {
         timeout: 10_000,
         message: 'parked BEL did not mark the terminal tab unread'
       })
       .toBe(true)
     await expect
-      .poll(() => isWorktreeUnread(orcaBotmuxPage, worktreeId), {
+      .poll(() => isWorktreeUnread(botmuxPage, worktreeId), {
         timeout: 10_000,
         message: 'parked BEL did not mark the worktree unread'
       })
@@ -404,39 +404,39 @@ test.describe('Terminal hidden view parking', () => {
 
     // Why: side effects must come from the pane-less watcher — the burst must
     // not have woken the parked view back up.
-    expect((await readTerminalTabViewState(orcaBotmuxPage, tabAId)).hasManager).toBe(false)
+    expect((await readTerminalTabViewState(botmuxPage, tabAId)).hasManager).toBe(false)
 
-    await activateTerminalTab(orcaBotmuxPage, tabAId)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await activateTerminalTab(botmuxPage, tabAId)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+      .poll(() => getTerminalContent(botmuxPage, 12_000), {
         timeout: 15_000,
         message: 'parked side-effect marker did not restore when the tab was revealed'
       })
       .toContain(marker)
   })
 
-  test('does not park excluded tabs', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const setup = await setUpParkableTabA(orcaBotmuxPage)
+  test('does not park excluded tabs', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    const setup = await setUpParkableTabA(botmuxPage)
     const { worktreeId, tabAId } = setup
 
     // Tab C: parking-excluded because it has a pending startup command. Queue
     // it after the pane mounted so the mount-time consume cannot drain it.
-    const tabCId = await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await orcaBotmuxPage.evaluate((tabId) => {
+    const tabCId = await createActiveTerminalTab(botmuxPage, worktreeId)
+    await botmuxPage.evaluate((tabId) => {
       const store = window.__store
       if (!store) {
         throw new Error('parking exclusion spec: window.__store is unavailable')
       }
       store.getState().queueTabStartupCommand(tabId, { command: 'echo parked-exclusion-probe' })
     }, tabCId)
-    expect(await hasPendingStartupCommand(orcaBotmuxPage, tabCId)).toBe(true)
+    expect(await hasPendingStartupCommand(botmuxPage, tabCId)).toBe(true)
 
     // Tab B on top hides both A and C.
-    const tabBId = await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
+    const tabBId = await createActiveTerminalTab(botmuxPage, worktreeId)
     await expect
-      .poll(() => getActiveTabId(orcaBotmuxPage), {
+      .poll(() => getActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'tab B did not stay active while waiting on the parking window'
       })
@@ -446,14 +446,14 @@ test.describe('Terminal hidden view parking', () => {
     // instance, so the tab C assertion below is not vacuously green. A decoy
     // takes the #8262 last-active exemption (tab C is excluded, not a candidate)
     // so tab A is the one that cold-parks.
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabAId, {
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabAId, {
       parkDelayMs: PARKING_DELAY_MS
     })
-    await orcaBotmuxPage.waitForTimeout(PARKING_DELAY_MS * 3)
+    await botmuxPage.waitForTimeout(PARKING_DELAY_MS * 3)
 
     // Premise guard: nothing consumed the pending startup while hidden.
-    expect(await hasPendingStartupCommand(orcaBotmuxPage, tabCId)).toBe(true)
-    const tabCState = await readTerminalTabViewState(orcaBotmuxPage, tabCId)
+    expect(await hasPendingStartupCommand(botmuxPage, tabCId)).toBe(true)
+    const tabCState = await readTerminalTabViewState(botmuxPage, tabCId)
     expect(tabCState.hasManager).toBe(true)
     expect(tabCState.paneCount).toBeGreaterThan(0)
   })
@@ -465,22 +465,22 @@ test.describe('Terminal hidden view parking', () => {
   // snapshot restore + PTY reattach path the fuzz suites model in isolation, and
   // fails if any single cycle — or accumulated drift across 25 — garbles a cell.
   test('reproduces a static frame byte-for-byte across 25 park/reveal cycles', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
     test.setTimeout(180_000)
-    await waitForSessionReady(orcaBotmuxPage)
-    const setup = await setUpParkableTabA(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    const setup = await setUpParkableTabA(botmuxPage)
     const { worktreeId, tabAId, tabAPtyId } = setup
 
     const runId = randomUUID()
     const marker = `CYCLE_REFERENCE_${runId}`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-cycle-reference-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-cycle-reference-${runId}.mjs`)
     writeCycleReferenceScript(scriptPath, runId)
     try {
-      await sendToTerminal(orcaBotmuxPage, tabAPtyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await sendToTerminal(botmuxPage, tabAPtyId, `node ${JSON.stringify(scriptPath)}\r`)
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+        .poll(() => getTerminalContent(botmuxPage, 12_000), {
           timeout: 15_000,
           message: 'cycle reference frame did not render while tab A was visible'
         })
@@ -490,8 +490,8 @@ test.describe('Terminal hidden view parking', () => {
       // between them is the deterministic hide/reveal driver. The decoy tab
       // absorbs the #8262 last-active exemption each cycle (hidden after B) so
       // tab A — not the just-hidden view — is the one that cold-parks.
-      const tabBId = await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-      const decoyTabId = await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
+      const tabBId = await createActiveTerminalTab(botmuxPage, worktreeId)
+      const decoyTabId = await createActiveTerminalTab(botmuxPage, worktreeId)
 
       // One park/reveal cycle to run the frame through the snapshot restore for a
       // baseline. Why not compare against the visible-before-park content: an
@@ -501,23 +501,23 @@ test.describe('Terminal hidden view parking', () => {
       // omits — that is contract, not garble. Baselining after one reveal makes
       // both sides pass through identical machinery, so any later diff is drift.
       const runOneParkRevealCycle = async (cycle: number): Promise<string[]> => {
-        await activateTerminalTab(orcaBotmuxPage, tabBId)
+        await activateTerminalTab(botmuxPage, tabBId)
         // Hide tab B behind the decoy so B (not A) holds the #8262 exemption.
-        await activateTerminalTab(orcaBotmuxPage, decoyTabId)
-        await waitForTabParked(orcaBotmuxPage, tabAId, { parkDelayMs: PARKING_DELAY_MS })
-        await activateTerminalTab(orcaBotmuxPage, tabAId)
-        await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-        const revealed = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+        await activateTerminalTab(botmuxPage, decoyTabId)
+        await waitForTabParked(botmuxPage, tabAId, { parkDelayMs: PARKING_DELAY_MS })
+        await activateTerminalTab(botmuxPage, tabAId)
+        await waitForActiveTerminalManager(botmuxPage, 30_000)
+        const revealed = await waitForPaneIdentitySnapshot(botmuxPage, 1)
         expect(revealed.panes[0]?.ptyId).toBe(tabAPtyId)
         await expect
-          .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+          .poll(() => getTerminalContent(botmuxPage, 12_000), {
             timeout: 15_000,
             message: `cycle ${cycle}: reference frame did not restore on reveal`
           })
           .toContain(marker)
-        const rows = terminalContentRows(await getTerminalContent(orcaBotmuxPage, 12_000))
+        const rows = terminalContentRows(await getTerminalContent(botmuxPage, 12_000))
         // Garble sentinel: the hidden-skip banner must never appear.
-        expect(rows.join('\n')).not.toContain('OrcaBotmux skipped hidden terminal output')
+        expect(rows.join('\n')).not.toContain('Botmux skipped hidden terminal output')
         return rows
       }
 
@@ -549,7 +549,7 @@ test.describe('Terminal hidden view parking', () => {
       ).toEqual([])
 
       const screenshotPath = testInfo.outputPath('park-reveal-25-cycles-final.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('park-reveal-25-cycles-final.png', {
         path: screenshotPath,
         contentType: 'image/png'

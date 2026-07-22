@@ -18,7 +18,7 @@ const SSH_BROWSE_TIMEOUT_MS = 15_000
 // Note: cmd.exe's ERRORLEVEL for an unrecognized command is 9009, but that value
 // never crosses cmd.exe's process boundary. sshd forwards cmd.exe's *process* exit
 // code, which is 1 — verified on real Windows OpenSSH + cmd.exe over both the ssh2
-// and system-ssh transports. So a Windows host rejecting OrcaBotmux's POSIX `exec`
+// and system-ssh transports. So a Windows host rejecting Botmux's POSIX `exec`
 // wrapper is detected by "the remote command ran and exited non-zero"
 // (RemoteBrowseError), not by a magic exit code or localized stderr text.
 const POSIX_COMMAND_NOT_FOUND_EXIT = 127
@@ -64,7 +64,7 @@ export function registerSshBrowseHandler(
       try {
         return await browseWithPosixShell(conn, args.dirPath)
       } catch (posixError) {
-        // Why: a Windows login shell (cmd.exe/PowerShell) rejects OrcaBotmux's POSIX
+        // Why: a Windows login shell (cmd.exe/PowerShell) rejects Botmux's POSIX
         // `exec` wrapper, and the only locale-independent signal for that is "the
         // remote command executed and exited non-zero" (RemoteBrowseError). Its
         // stderr prose is localized, and cmd.exe's 9009 ERRORLEVEL never reaches

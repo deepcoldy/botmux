@@ -187,7 +187,7 @@ export function useRemoteRepo(
       const state = useAppStore.getState()
       const existingIdx = state.repos.findIndex((r) => r.id === repo.id)
       if (existingIdx !== -1) {
-        state.clearOrcaHookTrustForRepo(repo.id)
+        state.clearBotmuxHookTrustForRepo(repo.id)
       }
       upsertAddedRepoWithProjectHostSetup(repo)
 

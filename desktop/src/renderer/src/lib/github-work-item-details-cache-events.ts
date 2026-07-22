@@ -8,7 +8,7 @@ export type GitHubWorkItemDetailsCacheMutation = {
   number: number
 }
 
-const GITHUB_WORK_ITEM_DETAILS_CACHE_MUTATED_EVENT = 'orca_botmux:github-work-item-details-cache-mutated'
+const GITHUB_WORK_ITEM_DETAILS_CACHE_MUTATED_EVENT = 'botmux:github-work-item-details-cache-mutated'
 
 export function emitGitHubWorkItemDetailsCacheMutation(
   payload: GitHubWorkItemDetailsCacheMutation

@@ -140,7 +140,7 @@ describe('fetchKimiRateLimits', () => {
     const result = await fetchKimiRateLimits()
     expect(result.status).toBe('error')
     expect(result.error).toMatch(/expired/i)
-    expect(result.error).toMatch(/run kimi on the computer running OrcaBotmux/i)
+    expect(result.error).toMatch(/run kimi on the computer running Botmux/i)
     expect(result.usageMetadata).toEqual({
       failureKind: 'delegated-refresh-required',
       source: 'oauth'

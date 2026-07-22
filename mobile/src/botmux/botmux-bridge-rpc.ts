@@ -15,6 +15,12 @@ export type BotmuxBridgeSession = {
   cwd?: string
   cliType?: string
   updatedAt?: number | string
+  /** Bot avatar URL (daemon enrichment); absent on older daemons. */
+  botAvatarUrl?: string
+  /** Repo top-level dir name of cwd, when it is a git repo. */
+  repoName?: string
+  /** Current branch of cwd; absent for detached HEAD / non-repo. */
+  gitBranch?: string
 }
 
 export type BotmuxBridgeListSessionsResult =
@@ -84,7 +90,7 @@ export async function botmuxBridgeGetStatus(client: RpcClient): Promise<BotmuxBr
 
 export async function botmuxBridgeListSessions(
   client: RpcClient,
-  scope?: { worktreePath?: string; orcaBotmuxHostId?: string }
+  scope?: { worktreePath?: string; botmuxHostId?: string }
 ): Promise<BotmuxBridgeListSessionsResult> {
   const response = await client.sendRequest('botmuxBridge.listSessions', scope ?? {})
   return unwrapResult<BotmuxBridgeListSessionsResult>(response)

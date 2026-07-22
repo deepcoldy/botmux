@@ -39,7 +39,7 @@ export function transferAgentPaneAuthorityAlias(args: {
   }
   const ptyId = args.ptyId?.trim() || aliasesByPhysicalPaneKey.get(physicalPaneKey)?.ptyId || null
   if (physicalPaneKey !== args.toPaneKey) {
-    // Why: the process keeps posting its original ORCA_PANE_KEY after detach;
+    // Why: the process keeps posting its original BOTMUX_PANE_KEY after detach;
     // one physical-to-owner alias keeps chained moves on the current surface.
     aliasesByPhysicalPaneKey.set(physicalPaneKey, {
       ownerPaneKey: args.toPaneKey,

@@ -1,4 +1,4 @@
-// Per-step copy for the review tile in the Explore OrcaBotmux modal. Mirrors
+// Per-step copy for the review tile in the Explore Botmux modal. Mirrors
 // agents-orchestration-steps.ts and workbench-steps.ts so the rail / body
 // code can render all three the same way.
 

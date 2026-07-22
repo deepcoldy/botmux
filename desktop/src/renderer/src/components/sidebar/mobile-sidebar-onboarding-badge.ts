@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { usePairedMobileDevices } from '../mobile/paired-mobile-devices'
 
-const DISMISS_KEY = 'orca_botmux.mobile.sidebar-onboarding-dismissed'
+const DISMISS_KEY = 'botmux.mobile.sidebar-onboarding-dismissed'
 
 function readDismissed(): boolean {
   try {
@@ -18,7 +18,7 @@ export function shouldShowMobileSidebarOnboardingBadge(
   return enabled && !dismissed
 }
 
-// Why: surface a one-time "Try it" badge on the OrcaBotmux Mobile sidebar entry
+// Why: surface a one-time "Try it" badge on the Botmux Mobile sidebar entry
 // for users who haven't paired any device. Clicking the row dismisses it
 // permanently, mirroring the once-and-done feel of an inbox unread dot.
 export function useMobileSidebarOnboardingBadge(enabled = true): {

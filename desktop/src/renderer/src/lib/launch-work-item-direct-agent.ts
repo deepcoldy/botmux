@@ -34,8 +34,8 @@ export function buildDirectWorkItemAgentStartupPlan(args: {
     | null
     | undefined
   launchPlatform: NodeJS.Platform
-  /** Why: SSH remotes deploy the CLI shim as plain `orca_botmux`, so the Linux-only
-   * `orca-botmux-ide` rename must not be applied for remote launches. */
+  /** Why: SSH remotes deploy the CLI shim as plain `botmux`, so the Linux-only
+   * `botmux-ide` rename must not be applied for remote launches. */
   isRemote?: boolean
 }): {
   startupPlan: AgentStartupPlan | null

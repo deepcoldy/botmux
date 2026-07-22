@@ -575,7 +575,7 @@ describe('keybindings', () => {
     expect(
       keybindingMatchesAction('tab.closeAll', linuxCloseAll, 'linux', undefined, {
         context: 'terminal',
-        terminalShortcutPolicy: 'orca-botmux-first'
+        terminalShortcutPolicy: 'botmux-first'
       })
     ).toBe(true)
     // Why: close-all is a workspace tab command, so terminal-first mode should
@@ -927,7 +927,7 @@ describe('keybindings', () => {
     })
   })
 
-  it('keeps OrcaBotmux-first terminal context backward compatible', () => {
+  it('keeps Botmux-first terminal context backward compatible', () => {
     const ctrlP = {
       key: 'p',
       code: 'KeyP',
@@ -941,7 +941,7 @@ describe('keybindings', () => {
     expect(
       keybindingMatchesAction('worktree.quickOpen', ctrlP, 'linux', undefined, {
         context: 'terminal',
-        terminalShortcutPolicy: 'orca-botmux-first'
+        terminalShortcutPolicy: 'botmux-first'
       })
     ).toBe(true)
     expect(
@@ -1645,7 +1645,7 @@ describe('digit-index shortcuts', () => {
         undefined,
         {
           context: 'terminal',
-          terminalShortcutPolicy: 'orca-botmux-first'
+          terminalShortcutPolicy: 'botmux-first'
         }
       )
     ).toBe(1)

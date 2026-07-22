@@ -4,12 +4,12 @@ import type {
   EphemeralVmRecipeDoctorCheck,
   EphemeralVmRecipeDoctorResult
 } from './ephemeral-vm-recipes'
-import type { OrcaVmRecipe } from './types'
+import type { BotmuxVmRecipe } from './types'
 
 export function doctorEphemeralVmRecipe(args: {
   repoPath: string
   recipeId: string
-  recipes: readonly OrcaVmRecipe[]
+  recipes: readonly BotmuxVmRecipe[]
   localExecutionSupported?: boolean
 }): EphemeralVmRecipeDoctorResult {
   const checks: EphemeralVmRecipeDoctorCheck[] = []
@@ -27,7 +27,7 @@ export function doctorEphemeralVmRecipe(args: {
       id: 'repo.path',
       status: 'fail',
       message: `Repo path does not exist or is not a directory: ${args.repoPath}`,
-      remediation: 'Pass the local repo that contains orca_botmux.yaml.'
+      remediation: 'Pass the local repo that contains botmux.yaml.'
     })
     return buildDoctorResult(args.recipeId, args.repoPath, checks)
   }
@@ -123,7 +123,7 @@ function checkCommandPath(
       id,
       status: 'warn',
       message: `Command is not a repo-relative path: ${executable}`,
-      remediation: 'Use a repo-relative script such as ./scripts/orca-botmux-vm/start.sh.'
+      remediation: 'Use a repo-relative script such as ./scripts/botmux-vm/start.sh.'
     }
   }
   const scriptPath = join(repoPath, normalize(executable))

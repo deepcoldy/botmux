@@ -163,7 +163,7 @@ describe('useAiVaultExecutionHostScope', () => {
 describe('buildAiVaultHostScopeOptions', () => {
   it('adds saved runtime hosts between active SSH and all hosts', () => {
     const runtimeHostOptions = buildRuntimeAiVaultHostScopeOptions([
-      { id: 'remote-server', name: 'VPS OrcaBotmux Server' }
+      { id: 'remote-server', name: 'VPS Botmux Server' }
     ])
 
     expect(
@@ -174,7 +174,7 @@ describe('buildAiVaultHostScopeOptions', () => {
     ).toEqual([
       { id: 'local', label: expect.any(String) },
       { id: 'ssh:dev-box', label: 'dev-box' },
-      { id: 'runtime:remote-server', label: 'VPS OrcaBotmux Server' },
+      { id: 'runtime:remote-server', label: 'VPS Botmux Server' },
       { id: 'all', label: 'All hosts' }
     ])
   })

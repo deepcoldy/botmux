@@ -91,15 +91,15 @@ describe('parseAgentStatusPayload', () => {
   // naive head-truncation would keep only lifecycle boilerplate in the 200-char
   // prompt field and drop the fallback label the UI needs before orchestration
   // metadata arrives.
-  it('compacts OrcaBotmux dispatch preambles so the task body survives 200-char truncation', () => {
+  it('compacts Botmux dispatch preambles so the task body survives 200-char truncation', () => {
     const longCliNoise = Array.from(
       { length: 50 },
-      (_, i) => `orca_botmux orchestration send --to term_parent --type heartbeat --phase step-${i}`
+      (_, i) => `botmux orchestration send --to term_parent --type heartbeat --phase step-${i}`
     ).join('\n')
     const result = parseAgentStatusPayload(
       JSON.stringify({
         state: 'working',
-        prompt: `You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.
+        prompt: `You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.
 Your task ID is: task_compact_1
 
 === CLI COMMANDS ===
@@ -112,7 +112,7 @@ Fix dispatch fallback preview for normalized status prompts`
     expect(result).not.toBeNull()
     expect(result!.prompt.length).toBeLessThanOrEqual(AGENT_STATUS_MAX_FIELD_LENGTH)
     expect(result!.prompt.includes('\n')).toBe(false)
-    expect(result!.prompt.startsWith('You are working inside OrcaBotmux, a multi-agent IDE.')).toBe(true)
+    expect(result!.prompt.startsWith('You are working inside Botmux, a multi-agent IDE.')).toBe(true)
     expect(result!.prompt).toContain('Your task ID is: task_compact_1')
     expect(result!.prompt).toContain('=== TASK ===')
     expect(result!.prompt).toContain('Fix dispatch fallback preview')
@@ -124,9 +124,9 @@ Fix dispatch fallback preview for normalized status prompts`
     const result = normalizeAgentStatusPayload({
       state: 'working',
       // Why: use CRLF to cover Windows hook payloads while proving repository
-      // commit text cannot impersonate OrcaBotmux's standalone task separator.
+      // commit text cannot impersonate Botmux's standalone task separator.
       prompt: [
-        'You are working inside OrcaBotmux, a multi-agent IDE. You are a dispatched worker.',
+        'You are working inside Botmux, a multi-agent IDE. You are a dispatched worker.',
         'Your task ID is: task_drift_marker',
         '',
         '--- BASE DRIFT ---',

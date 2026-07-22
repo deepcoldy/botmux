@@ -47,10 +47,10 @@ describe('buildAiVaultResumeCommand', () => {
         sessionId: 'session-1',
         cwd: '/repo/app',
         platform: 'darwin',
-        codexHome: '/Users/ada/Library/Application Support/OrcaBotmux/codex-runtime-home/home'
+        codexHome: '/Users/ada/Library/Application Support/Botmux/codex-runtime-home/home'
       })
     ).toBe(
-      "cd '/repo/app' && CODEX_HOME='/Users/ada/Library/Application Support/OrcaBotmux/codex-runtime-home/home' codex resume 'session-1'"
+      "cd '/repo/app' && CODEX_HOME='/Users/ada/Library/Application Support/Botmux/codex-runtime-home/home' codex resume 'session-1'"
     )
 
     expect(
@@ -59,10 +59,10 @@ describe('buildAiVaultResumeCommand', () => {
         sessionId: 'session-1',
         cwd: 'C:\\Users\\Ada Lovelace\\repo',
         platform: 'win32',
-        codexHome: 'C:\\Users\\Ada\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home'
+        codexHome: 'C:\\Users\\Ada\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home'
       })
     ).toBe(
-      'cmd /d /s /c "cd /d ""C:\\Users\\Ada Lovelace\\repo"" && set ""CODEX_HOME=C:\\Users\\Ada\\AppData\\Roaming\\OrcaBotmux\\codex-runtime-home\\home"" && codex resume ""session-1"""'
+      'cmd /d /s /c "cd /d ""C:\\Users\\Ada Lovelace\\repo"" && set ""CODEX_HOME=C:\\Users\\Ada\\AppData\\Roaming\\Botmux\\codex-runtime-home\\home"" && codex resume ""session-1"""'
     )
   })
 

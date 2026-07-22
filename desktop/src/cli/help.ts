@@ -3,45 +3,45 @@ import type { CommandSpec } from './args'
 import { findCommandSpec, isCommandGroup, supportsBrowserPageFlag } from './args'
 import { unknownCommandData } from './command-suggestion'
 
-const ROOT_HELP_TEXT = `orca_botmux
+const ROOT_HELP_TEXT = `botmux
 
-Usage: orca_botmux <command> [options]
+Usage: botmux <command> [options]
 
 Startup:
-  open                      Launch OrcaBotmux and wait for the runtime to be reachable
-  serve                     Start a headless OrcaBotmux runtime server
+  open                      Launch Botmux and wait for the runtime to be reachable
+  serve                     Start a headless Botmux runtime server
   status                    Show app/runtime/graph readiness
 
 Diagnostics:
-  diagnostics memory        Collect a memory snapshot for OrcaBotmux and managed terminals
+  diagnostics memory        Collect a memory snapshot for Botmux and managed terminals
 
 Agent Discovery:
   agent-context             Print the machine-readable command schema for agents
 
 Skills:
-  skills list               List version-matched skill guides bundled with this OrcaBotmux CLI
+  skills list               List version-matched skill guides bundled with this Botmux CLI
   skills get                Print a version-matched skill guide as Markdown
 
 Environments:
-  environment add           Save a remote OrcaBotmux runtime from a pairing code
-  environment list          List saved remote OrcaBotmux runtimes
-  environment show          Show one saved remote OrcaBotmux runtime
-  environment rm            Remove a saved remote OrcaBotmux runtime
+  environment add           Save a remote Botmux runtime from a pairing code
+  environment list          List saved remote Botmux runtimes
+  environment show          Show one saved remote Botmux runtime
+  environment rm            Remove a saved remote Botmux runtime
 
 Environment Recipes:
   vm recipe doctor          Validate a per-workspace environment recipe
 
 Automations:
-  automations list          List scheduled OrcaBotmux automations
-  automations show          Show one OrcaBotmux automation
-  automations create        Create a scheduled OrcaBotmux automation
-  automations edit          Edit an OrcaBotmux automation
-  automations remove        Remove an OrcaBotmux automation and its run history
-  automations run           Run an OrcaBotmux automation now
+  automations list          List scheduled Botmux automations
+  automations show          Show one Botmux automation
+  automations create        Create a scheduled Botmux automation
+  automations edit          Edit an Botmux automation
+  automations remove        Remove an Botmux automation and its run history
+  automations run           Run an Botmux automation now
   automations runs          List automation run history
 
 Projects:
-  project list              List durable projects known to OrcaBotmux
+  project list              List durable projects known to Botmux
   project setups            List project host setups
   project setup-existing-folder Make a project available on a host by importing an existing folder
   project setup-clone       Make a project available on a host by cloning a repository
@@ -50,28 +50,28 @@ Projects:
   project setup-delete      Remove a project host setup
 
 Repos:
-  repo list                 List repos registered in OrcaBotmux
-  repo add                  Add a project to OrcaBotmux by filesystem path
+  repo list                 List repos registered in Botmux
+  repo add                  Add a project to Botmux by filesystem path
   repo show                 Show one registered repo
   repo set-base-ref         Set the repo's default base ref for future worktrees
   repo search-refs          Search branch/tag refs within a repo
 
 Worktrees:
-  worktree list             List OrcaBotmux-managed worktrees
+  worktree list             List Botmux-managed worktrees
   worktree show             Show one worktree
-  worktree current          Show the OrcaBotmux-managed worktree for the current directory
-  worktree create           Create a new OrcaBotmux-managed worktree
-  worktree set              Update OrcaBotmux metadata for a worktree
-  worktree rm               Remove a worktree from OrcaBotmux and git
+  worktree current          Show the Botmux-managed worktree for the current directory
+  worktree create           Create a new Botmux-managed worktree
+  worktree set              Update Botmux metadata for a worktree
+  worktree rm               Remove a worktree from Botmux and git
   worktree ps               Show a compact orchestration summary across worktrees
 
 Files:
-  file open                 Open a workspace file in the OrcaBotmux editor
-  file diff                 Open a workspace file diff in the OrcaBotmux editor
+  file open                 Open a workspace file in the Botmux editor
+  file diff                 Open a workspace file diff in the Botmux editor
   file open-changed         Open all git-changed files for a workspace
 
 Terminals:
-  terminal list             List live OrcaBotmux-managed terminals
+  terminal list             List live Botmux-managed terminals
   terminal show             Show terminal metadata and preview
   terminal read             Read bounded terminal output
   terminal send             Send input to a live terminal
@@ -121,7 +121,7 @@ Linear:
   linear                    Read Linear ticket context for agents
 
 Mobile Emulator (iOS Simulator):
-  emulator list             List available/running emulators (OrcaBotmux-managed + raw serve-sim)
+  emulator list             List available/running emulators (Botmux-managed + raw serve-sim)
   emulator attach <device>  Attach/start helper and make active for the worktree
   emulator tap <x> <y>      Tap at normalized 0..1 coords (preferred for single taps)
   emulator type <text>      Type text (US ASCII only)
@@ -196,52 +196,52 @@ Browser Automation:
   exec                      Run any agent-browser command (--command "...")
 
 Common Commands:
-  orca_botmux open [--json]
-  orca-botmux-desktop serve [--port <port>] [--pairing-address <host>] [--mobile-pairing] [--no-pairing] [--project-root <path>] [--recipe-json] [--json]
-  orca_botmux status [--json]
-  orca_botmux diagnostics memory [--json]
-  orca_botmux agent-context [--json]
-  orca_botmux environment add --name <name> --pairing-code <code> [--json]
-  orca_botmux environment list [--json]
-  orca_botmux environment show --environment <selector> [--json]
-  orca_botmux environment rm --environment <selector> [--json]
-  orca_botmux worktree list [--repo <selector>] [--limit <n>] [--json]
-  orca_botmux worktree create --name <name> [--repo <selector>|--project <id> [--host <host-id>]|--project-host-setup <id>] [--agent <id>] [--prompt <text>] [--setup run|skip|inherit] [--base-branch <ref>] [--issue <number>] [--linear-issue <identifier-or-url>] [--comment <text>] [--parent-worktree <selector>] [--no-parent] [--run-hooks] [--activate] [--json]
-  orca_botmux worktree show --worktree <selector> [--json]
-  orca_botmux worktree current [--json]
-  orca_botmux worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--linear-issue <identifier-or-url|null>] [--comment <text>] [--workspace-status <id>] [--parent-worktree <selector>|--no-parent] [--json]
-  orca_botmux worktree rm --worktree <selector> [--force] [--run-hooks] [--json]
-  orca_botmux worktree ps [--limit <n>] [--json]
-  orca_botmux file open <path> [--worktree <selector>] [--json]
-  orca_botmux file diff <path> [--staged] [--worktree <selector>] [--json]
-  orca_botmux file open-changed [--mode edit|diff|both] [--worktree <selector>] [--json]
-  orca_botmux terminal list [--worktree <selector>] [--limit <n>] [--json]
-  orca_botmux terminal show [--terminal <handle>] [--json]
-  orca_botmux terminal read [--terminal <handle>] [--cursor <n>] [--limit <n>] [--json]
-  orca_botmux terminal send [--terminal <handle>] [--text <text>] [--enter] [--interrupt] [--json]
-  orca_botmux terminal wait [--terminal <handle>] --for exit|tui-idle [--timeout-ms <ms>] [--json]
-  orca_botmux terminal stop --worktree <selector> [--json]
-  orca_botmux terminal create [--worktree <selector>] [--title <name>] [--command <text>] [--focus] [--json]
-  orca_botmux terminal split [--terminal <handle>] [--direction horizontal|vertical] [--json]
-  orca_botmux terminal switch [--terminal <handle>] [--json]
-  orca_botmux terminal close [--terminal <handle>] [--tab] [--json]
-  orca_botmux project list [--json]
-  orca_botmux project setups [--project <id>] [--host <host-id>] [--json]
-  orca_botmux project setup-existing-folder --project <id> --host <host-id> --path <path> [--kind git|folder] [--display-name <name>] [--json]
-  orca_botmux project setup-clone --project <id> --host <host-id> --url <clone-url> --destination <path> [--display-name <name>] [--json]
-  orca_botmux project setup-create --project <id> --host <host-id> [--setup-id <id>] [--path <path>] [--kind git|folder] [--display-name <name>] [--worktree-base-path <path>] [--git-username <name>] [--state ready|not-set-up|setting-up|error|unsupported] [--method imported-existing-folder|cloned|provisioned] [--json]
-  orca_botmux project setup-update --setup <setup-id> [--display-name <name>] [--path <path>] [--worktree-base-path <path>] [--git-username <name>] [--kind git|folder] [--state ready|not-set-up|setting-up|error|unsupported] [--method legacy-repo|imported-existing-folder|cloned|provisioned] [--json]
-  orca_botmux project setup-delete --setup <setup-id> [--json]
-  orca_botmux repo list [--json]
-  orca_botmux repo add --path <path> [--json]
-  orca_botmux repo show --repo <selector> [--json]
-  orca_botmux repo set-base-ref --repo <selector> --ref <ref> [--json]
-  orca_botmux repo search-refs --repo <selector> --query <text> [--limit <n>] [--json]
+  botmux open [--json]
+  botmux-desktop serve [--port <port>] [--pairing-address <host>] [--mobile-pairing] [--no-pairing] [--project-root <path>] [--recipe-json] [--json]
+  botmux status [--json]
+  botmux diagnostics memory [--json]
+  botmux agent-context [--json]
+  botmux environment add --name <name> --pairing-code <code> [--json]
+  botmux environment list [--json]
+  botmux environment show --environment <selector> [--json]
+  botmux environment rm --environment <selector> [--json]
+  botmux worktree list [--repo <selector>] [--limit <n>] [--json]
+  botmux worktree create --name <name> [--repo <selector>|--project <id> [--host <host-id>]|--project-host-setup <id>] [--agent <id>] [--prompt <text>] [--setup run|skip|inherit] [--base-branch <ref>] [--issue <number>] [--linear-issue <identifier-or-url>] [--comment <text>] [--parent-worktree <selector>] [--no-parent] [--run-hooks] [--activate] [--json]
+  botmux worktree show --worktree <selector> [--json]
+  botmux worktree current [--json]
+  botmux worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--linear-issue <identifier-or-url|null>] [--comment <text>] [--workspace-status <id>] [--parent-worktree <selector>|--no-parent] [--json]
+  botmux worktree rm --worktree <selector> [--force] [--run-hooks] [--json]
+  botmux worktree ps [--limit <n>] [--json]
+  botmux file open <path> [--worktree <selector>] [--json]
+  botmux file diff <path> [--staged] [--worktree <selector>] [--json]
+  botmux file open-changed [--mode edit|diff|both] [--worktree <selector>] [--json]
+  botmux terminal list [--worktree <selector>] [--limit <n>] [--json]
+  botmux terminal show [--terminal <handle>] [--json]
+  botmux terminal read [--terminal <handle>] [--cursor <n>] [--limit <n>] [--json]
+  botmux terminal send [--terminal <handle>] [--text <text>] [--enter] [--interrupt] [--json]
+  botmux terminal wait [--terminal <handle>] --for exit|tui-idle [--timeout-ms <ms>] [--json]
+  botmux terminal stop --worktree <selector> [--json]
+  botmux terminal create [--worktree <selector>] [--title <name>] [--command <text>] [--focus] [--json]
+  botmux terminal split [--terminal <handle>] [--direction horizontal|vertical] [--json]
+  botmux terminal switch [--terminal <handle>] [--json]
+  botmux terminal close [--terminal <handle>] [--tab] [--json]
+  botmux project list [--json]
+  botmux project setups [--project <id>] [--host <host-id>] [--json]
+  botmux project setup-existing-folder --project <id> --host <host-id> --path <path> [--kind git|folder] [--display-name <name>] [--json]
+  botmux project setup-clone --project <id> --host <host-id> --url <clone-url> --destination <path> [--display-name <name>] [--json]
+  botmux project setup-create --project <id> --host <host-id> [--setup-id <id>] [--path <path>] [--kind git|folder] [--display-name <name>] [--worktree-base-path <path>] [--git-username <name>] [--state ready|not-set-up|setting-up|error|unsupported] [--method imported-existing-folder|cloned|provisioned] [--json]
+  botmux project setup-update --setup <setup-id> [--display-name <name>] [--path <path>] [--worktree-base-path <path>] [--git-username <name>] [--kind git|folder] [--state ready|not-set-up|setting-up|error|unsupported] [--method legacy-repo|imported-existing-folder|cloned|provisioned] [--json]
+  botmux project setup-delete --setup <setup-id> [--json]
+  botmux repo list [--json]
+  botmux repo add --path <path> [--json]
+  botmux repo show --repo <selector> [--json]
+  botmux repo set-base-ref --repo <selector> --ref <ref> [--json]
+  botmux repo search-refs --repo <selector> --query <text> [--limit <n>] [--json]
 
 Selectors:
   --repo <selector>         Registered repo selector such as id:<id>, name:<name>, or path:<path>
   --worktree <selector>     Worktree selector such as id:<repo-id>::<path>, name:<displayName>, branch:<branch>, issue:<number>, path:<path>, or active/current
-  --terminal <handle>       Runtime-issued terminal handle returned by \`orca_botmux terminal list --json\`
+  --terminal <handle>       Runtime-issued terminal handle returned by \`botmux terminal list --json\`
   --parent-worktree <selector> Parent worktree selector such as id:<repo-id>::<path>, branch:<branch>, issue:<number>, path:<path>, or active/current
   --no-parent               Force no parent lineage for unrelated worktree creation/update
 
@@ -256,31 +256,31 @@ Wait Options:
 
 Output Options:
   --json                    Emit machine-readable JSON instead of human text
-  --pairing-code <code>      Connect to a remote OrcaBotmux runtime using an orca_botmux://pair?... code
+  --pairing-code <code>      Connect to a remote Botmux runtime using an botmux://pair?... code
   --environment <selector>   Connect using a saved environment id or name
   --help                    Show this help message
 
 Behavior:
-  Most commands require a running OrcaBotmux runtime. If OrcaBotmux is not open yet, run \`orca_botmux open\` first.
-  Remote runtime access can also be supplied with ORCA_PAIRING_CODE or ORCA_ENVIRONMENT.
+  Most commands require a running Botmux runtime. If Botmux is not open yet, run \`botmux open\` first.
+  Remote runtime access can also be supplied with BOTMUX_PAIRING_CODE or BOTMUX_ENVIRONMENT.
   Use selectors for discovery and handles for repeated live terminal operations.
 
 Agent Sessions And Worktrees:
   \`worktree create --agent\` creates a new checkout with an agent.
   To start a fresh agent in the current worktree, use:
-    orca_botmux terminal create --worktree active --command "codex"
+    botmux terminal create --worktree active --command "codex"
 
 Browser Workflow:
-  1. Create or navigate:  orca_botmux tab create --url https://example.com
-                          orca_botmux goto --url https://example.com
-  2. Inspect the page:    orca_botmux snapshot
+  1. Create or navigate:  botmux tab create --url https://example.com
+                          botmux goto --url https://example.com
+  2. Inspect the page:    botmux snapshot
      (Returns an accessibility tree with element refs like e1, e2, e3)
-     For concurrent workflows, prefer: orca_botmux tab list --json
+     For concurrent workflows, prefer: botmux tab list --json
      then reuse tabs[].browserPageId with --page <id> on later commands.
-  3. Interact:            orca_botmux click --element e2
-                          orca_botmux fill --element e5 --value "search query"
-                          orca_botmux keypress --key Enter
-  4. Re-inspect:          orca_botmux snapshot
+  3. Interact:            botmux click --element e2
+                          botmux fill --element e5 --value "search query"
+                          botmux keypress --key Enter
+  4. Re-inspect:          botmux snapshot
      (Element refs change after navigation — always re-snapshot before interacting)
 
 Browser Options:
@@ -304,36 +304,36 @@ Browser Options:
   --worktree <selector>     Scope commands to a specific worktree's browser tabs
 
 Examples:
-  $ orca_botmux open
-  $ orca_botmux status --json
-  $ orca_botmux diagnostics memory --json
-  $ orca_botmux repo list
-  $ orca_botmux worktree create --name agent-task --agent codex --prompt "hi"
-  $ orca_botmux worktree create --repo name:orca_botmux --name cli-test-1 --issue 273
-  $ orca_botmux worktree create --repo name:orca_botmux --name linear-task --linear-issue https://linear.app/stably/issue/STA-335/test-issue
-  $ orca_botmux worktree create --name linear-task --linear-issue STA-335
-  $ orca_botmux worktree show --worktree branch:Jinwoo-H/cli
-  $ orca_botmux worktree current
-  $ orca_botmux worktree set --worktree active --comment "waiting on review"
-  $ orca_botmux worktree set --worktree active --linear-issue null
-  $ orca_botmux worktree ps --limit 10
-  $ orca_botmux file open-changed --mode diff
-  $ orca_botmux file open src/App.tsx
-  $ orca_botmux terminal create --worktree active --command "codex"
-  $ orca_botmux terminal list --worktree path:/Users/me/orca_botmux/workspaces/orca_botmux/cli-test-1 --json
-  $ orca_botmux terminal send --terminal term_123 --text "hi" --enter
-  $ orca_botmux terminal wait --terminal term_123 --for exit --timeout-ms 60000 --json
-  $ orca_botmux tab current --json
-  $ orca_botmux tab show --page page_123 --json
-  $ orca_botmux tab create --url https://example.com --profile work
-  $ orca_botmux tab profile clone --page page_123 --profile work --json
-  $ orca_botmux snapshot
-  $ orca_botmux click --element e3
-  $ orca_botmux fill --element e5 --value "hello"
-  $ orca_botmux goto --url https://example.com/login
-  $ orca_botmux keypress --key Enter
-  $ orca_botmux eval --expression "document.title"
-  $ orca_botmux tab list --json`
+  $ botmux open
+  $ botmux status --json
+  $ botmux diagnostics memory --json
+  $ botmux repo list
+  $ botmux worktree create --name agent-task --agent codex --prompt "hi"
+  $ botmux worktree create --repo name:botmux --name cli-test-1 --issue 273
+  $ botmux worktree create --repo name:botmux --name linear-task --linear-issue https://linear.app/stably/issue/STA-335/test-issue
+  $ botmux worktree create --name linear-task --linear-issue STA-335
+  $ botmux worktree show --worktree branch:Jinwoo-H/cli
+  $ botmux worktree current
+  $ botmux worktree set --worktree active --comment "waiting on review"
+  $ botmux worktree set --worktree active --linear-issue null
+  $ botmux worktree ps --limit 10
+  $ botmux file open-changed --mode diff
+  $ botmux file open src/App.tsx
+  $ botmux terminal create --worktree active --command "codex"
+  $ botmux terminal list --worktree path:/Users/me/botmux/workspaces/botmux/cli-test-1 --json
+  $ botmux terminal send --terminal term_123 --text "hi" --enter
+  $ botmux terminal wait --terminal term_123 --for exit --timeout-ms 60000 --json
+  $ botmux tab current --json
+  $ botmux tab show --page page_123 --json
+  $ botmux tab create --url https://example.com --profile work
+  $ botmux tab profile clone --page page_123 --profile work --json
+  $ botmux snapshot
+  $ botmux click --element e3
+  $ botmux fill --element e5 --value "hello"
+  $ botmux goto --url https://example.com/login
+  $ botmux keypress --key Enter
+  $ botmux eval --expression "document.title"
+  $ botmux tab list --json`
 
 export function printHelp(specs: CommandSpec[], commandPath: string[] = []): void {
   const exactSpec = findCommandSpec(specs, commandPath)
@@ -357,7 +357,7 @@ export function printHelp(specs: CommandSpec[], commandPath: string[] = []): voi
 }
 
 export function formatCommandHelp(spec: CommandSpec): string {
-  const lines = [`orca_botmux ${spec.path.join(' ')}`, '', `Usage: ${spec.usage}`, '', spec.summary]
+  const lines = [`botmux ${spec.path.join(' ')}`, '', `Usage: ${spec.usage}`, '', spec.summary]
   const displayedFlags =
     spec.argumentMode === 'passthrough'
       ? []
@@ -391,11 +391,11 @@ export function formatCommandHelp(spec: CommandSpec): string {
 
 export function formatGroupHelp(specs: CommandSpec[], group: string): string {
   const groupSpecs = specs.filter((spec) => spec.path[0] === group)
-  const lines = [`orca_botmux ${group}`, '', `Usage: orca_botmux ${group} <command> [options]`, '', 'Commands:']
+  const lines = [`botmux ${group}`, '', `Usage: botmux ${group} <command> [options]`, '', 'Commands:']
   for (const spec of groupSpecs) {
     lines.push(`  ${spec.path.slice(1).join(' ').padEnd(18)} ${spec.summary}`)
   }
-  lines.push('', `Run \`orca_botmux ${group} <command> --help\` for command-specific usage.`)
+  lines.push('', `Run \`botmux ${group} <command> --help\` for command-specific usage.`)
   return lines.join('\n')
 }
 
@@ -475,19 +475,19 @@ export function formatFlagHelp(flag: string): string {
     agent: '--agent <id>          Launch a known TUI agent in the first terminal',
     'base-branch': '--base-branch <ref>    Base branch/ref to create the worktree from',
     command: '--command <text>       Command to run in the terminal on startup',
-    comment: '--comment <text>       Comment stored in OrcaBotmux metadata',
+    comment: '--comment <text>       Comment stored in Botmux metadata',
     cursor: '--cursor <n>           Line cursor from a previous read (returns only new output)',
     action: '--action <name>       Secondary accessibility action name',
-    activate: '--activate             Reveal the new worktree in the OrcaBotmux app',
+    activate: '--activate             Reveal the new worktree in the Botmux app',
     app: '--app <app>            App name, bundle ID, or pid:N',
     direction:
       '--direction <dir>      Direction: up|down|left|right for scroll, horizontal|vertical for split',
-    'display-name': '--display-name <name>  Override the OrcaBotmux display name',
+    'display-name': '--display-name <name>  Override the Botmux display name',
     'element-index': '--element-index <n>   Element index from get-app-state',
     title: '--title <text>         Custom title for the terminal tab (omit to reset)',
     enter: '--enter                Append Enter after sending text',
     force: '--force                Force worktree removal when supported',
-    focus: '--focus                Reveal the created terminal session in OrcaBotmux',
+    focus: '--focus                Reveal the created terminal session in Botmux',
     for: '--for exit|tui-idle    Wait condition to satisfy',
     'from-element-index': '--from-element-index <n> Source element index from get-app-state',
     'from-x': '--from-x <x>           Source window-local x coordinate',
@@ -563,14 +563,14 @@ export function formatFlagHelp(flag: string): string {
     expression: '--expression <js>     JavaScript expression to evaluate',
     amount: '--amount <pixels>      Scroll distance in pixels',
     index: '--index <n>            Tab index to switch to',
-    page: '--page <id>            Stable browser page id from `orca_botmux tab list --json`',
+    page: '--page <id>            Stable browser page id from `botmux tab list --json`',
     profile: '--profile <id>        Browser profile id',
     'show-profile': '--show-profile        Include tab profile in text output',
     format: '--format <png|jpeg>    Screenshot image format'
   }
 
   if (flag === 'current') {
-    return '--current              Use the current OrcaBotmux worktree linked Linear issue'
+    return '--current              Use the current Botmux worktree linked Linear issue'
   }
   if (flag === 'comments') {
     return '--comments             Include threaded Linear comments'

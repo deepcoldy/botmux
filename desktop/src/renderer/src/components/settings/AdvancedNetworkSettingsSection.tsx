@@ -206,7 +206,7 @@ export function AdvancedNetworkSettingsSection({
       )}
       description={translate(
         'auto.components.settings.AdvancedNetworkSettingsSection.823e0f15b1',
-        'Proxy URL for OrcaBotmux network requests and local terminal children.'
+        'Proxy URL for Botmux network requests and local terminal children.'
       )}
       keywords={[
         'proxy',

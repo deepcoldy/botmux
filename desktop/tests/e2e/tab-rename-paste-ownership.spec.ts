@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   getActiveTabId,
   getActiveWorktreeId,
@@ -47,37 +47,37 @@ function tabLocatorByTitle(page: Page, title: string): ReturnType<Page['locator'
 test.describe('tab rename paste ownership', () => {
   test('keyboard paste into rename textbox does not also write to the active terminal', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await installTerminalPtyWriteSpy(electronApp)
 
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
-    const originalTitle = await getActiveTabTitle(orcaBotmuxPage, worktreeId)
-    const renameInput = orcaBotmuxPage.getByRole('textbox', {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
+    const originalTitle = await getActiveTabTitle(botmuxPage, worktreeId)
+    const renameInput = botmuxPage.getByRole('textbox', {
       name: `Rename tab ${originalTitle}`,
       exact: true
     })
 
-    await tabLocatorByTitle(orcaBotmuxPage, originalTitle).dblclick()
+    await tabLocatorByTitle(botmuxPage, originalTitle).dblclick()
     await expect(renameInput).toBeVisible()
     await renameInput.fill('')
 
-    const payload = `ORCA_E2E_TEXTBOX_PASTE_${randomUUID()}`
-    await orcaBotmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
+    const payload = `BOTMUX_E2E_TEXTBOX_PASTE_${randomUUID()}`
+    await botmuxPage.evaluate((text) => window.api.ui.writeClipboardText(text), payload)
     await clearTerminalPtyWriteLog(electronApp)
     await expect(renameInput).toBeFocused()
 
-    await orcaBotmuxPage.keyboard.press(editablePasteChord())
+    await botmuxPage.keyboard.press(editablePasteChord())
 
     await expect(renameInput).toHaveValue(payload)
     expect(countOccurrences(await renameInput.inputValue(), payload)).toBe(1)
     expect((await readTerminalPtyWrites(electronApp)).join('')).not.toContain(payload)
 
     await renameInput.press('Escape')
-    await expect(tabLocatorByTitle(orcaBotmuxPage, originalTitle)).toBeVisible()
+    await expect(tabLocatorByTitle(botmuxPage, originalTitle)).toBeVisible()
   })
 })

@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveTabId,
@@ -36,10 +36,10 @@ import { parkHiddenTabBehindDecoy } from './helpers/terminal-hidden-parking'
 // the hidden-but-mounted scenario needs the shell exit to land well inside the
 // hot-retain window — 500ms let slow shell teardown race past parking and turn
 // that scenario into the exits-while-parked one.
-const PARKING_DELAY_MS = Number(process.env.ORCA_E2E_TERMINAL_PARKING_DELAY_MS) || 2_000
+const PARKING_DELAY_MS = Number(process.env.BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS) || 2_000
 
 test.use({
-  orcaAppExtraEnv: { ORCA_E2E_TERMINAL_PARKING_DELAY_MS: String(PARKING_DELAY_MS) }
+  botmuxAppExtraEnv: { BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS: String(PARKING_DELAY_MS) }
 })
 
 type ParkingDebugWindow = Window & {
@@ -250,15 +250,15 @@ async function setUpSplitTab(page: Page): Promise<SplitTabSetup> {
 }
 
 test.describe('terminal pane close vs hidden/park lifecycle keeps layout consistent', () => {
-  test('control: close while visible', async ({ orcaBotmuxPage }) => {
-    const { tabId } = await setUpSplitTab(orcaBotmuxPage)
-    await closeLastPaneOnTab(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'close-visible')
+  test('control: close while visible', async ({ botmuxPage }) => {
+    const { tabId } = await setUpSplitTab(botmuxPage)
+    await closeLastPaneOnTab(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'close-visible')
   })
 
-  test('close and hide the tab in the same tick', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId } = await setUpSplitTab(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(
+  test('close and hide the tab in the same tick', async ({ botmuxPage }) => {
+    const { worktreeId, tabId } = await setUpSplitTab(botmuxPage)
+    await botmuxPage.evaluate(
       ({ tabId, worktreeId }) => {
         const store = window.__store
         const manager = window.__paneManagers?.get(tabId)
@@ -278,81 +278,81 @@ test.describe('terminal pane close vs hidden/park lifecycle keeps layout consist
       },
       { tabId, worktreeId }
     )
-    await orcaBotmuxPage.waitForTimeout(PARKING_DELAY_MS * 3)
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'close-then-hide-same-tick')
+    await botmuxPage.waitForTimeout(PARKING_DELAY_MS * 3)
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'close-then-hide-same-tick')
   })
 
-  test('close while hidden but still mounted (hot-retain window)', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId } = await setUpSplitTab(orcaBotmuxPage)
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await closeLastPaneOnTab(orcaBotmuxPage, tabId)
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabId, {
+  test('close while hidden but still mounted (hot-retain window)', async ({ botmuxPage }) => {
+    const { worktreeId, tabId } = await setUpSplitTab(botmuxPage)
+    await createActiveTerminalTab(botmuxPage, worktreeId)
+    await closeLastPaneOnTab(botmuxPage, tabId)
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabId, {
       parkDelayMs: PARKING_DELAY_MS
     })
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'close-while-hidden-mounted')
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'close-while-hidden-mounted')
   })
 
-  test('close immediately after reveal remount, before panes settle', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId } = await setUpSplitTab(orcaBotmuxPage)
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabId, {
+  test('close immediately after reveal remount, before panes settle', async ({ botmuxPage }) => {
+    const { worktreeId, tabId } = await setUpSplitTab(botmuxPage)
+    await createActiveTerminalTab(botmuxPage, worktreeId)
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabId, {
       parkDelayMs: PARKING_DELAY_MS
     })
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
     // Close as soon as the manager exists — panes may still be attaching.
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       const manager = window.__paneManagers?.get(tabId)
       const target = manager?.getPanes().at(-1)
       if (manager && target) {
         manager.closePane(target.id)
       }
     }, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'close-mid-reveal')
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'close-mid-reveal')
   })
 
-  test('clean visible close survives a later park/reveal cycle', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId } = await setUpSplitTab(orcaBotmuxPage)
-    await closeLastPaneOnTab(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'pre-park close')
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabId, {
+  test('clean visible close survives a later park/reveal cycle', async ({ botmuxPage }) => {
+    const { worktreeId, tabId } = await setUpSplitTab(botmuxPage)
+    await closeLastPaneOnTab(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'pre-park close')
+    await createActiveTerminalTab(botmuxPage, worktreeId)
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabId, {
       parkDelayMs: PARKING_DELAY_MS
     })
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'post-park-reveal')
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'post-park-reveal')
   })
 
-  test('split pane shell exits while hidden but still mounted', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId, splitPtyId } = await setUpSplitTab(orcaBotmuxPage)
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
+  test('split pane shell exits while hidden but still mounted', async ({ botmuxPage }) => {
+    const { worktreeId, tabId, splitPtyId } = await setUpSplitTab(botmuxPage)
+    await createActiveTerminalTab(botmuxPage, worktreeId)
     // The setup-script analog: the split's shell ends on its own while the
     // tab is hidden-but-mounted.
-    await sendToTerminal(orcaBotmuxPage, splitPtyId, 'exit\r')
-    await orcaBotmuxPage.waitForTimeout(PARKING_DELAY_MS / 2)
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'shell-exit-while-hidden-mounted', splitPtyId)
+    await sendToTerminal(botmuxPage, splitPtyId, 'exit\r')
+    await botmuxPage.waitForTimeout(PARKING_DELAY_MS / 2)
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'shell-exit-while-hidden-mounted', splitPtyId)
   })
 
-  test('split pane shell exits while the tab is parked', async ({ orcaBotmuxPage }) => {
-    const { worktreeId, tabId, splitPtyId } = await setUpSplitTab(orcaBotmuxPage)
-    await createActiveTerminalTab(orcaBotmuxPage, worktreeId)
-    await parkHiddenTabBehindDecoy(orcaBotmuxPage, worktreeId, tabId, {
+  test('split pane shell exits while the tab is parked', async ({ botmuxPage }) => {
+    const { worktreeId, tabId, splitPtyId } = await setUpSplitTab(botmuxPage)
+    await createActiveTerminalTab(botmuxPage, worktreeId)
+    await parkHiddenTabBehindDecoy(botmuxPage, worktreeId, tabId, {
       parkDelayMs: PARKING_DELAY_MS
     })
-    await sendToTerminal(orcaBotmuxPage, splitPtyId, 'exit\r')
-    await orcaBotmuxPage.waitForTimeout(PARKING_DELAY_MS)
-    await activateTerminalTab(orcaBotmuxPage, tabId)
-    await waitForTabRemounted(orcaBotmuxPage, tabId)
+    await sendToTerminal(botmuxPage, splitPtyId, 'exit\r')
+    await botmuxPage.waitForTimeout(PARKING_DELAY_MS)
+    await activateTerminalTab(botmuxPage, tabId)
+    await waitForTabRemounted(botmuxPage, tabId)
     // Why: the parked exit is deliberately deferred (no PaneManager to promote
     // siblings) — the reveal remount owns the per-leaf teardown. This asserts
     // that ownership actually resolves instead of leaving a ghost pane.
-    await expectLayoutConsistent(orcaBotmuxPage, tabId, 1, 'shell-exit-while-parked', splitPtyId)
+    await expectLayoutConsistent(botmuxPage, tabId, 1, 'shell-exit-while-parked', splitPtyId)
   })
 })

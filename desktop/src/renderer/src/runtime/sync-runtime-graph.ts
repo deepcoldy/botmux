@@ -619,7 +619,7 @@ async function syncRuntimeGraph(): Promise<void> {
   // inactive, so they never mount a TerminalPane and never enter `registeredTabs`.
   // Without this pass their leaf+ptyId is never published, so the runtime treats
   // the live agent PTY as orphaned (surfaced as a synthetic `pty:<id>` terminal)
-  // and `orca_botmux terminal list` / session-reuse can't see the real tab. Publish them
+  // and `botmux terminal list` / session-reuse can't see the real tab. Publish them
   // from the persisted layout, gated on a live eager buffer so we only adopt a
   // still-running unmounted PTY (never a stale saved ptyId).
   for (const [worktreeId, tabs] of Object.entries(state.tabsByWorktree)) {

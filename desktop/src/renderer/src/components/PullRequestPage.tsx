@@ -7073,7 +7073,7 @@ export default function PullRequestPage({
             </span>
           </h1>
           <div className="flex shrink-0 items-center gap-2">
-            {/* Why: OrcaBotmux's signature affordance — keep this primary so it stands out
+            {/* Why: Botmux's signature affordance — keep this primary so it stands out
                 against GitHub's familiar surface. */}
             <DropdownMenu modal={false}>
               <ButtonGroup>

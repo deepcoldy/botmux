@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { isLazyChunkLoadError, loadLazyWithRetry } from './lazy-with-retry'
 
-// Regression guard for crash report e08749bb-777c-446e-b407-5d1f154b6173 (OrcaBotmux 1.4.104).
+// Regression guard for crash report e08749bb-777c-446e-b407-5d1f154b6173 (Botmux 1.4.104).
 // boundary_id=right-sidebar, surface=right-sidebar, error_name=SyntaxError,
 // error_message="Unexpected token ')'". component_stack: Lazy -> Suspense ->
 // RightSidebarPanelContent -> ... -> RecoverableRenderErrorBoundary.
@@ -14,7 +14,7 @@ import { isLazyChunkLoadError, loadLazyWithRetry } from './lazy-with-retry'
 //
 // So the corrupt-chunk recovery IS wired in. The crash was a BLIND SPOT in that
 // recovery: after the single guarded window.location.reload() has already fired
-// once this session (sessionStorage 'orca_botmux:lazy-chunk-reload-attempted' === '1'),
+// once this session (sessionStorage 'botmux:lazy-chunk-reload-attempted' === '1'),
 // loadLazyWithRetry only converted the failure into a recoverable
 // LazyChunkLoadError when isKnownDynamicImportFailure(error) was true. A corrupt /
 // truncated chunk that parses as invalid JS rejects import() with a native
@@ -24,7 +24,7 @@ import { isLazyChunkLoadError, loadLazyWithRetry } from './lazy-with-retry'
 // reported crash. The fix treats a parse-time SyntaxError as a recoverable
 // corrupt-chunk failure; these tests pin that behavior.
 
-const RELOAD_GUARD_KEY = 'orca_botmux:lazy-chunk-reload-attempted'
+const RELOAD_GUARD_KEY = 'botmux:lazy-chunk-reload-attempted'
 
 // The exact error the renderer received from the corrupt right-sidebar chunk.
 const reportedCrashError = (): SyntaxError => new SyntaxError("Unexpected token ')'")

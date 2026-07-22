@@ -179,7 +179,7 @@ export function getGitRepoRoot(path: string): string {
 export function normalizeGitRepoRootForInputPath(inputPath: string, rootPath: string): string {
   const inputWsl = parseWslUncPath(inputPath)
   if (inputWsl && rootPath.startsWith('/')) {
-    // Why: WSL git reports Linux-native roots; OrcaBotmux must persist the UNC path so
+    // Why: WSL git reports Linux-native roots; Botmux must persist the UNC path so
     // later local git calls keep routing through the WSL-aware runner.
     return toWindowsWslPath(rootPath, inputWsl.distro)
   }

@@ -32,7 +32,7 @@ export const createClaudeUsageSlice: StateCreator<AppState, [], [], ClaudeUsageS
   set,
   get
 ) => ({
-  claudeUsageScope: 'orca_botmux',
+  claudeUsageScope: 'botmux',
   claudeUsageRange: '30d',
   claudeUsageScanState: null,
   claudeUsageSummary: null,

@@ -18,3 +18,6 @@ coverage/
 *.key
 *.mobileprovision
 *.orig.*
+
+# Local simulator/debug screenshots
+.pair-sim-shot.png

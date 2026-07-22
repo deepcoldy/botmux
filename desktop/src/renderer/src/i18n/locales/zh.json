@@ -1,9 +1,9 @@
 {
   "app": {
     "recoverableError": {
-      "rootTitle": "OrcaBotmux 遇到渲染器错误。",
-      "rootDescription": "应用 shell 无法完成渲染。重试以重新挂载，如果错误仍然存在，请重新启动 OrcaBotmux。",
-      "webTitle": "OrcaBotmux Web 遇到渲染器错误。",
+      "rootTitle": "Botmux 遇到渲染器错误。",
+      "rootDescription": "应用 shell 无法完成渲染。重试以重新挂载，如果错误仍然存在，请重新启动 Botmux。",
+      "webTitle": "Botmux Web 遇到渲染器错误。",
       "webDescription": "重试 Web 客户端或重新连接到配对的运行时。"
     }
   },
@@ -11,7 +11,7 @@
     "appearance": {
       "language": {
         "title": "语言",
-        "description": "选择 OrcaBotmux 界面使用的语言。",
+        "description": "选择 Botmux 界面使用的语言。",
         "system": "系统",
         "english": "English",
         "chinese": "中文（简体）",
@@ -26,7 +26,7 @@
         "opencodeGoToggleDescription": "显示当前工作区的 OpenCode Go Token 与费用消耗情况。",
         "kimiToggleDescription": "显示当前工作区的 Kimi 订阅使用情况。",
         "minimaxToggleDescription": "显示当前工作区的 MiniMax 订阅使用情况。",
-        "sshToggleDescription": "当有可用的 SSH 和远程 OrcaBotmux 主机时显示它们。",
+        "sshToggleDescription": "当有可用的 SSH 和远程 Botmux 主机时显示它们。",
         "resourceUsageToggleDescription": "显示资源管理器。点击可查看 CPU、内存、会话、守护进程控制和工作区磁盘扫描。",
         "portsToggleDescription": "显示实时工作区端口。单击可查看工作区范围的端口和外部监听器。",
         "antigravityToggleDescription": "显示当前工作区的 Antigravity 订阅使用量。",
@@ -34,15 +34,15 @@
       },
       "menuBarIcon": {
         "title": "显示菜单栏图标",
-        "description": "在 macOS 菜单栏中保留 OrcaBotmux 快捷方式和活动指示器。"
+        "description": "在 macOS 菜单栏中保留 Botmux 快捷方式和活动指示器。"
       }
     },
-    "orcaBotmuxBridge": {
+    "botmuxBridge": {
       "navTitle": "Botmux 会话",
-      "navDescription": "连接本地或 SSH 远程的 orca_botmux daemon/dashboard（飞书会话）。",
-      "searchLocal": "本地 orca_botmux dashboard",
-      "searchSsh": "SSH 远程 orca_botmux",
-      "searchMulti": "多主机 orca_botmux",
+      "navDescription": "连接本地或 SSH 远程的 botmux daemon/dashboard（飞书会话）。",
+      "searchLocal": "本地 botmux dashboard",
+      "searchSsh": "SSH 远程 botmux",
+      "searchMulti": "多主机 botmux",
       "searchSessions": "Botmux 会话",
       "sidebarTitle": "Botmux 连接",
       "sidebarHint": "连接本机/SSH 上的 Botmux。选中普通 worktree 时，这里会扫描并只显示该目录下的会话。",
@@ -71,7 +71,7 @@
       "connectLocal": "连接本地",
       "local": "本地",
       "platform": "平台",
-      "platformTitle": "使用 ~/.orca_botmux/platform.json 中的机器 URL",
+      "platformTitle": "使用 ~/.botmux/platform.json 中的机器 URL",
       "addSsh": "添加 SSH",
       "addSshFromSettings": "添加 SSH（来自 设置 → SSH）",
       "selectHost": "— 选择主机 —",
@@ -100,8 +100,8 @@
       "openedWeb": "已在浏览器标签打开 Web 终端",
       "openedExternal": "已在系统浏览器打开",
       "openedTerminal": "已打开终端",
-      "ipcMissing": "orcaBotmuxBridge IPC 不可用 — 请重新构建 desktop preload。",
-      "ipcMissingShort": "orcaBotmuxBridge 不可用 — 请重新构建 desktop。",
+      "ipcMissing": "botmuxBridge IPC 不可用 — 请重新构建 desktop preload。",
+      "ipcMissingShort": "botmuxBridge 不可用 — 请重新构建 desktop。",
       "openWorktreePty": "请先打开 worktree 再使用原生 PTY 标签。",
       "openWorktreePtyLong": "请先打开 worktree，再用 PTY 打开桌面原生终端标签。",
       "ptyUnavailable": "PTY 中继不可用",
@@ -136,13 +136,13 @@
       "localLabel": "本地",
       "disconnected": "断开",
       "knownSshHosts": "已知 SSH 主机",
-      "knownSshHint": "与「设置 → SSH」同源（含 ~/.ssh/config）。点连接即可在该主机上挂载 orca_botmux。",
+      "knownSshHint": "与「设置 → SSH」同源（含 ~/.ssh/config）。点连接即可在该主机上挂载 botmux。",
       "noKnownSsh": "还没有 SSH 主机。请在「设置 → SSH」添加，或导入 ~/.ssh/config。",
       "openSshSettings": "打开 设置 → SSH",
       "connectBotmux": "连接",
       "botmuxLinked": "已挂 Botmux",
-      "orcaSshConnected": "SSH 已连接",
-      "orcaSshIdle": "SSH 未连接",
+      "botmuxSshConnected": "SSH 已连接",
+      "botmuxSshIdle": "SSH 未连接",
       "sourceConfig": "来自 ~/.ssh/config",
       "sourceManual": "手动",
       "manualOptional": "手动目标（可选）",
@@ -156,7 +156,7 @@
       "hostsSessionsHiddenClosed": "{{visible}} 个进行中 · 已隐藏 {{closed}} 个已关闭",
       "closedHidden": "已隐藏 {{count}} 个已关闭",
       "showingClosed": "正在显示已关闭 ({{count}})",
-      "worktreeSessionBadge": "该目录下有 {{count}} 个 orca_botmux 会话",
+      "worktreeSessionBadge": "该目录下有 {{count}} 个 botmux 会话",
       "addMachine": "添加机器",
       "platformTunnel": "平台隧道",
       "sshHostsSection": "SSH 主机",
@@ -178,7 +178,7 @@
       "moreSessions": "还有 {{count}} 个…",
       "showLessSessions": "收起",
       "emptyMachinesTitle": "还没有连接的机器",
-      "emptyMachinesHint": "连接本机或 SSH 主机后，orca_botmux 会话会显示在这里。",
+      "emptyMachinesHint": "连接本机或 SSH 主机后，botmux 会话会显示在这里。",
       "dismissError": "关闭",
       "agentOther": "其他",
       "disconnectFailed": "断开失败",
@@ -191,8 +191,8 @@
   "menu": {
     "checkForUpdates": "检查更新...",
     "settings": "设置",
-    "exploreOrca": "探索 OrcaBotmux",
-    "gettingStarted": "OrcaBotmux 入门",
+    "exploreBotmux": "探索 Botmux",
+    "gettingStarted": "Botmux 入门",
     "reportCrash": "发送错误报告...",
     "file": "文件",
     "exit": "退出",
@@ -203,7 +203,7 @@
     "showStatusBar": "显示状态栏",
     "showTasksButton": "显示任务按钮",
     "showAutomationsButton": "显示自动化按钮",
-    "showMobileButton": "显示 OrcaBotmux 手机端按钮",
+    "showMobileButton": "显示 Botmux 手机端按钮",
     "showTitlebarAppName": "显示标题栏应用名称",
     "view": "查看",
     "reload": "重新加载",
@@ -217,12 +217,12 @@
     "paste": "粘贴"
   },
   "tray": {
-    "openOrca": "打开 OrcaBotmux",
+    "openBotmux": "打开 Botmux",
     "quit": "退出",
     "minimizeNotice": {
-      "body": "OrcaBotmux 仍在系统托盘中运行"
+      "body": "Botmux 仍在系统托盘中运行"
     },
-    "activityWaiting": "OrcaBotmux - 活动等待中",
+    "activityWaiting": "Botmux - 活动等待中",
     "activityWaitingSuffix": "activity waiting"
   },
   "worktreeJumpPalette": {
@@ -246,7 +246,7 @@
       "1b3024bcd6": "浮动工作区遇到错误。",
       "8d1e160ed1": "重试侧边栏或切换标签页以重新加载此面板。",
       "ed6b168d00": "右侧边栏出现错误。",
-      "03a14f6b5b": "重试此页面，或导航到其他 OrcaBotmux 界面。",
+      "03a14f6b5b": "重试此页面，或导航到其他 Botmux 界面。",
       "b7a714db1e": "此页面出现错误。",
       "98d4ea2823": "此工作区中的终端、浏览器或编辑器渲染失败。请重试以重新挂载。",
       "5a9519aef0": "工作区工作台遇到错误。",
@@ -258,7 +258,7 @@
       "df1d56bf87": "工作区界面遇到错误。",
       "9e0b441a91": "切换右侧边栏",
       "e81217c1b7": "隐藏应用名称",
-      "5096cbbc86": "orca_botmux",
+      "5096cbbc86": "botmux",
       "8b0b8eb54f": "应用菜单",
       "caea5b51b9": "立即重启",
       "0a9e810705": "重新启动之前不会保存更改。您以前的选项卡在磁盘上是安全的。",
@@ -289,12 +289,12 @@
         "b411ec0069": "连接",
         "2cf9e5a294": "清除已保存的服务器",
         "4a4c017be1": "端点：",
-        "27393856e4": "orca_botmux://pair?code=...",
+        "27393856e4": "botmux://pair?code=...",
         "7a566540de": "配对 URL 或代码",
         "cb4d287238": "服务器名称",
-        "3affe7de3a": "粘贴来自该浏览器可以访问的 OrcaBotmux 服务器的配对 URL。",
-        "e3bcd082ac": "连接到 OrcaBotmux",
-        "mobileScopeRejected": "此二维码仅授予受限（移动端）访问权限。若要使用完整 Web 应用，请从设置 → 远程 OrcaBotmux 服务器 → 分享此 OrcaBotmux 服务器 → 新链接打开浏览器访问链接。"
+        "3affe7de3a": "粘贴来自该浏览器可以访问的 Botmux 服务器的配对 URL。",
+        "e3bcd082ac": "连接到 Botmux",
+        "mobileScopeRejected": "此二维码仅授予受限（移动端）访问权限。若要使用完整 Web 应用，请从设置 → 远程 Botmux 服务器 → 分享此 Botmux 服务器 → 新链接打开浏览器访问链接。"
       },
       "webPreloadApi": {
         "aiVaultUnavailableForHost": "此执行主机不支持 Agent 会话历史记录。"
@@ -375,7 +375,7 @@
         },
         "worktrees": {
           "5a58e03a26": "删除了“{{value0}}”。",
-          "d1d78a7baa": "Git 无法安全删除分支“{{value0}}”{{value1}}，因此 OrcaBotmux 保留它以避免丢失本地 commits。",
+          "d1d78a7baa": "Git 无法安全删除分支“{{value0}}”{{value1}}，因此 Botmux 保留它以避免丢失本地 commits。",
           "4e6496f3d2": "{{value0}} 已删除，分支保留",
           "e50495aae6": "强制删除分支",
           "889487d8bb": "关闭",
@@ -384,21 +384,21 @@
           "fa9299a66f": "您的新工作树是最新的，但本地 {{value0}} 落后于 {{value1}} {{value2}} 。 AI 差异可能会错过最近的 commits。",
           "14bc053a47": "本地 {{value0}} 未刷新",
           "4a18052018": "本地 {{value0}} 落后于 {{value1}}",
-          "903b51c2ed": "从 {{value0}} 创建工作区，但 OrcaBotmux 无法快进本地 {{value1}}，因为 {{value2}}",
+          "903b51c2ed": "从 {{value0}} 创建工作区，但 Botmux 无法快进本地 {{value1}}，因为 {{value2}}",
           "0216895fb5": "删除分支失败",
           "19db0085fb": "本地分支已删除",
           "2b0afc7f14": "无法使本地 {{value0}} 保持最新",
           "670864ab52": "使本地 {{value0}} 保持最新",
           "5366d13eec": "工作区已删除，分支已保留",
           "2e17f825d4": "工作树已删除，分支已保留",
-          "78e08cd877": "Git 无法安全删除分支\"{{value0}}\"，因此 OrcaBotmux 将其保留以避免丢失本地提交。",
-          "3b57982bf6": "删除工作区\"{{value1}}\"后，Git 无法安全删除分支\"{{value0}}\"，因此 OrcaBotmux 将其保留以避免丢失本地提交。",
-          "81f13f48d2": "删除工作树\"{{value1}}\"后，Git 无法安全删除分支\"{{value0}}\"，因此 OrcaBotmux 将其保留以避免丢失本地提交。",
+          "78e08cd877": "Git 无法安全删除分支\"{{value0}}\"，因此 Botmux 将其保留以避免丢失本地提交。",
+          "3b57982bf6": "删除工作区\"{{value1}}\"后，Git 无法安全删除分支\"{{value0}}\"，因此 Botmux 将其保留以避免丢失本地提交。",
+          "81f13f48d2": "删除工作树\"{{value1}}\"后，Git 无法安全删除分支\"{{value0}}\"，因此 Botmux 将其保留以避免丢失本地提交。",
           "runtimeScopeForbiddenTitle": "此连接具有受限（移动端）访问权限",
-          "runtimeScopeForbiddenDescription": "移动端范围的配对无法使用工作区。请通过设置 → 远程 OrcaBotmux 服务器 → 分享此 OrcaBotmux 服务器中的浏览器访问链接重新连接。"
+          "runtimeScopeForbiddenDescription": "移动端范围的配对无法使用工作区。请通过设置 → 远程 Botmux 服务器 → 分享此 Botmux 服务器中的浏览器访问链接重新连接。"
         },
         "repos": {
-          "2975400634": "请更新 OrcaBotmux 服务器，以便在此运行时打开非 Git 文件夹。",
+          "2975400634": "请更新 Botmux 服务器，以便在此运行时打开非 Git 文件夹。",
           "b7e14472ae": "添加文件夹失败",
           "e649269645": "使用\"添加项目\"在所选主机上输入路径。",
           "c6e022ddfc": "添加项目失败",
@@ -425,13 +425,13 @@
         "linear": {
           "37d36984d0": "Linear 连接已被新的请求取代。"
         },
-        "orca_botmux": {
+        "botmux": {
           "profiles": {
             "612f7f6861": "创建配置文件失败",
             "319d7cf39b": "已创建云配置文件",
             "d6e764e7db": "请重新连接此配置文件",
             "f0c9e11a6d": "创建云配置文件失败",
-            "8b8fa73174": "未配置 OrcaBotmux Cloud 登录",
+            "8b8fa73174": "未配置 Botmux Cloud 登录",
             "33290e88ed": "连接配置文件失败",
             "9fcb07a796": "配置文件已连接",
             "2f6c78a039": "刷新配置文件身份验证失败",
@@ -486,13 +486,13 @@
         "skill": {
           "cli": {
             "prerequisite": {
-              "79371593b0": "OrcaBotmux CLI 在 PATH 上尚不可见",
-              "e99d7dc36f": "OrcaBotmux CLI注册需要注意",
-              "2db0bd7515": "OrcaBotmux CLI 注册不可用",
-              "8d6eedf97e": "无法在 PATH 中注册 OrcaBotmux CLI。",
-              "0f116999f1": "在安装之前重新启动 shell 或将 OrcaBotmux CLI 目录添加到 PATH。",
-              "15cbedc3e3": "在运行智能体技能设置之前安装 OrcaBotmux CLI。",
-              "windowsPathUnknown": "OrcaBotmux could not check your Windows user PATH"
+              "79371593b0": "Botmux CLI 在 PATH 上尚不可见",
+              "e99d7dc36f": "Botmux CLI注册需要注意",
+              "2db0bd7515": "Botmux CLI 注册不可用",
+              "8d6eedf97e": "无法在 PATH 中注册 Botmux CLI。",
+              "0f116999f1": "在安装之前重新启动 shell 或将 Botmux CLI 目录添加到 PATH。",
+              "15cbedc3e3": "在运行智能体技能设置之前安装 Botmux CLI。",
+              "windowsPathUnknown": "Botmux could not check your Windows user PATH"
             }
           }
         }
@@ -677,7 +677,7 @@
         "create": {
           "error": {
             "format": {
-              "37cf0bc991": "OrcaBotmux 无法解析此工作区的可用基础引用。",
+              "37cf0bc991": "Botmux 无法解析此工作区的可用基础引用。",
               "64555d0014": "未找到基础分支"
             }
           }
@@ -701,10 +701,10 @@
           "unavailable": "无法检查文件夹"
         },
         "description": {
-          "missing": "OrcaBotmux 找不到 {{path}}。请移除并重新导入此文件夹工作区。",
+          "missing": "Botmux 找不到 {{path}}。请移除并重新导入此文件夹工作区。",
           "notDirectory": "{{path}} 存在，但它不是文件夹。",
-          "ambiguousConnection": "OrcaBotmux 无法判断哪个 SSH 连接拥有此文件夹范围。",
-          "unavailable": "OrcaBotmux 现在无法验证此文件夹。请检查运行时或 SSH 连接，然后重试。"
+          "ambiguousConnection": "Botmux 无法判断哪个 SSH 连接拥有此文件夹范围。",
+          "unavailable": "Botmux 现在无法验证此文件夹。请检查运行时或 SSH 连接，然后重试。"
         },
         "createError": {
           "title": {
@@ -715,10 +715,10 @@
             "generic": "创建文件夹工作区失败"
           },
           "description": {
-            "missing": "OrcaBotmux 找不到 {{path}}。请移除并重新导入该文件夹。",
+            "missing": "Botmux 找不到 {{path}}。请移除并重新导入该文件夹。",
             "notDirectory": "{{path}} 存在，但它不是文件夹。",
-            "ambiguousConnection": "OrcaBotmux 无法判断哪个 SSH 连接拥有此文件夹范围。",
-            "unavailable": "OrcaBotmux 现在无法验证此文件夹。请检查运行时或 SSH 连接，然后重试。"
+            "ambiguousConnection": "Botmux 无法判断哪个 SSH 连接拥有此文件夹范围。",
+            "unavailable": "Botmux 现在无法验证此文件夹。请检查运行时或 SSH 连接，然后重试。"
           }
         }
       },
@@ -737,7 +737,7 @@
       "blocked": {
         "notification": {
           "fallback": {
-            "de50bef680": "macOS 正在阻止 OrcaBotmux 通知"
+            "de50bef680": "macOS 正在阻止 Botmux 通知"
           }
         }
       },
@@ -822,8 +822,8 @@
         "31e57d1c70": "通过 SSH 使用已有机器处理文件、终端、Git 和工作区。",
         "94a5afe910": "SSH 主机",
         "40d80bad8a": "测试版",
-        "de0c2907a1": "远程 OrcaBotmux 服务器",
-        "b351014180": "OrcaBotmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
+        "de0c2907a1": "远程 Botmux 服务器",
+        "b351014180": "Botmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
         "d72a58b5b9": "统计和使用情况",
         "dcd0d9b74f": "常见操作的键盘快捷键。",
         "94295ebfb3": "快捷键",
@@ -835,7 +835,7 @@
         "93d88d20bf": "外观",
         "2d0659f6f0": "全局终端、浏览器和 Markdown 选项卡。",
         "65b19f5bde": "浮动工作区",
-        "3d65d3f1b9": "配置对 OrcaBotmux 和编码智能体的手机模拟器支持。",
+        "3d65d3f1b9": "配置对 Botmux 和编码智能体的手机模拟器支持。",
         "1e761cff2b": "手机模拟器",
         "e815fd01bd": "主页、链接路由和会话 cookie。",
         "8c197f74a1": "浏览器",
@@ -852,16 +852,16 @@
         "2cd4ea75da": "工作区默认值、应用程序设置和维护。",
         "13241992bd": "通用",
         "724c440e72": "入门",
-        "0505d0df29": "开始使用 OrcaBotmux",
+        "0505d0df29": "开始使用 Botmux",
         "ea0b1bc7b8": "设置指南",
         "17005c73d4": "打开入门清单以了解设置和里程碑步骤。",
         "ded9e9032f": "入门清单",
-        "5f32ac08f3": "完成 OrcaBotmux 核心工作流程的入门清单。",
+        "5f32ac08f3": "完成 Botmux 核心工作流程的入门清单。",
         "8ac3de82f5": "使用设备端模型进行本地语音转文字听写。",
         "6a50cdcd7c": "语音",
         "0059bd17f3": "使智能体能够控制您计算机上的任何应用程序。",
         "b35e92364b": "计算机控制",
-        "cd50cec5d7": "通过 OrcaBotmux 协调多个编码智能体。",
+        "cd50cec5d7": "通过 Botmux 协调多个编码智能体。",
         "58a868e8e4": "编排",
         "7c79d3b7bf": "可选",
         "b1c2f8b0ac": "Claude、Codex、Gemini、OpenCode Go、MiniMax 和 Grok 的可选账户切换与使用量设置。",
@@ -1210,13 +1210,13 @@
         "76a95f7f47": "创建",
         "f05d237049": "先添加一个项目",
         "f9eaa9e12d": "添加项目",
-        "6ca6ff404e": "orca_botmux",
-        "520304a067": "OrcaBotmux 标志",
+        "6ca6ff404e": "botmux",
+        "520304a067": "Botmux 标志",
         "ce44fad849": "缺少依赖项",
         "c1cf168479": "隐藏",
         "00cee697c1": "在终端中运行“gh auth login”以连接您的 GitHub 账户。",
         "9f96d018b7": "GitHub CLI 未经过身份验证",
-        "73e1ad4282": "OrcaBotmux 使用 GitHub CLI (gh) 来显示PR、议题和检查。",
+        "73e1ad4282": "Botmux 使用 GitHub CLI (gh) 来显示PR、议题和检查。",
         "5beaef5f9e": "GitHub CLI 未安装",
         "b673e7cf1b": "Git 项目、源代码控制和工作区管理需要 Git。",
         "e5b7296d9d": "未安装 Git",
@@ -1345,12 +1345,12 @@
         "dccd26d4e4": "选择项目",
         "d6b0a96f32": "添加项目",
         "969a8bff66": "项目",
-        "23bb365554": "orca_botmux.yaml",
+        "23bb365554": "botmux.yaml",
         "a239038146": "SSH 连接错误",
         "9a70e4859e": "选择是否在创建此工作区前运行设置。",
         "803b7fe72f": "正在检查设置配置...",
         "92e34f0311": "本地设置",
-        "326a578923": "orca_botmux.yaml + 本地",
+        "326a578923": "botmux.yaml + 本地",
         "2132b670da": "两者",
         "0e587e31fb": "yaml",
         "ac3748dcda": "名称或创建来源",
@@ -1607,9 +1607,9 @@
         "92b0f9d921": "已通过身份验证并重试。",
         "cd8c34aac1": "gh",
         "cf82170065": "无法为该仓库加注星标。确保",
-        "30c36231c1": "OrcaBotmux 是开源项目。如果它今天帮到了你，GitHub 星标会帮助其他开发者找到它。",
+        "30c36231c1": "Botmux 是开源项目。如果它今天帮到了你，GitHub 星标会帮助其他开发者找到它。",
         "b5e685e4d9": "关闭",
-        "5f6df21046": "喜欢 OrcaBotmux 吗？",
+        "5f6df21046": "喜欢 Botmux 吗？",
         "2d67b6c849": "在 GitHub 上加星标",
         "af3c9bbb37": "正在加星标...",
         "68a41bc3aa": "无法使用以下方式加星:",
@@ -1964,8 +1964,8 @@
       },
       "UpdateCard": {
         "68b235d264": "重启即可更新",
-        "6714206e5a": "OrcaBotmux v{{value0}} 已下载。准备好后请重新启动。",
-        "93794ea932": "OrcaBotmux v{{value0}} 正在下载。",
+        "6714206e5a": "Botmux v{{value0}} 已下载。准备好后请重新启动。",
+        "93794ea932": "Botmux v{{value0}} 正在下载。",
         "8acbdd3961": "最小化到状态栏",
         "17412483da": "准备安装",
         "47126bcf57": "手动下载",
@@ -1977,7 +1977,7 @@
         "ec8fe71cfc": "更新",
         "44324ef542": "发行说明",
         "fdd4a364fa": "会话不会被中断。",
-        "05ad78a6d1": "OrcaBotmux v{{value0}} 已准备就绪。",
+        "05ad78a6d1": "Botmux v{{value0}} 已准备就绪。",
         "318d3b4bc7": "关闭更新",
         "9abc59f814": "可用更新",
         "aad383aecc": "阅读完整的发行说明",
@@ -1999,7 +1999,7 @@
         "522df222b9": "旋转器",
         "e944c2de43": "Update Verification Blocked",
         "5b309b19f3": "Update Wasn't Installed",
-        "092f09fc14": "The installer's publisher doesn't match OrcaBotmux, so we stopped the update. Don't install this download; check official releases for a corrected version.",
+        "092f09fc14": "The installer's publisher doesn't match Botmux, so we stopped the update. Don't install this download; check official releases for a corrected version.",
         "c9ff9b9ec2": "Check official releases",
         "a05992a26b": "The signature check couldn't run — usually because antivirus software blocked it. Retry the download, or get the installer from our official releases.",
         "5194358929": "Hide details",
@@ -2020,7 +2020,7 @@
         "1ebe225fee": "搜索工作树、设置、选项卡和操作...",
         "4e4ff044d5": "搜索工作树、设置、选项卡和操作",
         "4ee378034d": "跳转到...",
-        "f7fda8d562": "在 OrcaBotmux 中创建工作树或打开选项卡即可开始。",
+        "f7fda8d562": "在 Botmux 中创建工作树或打开选项卡即可开始。",
         "1628fd7dfa": "没有活动的工作树、设置、操作或打开的选项卡",
         "b781ae05e3": "键入以搜索工作树、设置、选项卡和操作。",
         "f60f8730be": "没有其他工作树可供切换",
@@ -2173,21 +2173,21 @@
             "463f1205c0": "加载项目视图",
             "23b87ba9f7": "在 GitHub 中打开",
             "4d2a77a119": "提交功能请求",
-            "1bf8c01c8b": "切换到表格视图以在 OrcaBotmux 中处理此项目。",
+            "1bf8c01c8b": "切换到表格视图以在 Botmux 中处理此项目。",
             "55de4fb57a": "{{value0}}。 {{value1}} 在 {{value2}} 提交功能请求。",
-            "2edf5e7e77": "{{value0}} — OrcaBotmux 尚不支持 {{value1}} 项目视图。在 {{value2}} 提交功能请求。",
+            "2edf5e7e77": "{{value0}} — Botmux 尚不支持 {{value1}} 项目视图。在 {{value2}} 提交功能请求。",
             "7245c3d7ac": "清除搜索",
             "c5bc7ec007": "视图筛选条件：{{value0}}",
             "840c268665": "添加仓库",
             "dffa899f36": "取消",
-            "7037c8f5f1": "存储库不在 OrcaBotmux 中",
+            "7037c8f5f1": "存储库不在 Botmux 中",
             "512fc171d6": "选择一个项目来开始。",
             "71fb69926c": "刷新",
             "a8fa0d2bf5": "刷新中",
             "fd15491034": "在 GitHub 中打开视图",
             "22df63c393": "您的token无法获取子议题数据。",
             "067119985c": "GitHub 搜索，例如 assignee:@me is:open",
-            "1850fceac8": "{{value0}}/{{value1}} 未添加到 OrcaBotmux。添加它以开始工作，或在 GitHub 中打开。",
+            "1850fceac8": "{{value0}}/{{value1}} 未添加到 Botmux。添加它以开始工作，或在 GitHub 中打开。",
             "1aa7c952b9": "项目视图",
             "f352abf7c3": "仓库列表正在更新。",
             "1ce21b8cff": "此项目不在选中的仓库中。",
@@ -2298,7 +2298,7 @@
                 "5509443543": "正在加载 GitHub API 预算...",
                 "34973d4695": "GitHub API 预算不可用。",
                 "d12d3d6f33": "刷新 GitHub API 预算",
-                "d5e5de9070": "OrcaBotmux 通过 GitHub CLI 使用 REST、搜索和 GraphQL。",
+                "d5e5de9070": "Botmux 通过 GitHub CLI 使用 REST、搜索和 GraphQL。",
                 "58c5f88216": "GitHub API 预算",
                 "6da1858354": "剩余 · 重置于",
                 "f42790d150": "的",
@@ -2365,7 +2365,7 @@
               "e603ee9156": "工作区 API 设置",
               "dc7ccb0f7c": "个人 API 密钥",
               "e3100b36b9": "如果成员 API 密钥被阻止，请请求工作区管理员允许他们通过工作区 API 设置。",
-              "d56d3629f4": "当 OrcaBotmux 应显示该账户可以在该工作区中访问的每个团队时，首选完全访问权限。受限密钥仅公开允许的团队，而私有团队需要密钥所有者才能访问。",
+              "d56d3629f4": "当 Botmux 应显示该账户可以在该工作区中访问的每个团队时，首选完全访问权限。受限密钥仅公开允许的团队，而私有团队需要密钥所有者才能访问。",
               "af52a6227f": "从账户 > 安全和访问创建个人 API 密钥。",
               "edec49dfae": "lin_api_...",
               "7d498f653c": "个人API密钥",
@@ -2520,7 +2520,7 @@
             "7eee951968": "检查工作区安全",
             "191f0bc98e": "关闭",
             "7ae2ad30f4": "刷新",
-            "e0b5a4deaa": "在删除其本地文件和 OrcaBotmux 状态之前查看非活动工作区。",
+            "e0b5a4deaa": "在删除其本地文件和 Botmux 状态之前查看非活动工作区。",
             "b2c1331844": "删除不活动的工作区",
             "41d594d01e": "{{value0}} 工作区{{value1}} 无法删除",
             "0f00612b6d": "删除了 {{value0}} 工作区 {{value1}}",
@@ -2770,7 +2770,7 @@
             "6bee0c8f17": "打开磁盘空间分析器",
             "ae20d0ffc2": "关闭",
             "38c282a2c4": "分析器直接从这里打开。您也可以稍后从左下角的工具箱菜单中选择“空间分析器”将其打开。",
-            "e2fcf07c0d": "OrcaBotmux 无法保存此终端会话，因为本地存储已满或不可写。打开磁盘空间分析器以查找可以清理的工作区存储。",
+            "e2fcf07c0d": "Botmux 无法保存此终端会话，因为本地存储已满或不可写。打开磁盘空间分析器以查找可以清理的工作区存储。",
             "678c780a2c": "磁盘空间不可用"
           },
           "osc52": {
@@ -3127,9 +3127,9 @@
             "298f4be7f2": "中央处理器",
             "2aa2de6cb9": "姓名",
             "30ff2c3c31": "{{value0}} 个孤立项",
-            "6449a95c78": "OrcaBotmux 跟踪的进程占用了该计算机的物理 RAM 的大小。",
+            "6449a95c78": "Botmux 跟踪的进程占用了该计算机的物理 RAM 的大小。",
             "e7ccce7e87": "系统内存",
-            "9e2525c89f": "OrcaBotmux 持有的常驻内存加上每个工作树终端下的进程。",
+            "9e2525c89f": "Botmux 持有的常驻内存加上每个工作树终端下的进程。",
             "1fedf94eae": "组合 CPU 负载。高于 100% 的值意味着多个核心同时工作。",
             "e7cf14ec78": "终端会话不可用。该列表可能已过时。",
             "93b0de3c21": "重新启动",
@@ -3145,9 +3145,9 @@
             "bbcd9b7b85": "折叠工作区",
             "c4a8968bdd": "扩大工作区",
             "b10695d6ce": "终止会话",
-            "288a4dd177": "orca_botmux",
-            "53dd5560ae": "折叠 OrcaBotmux",
-            "e419d27083": "展开 OrcaBotmux",
+            "288a4dd177": "botmux",
+            "53dd5560ae": "折叠 Botmux",
+            "e419d27083": "展开 Botmux",
             "41ae4fa725": "正在结束…",
             "138b99bd80": "本次会话",
             "888dad8c55": "加载中…",
@@ -3263,10 +3263,10 @@
             "2201df6987": "更新失败——点击查看详情",
             "8533c12c3c": "更新失败",
             "962404f68e": "更新准备安装。单击以展开。",
-            "248ee5d8ef": "OrcaBotmux v{{value0}} 正在下载... {{value1}}%",
+            "248ee5d8ef": "Botmux v{{value0}} 正在下载... {{value1}}%",
             "57a29c3b0e": "更新准备就绪",
             "fd1d3b3a1d": "更新下载，{{value0}}%。单击以展开。",
-            "9d13213a56": "OrcaBotmux v{{value0}} 已准备好安装"
+            "9d13213a56": "Botmux v{{value0}} 已准备好安装"
           },
           "WorkspaceSpaceCompactPanel": {
             "a471aa9c24": "已更新",
@@ -3409,9 +3409,9 @@
             "cabdc2a9e0": "无法读取 Claude 登录凭据。",
             "a7517cccb6": "Claude 用量目前不可用。",
             "e2c6a4f917": "Run Grok to refresh",
-            "d1b7f509ac": "Run grok in a terminal on the computer running OrcaBotmux and wait for it to start. If prompted, complete sign-in, then retry usage. You do not need to send a chat message.",
+            "d1b7f509ac": "Run grok in a terminal on the computer running Botmux and wait for it to start. If prompted, complete sign-in, then retry usage. You do not need to send a chat message.",
             "f90b3d7a16": "Run Kimi to refresh",
-            "a37e8c15d4": "Run kimi in a terminal on the computer running OrcaBotmux and wait for it to start, then retry usage."
+            "a37e8c15d4": "Run kimi in a terminal on the computer running Botmux and wait for it to start, then retry usage."
           },
           "SshTargetStatusRow": {
             "sshHost": "SSH 主机"
@@ -3475,7 +3475,7 @@
           "6afacbee37": "Claude 使用量跟踪",
           "0cb1a36d7d": "读取本地 Claude 使用日志，显示token、模型和会话统计。",
           "5ce4842c2c": "所有本地 Claude 使用情况",
-          "4f8368c272": "仅 OrcaBotmux 工作树",
+          "4f8368c272": "仅 Botmux 工作树",
           "cfe2282ffa": "未知",
           "7765a4c3e1": "不适用",
           "2d41fd45c6": "• 上次扫描错误：{{value0}}",
@@ -3527,7 +3527,7 @@
           "408210470c": "Codex 使用量跟踪",
           "13badcd8f2": "读取本地 Codex 使用日志，显示token、模型和会话统计。",
           "4fe8820098": "所有本地 Codex 使用情况",
-          "201766b754": "仅 OrcaBotmux 工作树",
+          "201766b754": "仅 Botmux 工作树",
           "bf6cf2d4dd": "未知",
           "ae255c3dba": "不适用",
           "247c93ca92": "• 推理定价",
@@ -3571,7 +3571,7 @@
           "bea80ceae0": "OpenCode 使用情况跟踪",
           "b8b3522436": "读取本地 OpenCode 使用日志以显示token、模型和会话统计信息。",
           "144a6050e9": "所有本地 OpenCode 使用情况",
-          "e04c58327c": "仅 OrcaBotmux 工作树",
+          "e04c58327c": "仅 Botmux 工作树",
           "362231082f": "未知",
           "8095a63426": "不适用",
           "6cc7782458": "• 上次扫描错误：{{value0}}",
@@ -3594,7 +3594,7 @@
           "2d9eb39264": "token总数",
           "beb6f24f37": "预计成本",
           "da62578d9d": "用法",
-          "0eb31e79ee": "OrcaBotmux IDE",
+          "0eb31e79ee": "Botmux IDE",
           "960324e9b8": "事件",
           "6adac63cfe": "轮流"
         },
@@ -3637,7 +3637,7 @@
         "share": {
           "card": {
             "utils": {
-              "19f4b4dc75": "github.com/stablyai/orca_botmux",
+              "19f4b4dc75": "github.com/stablyai/botmux",
               "d864fc5f98": "输出",
               "5d66fdd7c2": "输入",
               "7080aeaebb": "推理",
@@ -3663,7 +3663,7 @@
             "0bba8ca244": "统计数据",
             "0e2a0b6431": "用法",
             "372debfac0": "统计数据",
-            "26bb901fcd": "OrcaBotmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
+            "26bb901fcd": "Botmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
             "cb2430ae6a": "统计和使用情况",
             "f8a1b2c3d4": "grok",
             "e7f0a1b2c3": "订阅",
@@ -3790,16 +3790,16 @@
           "0c74e7ff34": "当地的"
         },
         "SkillFreshnessNudge": {
-          "titleOne": "已安装的 OrcaBotmux 技能已过期",
-          "titleMany": "{{value0}} 个已安装的 OrcaBotmux 技能已过期",
+          "titleOne": "已安装的 Botmux 技能已过期",
+          "titleMany": "{{value0}} 个已安装的 Botmux 技能已过期",
           "updateOne": "更新技能",
           "updateMany": "更新技能",
-          "description": "更新 {{value0}}，让 Agents 遵循此版本 OrcaBotmux 的最新说明。"
+          "description": "更新 {{value0}}，让 Agents 遵循此版本 Botmux 的最新说明。"
         },
         "SkillFreshnessRow": {
           "statusUpdateAvailable": "有更新",
           "statusCantUpdate": "无法更新",
-          "cantUpdateReason": "此技能安装在 OrcaBotmux 无法安全更新的位置，因此 npx skills update 命令不会更改它。",
+          "cantUpdateReason": "此技能安装在 Botmux 无法安全更新的位置，因此 npx skills update 命令不会更改它。",
           "chipCurrent": "最新",
           "chipUnrecognized": "无法识别",
           "chipInaccessible": "无法访问",
@@ -3810,35 +3810,35 @@
           "chipInRepo": "在仓库中",
           "chipPluginCache": "插件缓存",
           "tipCurrent": "这里的技能已是最新，更新不会更改它。",
-          "tipUnrecognized": "这里的技能内容与任何官方版本都不匹配，因此 OrcaBotmux 无法安全更新它。请移除或替换此处的内容以允许更新。",
-          "tipInaccessible": "OrcaBotmux 无法读取这里的技能（权限或文件错误），因此无法检查或更新它。",
+          "tipUnrecognized": "这里的技能内容与任何官方版本都不匹配，因此 Botmux 无法安全更新它。请移除或替换此处的内容以允许更新。",
+          "tipInaccessible": "Botmux 无法读取这里的技能（权限或文件错误），因此无法检查或更新它。",
           "tipDuplicate": "此技能除主副本外还安装在这里，因此 npx skills update 命令无法访问它。请移除它以允许更新。",
-          "tipExternalLink": "这是一个指向 OrcaBotmux 技能文件夹之外的快捷方式；更新不会跟随它。",
+          "tipExternalLink": "这是一个指向 Botmux 技能文件夹之外的快捷方式；更新不会跟随它。",
           "tipBrokenLink": "这是一个指向已不存在内容的快捷方式，可以安全删除。",
           "tipReadOnly": "这里的技能位于只读位置，需更改其权限后才能更新。",
-          "tipInRepo": "这里的技能位于某个项目内，而非全局技能；OrcaBotmux 只更新全局技能。",
+          "tipInRepo": "这里的技能位于某个项目内，而非全局技能；Botmux 只更新全局技能。",
           "tipPluginCache": "这里的技能由插件管理；请改为更新插件。",
-          "skippedReasonUnrecognized": "The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. OrcaBotmux left it out of the update so it won’t overwrite it. Remove it if you want OrcaBotmux to update this skill.",
-          "skippedReasonReadOnly": "This copy is in a read-only location, so OrcaBotmux left it out of the update. Change its permissions to let OrcaBotmux update it.",
-          "skippedReasonInaccessible": "OrcaBotmux couldn’t read this copy, so it left the skill out of the update.",
-          "skippedReasonInRepo": "This is a project skill, not a global one — OrcaBotmux only updates your global skills, so it left this out of the update.",
-          "skippedReasonPluginCache": "A plugin manages this skill, so OrcaBotmux left it out of the update — update the plugin instead.",
-          "skippedReasonExternalLink": "This copy is a shortcut pointing outside OrcaBotmux’s skill folders, so OrcaBotmux left it out of the update.",
-          "skippedReasonBrokenLink": "This copy is a shortcut to something that no longer exists, so OrcaBotmux left it out — you can safely delete it."
+          "skippedReasonUnrecognized": "The copy here doesn’t match the official version — it may be modified, or a different skill with the same name. Botmux left it out of the update so it won’t overwrite it. Remove it if you want Botmux to update this skill.",
+          "skippedReasonReadOnly": "This copy is in a read-only location, so Botmux left it out of the update. Change its permissions to let Botmux update it.",
+          "skippedReasonInaccessible": "Botmux couldn’t read this copy, so it left the skill out of the update.",
+          "skippedReasonInRepo": "This is a project skill, not a global one — Botmux only updates your global skills, so it left this out of the update.",
+          "skippedReasonPluginCache": "A plugin manages this skill, so Botmux left it out of the update — update the plugin instead.",
+          "skippedReasonExternalLink": "This copy is a shortcut pointing outside Botmux’s skill folders, so Botmux left it out of the update.",
+          "skippedReasonBrokenLink": "This copy is a shortcut to something that no longer exists, so Botmux left it out — you can safely delete it."
         },
         "SkillFreshnessUpdateDialog": {
           "title": "更新技能",
-          "checking": "正在检查已安装的 OrcaBotmux 技能…",
-          "none": "未找到已安装的 OrcaBotmux 技能。",
+          "checking": "正在检查已安装的 Botmux 技能…",
+          "none": "未找到已安装的 Botmux 技能。",
           "updateOne": "可以安全更新 1 个技能",
           "updateMany": "可以安全更新 {{value0}} 个技能",
-          "success": "所有已安装的 OrcaBotmux 技能均为最新。",
-          "attention": "部分已安装的 OrcaBotmux 技能无法自动更新。",
+          "success": "所有已安装的 Botmux 技能均为最新。",
+          "attention": "部分已安装的 Botmux 技能无法自动更新。",
           "attentionDescription": "打开“更新详情”查看为何每一项都无法更新。",
           "details": "更新详情",
-          "terminalTitle": "更新 OrcaBotmux 技能",
+          "terminalTitle": "更新 Botmux 技能",
           "terminalDescription": "检查预填的命令，然后按 Enter 键运行。",
-          "terminalAria": "OrcaBotmux 技能更新终端",
+          "terminalAria": "Botmux 技能更新终端",
           "checkNow": "立即检查",
           "close": "关闭"
         },
@@ -3852,7 +3852,7 @@
         "AddProjectFromFolderDialog": {
           "7d1f51678c": "添加项目",
           "7726a16374": "取消",
-          "046751dbfb": "将此文件夹添加为单独的 OrcaBotmux 项目。",
+          "046751dbfb": "将此文件夹添加为单独的 Botmux 项目。",
           "e643b30398": "添加了远程项目"
         },
         "AddRepoCreateStep": {
@@ -3865,7 +3865,7 @@
           "45b7c26034": "创建项目",
           "85085d74d2": "创建中…",
           "c7b9f94456": "创建新项目",
-          "b100311784": "为它命名，OrcaBotmux 会使用合理的默认设置创建一个真实项目。",
+          "b100311784": "为它命名，Botmux 会使用合理的默认设置创建一个真实项目。",
           "685b5eefe1": "{{parent}} 中的 {{kind}}",
           "2a762f3b19": "正在检查此主机上的 Git...",
           "fe1e616c5b": "创建项目需要 Git。",
@@ -3885,7 +3885,7 @@
           "cf9d382ca1": "导入",
           "220dd32d83": "扫描...",
           "fb33359f69": "将这些仓库分组吗？",
-          "d75170194e": "如果这些项目应放在一起（可以是 Monorepo，也可以只是一组相关仓库），请选择此项。OrcaBotmux 会将它们分组，并让你从父文件夹开始工作。",
+          "d75170194e": "如果这些项目应放在一起（可以是 Monorepo，也可以只是一组相关仓库），请选择此项。Botmux 会将它们分组，并让你从父文件夹开始工作。",
           "39d51212cc": "组名称",
           "aa0247680d": "否，单独导入",
           "a0bc4d1f8e": "是，作为组导入",
@@ -3935,7 +3935,7 @@
           "0f8aba944c": "导航到目录并单击“选择”以选择它。"
         },
         "AddRepoStartSteps": {
-          "acf895cb42": "添加一个项目以开始使用 OrcaBotmux。",
+          "acf895cb42": "添加一个项目以开始使用 Botmux。",
           "d13757911c": "添加项目",
           "d301db1c9a": "扫描存储库。单击停止。",
           "69ea7f8dc4": "停止扫描",
@@ -3968,7 +3968,7 @@
           "a23b22d16f": "已复制",
           "74fc00776f": "错误详情",
           "3afcad0497": "从第一条智能体消息开始。",
-          "ff62a18580": "OrcaBotmux 无法生成分支名称",
+          "ff62a18580": "Botmux 无法生成分支名称",
           "ca3b225195": "分支自动命名失败"
         },
         "CreateProjectLocationField": {
@@ -4028,11 +4028,11 @@
           "79fd02cf5f": "已在 {{hostName}} 上检查此路径。",
           "8851b77327": "已在本机检查此路径。"
         },
-        "OrcaYamlTrustDialog": {
+        "BotmuxYamlTrustDialog": {
           "f3e2b868fb": "运行钩子",
           "43b7bec4cd": "别跑",
           "c494b3ccb1": "在",
-          "79afc6772b": "OrcaBotmux.yaml",
+          "79afc6772b": "Botmux.yaml",
           "531689199b": "永远信任",
           "bf800b7e04": "。仅当您信任时才运行",
           "831f2cd9f0": "在你的机器上运行",
@@ -4057,7 +4057,7 @@
           "ad407c2d55": "更多",
           "removeContainedProjectSingular": "移除 1 个包含的项目",
           "removeContainedProjectPlural": "移除 {{value0}} 个包含的项目",
-          "eeabb8e8e4": "从 OrcaBotmux 移除 {{value0}} 个包含的{{value1}}",
+          "eeabb8e8e4": "从 Botmux 移除 {{value0}} 个包含的{{value1}}",
           "55f75628c0": "不会删除磁盘上的项目文件夹。",
           "897e5d3d4c": "删除组并移除项目",
           "fec7e9c8ae": "删除组"
@@ -4080,8 +4080,8 @@
           "4dc5b5065b": "移除",
           "d36883e046": "取消",
           "b79b39d865": "删除项目",
-          "removeDescriptionSsh": "此操作仅将 {{name}} 从 OrcaBotmux 中移除。文件仍保留在 {{host}} 上 — 重新添加该 SSH 主机即可恢复。",
-          "removeDescriptionLocal": "此操作仅将 {{name}} 从 OrcaBotmux 中移除。文件仍保留在您的磁盘上。"
+          "removeDescriptionSsh": "此操作仅将 {{name}} 从 Botmux 中移除。文件仍保留在 {{host}} 上 — 重新添加该 SSH 主机即可恢复。",
+          "removeDescriptionLocal": "此操作仅将 {{name}} 从 Botmux 中移除。文件仍保留在您的磁盘上。"
         },
         "ScrollToCurrentWorkspaceToolbarButton": {
           "23989bb663": "显示活动工作区"
@@ -4094,7 +4094,7 @@
           "ff1e819a11": "添加设置脚本",
           "70715947fb": "安装脚本不能为空",
           "888b83bf78": "无法保存设置脚本",
-          "a49196d538": "当 OrcaBotmux 创建新工作树时运行。",
+          "a49196d538": "当 Botmux 创建新工作树时运行。",
           "d9f2db2738": "项目的设置",
           "a5bb8c5135": "保存在这个",
           "dcaa645da5": "好的"
@@ -4104,12 +4104,12 @@
           "3933401d28": "配置",
           "31b8b01a45": "设置",
           "4a98f907ae": "重试",
-          "0a98169776": "添加在 OrcaBotmux 创建新工作树时运行的设置命令。",
+          "0a98169776": "添加在 Botmux 创建新工作树时运行的设置命令。",
           "8349e3fa4c": "。保存它以运行新的工作树。",
           "b56d1322f7": "找到一个设置命令",
-          "aef6c0a213": "保存已检测的命令，以便在 OrcaBotmux 创建工作树时运行它。",
+          "aef6c0a213": "保存已检测的命令，以便在 Botmux 创建工作树时运行它。",
           "660cdc17f8": "设置脚本。添加本地命令，或在“设置”中更改源。",
-          "8f6be51aa1": "OrcaBotmux.yaml",
+          "8f6be51aa1": "Botmux.yaml",
           "bb879db364": "此仓库忽略共享",
           "0155fb9ed3": "目前无法验证此仓库的设置脚本。",
           "eefa756190": "手动配置",
@@ -4131,7 +4131,7 @@
           "26108d3699": "加入 Discord",
           "d245c4ef6c": "GitHub 议题",
           "9b33530b3d": "其他联系我们的方式",
-          "a828fa4aee": "分享什么是有效的、什么是有问题的，或者 OrcaBotmux 接下来应该做什么。",
+          "a828fa4aee": "分享什么是有效的、什么是有问题的，或者 Botmux 接下来应该做什么。",
           "0eb643f07f": "发送反馈",
           "60b721e857": "提交反馈失败。请再试一次。",
           "7a46c228b8": "感谢您的反馈。",
@@ -4167,7 +4167,7 @@
           "80611a8b10": "搜索",
           "0c3395fd32": "搜索工作树和浏览器选项卡",
           "c86d83b5c3": "新建",
-          "1b5c41caee": "OrcaBotmux 手机端",
+          "1b5c41caee": "Botmux 手机端",
           "9c95e1ce91": "智能体",
           "f323383e9a": "自动化",
           "e7ad3c540d": "打开 Jira 任务",
@@ -4188,7 +4188,7 @@
           "bbbc6e8e3b": "没有匹配的未选择项目"
         },
         "SidebarSettingsHelpMenu": {
-          "ad3d3ed7f1": "重启 OrcaBotmux",
+          "ad3d3ed7f1": "重启 Botmux",
           "29c56f30ee": "检查更新",
           "eb9884e55b": "Discord",
           "5687ab246a": "GitHub",
@@ -4198,8 +4198,8 @@
           "4cf5b868d7": "发送反馈",
           "a428c25998": "设置",
           "2991a0106c": "帮助",
-          "4e8f5710d3": "无法重新启动 OrcaBotmux。",
-          "5161eef55d": "正在重启 OrcaBotmux…",
+          "4e8f5710d3": "无法重新启动 Botmux。",
+          "5161eef55d": "正在重启 Botmux…",
           "d396773ef0": "检查中",
           "f8a2c91d4e": "里程碑",
           "b7e4d2a19c": "入门引导",
@@ -4346,7 +4346,7 @@
           "ca74db7550": "SSH 主机上的项目",
           "021538e1d1": "SSH 已断开连接",
           "runtimeHostDisconnected": "服务器已断开连接",
-          "runtimeHostProject": "OrcaBotmux 服务器上的项目",
+          "runtimeHostProject": "Botmux 服务器上的项目",
           "automationCreated": "由自动化创建",
           "branchIdentity": "分支",
           "branchFolderPathIdentity": "分支或文件夹路径",
@@ -4367,7 +4367,7 @@
           "dbe2d18972": "更多 {{value0}} 操作",
           "ae76907ca6": "取消链接 {{value0}}",
           "ad25c3ff05": "在 {{value0}} 上查看",
-          "2c67730e07": "在 OrcaBotmux 中打开",
+          "2c67730e07": "在 Botmux 中打开",
           "e42941631a": "Linear 视图",
           "5e982e6128": "Linear {{value0}}",
           "807b13b9ec": "编辑议题",
@@ -4425,7 +4425,7 @@
           "503ec0f8e6": "来自项目的新组",
           "3350101edb": "复制路径",
           "f4475537d8": "删除",
-          "f5ac91531d": "从 OrcaBotmux 中删除项目",
+          "f5ac91531d": "从 Botmux 中删除项目",
           "b42391d8bf": "正在删除...",
           "0918b35e4f": "关闭此工作区中的所有活动面板以释放内存和 CPU。",
           "7d190f7d2b": "关闭选定工作区中的所有活动面板以释放内存和 CPU。",
@@ -4475,7 +4475,7 @@
           "e97297cb75": "隐藏 {{value0}} 个子工作区",
           "0cd15956d4": "隐藏 {{value0}} 个子工作区",
           "bd37a57ac8": "为 {{value0}} 创建工作区",
-          "b667b59632": "部分项目无法从 OrcaBotmux 中移除",
+          "b667b59632": "部分项目无法从 Botmux 中移除",
           "f94466bc39": "删除分组后，{{value1}} 个包含项目{{value2}}中仍剩 {{value0}} 个。",
           "groupDeleteFailed": "删除分组失败",
           "groupDeleteFailedDesc": "删除分组时出现问题。没有项目被移除。",
@@ -4512,7 +4512,7 @@
           "8009ab69a6": "打开于",
           "bd0e8159f8": "检查本机上的编辑器命令或文件管理器配置。",
           "9a5381eb09": "无法打开工作区文件夹。",
-          "0bed8727db": "它可能已被手机或删除。刷新工作区或将其从 OrcaBotmux 中删除。",
+          "0bed8727db": "它可能已被手机或删除。刷新工作区或将其从 Botmux 中删除。",
           "3921d3d9a5": "找不到工作区文件夹。",
           "f387af445b": "工作区路径不是有效的本地路径。",
           "3ec372b664": "文件管理器"
@@ -4523,7 +4523,7 @@
           "8df295a78d": "无法重命名工作区。"
         },
         "WorktreeVisibilityDialog": {
-          "83a5ba8dd1": "非 OrcaBotmux 工作树",
+          "83a5ba8dd1": "非 Botmux 工作树",
           "f1f71b9f02": "导入",
           "759371df43": "隐藏",
           "25ddf19920": "{{value0}} 可导入",
@@ -4566,7 +4566,7 @@
             "toast": {
               "1d0fa5c0a5": "无法删除工作区 {{value0}}",
               "ead7b8ee15": "它已更改文件。无论如何，请使用强制删除将其删除。",
-              "905fc8efac": "Git 已经删除了这个工作区。使用强制删除将其从 OrcaBotmux 中清除。",
+              "905fc8efac": "Git 已经删除了这个工作区。使用强制删除将其从 Botmux 中清除。",
               "0899ebdb28": "Git 已经忘记了这个工作区，但它的目录仍然在磁盘上。使用强制删除来删除孤立目录。",
               "locked": "此工作区被 Git 锁定。请在其仓库中运行 git worktree unlock <worktree-path>，然后重试删除。",
               "lockedReason": "此工作区被 Git 锁定。Git 报告：{{value0}}。请在其仓库中运行 git worktree unlock <worktree-path>，然后重试删除。"
@@ -4705,7 +4705,7 @@
                   "670864ab52": "使本地 {{value0}} 保持最新",
                   "84c62e4d7f": "无法开启 {{value0}}",
                   "442552c656": "打开设置并重试。",
-                  "f15fd80989": "新工作树是最新的，但本地 {{value0}} 落后 {{value1}} {{value2}}，因此 AI 差异可能会与过时历史比较。让 OrcaBotmux 自动保持它最新。可随时在",
+                  "f15fd80989": "新工作树是最新的，但本地 {{value0}} 落后 {{value1}} {{value2}}，因此 AI 差异可能会与过时历史比较。让 Botmux 自动保持它最新。可随时在",
                   "3d260e1a5d": "设置 › {{value0}}",
                   "34a03a6565": "保持 {{value0}} 最新",
                   "4a18052018": "本地 {{value0}} 落后于 {{value1}}",
@@ -4717,14 +4717,14 @@
           }
         },
         "LinearAgentSkillSetupPrompt": {
-          "missingCliAndSkill": "缺少 OrcaBotmux CLI 和 Linear 智能体技能。",
+          "missingCliAndSkill": "缺少 Botmux CLI 和 Linear 智能体技能。",
           "modalTitle": "启用 Linear ticket 访问",
           "modalDescription": "从终端安装 Linear 技能。",
           "modalPrompt": "允许智能体读取和编辑已附加的 Linear ticket。",
           "dontShowAgain": "不再显示",
           "notNow": "暂不",
-          "missingBoth": "缺少 OrcaBotmux CLI 和 Linear 智能体技能。",
-          "missingCli": "缺少 OrcaBotmux CLI。",
+          "missingBoth": "缺少 Botmux CLI 和 Linear 智能体技能。",
+          "missingCli": "缺少 Botmux CLI。",
           "missingSkill": "缺少 Linear 智能体技能。",
           "title": "设置 Linear 智能体技能",
           "remoteCopy": "这会安装主机设置；远程智能体环境可能需要单独设置。",
@@ -4745,12 +4745,12 @@
           "done": "完成",
           "wslCopy": "为已链接 Linear 工作的 WSL 智能体交接安装此项。",
           "wslLabel": "WSL 默认值",
-          "toastMissingCliAndSkill": "缺少 OrcaBotmux CLI 和 Linear 技能",
-          "toastMissingCli": "缺少 OrcaBotmux CLI",
+          "toastMissingCliAndSkill": "缺少 Botmux CLI 和 Linear 技能",
+          "toastMissingCli": "缺少 Botmux CLI",
           "toastMissingSkill": "缺少 Linear 技能",
-          "toastInstallCliAndSkillDescription": "安装 OrcaBotmux CLI 和 Linear 技能，让智能体可以读取并编辑 Linear 任务。",
-          "toastInstallCliDescription": "安装 OrcaBotmux CLI，让智能体可以读取并编辑 Linear 任务。",
-          "toastInstallSkillDescription": "安装 Linear 技能，让智能体可以通过 OrcaBotmux CLI 读取并编辑 Linear 任务。",
+          "toastInstallCliAndSkillDescription": "安装 Botmux CLI 和 Linear 技能，让智能体可以读取并编辑 Linear 任务。",
+          "toastInstallCliDescription": "安装 Botmux CLI，让智能体可以读取并编辑 Linear 任务。",
+          "toastInstallSkillDescription": "安装 Linear 技能，让智能体可以通过 Botmux CLI 读取并编辑 Linear 任务。",
           "toastRemoteDescription": "{{value0}} 远程智能体环境可能仍需要自己的设置。",
           "toastWslDescription": "{{value0}} 此设置会在所选 WSL 智能体运行时中执行。"
         },
@@ -4779,10 +4779,10 @@
           "addSshHost": "添加 SSH 主机",
           "addRemoteServer": "添加远程服务器",
           "addRemoteHost": "添加远程主机",
-          "addRemoteHostTooltip": "可选择能通过 SSH 登录的机器，也可选择运行 OrcaBotmux 的远程服务器。",
+          "addRemoteHostTooltip": "可选择能通过 SSH 登录的机器，也可选择运行 Botmux 的远程服务器。",
           "addSshHostDetail": "通过 SSH 使用现有机器。",
-          "addRemoteServerDetail": "与另一台电脑上运行的 OrcaBotmux 配对。",
-          "addRemoteHostDetail": "SSH 主机或 OrcaBotmux 服务器"
+          "addRemoteServerDetail": "与另一台电脑上运行的 Botmux 配对。",
+          "addRemoteHostDetail": "SSH 主机或 Botmux 服务器"
         },
         "sidebarHostOptions": {
           "3e102f111c": "所有主机",
@@ -4796,7 +4796,7 @@
           "1a2b3c4d5e": "已移除 {{value0}}",
           "2b3c4d5e6f": "删除主机失败",
           "3c4d5e6f7a": "移除 {{value0}}？",
-          "4d5e6f7a8b": "这会打开 OrcaBotmux 服务器设置，你可以在那里移除此服务器。",
+          "4d5e6f7a8b": "这会打开 Botmux 服务器设置，你可以在那里移除此服务器。",
           "5e6f7a8b9c": "这会从此计算机移除保存的 SSH 主机及其凭据。远程文件不会被删除。",
           "6f7a8b9c0d": "取消",
           "7a8b9c0d1e": "打开设置",
@@ -4804,12 +4804,12 @@
           "workspacesFailed": "无法移除此主机的 {{count}} 个工作区。主机已保留，您可以重试。",
           "oneWorkspace": "1 个工作区",
           "manyWorkspaces": "{{count}} 个工作区",
-          "hostHasWorkspacesDefault": "从此计算机移除 {{value0}} 及其凭据。其 {{value1}} 保留在 OrcaBotmux 中 — 远程文件不会被删除。",
+          "hostHasWorkspacesDefault": "从此计算机移除 {{value0}} 及其凭据。其 {{value1}} 保留在 Botmux 中 — 远程文件不会被删除。",
           "alsoDeleteRemote": "同时在 {{value1}} 上删除这些 {{value0}}",
-          "alsoForgetLocal": "同时从 OrcaBotmux 中移除这些 {{value0}}",
+          "alsoForgetLocal": "同时从 Botmux 中移除这些 {{value0}}",
           "advanced": "高级",
           "alsoDeleteRemoteHint": "永久删除远程 Git worktree 及其分支。此操作不可撤销。",
-          "alsoForgetLocalHint": "仅从 OrcaBotmux 中清除。远程文件、worktree 和分支不受影响。"
+          "alsoForgetLocalHint": "仅从 Botmux 中清除。远程文件、worktree 和分支不受影响。"
         },
         "HostRenameDialog": {
           "1a2b3c4d5e": "重命名主机",
@@ -4862,7 +4862,7 @@
           "e2c4a8d91f": "展开 {{value0}} 的外部创建的新工作树",
           "7c4e9b2a81": "外部创建的新工作树",
           "5e1b8d3f62": "永久隐藏外部工作树",
-          "4d7a1c9e53": "这些工作树是在 OrcaBotmux 外部创建的。",
+          "4d7a1c9e53": "这些工作树是在 Botmux 外部创建的。",
           "8b3f2e1d74": "导入",
           "1c9e7a4b28": "保持隐藏",
           "6f2d8c1e95": "全部导入",
@@ -4877,7 +4877,7 @@
           "a4c2d8f1b0": "隐藏外部工作树？",
           "6e91b3c4d2": "对于 {{value0}}，外部工作树将不再显示在侧边栏或此列表中，包括之后创建的工作树。",
           "1f8a5d9e73": "之后可以在项目设置中重新开启。",
-          "8c0b2e7a41": "打开 Non-OrcaBotmux 工作树设置",
+          "8c0b2e7a41": "打开 Non-Botmux 工作树设置",
           "5d1c9f0a82": "取消",
           "3b7e4a1c96": "隐藏外部工作树"
         },
@@ -4895,7 +4895,7 @@
           "serverSaveFailed": "添加远程服务器失败。",
           "serverTitle": "添加远程服务器",
           "sshTitle": "添加 SSH 主机",
-          "serverDescription": "与另一台电脑上运行的 OrcaBotmux 配对。",
+          "serverDescription": "与另一台电脑上运行的 Botmux 配对。",
           "sshDescription": "添加一台可通过 SSH 登录并持久保存的机器。",
           "cancel": "取消",
           "saving": "正在保存...",
@@ -4912,9 +4912,9 @@
           "serverName": "服务器名称",
           "serverNamePlaceholder": "开发机",
           "pairingCode": "配对码",
-          "pairingCodePlaceholder": "orca_botmux://pair?code=...",
+          "pairingCodePlaceholder": "botmux://pair?code=...",
           "pairingHelpPrefix": "在服务器上运行",
-          "pairingCommand": "orca-botmux-desktop serve --pairing-address <host>",
+          "pairingCommand": "botmux-desktop serve --pairing-address <host>",
           "pairingHelpSuffix": "，然后粘贴打印出的配对 URL。",
           "sshImportAlreadySynced": "~/.ssh/config 已同步。",
           "sshImportSynced": "已同步 {{value0}} 个主机{{value1}}。",
@@ -4925,12 +4925,12 @@
         },
         "ForgetSshWorkspaceDialog": {
           "reconnectFailed": "重新连接失败",
-          "forgetBody": "仅从 OrcaBotmux 中移除此工作区。文件、Git 工作树和 {{host}} 上的分支保持不变。",
-          "title": "从 OrcaBotmux 中移除“{{name}}”？",
-          "disconnectedBody": "此工作区的 SSH 主机未连接。重新连接以同时在远程删除，或仅从 OrcaBotmux 中移除。",
-          "ghostBody": "{{host}} 不再是已保存的 SSH 主机，因此此工作区不再连接到活跃主机。只能从 OrcaBotmux 中移除 — 远程文件和分支保持不变。",
+          "forgetBody": "仅从 Botmux 中移除此工作区。文件、Git 工作树和 {{host}} 上的分支保持不变。",
+          "title": "从 Botmux 中移除“{{name}}”？",
+          "disconnectedBody": "此工作区的 SSH 主机未连接。重新连接以同时在远程删除，或仅从 Botmux 中移除。",
+          "ghostBody": "{{host}} 不再是已保存的 SSH 主机，因此此工作区不再连接到活跃主机。只能从 Botmux 中移除 — 远程文件和分支保持不变。",
           "cancel": "取消",
-          "forget": "从 OrcaBotmux 中移除",
+          "forget": "从 Botmux 中移除",
           "reconnectAndDelete": "重新连接并删除"
         }
       },
@@ -4968,7 +4968,7 @@
       "setup": {
         "guide": {
           "SetupGuideModal": {
-            "3598a3ca0c": "完成使 OrcaBotmux 对于并行智能体工作有用的核心工作流程。",
+            "3598a3ca0c": "完成使 Botmux 对于并行智能体工作有用的核心工作流程。",
             "48a9e5ef2d": "入门",
             "28cf59fcb4": "这将从侧边栏隐藏清单",
             "f3b5ffb2a6": "从侧边栏隐藏清单"
@@ -4982,9 +4982,9 @@
         "AccountsPane": {
           "c2d2751587": "删除账户",
           "dbb9626ed1": "取消",
-          "854ebbcc45": "OrcaBotmux 将删除此已保存账户的托管 Claude 身份验证。如果当前处于活动状态，OrcaBotmux 将回退到系统默认的 Claude 登录名。",
+          "854ebbcc45": "Botmux 将删除此已保存账户的托管 Claude 身份验证。如果当前处于活动状态，Botmux 将回退到系统默认的 Claude 登录名。",
           "63843e37e2": "删除 Claude 账户？",
-          "99c8f9e498": "OrcaBotmux 将删除此已保存账户的托管 Codex 主目录。如果当前处于活动状态，OrcaBotmux 将回退到系统默认的 Codex 登录。",
+          "99c8f9e498": "Botmux 将删除此已保存账户的托管 Codex 主目录。如果当前处于活动状态，Botmux 将回退到系统默认的 Codex 登录。",
           "0d47394635": "删除 Codex 账户？",
           "ae3b21eb6c": "opencode.ai/workspace/wrk_…/go",
           "51c9104e13": "登录 opencode.ai 后在 URL 中找到此内容（例如",
@@ -5005,9 +5005,9 @@
           "36223200ac": "OpenCode Go 会话 Cookie",
           "ea631977b5": "配置 OpenCode Go 提供商设置。",
           "4ac10b4d08": "OpenCode Go",
-          "c2aee76420": "从本地 Gemini CLI 安装中提取 OAuth 凭据，用于在 {{value0}} 通过 Google 进行身份验证。这将使用颁发给 Gemini CLI 应用的凭据，而非 OrcaBotmux。若 Google 更新 CLI，可能会失效。请自行承担风险。",
+          "c2aee76420": "从本地 Gemini CLI 安装中提取 OAuth 凭据，用于在 {{value0}} 通过 Google 进行身份验证。这将使用颁发给 Gemini CLI 应用的凭据，而非 Botmux。若 Google 更新 CLI，可能会失效。请自行承担风险。",
           "96f3649526": "使用 Gemini CLI 凭据（实验）",
-          "d676c41fc6": "从本地 Gemini CLI 安装中提取 OAuth 凭据以通过 Google 认证。这将使用颁发给 Gemini CLI 应用的凭据，而非 OrcaBotmux。若 Google 更新 CLI，可能会失效。请自行承担风险。",
+          "d676c41fc6": "从本地 Gemini CLI 安装中提取 OAuth 凭据以通过 Google 认证。这将使用颁发给 Gemini CLI 应用的凭据，而非 Botmux。若 Google 更新 CLI，可能会失效。请自行承担风险。",
           "0c7f915b01": "使用 Gemini CLI 凭据",
           "973741a871": "配置 Gemini 提供商设置。",
           "0c64dc2a64": "Gemini",
@@ -5016,23 +5016,23 @@
           "3d245ef7d9": "Codex 报告此登录已过时",
           "589eba1eee": "需要重新授权",
           "e74831fb6b": "当前",
-          "b4c9450319": "{{value0}} 没有受管理的 Codex 账户。OrcaBotmux 将使用该环境的系统默认 Codex 登录，直到您在此处添加一个。",
+          "b4c9450319": "{{value0}} 没有受管理的 Codex 账户。Botmux 将使用该环境的系统默认 Codex 登录，直到您在此处添加一个。",
           "93c47b333a": "需要登录",
           "f2a265f8c7": "系统默认",
           "b0e948a4f9": "添加账户",
           "c0a52abfc5": "正在显示 {{value0}} 的账户。新账户会添加到此处。",
           "94d351af4a": "账户",
-          "d0d53b7eb0": "管理 OrcaBotmux 使用哪个 Codex 账户进行实时速率限制提取。",
+          "d0d53b7eb0": "管理 Botmux 使用哪个 Codex 账户进行实时速率限制提取。",
           "3180536c7a": "Codex 账户",
-          "340d6f7a85": "每个账户在 OrcaBotmux 中都保留自己的本地登录上下文。账户身份验证保留在此设备上。",
-          "cedfab35ab": "可选。OrcaBotmux 可使用系统默认 Codex 登录；仅当你需要在 OrcaBotmux 中快速切换账户时才添加账户。",
+          "340d6f7a85": "每个账户在 Botmux 中都保留自己的本地登录上下文。账户身份验证保留在此设备上。",
+          "cedfab35ab": "可选。Botmux 可使用系统默认 Codex 登录；仅当你需要在 Botmux 中快速切换账户时才添加账户。",
           "ef91cfa06b": "Codex",
-          "3fe7862418": "{{value0}} 没有受管理的 Claude 账户。OrcaBotmux 将使用该环境的系统默认 Claude 登录，直到您在此处添加一个。",
+          "3fe7862418": "{{value0}} 没有受管理的 Claude 账户。Botmux 将使用该环境的系统默认 Claude 登录，直到您在此处添加一个。",
           "3455cf43fa": "Claude 登录。",
           "fcc4093fc1": "使用您当前 {{value0}} Codex 登录名。",
           "79e484c3b2": "用于共享 Claude 身份验证文件的可选账户切换器。",
           "8bbfd74556": "Claude 账户",
-          "72b36ea174": "可选。OrcaBotmux 可使用系统默认 Claude 登录；仅当你需要快速切换且不想迁移聊天会话时才添加账户。",
+          "72b36ea174": "可选。Botmux 可使用系统默认 Claude 登录；仅当你需要快速切换且不想迁移聊天会话时才添加账户。",
           "26ef4b55be": "Claude",
           "2743cdc0af": "Claude 账户更新失败。",
           "b15ce90870": "{{value0}} -> {{value1}}。在继续旧会话之前重新启动实时 Claude 终端。",
@@ -5095,7 +5095,7 @@
           "435df0ee51": "在请求头中，复制 Cookie 的值。",
           "7492fb3bba": "在此粘贴并点击保存。",
           "9fec52de4b": "如何复制 Cookie",
-          "4e32e030b2": "存储在本地。OrcaBotmux 仅将其发送到 platform.minimax.io 以刷新使用量。",
+          "4e32e030b2": "存储在本地。Botmux 仅将其发送到 platform.minimax.io 以刷新使用量。",
           "remoteServerFallback": "远程服务器",
           "loadAccountsFailed": "无法加载提供商账户。",
           "remoteScopeAccounts": "正在显示由 {{value0}} 管理的账户。请在该服务器上添加或重新验证账户。",
@@ -5105,7 +5105,7 @@
         },
         "AdvancedPane": {
           "40b29e0bf3": "重新启动",
-          "87a2cb2ac8": "OrcaBotmux 在启动时应用此网络模式。",
+          "87a2cb2ac8": "Botmux 在启动时应用此网络模式。",
           "89958d7edf": "需要重新启动",
           "b3ad629640": "仅当企业 VPN 或代理因 HTTP/2 协议错误而中断更新下载时使用。重启后会影响所有 Electron 网络。",
           "6627e75c92": "解释 HTTP/1.1 兼容性",
@@ -5178,13 +5178,13 @@
           "agentPermissions": "智能体权限",
           "agentPermissionsInfo": "智能体权限信息",
           "agentPermissionsTooltip": "切换模式时，自定义智能体参数保持不变。",
-          "agentPermissionsDescription": "选择 OrcaBotmux 是以更少的权限提示启动智能体，还是手动检查。",
+          "agentPermissionsDescription": "选择 Botmux 是以更少的权限提示启动智能体，还是手动检查。",
           "agentPermissionsYolo": "Yolo",
           "agentPermissionsManual": "手动",
           "3f1bdf3cb4": "环境文本过长，无法安全解析。",
           "codexSessionSource": "要导入的 Codex 主目录",
           "codexSessionSourceInfo": "关于导入 Codex 历史记录",
-          "codexSessionSourceTooltip": "OrcaBotmux 在隔离的主目录中运行 Codex。将此项指向您现有的 Codex 主目录以导入会话历史记录。留空则使用 ~/.codex。"
+          "codexSessionSourceTooltip": "Botmux 在隔离的主目录中运行 Codex。将此项指向您现有的 Codex 主目录以导入会话历史记录。留空则使用 ~/.codex。"
         },
         "AppIconSelector": {
           "d5a112dc9b": "下一个图标",
@@ -5195,9 +5195,9 @@
           "3057983501": "未分配",
           "0cd9b8228f": "选择 Dock 和窗口切换器中显示的应用程序图标。",
           "ca1590d42f": "应用程序图标",
-          "61d842eca0": "在侧边栏中显示 OrcaBotmux 手机端 快捷方式。它仍然可以从工具箱中获取。",
-          "9da1020447": "显示 OrcaBotmux 手机端按钮",
-          "5db6ba961f": "在左侧边栏顶部显示 OrcaBotmux 手机端按钮。",
+          "61d842eca0": "在侧边栏中显示 Botmux 手机端 快捷方式。它仍然可以从工具箱中获取。",
+          "9da1020447": "显示 Botmux 手机端按钮",
+          "5db6ba961f": "在左侧边栏顶部显示 Botmux 手机端按钮。",
           "fa882a3e6b": "在左侧边栏顶部显示“自动化”按钮。",
           "511f270ebb": "显示自动化按钮",
           "661942ab7f": "在左侧边栏顶部显示“任务”按钮。",
@@ -5205,7 +5205,7 @@
           "dc29f3cc0d": "侧边栏",
           "ea943d0db0": "选择窗口底部显示的指示器。您还可以右键单击状态栏进行相同的切换。",
           "3e4175e5c6": "状态栏",
-          "2df8f79aa5": "在标题栏中显示 OrcaBotmux。",
+          "2df8f79aa5": "在标题栏中显示 Botmux。",
           "9868f39007": "标题栏应用程序名称",
           "4de76f6902": "控制应用程序标题栏中显示的内容。",
           "6a272ca553": "标题栏",
@@ -5213,7 +5213,7 @@
           "0fafabcf35": "显示 Git 忽略的文件",
           "75f07ab60c": "在文件资源管理器中显示与 .gitignore 匹配的文件。",
           "d496901cd0": "文件浏览器",
-          "42554f615f": "选择 OrcaBotmux 界面使用的字体。",
+          "42554f615f": "选择 Botmux 界面使用的字体。",
           "102d6b5f9b": "IDE字体",
           "ef89200c1f": "当不在终端窗格中时。",
           "f687711a9b": "缩放整个应用程序界面。使用",
@@ -5223,7 +5223,7 @@
           "7d26ccabe8": "深色",
           "fb0e0b4453": "系统",
           "932ff1fbff": "主题",
-          "0f28e7b30c": "选择 OrcaBotmux 在应用程序窗口中的外观。",
+          "0f28e7b30c": "选择 Botmux 在应用程序窗口中的外观。",
           "leftSidebarAppearance": {
             "title": "左侧边栏外观",
             "rowDescription": "让左侧边栏匹配终端、保持默认，或使用色调。",
@@ -5238,7 +5238,7 @@
           "workspaceCardLayoutGuidance": "从工作区侧边栏管理。",
           "872af9556e": "系统托盘",
           "2edf606c46": "关闭时最小化到托盘",
-          "b707773a0d": "启用后，关闭窗口会让 OrcaBotmux 继续在系统托盘中运行，而不是退出。",
+          "b707773a0d": "启用后，关闭窗口会让 Botmux 继续在系统托盘中运行，而不是退出。",
           "interfaceDefaultFont": "默认字体",
           "terminalDefaultFont": "默认字体",
           "interfaceTitle": "界面",
@@ -5259,16 +5259,16 @@
           "c71770c455": "{basePrompt}",
           "f19a56498d": ";您的分支前缀设置仍然适用。",
           "800edb1e54": "修复登录流程",
-          "5d569f5199": "。 OrcaBotmux 仅生成最后一段，例如",
+          "5d569f5199": "。 Botmux 仅生成最后一段，例如",
           "570817d126": "和",
           "56580dcf60": "。您还可以参考",
           "9c9b54e4ea": "内置分支名称提示",
-          "69bf4830c2": "包括 OrcaBotmux 的",
+          "69bf4830c2": "包括 Botmux 的",
           "9241b59bf5": "使用",
           "a869d0edd8": "分支名称提示词模板",
           "e784ea62dc": "高级",
-          "d9b65054ef": "）到总结任务的简短名称。只有 OrcaBotmux 命名的分支才会被重命名，并且在推送后不会被重命名。",
-          "12ea4a408d": "当智能体开始在新工作区中工作时，OrcaBotmux 会重命名其自动生成的分支（例如",
+          "d9b65054ef": "）到总结任务的简短名称。只有 Botmux 命名的分支才会被重命名，并且在推送后不会被重命名。",
+          "12ea4a408d": "当智能体开始在新工作区中工作时，Botmux 会重命名其自动生成的分支（例如",
           "ef787db0e3": "自动重命名分支",
           "6a051586d2": "智能体启动后，根据工作重命名自动生成的分支。",
           "ec3e0c388e": "保存",
@@ -5283,9 +5283,9 @@
           "4416b25d29": "优先使用任务中的领域名词，避免工单 ID，并保持名称便于评审人理解。",
           "39278f4411": ";您的分支前缀设置仍然适用。",
           "ebb942a2ec": "修复登录流程",
-          "af2d9a2cc6": "。 OrcaBotmux 仅生成最后一段，例如",
+          "af2d9a2cc6": "。 Botmux 仅生成最后一段，例如",
           "182d419b97": "内置分支名称提示",
-          "2f5dc661fe": "附加到 OrcaBotmux 的",
+          "2f5dc661fe": "附加到 Botmux 的",
           "7d6176f506": "提示词",
           "5968112152": "保存",
           "54ac229ad4": "保存中...",
@@ -5340,7 +5340,7 @@
           "7b649a578a": "创建中…",
           "4399c77caa": "默认",
           "4af9a17947": "kagi",
-          "c0f85056d9": "此 OrcaBotmux 服务器上的浏览器配置。",
+          "c0f85056d9": "此 Botmux 服务器上的浏览器配置。",
           "86b7c83fee": "本机",
           "6480776a03": "所选主机的浏览器配置。",
           "5e19a692f7": "主机"
@@ -5382,20 +5382,20 @@
           "e44c5d681e": "从",
           "67d9a53f47": "管理单独登录的配置文件",
           "112f70adc4": "上次导入自 {{value0}}",
-          "72d4815523": "将您现有的登录信息带入 OrcaBotmux，以便智能体可以访问经过身份验证的页面。导入到默认配置文件中。",
+          "72d4815523": "将您现有的登录信息带入 Botmux，以便智能体可以访问经过身份验证的页面。导入到默认配置文件中。",
           "2eb906706c": "导入浏览器 Cookie",
           "af8c83ed61": "从 Chrome、Edge 或其他浏览器导入 cookie，以便智能体可以重复使用您的登录信息。",
-          "68ea76eb71": "安装浏览器使用技能，以便智能体可以操作 OrcaBotmux 的浏览器。",
+          "68ea76eb71": "安装浏览器使用技能，以便智能体可以操作 Botmux 的浏览器。",
           "2d6ead9ab2": "安装浏览器使用技能",
           "e9f3f3b488": "安装于",
-          "9fca1f7f5d": "注册 OrcaBotmux CLI 命令，以便智能体可以从其 shell 编排浏览器。",
-          "c6065d205d": "启用 OrcaBotmux CLI",
-          "c79eff0213": "注册 OrcaBotmux CLI，以便智能体可以驱动浏览器。",
+          "9fca1f7f5d": "注册 Botmux CLI 命令，以便智能体可以从其 shell 编排浏览器。",
+          "c6065d205d": "启用 Botmux CLI",
+          "c79eff0213": "注册 Botmux CLI，以便智能体可以驱动浏览器。",
           "702488a5f7": "让编码智能体通过您的登录来驱动此浏览器。完成以下三个步骤。",
           "b8a1f2d84d": "智能体浏览器使用",
           "96b91c6349": "让编码智能体通过您的登录来驱动此浏览器。",
           "2ea4617e3a": "从 {{value1}}{{value2}} 导入 {{value0}} cookie。",
-          "721aee31b4": "在 PATH 中注册 OrcaBotmux CLI。",
+          "721aee31b4": "在 PATH 中注册 Botmux CLI。",
           "180a9abf3a": "无法加载 CLI 状态。",
           "2ccfc9cff8": "导入",
           "0462565413": "重新导入",
@@ -5407,17 +5407,17 @@
           "5301857d88": "从 {{value0}}"
         },
         "BrowserUseSkillStep": {
-          "0871b6998d": "使智能体能够在 OrcaBotmux 浏览器中导航和验证页面。",
+          "0871b6998d": "使智能体能够在 Botmux 浏览器中导航和验证页面。",
           "459e24eebc": "浏览器使用技能"
         },
         "CliSection": {
           "8671e406f0": "取消",
           "a4aafe46e3": "目标路径：",
-          "e8012c03a1": "使智能体能够使用 OrcaBotmux 工作区、终端和进度命令。",
+          "e8012c03a1": "使智能体能够使用 Botmux 工作区、终端和进度命令。",
           "cliSkillTerminalTitle": "CLI 技能设置",
           "cliSkillTerminalAria": "CLI 技能安装终端",
           "6053cf736c": "CLI技能",
-          "36a6f919ba": "为智能体提供 OrcaBotmux 感知的工作区、终端和进度工作流程。",
+          "36a6f919ba": "为智能体提供 Botmux 感知的工作区、终端和进度工作流程。",
           "04873eea3e": "智能体技能",
           "7f2747f7dd": "当前在此 shell 的 PATH 上不可见。",
           "b0c310ab46": "现有启动器目标：",
@@ -5425,8 +5425,8 @@
           "5dae812f50": "刷新",
           "52e640f3a0": "刷新 CLI 状态",
           "38edbb5721": "Shell 命令",
-          "6930feda9e": "从终端使用 OrcaBotmux 打开应用程序、管理工作树并与 OrcaBotmux 终端交互。",
-          "c5c0f2641d": "OrcaBotmux CLI",
+          "6930feda9e": "从终端使用 Botmux 打开应用程序、管理工作树并与 Botmux 终端交互。",
+          "c5c0f2641d": "Botmux CLI",
           "d77352f2df": "无法从 PATH 中删除 `{{value0}}`。",
           "af5540930c": "从路径中删除了“{{value0}}”。",
           "a2b13efa94": "无法在 PATH 中注册 `{{value0}}`。",
@@ -5438,8 +5438,8 @@
           "4c7e3e4c5f": "安装",
           "068552b191": "正在删除...",
           "8d96213669": "移除",
-          "aa6536977e": "OrcaBotmux 将注册 {{value0}} ，以便该命令在您的终端上运行。",
-          "a030816e3e": "这将删除 shell 命令符号链接。 OrcaBotmux 本身仍保持安装状态。",
+          "aa6536977e": "Botmux 将注册 {{value0}} ，以便该命令在您的终端上运行。",
+          "a030816e3e": "这将删除 shell 命令符号链接。 Botmux 本身仍保持安装状态。",
           "fa87db3d6e": "在路径中注册`{{value0}}`？",
           "14444243ba": "从路径中删除`{{value0}}`？",
           "5d432fe44d": "已安装",
@@ -5453,7 +5453,7 @@
           "3728a94fb6": "WSL shell命令需要注意的地方",
           "775a4cfbb8": "WSL shell 命令注册不可用",
           "c47127f222": "WSL 默认值",
-          "0c9f3cf9da": "选择 OrcaBotmux 检查和安装全局智能体技能的位置。",
+          "0c9f3cf9da": "选择 Botmux 检查和安装全局智能体技能的位置。",
           "f00d6aa9b5": "WSL 在此计算机上不可用。",
           "7c776ff9d8": "wsl",
           "fc0fcf72fd": "在技​​能设置之前注册 WSL shell 命令。",
@@ -5474,10 +5474,10 @@
           "e001734396": "除非在编辑器中更改，否则将托管评审创建为草稿。",
           "6ba48f07a4": "默认草稿",
           "15b60d54b2": "例如 ollama run llama3.1 {prompt}",
-          "3f1b26cc91": "将提示词输入作为参数传递；否则 OrcaBotmux 会通过标准输入传递。",
+          "3f1b26cc91": "将提示词输入作为参数传递；否则 Botmux 会通过标准输入传递。",
           "4f722a5f53": "由选择自定义命令的 commit 消息、PR 和分支名称预设使用。使用",
           "47e45cbd5a": "自定义命令",
-          "1ef29f8c29": "文本生成预设使用自定义命令时，OrcaBotmux 运行的命令行。",
+          "1ef29f8c29": "文本生成预设使用自定义命令时，Botmux 运行的命令行。",
           "2339a89104": "添加 AI 按钮，用于使用该操作的提示词模板运行选定的智能体。",
           "d5b45a3628": "显示源代码控制 AI 操作",
           "7bcad2b200": "为源代码管理的 commit、PR、分支命名和修复操作添加操作方案。",
@@ -5525,8 +5525,8 @@
         },
         "DeveloperPermissionsPane": {
           "4c17304beb": "刷新",
-          "6326a4c5cc": "当 CLI、本地应用程序或自动化工具需要 macOS 隐私访问时，请使用这些控件。 OrcaBotmux 在启动时不会询问。",
-          "6f011b9bf6": "终端工具继承了 OrcaBotmux 的 macOS 隐私信封。",
+          "6326a4c5cc": "当 CLI、本地应用程序或自动化工具需要 macOS 隐私访问时，请使用这些控件。 Botmux 在启动时不会询问。",
+          "6f011b9bf6": "终端工具继承了 Botmux 的 macOS 隐私信封。",
           "bfa3402305": "无法请求许可",
           "66e94d6cf3": "已发送权限请求",
           "fa809e8ada": "打开 macOS 隐私和安全",
@@ -5566,9 +5566,9 @@
           "dd6f0a1d45": "宠物",
           "0e89a574ae": "右下角漂浮的动画宠物。",
           "agentHibernation": {
-            "copy": "在配置的空闲时间后停止后台智能体终端，并在你再次打开时恢复受支持的会话。智能体睡眠会保留由 OrcaBotmux 启动的智能体的启动选项。手动启动的智能体可能会使用当前的 OrcaBotmux 默认值恢复。我们仍在调校安全模型，此功能为实验性功能。",
+            "copy": "在配置的空闲时间后停止后台智能体终端，并在你再次打开时恢复受支持的会话。智能体睡眠会保留由 Botmux 启动的智能体的启动选项。手动启动的智能体可能会使用当前的 Botmux 默认值恢复。我们仍在调校安全模型，此功能为实验性功能。",
             "description": "在配置的空闲时间后停止后台智能体终端，并在你再次打开时恢复受支持的会话。",
-            "idleMinutesDescription": "已完成的后台智能体在 OrcaBotmux 可以将其睡眠前需要等待的空闲分钟数。",
+            "idleMinutesDescription": "已完成的后台智能体在 Botmux 可以将其睡眠前需要等待的空闲分钟数。",
             "idleMinutesLabel": "睡眠等待时间",
             "idleMinutesSuffix": "分钟",
             "title": "智能体睡眠",
@@ -5598,7 +5598,7 @@
           "3c900e26e5": "无论切换显示在何处，键盘快捷键都有效。",
           "5e5a8da236": "切换按钮位置",
           "505001823e": "选择浮动工作区目录",
-          "81afb79785": "新的浮动终端选项卡从这里开始。 Markdown 笔记保存在 OrcaBotmux 应用程序拥有的浮动工作区中。",
+          "81afb79785": "新的浮动终端选项卡从这里开始。 Markdown 笔记保存在 Botmux 应用程序拥有的浮动工作区中。",
           "12aa09f10c": "终端目录",
           "41eb95f7f0": "显示浮动工作区按钮和面板。",
           "5136813663": "启用浮动工作区",
@@ -5633,12 +5633,12 @@
           "b492397d34": "默认情况下显示 git diff 的首选演示格式。",
           "a5db1d3975": "ms",
           "fc5c5306ff": "ms。",
-          "8112cd6dcf": "OrcaBotmux 在您上次编辑后等待多长时间才会自动保存。首次启动默认为",
+          "8112cd6dcf": "Botmux 在您上次编辑后等待多长时间才会自动保存。首次启动默认为",
           "d6cf227ca0": "自动保存延迟",
-          "1bec6d8318": "OrcaBotmux 在您上次编辑后等待多长时间才会自动保存。",
+          "1bec6d8318": "Botmux 在您上次编辑后等待多长时间才会自动保存。",
           "70bb30feb1": "短暂暂停后自动保存编辑器和可编辑差异更改。",
           "0df2e4fd12": "自动保存文件",
-          "d21136d9ef": "配置 OrcaBotmux 如何保留文件编辑。",
+          "d21136d9ef": "配置 Botmux 如何保留文件编辑。",
           "45c6e85c4d": "编辑",
           "8f1afdfbd8": "差异自动换行",
           "4aa4d9fb73": "在差异编辑器中换行显示长行，而不是要求水平滚动。",
@@ -5658,7 +5658,7 @@
           "476f302aca": "http://proxy.example.com:8080",
           "1e214e265a": "留空以使用系统代理设置和继承的代理环境变量。",
           "f00daf6324": "HTTP 代理",
-          "823e0f15b1": "用于 OrcaBotmux 网络请求和本地终端子进程的代理 URL。",
+          "823e0f15b1": "用于 Botmux 网络请求和本地终端子进程的代理 URL。",
           "d93c7cd531": "配置应用程序级网络路由。",
           "c46cdbbd4e": "网络",
           "configureProxy": "配置代理"
@@ -5672,9 +5672,9 @@
         },
         "GeneralSupportSection": {
           "af7d9f4396": "感谢您的支持！",
-          "6922c1fa2b": "GitHub 上的 Star OrcaBotmux",
+          "6922c1fa2b": "GitHub 上的 Star Botmux",
           "511782265b": "通过 gh CLI 通过 GitHub star 支持该项目。",
-          "55a87e5fd1": "支持 OrcaBotmux",
+          "55a87e5fd1": "支持 Botmux",
           "964acc6bb4": "加星标",
           "73b327e793": "重试",
           "c9f96d4234": "错误",
@@ -5695,7 +5695,7 @@
           "42717918f4": "安装更新（",
           "02dc082e70": "无法开始更新下载。",
           "e1a647adc5": "检查更新",
-          "ceb579abaf": "检查应用程序更新并安装较新的 OrcaBotmux 版本。",
+          "ceb579abaf": "检查应用程序更新并安装较新的 Botmux 版本。",
           "d91ebfb87e": "当前版本：{{value0}}",
           "f2b1ccc12a": "更新",
           "bd79d412f0": "更新检查失败。 {{value0}}",
@@ -5745,9 +5745,9 @@
           "1f744a72f4": "配置"
         },
         "GitPane": {
-          "d2eede4c54": "将 OrcaBotmux 署名添加到 commits、PR 和议题。",
-          "e02ea23a32": "OrcaBotmux 署名",
-          "e71ce09c42": "orca_botmux",
+          "d2eede4c54": "将 Botmux 署名添加到 commits、PR 和议题。",
+          "e02ea23a32": "Botmux 署名",
+          "e71ce09c42": "botmux",
           "b9b5771bb1": "署名",
           "b5f534717a": "合着的",
           "9838c921ed": "共同作者",
@@ -5764,13 +5764,13 @@
           "aa204f185f": "当前 GitHub CLI REST、搜索和 GraphQL 速率限制。",
           "612a440e57": "GitHub API 预算",
           "2cde9044a8": "graphql",
-          "36e3de3619": "避免与过时的历史记录进行比较。如果该分支有未提交的更改或仅在本地的提交，OrcaBotmux 会跳过更新。",
+          "36e3de3619": "避免与过时的历史记录进行比较。如果该分支有未提交的更改或仅在本地的提交，Botmux 会跳过更新。",
           "d072a12995": "git diff main...HEAD",
           "db3a127eb1": "。这使得命令像",
           "3ae3de8898": "master",
           "5bf885be48": "或者",
           "ffba483bae": "main",
-          "976afc6b3e": "当您创建工作区时，OrcaBotmux 会刷新远程库并安全地快进您匹配的本地分支，例如",
+          "976afc6b3e": "当您创建工作区时，Botmux 会刷新远程库并安全地快进您匹配的本地分支，例如",
           "1ec5c91e1d": "选择分支名称是使用您的 Git 用户名、自定义前缀还是不使用前缀。",
           "330f584b50": "分支前缀",
           "1ffaadf0a0": "创建工作树时添加到分支名称的前缀。",
@@ -5813,27 +5813,27 @@
           "264a9b6128": "Linear",
           "4831ba1083": "重新检查",
           "01f6c7582e": "了解更多",
-          "1a62c295c6": "Gitea 凭据已配置，但无法进行身份验证。检查 token、API 基本 URL 和存储库权限；如果环境变量发生更改，则重新启动 OrcaBotmux。",
-          "5a1f86225a": "仅当 OrcaBotmux 无法从远程获取 API URL 时。",
-          "6193444689": "ORCA_GITEA_API_BASE_URL",
+          "1a62c295c6": "Gitea 凭据已配置，但无法进行身份验证。检查 token、API 基本 URL 和存储库权限；如果环境变量发生更改，则重新启动 Botmux。",
+          "5a1f86225a": "仅当 Botmux 无法从远程获取 API URL 时。",
+          "6193444689": "BOTMUX_GITEA_API_BASE_URL",
           "2c0330ec3e": "对于私有存储库，并设置",
-          "e678d89e8c": "ORCA_GITEA_TOKEN",
+          "e678d89e8c": "BOTMUX_GITEA_TOKEN",
           "d9467ab026": "公共仓库通过其 git 远程检测。设置",
           "4ab9b96925": "Gitea",
-          "953b7bf6f7": "Azure DevOps 凭据已配置，但无法进行身份验证。检查 token、API 基本 URL 和存储库权限；如果环境变量发生更改，则重新启动 OrcaBotmux。",
-          "6f317f5132": "仅当 OrcaBotmux 无法从 git 远程派生 API 基本 URL 时。",
-          "ae6b7f5f40": "ORCA_AZURE_DEVOPS_API_BASE_URL",
+          "953b7bf6f7": "Azure DevOps 凭据已配置，但无法进行身份验证。检查 token、API 基本 URL 和存储库权限；如果环境变量发生更改，则重新启动 Botmux。",
+          "6f317f5132": "仅当 Botmux 无法从 git 远程派生 API 基本 URL 时。",
+          "ae6b7f5f40": "BOTMUX_AZURE_DEVOPS_API_BASE_URL",
           "67a9f26a80": "。设置",
-          "8f960935c1": "ORCA_AZURE_DEVOPS_ACCESS_TOKEN",
+          "8f960935c1": "BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN",
           "ce3c58cd63": "，或设置",
-          "5ee6ef6405": "ORCA_AZURE_DEVOPS_TOKEN",
+          "5ee6ef6405": "BOTMUX_AZURE_DEVOPS_TOKEN",
           "4ee74d1470": "设置",
           "5efce6953d": "Azure DevOps",
-          "3c3cf05c63": "Bitbucket 凭据已配置，但无法进行身份验证。检查 token 和存储库权限；如果环境变量发生更改，则重新启动 OrcaBotmux。",
-          "6e0ff3403e": "ORCA_BITBUCKET_ACCESS_TOKEN",
-          "44cde4aa01": "ORCA_BITBUCKET_API_TOKEN",
+          "3c3cf05c63": "Bitbucket 凭据已配置，但无法进行身份验证。检查 token 和存储库权限；如果环境变量发生更改，则重新启动 Botmux。",
+          "6e0ff3403e": "BOTMUX_BITBUCKET_ACCESS_TOKEN",
+          "44cde4aa01": "BOTMUX_BITBUCKET_API_TOKEN",
           "a6c2816115": "和",
-          "b8a7efb3f6": "ORCA_BITBUCKET_EMAIL",
+          "b8a7efb3f6": "BOTMUX_BITBUCKET_EMAIL",
           "8489c0aa49": "Bitbucket",
           "e74de656ce": "glab 身份验证登录",
           "05e5245af7": "GitLab CLI 已安装但未经过身份验证。在终端中运行此命令：",
@@ -5875,9 +5875,9 @@
           "a565377c38": "未安装",
           "15cf990798": "未经过验证",
           "f7eb5f0b24": "未安装",
-          "3ba07f933b": "连接 OrcaBotmux 可用于浏览任务并启动带链接上下文工作区的议题追踪器。",
+          "3ba07f933b": "连接 Botmux 可用于浏览任务并启动带链接上下文工作区的议题追踪器。",
           "70e885705b": "任务提供商",
-          "1683acbac4": "连接 OrcaBotmux 可用于 pull request、merge request、检查和评审状态的源代码主机。",
+          "1683acbac4": "连接 Botmux 可用于 pull request、merge request、检查和评审状态的源代码主机。",
           "298c65ecac": "评审提供商"
         },
         "KagiSessionLinkForm": {
@@ -5897,10 +5897,10 @@
           "1637f64033": "在 VS Code 中打开",
           "98f1a23e1c": "使用默认应用程序打开",
           "400397a10d": "打开键绑定文件菜单",
-          "1c2be2b2c6": "在 OrcaBotmux 中编辑文件",
+          "1c2be2b2c6": "在 Botmux 中编辑文件",
           "c5886a31cc": "无法打开外部编辑器。",
           "cdf794f46d": "键绑定文件不可用。",
-          "dd532a01ce": "无法在 OrcaBotmux 中打开键绑定。"
+          "dd532a01ce": "无法在 Botmux 中打开键绑定。"
         },
         "ManageSessionKillDialog": {
           "6bf4627168": "取消",
@@ -5953,37 +5953,37 @@
           "1861982430": "无法加载 CLI 状态。",
           "8af7a8bc38": "命令针对当前工作树的活动模拟器。坐标从 0..1 标准化。",
           "c7f3fe0a6e": "常用模拟器命令",
-          "d94ca6a623": "使智能体能够使用 OrcaBotmux CLI 命令，包括手机模拟器控制。",
-          "67e19ee03c": "OrcaBotmux CLI 技能",
+          "d94ca6a623": "使智能体能够使用 Botmux CLI 命令，包括手机模拟器控制。",
+          "67e19ee03c": "Botmux CLI 技能",
           "aaf62a3dd2": "安装于",
-          "2fef055608": "注册 OrcaBotmux CLI 命令，以便智能体可以从其 shell 控制活动模拟器。",
-          "4f2205f3b6": "启用 OrcaBotmux CLI",
-          "ff4b7e65d6": "让编码智能体使用 OrcaBotmux CLI 命令控制活动手机模拟器。",
+          "2fef055608": "注册 Botmux CLI 命令，以便智能体可以从其 shell 控制活动模拟器。",
+          "4f2205f3b6": "启用 Botmux CLI",
+          "ff4b7e65d6": "让编码智能体使用 Botmux CLI 命令控制活动手机模拟器。",
           "2a674aa810": "智能体手机模拟器控制",
-          "cdeaed9e37": "在 PATH 中注册 OrcaBotmux CLI。",
-          "3d34423e88": "正在注册 OrcaBotmux CLI",
+          "cdeaed9e37": "在 PATH 中注册 Botmux CLI。",
+          "3d34423e88": "正在注册 Botmux CLI",
           "3be27641c9": "以便智能体 shell 可以运行模拟器命令。",
-          "3941719a56": "打开技能设置前正在检查 OrcaBotmux CLI。"
+          "3941719a56": "打开技能设置前正在检查 Botmux CLI。"
         },
         "MobileEmulatorExamples": {
           "edf13dd03b": "复制",
           "c12b253997": "复制示例提示",
           "d151e25078": "”",
           "b525ff2b12": "”",
-          "4daa95f25a": "将其中任何内容粘贴到安装了 OrcaBotmux CLI 技能的项目中的 Claude Code、Codex 或其他智能体中。",
+          "4daa95f25a": "将其中任何内容粘贴到安装了 Botmux CLI 技能的项目中的 Claude Code、Codex 或其他智能体中。",
           "0820b3f84f": "尝试一下 - 示例提示",
           "1f608e7d60": "复制提示失败。",
           "2b077b5544": "已复制提示。"
         },
         "MobileEmulatorSettingsPane": {
-          "19d39113b6": "让编码智能体使用 OrcaBotmux CLI 命令控制活动手机模拟器。",
+          "19d39113b6": "让编码智能体使用 Botmux CLI 命令控制活动手机模拟器。",
           "f2f8d97bb6": "智能体手机模拟器控制",
           "143961d031": "默认设备",
           "8aec2f99a0": "刷新模拟器可用性",
           "ae1612c58c": "可用性",
           "f9af91ea26": "显示“新建手机模拟器”操作并允许智能体连接到活动模拟器。",
           "700ddbf9b1": "启用手机模拟器",
-          "bc39d0f115": "配置对 OrcaBotmux 和编码智能体的手机模拟器支持。",
+          "bc39d0f115": "配置对 Botmux 和编码智能体的手机模拟器支持。",
           "6593c9ddd3": "手机模拟器",
           "a4f1c82d90": "已禁用",
           "b5e2d93e01": "检查中...",
@@ -5992,17 +5992,17 @@
           "06b06429c6": "正在检查 Android SDK 和 iOS 模拟器支持。",
           "6d1483d4a0": "检测到 1 个模拟器设备。",
           "0a452d4d3b": "检测到 {{value0}} 个模拟器设备。",
-          "f62a1bb759": "检测到设备后，OrcaBotmux 会自动选择一个模拟器设备。",
+          "f62a1bb759": "检测到设备后，Botmux 会自动选择一个模拟器设备。",
           "b2fd62ea75": "新模拟器标签页和智能体附加命令使用的默认设备。自动选择会优先使用已在运行的设备。"
         },
         "MobileNetworkInterfaceSection": {
-          "63d5e4ae1e": "重新生成二维码并从 OrcaBotmux 手机应用程序扫描。",
+          "63d5e4ae1e": "重新生成二维码并从 Botmux 手机应用程序扫描。",
           "87985ba6f5": "在此网络接口菜单中，选择 Tailscale 地址，通常是 100.x.y.z IP。",
           "1f7c26d36a": "在两台设备上登录相同的 tailnet。",
           "668016be7a": "在您的计算机和手机上。",
           "1dc87a7fbc": "Tailscale",
           "51d29927eb": "安装",
-          "9fc5d203ff": "OrcaBotmux 手机端 直接连接到此计算机。要在远离同一本地网络的地方使用它，请将您的计算机和手机置于同一私有覆盖网络上，然后使用所选的网络地址生成二维码。",
+          "9fc5d203ff": "Botmux 手机端 直接连接到此计算机。要在远离同一本地网络的地方使用它，请将您的计算机和手机置于同一私有覆盖网络上，然后使用所选的网络地址生成二维码。",
           "39fad211d9": "使用尾网连接 Wi-Fi 外部",
           "a9db5d771d": "刷新网络接口",
           "b2c384cfd6": "没有找到接口",
@@ -6012,14 +6012,14 @@
           "1e64659126": "再生"
         },
         "MobilePane": {
-          "dd3cd78d04": "使用 OrcaBotmux 手机端 扫描",
-          "35100bca5d": "当您在手机上使用终端时，OrcaBotmux 会将其缩小以适合您的手机屏幕。当您关闭应用程序或切换离开时，这可以控制它是保持手机大小（因此交互式 CLI 工具不会回流）还是将大小调整回桌面。您始终可以在横幅上使用“恢复此终端”或“恢复所有终端”来手动调整大小。",
+          "dd3cd78d04": "使用 Botmux 手机端 扫描",
+          "35100bca5d": "当您在手机上使用终端时，Botmux 会将其缩小以适合您的手机屏幕。当您关闭应用程序或切换离开时，这可以控制它是保持手机大小（因此交互式 CLI 工具不会回流）还是将大小调整回桌面。您始终可以在横幅上使用“恢复此终端”或“恢复所有终端”来手动调整大小。",
           "ee56f1c7e4": "当您离开手机应用程序时",
           "3939fd062c": "撤销设备会立即断开连接。",
           "254a6d09e4": "配对",
           "d7ce676270": "配对设备",
           "e778ecb209": "或者将此代码粘贴到手机应用程序中：",
-          "310924ad2c": "使用 OrcaBotmux 手机应用程序扫描此代码。每个代码都会创建一个唯一的设备token。",
+          "310924ad2c": "使用 Botmux 手机应用程序扫描此代码。每个代码都会创建一个唯一的设备token。",
           "870e1b5ca5": "撤销设备失败",
           "2e3dd0bc29": "设备已撤销",
           "711231348f": "复制配对码失败",
@@ -6032,20 +6032,20 @@
           "aa1263e881": "保持手机尺寸（默认）",
           "6436e56546": "用于手机配对的二维码",
           "1b1b70279a": "尚未配对任何设备。",
-          "1592afcc7a": "尚未配对任何设备。使用 OrcaBotmux 手机应用程序扫描二维码。",
+          "1592afcc7a": "尚未配对任何设备。使用 Botmux 手机应用程序扫描二维码。",
           "relayDegradedNotice": "Relay couldn’t be reached — this code only works on your local network. Regenerate to try again."
         },
         "MobileSettingsPane": {
           "9a3c280e49": "GitHub 发布",
           "b0088412a1": "或 Android APK 来自",
           "b5a2ed83ff": "应用商店",
-          "c8491c17ef": "通过扫描二维码从手机控制 OrcaBotmux。 Beta/早期预览 - 预计会出现错误和重大更改。从以下位置获取 iOS 应用程序",
+          "c8491c17ef": "通过扫描二维码从手机控制 Botmux。 Beta/早期预览 - 预计会出现错误和重大更改。从以下位置获取 iOS 应用程序",
           "e7a3ae8c4e": "移动端",
           "174f4a3c6d": "通过手机控制终端和智能体。",
-          "1de96ec8a6": "显示 OrcaBotmux 手机端按钮",
-          "682293cadf": "在左侧边栏顶部显示 OrcaBotmux 手机端按钮。",
-          "d4f2b65f30": "在边栏中显示 OrcaBotmux 手机端 快捷入口。",
-          "installIntro": "从以下应用商店安装 OrcaBotmux Mobile",
+          "1de96ec8a6": "显示 Botmux 手机端按钮",
+          "682293cadf": "在左侧边栏顶部显示 Botmux 手机端按钮。",
+          "d4f2b65f30": "在边栏中显示 Botmux 手机端 快捷入口。",
+          "installIntro": "从以下应用商店安装 Botmux Mobile",
           "installOutro": "，然后在下方配对。",
           "androidApkLabel": "Android APK"
         },
@@ -6056,7 +6056,7 @@
           "2a42dd8d6f": "通知音量",
           "4aa5085cd7": "风俗：",
           "c258cb96dc": "选择通知声音",
-          "2a2033c388": "选择发送桌面通知时 OrcaBotmux 播放的警报。",
+          "2a2033c388": "选择发送桌面通知时 Botmux 播放的警报。",
           "88686e6ca8": "通知声音",
           "b6fc369244": "后台终端发出响铃字符。",
           "591fe605b9": "终端响铃",
@@ -6067,11 +6067,11 @@
           "0fadad17ce": "无法播放通知声音",
           "406feb0aa6": "测试通知未送达",
           "6fc3781729": "通知已禁用",
-          "4676a95bc3": "检查 OrcaBotmux 的桌面通知设置。",
+          "4676a95bc3": "检查 Botmux 的桌面通知设置。",
           "0cb93240b8": "系统没有显示通知",
           "145227ca2b": "打开设置",
           "d3d54e0915": "已发送测试通知",
-          "115437bc35": "如果没有出现 macOS 横幅，请启用 OrcaBotmux 的允许通知。",
+          "115437bc35": "如果没有出现 macOS 横幅，请启用 Botmux 的允许通知。",
           "7f45542625": "要求测试通知",
           "98d70fb261": "自定义通知声音无法播放",
           "c83b05a055": "该系统不支持通知",
@@ -6083,7 +6083,7 @@
         "OpenAiTranscriptionKeyDialog": {
           "fa83512e48": "保存密钥",
           "07b26f2742": "清除键",
-          "d246b2bdb3": "本地运行时密钥使用 Electron 加密存储（如果可用）存储在 ~/.orca_botmux 中。",
+          "d246b2bdb3": "本地运行时密钥使用 Electron 加密存储（如果可用）存储在 ~/.botmux 中。",
           "c3380e4ca5": "sk-...",
           "2f797018f0": "API 密钥已配置",
           "16015322f9": "API密钥",
@@ -6121,13 +6121,13 @@
           "ae79504732": "如何使用",
           "7bc082f4de": "复制安装命令",
           "832f1f3ee6": "更喜欢自己的终端？",
-          "9bedd2a6e5": "使智能体能够通过 OrcaBotmux 传递上下文并协调工作。",
+          "9bedd2a6e5": "使智能体能够通过 Botmux 传递上下文并协调工作。",
           "07641b9768": "编排技能",
           "2aacdb0517": "跨切换、工作树切换和子智能体工作协调编码智能体。",
           "191ac34567": "智能体编排"
         },
         "OrchestrationSetupCard": {
-          "e7d2a5146c": "使智能体能够通过 OrcaBotmux 传递上下文并协调工作。",
+          "e7d2a5146c": "使智能体能够通过 Botmux 传递上下文并协调工作。",
           "2777ff0fdc": "编排技能"
         },
         "OrchestrationSkillAgentCoverage": {
@@ -6174,7 +6174,7 @@
           "e3970bbbf5": "由于设置了 CI 环境变量，遥测被禁用。取消设置并重新启动。",
           "fe904ac984": "共享匿名使用数据",
           "77410e0566": "隐私政策",
-          "8bfdd23a88": "帮助我们弄清楚下一步要构建什么。 OrcaBotmux 会发送匿名计数，记录您使用的功能以及出现故障的位置。",
+          "8bfdd23a88": "帮助我们弄清楚下一步要构建什么。 Botmux 会发送匿名计数，记录您使用的功能以及出现故障的位置。",
           "afec8b03be": "CI"
         },
         "QuickCommandsPane": {
@@ -6206,14 +6206,14 @@
           "a867a0889f": "最近或标签栏。"
         },
         "RepositoryHooksSection": {
-          "af49e2a19e": "该文件存在，但 OrcaBotmux 找不到有效的“scripts”或“issueCommand”定义。",
+          "af49e2a19e": "该文件存在，但 Botmux 找不到有效的“scripts”或“issueCommand”定义。",
           "3397879bee": "并且本地命令存在，选择哪个运行。",
-          "39da2ae12f": "OrcaBotmux.yaml",
+          "39da2ae12f": "Botmux.yaml",
           "ac9038d2cc": "当两者",
           "32fec28f5b": "命令源",
-          "bbbd6e0bc4": "命令源 & orca_botmux.yaml",
+          "bbbd6e0bc4": "命令源 & botmux.yaml",
           "c9bc1bfd8f": "高级",
-          "610d90fdbd": "命令源和 orca_botmux.yaml 详细信息。",
+          "610d90fdbd": "命令源和 botmux.yaml 详细信息。",
           "52aef29e69": "留空以使用仓库默认值",
           "4084720f47": "完成 {{artifact_url}}",
           "13394103bd": "自定义 GitHub 议题命令",
@@ -6228,7 +6228,7 @@
           "fb6bebcf7e": "何时运行安装程序",
           "30d555acd2": "创建新工作树后运行的本地和共享脚本。",
           "52b31baf02": "设置脚本",
-          "8567127a40": "创建或归档工作树时运行的脚本。本地脚本存储在本机上； `orca_botmux.yaml` 脚本与您的团队共享。",
+          "8567127a40": "创建或归档工作树时运行的脚本。本地脚本存储在本机上； `botmux.yaml` 脚本与您的团队共享。",
           "ff082fe7c6": "工作树挂钩",
           "5d940bde5c": "添加本地脚本",
           "8c2893fae0": "作为单个 shell 脚本运行。保存在本机上。",
@@ -6242,17 +6242,17 @@
           "b2b06c7ce8": "可用的环境变量（将鼠标悬停以查看详细信息）：",
           "95a0411b3e": "模板",
           "175daba180": "例子",
-          "b20c5df6ca": "添加“orca_botmux.yaml”文件以启用此仓库的共享设置、存档或议题自动化默认值。示例模板：",
-          "56f9a4a1d0": "正在使用 `orca_botmux.yaml`",
-          "623e0c9f31": "无法解析 `orca_botmux.yaml`",
-          "5a67e4793d": "未检测到 `orca_botmux.yaml`",
+          "b20c5df6ca": "添加“botmux.yaml”文件以启用此仓库的共享设置、存档或议题自动化默认值。示例模板：",
+          "56f9a4a1d0": "正在使用 `botmux.yaml`",
+          "623e0c9f31": "无法解析 `botmux.yaml`",
+          "5a67e4793d": "未检测到 `botmux.yaml`",
           "07ba35bc68": "检查 `scripts:` 下的缩进。钩子键应使用两个空格，命令行应使用四个空格。",
           "787ca433ef": "仅定义支持的键：`scripts`、`setup`、`archive` 和 `issueCommand`。",
           "ecc73d9125": "将你的文件与下面可用的模板进行比较，并在需要时复制该结构。",
           "925f9e0dc4": "文本前景",
-          "0cc712b823": "核心配置文件存在于仓库根目录中，但 OrcaBotmux 尚无法解析支持的钩子定义。",
+          "0cc712b823": "核心配置文件存在于仓库根目录中，但 Botmux 尚无法解析支持的钩子定义。",
           "c90b858573": "文本-​​Amber-700 深色：文本-Amber-300",
-          "aba825233f": "该文件包含此版本的 OrcaBotmux 无法识别的配置密钥。您可能需要更新 OrcaBotmux，或检查文件是否有拼写错误。",
+          "aba825233f": "该文件包含此版本的 Botmux 无法识别的配置密钥。您可能需要更新 Botmux，或检查文件是否有拼写错误。",
           "ca424ff135": "共享挂钩和议题自动化默认值在仓库中定义，可供所有使用它的人使用。",
           "32f417fe17": "文本-​​emerald-700 深色：文本-emerald-300",
           "8bfe65fc60": "使用本地命令",
@@ -6260,15 +6260,15 @@
           "0fa21e19ec": "工作区的名称，通常基于分支名称。",
           "54c73d88d0": "正在创建的工作树的路径。安装命令从此目录运行。",
           "30952c4aa4": "主仓库检出目录的路径。对于将共享文件（例如 .env）复制到工作树中非常有用。",
-          "9b821fa19d": "# e.g. echo \"Cleaning up $ORCA_WORKSPACE_NAME\"",
+          "9b821fa19d": "# e.g. echo \"Cleaning up $BOTMUX_WORKSPACE_NAME\"",
           "6f90ebe3fd": "在归档或删除工作树之前运行。",
-          "a3fc966677": "# e.g. pnpm install cp \"$ORCA_ROOT_PATH/.env\" \"$ORCA_WORKTREE_PATH/.env\"",
+          "a3fc966677": "# e.g. pnpm install cp \"$BOTMUX_ROOT_PATH/.env\" \"$BOTMUX_WORKTREE_PATH/.env\"",
           "f0710e1c83": "创建新工作树后运行；安装 deps，复制 env 文件，运行迁移。",
-          "8561b0665f": "首先是 orca_botmux.yaml，然后是本地命令。",
-          "0e8b2a520d": "忽略 orca_botmux.yaml；仅运行本地命令。",
+          "8561b0665f": "首先是 botmux.yaml，然后是本地命令。",
+          "0e8b2a520d": "忽略 botmux.yaml；仅运行本地命令。",
           "83dc78202a": "仅限本地",
           "29397e8bbc": "仅运行已 commit 的仓库命令；忽略本地命令。",
-          "d88b6ff88f": "仅 OrcaBotmux.yaml",
+          "d88b6ff88f": "仅 Botmux.yaml",
           "99e3264a49": "仅在选择时运行安装程序。",
           "15debc1fd9": "默认跳过",
           "022ba10cf2": "自动运行安装程序。",
@@ -6285,8 +6285,8 @@
           "4611b78617": "命令源",
           "c5a55a2d2e": "高级",
           "b5e3e77e89": "操作",
-          "0ce113fd7b": "保存本地脚本，但脚本源仅设置为 orca_botmux.yaml。",
-          "7f78e5eea6": "保存本地脚本。 OrcaBotmux 仍在检查 orca_botmux.yaml，然后才能建议使用哪个脚本源。",
+          "0ce113fd7b": "保存本地脚本，但脚本源仅设置为 botmux.yaml。",
+          "7f78e5eea6": "保存本地脚本。 Botmux 仍在检查 botmux.yaml，然后才能建议使用哪个脚本源。",
           "2b6356e744": "已保存",
           "81057d5f71": "保存中...",
           "da37d6f10e": "复制",
@@ -6327,7 +6327,7 @@
           "26fef02bf3": "项目图标",
           "c7ef4415de": "显示名称",
           "b0a0c14a1c": "侧边栏和选项卡的项目特定显示详细信息。",
-          "removeProjectAllHosts": "从所有已配置主机的 OrcaBotmux 中删除该项目。",
+          "removeProjectAllHosts": "从所有已配置主机的 Botmux 中删除该项目。",
           "0909e5d650": "删除项目",
           "ee5a290616": "作为文件夹打开。 Git 功能对此工作区不可用。",
           "323debba71": "类型：",
@@ -6345,8 +6345,8 @@
           "setupPathPending": "路径待定",
           "openSetup": "打开",
           "removeSetup": "移除",
-          "hostSetupBlockedVersion": "OrcaBotmux 服务器版本不兼容",
-          "hostSetupMissingCapability": "在此主机上更新 OrcaBotmux 以设置项目",
+          "hostSetupBlockedVersion": "Botmux 服务器版本不兼容",
+          "hostSetupMissingCapability": "在此主机上更新 Botmux 以设置项目",
           "setupProjectOnHost": "在其他主机上设置",
           "setupProjectOnHostHelp": "选择一台主机，然后导入已有检出、在那里克隆仓库，或跟踪稍后才配置的设置。",
           "setupExistingFolder": "导入现有文件夹",
@@ -6449,16 +6449,16 @@
           "bb90dd6487": "删除服务器",
           "d2e00809e4": "切换",
           "05e0fc3ebf": "切换到",
-          "b2290ed203": "OrcaBotmux 会聚焦此主机并加载其项目。其他主机上的现有终端和浏览器标签页会保持运行。",
+          "b2290ed203": "Botmux 会聚焦此主机并加载其项目。其他主机上的现有终端和浏览器标签页会保持运行。",
           "d570c35a99": "切换服务器",
-          "84b9b2be05": "创建可撤销的访问授权，以便浏览器或其他 OrcaBotmux 客户端可以连接。",
-          "6e1280ca55": "分享此 OrcaBotmux 服务器",
+          "84b9b2be05": "创建可撤销的访问授权，以便浏览器或其他 Botmux 客户端可以连接。",
+          "6e1280ca55": "分享此 Botmux 服务器",
           "9a3758d983": "没有保存的服务器。",
           "9bee6bbeeb": "添加服务器",
           "55fcc964cd": "在服务器上运行，并粘贴输出的配对 URL。",
-          "960e901ae4": "orca-botmux-desktop serve --pairing-address <host>",
+          "960e901ae4": "botmux-desktop serve --pairing-address <host>",
           "163671f7b5": "运行",
-          "c3d772c514": "orca_botmux://pair?code=...",
+          "c3d772c514": "botmux://pair?code=...",
           "9bc9b83474": "配对码",
           "e038625857": "开发环境",
           "54ebacc600": "服务器名称",
@@ -6476,12 +6476,12 @@
           "0c55a47480": "需要名称和配对代码。",
           "e6410d72c3": "无法加载运行时环境。",
           "6ef71985da": "无终点",
-          "ed3e3f069d": "这将从 OrcaBotmux 中删除保存的服务器。它不会更改活动服务器。",
+          "ed3e3f069d": "这将从 Botmux 中删除保存的服务器。它不会更改活动服务器。",
           "b2fda48c39": "删除活动服务器会使此浏览器与该主机断开连接。现有主机会话会保持不变。",
-          "9f7665a01b": "删除活动服务器会先将 OrcaBotmux 切换回本地桌面。现有主机会话会保持不变。",
+          "9f7665a01b": "删除活动服务器会先将 Botmux 切换回本地桌面。现有主机会话会保持不变。",
           "3595fd1948": "新链接",
           "54dee18f5c": "隐藏表格",
-          "8cf8790697": "已保存的服务器会通过配对的 OrcaBotmux 运行时路由此浏览器。",
+          "8cf8790697": "已保存的服务器会通过配对的 Botmux 运行时路由此浏览器。",
           "f75ce1c7a5": "本地会保留当前的桌面行为。已保存的服务器会通过远程运行时路由受支持的客户端调用。",
           "d25f0688b1": "移除",
           "f3a3d6d834": "{{value0}} 功能",
@@ -6499,29 +6499,29 @@
           "hostModelCapabilityTaskSourceContext": "任务来源上下文",
           "hostModelCapabilityWorkspaceRunContext": "工作区运行上下文",
           "3f67e8078a": "默认使用此电脑。仅当你希望受支持的项目、文件、终端、提供商检查以及浏览器/移动端接续通过某个服务器运行时，才选择已保存的服务器。",
-          "2c85efb3e8": "选择已保存的服务器后，此浏览器会将配对的 OrcaBotmux 运行时用作默认主机。",
+          "2c85efb3e8": "选择已保存的服务器后，此浏览器会将配对的 Botmux 运行时用作默认主机。",
           "serverConnected": "已连接",
           "serverChecking": "正在检查…",
           "serverDisconnected": "已断开连接",
           "disconnectedServer": "已断开与 {{value0}} 的连接。",
           "connectToRemoteServers": "连接到远程服务器",
-          "connectToRemoteServersHelp": "配对另一个 OrcaBotmux 运行时，然后在此处连接或断开连接。仅当你想更改默认主机时，才使用高级 > 活动服务器。",
+          "connectToRemoteServersHelp": "配对另一个 Botmux 运行时，然后在此处连接或断开连接。仅当你想更改默认主机时，才使用高级 > 活动服务器。",
           "activeServerRowHelp": "用于通过服务器路由的项目、终端和提供商检查的活动服务器。",
           "disconnect": "断开连接",
           "connect": "连接",
           "advanced": "高级",
           "serverDetails": "服务器详细信息",
           "advertiseThisApp": "将此应用作为服务器公布",
-          "advertiseThisAppHelp": "创建访问链接，让浏览器、移动客户端或另一个 OrcaBotmux 客户端连接回这个正在运行的应用。",
+          "advertiseThisAppHelp": "创建访问链接，让浏览器、移动客户端或另一个 Botmux 客户端连接回这个正在运行的应用。",
           "runtimeReachable": "可连接到 {{value0}}。"
         },
         "RuntimePairingGeneratedUrlRows": {
           "0495f68959": "复制 {{value0}}"
         },
         "RuntimePairingUrlGenerator": {
-          "849825e829": "将此配对 URL 粘贴到另一个 OrcaBotmux 客户端中。",
-          "2e5c4e3c93": "与另一个 OrcaBotmux 客户端配对",
-          "f7cafdc9f3": "浏览器链接在此版本中不可用。配对 URL 仍然适用于 OrcaBotmux 客户端。",
+          "849825e829": "将此配对 URL 粘贴到另一个 Botmux 客户端中。",
+          "2e5c4e3c93": "与另一个 Botmux 客户端配对",
+          "f7cafdc9f3": "浏览器链接在此版本中不可用。配对 URL 仍然适用于 Botmux 客户端。",
           "6b9ca3e69b": "在浏览器中打开",
           "1ca2e5194d": "从可以到达所选地址的浏览器使用此 URL。",
           "8de0f84fff": "生成访问链接",
@@ -6532,7 +6532,7 @@
           "de6d5cff95": "这台电脑（",
           "de77eb1b65": "连接地址",
           "ff80904fc4": "为浏览器或桌面客户端创建可撤销的访问授权。",
-          "f8500e134a": "分享此 OrcaBotmux 服务器",
+          "f8500e134a": "分享此 Botmux 服务器",
           "d6c081adf4": "复制 URL 失败。",
           "df0aa45a86": "复制的配对 URL。",
           "13704d635e": "复制的 Web 客户端 URL。",
@@ -6568,10 +6568,10 @@
           "c40dadaac8": "移动端",
           "c2ee313198": "通过 SSH 使用已有机器处理文件、终端、Git 和工作区。",
           "9b02492d1f": "SSH 远程主机",
-          "b5ee17826b": "配对远程 OrcaBotmux 运行时，以获得持久会话、更丰富的远程状态，以及 Web 或移动端接续。",
-          "7686cb5c36": "将此浏览器连接到已保存的 OrcaBotmux 服务器。",
-          "bd0181eeca": "远程 OrcaBotmux 服务器",
-          "8acf3f22e0": "OrcaBotmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
+          "b5ee17826b": "配对远程 Botmux 运行时，以获得持久会话、更丰富的远程状态，以及 Web 或移动端接续。",
+          "7686cb5c36": "将此浏览器连接到已保存的 Botmux 服务器。",
+          "bd0181eeca": "远程 Botmux 服务器",
+          "8acf3f22e0": "Botmux 统计，以及 Claude、Codex、OpenCode Token 分析和 Grok 订阅使用量。",
           "954a8f5aef": "统计和使用情况",
           "a737a4bb22": "常见操作的键盘快捷键。",
           "23bf7a1ad4": "快捷键",
@@ -6583,7 +6583,7 @@
           "2b4474780a": "外观",
           "3d9adfe6a5": "全局终端、浏览器和 Markdown 选项卡。",
           "3eb22a3ada": "浮动工作区",
-          "01f9d36292": "配置对 OrcaBotmux 和编码智能体的手机模拟器支持。",
+          "01f9d36292": "配置对 Botmux 和编码智能体的手机模拟器支持。",
           "f75daf1002": "手机模拟器",
           "ad9788036f": "主页、链接路由和会话 cookie。",
           "c46215ea03": "浏览器",
@@ -6599,15 +6599,15 @@
           "c9ca101a3b": "集成",
           "f9b77539fd": "工作区默认值、应用程序设置和维护。",
           "7807c11c4d": "通用",
-          "6855b0f77d": "完成使 OrcaBotmux 对于并行智能体工作有用的核心工作流程。",
+          "6855b0f77d": "完成使 Botmux 对于并行智能体工作有用的核心工作流程。",
           "6d119427ef": "入门清单",
           "eb1176a14e": "使用设备上模型进行本地语音到文本听写。",
           "5063bb47a5": "语音",
           "7118953f14": "使智能体能够控制您计算机上的任何应用程序。",
           "c9841721cb": "计算机控制",
-          "475980f53d": "通过 OrcaBotmux 协调多个编码智能体。",
+          "475980f53d": "通过 Botmux 协调多个编码智能体。",
           "00c3a7950d": "编排",
-          "21f09426ea": "可选。 OrcaBotmux 可与您现有的提供商登录配合使用；仅当您希望 OrcaBotmux 帮助在账户之间切换时才添加账户。",
+          "21f09426ea": "可选。 Botmux 可与您现有的提供商登录配合使用；仅当您希望 Botmux 帮助在账户之间切换时才添加账户。",
           "ad6c529693": "AI 提供商账户",
           "ec1ba547f7": "管理 AI 智能体、设置默认值并自定义命令。",
           "8afa676615": "智能体",
@@ -6674,10 +6674,10 @@
         },
         "ShortcutTerminalPolicyControl": {
           "0762983d13": "终端优先",
-          "63308571d8": "OrcaBotmux 优先",
+          "63308571d8": "Botmux 优先",
           "c43c7ff5f9": "决定谁首先拦截捷径",
           "c3a554288e": "终端中的快捷键",
-          "0f55c6f15c": "选择当快捷键重叠时 OrcaBotmux 或焦点终端是否获胜。"
+          "0f55c6f15c": "选择当快捷键重叠时 Botmux 或焦点终端是否获胜。"
         },
         "ShortcutsPane": {
           "4b7ae34062": "直接地。",
@@ -6686,12 +6686,12 @@
           "f0b35b0b2e": "当终端或 TUI 具有键盘焦点时禁用。",
           "5c65d5db9d": "终端优先",
           "dfa8ff612f": "也在终端或 TUI 具有键盘焦点时运行。",
-          "2a0e8aeccf": "OrcaBotmux 优先",
+          "2a0e8aeccf": "Botmux 优先",
           "3c0fac059a": "当终端具有键盘焦点时仍然运行。",
           "25b0004fbf": "终端活跃",
           "781cb74d22": "从终端窗格运行。",
           "cb02e00202": "终端",
-          "d8c988dab4": "~/.orca_botmux/keybindings.json"
+          "d8c988dab4": "~/.botmux/keybindings.json"
         },
         "SourceControlAiActionRecipeDefaults": {
           "2576299196": "参数",
@@ -6700,7 +6700,7 @@
           "2cb4bb7e5d": "CLI 参数",
           "0740d30915": "自定义命令",
           "ee0e5c2a48": "使用默认智能体",
-          "bf84dea6af": "仅当您希望 OrcaBotmux 注入上下文时才使用变量。将智能体保留为默认值以遵循您的正常智能体偏好。",
+          "bf84dea6af": "仅当您希望 Botmux 注入上下文时才使用变量。将智能体保留为默认值以遵循您的正常智能体偏好。",
           "a79c567194": "操作方案",
           "cf01d41bce": "每个源代码管理 AI 按钮使用的智能体、CLI 参数和提示词模板。",
           "a9359c8aa9": "未知错误",
@@ -6758,7 +6758,7 @@
           "c0f1c80166": "未配置 SSH 目标。",
           "639ceb3698": "添加目标",
           "51d7dba44d": "导入",
-          "a7d28dff81": "添加远程主机以在 OrcaBotmux 中连接到它。",
+          "a7d28dff81": "添加远程主机以在 Botmux 中连接到它。",
           "94c5284560": "目标",
           "f495689b82": "导入失败",
           "f8050f6307": "已同步 {{value0}} 服务器{{value1}}",
@@ -6825,7 +6825,7 @@
         "SshTargetForm": {
           "fea9cb402e": "取消",
           "1b19b00e93": "有限超时时间必须介于 60 秒到 7 天之间。",
-          "137e88ce8d": "OrcaBotmux 与此主机断开连接后，远程终端会继续运行。",
+          "137e88ce8d": "Botmux 与此主机断开连接后，远程终端会继续运行。",
           "b574994adc": "需要停止它们时，请使用“结束远程终端”或“重置中继”。",
           "71fc546097": "保持终端运行直到重置",
           "92f80edbfd": "远程终端持久化",
@@ -6885,7 +6885,7 @@
           "52854a5608": "堵塞",
           "e070e8aeba": "酒吧",
           "db270cc9a9": "Cursor 形状",
-          "d455f2ef4f": "OrcaBotmux 终端窗格的默认光标外观。",
+          "d455f2ef4f": "Botmux 终端窗格的默认光标外观。",
           "abcb4dd019": "终端光标",
           "70beb1bbc7": "预览",
           "31f6e61085": "目前连字",
@@ -7028,7 +7028,7 @@
           "db210115c5": "灯光模式预览",
           "5e0c24b5c8": "控制浅色模式下窗格之间的分割分隔线。",
           "ec2e33ad80": "分光器颜色",
-          "d56af60e6f": "选择 OrcaBotmux 处于浅色模式时使用的主题。",
+          "d56af60e6f": "选择 Botmux 处于浅色模式时使用的主题。",
           "8273bc75d7": "浅色主题",
           "bc8e8a251a": "深色模式预览",
           "cbe56a0f79": "控制深色模式下窗格之间的分割分隔线。",
@@ -7059,7 +7059,7 @@
           "1afcc1d973": "垂直内边距",
           "25e2f8e8e1": "终端网格周围的水平填充（以像素为单位）。",
           "36b8402015": "水平填充",
-          "53ce336e15": "重新启动 OrcaBotmux 以应用窗口模糊更改。",
+          "53ce336e15": "重新启动 Botmux 以应用窗口模糊更改。",
           "c65bb9ce63": "需要重新启动",
           "97950bb087": "将背景模糊应用到终端窗口。需要重新启动。",
           "2b82242f43": "窗口模糊",
@@ -7188,12 +7188,12 @@
           "41a1480d3e": "安装",
           "4598b18464": "正在删除...",
           "7c3bb36706": "移除",
-          "7ee4e52b99": "OrcaBotmux 将注册 {{value0}} ，以便该命令在 WSL 终端上运行。",
-          "d8216eb22e": "这会删除 WSL shell 命令。 OrcaBotmux 本身仍安装在 Windows 上。",
+          "7ee4e52b99": "Botmux 将注册 {{value0}} ，以便该命令在 WSL 终端上运行。",
+          "d8216eb22e": "这会删除 WSL shell 命令。 Botmux 本身仍安装在 Windows 上。",
           "e49688f67f": "在 WSL 中注册 `{{value0}}`？",
           "61ac55278e": "从 WSL 中删除“{{value0}}”？",
           "e2b0ee267f": "陈旧",
-          "7aa456a460": "在 WSL 内的 ~/.local/bin 中注册 `orca-botmux-ide`。",
+          "7aa456a460": "在 WSL 内的 ~/.local/bin 中注册 `botmux-ide`。",
           "0307677bb9": "正在检查 WSL CLI 注册..."
         },
         "accounts": {
@@ -7338,7 +7338,7 @@
             "651f35b2c6": "切换器",
             "e5bc35d59e": "窗户",
             "d18b54ca90": "码头",
-            "1f2880a9d5": "orca_botmux",
+            "1f2880a9d5": "botmux",
             "2cfb3420c0": "应用程序图标",
             "e80c2af428": "选择 Dock 和窗口切换器中显示的应用程序图标。",
             "2b313598c6": "应用程序图标",
@@ -7349,8 +7349,8 @@
             "5bff6a2ef0": "侧边栏",
             "5e5b8878bf": "手机",
             "74618577c7": "移动端",
-            "682293cadf": "在左侧边栏顶部显示 OrcaBotmux 手机端按钮。",
-            "1de96ec8a6": "显示 OrcaBotmux 手机端按钮",
+            "682293cadf": "在左侧边栏顶部显示 Botmux 手机端按钮。",
+            "1de96ec8a6": "显示 Botmux 手机端按钮",
             "4c920ab2d1": "日程",
             "58f4e22fa2": "自动化",
             "b186f3cefb": "自动化",
@@ -7365,7 +7365,7 @@
             "51f957ce39": "姓名",
             "36e006efc1": "应用程序",
             "bed343b03e": "标题栏",
-            "18b4c4c30b": "在标题栏中显示 OrcaBotmux。",
+            "18b4c4c30b": "在标题栏中显示 Botmux。",
             "fdd31b00d0": "标题栏应用程序名称",
             "c1bca1885a": "文件浏览器",
             "9f2df826ac": "被忽略",
@@ -7379,7 +7379,7 @@
             "8b36fb3f64": "版式",
             "a0e09aed9c": "字体",
             "24094af355": "字体",
-            "07c7c38fac": "选择 OrcaBotmux 界面使用的字体。",
+            "07c7c38fac": "选择 Botmux 界面使用的字体。",
             "ddb991024d": "IDE字体",
             "0c83659f48": "捷径",
             "0952091186": "比例",
@@ -7389,7 +7389,7 @@
             "3a9b69d734": "系统",
             "44d873fd18": "浅色",
             "262fe1d24f": "深色",
-            "0709c794f7": "选择 OrcaBotmux 在应用程序窗口中的外观。",
+            "0709c794f7": "选择 Botmux 在应用程序窗口中的外观。",
             "71e06350b4": "主题",
             "dc02c8759d": "工作区",
             "43cfba3b95": "服务器",
@@ -7463,7 +7463,7 @@
               "detailed": "详细"
             },
             "9a115966d3": "关闭时最小化到托盘",
-            "4d5b9427b5": "启用后，关闭窗口会让 OrcaBotmux 继续在系统托盘中运行，而不是退出。",
+            "4d5b9427b5": "启用后，关闭窗口会让 Botmux 继续在系统托盘中运行，而不是退出。",
             "showPinnedWorktreesInGroups": {
               "title": "也在原来的列表中显示已固定的工作树",
               "description": "已固定的工作树会保留在 Pinned 中，同时也显示在全部、项目、状态和 PR 中。"
@@ -7517,7 +7517,7 @@
             "66dd641a47": "会话",
             "29193a51d5": "曲奇饼",
             "2d2d995c58": "浏览器",
-            "060ac1fcba": "从 Chrome、Edge 或其他浏览器导入 cookie，以使用 OrcaBotmux 内的现有登录信息。",
+            "060ac1fcba": "从 Chrome、Edge 或其他浏览器导入 cookie，以使用 Botmux 内的现有登录信息。",
             "96afedcb5c": "会话和 Cookie",
             "a7a07d5415": "编辑",
             "8dd4805991": "文件",
@@ -7556,7 +7556,7 @@
             "a942905148": "创建新浏览器选项卡时打开的 URL。留空以打开空白选项卡。",
             "c3903322d2": "默认主页",
             "19ea5607cf": "本地主机工作区标签",
-            "4e0fdf0a3f": "将工作区端口打开为特定于工作区的 OrcaBotmux localhost URL，便于区分浏览器标签页。"
+            "4e0fdf0a3f": "将工作区端口打开为特定于工作区的 Botmux localhost URL，便于区分浏览器标签页。"
           },
           "use": {
             "search": {
@@ -7581,21 +7581,21 @@
               "cee44fb442": "自动化",
               "a57c2172dc": "智能体浏览器",
               "6ea88e5206": "恩克斯",
-              "f5b8fdddf5": "orca-botmux-cli",
+              "f5b8fdddf5": "botmux-cli",
               "e5a784bc54": "安装",
               "9d97446873": "智能体",
               "a2d489263e": "技能",
-              "a7e82445fa": "安装浏览器使用技能，以便智能体可以操作 OrcaBotmux 的浏览器。",
+              "a7e82445fa": "安装浏览器使用技能，以便智能体可以操作 Botmux 的浏览器。",
               "a1414dcefb": "安装浏览器使用技能",
               "e56c7b55c9": "设置",
               "034c5e8d7f": "启用",
               "7e0dcb257a": "Shell",
               "3ffafc9b95": "命令",
               "30c74aaa1f": "路径",
-              "ff05cbc344": "orca_botmux",
+              "ff05cbc344": "botmux",
               "85fab5e12c": "CLI",
-              "890ddf943d": "注册 OrcaBotmux CLI，以便智能体可以驱动浏览器。",
-              "50f0860e18": "启用 OrcaBotmux CLI"
+              "890ddf943d": "注册 Botmux CLI，以便智能体可以驱动浏览器。",
+              "50f0860e18": "启用 Botmux CLI"
             }
           }
         },
@@ -7742,7 +7742,7 @@
             "agentHibernation": {
               "agent": "智能体",
               "agents": "智能体",
-              "description": "在配置的空闲时间后停止后台智能体终端，并在再次打开时恢复受支持的会话。智能体睡眠会保留由 OrcaBotmux 启动的智能体的启动选项；手动启动的智能体可能会使用当前的 OrcaBotmux 默认值恢复。",
+              "description": "在配置的空闲时间后停止后台智能体终端，并在再次打开时恢复受支持的会话。智能体睡眠会保留由 Botmux 启动的智能体的启动选项；手动启动的智能体可能会使用当前的 Botmux 默认值恢复。",
               "minutes": "分钟",
               "sleep": "睡眠",
               "terminal": "终端",
@@ -7795,7 +7795,7 @@
             "06ea5a69a6": "GitHub",
             "e4fb4516d0": "星星",
             "e0b8c8bc25": "点赞 GitHub star 支持该项目（通过 gh CLI ",
-            "36a72f0d9e": "GitHub 上的 Star OrcaBotmux",
+            "36a72f0d9e": "GitHub 上的 Star Botmux",
             "c61b14be7c": "grok",
             "5d9ba08673": "copilot",
             "f472e97440": "助手",
@@ -7823,20 +7823,20 @@
             "c9d8c1ce66": "发行说明",
             "9e86ccd05c": "版本",
             "f89a94773c": "更新",
-            "79ff46776e": "检查应用程序更新并安装较新的 OrcaBotmux 版本。",
+            "79ff46776e": "检查应用程序更新并安装较新的 Botmux 版本。",
             "e15af4eb64": "检查更新",
             "6382fe9724": "恩克斯",
             "baa263d6d8": "智能体",
             "bda108e66c": "技能",
-            "244e3fb4c8": "安装 OrcaBotmux 技能，以便智能体知道如何使用 OrcaBotmux CLI。",
+            "244e3fb4c8": "安装 Botmux 技能，以便智能体知道如何使用 Botmux CLI。",
             "2d9f7b42df": "智能体技能",
             "0a00691c06": "Shell 命令",
             "dbeb1f348e": "命令",
             "88d3df9ce9": "终端",
             "fb4f338a3d": "路径",
             "924a660a78": "CLI",
-            "ca529079bf": "注册或删除 OrcaBotmux CLI 命令。",
-            "327e3fa70d": "OrcaBotmux CLI",
+            "ca529079bf": "注册或删除 Botmux CLI 命令。",
+            "327e3fa70d": "Botmux CLI",
             "fb84767421": "转变",
             "f8f0ac213a": "顺序的",
             "12ecc640a8": "姆鲁",
@@ -7875,7 +7875,7 @@
             "b2799ba622": "毫秒",
             "146728ac2c": "延迟",
             "86f54575c7": "自动保存",
-            "8ea61ad55c": "OrcaBotmux 在您上次编辑后等待多长时间才会自动保存。",
+            "8ea61ad55c": "Botmux 在您上次编辑后等待多长时间才会自动保存。",
             "14e46c745b": "自动保存延迟",
             "4469b6fa4e": "保存",
             "e9d948d3c3": "短暂暂停后自动保存编辑器和可编辑差异更改。",
@@ -7891,7 +7891,7 @@
             "9da6c875e5": "码头",
             "b9096a44cf": "https_proxy",
             "8f03d44672": "http_proxy",
-            "e3b1d42f95": "用于 OrcaBotmux 网络请求和本地终端子进程的代理 URL。",
+            "e3b1d42f95": "用于 Botmux 网络请求和本地终端子进程的代理 URL。",
             "c29f23ab57": "HTTP 代理",
             "6c2ce8457c": "文件浏览器",
             "c9d9636f24": "发现者",
@@ -7935,7 +7935,7 @@
         },
         "git": {
           "search": {
-            "61eab13403": "orca_botmux",
+            "61eab13403": "botmux",
             "1b93c1143c": "署名",
             "8461c908ae": "合着的",
             "61f9f5d1fc": "共同作者",
@@ -7943,8 +7943,8 @@
             "6bdea421bb": "PR",
             "16f53f7323": "gh",
             "d088806071": "GitHub",
-            "118c23484b": "将 OrcaBotmux 署名添加到 commits、PR 和议题。",
-            "bc7d9f69ce": "OrcaBotmux 署名",
+            "118c23484b": "将 Botmux 署名添加到 commits、PR 和议题。",
+            "bc7d9f69ce": "Botmux 署名",
             "40f9b815fd": "API预算",
             "b7e52124c7": "速率限制",
             "ead733645f": "光亮的",
@@ -7966,7 +7966,7 @@
             "564942ffc5": "origin/main",
             "28192e3a63": "master",
             "e3e9adde59": "main",
-            "0e993bf00f": "当您创建工作区时，OrcaBotmux 会刷新远程基准并安全地快进匹配的本地分支，例如 main 或 master。这可以防止像 git diff main...HEAD 这样的命令对比过时的历史记录。如果该分支有未提交的更改或仅在本地的提交，OrcaBotmux 会跳过更新。",
+            "0e993bf00f": "当您创建工作区时，Botmux 会刷新远程基准并安全地快进匹配的本地分支，例如 main 或 master。这可以防止像 git diff main...HEAD 这样的命令对比过时的历史记录。如果该分支有未提交的更改或仅在本地的提交，Botmux 会跳过更新。",
             "f8bda25f29": "保持本地 main 最新",
             "769ddd7f81": "风俗",
             "1d2fae1fa2": "git 用户名",
@@ -8085,13 +8085,13 @@
         "mobile": {
           "emulator": {
             "search": {
-              "2348045036": "选择 OrcaBotmux 默认打开的模拟器设备。",
+              "2348045036": "选择 Botmux 默认打开的模拟器设备。",
               "2bb2e09225": "手机技能",
               "bbe4267416": "模拟器类型",
               "64494f03c3": "模拟器附加",
               "6f728f1456": "模拟器抽头",
               "f8b871d655": "智能体客户端",
-              "2e0b45b2ba": "使用 OrcaBotmux CLI 命令列出、附加、点击和输入手机模拟器。",
+              "2e0b45b2ba": "使用 Botmux CLI 命令列出、附加、点击和输入手机模拟器。",
               "ea3eac39bb": "智能体 CLI 控制",
               "8ef0f08d36": "运行时",
               "27397fe8e9": "xcode 命令行工具",
@@ -8109,8 +8109,8 @@
               "b8ddd13195": "智能体模拟器",
               "1ad6fb6230": "默认设备",
               "ac0a985873": "模拟器技能",
-              "9353854ff3": "OrcaBotmux 模拟器",
-              "d4b7833894": "OrcaBotmux CLI",
+              "9353854ff3": "Botmux 模拟器",
+              "d4b7833894": "Botmux CLI",
               "84e5706975": "服务SIM卡",
               "7c5a8a2bee": "Xcode",
               "bec7231663": "平板电脑",
@@ -8119,7 +8119,7 @@
               "2d67f708ce": "模拟器",
               "c5eca29310": "ios模拟器",
               "25159de808": "手机模拟器",
-              "9595354cff": "配置对 OrcaBotmux 和编码智能体的手机模拟器支持。",
+              "9595354cff": "配置对 Botmux 和编码智能体的手机模拟器支持。",
               "cdd3c31918": "手机模拟器"
             }
           },
@@ -8180,8 +8180,8 @@
               "f213400800": "移动端",
               "671eb4173c": "通过手机控制终端和智能体。",
               "ffd52a96e4": "移动端",
-              "1de96ec8a6": "显示 OrcaBotmux Mobile 按钮",
-              "682293cadf": "在左侧边栏顶部显示 OrcaBotmux Mobile 按钮。",
+              "1de96ec8a6": "显示 Botmux Mobile 按钮",
+              "682293cadf": "在左侧边栏顶部显示 Botmux Mobile 按钮。",
               "e4f4daea0e": "中继",
               "5d5af8e041": "iPhone"
             }
@@ -8207,12 +8207,12 @@
             "57e34a31cd": "声音",
             "5362074f19": "mp3",
             "6e08f78315": "声音的",
-            "c718793e95": "选择 OrcaBotmux 为桌面通知播放的内置、系统或本地音频文件。",
+            "c718793e95": "选择 Botmux 为桌面通知播放的内置、系统或本地音频文件。",
             "ea8cb8d9ce": "通知声音",
             "4ada6bfde9": "搜索",
             "fa60d8e4ab": "压制",
             "a4c3b29a3c": "专注的",
-            "7247b97a31": "当 OrcaBotmux 聚焦于活动工作树时，避免发出通知。",
+            "7247b97a31": "当 Botmux 聚焦于活动工作树时，避免发出通知。",
             "96562a72c6": "专注时抑制",
             "a2ab73b325": "注意力",
             "ae0487f8fd": "钟",
@@ -8228,7 +8228,7 @@
             "adbc3a0fcf": "本国的",
             "72539aede4": "系统",
             "51ae2183e1": "桌面",
-            "0534c76311": "OrcaBotmux 桌面通知的主开关。",
+            "0534c76311": "Botmux 桌面通知的主开关。",
             "4a210b2f72": "启用通知"
           }
         },
@@ -8261,7 +8261,7 @@
             "94e04427f6": "环境",
             "664f1a8984": "持续集成",
             "5854a5c752": "ci",
-            "69637f4dc4": "orca_botmux_telemetry_disabled",
+            "69637f4dc4": "botmux_telemetry_disabled",
             "058550f6bc": "不跟踪",
             "83a6cd79b3": "不跟踪",
             "f7a2d9f137": "禁用遥测传输的环境变量。",
@@ -8276,7 +8276,7 @@
             "b021b9cb81": "匿名的",
             "79c319948b": "用法",
             "77d3180def": "遥测",
-            "b707cc3981": "通过发送匿名功能使用事件来帮助改进 OrcaBotmux。",
+            "b707cc3981": "通过发送匿名功能使用事件来帮助改进 Botmux。",
             "57b283461a": "共享匿名使用数据",
             "2b5a5c312f": "邮差",
             "4104f6f0f3": "分析",
@@ -8310,13 +8310,13 @@
         },
         "repository": {
           "search": {
-            "bc7e504b8e": ".orca_botmux/issue-command",
-            "603c68b68c": "OrcaBotmux.yaml",
+            "bc7e504b8e": ".botmux/issue-command",
+            "603c68b68c": "Botmux.yaml",
             "9dc60d7f6d": "GitHub",
             "ec70364df2": "工作流程",
             "66b584bd6c": "issue 命令",
             "2011a6a4f2": "GitHub issue 命令",
-            "d42d1e49c0": "通过 orca_botmux.yaml 和可选本地覆盖配置的基于文件的关联议题命令。",
+            "d42d1e49c0": "通过 botmux.yaml 和可选本地覆盖配置的基于文件的关联议题命令。",
             "d86ea12d16": "自定义 GitHub 议题命令",
             "c5e8bdbcbb": "默认跳过",
             "a69c5cbe90": "默认运行",
@@ -8331,10 +8331,10 @@
             "0432d2fb7c": "当地的",
             "ed269fad69": "命令源",
             "19f58d6d89": "高级",
-            "d141897c90": "命令源和 orca_botmux.yaml 详细信息。",
+            "d141897c90": "命令源和 botmux.yaml 详细信息。",
             "cc11699c3d": "高级",
             "bf460fded8": "yaml",
-            "9cad92fe77": "OrcaBotmux.yaml 挂钩",
+            "9cad92fe77": "Botmux.yaml 挂钩",
             "6b80f7d3c8": "本地设置脚本",
             "a1a4c51d58": "归档命令",
             "fbfd2386e8": "存档脚本",
@@ -8377,7 +8377,7 @@
             "cc876ca5f2": "存储库",
             "6469de5368": "项目",
             "3067595d82": "删除",
-            "c86478c3d8": "从 OrcaBotmux 中删除该项目。",
+            "c86478c3d8": "从 Botmux 中删除该项目。",
             "c5266c2c9d": "删除项目",
             "4b9a18a56d": "单一仓库",
             "4e2529722c": "目录",
@@ -8438,13 +8438,13 @@
               "09568ccc65": "服务器",
               "ebd5369acf": "环境",
               "d198440ce3": "运行时",
-              "baec27aa8f": "将此浏览器连接到已保存的 OrcaBotmux 服务器。",
+              "baec27aa8f": "将此浏览器连接到已保存的 Botmux 服务器。",
               "3517fb2ec0": "活动服务器",
               "c6e5a03aa0": "开发盒",
               "f1575f1e09": "网络客户端",
               "81444c4102": "配对网址",
               "104f4d7dbd": "配对",
-              "4575341c77": "选择本地桌面、添加已保存的远程 OrcaBotmux 服务器或生成配对 URL。"
+              "4575341c77": "选择本地桌面、添加已保存的远程 Botmux 服务器或生成配对 URL。"
             }
           }
         },
@@ -8452,14 +8452,14 @@
           "search": {
             "ca6a0c2df7": "捷径",
             "4811a8264a": "终端优先",
-            "afda131738": "OrcaBotmux 优先",
+            "afda131738": "Botmux 优先",
             "0ecfc47434": "冲突",
             "0f8cb15582": "智能体",
             "f1adebbe8c": "Shell",
             "7f1b38f59a": "推",
             "7e3fc707aa": "终端",
             "0ecba9aa5f": "键盘",
-            "ebd7d81e1d": "选择当快捷键重叠时 OrcaBotmux 或焦点终端是否获胜。",
+            "ebd7d81e1d": "选择当快捷键重叠时 Botmux 或焦点终端是否获胜。",
             "f052906167": "终端中的快捷键"
           }
         },
@@ -8634,7 +8634,7 @@
             "77d9f9cd55": "控制浅色模式下窗格之间的分割分隔线。",
             "595b97b446": "分光器颜色",
             "7718d70356": "预览",
-            "1dee533bd9": "选择 OrcaBotmux 处于浅色模式时使用的主题。",
+            "1dee533bd9": "选择 Botmux 处于浅色模式时使用的主题。",
             "1d89457764": "浅色主题",
             "da864e6cec": "灯光模式",
             "f268092ee3": "浅色模式可以使用自己的终端主题。",
@@ -8665,7 +8665,7 @@
             "eefd1d8332": "下划线光标",
             "015c82349f": "块状光标",
             "a6e9dcc829": "竖线光标",
-            "275a9d6395": "OrcaBotmux 终端窗口的默认光标外观。",
+            "275a9d6395": "Botmux 终端窗口的默认光标外观。",
             "97bcfff662": "Cursor 形状",
             "1abcf4d7de": "操作系统",
             "7d924d870d": "图形",
@@ -8701,7 +8701,7 @@
             "5930244899": "字体大小",
             "warp_import": {
               "title": "从 Warp 导入",
-              "description": "将 Warp 主题导入为 OrcaBotmux 终端主题。",
+              "description": "将 Warp 主题导入为 Botmux 终端主题。",
               "keyword_warp": "warp",
               "keyword_themes": "themes",
               "keyword_yaml": "yaml",
@@ -8709,7 +8709,7 @@
             },
             "yaml_import": {
               "title": "从 YAML 导入",
-              "description": "将主题 YAML 文件导入为 OrcaBotmux 终端主题。",
+              "description": "将主题 YAML 文件导入为 Botmux 终端主题。",
               "keyword_yaml": "yaml",
               "keyword_custom": "自定义"
             },
@@ -8798,7 +8798,7 @@
                 "options": {
                   "commitMessage": "根据已暂存的更改生成提交信息。",
                   "pullRequest": "生成托管评论标题和描述。",
-                  "branchName": "重命名 OrcaBotmux 从初始智能体任务创建的分支。",
+                  "branchName": "重命名 Botmux 从初始智能体任务创建的分支。",
                   "fixCommitFailure": "当 commit 挂钩或 git commit 失败时启动智能体。",
                   "fixChecks": "从失败的托管评审检查中启动智能体。",
                   "resolveConflicts": "启动用于解决本地或托管评审合并冲突的智能体。",
@@ -8815,11 +8815,11 @@
         "agent-awake-copy": {
           "e5995ce268": "智能体工作时保持电脑唤醒",
           "95d3031db2": "在智能体工作时保持此电脑和显示器唤醒。合盖行为遵循此设备的电源设置。",
-          "a42f6fbdd8": "在智能体工作时保持此电脑和显示器唤醒。OrcaBotmux 还会根据电源策略，在合盖时请求此设备保持唤醒。"
+          "a42f6fbdd8": "在智能体工作时保持此电脑和显示器唤醒。Botmux 还会根据电源策略，在合盖时请求此设备保持唤醒。"
         },
         "agent-status-hooks-copy": {
           "7707c15abb": "智能体状态钩子",
-          "a68a642835": "在 OrcaBotmux 中显示工作中、等待中和完成状态。关闭后将移除 OrcaBotmux 管理的钩子并停止重新安装。"
+          "a68a642835": "在 Botmux 中显示工作中、等待中和完成状态。关闭后将移除 Botmux 管理的钩子并停止重新安装。"
         },
         "agent-generated-tab-title-copy": {
           "19ad21615a": "自动生成标签页标题",
@@ -8842,9 +8842,9 @@
         },
         "WarpThemeImportModal": {
           "title": "从 Warp 导入",
-          "description": "将 Warp 主题导入为 OrcaBotmux 终端主题。",
+          "description": "将 Warp 主题导入为 Botmux 终端主题。",
           "yaml_title": "导入主题 YAML",
-          "yaml_description": "将主题 YAML 文件（Warp 格式）导入为 OrcaBotmux 终端主题。",
+          "yaml_description": "将主题 YAML 文件（Warp 格式）导入为 Botmux 终端主题。",
           "yaml_no_themes_found": "所选文件中未找到主题。",
           "choose_file": "选择文件",
           "choose_folder": "选择文件夹",
@@ -8856,7 +8856,7 @@
           "select_all": "全选",
           "colors_only": "仅颜色",
           "no_themes_found": "未找到自定义 Warp 主题。",
-          "builtin_themes_hint": "Warp 的预装主题是 Warp 应用的一部分，无法从磁盘读取。OrcaBotmux 已包含其中大多数，如 Dracula、Gruvbox、Solarized 和 Tokyo Night。",
+          "builtin_themes_hint": "Warp 的预装主题是 Warp 应用的一部分，无法从磁盘读取。Botmux 已包含其中大多数，如 Dracula、Gruvbox、Solarized 和 Tokyo Night。",
           "custom_theme_yaml_hint": "自定义和社区主题必须以 YAML 文件形式存在于 Warp themes 文件夹中，自动导入才能发现它们。如果你克隆了 Warp 的公开主题仓库，请使用 Choose Folder 导入该仓库副本。",
           "choose_manually": "选择主题 YAML 文件或文件夹以手动导入。",
           "skipped_files": "已跳过文件",
@@ -8943,33 +8943,33 @@
                 "cards": {
                   "793a06e899": "重新检查",
                   "1a9475dace": "了解更多",
-                  "19fb419c12": "Gitea 凭据已配置但无法通过身份验证。请检查 token、API 基础 URL 和仓库权限；如果环境变量已更改，请重启 OrcaBotmux。",
-                  "60708f23da": "仅当 OrcaBotmux 无法从 remote 推导出 API URL 时。",
-                  "709057ad91": "ORCA_GITEA_API_BASE_URL",
+                  "19fb419c12": "Gitea 凭据已配置但无法通过身份验证。请检查 token、API 基础 URL 和仓库权限；如果环境变量已更改，请重启 Botmux。",
+                  "60708f23da": "仅当 Botmux 无法从 remote 推导出 API URL 时。",
+                  "709057ad91": "BOTMUX_GITEA_API_BASE_URL",
                   "6da9dfa5de": "用于私有仓库，并设置",
-                  "6d5c2a3005": "ORCA_GITEA_TOKEN",
+                  "6d5c2a3005": "BOTMUX_GITEA_TOKEN",
                   "fcbe0469fd": "公开仓库会从其 git remote 检测。设置",
                   "0613928cb3": "此运行时暂不支持 Gitea 状态。",
                   "05863d2599": "通过 Gitea REST API 获取 pull request 和 commit 状态。",
                   "52f75876be": "已检测仓库的 pull request 和 commit 状态",
                   "0b5242f8a2": "{{value0}} · 拉取请求和提交状态",
-                  "40f678df73": "Azure DevOps 凭据已配置但无法通过身份验证。请检查 token、API 基础 URL 和仓库权限；如果环境变量已更改，请重启 OrcaBotmux。",
-                  "7bd345e3f6": "仅当 OrcaBotmux 无法从 git remote 推导出 API 基础 URL 时。",
-                  "186a6689df": "ORCA_AZURE_DEVOPS_API_BASE_URL",
+                  "40f678df73": "Azure DevOps 凭据已配置但无法通过身份验证。请检查 token、API 基础 URL 和仓库权限；如果环境变量已更改，请重启 Botmux。",
+                  "7bd345e3f6": "仅当 Botmux 无法从 git remote 推导出 API 基础 URL 时。",
+                  "186a6689df": "BOTMUX_AZURE_DEVOPS_API_BASE_URL",
                   "b8a10b07c1": "。设置",
-                  "fbfd237f5e": "ORCA_AZURE_DEVOPS_ACCESS_TOKEN",
+                  "fbfd237f5e": "BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN",
                   "087feb92f1": "，或设置",
-                  "48842720d2": "ORCA_AZURE_DEVOPS_TOKEN",
+                  "48842720d2": "BOTMUX_AZURE_DEVOPS_TOKEN",
                   "7bbc9c64f0": "设置",
                   "f3f47dc7de": "此运行时暂不支持 Azure DevOps 状态。",
                   "0eb50d5593": "通过 Azure DevOps REST API token 获取 pull request 和构建状态。",
                   "54636c65d4": "已检测 Azure Repos 的 pull request 和构建状态",
                   "ea204f5e03": "{{value0}} · 拉取请求和构建状态",
-                  "6154b02093": "Bitbucket 凭据已配置但无法通过身份验证。请检查 token 和仓库权限；如果环境变量已更改，请重启 OrcaBotmux。",
-                  "e63fe8f627": "ORCA_BITBUCKET_ACCESS_TOKEN",
-                  "19416c874c": "ORCA_BITBUCKET_API_TOKEN",
+                  "6154b02093": "Bitbucket 凭据已配置但无法通过身份验证。请检查 token 和仓库权限；如果环境变量已更改，请重启 Botmux。",
+                  "e63fe8f627": "BOTMUX_BITBUCKET_ACCESS_TOKEN",
+                  "19416c874c": "BOTMUX_BITBUCKET_API_TOKEN",
                   "fc71a0e7aa": "和",
-                  "63a7f47392": "ORCA_BITBUCKET_EMAIL",
+                  "63a7f47392": "BOTMUX_BITBUCKET_EMAIL",
                   "24ac1c69dc": "此运行时暂不支持 Bitbucket 状态。",
                   "a924e8dcd1": "通过 Bitbucket Cloud API token 获取 pull request 和构建状态。",
                   "0fa5629dad": "pull request 和构建状态"
@@ -8981,7 +8981,7 @@
         "computerUseSummary": {
           "permissionsRequired": "在智能体可操作应用窗口前需要 {{value0}} 项权限{{value1}}。",
           "checkingTitle": "正在检查计算机控制访问权限。",
-          "checkingDescription": "OrcaBotmux 正在检查计算机控制助手的 macOS 隐私权限。",
+          "checkingDescription": "Botmux 正在检查计算机控制助手的 macOS 隐私权限。",
           "unavailableTitle": "计算机控制不可用。",
           "unavailableDescription": "Computer Use 权限不可用，因为 {{value0}}。",
           "readyTitle": "计算机控制已就绪。",
@@ -8997,7 +8997,7 @@
           "3c4d5e6f7a": "覆盖客户端默认值",
           "4d5e6f7a8b": "继承客户端默认值",
           "5e6f7a8b9c": "重置",
-          "6f7a8b9cad": "使用相对路径（例如 .orca_botmux/worktrees）可让每个项目使用各自的位置，使用绝对路径则所有项目共用一个文件夹。"
+          "6f7a8b9cad": "使用相对路径（例如 .botmux/worktrees）可让每个项目使用各自的位置，使用绝对路径则所有项目共用一个文件夹。"
         },
         "ProviderHostScopeControl": {
           "scope_label": "{{value0}}：{{value1}}",
@@ -9005,11 +9005,11 @@
         },
         "providerAccountScope": {
           "remoteServer": "远程服务器：{{value0}}",
-          "remoteServerCredentials": "此提供商的凭据和账户检查由该远程服务器拥有。使用“设置 > 远程 OrcaBotmux 服务器 > 高级”编辑另一个默认运行时范围。",
+          "remoteServerCredentials": "此提供商的凭据和账户检查由该远程服务器拥有。使用“设置 > 远程 Botmux 服务器 > 高级”编辑另一个默认运行时范围。",
           "localMac": "本地 Mac",
-          "localCredentials": "此提供商的凭据和账户检查由该桌面客户端拥有。使用“设置 > 远程 OrcaBotmux 服务器 > 高级”编辑服务器拥有的凭据。",
-          "remoteServerRateLimit": "{{value0}} API 预算从此远程服务器上的 CLI 获取。使用“设置 > 远程 OrcaBotmux 服务器 > 高级”查看另一个默认运行时预算。",
-          "localRateLimit": "{{value0}} API 预算从此桌面客户端上的 CLI 获取。使用“设置 > 远程 OrcaBotmux 服务器 > 高级”查看服务器拥有的预算。"
+          "localCredentials": "此提供商的凭据和账户检查由该桌面客户端拥有。使用“设置 > 远程 Botmux 服务器 > 高级”编辑服务器拥有的凭据。",
+          "remoteServerRateLimit": "{{value0}} API 预算从此远程服务器上的 CLI 获取。使用“设置 > 远程 Botmux 服务器 > 高级”查看另一个默认运行时预算。",
+          "localRateLimit": "{{value0}} API 预算从此桌面客户端上的 CLI 获取。使用“设置 > 远程 Botmux 服务器 > 高级”查看服务器拥有的预算。"
         },
         "settingOwnership": {
           "clientDefault": "客户端默认",
@@ -9038,11 +9038,11 @@
           "missingOriginBranch": "origin 没有 upstream 默认分支。",
           "diverged": "origin 有 upstream 中不存在的提交。",
           "blocked": "已跳过 Fork 同步",
-          "blockedFallback": "OrcaBotmux 无法安全地快进此 Fork。",
+          "blockedFallback": "Botmux 无法安全地快进此 Fork。",
           "failed": "Fork 同步失败",
           "title": "保持 Fork 最新",
           "description": "从 upstream 安全地快进此 Fork。",
-          "longDescription": "当此 Fork 落后于 upstream 时，OrcaBotmux 可以安全地快进其默认分支。如果该分支有仅本地提交或冲突，OrcaBotmux 会跳过更新。",
+          "longDescription": "当此 Fork 落后于 upstream 时，Botmux 可以安全地快进其默认分支。如果该分支有仅本地提交或冲突，Botmux 会跳过更新。",
           "forkOf": "{{owner}}/{{repo}} 的 Fork",
           "syncing": "同步中",
           "syncNow": "立即同步",
@@ -9087,8 +9087,8 @@
         },
         "PrivacyDiagnosticsRows": {
           "5a7cbe069a": "已设置 DO_NOT_TRACK=1，创建和发送诊断文件已停用。",
-          "63d03261d1": "已设置 ORCA_TELEMETRY_DISABLED=1，创建和发送诊断文件已停用。",
-          "d37e92a06b": "已设置 ORCA_DIAGNOSTICS_DISABLED=1，应用诊断已关闭。",
+          "63d03261d1": "已设置 BOTMUX_TELEMETRY_DISABLED=1，创建和发送诊断文件已停用。",
+          "d37e92a06b": "已设置 BOTMUX_DIAGNOSTICS_DISABLED=1，应用诊断已关闭。",
           "5ebb31e1fb": "正在 CI 中运行，诊断已关闭。",
           "e27c8d45bf": "诊断已被环境变量停用。"
         },
@@ -9124,7 +9124,7 @@
         },
         "BrowserLocalhostWorktreeLabelsSetting": {
           "8ac8c3ad19": "本地主机工作区标签",
-          "1db3c8b983": "将工作区端口打开为特定于工作区的 OrcaBotmux localhost URL，便于区分浏览器标签页。"
+          "1db3c8b983": "将工作区端口打开为特定于工作区的 Botmux localhost URL，便于区分浏览器标签页。"
         },
         "AgentRuntimeSetting": {
           "label": "智能体运行时",
@@ -9138,7 +9138,7 @@
         },
         "MobileEmulatorSdkStatus": {
           "536026130e": "模拟器 SDK",
-          "dde0ec1cd8": "OrcaBotmux 用于运行模拟器的工具链。Android 可通过 Android SDK 在任何系统上运行；iOS 模拟器需要 macOS 上的 Xcode。",
+          "dde0ec1cd8": "Botmux 用于运行模拟器的工具链。Android 可通过 Android SDK 在任何系统上运行；iOS 模拟器需要 macOS 上的 Xcode。",
           "027cbf668a": "Android SDK",
           "f6d080d128": "正在使用配置的路径",
           "7fe4bd5907": "检测位置",
@@ -9183,13 +9183,13 @@
           "notificationPlayground": "通知测试面板",
           "notificationPlaygroundDescription": "用于检查提示布局、恢复操作和长文案换行的开发触发器。",
           "devOnly": "仅开发",
-          "orcaCloud": "OrcaBotmux Cloud",
-          "orcaCloudDescription": "仅限开发环境的第一方云登录预览。在生产环境中隐藏；在开发环境中，设置 ORCA_CLOUD_API_URL 和 ORCA_CLOUD_CLIENT_ID 后也会出现在侧边栏账户切换器中。",
-          "orcaCloudStatus": "状态",
-          "orcaCloudSignOut": "退出登录",
-          "orcaCloudConnect": "连接配置文件",
-          "orcaCloudRefresh": "刷新状态",
-          "orcaCloudNotConfigured": "设置 ORCA_CLOUD_API_URL 和 ORCA_CLOUD_CLIENT_ID 以在此开发版本中预览 OrcaBotmux Cloud 登录。"
+          "botmuxCloud": "Botmux Cloud",
+          "botmuxCloudDescription": "仅限开发环境的第一方云登录预览。在生产环境中隐藏；在开发环境中，设置 BOTMUX_CLOUD_API_URL 和 BOTMUX_CLOUD_CLIENT_ID 后也会出现在侧边栏账户切换器中。",
+          "botmuxCloudStatus": "状态",
+          "botmuxCloudSignOut": "退出登录",
+          "botmuxCloudConnect": "连接配置文件",
+          "botmuxCloudRefresh": "刷新状态",
+          "botmuxCloudNotConfigured": "设置 BOTMUX_CLOUD_API_URL 和 BOTMUX_CLOUD_CLIENT_ID 以在此开发版本中预览 Botmux Cloud 登录。"
         },
         "EphemeralVmRecipeRow": {
           "useInWorkspace": "在工作区中使用"
@@ -9228,14 +9228,14 @@
           "skillTitle": "工作区专属环境技能",
           "skillDescription": "设置、构建、认证并验证仓库自带的环境模板。",
           "whatTitle": "此技能会与你一起完成",
-          "whatScaffold": "为你的提供商编写环境模板和脚本，可通过 OrcaBotmux 服务器或 SSH 连接。",
+          "whatScaffold": "为你的提供商编写环境模板和脚本，可通过 Botmux 服务器或 SSH 连接。",
           "whatBuild": "构建可复用的基础镜像，并让智能体完成登录。",
           "whatValidate": "验证环境，以便你可以在其上创建工作区。",
           "promptHint": "在任意工作区中，可以这样询问智能体：",
           "copy": "复制",
           "copied": "已复制",
           "recipes": "环境模板",
-          "recipesHelp": "智能体添加到 orca_botmux.yaml 的环境模板会显示在这里，可用于启动工作区。",
+          "recipesHelp": "智能体添加到 botmux.yaml 的环境模板会显示在这里，可用于启动工作区。",
           "refresh": "刷新临时 VM 环境模板",
           "checking": "正在检查环境模板...",
           "none": "还没有找到环境模板。"
@@ -9286,7 +9286,7 @@
           "0d8e77bc40": "Grok CLI 文档",
           "ad47a33f72": "正在加载…",
           "b2c3d4e5f6": "已登录",
-          "c3d4e5f6a7": "已登录。OrcaBotmux 只读取磁盘上的该文件；如果使用量获取失败，请重新运行 grok login。",
+          "c3d4e5f6a7": "已登录。Botmux 只读取磁盘上的该文件；如果使用量获取失败，请重新运行 grok login。",
           "d4e5f6a7b8": "会话已过期，请在终端运行 grok login 以刷新。",
           "e5f6a7b8c9": "未登录 Grok CLI",
           "f6a7b8c9d0": "在终端运行 grok login，然后点击此处的刷新使用量。",
@@ -9296,8 +9296,8 @@
           "c6d1a8f4e2": "{{when}} 重置",
           "e6dadc1e2b": "Monthly usage",
           "75e396bf42": "Grok 统一计费账户的月度已用额度。",
-          "b36fa2c908": "已登录。OrcaBotmux 读取存储在磁盘上的 Grok CLI 会话。",
-          "f08c41de73": "会话已过期 — 在运行 OrcaBotmux 的计算机上运行 grok 并等待其启动。如果提示，请完成登录，然后点击刷新使用量。无需发送聊天消息。"
+          "b36fa2c908": "已登录。Botmux 读取存储在磁盘上的 Grok CLI 会话。",
+          "f08c41de73": "会话已过期 — 在运行 Botmux 的计算机上运行 grok 并等待其启动。如果提示，请完成登录，然后点击刷新使用量。无需发送聊天消息。"
         },
         "AppearanceWindowSidebarSection": {
           "usagePercentageDisplayUsed": "已用",
@@ -9312,7 +9312,7 @@
           "connecting": "正在连接",
           "reconnecting": "正在重新连接",
           "offline": "离线",
-          "title": "OrcaBotmux Relay",
+          "title": "Botmux Relay",
           "automatic": "手机配对后可从任何地方连接",
           "signInPrompt": "在此桌面端登录以从任何地方连接",
           "directStillAvailable": "局域网和 Tailscale 连接仍然可用。",
@@ -9330,10 +9330,10 @@
           "signIn": "登录",
           "localDescription": "手机必须连接此 Wi‑Fi 或您的 Tailscale。无需登录。",
           "pathGroup": "手机访问此电脑的方式",
-          "anywhereTitle": "OrcaBotmux Relay",
+          "anywhereTitle": "Botmux Relay",
           "anywhereDescription": "手机可通过蜂窝网络或任意 Wi‑Fi 连接。需要登录。",
-          "signInRequired": "请登录以使用 OrcaBotmux Mobile Relay。",
-          "relayUnavailable": "此版本不支持 OrcaBotmux Relay。请使用本地网络。",
+          "signInRequired": "请登录以使用 Botmux Mobile Relay。",
+          "relayUnavailable": "此版本不支持 Botmux Relay。请使用本地网络。",
           "signInAgain": "重新登录",
           "localTitle": "本地网络"
         },
@@ -9342,14 +9342,14 @@
           "regenerate": "重新生成",
           "generate": "生成二维码",
           "refresh": "刷新网络接口",
-          "overview": "生成二维码，然后在 OrcaBotmux Mobile 的 Pair Desktop 中扫描。",
+          "overview": "生成二维码，然后在 Botmux Mobile 的 Pair Desktop 中扫描。",
           "step1Title": "连接方式",
           "step2Title": "此电脑的地址",
           "step2RelayDescription": "距离较近时用于快速直接连接。Relay 覆盖远程访问。",
           "step2LocalDescription": "手机必须能通过 Wi‑Fi 或 Tailscale 访问此地址。"
         },
         "MobileRelayBetaAvailability": {
-          "about": "关于 OrcaBotmux Relay 测试版",
+          "about": "关于 Botmux Relay 测试版",
           "beta": "测试版",
           "availability": "可用平台：",
           "testFlight": "TestFlight",
@@ -9366,14 +9366,14 @@
           "title": "Linear",
           "description": "Give agents the skill to read and update your linked Linear tickets.",
           "skillTitle": "Linear skill",
-          "skillDescription": "Enables agents to read linked tickets and post updates to Linear through OrcaBotmux.",
+          "skillDescription": "Enables agents to read linked tickets and post updates to Linear through Botmux.",
           "howToUse": "How to use it",
           "howToUseDescription": "Ask an agent working a Linear-linked worktree to read context, post updates, move the ticket, or attach the PR.",
           "terminalTitle": "Linear skill setup",
           "terminalAriaLabel": "Linear skill install terminal"
         },
         "MobileRelayBetaNotice": {
-          "notice": "OrcaBotmux Relay is in beta."
+          "notice": "Botmux Relay is in beta."
         }
       },
       "right": {
@@ -9423,7 +9423,7 @@
             "495b2f8c4b": "已启动智能体，但无法将选中的评论标记为已解决。",
             "3c3ad3a1d2": "已启动智能体。选中的评论中没有可在托管平台上标记为已解决的评论。",
             "review": {
-              "auto_retry": "OrcaBotmux 将在 {{time}} 重试。",
+              "auto_retry": "Botmux 将在 {{time}} 重试。",
               "open_review": "打开评审",
               "retry": "重试"
             },
@@ -9484,7 +9484,7 @@
             "d87a4c42e1": "打开 Markdown 预览",
             "c2112579f6": "下载",
             "7ac885bd2f": "下载文件夹",
-            "dd112c81d2": "在 OrcaBotmux 浏览器中打开",
+            "dd112c81d2": "在 Botmux 浏览器中打开",
             "1bb9be455c": "添加为项目...",
             "0fec99bfd7": "复制",
             "f61af83316": "新建文件夹",
@@ -9739,7 +9739,7 @@
             "fe5bd1a610": "创建 {{value0}}...",
             "812cb992ee": "打开于 {{value0}}",
             "eef5446523": "{{value0}} #{{value1}} 已开放",
-            "0453ca3a9a": "{{value0}} 已创建，但 OrcaBotmux 尚无法刷新它。",
+            "0453ca3a9a": "{{value0}} 已创建，但 Botmux 尚无法刷新它。",
             "f99560ab29": "中止 {{value0}} 失败",
             "eae7a1da5f": "无法清除笔记。",
             "657e0c90ad": "{{value0}} 注{{value1}}",
@@ -9893,16 +9893,16 @@
             "1d47db9bf0": "没有启用智能体",
             "c7ff8cef11": "检测剂...",
             "013c9ac04a": "保存范围",
-            "1bb611240f": "使用 {basePrompt} 作为 OrcaBotmux 的默认提示词。",
-            "23280cbab1": "此模板不包含 {basePrompt}，因此智能体不会收到 OrcaBotmux 的默认提示词。",
+            "1bb611240f": "使用 {basePrompt} 作为 Botmux 的默认提示词。",
+            "23280cbab1": "此模板不包含 {basePrompt}，因此智能体不会收到 Botmux 的默认提示词。",
             "5421a96acb": "保存并启动智能体",
             "6cefcdfba1": "稍后可以在源代码管理 AI 设置中更改。",
             "c29f9cf266": "保存此提示，下次不再显示此评审",
-            "d8f40128ee": "{basePrompt} 是 OrcaBotmux 的默认提示词。",
+            "d8f40128ee": "{basePrompt} 是 Botmux 的默认提示词。",
             "ea4788705e": "取消",
             "b0da3a4d3e": "启动预设已保存",
             "bff4795a6d": "更改智能体、参数或提示词模板以更新已保存的预设。",
-            "5c75b24735": "自定义 OrcaBotmux 启动智能体前发送给它的内容。",
+            "5c75b24735": "自定义 Botmux 启动智能体前发送给它的内容。",
             "repoAgentOverrideNote": "此仓库会覆盖你的全局默认值（{{global}}），当前运行 {{effective}}。保存到此仓库以更改这里运行的内容。"
           },
           "SourceControlTextGenerationDialog": {
@@ -9979,7 +9979,7 @@
                 "60186d8498": "冲突阻碍了这一点",
                 "c16762ac8c": "下面的检查和注释显示当前获取的上下文。",
                 "9d0e7bcefc": "没有阻塞 PR 操作",
-                "5856874b59": "当该面板保持打开状态时，OrcaBotmux 将刷新检查。",
+                "5856874b59": "当该面板保持打开状态时，Botmux 将刷新检查。",
                 "5341023167": "查看",
                 "b45db92d0e": "修复",
                 "5d4ebf9391": "检查详细信息或启动 AI 修复过程。",
@@ -10048,14 +10048,14 @@
               },
               "review": {
                 "detail": {
-                  "positive": "OrcaBotmux 也有已保存的 {{reviewLabel}} 信息但无法验证。",
-                  "rate_limited": "OrcaBotmux 无法检查 {{reviewLabel}} 状态，因为 {{provider}} 正在临时限制请求。",
-                  "network": "OrcaBotmux 无法检查 {{reviewLabel}} 状态，因为当前环境无法连接到 {{provider}}。",
-                  "untyped": "OrcaBotmux 无法确认此分支是否已有 {{reviewLabel}}。"
+                  "positive": "Botmux 也有已保存的 {{reviewLabel}} 信息但无法验证。",
+                  "rate_limited": "Botmux 无法检查 {{reviewLabel}} 状态，因为 {{provider}} 正在临时限制请求。",
+                  "network": "Botmux 无法检查 {{reviewLabel}} 状态，因为当前环境无法连接到 {{provider}}。",
+                  "untyped": "Botmux 无法确认此分支是否已有 {{reviewLabel}}。"
                 },
                 "positive": {
                   "title": "{{reviewLabelCap}} 详细信息不可用",
-                  "body": "OrcaBotmux 已为此分支保存了 {{reviewLabel}} 信息，但无法确认其当前状态。"
+                  "body": "Botmux 已为此分支保存了 {{reviewLabel}} 信息，但无法确认其当前状态。"
                 },
                 "no_review": {
                   "title": "未找到 {{reviewLabel}}",
@@ -10063,19 +10063,19 @@
                 },
                 "active": {
                   "title": "正在检查 {{reviewLabel}} 状态",
-                  "body": "OrcaBotmux 正在检查 {{provider}} 上此分支的 {{reviewLabel}}。"
+                  "body": "Botmux 正在检查 {{provider}} 上此分支的 {{reviewLabel}}。"
                 },
                 "git_loading": {
                   "title": "正在检查分支状态",
-                  "body": "OrcaBotmux 正在检查此分支，然后显示创建或发布操作。"
+                  "body": "Botmux 正在检查此分支，然后显示创建或发布操作。"
                 },
                 "git_error": {
                   "title": "无法检查分支状态",
-                  "body": "OrcaBotmux 无法从当前环境确认此分支的上游。请在发布或创建 {{reviewLabel}} 之前重试。"
+                  "body": "Botmux 无法从当前环境确认此分支的上游。请在发布或创建 {{reviewLabel}} 之前重试。"
                 },
                 "unknown": {
                   "title": "{{reviewLabelCap}} 状态不可用",
-                  "body": "OrcaBotmux 尚未确认此分支的 {{reviewLabel}} 状态。请重试以再次检查。"
+                  "body": "Botmux 尚未确认此分支的 {{reviewLabel}} 状态。请重试以再次检查。"
                 },
                 "paused": {
                   "title": "{{provider}} 刷新已暂停",
@@ -10087,11 +10087,11 @@
                 },
                 "unknown_error": {
                   "title": "无法检查 {{reviewLabel}} 状态",
-                  "body": "查询失败，OrcaBotmux 无法确认此分支是否已有 {{reviewLabel}}。"
+                  "body": "查询失败，Botmux 无法确认此分支是否已有 {{reviewLabel}}。"
                 },
                 "untyped": {
                   "title": "{{reviewLabelCap}} 状态不可用",
-                  "body": "OrcaBotmux 无法确认此分支是否已有 {{reviewLabel}}。请重试以再次检查。"
+                  "body": "Botmux 无法确认此分支是否已有 {{reviewLabel}}。请重试以再次检查。"
                 },
                 "auth": {
                   "title": "{{provider}} 身份验证失败",
@@ -10107,12 +10107,12 @@
                 },
                 "cli": {
                   "title": "{{provider}} CLI 不可用",
-                  "body": "OrcaBotmux 无法在当前环境中运行 {{provider}} CLI。请在此处设置后重试。"
+                  "body": "Botmux 无法在当前环境中运行 {{provider}} CLI。请在此处设置后重试。"
                 },
                 "skipped": {
                   "disconnected": {
                     "title": "主机已断开连接",
-                    "body": "此仓库的执行主机已断开连接，OrcaBotmux 无法刷新 {{reviewLabel}} 状态。"
+                    "body": "此仓库的执行主机已断开连接，Botmux 无法刷新 {{reviewLabel}} 状态。"
                   },
                   "bare": {
                     "title": "裸仓库",
@@ -10120,15 +10120,15 @@
                   },
                   "archived": {
                     "title": "仓库已归档",
-                    "body": "此仓库已归档，OrcaBotmux 不会刷新 {{reviewLabel}} 状态。"
+                    "body": "此仓库已归档，Botmux 不会刷新 {{reviewLabel}} 状态。"
                   },
                   "not_git": {
                     "title": "不是 Git 仓库",
-                    "body": "OrcaBotmux 无法将此文件夹作为 Git 仓库来获取 {{reviewLabel}} 状态。"
+                    "body": "Botmux 无法将此文件夹作为 Git 仓库来获取 {{reviewLabel}} 状态。"
                   },
                   "remote": {
                     "title": "仅远程上下文",
-                    "body": "OrcaBotmux 无法刷新此远程上下文的 {{reviewLabel}} 状态。请在主机可用后重试。"
+                    "body": "Botmux 无法刷新此远程上下文的 {{reviewLabel}} 状态。请在主机可用后重试。"
                   }
                 },
                 "no_upstream": {
@@ -10141,7 +10141,7 @@
                 },
                 "auth_required": {
                   "title": "连接 {{provider}}",
-                  "body": "OrcaBotmux 创建 {{reviewLabel}} 之前，必须在当前环境中连接 {{provider}}。"
+                  "body": "Botmux 创建 {{reviewLabel}} 之前，必须在当前环境中连接 {{provider}}。"
                 },
                 "needs_push": {
                   "title": "分支有未推送的提交",
@@ -10149,7 +10149,7 @@
                 },
                 "existing": {
                   "title": "{{reviewLabelCap}} 已存在",
-                  "body": "OrcaBotmux 找到了此分支的现有 {{reviewLabel}}。"
+                  "body": "Botmux 找到了此分支的现有 {{reviewLabel}}。"
                 },
                 "detached": {
                   "title": "没有当前分支",
@@ -10165,7 +10165,7 @@
                 },
                 "fork": {
                   "title": "不支持 Fork 头",
-                  "body": "OrcaBotmux 无法从此处的 Fork 头创建 {{reviewLabel}}。"
+                  "body": "Botmux 无法从此处的 Fork 头创建 {{reviewLabel}}。"
                 },
                 "base_missing": {
                   "title": "基础分支不在远程上",
@@ -10173,7 +10173,7 @@
                 },
                 "unsupported": {
                   "title": "此处不支持 {{reviewLabelCap}}",
-                  "body": "此仓库提供程序不支持从 OrcaBotmux 创建 {{reviewLabel}}。"
+                  "body": "此仓库提供程序不支持从 Botmux 创建 {{reviewLabel}}。"
                 }
               }
             }
@@ -10711,7 +10711,7 @@
           "e6a369bd04": "热门智能体",
           "d7b3ef168b": "在系统中已检测",
           "9c163bb0e0": "安装说明",
-          "69af7e9c1c": "尚未加入 PATH。OrcaBotmux 会将其设为默认，你可随时安装。",
+          "69af7e9c1c": "尚未加入 PATH。Botmux 会将其设为默认，你可随时安装。",
           "1eee1c7bd8": "PATH 中未检测到智能体。可选择一个稍后安装，或使用空白终端继续。",
           "hideAgents": "隐藏智能体",
           "showMoreAgents": "显示另外 {{value0}} 个智能体→",
@@ -10764,11 +10764,11 @@
           "3bede04483": "发送测试通知",
           "dc897423e1": "选择通知声音",
           "53aaffe49a": "通知声音",
-          "0fe570690c": "选择发送桌面通知后 OrcaBotmux 播放的警报。",
+          "0fe570690c": "选择发送桌面通知后 Botmux 播放的警报。",
           "0af746e41f": "选择声音",
           "8124d085a6": "打开 Mac 设置",
-          "aa36281b00": "打开系统设置并确保允许 OrcaBotmux 发送通知。",
-          "d2dba86837": "在 macOS 中允许 OrcaBotmux",
+          "aa36281b00": "打开系统设置并确保允许 Botmux 发送通知。",
+          "d2dba86837": "在 macOS 中允许 Botmux",
           "e52aacf380": "正在加载通知设置...",
           "3cd5374e22": "通知设置仍在加载中",
           "b6a994e36e": "无法播放通知声音",
@@ -10777,25 +10777,25 @@
           "56b836215c": "正在检查通知权限…",
           "fd84d3e9b8": "通知已启用",
           "4f7bce5644": "当代理完成或终端需要处理时，macOS 会提醒你。",
-          "95d99b52fa": "允许 OrcaBotmux 发送通知",
+          "95d99b52fa": "允许 Botmux 发送通知",
           "94562ba367": "macOS 正在请求权限。在对话框中点按允许，此步骤会自动更新。",
           "4f6a1da718": "打开系统设置",
-          "90b5d2e363": "macOS 未送达 OrcaBotmux 的通知",
-          "2c47f5465f": "在系统设置中启用 OrcaBotmux 的允许通知。启用后此步骤会自动更新。"
+          "90b5d2e363": "macOS 未送达 Botmux 的通知",
+          "2c47f5465f": "在系统设置中启用 Botmux 的允许通知。启用后此步骤会自动更新。"
         },
         "OnboardingFlow": {
-          "1b5e182e9f": "欢迎使用 OrcaBotmux",
+          "1b5e182e9f": "欢迎使用 Botmux",
           "4db04f2f57": "/",
           "adaa0aa627": "前往入门步骤 {{value0}}：{{value1}}",
-          "a249f81538": "orca_botmux",
-          "277ba45540": "OrcaBotmux 入门引导",
+          "a249f81538": "botmux",
+          "277ba45540": "Botmux 入门引导",
           "97c42cda00": "安装 GitHub CLI 以：",
           "ae3b00ca82": "设置 GitHub 任务",
-          "ff92d15436": "OrcaBotmux 会在智能体完成工作或需要帮助时通知你。",
+          "ff92d15436": "Botmux 会在智能体完成工作或需要帮助时通知你。",
           "b054332836": "设置通知",
           "04ae28d8ca": "选择你想盯着看几个小时的主题。",
           "f396db9f20": "让这里有家的感觉",
-          "322fc50a18": "OrcaBotmux 支持所有 CLI 智能体。选择你最常用的一个，随时可切换。",
+          "322fc50a18": "Botmux 支持所有 CLI 智能体。选择你最常用的一个，随时可切换。",
           "198b148b3c": "选择默认智能体",
           "a5e5da02f7": "集成",
           "35bbaf5ae0": "通知",
@@ -10900,7 +10900,7 @@
           "rightClickMenuDescription": "右键单击会打开终端菜单。可从菜单或键盘粘贴。",
           "loading": "正在加载终端设置...",
           "defaultShell": "默认 Shell",
-          "defaultShellDescription": "选择 OrcaBotmux 在新的 Windows 终端面板中打开的 shell。",
+          "defaultShellDescription": "选择 Botmux 在新的 Windows 终端面板中打开的 shell。",
           "wslDistribution": "WSL 发行版",
           "wslDistributionDescription": "使用 Windows 默认发行版，或选择一个已安装的特定发行版。",
           "loadingDistros": "正在加载发行版",
@@ -10914,7 +10914,7 @@
               "card": {
                 "f696515944": "在 macOS 对话框中点按允许。",
                 "3d18cf71f9": "将自动更新。",
-                "721d2bedb6": "在系统设置中为 OrcaBotmux 开启允许通知。"
+                "721d2bedb6": "在系统设置中为 Botmux 开启允许通知。"
               }
             }
           }
@@ -10996,7 +10996,7 @@
           "dfd2aa9d5d": "网络",
           "2f077ef4eb": "，然后扫码。",
           "3aa7bb2d8b": "配对桌面",
-          "d1495e5e64": "打开 OrcaBotmux 手机端，点击",
+          "d1495e5e64": "打开 Botmux 手机端，点击",
           "901c98bb93": "配对这个",
           "3960f5c339": "第 2 步（共 2 步）",
           "3241f3c26a": "安装二维码",
@@ -11004,19 +11004,19 @@
           "aa97420ba4": "复制安装链接",
           "ac1eb64952": "安卓",
           "711e6f4b47": "iOS系统",
-          "e75647ace0": "使用手机扫描二维码或打开安装链接以获取 OrcaBotmux 手机端。",
+          "e75647ace0": "使用手机扫描二维码或打开安装链接以获取 Botmux 手机端。",
           "0d9b33299e": "获取应用程序。",
           "92ddfdfa1f": "第 1 步（共 2 步）",
           "ff48d9d520": "与另一台设备配对",
           "f9cbf4bb53": "撤销设备",
           "34f878d04f": "撤销 {{value0}}",
           "94829abdb1": "配对",
-          "266c18c105": "打开 OrcaBotmux 手机端 从上次中断的地方继续，或配对其他设备。",
-          "5410d55d79": "OrcaBotmux 手机端",
+          "266c18c105": "打开 Botmux 手机端 从上次中断的地方继续，或配对其他设备。",
+          "5410d55d79": "Botmux 手机端",
           "10d27b4cba": "开始使用",
           "da1d5e5ed0": "可用于",
           "ec0607bf66": "支持的手机平台",
-          "b4ccce5cb7": "从您的手机控制 OrcaBotmux。当您离开办公桌时，检查智能体、查看更改并启动任务。",
+          "b4ccce5cb7": "从您的手机控制 Botmux。当您离开办公桌时，检查智能体、查看更改并启动任务。",
           "cd4e5e816f": "您的工作区就在您的口袋里。",
           "a6cffbbb0b": "生成代码",
           "e59a252eca": "重新生成代码",
@@ -11044,18 +11044,18 @@
         },
         "MobilePageToolbar": {
           "ad2284a9e2": "关闭 · Esc",
-          "9883b58693": "关闭 OrcaBotmux 手机",
+          "9883b58693": "关闭 Botmux 手机",
           "fb5f28330e": "在侧边栏中显示",
           "c669abcf8f": "从侧边栏隐藏",
           "e1c7b4a92d": "在设置 > 移动端中配置。",
-          "a4f8c2d91e": "从左侧边栏隐藏 OrcaBotmux 手机端",
-          "b7e3d1c84a": "在左侧边栏显示 OrcaBotmux 手机端",
+          "a4f8c2d91e": "从左侧边栏隐藏 Botmux 手机端",
+          "b7e3d1c84a": "在左侧边栏显示 Botmux 手机端",
           "f3d8e5b71a": "将快捷方式添加回左侧边栏。"
         },
         "PhoneCarousel": {
           "96d651cb87": "终端会话",
           "93217b41c1": "工作树列表",
-          "89c7713645": "OrcaBotmux 手机主屏幕"
+          "89c7713645": "Botmux 手机主屏幕"
         },
         "mobile": {
           "platform": {
@@ -11082,7 +11082,7 @@
             "0bad5b07c8": "GitHub 和 Linear",
             "d047197480": "GitHub · Linear",
             "a4c3f7b7aa": "任务",
-            "d33d7a9c29": "OrcaBotmux / mobile页面",
+            "d33d7a9c29": "Botmux / mobile页面",
             "25d6e8a491": "mobile页面",
             "c791677f2f": "恢复",
             "cf3f98fa3f": "已断开连接",
@@ -11095,7 +11095,7 @@
             "00a6903322": "特工产生",
             "c0e2e9dcd9": "欢迎回来",
             "af761a0c0d": "设置",
-            "5d94e8ddcc": "orca_botmux"
+            "5d94e8ddcc": "botmux"
           },
           "TerminalSlide": {
             "0bb39f8fe6": "发送",
@@ -11116,12 +11116,12 @@
             "a6e7cdc688": "pnpm 测试 -- 搜索手机设备",
             "21b67dfc92": "Bash",
             "d6d1041a1c": "⎿ 用终端会话替换配对扫描幻灯片",
-            "336c0e070e": "手机/orca-botmux-mobile-sidebar-mock-v3.html",
+            "336c0e070e": "手机/botmux-mobile-sidebar-mock-v3.html",
             "6d4ebd5833": "编辑",
             "fc83e0d5ef": "⎿ 阅读2103行",
             "80cc356591": "读",
             "2c10d43745": "claude",
-            "e0f98be657": "OrcaBotmux/壮举-手机页面",
+            "e0f98be657": "Botmux/壮举-手机页面",
             "2defc05141": "开发@mac",
             "da121ba48d": "计划.md",
             "e4befee569": "Shell",
@@ -11157,18 +11157,18 @@
           "add-custom": "添加自定义地址…"
         },
         "WindowsFirewallNotice": {
-          "repair-success": "Windows 防火墙现已允许 OrcaBotmux Mobile 在专用网络上通信",
+          "repair-success": "Windows 防火墙现已允许 Botmux Mobile 在专用网络上通信",
           "repair-failed": "无法更新 Windows 防火墙规则",
           "public-title": "Windows 将此网络标记为公用",
           "missing-title": "允许手机连接通过 Windows 防火墙",
-          "public-description": "请先将此受信任的 Wi-Fi 网络更改为专用网络，然后再允许 OrcaBotmux Mobile 连接。",
-          "missing-description": "Windows 可能会阻止配对服务器。请为此 OrcaBotmux 应用和专用网络上的 TCP 端口 {{port}} 添加规则。",
+          "public-description": "请先将此受信任的 Wi-Fi 网络更改为专用网络，然后再允许 Botmux Mobile 连接。",
+          "missing-description": "Windows 可能会阻止配对服务器。请为此 Botmux 应用和专用网络上的 TCP 端口 {{port}} 添加规则。",
           "open-settings": "打开网络设置",
           "waiting": "正在等待 Windows…",
           "allow": "允许手机连接",
           "repair-unverified": "无法验证 Windows 防火墙访问权限",
-          "blocked-title": "Windows 可能正在阻止 OrcaBotmux Mobile",
-          "blocked-description": "现有的入站阻止规则可能会覆盖配对例外。修复将移除此 OrcaBotmux 应用的冲突 TCP 规则，然后在专用网络上允许端口 {{port}}。",
+          "blocked-title": "Windows 可能正在阻止 Botmux Mobile",
+          "blocked-description": "现有的入站阻止规则可能会覆盖配对例外。修复将移除此 Botmux 应用的冲突 TCP 规则，然后在专用网络上允许端口 {{port}}。",
           "repair": "修复防火墙访问权限"
         }
       },
@@ -11180,7 +11180,7 @@
                 "ebc0e8ecf1": "正在加载 GitLab API 预算...",
                 "a2d3d1fdde": "GitLab API 预算不可用。",
                 "a2f68645ac": "刷新 GitLab API 预算",
-                "2f9c16d6c3": "OrcaBotmux 通过 GitLab CLI 使用 REST。",
+                "2f9c16d6c3": "Botmux 通过 GitLab CLI 使用 REST。",
                 "14e144f7a7": "GitLab API预算",
                 "3e2c982cfa": "向左，重置于",
                 "ea8ad0bae8": "的",
@@ -11200,9 +11200,9 @@
             "0ee79e0674": "移至状态栏"
           },
           "FloatingTerminalOrchestrationDialog": {
-            "f726054620": "使智能体能够通过 OrcaBotmux 传递上下文并协调工作。",
+            "f726054620": "使智能体能够通过 Botmux 传递上下文并协调工作。",
             "1cd3f8af64": "编排技能",
-            "6f0aed26b8": "安装 OrcaBotmux CLI 和编排技能，以便智能体可以通过 OrcaBotmux 进行协调。",
+            "6f0aed26b8": "安装 Botmux CLI 和编排技能，以便智能体可以通过 Botmux 进行协调。",
             "05d7aabc20": "未安装",
             "630c0ac8c8": "已安装",
             "dfd021ce46": "检查中...",
@@ -11220,7 +11220,7 @@
             "690b6fb98a": "未保存的更改",
             "bbc177f98f": "启用",
             "adc281394d": "关闭",
-            "8cf80db43b": "设置 OrcaBotmux CLI 和智能体技能，以便智能体可以通过 OrcaBotmux 进行协调。",
+            "8cf80db43b": "设置 Botmux CLI 和智能体技能，以便智能体可以通过 Botmux 进行协调。",
             "2a3c5ddf5e": "启用编排",
             "d6b563ae24": "正在加载编辑器...",
             "8b14ba6c17": "新浏览器选项卡",
@@ -11253,9 +11253,9 @@
             "b8dc9dd8a2": "已安装",
             "1b51644c2d": "让智能体控制桌面、手机光标、单击并在任何应用程序中键入。",
             "362a07517d": "计算机控制",
-            "5e8fe5a72d": "让智能体直接访问 OrcaBotmux 的浏览器，以便测试页面、捕获屏幕截图并根据所见内容执行操作。",
+            "5e8fe5a72d": "让智能体直接访问 Botmux 的浏览器，以便测试页面、捕获屏幕截图并根据所见内容执行操作。",
             "e638da007a": "智能体浏览器使用",
-            "c61c91e642": "让智能体通过 OrcaBotmux 进行协调，以确保大型、多步骤的任务顺利完成。",
+            "c61c91e642": "让智能体通过 Botmux 进行协调，以确保大型、多步骤的任务顺利完成。",
             "ac07f8887f": "智能体编排",
             "e9eb197e12": "打开计算机使用权限",
             "3a59452a67": "技能命令已复制并插入到下方以供评审。",
@@ -11298,7 +11298,7 @@
             "f39be6ca14": "/报名"
           },
           "BrowserUseSkillSetupCard": {
-            "cbc45022d4": "使智能体能够在 OrcaBotmux 浏览器中导航和验证页面。",
+            "cbc45022d4": "使智能体能够在 Botmux 浏览器中导航和验证页面。",
             "d5bb1cd4ba": "浏览器使用技能"
           },
           "ComputerUseAnimatedVisual": {
@@ -11346,7 +11346,7 @@
             "24fedd5a52": "登录规范",
             "8279e9d95b": "运行 12 项测试",
             "6218a9014d": "pnpm剧作家测试",
-            "04d54d50ec": "OrcaBotmux·zsh",
+            "04d54d50ec": "Botmux·zsh",
             "1aa8a9a24a": "可拆分终端",
             "2a7cfc82c8": "链接到 GH #1842",
             "3822d8d14b": "修复/worktree-picker-截断",
@@ -11377,8 +11377,8 @@
             "25ec5356d6": "设置"
           },
           "FeatureWallModal": {
-            "33dca8bbbe": "OrcaBotmux 的一个简短的、逐个工作流程的浏览。",
-            "3567e147c8": "了解 OrcaBotmux"
+            "33dca8bbbe": "Botmux 的一个简短的、逐个工作流程的浏览。",
+            "3567e147c8": "了解 Botmux"
           },
           "FeatureWallPreview": {
             "a666384798": "也在这个工作流程中"
@@ -11507,7 +11507,7 @@
                   "aae94eeb52": "单击安装 CLI 和技能",
                   "aa8e143a2f": "无法检查安装",
                   "9b33e7fb13": "检查安装",
-                  "4c8e1f92a7": "在此 Mac 上打开 orca_botmux",
+                  "4c8e1f92a7": "在此 Mac 上打开 botmux",
                   "6d2b0a84e1": "此版本不可用"
                 }
               }
@@ -11622,7 +11622,7 @@
           },
           "ConnectIntegrationsList": {
             "3dddb2d565": "已连接，可用于任务",
-            "33b650af52": "连接团队用于跟踪工作的地方。OrcaBotmux 会在启动工作区时自动附上议题标题、链接和上下文。",
+            "33b650af52": "连接团队用于跟踪工作的地方。Botmux 会在启动工作区时自动附上议题标题、链接和上下文。",
             "5b3577a492": "已连接，可用于评审状态",
             "list_end": "，以及",
             "list_pair": " 和 ",
@@ -11630,8 +11630,8 @@
             "code_host_tasks_summary": "议题可作为任务使用 · 如果团队在 Linear 或 Jira 中规划工作，也可以添加它们",
             "code_host_tasks_caption": "代码托管平台的议题也可以作为任务使用。",
             "review_step_title": "在智能体工作时查看 PR 状态",
-            "review_step_description": "连接评审提供方，让 OrcaBotmux 显示 PR 或 MR 状态、检查和评审。",
-            "task_step_title": "无需离开 OrcaBotmux，即可让智能体处理任务"
+            "review_step_description": "连接评审提供方，让 Botmux 显示 PR 或 MR 状态、检查和评审。",
+            "task_step_title": "无需离开 Botmux，即可让智能体处理任务"
           },
           "connect": {
             "integration": {
@@ -11661,8 +11661,8 @@
             "22e62f3bab": "Claude Code 会话已开始"
           },
           "CliSkillSetupTerminal": {
-            "1953e90447": "按 Enter 为您的智能体安装 OrcaBotmux CLI 编排技能。",
-            "43b60ec5c3": "OrcaBotmux CLI 和编排技能安装终端",
+            "1953e90447": "按 Enter 为您的智能体安装 Botmux CLI 编排技能。",
+            "43b60ec5c3": "Botmux CLI 和编排技能安装终端",
             "84e9576dac": "技能设置",
             "5c3aee22c0": "复制命令",
             "5eca672aac": "复制技能安装命令",
@@ -11686,8 +11686,8 @@
             "55846c7f95": "将此 PR 拆成两个",
             "4795ac2d4a": "尝试询问：",
             "53905bd076": "开发预览：打开技能设置终端。",
-            "1da82af45b": "OrcaBotmux CLI 需要注意",
-            "ce13a742d0": "在 PATH 中注册了 `orca_botmux`。",
+            "1da82af45b": "Botmux CLI 需要注意",
+            "ce13a742d0": "在 PATH 中注册了 `botmux`。",
             "d1a86c7eb5": "打开“设置”以完成 CLI 设置。"
           },
           "CmdJPaletteFeatureTipVisual": {
@@ -11703,7 +11703,7 @@
           "RecoverableRenderErrorBoundary": {
             "55001880db": "重试",
             "34a189ae0f": "应用程序的其余部分仍在运行。重试此表面或切换出去然后再回来。",
-            "ab855c11f4": "OrcaBotmux 的这一部分遇到了错误。"
+            "ab855c11f4": "Botmux 的这一部分遇到了错误。"
           }
         }
       },
@@ -11766,11 +11766,11 @@
                       "7c1b6bdb1e": "启用",
                       "51074ccb05": "无法加载 CLI 状态。",
                       "35dea1ae12": "智能体控制已就绪。",
-                      "9dff3a6338": "技能已安装。启用 OrcaBotmux CLI 以完成设置。",
-                      "15986a1080": "OrcaBotmux CLI 已就绪。安装技能以完成设置。",
+                      "9dff3a6338": "技能已安装。启用 Botmux CLI 以完成设置。",
+                      "15986a1080": "Botmux CLI 已就绪。安装技能以完成设置。",
                       "4c26913def": "尚未设置完成。请完成两个步骤以启用智能体控制。",
                       "c94ff11e91": "无法重新检查设置状态。",
-                      "2b519eed94": "已在 PATH 中注册 OrcaBotmux CLI。"
+                      "2b519eed94": "已在 PATH 中注册 Botmux CLI。"
                     }
                   }
                 },
@@ -11788,7 +11788,7 @@
             "2fda9ff015": "设置智能体控制",
             "0ac0fef514": "智能体控制已就绪。",
             "2bdfff8763": "智能体控制（可选）。",
-            "72736b051f": "当您希望智能体控制此模拟器时，设置 OrcaBotmux CLI + 技能。",
+            "72736b051f": "当您希望智能体控制此模拟器时，设置 Botmux CLI + 技能。",
             "d10ae98046": "完成",
             "3756cbeca7": "暂不",
             "6d950431d2": "隐藏",
@@ -11796,15 +11796,15 @@
             "3f003507f4": "在设置中打开完整设置"
           },
           "MobileEmulatorAgentSetupGuideSteps": {
-            "9b49d892e3": "启用 OrcaBotmux CLI",
-            "3d8dc52c93": "在智能体 shell 中注册用于模拟器控制的 orca_botmux 命令。",
-            "21f5687c07": "OrcaBotmux CLI 技能",
-            "64fb057667": "教授智能体此工作区的 orca_botmux 模拟器命令。",
-            "5c59ea96ca": "移动端模拟器 OrcaBotmux CLI 技能设置",
-            "bff5341ac3": "移动端模拟器 OrcaBotmux CLI 技能安装终端",
-            "3d34423e88": "正在注册 OrcaBotmux CLI",
+            "9b49d892e3": "启用 Botmux CLI",
+            "3d8dc52c93": "在智能体 shell 中注册用于模拟器控制的 botmux 命令。",
+            "21f5687c07": "Botmux CLI 技能",
+            "64fb057667": "教授智能体此工作区的 botmux 模拟器命令。",
+            "5c59ea96ca": "移动端模拟器 Botmux CLI 技能设置",
+            "bff5341ac3": "移动端模拟器 Botmux CLI 技能安装终端",
+            "3d34423e88": "正在注册 Botmux CLI",
             "3be27641c9": "以便智能体 shell 可以运行模拟器命令。",
-            "3941719a56": "打开技能设置前正在检查 OrcaBotmux CLI。"
+            "3941719a56": "打开技能设置前正在检查 Botmux CLI。"
           },
           "MobileEmulatorTabIntroCallout": {
             "1924982130": "关闭",
@@ -12162,7 +12162,7 @@
         "RichMarkdownErrorBoundary": {
           "aad0998127": "重试",
           "4a5de9f2f0": "切换到源模式，或单击“重试”以重新加载丰富视图。",
-          "dfdf1cacd4": "丰富的 Markdown 编辑器遇到了意外错误，并被重置以保持 OrcaBotmux 的其余部分响应。"
+          "dfdf1cacd4": "丰富的 Markdown 编辑器遇到了意外错误，并被重置以保持 Botmux 的其余部分响应。"
         },
         "RichMarkdownLinkBubble": {
           "1c99b726e0": "删除链接",
@@ -12470,7 +12470,7 @@
           "7afff43472": "听写完成，但没有聚焦文本字段。",
           "55127a3706": "听写失败：{{value0}}",
           "bb7f599ee7": "打开设置",
-          "2d5b9fabf9": "麦克风访问被拒绝。在系统设置中授予访问权限，然后重新启动 OrcaBotmux。",
+          "2d5b9fabf9": "麦克风访问被拒绝。在系统设置中授予访问权限，然后重新启动 Botmux。",
           "5d2c3e7ae3": "未检测到语音。"
         }
       },
@@ -12500,7 +12500,7 @@
             "88fea8e84e": "不发送",
             "50b00dc327": "复制详情",
             "6d3ebe216a": "诊断文本",
-            "835037edc9": "·OrcaBotmux",
+            "835037edc9": "·Botmux",
             "56a3dfa283": "无法发送错误报告。",
             "8e24fe4f75": "已发送错误报告。",
             "8b8473c544": "已复制错误报告。",
@@ -12669,7 +12669,7 @@
             "40edfa75cb": "返回",
             "efb0e8f7f3": "复制链接地址",
             "8ce4f6b12e": "在默认浏览器中打开链接",
-            "b5b87d6cbb": "在 OrcaBotmux 浏览器中打开链接",
+            "b5b87d6cbb": "在 Botmux 浏览器中打开链接",
             "87eb75f7d2": "输入有效的 http(s) 或本地主机 URL。",
             "27d863542c": "浏览器注释",
             "e48569ac6d": "无法访问该网站。",
@@ -12795,7 +12795,7 @@
           "2f8baf5360": "创建自",
           "578ff46987": "下次运行",
           "18763ded26": "日程",
-          "dbef8dc110": "此 SSH 自动化仅在 OrcaBotmux 可以到达 SSH 远程主机时运行。如果重新连接需要交互式凭据或主机不可用，则运行将记录为已跳过。",
+          "dbef8dc110": "此 SSH 自动化仅在 Botmux 可以到达 SSH 远程主机时运行。如果重新连接需要交互式凭据或主机不可用，则运行将记录为已跳过。",
           "1f6026358e": "删除自动化",
           "d79452fb30": "恢复自动化",
           "91a4155e95": "暂停自动化",
@@ -12831,7 +12831,7 @@
         "AutomationEditorDialogHeader": {
           "31f9253920": "使用模板",
           "7e35393632": "Hermes",
-          "6f309eef8d": "orca_botmux",
+          "6f309eef8d": "botmux",
           "58f56b73d9": "自动化名称",
           "1d9826933e": "工作日仓库审计",
           "4133d33862": "创建自动化",
@@ -12847,7 +12847,7 @@
           "521f77cd58": "1小时",
           "e5ad263ae5": "30分钟",
           "529dc6c0b7": "没有恩典",
-          "3d70c185c8": "如果 OrcaBotmux 或执行主机在计划时间不可用，OrcaBotmux 会在该窗口内变得可用时运行一次错过的事件。较旧的错过运行将被跳过。",
+          "3d70c185c8": "如果 Botmux 或执行主机在计划时间不可用，Botmux 会在该窗口内变得可用时运行一次错过的事件。较旧的错过运行将被跳过。",
           "3df53d554a": "错过运行恩典帮助",
           "fc089e5fde": "优雅"
         },
@@ -12890,7 +12890,7 @@
         "AutomationSessionField": {
           "f3c76dce51": "重复利用",
           "c90888ee94": "新鲜的",
-          "b675112193": "重用将未来的运行发送到之前的实时自动化会话。如果该会话结束，OrcaBotmux 将开始新的会话。",
+          "b675112193": "重用将未来的运行发送到之前的实时自动化会话。如果该会话结束，Botmux 将开始新的会话。",
           "4bdce31f37": "会话重用帮助",
           "5ad314118e": "会话"
         },
@@ -13236,11 +13236,11 @@
             "dialog": {
               "badge": "终端链接",
               "preview": "预览",
-              "title": "在 OrcaBotmux 浏览器中打开终端链接？",
-              "description": "用 OrcaBotmux 浏览器打开终端链接，或继续使用系统浏览器。",
-              "orca_botmux": {
-                "button": "在 OrcaBotmux 中打开",
-                "note": "OrcaBotmux 可以使用已导入的 Cookie 打开已登录的网站。"
+              "title": "在 Botmux 浏览器中打开终端链接？",
+              "description": "用 Botmux 浏览器打开终端链接，或继续使用系统浏览器。",
+              "botmux": {
+                "button": "在 Botmux 中打开",
+                "note": "Botmux 可以使用已导入的 Cookie 打开已登录的网站。"
               },
               "settings": {
                 "note": "之后可在设置 → 浏览器中更改。"
@@ -13253,15 +13253,15 @@
               },
               "shortcut": {
                 "note": {
-                  "prefix": "当链接在 OrcaBotmux 中打开时，",
+                  "prefix": "当链接在 Botmux 中打开时，",
                   "suffix": "点击可临时改用系统浏览器。"
                 }
               },
               "keep": {
-                "title": "继续在 OrcaBotmux 浏览器中打开终端链接？",
+                "title": "继续在 Botmux 浏览器中打开终端链接？",
                 "description": "或默认使用系统浏览器。",
-                "orca_botmux": {
-                  "button": "继续使用 OrcaBotmux"
+                "botmux": {
+                  "button": "继续使用 Botmux"
                 }
               }
             }
@@ -13284,7 +13284,7 @@
       },
       "taskPageEmptyState": {
         "noProjectSourcesTitle": "未选择项目来源",
-        "noProjectSourcesDescription": "请至少选择一个项目来源，让 OrcaBotmux 知道要从哪个主机/账户获取任务。",
+        "noProjectSourcesDescription": "请至少选择一个项目来源，让 Botmux 知道要从哪个主机/账户获取任务。",
         "noMatchingGitHubWorkTitle": "没有匹配的 GitHub 工作",
         "changeQueryDescription": "更改查询或清除它。",
         "noGitLabIssuesTitle": "没有 GitLab 议题",
@@ -13312,7 +13312,7 @@
             "openGithub": "打开 GitHub",
             "starOnGithub": "在 GitHub 上加星",
             "onboardingCompleted": "入门流程已完成！",
-            "body": "如果你目前喜欢 OrcaBotmux，在 GitHub 上加星可以帮助其他开发者发现它。",
+            "body": "如果你目前喜欢 Botmux，在 GitHub 上加星可以帮助其他开发者发现它。",
             "dismiss": "关闭",
             "later": "稍后"
           }
@@ -13323,11 +13323,11 @@
           "copy": "复制"
         }
       },
-      "orca_botmux": {
+      "botmux": {
         "profiles": {
           "switcher": {
             "cloud": {
-              "unavailable": "OrcaBotmux 登录不可用"
+              "unavailable": "Botmux 登录不可用"
             },
             "reconnect": "重新连接配置文件",
             "connect": "连接配置文件",
@@ -13354,8 +13354,8 @@
             },
             "signInWaiting": "正在等待登录…",
             "signInAgain": "重新登录",
-            "signIn": "登录 OrcaBotmux",
-            "accountTitle": "OrcaBotmux 帐户",
+            "signIn": "登录 Botmux",
+            "accountTitle": "Botmux 帐户",
             "accountSignedIn": "已登录",
             "accountSignInRequired": "需要登录",
             "accountSignedOut": "已退出登录"
@@ -13378,12 +13378,12 @@
               "confirm": {
                 "move": {
                   "title": "移动项目？",
-                  "description": "将 {{repoName}} 移动到 {{targetName}}。OrcaBotmux 会将其从 {{activeProfileName}} 中移除，保留文件原位，并重新启动进入 {{targetName}}。",
+                  "description": "将 {{repoName}} 移动到 {{targetName}}。Botmux 会将其从 {{activeProfileName}} 中移除，保留文件原位，并重新启动进入 {{targetName}}。",
                   "action": "移动项目"
                 },
                 "copy": {
                   "title": "复制项目？",
-                  "description": "将 {{repoName}} 复制到 {{targetName}}。两个配置文件将指向相同的文件，但使用各自独立的 OrcaBotmux 元数据。",
+                  "description": "将 {{repoName}} 复制到 {{targetName}}。两个配置文件将指向相同的文件，但使用各自独立的 Botmux 元数据。",
                   "action": "复制项目"
                 },
                 "live": {
@@ -13401,8 +13401,8 @@
           },
           "signout": {
             "confirm": {
-              "title": "退出 OrcaBotmux？",
-              "description": "你将在此设备上退出 OrcaBotmux。本地项目和工作树不会受到影响。",
+              "title": "退出 Botmux？",
+              "description": "你将在此设备上退出 Botmux。本地项目和工作树不会受到影响。",
               "cancel": "取消",
               "action": "退出登录"
             }
@@ -13411,7 +13411,7 @@
             "confirm": {
               "target": "所选配置文件",
               "title": "切换配置文件？",
-              "description": "切换到 {{targetName}} 将重新启动 OrcaBotmux 并重新加载 {{activeProfileName}} 的工作区。",
+              "description": "切换到 {{targetName}} 将重新启动 Botmux 并重新加载 {{activeProfileName}} 的工作区。",
               "live": {
                 "work": "此配置文件中正在进行的工作"
               },
@@ -13435,7 +13435,7 @@
               },
               "not": {
                 "signed": {
-                  "in": "他们尚未登录 OrcaBotmux。"
+                  "in": "他们尚未登录 Botmux。"
                 }
               },
               "remove": {
@@ -13475,8 +13475,8 @@
                 "failed": "出现问题。请重试。"
               },
               "subtitle": {
-                "named": "{{orgName}} 中可以协作使用 OrcaBotmux 的成员。",
-                "default": "你的组织中可以协作使用 OrcaBotmux 的成员。"
+                "named": "{{orgName}} 中可以协作使用 Botmux 的成员。",
+                "default": "你的组织中可以协作使用 Botmux 的成员。"
               }
             }
           }
@@ -13695,8 +13695,8 @@
       "cantLoadPage": "Can't load this page",
       "certificateNameMismatch": "The certificate doesn't match {{value0}}.",
       "certificateDateInvalid": "The certificate for {{value0}} isn't valid at the current date and time.",
-      "certificateAuthorityInvalid": "OrcaBotmux doesn't trust the authority that issued the certificate for {{value0}}.",
-      "certificateVerificationFailed": "OrcaBotmux couldn't verify the certificate for {{value0}}.",
+      "certificateAuthorityInvalid": "Botmux doesn't trust the authority that issued the certificate for {{value0}}.",
+      "certificateVerificationFailed": "Botmux couldn't verify the certificate for {{value0}}.",
       "trustedCertificateGuidance": "For local development, use a trusted local certificate when possible.",
       "retry": "Retry",
       "copyAddress": "Copy Address",
@@ -13708,31 +13708,31 @@
       "certificateChallengeExpired": "This certificate approval expired. Retry the page to request a new one.",
       "certificateChallengeChanged": "The certificate request changed. Retry the page and review the new warning.",
       "certificateChallengeUnavailable": "This certificate request is no longer available. Retry the page to request a new one.",
-      "certificateProceedFailed": "OrcaBotmux could not approve this certificate request. Retry the page and try again."
+      "certificateProceedFailed": "Botmux could not approve this certificate request. Retry the page and try again."
     }
   },
-  "ipcMissingShort": "orcaBotmuxBridge unavailable — rebuild desktop.",
+  "ipcMissingShort": "botmuxBridge unavailable — rebuild desktop.",
   "localConnectFailed": "Local connect failed",
   "platformConnectFailed": "Platform connect failed",
   "sshConnectFailed": "SSH connect failed",
   "openFailed": "Open failed",
   "answerFailed": "Answer failed",
   "sendFailed": "Send failed",
-  "sidebarTitle": "orca_botmux",
+  "sidebarTitle": "botmux",
   "refreshTitle": "Refresh all hosts",
   "connectedHosts": "Connected hosts",
   "noneConnect": "None — connect local and/or SSH.",
   "local": "Local",
   "disconnect": "Disconnect",
-  "platformTitle": "Use ~/.orca_botmux/platform.json machine URL",
+  "platformTitle": "Use ~/.botmux/platform.json machine URL",
   "platform": "Platform",
   "knownSshHosts": "Known SSH hosts",
-  "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach orca_botmux over that host.",
+  "knownSshHint": "Same hosts as Settings → SSH (including ~/.ssh/config). Click Connect to attach botmux over that host.",
   "noKnownSsh": "No SSH hosts yet. Add them in Settings → SSH or import ~/.ssh/config.",
-  "orcaSshConnected": "SSH connected",
-  "orcaSshIdle": "SSH idle",
+  "botmuxSshConnected": "SSH connected",
+  "botmuxSshIdle": "SSH idle",
   "sourceConfig": "from ~/.ssh/config",
-  "botmuxLinked": "OrcaBotmux linked",
+  "botmuxLinked": "Botmux linked",
   "connectBotmux": "Connect",
   "showAllHosts": "Show all hosts",
   "needsAnswer": "Needs answer ({{count}})",
@@ -13745,9 +13745,9 @@
   "sendTitle": "Send message",
   "messagePlaceholder": "Message…",
   "send": "Send",
-  "searchMulti": "Multi-host orca_botmux",
-  "searchSessions": "OrcaBotmux sessions",
-  "ipcMissing": "orcaBotmuxBridge IPC not available — rebuild desktop preload.",
+  "searchMulti": "Multi-host botmux",
+  "searchSessions": "Botmux sessions",
+  "ipcMissing": "botmuxBridge IPC not available — rebuild desktop preload.",
   "hostsSessions": "{{hosts}} host(s) · {{sessions}} session(s)",
   "selectSshOrManual": "Select an SSH host or enter a manual destination.",
   "openedAttach": "Opened native terminal (tmux attach)",
@@ -13756,7 +13756,7 @@
   "openedWeb": "Opened web terminal in browser tab",
   "queued": "Queued {{id}}",
   "sent": "Sent",
-  "controlPlaneTitle": "Multi-host OrcaBotmux control plane",
+  "controlPlaneTitle": "Multi-host Botmux control plane",
   "controlPlaneBody": "Connect local, platform tunnel, and multiple SSH remotes at once. Sessions merge with host labels. Pending ask-hooks appear above the session list (multi-question supported).",
   "connected": "Connected",
   "noEndpoints": "No endpoints yet.",
@@ -13778,7 +13778,7 @@
   "filterWorktree": "This worktree",
   "filterAll": "All",
   "filterWorktreeActive": "Under {{path}}",
-  "noSessionsInWorktree": "No orca_botmux sessions under this worktree. Switch to All or start a session in this directory.",
+  "noSessionsInWorktree": "No botmux sessions under this worktree. Switch to All or start a session in this directory.",
   "otherSessions": "Other sessions",
   "hostsSessionsMatched": "{{hosts}} hosts · {{sessions}} sessions · {{matched}} in this worktree",
   "showingClosed": "Showing closed ({{count}})",
@@ -13807,7 +13807,7 @@
   "hostsSessionsHiddenClosed": "{{visible}} open · {{closed}} closed hidden",
   "dismissError": "Dismiss",
   "emptyMachinesTitle": "No machines connected",
-  "emptyMachinesHint": "Connect this machine or an SSH host to see orca_botmux sessions here.",
+  "emptyMachinesHint": "Connect this machine or an SSH host to see botmux sessions here.",
   "noFilterMatch": "No sessions match \"{{query}}\"",
   "disconnectFailed": "Disconnect failed",
   "agentsSection": "Agents",

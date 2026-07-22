@@ -5,7 +5,7 @@ import { collectAgentMetadataForTerminal } from './workspace-tab-agent-metadata'
 function makeEntry(overrides: Partial<AgentStatusEntry> = {}): AgentStatusEntry {
   return {
     state: 'working',
-    prompt: 'You are working inside OrcaBotmux, a multi-agent IDE.',
+    prompt: 'You are working inside Botmux, a multi-agent IDE.',
     updatedAt: 1000,
     stateStartedAt: 900,
     paneKey: 'tab-1:leaf-1',

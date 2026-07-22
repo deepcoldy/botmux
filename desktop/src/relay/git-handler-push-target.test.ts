@@ -116,32 +116,32 @@ describe('resolveRelayPushTarget', () => {
   })
 
   it('normalizes a URL-valued branch remote to a matching named remote', async () => {
-    const forkUrl = 'https://github.com/contributor/orca_botmux.git'
+    const forkUrl = 'https://github.com/contributor/botmux.git'
     const git = gitForConfig({
       pushRemote: new Error('missing pushRemote'),
       pushDefault: new Error('missing pushDefault'),
       branchRemote: forkUrl,
-      remotes: ['origin', 'pr-contributor-orca_botmux'],
+      remotes: ['origin', 'pr-contributor-botmux'],
       remoteUrls: {
-        origin: 'https://github.com/stablyai/orca_botmux.git',
-        'pr-contributor-orca_botmux': forkUrl
+        origin: 'https://github.com/stablyai/botmux.git',
+        'pr-contributor-botmux': forkUrl
       }
     })
 
     await expect(resolveRelayPushTarget(git, '/repo', undefined)).resolves.toEqual({
-      remote: 'pr-contributor-orca_botmux',
+      remote: 'pr-contributor-botmux',
       refspec: 'HEAD:feature/fix'
     })
   })
 
   it('keeps a URL-valued pushRemote when no named remote matches it', async () => {
-    const forkUrl = 'git@github.com:contributor/orca_botmux.git'
+    const forkUrl = 'git@github.com:contributor/botmux.git'
     const git = gitForConfig({
       pushRemote: forkUrl,
       branchRemote: forkUrl,
       remotes: ['origin'],
       remoteUrls: {
-        origin: 'git@github.com:stablyai/orca_botmux.git'
+        origin: 'git@github.com:stablyai/botmux.git'
       }
     })
 

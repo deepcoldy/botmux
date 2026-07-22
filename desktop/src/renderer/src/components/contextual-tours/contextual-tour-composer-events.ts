@@ -1,2 +1,2 @@
 export const CONTEXTUAL_TOUR_ENABLE_AUTO_WORKSPACE_NAME_EVENT =
-  'orca_botmux:contextual-tour-enable-auto-workspace-name'
+  'botmux:contextual-tour-enable-auto-workspace-name'

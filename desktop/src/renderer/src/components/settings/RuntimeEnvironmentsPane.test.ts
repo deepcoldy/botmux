@@ -206,6 +206,6 @@ describe('RuntimeEnvironmentsPane host details', () => {
     expect(getActiveServerModeDescription(true)).toContain('Use this computer by default')
     expect(getActiveServerModeDescription(true)).toContain('browser/mobile handoff')
     expect(getActiveServerModeDescription(false)).toContain('default Host')
-    expect(getActiveServerModeDescription(false)).toContain('paired OrcaBotmux runtime')
+    expect(getActiveServerModeDescription(false)).toContain('paired Botmux runtime')
   })
 })

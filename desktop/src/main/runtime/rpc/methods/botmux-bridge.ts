@@ -1,17 +1,17 @@
 /**
- * Mobile / runtime RPC surface for the OrcaBotmux Feishu Botmux bridge.
+ * Mobile / runtime RPC surface for the Botmux Feishu Botmux bridge.
  * Thin wrappers around the main-process bridge service (same as desktop IPC).
  */
 import { z } from 'zod'
 import { defineMethod, type RpcMethod } from '../core'
 import {
-  getOrcaBotmuxBridgeNativeTerminalSpec,
-  getOrcaBotmuxBridgeStatus,
-  getOrcaBotmuxBridgeTmuxAttachSpec,
-  listOrcaBotmuxBridgeEndpoints,
-  listOrcaBotmuxBridgeSessions,
-  openOrcaBotmuxBridgeTerminal
-} from '../../../orca-botmux-bridge/orca-botmux-bridge-service'
+  getBotmuxBridgeNativeTerminalSpec,
+  getBotmuxBridgeStatus,
+  getBotmuxBridgeTmuxAttachSpec,
+  listBotmuxBridgeEndpoints,
+  listBotmuxBridgeSessions,
+  openBotmuxBridgeTerminal
+} from '../../../botmux-bridge/botmux-bridge-service'
 import { applyBotmuxSessionWorktreeScope } from '../../../../shared/botmux-session-worktree-match'
 
 const OptionalString = z
@@ -21,10 +21,10 @@ const OptionalString = z
 
 const ListSessionsParams = z
   .object({
-    /** When set with orcaBotmuxHostId, only sessions under this path are returned. */
+    /** When set with botmuxHostId, only sessions under this path are returned. */
     worktreePath: OptionalString,
     /** Bridge host id (`local` | `ssh:…`) for worktree scope matching. */
-    orcaBotmuxHostId: OptionalString
+    botmuxHostId: OptionalString
   })
   .optional()
   .default({})
@@ -45,9 +45,9 @@ const OpenTerminalParams = z.object({
  * Pure post-process for listSessions RPC (unit-tested without live tunnels).
  */
 export function shapeBotmuxBridgeListSessionsResult(
-  list: Awaited<ReturnType<typeof listOrcaBotmuxBridgeSessions>>,
-  scope?: { worktreePath?: string; orcaBotmuxHostId?: string }
-): Awaited<ReturnType<typeof listOrcaBotmuxBridgeSessions>> {
+  list: Awaited<ReturnType<typeof listBotmuxBridgeSessions>>,
+  scope?: { worktreePath?: string; botmuxHostId?: string }
+): Awaited<ReturnType<typeof listBotmuxBridgeSessions>> {
   if (!list.ok) return list
   const sessions = applyBotmuxSessionWorktreeScope(list.sessions, scope ?? null)
   return {
@@ -61,24 +61,24 @@ export const BOTMUX_BRIDGE_METHODS: RpcMethod[] = [
     name: 'botmuxBridge.getStatus',
     params: null,
     handler: async () => {
-      return await getOrcaBotmuxBridgeStatus()
+      return await getBotmuxBridgeStatus()
     }
   }),
   defineMethod({
     name: 'botmuxBridge.listEndpoints',
     params: null,
     handler: () => {
-      return listOrcaBotmuxBridgeEndpoints()
+      return listBotmuxBridgeEndpoints()
     }
   }),
   defineMethod({
     name: 'botmuxBridge.listSessions',
     params: ListSessionsParams,
     handler: async (params) => {
-      const list = await listOrcaBotmuxBridgeSessions()
+      const list = await listBotmuxBridgeSessions()
       return shapeBotmuxBridgeListSessionsResult(list, {
         worktreePath: params?.worktreePath,
-        orcaBotmuxHostId: params?.orcaBotmuxHostId
+        botmuxHostId: params?.botmuxHostId
       })
     }
   }),
@@ -86,7 +86,7 @@ export const BOTMUX_BRIDGE_METHODS: RpcMethod[] = [
     name: 'botmuxBridge.nativeTerminalSpec',
     params: SessionHostParams,
     handler: async (params) => {
-      return await getOrcaBotmuxBridgeNativeTerminalSpec({
+      return await getBotmuxBridgeNativeTerminalSpec({
         sessionId: params.sessionId,
         hostId: params.hostId
       })
@@ -96,7 +96,7 @@ export const BOTMUX_BRIDGE_METHODS: RpcMethod[] = [
     name: 'botmuxBridge.tmuxAttachSpec',
     params: SessionHostParams,
     handler: (params) => {
-      return getOrcaBotmuxBridgeTmuxAttachSpec({
+      return getBotmuxBridgeTmuxAttachSpec({
         sessionId: params.sessionId,
         hostId: params.hostId
       })
@@ -109,7 +109,7 @@ export const BOTMUX_BRIDGE_METHODS: RpcMethod[] = [
       // Why: opens on the paired desktop (Electron window/tab). Mobile uses this
       // so the phone can trigger attach on the desk machine while also showing
       // nativeTerminalSpec for local display when needed.
-      return await openOrcaBotmuxBridgeTerminal(params.sessionId, {
+      return await openBotmuxBridgeTerminal(params.sessionId, {
         external: params.external === true,
         title: params.title,
         hostId: params.hostId

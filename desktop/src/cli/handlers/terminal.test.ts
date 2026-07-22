@@ -57,7 +57,7 @@ describe('terminal close CLI', () => {
     printHelp(COMMAND_SPECS, ['terminal', 'close'])
 
     const help = String(log.mock.calls[0]?.[0])
-    expect(help).toContain('orca_botmux terminal close [--terminal <handle>] [--tab] [--json]')
+    expect(help).toContain('botmux terminal close [--terminal <handle>] [--tab] [--json]')
     expect(help).toContain('durable persistence')
   })
 })

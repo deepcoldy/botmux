@@ -26,10 +26,10 @@ import { FeatureTipActions } from './FeatureTipActions'
 import { installCliFromFeatureTip } from './feature-tip-cli-install-action'
 import { getFeatureTipForModal } from './feature-tip-modal-state'
 import {
-  getOrcaCliFeatureTipTelemetrySource,
+  getBotmuxCliFeatureTipTelemetrySource,
   trackCmdJPaletteFeatureTipAcknowledged,
-  trackOrcaCliFeatureTipSetupClicked,
-  trackOrcaCliFeatureTipSetupResult
+  trackBotmuxCliFeatureTipSetupClicked,
+  trackBotmuxCliFeatureTipSetupResult
 } from './feature-tip-telemetry'
 import { useMountedRef } from '@/hooks/useMountedRef'
 import { translate } from '@/i18n/i18n'
@@ -160,7 +160,7 @@ export default function FeatureTipsModal(): JSX.Element | null {
         // Why: passive education tip — acknowledging just dismisses; the rebind
         // path lives in Settings and is reachable from the palette itself.
         trackCmdJPaletteFeatureTipAcknowledged(
-          getOrcaCliFeatureTipTelemetrySource(modalData.source)
+          getBotmuxCliFeatureTipTelemetrySource(modalData.source)
         )
         closeModal()
         break
@@ -187,13 +187,13 @@ export default function FeatureTipsModal(): JSX.Element | null {
           mountedRef.current &&
           activeModalRef.current === 'feature-tips' &&
           setupRequestIdRef.current === setupRequestId
-        const telemetrySource = getOrcaCliFeatureTipTelemetrySource(modalData.source)
-        trackOrcaCliFeatureTipSetupClicked(telemetrySource)
+        const telemetrySource = getBotmuxCliFeatureTipTelemetrySource(modalData.source)
+        trackBotmuxCliFeatureTipSetupClicked(telemetrySource)
         setPrimaryBusy(true)
         try {
           const result = await installCliFromFeatureTip(() => window.api.cli.install())
           if (result.kind === 'installed') {
-            trackOrcaCliFeatureTipSetupResult(telemetrySource, 'installed')
+            trackBotmuxCliFeatureTipSetupResult(telemetrySource, 'installed')
             if (!canApplySetupResult()) {
               return
             }
@@ -201,21 +201,21 @@ export default function FeatureTipsModal(): JSX.Element | null {
             toast.success(
               translate(
                 'auto.components.feature.tips.FeatureTipsModal.ce13a742d0',
-                'Registered `orca_botmux` in PATH.'
+                'Registered `botmux` in PATH.'
               )
             )
             setSkillTerminalOpen(true)
             return
           }
 
-          trackOrcaCliFeatureTipSetupResult(telemetrySource, 'needs_attention')
+          trackBotmuxCliFeatureTipSetupResult(telemetrySource, 'needs_attention')
           if (!canApplySetupResult()) {
             return
           }
           toast.warning(
             translate(
               'auto.components.feature.tips.FeatureTipsModal.1da82af45b',
-              'OrcaBotmux CLI needs attention'
+              'Botmux CLI needs attention'
             ),
             {
               description:
@@ -229,12 +229,12 @@ export default function FeatureTipsModal(): JSX.Element | null {
           closeModal()
           openCliSettings()
         } catch (error) {
-          const message = error instanceof Error ? error.message : 'Failed to install OrcaBotmux CLI.'
+          const message = error instanceof Error ? error.message : 'Failed to install Botmux CLI.'
           if (
             import.meta.env.DEV &&
             message.includes('Development mode uses a generated launcher for validation only')
           ) {
-            trackOrcaCliFeatureTipSetupResult(telemetrySource, 'dev_preview')
+            trackBotmuxCliFeatureTipSetupResult(telemetrySource, 'dev_preview')
             if (!canApplySetupResult()) {
               return
             }
@@ -249,7 +249,7 @@ export default function FeatureTipsModal(): JSX.Element | null {
             return
           }
 
-          trackOrcaCliFeatureTipSetupResult(telemetrySource, 'failed')
+          trackBotmuxCliFeatureTipSetupResult(telemetrySource, 'failed')
           if (canApplySetupResult()) {
             toast.error(message)
           }

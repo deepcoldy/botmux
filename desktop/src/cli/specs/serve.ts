@@ -4,9 +4,9 @@ import { GLOBAL_FLAGS } from '../args'
 export const SERVE_COMMAND_SPECS: CommandSpec[] = [
   {
     path: ['serve'],
-    summary: 'Start an OrcaBotmux runtime server without opening a desktop window',
+    summary: 'Start an Botmux runtime server without opening a desktop window',
     usage:
-      'orca-botmux-desktop serve [--port <port>] [--pairing-address <host>] [--mobile-pairing] [--no-pairing] [--project-root <path>] [--recipe-json] [--json]',
+      'botmux-desktop serve [--port <port>] [--pairing-address <host>] [--mobile-pairing] [--no-pairing] [--project-root <path>] [--recipe-json] [--json]',
     allowedFlags: [
       ...GLOBAL_FLAGS,
       'port',
@@ -24,11 +24,11 @@ export const SERVE_COMMAND_SPECS: CommandSpec[] = [
       'When the web client bundle is available, the server also prints a browser URL with the pairing data embedded.'
     ],
     examples: [
-      'orca-botmux-desktop serve',
-      'orca-botmux-desktop serve --json',
-      'orca-botmux-desktop serve --project-root /workspace/repo --pairing-address wss://sandbox.example.com --recipe-json',
-      'orca-botmux-desktop serve --port 6768 --pairing-address 100.64.1.20',
-      'orca-botmux-desktop serve --pairing-address 100.64.1.20 --mobile-pairing'
+      'botmux-desktop serve',
+      'botmux-desktop serve --json',
+      'botmux-desktop serve --project-root /workspace/repo --pairing-address wss://sandbox.example.com --recipe-json',
+      'botmux-desktop serve --port 6768 --pairing-address 100.64.1.20',
+      'botmux-desktop serve --pairing-address 100.64.1.20 --mobile-pairing'
     ]
   }
 ]

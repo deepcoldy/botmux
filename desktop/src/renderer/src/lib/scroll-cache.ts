@@ -43,5 +43,5 @@ export const cursorPositionCache = new Map<string, { lineNumber: number; column:
 // Why: Diff editors need more than a numeric scroll offset to restore the same
 // working context. Monaco's diff view state also carries cursor/selection state
 // for both sides plus diff model state, which matches VS Code's restore path
-// more closely than OrcaBotmux's previous scroll-only cache.
+// more closely than Botmux's previous scroll-only cache.
 export const diffViewStateCache = new Map<string, editor.IDiffEditorViewState>()

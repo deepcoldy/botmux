@@ -116,7 +116,7 @@ export class TerminalHost {
       sessionId: opts.sessionId,
       cols: size.cols,
       rows: size.rows,
-      terminalHandle: opts.env?.ORCA_TERMINAL_HANDLE,
+      terminalHandle: opts.env?.BOTMUX_TERMINAL_HANDLE,
       launchAgent: opts.launchAgent,
       subprocess,
       shellReadySupported,
@@ -144,11 +144,11 @@ export class TerminalHost {
       // unsupported ones.
       // Why CR on Windows: PowerShell's PSReadLine and cmd.exe submit the line
       // on CR (`\r`); a bare LF leaves the command typed but unsubmitted, so
-      // the user would need to press Enter after OrcaBotmux launches the agent or
+      // the user would need to press Enter after Botmux launches the agent or
       // setup script. POSIX shells accept CR as Enter under ICRNL.
       const submit = process.platform === 'win32' ? '\r' : '\n'
       // Why: multiline startup prompts are pasted literally via bracketed paste
-      // only for OrcaBotmux-wrapped bash/zsh, which is exactly when the shell-ready
+      // only for Botmux-wrapped bash/zsh, which is exactly when the shell-ready
       // barrier is supported; other shells keep the raw submit path.
       session.write(
         buildStartupCommandSubmission(opts.command, {
@@ -236,7 +236,7 @@ export class TerminalHost {
     if (tracked) {
       return tracked
     }
-    // Why: the emulator's cwd is null until the shell emits OSC 7. OrcaBotmux's
+    // Why: the emulator's cwd is null until the shell emits OSC 7. Botmux's
     // bash/zsh rcfiles ship with OSC 133 markers but not OSC 7, so the
     // tracked value stays null through the entire session for most users.
     // Fall back to the live process cwd via /proc/<pid>/cwd (Linux) or

@@ -5,7 +5,7 @@ import { realpath, readdir, stat } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import type { Repo } from '../../shared/types'
 import { areWorktreePathsEqual } from '../ipc/worktree-logic'
-import { getOrcaManagedCodexHomePath, getSystemCodexHomePath } from '../codex/codex-home-paths'
+import { getBotmuxManagedCodexHomePath, getSystemCodexHomePath } from '../codex/codex-home-paths'
 import { getLegacyCopiedCodexSessionBridgeScanPreference } from '../codex/codex-session-bridge'
 import { canonicalizeUsageWorktreePaths } from '../usage-worktree-canonicalizer'
 import type {
@@ -126,22 +126,22 @@ function appendDiscoveredFiles(target: string[], source: readonly string[]): voi
 }
 
 export function getCodexSessionsDirectory(): string {
-  // Why: OrcaBotmux-launched Codex processes receive an OrcaBotmux-owned CODEX_HOME, so
+  // Why: Botmux-launched Codex processes receive an Botmux-owned CODEX_HOME, so
   // callers that need the primary runtime path should not consult ambient
   // shell CODEX_HOME.
-  return join(getOrcaManagedCodexHomePath(), 'sessions')
+  return join(getBotmuxManagedCodexHomePath(), 'sessions')
 }
 
 export function getCodexSessionDirectories(): string[] {
   // Why: upgraded users still have ordinary Codex history under ~/.codex, while
-  // new OrcaBotmux-launched sessions are written under OrcaBotmux's managed runtime home.
+  // new Botmux-launched sessions are written under Botmux's managed runtime home.
   return [getCodexSessionsDirectory(), join(getSystemCodexHomePath(), 'sessions')].filter(
     (dirPath, index, allDirPaths) => allDirPaths.indexOf(dirPath) === index
   )
 }
 
 function hasLegacyCopiedSessionBridgeMarkers(): boolean {
-  return existsSync(join(getOrcaManagedCodexHomePath(), '.orca-botmux-session-copies'))
+  return existsSync(join(getBotmuxManagedCodexHomePath(), '.botmux-session-copies'))
 }
 
 export async function listCodexSessionFiles(): Promise<string[]> {
@@ -495,7 +495,7 @@ function isContainingPath(candidatePath: string, targetPath: string): boolean {
   // Why: on Windows, `path.relative('C:\\repo', 'D:\\other')` returns an
   // absolute `D:\\other` path instead of a `..`-prefixed relative. Treating
   // that as "contained" would attribute off-drive Codex usage to the wrong
-  // OrcaBotmux worktree.
+  // Botmux worktree.
   const isAbsoluteRelative = useWin32
     ? win32.isAbsolute(relativePath)
     : posix.isAbsolute(relativePath)
@@ -547,7 +547,7 @@ export async function attributeCodexUsageEvent(
       projectKey = `worktree:${worktree.worktreeId}`
       projectLabel = worktree.displayName
     } else {
-      // Why: all-local mode should still collapse repeated off-OrcaBotmux sessions by
+      // Why: all-local mode should still collapse repeated off-Botmux sessions by
       // location, but those keys must normalize slash/case differences so the
       // same folder does not fragment into multiple "projects" across platforms.
       projectKey = `cwd:${normalizeComparablePath(event.cwd)}`

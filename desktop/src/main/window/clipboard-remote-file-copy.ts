@@ -16,7 +16,7 @@ import {
 type RemoteClipboardFileDeps = Omit<ClipboardFileDeps, 'resolveFilePath'>
 
 const REMOTE_CLIPBOARD_FILE_TTL_MS = 60 * 60 * 1000
-const REMOTE_CLIPBOARD_FILE_PREFIX = 'orca-botmux-clipboard-file-'
+const REMOTE_CLIPBOARD_FILE_PREFIX = 'botmux-clipboard-file-'
 const WINDOWS_RESERVED_LOCAL_BASENAME = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i
 const LOCAL_FILENAME_REPLACEMENT_CHARS = new Set(['<', '>', ':', '"', '/', '\\', '|', '?', '*'])
 

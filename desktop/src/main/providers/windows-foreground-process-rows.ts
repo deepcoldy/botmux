@@ -222,7 +222,7 @@ async function queryWindowsProcessesWithPowerShell(): Promise<WindowsProcessRow[
         // Why: this scan re-forks on a ~1s/pane cadence. Electron's main has no
         // console, so without windowsHide each fork pops a fresh conhost window
         // that flashes and steals keyboard focus from the foreground app
-        // (including OrcaBotmux's own terminal).
+        // (including Botmux's own terminal).
         windowsHide: true
       }
     )

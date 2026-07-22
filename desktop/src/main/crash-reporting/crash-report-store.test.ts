@@ -18,7 +18,7 @@ import type { CrashReportCreateInput } from '../../shared/crash-reporting'
 const tempDirs: string[] = []
 
 async function createStore(): Promise<{ store: CrashReportStore; filePath: string }> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'orca-botmux-crash-reports-'))
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'botmux-crash-reports-'))
   tempDirs.push(dir)
   const filePath = path.join(dir, 'crash-reports.json')
   return { store: new CrashReportStore(filePath), filePath }

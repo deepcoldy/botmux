@@ -23,7 +23,7 @@ export const getGitPaneSearchEntries = createLocalizedCatalog(() => [
     ),
     description: translate(
       'auto.components.settings.git.search.0e993bf00f',
-      'When you create a workspace, OrcaBotmux refreshes the remote base and safely fast-forwards your matching local branch, such as main or master. This keeps commands like git diff main...HEAD from comparing against stale history. OrcaBotmux skips the update if that branch has uncommitted changes or local-only commits.'
+      'When you create a workspace, Botmux refreshes the remote base and safely fast-forwards your matching local branch, such as main or master. This keeps commands like git diff main...HEAD from comparing against stale history. Botmux skips the update if that branch has uncommitted changes or local-only commits.'
     ),
     keywords: [
       ...translateSearchKeyword('auto.components.settings.git.search.e3e9adde59', 'main'),
@@ -123,10 +123,10 @@ export const getGitPaneSearchEntries = createLocalizedCatalog(() => [
   },
   ...getAutoRenameBranchSearchEntries(),
   {
-    title: translate('auto.components.settings.git.search.bc7d9f69ce', 'OrcaBotmux Attribution'),
+    title: translate('auto.components.settings.git.search.bc7d9f69ce', 'Botmux Attribution'),
     description: translate(
       'auto.components.settings.git.search.118c23484b',
-      'Add OrcaBotmux attribution to commits, PRs, and issues.'
+      'Add Botmux attribution to commits, PRs, and issues.'
     ),
     keywords: [
       ...translateSearchKeyword('auto.components.settings.git.search.d088806071', 'github'),
@@ -136,7 +136,7 @@ export const getGitPaneSearchEntries = createLocalizedCatalog(() => [
       ...translateSearchKeyword('auto.components.settings.git.search.61f9f5d1fc', 'co-author'),
       ...translateSearchKeyword('auto.components.settings.git.search.8461c908ae', 'coauthored'),
       ...translateSearchKeyword('auto.components.settings.git.search.1b93c1143c', 'attribution'),
-      ...translateSearchKeyword('auto.components.settings.git.search.61eab13403', 'orca_botmux')
+      ...translateSearchKeyword('auto.components.settings.git.search.61eab13403', 'botmux')
     ]
   }
 ])

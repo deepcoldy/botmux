@@ -318,10 +318,10 @@ export function openTerminalHttpLink(url: string, deps: UrlLinkHitTestDeps): voi
   // Suppress the browser's default link handling first, then route after the
   // persisted choice is available.
   void Promise.resolve(preferenceDecision)
-    .then((openInOrca) => {
+    .then((openInBotmux) => {
       openHttpLink(url, {
         worktreeId: deps.worktreeId,
-        forceSystemBrowser: !openInOrca
+        forceSystemBrowser: !openInBotmux
       })
     })
     .catch(() => {

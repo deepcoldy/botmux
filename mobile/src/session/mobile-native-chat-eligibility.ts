@@ -38,13 +38,20 @@ export function resolveMobileNativeChat(
   if (!tab || tab.type !== 'terminal') {
     return null
   }
-  const liveAgent = tab.agentStatus?.agentType ?? null
-  const agent = liveAgent
-    ? isNativeChatSupportedAgent(liveAgent)
-      ? liveAgent
-      : null
-    : tab.launchAgent
-  if (!agent || !isNativeChatSupportedAgent(agent)) {
+  // Why: a supported live hook agent wins. A *known* unsupported live agent
+  // (e.g. gemini) must not fall back to a stale launch hint. Missing/unknown
+  // status still uses launchAgent so Orca-style agent worktrees stay
+  // chat-eligible before the first status frame.
+  const liveAgent = tab.agentStatus?.agentType?.trim() || null
+  let agent: string | null = null
+  if (liveAgent && isNativeChatSupportedAgent(liveAgent)) {
+    agent = liveAgent
+  } else if (liveAgent && liveAgent !== 'unknown') {
+    return null
+  } else if (tab.launchAgent && isNativeChatSupportedAgent(tab.launchAgent)) {
+    agent = tab.launchAgent
+  }
+  if (!agent) {
     return null
   }
   if (agent === 'grok' && !nativeChatTranscriptIsLocalReadable) {

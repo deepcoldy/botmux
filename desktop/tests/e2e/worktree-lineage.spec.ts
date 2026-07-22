@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   markWorkspaceTerminalSlept,
@@ -16,15 +16,15 @@ function worktreeOption(page: Page, worktreeId: string) {
 test.describe('Worktree Lineage', () => {
   test.describe.configure({ mode: 'serial' })
 
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('renders existing child lineage in the sidebar', async ({ orcaBotmuxPage }) => {
-    const { parentId, childId } = await seedLineageScenario(orcaBotmuxPage)
-    const parentRow = worktreeOption(orcaBotmuxPage, parentId)
-    const childRow = worktreeOption(orcaBotmuxPage, childId)
+  test('renders existing child lineage in the sidebar', async ({ botmuxPage }) => {
+    const { parentId, childId } = await seedLineageScenario(botmuxPage)
+    const parentRow = worktreeOption(botmuxPage, parentId)
+    const childRow = worktreeOption(botmuxPage, childId)
 
     await expect(parentRow).toBeVisible()
     await parentRow.click()
@@ -35,7 +35,7 @@ test.describe('Worktree Lineage', () => {
     await expect(childToggle).toBeVisible({ timeout: 10_000 })
     await expect(childRow).toBeVisible()
 
-    const positions = await orcaBotmuxPage.evaluate(
+    const positions = await botmuxPage.evaluate(
       ({ parentId, childId }) => {
         const rowFor = (worktreeId: string) =>
           [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(
@@ -61,7 +61,7 @@ test.describe('Worktree Lineage', () => {
     await expect(childRow).toBeHidden()
 
     await parentRow.getByRole('button', { name: 'Show 1 child workspace' }).click()
-    await orcaBotmuxPage.evaluate(async (childId) => {
+    await botmuxPage.evaluate(async (childId) => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -74,7 +74,7 @@ test.describe('Worktree Lineage', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((childId) => {
+          botmuxPage.evaluate((childId) => {
             const store = window.__store
             return Boolean(store?.getState().worktreeLineageById[childId])
           }, childId),
@@ -88,11 +88,11 @@ test.describe('Worktree Lineage', () => {
   })
 
   test('injects filtered parents structurally without showing a parent badge', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const { parentId, childId } = await seedLineageScenario(orcaBotmuxPage)
+    const { parentId, childId } = await seedLineageScenario(botmuxPage)
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ parentId, childId }) => {
         const store = window.__store
         if (!store) {
@@ -122,14 +122,14 @@ test.describe('Worktree Lineage', () => {
       { parentId, childId }
     )
 
-    const parentRow = worktreeOption(orcaBotmuxPage, parentId)
-    const childRow = worktreeOption(orcaBotmuxPage, childId)
+    const parentRow = worktreeOption(botmuxPage, parentId)
+    const childRow = worktreeOption(botmuxPage, childId)
 
     await expect(parentRow).toBeVisible()
     await expect(childRow).toBeVisible()
     await expect(childRow).not.toContainText(/\bfrom\b/)
 
-    const positions = await orcaBotmuxPage.evaluate(
+    const positions = await botmuxPage.evaluate(
       ({ parentId, childId }) => {
         const rowFor = (worktreeId: string) =>
           [...document.querySelectorAll<HTMLElement>('[data-worktree-id]')].find(
@@ -152,35 +152,35 @@ test.describe('Worktree Lineage', () => {
   })
 
   test('updates nested child preview status when the child terminal sleeps', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const { parentId, childId } = await seedLineageScenario(orcaBotmuxPage)
-    const parentRow = worktreeOption(orcaBotmuxPage, parentId)
-    const childRow = worktreeOption(orcaBotmuxPage, childId)
+    const { parentId, childId } = await seedLineageScenario(botmuxPage)
+    const parentRow = worktreeOption(botmuxPage, parentId)
+    const childRow = worktreeOption(botmuxPage, childId)
 
     await expect(parentRow).toBeVisible()
     await expect(childRow).toBeVisible()
 
-    const childTabId = await seedWorkspaceLiveTerminal(orcaBotmuxPage, childId)
+    const childTabId = await seedWorkspaceLiveTerminal(botmuxPage, childId)
     await expect(childRow).toContainText('Active')
 
-    await markWorkspaceTerminalSlept(orcaBotmuxPage, { worktreeId: childId, tabId: childTabId })
+    await markWorkspaceTerminalSlept(botmuxPage, { worktreeId: childId, tabId: childTabId })
     await expect(childRow).toContainText('Inactive')
   })
 
   test('shows parent and child agent rows while the parent workspace is active', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const { parentId, childId } = await seedLineageScenario(orcaBotmuxPage)
-    const parentRow = worktreeOption(orcaBotmuxPage, parentId)
-    const childRow = worktreeOption(orcaBotmuxPage, childId)
+    const { parentId, childId } = await seedLineageScenario(botmuxPage)
+    const parentRow = worktreeOption(botmuxPage, parentId)
+    const childRow = worktreeOption(botmuxPage, childId)
 
     await parentRow.click()
     await expect(parentRow).toHaveAttribute('aria-current', 'page')
     await expect(childRow).toBeVisible()
 
-    const parentAgentPrompt = await seedWorkspaceAgentStatus(orcaBotmuxPage, parentId, 'PARENT')
-    const childAgentPrompt = await seedWorkspaceAgentStatus(orcaBotmuxPage, childId, 'CHILD')
+    const parentAgentPrompt = await seedWorkspaceAgentStatus(botmuxPage, parentId, 'PARENT')
+    const childAgentPrompt = await seedWorkspaceAgentStatus(botmuxPage, childId, 'CHILD')
 
     await expect(
       parentRow.getByRole('treeitem').filter({ hasText: parentAgentPrompt })

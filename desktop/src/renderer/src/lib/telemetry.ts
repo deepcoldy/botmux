@@ -21,11 +21,8 @@ import type { TelemetryConsentState } from '../../../shared/telemetry-consent-ty
 // receives a `TuiAgent`-derived agent kind through the spawn IPC.
 export { tuiAgentToAgentKind } from '../../../shared/agent-kind'
 
-// Why: single source-of-truth for the privacy doc URL linked from the two
-// telemetry surfaces (FirstLaunchBanner, PrivacyPane). Keeping it here — in
-// the shared telemetry lib — prevents the surfaces from drifting if the doc
-// ever moves.
-export const PRIVACY_URL = 'https://www.onorca.dev/docs/telemetry'
+// Why: product docs / privacy site is not shipped for Botmux yet. Call sites
+// should not open an external privacy URL until a real Botmux policy host exists.
 
 // Why: the IPC boundary is untyped at runtime, so a malformed payload from
 // main would otherwise let the Privacy pane render on garbage. Validate the
@@ -42,7 +39,7 @@ function isTelemetryConsentState(x: unknown): x is TelemetryConsentState {
   }
   if (e === 'disabled') {
     const r = (x as { reason?: unknown }).reason
-    return r === 'do_not_track' || r === 'orca_botmux_disabled' || r === 'ci' || r === 'user_opt_out'
+    return r === 'do_not_track' || r === 'botmux_disabled' || r === 'ci' || r === 'user_opt_out'
   }
   return false
 }

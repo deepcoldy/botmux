@@ -25,7 +25,7 @@ import {
 import { buildPosixHookPayloadCapture } from '../agent-hooks/hook-stdin-contract'
 
 // Why: Copilot's user-level hook files can use VS Code-compatible PascalCase
-// names, which match the event vocabulary already normalized by OrcaBotmux's hook
+// names, which match the event vocabulary already normalized by Botmux's hook
 // server and avoid wrapper-side event remapping.
 const COPILOT_EVENTS = [
   'SessionStart',
@@ -36,7 +36,7 @@ const COPILOT_EVENTS = [
   'PostToolUseFailure',
   // Why: GitHub's current reference documents subagentStart with only the
   // camelCase payload shape. The wrapper passes the event name separately, so
-  // OrcaBotmux can normalize it without depending on a PascalCase payload.
+  // Botmux can normalize it without depending on a PascalCase payload.
   'subagentStart',
   'SubagentStop',
   'PreCompact',
@@ -52,7 +52,7 @@ function getCopilotHome(): string {
 }
 
 function getConfigPath(): string {
-  return join(getCopilotHome(), 'hooks', 'orca_botmux.json')
+  return join(getCopilotHome(), 'hooks', 'botmux.json')
 }
 
 function getManagedScriptFileName(): string {
@@ -65,9 +65,9 @@ function getManagedScriptPath(): string {
 
 function getManagedCommand(scriptPath: string, eventName: string): string {
   if (process.platform !== 'win32') {
-    return wrapPosixHookCommand(scriptPath, { ORCA_COPILOT_HOOK_EVENT: eventName })
+    return wrapPosixHookCommand(scriptPath, { BOTMUX_COPILOT_HOOK_EVENT: eventName })
   }
-  return wrapWindowsHookCommand(scriptPath, { ORCA_COPILOT_HOOK_EVENT: eventName })
+  return wrapWindowsHookCommand(scriptPath, { BOTMUX_COPILOT_HOOK_EVENT: eventName })
 }
 
 function getManagedHookDefinition(command: string): HookDefinition {
@@ -119,31 +119,31 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
       "Write-Output '{}'",
       '$inputData = [Console]::In.ReadToEnd()',
       // Why: endpoint.cmd is cmd syntax, not PowerShell. Parse its `set KEY=...`
-      // lines so surviving PTYs can refresh to the current OrcaBotmux server.
-      'if ($env:ORCA_AGENT_HOOK_ENDPOINT -and (Test-Path -LiteralPath $env:ORCA_AGENT_HOOK_ENDPOINT)) {',
+      // lines so surviving PTYs can refresh to the current Botmux server.
+      'if ($env:BOTMUX_AGENT_HOOK_ENDPOINT -and (Test-Path -LiteralPath $env:BOTMUX_AGENT_HOOK_ENDPOINT)) {',
       '  try {',
-      '    Get-Content -LiteralPath $env:ORCA_AGENT_HOOK_ENDPOINT | ForEach-Object {',
+      '    Get-Content -LiteralPath $env:BOTMUX_AGENT_HOOK_ENDPOINT | ForEach-Object {',
       "      if ($_ -match '^set ([A-Za-z0-9_]+)=(.*)$') {",
       "        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')",
       '      }',
       '    }',
       '  } catch {}',
       '}',
-      'if (-not $env:ORCA_AGENT_HOOK_PORT -or -not $env:ORCA_AGENT_HOOK_TOKEN -or -not $env:ORCA_PANE_KEY) { exit 0 }',
+      'if (-not $env:BOTMUX_AGENT_HOOK_PORT -or -not $env:BOTMUX_AGENT_HOOK_TOKEN -or -not $env:BOTMUX_PANE_KEY) { exit 0 }',
       'if ([string]::IsNullOrWhiteSpace($inputData)) { exit 0 }',
       'try {',
       '  $payload = $inputData | ConvertFrom-Json',
       '  $body = @{',
-      '    paneKey = $env:ORCA_PANE_KEY',
-      '    launchToken = $env:ORCA_AGENT_LAUNCH_TOKEN',
-      '    tabId = $env:ORCA_TAB_ID',
-      '    worktreeId = $env:ORCA_WORKTREE_ID',
-      '    hookEventName = $env:ORCA_COPILOT_HOOK_EVENT',
-      '    env = $env:ORCA_AGENT_HOOK_ENV',
-      '    version = $env:ORCA_AGENT_HOOK_VERSION',
+      '    paneKey = $env:BOTMUX_PANE_KEY',
+      '    launchToken = $env:BOTMUX_AGENT_LAUNCH_TOKEN',
+      '    tabId = $env:BOTMUX_TAB_ID',
+      '    worktreeId = $env:BOTMUX_WORKTREE_ID',
+      '    hookEventName = $env:BOTMUX_COPILOT_HOOK_EVENT',
+      '    env = $env:BOTMUX_AGENT_HOOK_ENV',
+      '    version = $env:BOTMUX_AGENT_HOOK_VERSION',
       '    payload = $payload',
       '  } | ConvertTo-Json -Depth 100',
-      "  Invoke-WebRequest -UseBasicParsing -Method Post -Uri ('http://127.0.0.1:' + $env:ORCA_AGENT_HOOK_PORT + '/hook/copilot') -Headers @{ 'Content-Type'='application/json'; 'X-OrcaBotmux-Agent-Hook-Token'=$env:ORCA_AGENT_HOOK_TOKEN } -Body $body -TimeoutSec 2 | Out-Null",
+      "  Invoke-WebRequest -UseBasicParsing -Method Post -Uri ('http://127.0.0.1:' + $env:BOTMUX_AGENT_HOOK_PORT + '/hook/copilot') -Headers @{ 'Content-Type'='application/json'; 'X-Botmux-Agent-Hook-Token'=$env:BOTMUX_AGENT_HOOK_TOKEN } -Body $body -TimeoutSec 2 | Out-Null",
       '} catch {}',
       'exit 0',
       ''
@@ -156,26 +156,26 @@ function getManagedScript(target: 'local' | 'posix' = 'local'): string {
     ...buildPosixHookPayloadCapture(),
     // Why: Copilot consumes stdout for some hooks, so stdout is emitted before
     // endpoint refresh, stdin parsing, or the network POST can fail.
-    'if [ -n "$ORCA_AGENT_HOOK_ENDPOINT" ] && [ -r "$ORCA_AGENT_HOOK_ENDPOINT" ]; then',
-    '  . "$ORCA_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
+    'if [ -n "$BOTMUX_AGENT_HOOK_ENDPOINT" ] && [ -r "$BOTMUX_AGENT_HOOK_ENDPOINT" ]; then',
+    '  . "$BOTMUX_AGENT_HOOK_ENDPOINT" 2>/dev/null || :',
     'fi',
-    'if [ -z "$ORCA_AGENT_HOOK_PORT" ] || [ -z "$ORCA_AGENT_HOOK_TOKEN" ] || [ -z "$ORCA_PANE_KEY" ]; then',
+    'if [ -z "$BOTMUX_AGENT_HOOK_PORT" ] || [ -z "$BOTMUX_AGENT_HOOK_TOKEN" ] || [ -z "$BOTMUX_PANE_KEY" ]; then',
     '  exit 0',
     'fi',
     // Why: pipe payload to curl's stdin (`payload@-`) instead of an inline
     // `payload=$VALUE` arg, so tens-of-KB tool output stays off the curl
     // command line (EDR command-line false positives). Wire body is identical.
-    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${ORCA_AGENT_HOOK_PORT}/hook/copilot" \\',
+    'printf \'%s\' "$payload" | curl -sS -X POST "http://127.0.0.1:${BOTMUX_AGENT_HOOK_PORT}/hook/copilot" \\',
     '  --connect-timeout 0.5 --max-time 1.5 \\',
     '  -H "Content-Type: application/x-www-form-urlencoded" \\',
-    '  -H "X-OrcaBotmux-Agent-Hook-Token: ${ORCA_AGENT_HOOK_TOKEN}" \\',
-    '  --data-urlencode "paneKey=${ORCA_PANE_KEY}" \\',
-    '  --data-urlencode "tabId=${ORCA_TAB_ID}" \\',
-    '  --data-urlencode "launchToken=${ORCA_AGENT_LAUNCH_TOKEN}" \\',
-    '  --data-urlencode "worktreeId=${ORCA_WORKTREE_ID}" \\',
-    '  --data-urlencode "hookEventName=${ORCA_COPILOT_HOOK_EVENT}" \\',
-    '  --data-urlencode "env=${ORCA_AGENT_HOOK_ENV}" \\',
-    '  --data-urlencode "version=${ORCA_AGENT_HOOK_VERSION}" \\',
+    '  -H "X-Botmux-Agent-Hook-Token: ${BOTMUX_AGENT_HOOK_TOKEN}" \\',
+    '  --data-urlencode "paneKey=${BOTMUX_PANE_KEY}" \\',
+    '  --data-urlencode "tabId=${BOTMUX_TAB_ID}" \\',
+    '  --data-urlencode "launchToken=${BOTMUX_AGENT_LAUNCH_TOKEN}" \\',
+    '  --data-urlencode "worktreeId=${BOTMUX_WORKTREE_ID}" \\',
+    '  --data-urlencode "hookEventName=${BOTMUX_COPILOT_HOOK_EVENT}" \\',
+    '  --data-urlencode "env=${BOTMUX_AGENT_HOOK_ENV}" \\',
+    '  --data-urlencode "version=${BOTMUX_AGENT_HOOK_VERSION}" \\',
     '  --data-urlencode "payload@-" >/dev/null 2>&1 || true',
     'exit 0',
     ''
@@ -193,7 +193,7 @@ export class CopilotHookService {
         state: 'error',
         configPath,
         managedHooksPresent: false,
-        detail: 'Could not parse Copilot hooks/orca_botmux.json'
+        detail: 'Could not parse Copilot hooks/botmux.json'
       }
     }
 
@@ -260,7 +260,7 @@ export class CopilotHookService {
         state: 'error',
         configPath,
         managedHooksPresent: false,
-        detail: 'Could not parse Copilot hooks/orca_botmux.json'
+        detail: 'Could not parse Copilot hooks/botmux.json'
       }
     }
 
@@ -299,8 +299,8 @@ export class CopilotHookService {
 
   async installRemote(sftp: SFTPWrapper, remoteHome: string): Promise<AgentHookInstallStatus> {
     const home = remoteHome.replace(/\/$/, '')
-    const remoteConfigPath = `${home}/.copilot/hooks/orca_botmux.json`
-    const remoteScriptPath = `${home}/.orca_botmux/agent-hooks/copilot-hook.sh`
+    const remoteConfigPath = `${home}/.copilot/hooks/botmux.json`
+    const remoteScriptPath = `${home}/.botmux/agent-hooks/copilot-hook.sh`
 
     try {
       const config = await readHooksJsonRemote(sftp, remoteConfigPath)
@@ -310,7 +310,7 @@ export class CopilotHookService {
           state: 'error',
           configPath: remoteConfigPath,
           managedHooksPresent: false,
-          detail: 'Could not parse remote Copilot hooks/orca_botmux.json'
+          detail: 'Could not parse remote Copilot hooks/botmux.json'
         }
       }
 
@@ -336,7 +336,7 @@ export class CopilotHookService {
         nextHooks[eventName] = [
           ...cleaned,
           getRemoteManagedHookDefinition(
-            wrapPosixHookCommand(remoteScriptPath, { ORCA_COPILOT_HOOK_EVENT: eventName })
+            wrapPosixHookCommand(remoteScriptPath, { BOTMUX_COPILOT_HOOK_EVENT: eventName })
           )
         ]
       }
@@ -344,8 +344,8 @@ export class CopilotHookService {
       config.version = 1
       delete config.disableAllHooks
       config.hooks = nextHooks
-      // Why: SSH remotes use POSIX scripts regardless of OrcaBotmux's local OS. Write
-      // the script before hooks/orca_botmux.json so a partial install cannot point
+      // Why: SSH remotes use POSIX scripts regardless of Botmux's local OS. Write
+      // the script before hooks/botmux.json so a partial install cannot point
       // Copilot at a missing managed command.
       await writeManagedScriptRemote(sftp, remoteScriptPath, getManagedScript('posix'))
       await writeHooksJsonRemote(sftp, remoteConfigPath, config)
@@ -380,7 +380,7 @@ export class CopilotHookService {
         state: 'error',
         configPath,
         managedHooksPresent: false,
-        detail: 'Could not parse Copilot hooks/orca_botmux.json'
+        detail: 'Could not parse Copilot hooks/botmux.json'
       }
     }
 

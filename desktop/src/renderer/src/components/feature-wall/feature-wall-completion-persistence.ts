@@ -7,17 +7,17 @@ import type { ReviewStepId } from '../../../../shared/review-steps'
 import type { WorkbenchStepId } from '../../../../shared/workbench-steps'
 
 const PERSISTED_WORKFLOW_IDS = new Set<FeatureWallWorkflowId>(FEATURE_WALL_WORKFLOW_IDS)
-const VISITED_WORKFLOWS_STORAGE_KEY = 'orca_botmux.featureWall.visitedWorkflows.v1'
-const COMPLETED_WORKFLOWS_STORAGE_KEY = 'orca_botmux.featureWall.completedWorkflows.v1'
+const VISITED_WORKFLOWS_STORAGE_KEY = 'botmux.featureWall.visitedWorkflows.v1'
+const COMPLETED_WORKFLOWS_STORAGE_KEY = 'botmux.featureWall.completedWorkflows.v1'
 const PERSISTED_AGENT_STEP_IDS = new Set<AgentsStepId>(['statuses', 'usage', 'orchestration'])
-const VISITED_AGENT_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.visitedAgentSteps.v1'
-const COMPLETED_AGENT_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.completedAgentSteps.v1'
+const VISITED_AGENT_STEPS_STORAGE_KEY = 'botmux.featureWall.visitedAgentSteps.v1'
+const COMPLETED_AGENT_STEPS_STORAGE_KEY = 'botmux.featureWall.completedAgentSteps.v1'
 const PERSISTED_WORKBENCH_STEP_IDS = new Set<WorkbenchStepId>(['terminal', 'editor', 'browser'])
-const VISITED_WORKBENCH_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.visitedWorkbenchSteps.v1'
-const COMPLETED_WORKBENCH_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.completedWorkbenchSteps.v1'
+const VISITED_WORKBENCH_STEPS_STORAGE_KEY = 'botmux.featureWall.visitedWorkbenchSteps.v1'
+const COMPLETED_WORKBENCH_STEPS_STORAGE_KEY = 'botmux.featureWall.completedWorkbenchSteps.v1'
 const PERSISTED_REVIEW_STEP_IDS = new Set<ReviewStepId>(['notes', 'pr-view', 'ship'])
-const VISITED_REVIEW_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.visitedReviewSteps.v1'
-const COMPLETED_REVIEW_STEPS_STORAGE_KEY = 'orca_botmux.featureWall.completedReviewSteps.v1'
+const VISITED_REVIEW_STEPS_STORAGE_KEY = 'botmux.featureWall.visitedReviewSteps.v1'
+const COMPLETED_REVIEW_STEPS_STORAGE_KEY = 'botmux.featureWall.completedReviewSteps.v1'
 
 export function normalizeFeatureWallVisitedWorkflows(value: unknown): FeatureWallWorkflowId[] {
   if (!Array.isArray(value)) {

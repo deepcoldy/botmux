@@ -48,7 +48,7 @@ export function AutomationMissedRunGraceField({
             <TooltipContent side="top" sideOffset={6} className="max-w-72">
               {translate(
                 'auto.components.automations.AutomationMissedRunGraceField.3d70c185c8',
-                'If OrcaBotmux or the execution host was unavailable at the scheduled time, OrcaBotmux runs one missed occurrence when it becomes available within this window. Older missed runs are skipped.'
+                'If Botmux or the execution host was unavailable at the scheduled time, Botmux runs one missed occurrence when it becomes available within this window. Older missed runs are skipped.'
               )}
             </TooltipContent>
           </Tooltip>

@@ -1,6 +1,6 @@
 import type { CliStatusResult, RuntimeStatus } from '../../shared/runtime-types'
 import { parsePairingCode, type PairingOffer } from '../../shared/pairing'
-import { launchOrcaApp } from './launch'
+import { launchBotmuxApp } from './launch'
 import { getDefaultUserDataPath, readMetadata } from './metadata'
 import { getCliStatus, resolveDesktopWindowStatus } from './status'
 import { sendRequest } from './transport'
@@ -34,8 +34,8 @@ export class RuntimeClient {
   constructor(
     userDataPath = getDefaultUserDataPath(),
     requestTimeoutMs = 60_000,
-    remotePairingCode = process.env.ORCA_PAIRING_CODE ?? process.env.ORCA_REMOTE_PAIRING ?? null,
-    environmentSelector = process.env.ORCA_ENVIRONMENT ?? null
+    remotePairingCode = process.env.BOTMUX_PAIRING_CODE ?? process.env.BOTMUX_REMOTE_PAIRING ?? null,
+    environmentSelector = process.env.BOTMUX_ENVIRONMENT ?? null
   ) {
     this.userDataPath = userDataPath
     this.requestTimeoutMs = requestTimeoutMs
@@ -112,7 +112,7 @@ export class RuntimeClient {
         ok: true,
         result: {
           // Why: remote status proves the paired runtime is reachable, not
-          // that this client machine has a local OrcaBotmux desktop process.
+          // that this client machine has a local Botmux desktop process.
           app: {
             running: false,
             pid: null,
@@ -173,7 +173,7 @@ export class RuntimeClient {
     }
   }
 
-  async openOrca(timeoutMs = 15_000): Promise<RuntimeRpcSuccess<CliStatusResult>> {
+  async openBotmux(timeoutMs = 15_000): Promise<RuntimeRpcSuccess<CliStatusResult>> {
     const initial = await this.getCliStatus()
     if (this.remotePairing) {
       return initial
@@ -184,7 +184,7 @@ export class RuntimeClient {
     if (initial.result.app.desktopWindowStatus === 'blocked') {
       throwDesktopActivationBlocked()
     }
-    launchOrcaApp()
+    launchBotmuxApp()
     if (initial.result.app.desktopWindowStatus === 'available') {
       return initial
     }
@@ -203,7 +203,7 @@ export class RuntimeClient {
 
     throw new RuntimeClientError(
       'runtime_open_timeout',
-      'Timed out waiting for an OrcaBotmux desktop window. The runtime may still be running headlessly.'
+      'Timed out waiting for an Botmux desktop window. The runtime may still be running headlessly.'
     )
   }
 }
@@ -211,7 +211,7 @@ export class RuntimeClient {
 function throwDesktopActivationBlocked(): never {
   throw new RuntimeClientError(
     'desktop_activation_blocked',
-    'OrcaBotmux is running headlessly, but it cannot open a desktop window safely because the persistent terminal provider is unavailable. Quit OrcaBotmux normally and start the app again; do not use open -n.'
+    'Botmux is running headlessly, but it cannot open a desktop window safely because the persistent terminal provider is unavailable. Quit Botmux normally and start the app again; do not use open -n.'
   )
 }
 
@@ -236,7 +236,7 @@ function resolveRemotePairing(
   if (!pairing) {
     throw new RuntimeClientError(
       'invalid_argument',
-      'Invalid remote pairing code. Expected an orca_botmux://pair?... URL or bare pairing payload.'
+      'Invalid remote pairing code. Expected an botmux://pair?... URL or bare pairing payload.'
     )
   }
   return pairing

@@ -6,7 +6,7 @@ vi.mock('../runtime-client', () => {
   class RuntimeClient {
     call = callMock
     getCliStatus = vi.fn()
-    openOrca = vi.fn()
+    openBotmux = vi.fn()
   }
 
   class RuntimeClientError extends Error {
@@ -37,7 +37,7 @@ vi.mock('../runtime-client', () => {
 import { main } from '../index'
 import { buildWorktree, okFixture, queueFixtures, worktreeListFixture } from '../test-fixtures'
 
-describe('orca_botmux computer observation CLI handlers', () => {
+describe('botmux computer observation CLI handlers', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     callMock.mockReset()
@@ -68,7 +68,7 @@ describe('orca_botmux computer observation CLI handlers', () => {
 
     const output = vi.mocked(console.log).mock.calls[0][0]
     expect(output).toContain(
-      'orca_botmux computer permissions [--id <accessibility|screenshots>] [--json]'
+      'botmux computer permissions [--id <accessibility|screenshots>] [--json]'
     )
     expect(output).toContain('--id <id>')
     expect(output).toContain('Identifier for a target item or permission')
@@ -114,7 +114,7 @@ describe('orca_botmux computer observation CLI handlers', () => {
       callMock,
       okFixture('req_capabilities', {
         platform: 'darwin',
-        provider: 'orca-botmux-computer-use-macos',
+        provider: 'botmux-computer-use-macos',
         providerVersion: '1.0.0',
         protocolVersion: 1,
         supports: {
@@ -131,7 +131,7 @@ describe('orca_botmux computer observation CLI handlers', () => {
 
     expect(callMock).toHaveBeenCalledTimes(1)
     expect(callMock).toHaveBeenCalledWith('computer.capabilities', {})
-    expect(vi.mocked(console.log).mock.calls[0][0]).toContain('orca-botmux-computer-use-macos')
+    expect(vi.mocked(console.log).mock.calls[0][0]).toContain('botmux-computer-use-macos')
   })
 
   it('opens computer permission setup without resolving a worktree', async () => {
@@ -139,7 +139,7 @@ describe('orca_botmux computer observation CLI handlers', () => {
       callMock,
       okFixture('req_permissions', {
         platform: 'darwin',
-        helperAppPath: '/Applications/OrcaBotmux Computer Use.app',
+        helperAppPath: '/Applications/Botmux Computer Use.app',
         openedSettings: false,
         launchedHelper: true
       })
@@ -150,8 +150,8 @@ describe('orca_botmux computer observation CLI handlers', () => {
     expect(callMock).toHaveBeenCalledTimes(1)
     expect(callMock).toHaveBeenCalledWith('computer.permissions', {})
     const output = vi.mocked(console.log).mock.calls[0][0]
-    expect(output).toContain('Opened OrcaBotmux Computer Use permission setup')
-    expect(output).toContain('/Applications/OrcaBotmux Computer Use.app')
+    expect(output).toContain('Opened Botmux Computer Use permission setup')
+    expect(output).toContain('/Applications/Botmux Computer Use.app')
   })
 
   it('passes targeted computer permission setup id', async () => {
@@ -159,7 +159,7 @@ describe('orca_botmux computer observation CLI handlers', () => {
       callMock,
       okFixture('req_permissions', {
         platform: 'darwin',
-        helperAppPath: '/Applications/OrcaBotmux Computer Use.app',
+        helperAppPath: '/Applications/Botmux Computer Use.app',
         openedSettings: true,
         launchedHelper: true
       })

@@ -47,15 +47,15 @@ describe('locale-translation-policy', () => {
     ).toBe('Gemini')
   })
 
-  it('preserves orca_botmux URL scheme in Chinese', () => {
+  it('preserves botmux URL scheme in Chinese', () => {
     expect(
       repairTranslatedValue({
         key: 'auto.web.WebConnect.27393856e4',
-        enValue: 'orca_botmux://pair?code=...',
+        enValue: 'botmux://pair?code=...',
         localeValue: '虎鲸://pair?code=...',
         locale: 'zh'
       })
-    ).toBe('orca_botmux://pair?code=...')
+    ).toBe('botmux://pair?code=...')
   })
 
   it('skips machine translation for standalone brands', () => {

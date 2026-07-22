@@ -282,7 +282,7 @@ window.onerror = function(msg) {
       var cellW = getCellWidth();
       var cellH = getCellHeight();
       if (cellW > 0 && cellH > 0) {
-        var cols = Math.floor(window.innerWidth / cellW);
+        var cols = Math.floor(window.innerWidth / cellW) - 2;
         if (cols < MIN_FIT_COLS) return;
         var rows = Math.max(8, Math.floor(window.innerHeight / cellH));
         term.resize(cols, rows);
@@ -349,9 +349,15 @@ window.onerror = function(msg) {
   function computeFitScale() {
     if (!term) return 1;
     var cellW = getCellWidth();
-    var termWidth = cellW > 0 ? cellW * term.cols : (term.element ? term.element.scrollWidth : 0);
+    // Why: prefer cellWidth × cols (logical grid width). scrollWidth under
+    // overflow:hidden can report the *clipped* viewport width, which yields
+    // scale=1 even when the grid is still desktop-wide.
+    var termWidth = cellW > 0 && term.cols > 0
+      ? cellW * term.cols
+      : (term.element ? term.element.scrollWidth : 0);
     if (termWidth <= 0) return 1;
     var vpWidth = window.innerWidth;
+    if (vpWidth <= 0) return 1;
     return Math.min(1, vpWidth / termWidth);
   }
 
@@ -478,12 +484,30 @@ ${TERMINAL_WEBVIEW_THEME_JS}
 
   function commitFitScale(reason, attempts, gate) {
     if (!term || !term.element) return;
+    var cellW = getCellWidth();
+    var vpW = window.innerWidth;
+    var expectedW = cellW > 0 && term.cols > 0 ? cellW * term.cols : 0;
     var preSnapScale = computeFitScale();
     currentScale = preSnapScale;
-    // Why: when scale is very close to 1 (e.g. 0.97 from xterm scrollbar
-    // sub-pixels) snap to 1 to avoid imperceptible shrinkage that prevents
-    // a second applyFitScale from observing a "no-op needed" state.
-    if (currentScale >= 0.95) currentScale = 1;
+    // Why: only snap near-1 scales when the grid actually fits the viewport.
+    // Snapping while expectedW > vpW (desktop-wide PTY on a phone) left scale=1
+    // and overflow:hidden clipped the right edge — text looked incomplete.
+    var gridOverflowsViewport = expectedW > vpW + 0.5;
+    if (gridOverflowsViewport && expectedW > 0) {
+      // Why: always prefer cell×cols when the logical grid is wider than the
+      // phone. scrollWidth under overflow:hidden can equal the clipped width
+      // and falsely report scale≈1 (Claude TUI right-edge / status-line clip).
+      currentScale = Math.min(1, vpW / expectedW);
+    } else if (currentScale >= 0.95 && !gridOverflowsViewport) {
+      currentScale = 1;
+    } else if (currentScale <= 0 && expectedW > 0) {
+      currentScale = Math.min(1, vpW / expectedW);
+    }
+    // Why: leave headroom so the last column isn't flush against the WebView
+    // edge (iOS subpixel + full-width Claude/tmux frames often clip one glyph).
+    if (currentScale < 1 && currentScale > 0) {
+      currentScale = Math.max(0.05, currentScale * 0.97);
+    }
     userScale = 1;
     panX = 0;
     panY = 0;
@@ -491,12 +515,9 @@ ${TERMINAL_WEBVIEW_THEME_JS}
     updateTransform();
     adjustRowsForViewport();
 
-    var cellW = getCellWidth();
     var sw = term.element.scrollWidth;
-    var vpW = window.innerWidth;
-    var expectedW = cellW * term.cols;
     var suspect =
-      currentScale === 1 && term.cols > 0 && expectedW > vpW + 1; // expected wider than viewport but no zoom
+      currentScale >= 0.99 && term.cols > 0 && expectedW > vpW + 1;
     if (suspect) {
       flog('commit-SUSPECT', {
         reason: reason,
@@ -510,6 +531,12 @@ ${TERMINAL_WEBVIEW_THEME_JS}
         scrollWidth: sw,
         vpWidth: vpW
       });
+      // Last resort: force a fit from expected width so the user never sees a
+      // clipped desktop-wide TUI on a phone-width surface.
+      if (expectedW > 0) {
+        currentScale = Math.max(0.05, Math.min(1, (vpW / expectedW) * 0.99));
+        updateTransform();
+      }
     }
     repositionOverlay();
   }
@@ -890,7 +917,9 @@ ${TERMINAL_WEBGL_RECOVERY_JS}
     var vpHeight = (typeof containerHeightPx === 'number' && containerHeightPx > 0)
       ? containerHeightPx
       : window.innerHeight;
-    var cols = Math.floor(vpWidth / cellWidth);
+    // Why: leave two cells of headroom so the last column is not flush against
+    // the WebView edge (iOS subpixel + Claude/tmux full-width frames clip otherwise).
+    var cols = Math.floor(vpWidth / cellWidth) - 2;
     if (cols < MIN_FIT_COLS) {
       flog('measure-skip-small-width', {
         vpWidth: vpWidth,
@@ -1688,8 +1717,8 @@ ${TERMINAL_WEBGL_RECOVERY_JS}
   }
 
   function attachSurfaceEventHandlers(targetSurface) {
-    if (!targetSurface || targetSurface.__orcaSurfaceHandlersAttached) return;
-    targetSurface.__orcaSurfaceHandlersAttached = true;
+    if (!targetSurface || targetSurface.__botmuxSurfaceHandlersAttached) return;
+    targetSurface.__botmuxSurfaceHandlersAttached = true;
     // Why: init() swaps in a new hidden surface to avoid flicker; each
     // replacement needs gesture handlers or tab-switch replays stop scrolling.
     targetSurface.addEventListener('mousedown', function(e) { e.preventDefault(); e.stopPropagation(); }, true);

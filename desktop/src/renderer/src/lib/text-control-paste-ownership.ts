@@ -13,7 +13,7 @@ export type TextControlPastePayloadOwnership =
       exceededLimit: false
     }
   | {
-      action: 'claim-orca_botmux'
+      action: 'claim-botmux'
       byteLength: number
       exceededLimit: true
     }
@@ -97,7 +97,7 @@ export function classifyTextControlPastePayloadOwnership(
   }
 
   return {
-    action: 'claim-orca_botmux',
+    action: 'claim-botmux',
     byteLength: ownershipMeasurement.byteLength,
     exceededLimit: true
   }

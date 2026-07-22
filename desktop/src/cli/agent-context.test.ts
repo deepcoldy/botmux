@@ -13,13 +13,13 @@ describe('buildAgentContext', () => {
         ['worktree', 'delete']
       ],
       summary: 'Remove a worktree',
-      usage: 'orca_botmux worktree rm',
+      usage: 'botmux worktree rm',
       allowedFlags: ['worktree', 'force']
     },
     {
       path: ['agent-context'],
       summary: 'Print the schema',
-      usage: 'orca_botmux agent-context',
+      usage: 'botmux agent-context',
       allowedFlags: []
     }
   ]
@@ -84,7 +84,7 @@ describe('agent-context over the live registry', () => {
     expect(agentContext?.flags).not.toContain('page')
   })
 
-  it('marks raw passthrough commands without synthesizing OrcaBotmux flags', () => {
+  it('marks raw passthrough commands without synthesizing Botmux flags', () => {
     const schema = buildAgentContext(COMMAND_SPECS)
     const claudeTeams = schema.commands.find((command) => command.command === 'claude-teams')
     expect(claudeTeams?.argumentMode).toBe('passthrough')

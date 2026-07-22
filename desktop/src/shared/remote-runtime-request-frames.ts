@@ -11,7 +11,7 @@ export type ParsedRemoteRuntimeFrame =
   | { type: 'error'; error: RemoteRuntimeClientError }
 
 export function remoteRuntimeUnavailableError(
-  message = 'Remote OrcaBotmux runtime closed the connection.'
+  message = 'Remote Botmux runtime closed the connection.'
 ): RemoteRuntimeClientError {
   return new RemoteRuntimeClientError('remote_runtime_unavailable', message)
 }
@@ -19,7 +19,7 @@ export function remoteRuntimeUnavailableError(
 export function remoteRuntimeTimeoutError(): RemoteRuntimeClientError {
   return new RemoteRuntimeClientError(
     'runtime_timeout',
-    'Timed out waiting for the remote OrcaBotmux runtime to respond.'
+    'Timed out waiting for the remote Botmux runtime to respond.'
   )
 }
 
@@ -33,7 +33,7 @@ export function parseReadyFrame(frame: string): RemoteRuntimeClientError | null 
     ready = JSON.parse(frame)
   } catch {
     return invalidRemoteRuntimeResponseError(
-      'Remote OrcaBotmux runtime returned an invalid E2EE handshake frame.'
+      'Remote Botmux runtime returned an invalid E2EE handshake frame.'
     )
   }
   if (
@@ -42,7 +42,7 @@ export function parseReadyFrame(frame: string): RemoteRuntimeClientError | null 
     (ready as { type?: unknown }).type !== 'e2ee_ready'
   ) {
     return invalidRemoteRuntimeResponseError(
-      'Remote OrcaBotmux runtime returned an unexpected E2EE handshake frame.'
+      'Remote Botmux runtime returned an unexpected E2EE handshake frame.'
     )
   }
   return null
@@ -54,7 +54,7 @@ export function parseAuthenticatedFrame(plaintext: string): RemoteRuntimeClientE
     authenticated = JSON.parse(plaintext)
   } catch {
     return invalidRemoteRuntimeResponseError(
-      'Remote OrcaBotmux runtime returned an invalid E2EE auth frame.'
+      'Remote Botmux runtime returned an invalid E2EE auth frame.'
     )
   }
   const type = (authenticated as { type?: unknown }).type
@@ -67,7 +67,7 @@ export function parseAuthenticatedFrame(plaintext: string): RemoteRuntimeClientE
     (authenticated as { error?: { code?: unknown } }).error?.code === 'unauthorized'
       ? 'unauthorized'
       : 'invalid_runtime_response'
-  return new RemoteRuntimeClientError(code, 'Remote OrcaBotmux runtime rejected the pairing token.')
+  return new RemoteRuntimeClientError(code, 'Remote Botmux runtime rejected the pairing token.')
 }
 
 export function parseRemoteRuntimeRpcFrame(plaintext: string): ParsedRemoteRuntimeFrame {
@@ -78,7 +78,7 @@ export function parseRemoteRuntimeRpcFrame(plaintext: string): ParsedRemoteRunti
     return {
       type: 'error',
       error: invalidRemoteRuntimeResponseError(
-        'Remote OrcaBotmux runtime returned an invalid response frame.'
+        'Remote Botmux runtime returned an invalid response frame.'
       )
     }
   }
@@ -90,7 +90,7 @@ export function parseRemoteRuntimeRpcFrame(plaintext: string): ParsedRemoteRunti
     return {
       type: 'error',
       error: invalidRemoteRuntimeResponseError(
-        'Remote OrcaBotmux runtime returned an invalid response frame.'
+        'Remote Botmux runtime returned an invalid response frame.'
       )
     }
   }

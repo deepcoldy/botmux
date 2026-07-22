@@ -12,7 +12,7 @@ import type {
 } from './types'
 
 const { getPathMock } = vi.hoisted(() => ({
-  getPathMock: vi.fn(() => '/tmp/orca-botmux-test-userdata')
+  getPathMock: vi.fn(() => '/tmp/botmux-test-userdata')
 }))
 
 vi.mock('electron', () => ({
@@ -94,7 +94,7 @@ describe('CodexUsageStore', () => {
   let tempUserData: string
 
   beforeEach(() => {
-    tempUserData = mkdtempSync(join(tmpdir(), 'orca-botmux-codex-usage-store-'))
+    tempUserData = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-store-'))
     getPathMock.mockReturnValue(tempUserData)
     initCodexUsagePath()
     vi.mocked(writeFileSync).mockClear()
@@ -123,7 +123,7 @@ describe('CodexUsageStore', () => {
     await store.refresh(true)
 
     expect(writeFileSync).toHaveBeenCalledTimes(1)
-    const persistedJson = readFileSync(join(tempUserData, 'orca-botmux-codex-usage.json'), 'utf-8')
+    const persistedJson = readFileSync(join(tempUserData, 'botmux-codex-usage.json'), 'utf-8')
     expect(persistedJson).toBe(JSON.stringify(JSON.parse(persistedJson)))
     expect(persistedJson).not.toContain('\n')
     expect(JSON.parse(persistedJson).scanState).toMatchObject({
@@ -164,7 +164,7 @@ describe('CodexUsageStore', () => {
     expect(writeFileSync).toHaveBeenCalledTimes(1)
   })
 
-  it('reports no data for OrcaBotmux scope when only non-OrcaBotmux Codex usage exists', async () => {
+  it('reports no data for Botmux scope when only non-Botmux Codex usage exists', async () => {
     const store = createStoreWithState({
       sessions: [
         {
@@ -249,7 +249,7 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const summary = await store.getSummary('orca_botmux', '30d')
+    const summary = await store.getSummary('botmux', '30d')
 
     expect(summary.hasAnyCodexData).toBe(false)
     expect(summary.sessions).toBe(0)
@@ -277,7 +277,7 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const summary = await store.getSummary('orca_botmux', '30d')
+    const summary = await store.getSummary('botmux', '30d')
 
     expect(summary.estimatedCostUsd).toBeCloseTo(0.0014)
     expect(summary.totalTokens).toBe(1250)
@@ -350,8 +350,8 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const summary = await store.getSummary('orca_botmux', '30d')
-    const breakdown = await store.getBreakdown('orca_botmux', '30d', 'model')
+    const summary = await store.getSummary('botmux', '30d')
+    const breakdown = await store.getBreakdown('botmux', '30d', 'model')
 
     expect(summary.estimatedCostUsd).toBeCloseTo(107.486)
     expect(breakdown.find((row) => row.key === 'gpt-5.2-codex')?.estimatedCostUsd).toBeCloseTo(
@@ -415,7 +415,7 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const breakdown = await store.getBreakdown('orca_botmux', '30d', 'model')
+    const breakdown = await store.getBreakdown('botmux', '30d', 'model')
 
     expect(breakdown.find((row) => row.key === 'gpt-5.4-mini-high')?.estimatedCostUsd).toBeCloseTo(
       4.9125
@@ -449,7 +449,7 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const summary = await store.getSummary('orca_botmux', '30d')
+    const summary = await store.getSummary('botmux', '30d')
 
     expect(summary.estimatedCostUsd).toBeCloseTo(858.929724)
   })
@@ -579,13 +579,13 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const breakdown = await store.getBreakdown('orca_botmux', '30d', 'model')
+    const breakdown = await store.getBreakdown('botmux', '30d', 'model')
 
     expect(breakdown.find((row) => row.key === 'gpt-5')?.sessions).toBe(1)
     expect(breakdown.find((row) => row.key === 'gpt-5.2-codex')?.sessions).toBe(1)
   })
 
-  it('uses only OrcaBotmux-scoped models when projecting mixed-scope sessions', async () => {
+  it('uses only Botmux-scoped models when projecting mixed-scope sessions', async () => {
     const store = createStoreWithState({
       sessions: [
         {
@@ -723,8 +723,8 @@ describe('CodexUsageStore', () => {
       ]
     })
 
-    const breakdown = await store.getBreakdown('orca_botmux', '30d', 'model')
-    const recentSessions = await store.getRecentSessions('orca_botmux', '30d', 10)
+    const breakdown = await store.getBreakdown('botmux', '30d', 'model')
+    const recentSessions = await store.getRecentSessions('botmux', '30d', 10)
 
     expect(breakdown.find((row) => row.key === 'gpt-5')?.sessions).toBe(1)
     expect(breakdown.find((row) => row.key === 'gpt-5.2-codex')).toBeUndefined()

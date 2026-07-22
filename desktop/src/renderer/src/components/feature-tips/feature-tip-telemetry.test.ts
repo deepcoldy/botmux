@@ -7,12 +7,12 @@ vi.mock('@/lib/telemetry', () => ({
 }))
 
 import {
-  getOrcaCliFeatureTipTelemetrySource,
+  getBotmuxCliFeatureTipTelemetrySource,
   trackCmdJPaletteFeatureTipAcknowledged,
   trackCmdJPaletteFeatureTipShown,
-  trackOrcaCliFeatureTipSetupClicked,
-  trackOrcaCliFeatureTipSetupResult,
-  trackOrcaCliFeatureTipShown
+  trackBotmuxCliFeatureTipSetupClicked,
+  trackBotmuxCliFeatureTipSetupResult,
+  trackBotmuxCliFeatureTipShown
 } from './feature-tip-telemetry'
 
 describe('feature tip telemetry', () => {
@@ -21,16 +21,16 @@ describe('feature tip telemetry', () => {
   })
 
   it('keeps feature tip sources low-cardinality', () => {
-    expect(getOrcaCliFeatureTipTelemetrySource('app_open')).toBe('app_open')
-    expect(getOrcaCliFeatureTipTelemetrySource('settings')).toBe('manual')
-    expect(getOrcaCliFeatureTipTelemetrySource(undefined)).toBe('manual')
+    expect(getBotmuxCliFeatureTipTelemetrySource('app_open')).toBe('app_open')
+    expect(getBotmuxCliFeatureTipTelemetrySource('settings')).toBe('manual')
+    expect(getBotmuxCliFeatureTipTelemetrySource(undefined)).toBe('manual')
   })
 
   it('tracks CLI tip exposure once per explicit call', () => {
-    trackOrcaCliFeatureTipShown('app_open')
+    trackBotmuxCliFeatureTipShown('app_open')
 
     expect(trackMock).toHaveBeenCalledTimes(1)
-    expect(trackMock).toHaveBeenCalledWith('orca_botmux_cli_feature_tip_shown', {
+    expect(trackMock).toHaveBeenCalledWith('botmux_cli_feature_tip_shown', {
       source: 'app_open'
     })
   })
@@ -49,14 +49,14 @@ describe('feature tip telemetry', () => {
   })
 
   it('tracks setup click and result without raw CLI details', () => {
-    trackOrcaCliFeatureTipSetupClicked('app_open')
-    trackOrcaCliFeatureTipSetupResult('app_open', 'installed')
+    trackBotmuxCliFeatureTipSetupClicked('app_open')
+    trackBotmuxCliFeatureTipSetupResult('app_open', 'installed')
 
     expect(trackMock).toHaveBeenCalledTimes(2)
-    expect(trackMock).toHaveBeenNthCalledWith(1, 'orca_botmux_cli_feature_tip_setup_clicked', {
+    expect(trackMock).toHaveBeenNthCalledWith(1, 'botmux_cli_feature_tip_setup_clicked', {
       source: 'app_open'
     })
-    expect(trackMock).toHaveBeenNthCalledWith(2, 'orca_botmux_cli_feature_tip_setup_result', {
+    expect(trackMock).toHaveBeenNthCalledWith(2, 'botmux_cli_feature_tip_setup_result', {
       source: 'app_open',
       result: 'installed'
     })

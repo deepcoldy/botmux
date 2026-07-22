@@ -2,9 +2,9 @@ import type { AppState } from '@/store/types'
 import { getIndexedRepoMap, getIndexedWorktreeMap } from '@/store/worktree-repo-index'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../shared/constants'
 import {
-  getOrcaBotmuxFilesystemConnectionId,
-  isOrcaBotmuxControlPlaneHostId
-} from '../../../shared/orca-botmux-main-terminal-host'
+  getBotmuxFilesystemConnectionId,
+  isBotmuxControlPlaneHostId
+} from '../../../shared/botmux-main-terminal-host'
 import { getRepoIdFromWorktreeId } from '../../../shared/worktree-id'
 import { parseWorkspaceKey } from '../../../shared/workspace-scope'
 import {
@@ -56,14 +56,14 @@ export function getConnectionIdFromState(
   worktreeId: string | null
 ): string | null | undefined {
   // null = local host (floating terminal).
-  // OrcaBotmux control-plane: FileExplorer uses filesystemConnectionId (SSH target)
-  // while terminal spawn stays local — see getOrcaBotmuxHostSshTargetId / PTY path.
+  // Botmux control-plane: FileExplorer uses filesystemConnectionId (SSH target)
+  // while terminal spawn stays local — see getBotmuxHostSshTargetId / PTY path.
   // undefined = still hydrating a real worktree's repo — do not fall back to local.
   if (!worktreeId || worktreeId === FLOATING_TERMINAL_WORKTREE_ID) {
     return null
   }
-  if (isOrcaBotmuxControlPlaneHostId(worktreeId)) {
-    return getOrcaBotmuxFilesystemConnectionId(worktreeId)
+  if (isBotmuxControlPlaneHostId(worktreeId)) {
+    return getBotmuxFilesystemConnectionId(worktreeId)
   }
   const parsedWorkspaceKey = parseWorkspaceKey(worktreeId)
   if (parsedWorkspaceKey?.type === 'folder') {

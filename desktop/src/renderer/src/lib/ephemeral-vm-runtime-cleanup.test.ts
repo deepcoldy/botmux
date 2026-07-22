@@ -35,15 +35,15 @@ describe('cleanupEphemeralVmRuntimesForDeleted', () => {
     // The SSH-mode workspace is the repo's main worktree, so project removal must still find the
     // runtime via the repo's connectionId even when no workspace id matches.
     listRuntimes.mockResolvedValue([
-      runtime({ id: 'rt-1', workspaceId: undefined, sshTargetId: 'runtime-ssh-orca-botmux-1' })
+      runtime({ id: 'rt-1', workspaceId: undefined, sshTargetId: 'runtime-ssh-botmux-1' })
     ])
 
     const destroyed = await cleanupEphemeralVmRuntimesForDeleted({
-      runtimeOwnedSshTargetIds: ['runtime-ssh-orca-botmux-1']
+      runtimeOwnedSshTargetIds: ['runtime-ssh-botmux-1']
     })
 
     expect(cleanup).toHaveBeenCalledWith({ runtimeId: 'rt-1' })
-    expect(destroyed).toEqual(['runtime-ssh-orca-botmux-1'])
+    expect(destroyed).toEqual(['runtime-ssh-botmux-1'])
   })
 
   it('ignores non-runtime-owned target ids and already-cleaned runtimes', async () => {

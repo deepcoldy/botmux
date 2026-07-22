@@ -10,7 +10,17 @@ type ChangelogEntry = {
   releaseNotesUrl: string
 }
 
-const CHANGELOG_URL = 'https://onorca.dev/changelog'
+// Why: reserved until Botmux hosts its own changelog / what's-new JSON.
+// Empty means production fetchChangelog no-ops and no external release-notes link is minted.
+export const CHANGELOG_URL = ''
+export const CHANGELOG_JSON_URL = ''
+
+export type FetchChangelogOptions = {
+  /** Test seam / future host cutover. Defaults to CHANGELOG_JSON_URL. */
+  changelogJsonUrl?: string
+  /** Generic release-notes page used when falling back to older rich entries. */
+  genericChangelogUrl?: string
+}
 
 function isValidEntry(entry: ChangelogEntry): boolean {
   return (
@@ -40,9 +50,15 @@ function hasRichContent(entry: ChangelogEntry): boolean {
  */
 export async function fetchChangelog(
   incomingVersion: string,
-  localVersion: string
+  localVersion: string,
+  options: FetchChangelogOptions = {}
 ): Promise<ChangelogData | null> {
-  const res = await net.fetch('https://onorca.dev/whats-new/changelog.json', {
+  const changelogJsonUrl = options.changelogJsonUrl ?? CHANGELOG_JSON_URL
+  const genericChangelogUrl = options.genericChangelogUrl ?? CHANGELOG_URL
+  if (!changelogJsonUrl) {
+    return null
+  }
+  const res = await net.fetch(changelogJsonUrl, {
     signal: AbortSignal.timeout(5000)
   })
   if (!res.ok) {
@@ -127,7 +143,10 @@ export async function fetchChangelog(
     const { version: _, ...release } = candidate
     // Why: the shown content is from an older entry, not the incoming version.
     // Point to the generic changelog page so the link doesn't mislead.
-    return { release: { ...release, releaseNotesUrl: CHANGELOG_URL }, releasesBehind }
+    return {
+      release: { ...release, releaseNotesUrl: genericChangelogUrl },
+      releasesBehind
+    }
   }
 
   return null

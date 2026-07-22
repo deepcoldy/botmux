@@ -167,7 +167,7 @@ export function getRepositoryPaneSearchEntries(
       title: translate('auto.components.settings.repository.search.c5266c2c9d', 'Remove Project'),
       description: translate(
         'auto.components.settings.repository.search.c86478c3d8',
-        'Remove this project from OrcaBotmux.'
+        'Remove this project from Botmux.'
       ),
       keywords: [
         repo.displayName,

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import { waitForActivePaneHookDescriptor, waitForActiveTerminalManager } from './helpers/terminal'
 import { waitForTerminalPtyDataInjector } from './helpers/terminal-pty-injection'
@@ -340,28 +340,28 @@ function annotateMeasurement(
 
 test.describe('Terminal foreground redraw freeze repro', () => {
   test('Codex-style line rewrites request a visible row refresh', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { paneKey } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
-    await waitForTerminalPtyDataInjector(orcaBotmuxPage, paneKey)
-    const webglAttached = await forceActivePaneWebglRenderer(orcaBotmuxPage)
+    const { paneKey } = await waitForActivePaneHookDescriptor(botmuxPage)
+    await waitForTerminalPtyDataInjector(botmuxPage, paneKey)
+    const webglAttached = await forceActivePaneWebglRenderer(botmuxPage)
     // Why: Linux headless CI intentionally disables GPU. Declare that
     // environment unsupported instead of weakening the WebGL-only oracle.
     test.skip(!webglAttached, 'WebGL is unavailable for the refresh-policy probe')
     if (!webglAttached) {
       return
     }
-    await installActivePaneRefreshProbe(orcaBotmuxPage)
+    await installActivePaneRefreshProbe(botmuxPage)
     try {
-      const refreshBaseline = await readRefreshProbe(orcaBotmuxPage)
-      await resetSchedulerDebug(orcaBotmuxPage)
-      const measurement = await measureRendererDuringRewriteBurst(orcaBotmuxPage, paneKey)
-      const scheduler = await readSchedulerDebug(orcaBotmuxPage)
+      const refreshBaseline = await readRefreshProbe(botmuxPage)
+      await resetSchedulerDebug(botmuxPage)
+      const measurement = await measureRendererDuringRewriteBurst(botmuxPage, paneKey)
+      const scheduler = await readSchedulerDebug(botmuxPage)
 
       expect(measurement.injectedFrames).toBe(REWRITE_REDRAW_FRAME_COUNT)
       expect(measurement.maxTimerDriftMs).toBeLessThan(MAX_RENDERER_TIMER_DRIFT_MS)
@@ -369,7 +369,7 @@ test.describe('Terminal foreground redraw freeze repro', () => {
       await expect
         .poll(
           async () => {
-            const refresh = await readRefreshProbe(orcaBotmuxPage)
+            const refresh = await readRefreshProbe(botmuxPage)
             const delta = subtractRefreshProbe(refresh, refreshBaseline)
             return Object.values(delta).reduce((total, count) => total + count, 0)
           },
@@ -379,7 +379,7 @@ test.describe('Terminal foreground redraw freeze repro', () => {
           }
         )
         .toBeGreaterThan(0)
-      const refresh = await readRefreshProbe(orcaBotmuxPage)
+      const refresh = await readRefreshProbe(botmuxPage)
       const refreshDelta = subtractRefreshProbe(refresh, refreshBaseline)
       testInfo.annotations.push({
         type: 'terminal-refresh-probe',
@@ -394,23 +394,23 @@ test.describe('Terminal foreground redraw freeze repro', () => {
       // fallback from turning the zero-sync assertion into a vacuous pass.
       expect(refreshDelta.debouncedWebgl).toBeGreaterThan(0)
     } finally {
-      await disposeActivePaneRefreshProbe(orcaBotmuxPage)
+      await disposeActivePaneRefreshProbe(botmuxPage)
     }
   })
 
   test('active OpenTUI-style redraw bursts do not monopolize the renderer', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { paneKey } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
-    await waitForTerminalPtyDataInjector(orcaBotmuxPage, paneKey)
-    await resetSchedulerDebug(orcaBotmuxPage)
-    const measurement = await measureRendererDuringBurst(orcaBotmuxPage, paneKey)
-    const scheduler = await readSchedulerDebug(orcaBotmuxPage)
+    const { paneKey } = await waitForActivePaneHookDescriptor(botmuxPage)
+    await waitForTerminalPtyDataInjector(botmuxPage, paneKey)
+    await resetSchedulerDebug(botmuxPage)
+    const measurement = await measureRendererDuringBurst(botmuxPage, paneKey)
+    const scheduler = await readSchedulerDebug(botmuxPage)
     annotateMeasurement(testInfo, measurement, scheduler)
 
     expect(measurement.injectedFrames).toBe(REDRAW_FRAME_COUNT)
@@ -421,7 +421,7 @@ test.describe('Terminal foreground redraw freeze repro', () => {
   })
 
   test('captured OpenCode/OpenTUI redraw bytes do not monopolize foreground writes', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     const frames = loadCapturedOpenCodeSmallRedrawFrames()
     test.skip(
@@ -429,16 +429,16 @@ test.describe('Terminal foreground redraw freeze repro', () => {
       `OpenCode PTY capture missing; run "git clone https://github.com/anomalyco/opencode.git .tmp/opencode" then "node tests/e2e/capture-opencode-tui-repro.mjs" to generate ${OPENCODE_CAPTURE_PATH}`
     )
 
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { paneKey } = await waitForActivePaneHookDescriptor(orcaBotmuxPage)
-    await waitForTerminalPtyDataInjector(orcaBotmuxPage, paneKey)
-    await resetSchedulerDebug(orcaBotmuxPage)
-    const measurement = await measureRendererDuringFrames(orcaBotmuxPage, paneKey, frames)
-    const scheduler = await readSchedulerDebug(orcaBotmuxPage)
+    const { paneKey } = await waitForActivePaneHookDescriptor(botmuxPage)
+    await waitForTerminalPtyDataInjector(botmuxPage, paneKey)
+    await resetSchedulerDebug(botmuxPage)
+    const measurement = await measureRendererDuringFrames(botmuxPage, paneKey, frames)
+    const scheduler = await readSchedulerDebug(botmuxPage)
     annotateMeasurement(testInfo, measurement, scheduler)
 
     expect(measurement.injectedFrames).toBe(frames.length)

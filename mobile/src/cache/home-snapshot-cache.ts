@@ -6,7 +6,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage'
 import type { AccountsSnapshot } from '../components/AccountUsage'
 
-const STORAGE_KEY = 'orca:home-snapshot:v1'
+const STORAGE_KEY = 'botmux:home-snapshot:v1'
 
 type WorktreeSummary = {
   worktreeId: string

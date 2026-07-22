@@ -14,7 +14,7 @@ pnpm daemon:logs          # 查看日志
 
 ### Orca-class Desktop + Mobile（`desktop/` · `mobile/`）
 
-上游 Orca 已独立；**PC 与移动端均在 botmux 内维护**（勿再向 stablyai/orca 推送本仓库改动）。
+上游 Orca 已独立；**PC 与移动端均在 botmux 内维护**（勿再向 deepcoldy/botmux 推送本仓库改动）。
 
 | 目录 | 角色 |
 |---|---|

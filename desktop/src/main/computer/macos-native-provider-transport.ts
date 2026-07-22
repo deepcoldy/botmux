@@ -70,14 +70,14 @@ export async function startMacOSNativeProviderSocket({
   helperExecutablePath: string
   isCurrent: (socketPath: string) => boolean
 }): Promise<StartedMacOSProviderSocket> {
-  const socketDirectory = mkdtempSync(join(tmpdir(), 'orca-botmux-computer-use-'))
+  const socketDirectory = mkdtempSync(join(tmpdir(), 'botmux-computer-use-'))
   chmodSync(socketDirectory, 0o700)
   const socketPath = join(socketDirectory, 'provider.sock')
   const socketToken = randomUUID()
   const socketTokenPath = join(socketDirectory, 'provider.token')
   writeFileSync(socketTokenPath, socketToken, { encoding: 'utf8', mode: 0o600 })
   // Why: launching the nested helper via LaunchServices can make TCC evaluate
-  // OrcaBotmux.app as responsible; the signed helper executable owns this grant.
+  // Botmux.app as responsible; the signed helper executable owns this grant.
   const provider = spawnProvider(helperExecutablePath, socketPath, socketTokenPath)
   const providerFailure = waitForProviderLaunchFailure(provider)
   const connectAbort = new AbortController()

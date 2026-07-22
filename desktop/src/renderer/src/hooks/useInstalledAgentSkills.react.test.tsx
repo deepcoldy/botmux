@@ -60,7 +60,7 @@ function deferred<T>(): {
   return { promise, resolve, reject }
 }
 
-const LINEAR_AGENT_SKILL_NAMES = ['orca-botmux-linear', 'linear-tickets'] as const
+const LINEAR_AGENT_SKILL_NAMES = ['botmux-linear', 'linear-tickets'] as const
 
 const projectWslRuntime: ProjectExecutionRuntimeResolution = {
   status: 'resolved',

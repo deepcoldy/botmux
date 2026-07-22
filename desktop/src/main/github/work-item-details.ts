@@ -1192,7 +1192,7 @@ export async function getWorkItemDetails(
   }
 }
 
-// Why: base64-decoded contents at specific commits are needed to feed OrcaBotmux's
+// Why: base64-decoded contents at specific commits are needed to feed Botmux's
 // Monaco-based DiffViewer (which expects original/modified text, not unified
 // diff patches). Fetching via gh api --cache keeps rate-limit usage bounded
 // during rapid file-expand clicks in the drawer.

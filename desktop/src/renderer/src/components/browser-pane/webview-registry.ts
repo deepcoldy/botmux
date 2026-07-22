@@ -14,7 +14,7 @@ export type BrowserWebviewMemoryProfile = {
   registeredBrowserGuestCount: number
 }
 
-const DRAG_LISTENER_KEY = '__orcaBrowserPaneDragListeners'
+const DRAG_LISTENER_KEY = '__botmuxBrowserPaneDragListeners'
 let dragListenersAttached = false
 let nativeDragPassthroughRelease: (() => void) | null = null
 const dragPassthroughTokens = new Set<symbol>()
@@ -167,7 +167,7 @@ function moveFocusToRendererIfWebviewOwnsFocus(webview: Electron.WebviewTag): bo
     return false
   }
   // Why: hiding/removing a focused webview can let macOS reactivate the
-  // previously-frontmost app. Give focus back to OrcaBotmux's renderer first.
+  // previously-frontmost app. Give focus back to Botmux's renderer first.
   if (webview === activeElement || webview.contains(activeElement)) {
     activeElement.blur?.()
     window.focus()

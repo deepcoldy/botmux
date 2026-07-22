@@ -17,7 +17,7 @@ export const GPU_DLLS = new Set([
 
 // Each tier declares which top-level DLLs to include. The exe, runtime data
 // blobs, daemon bundle, and node-pty are in every tier — they are the
-// irreducible core (OrcaBotmux.exe needs icu + snapshots even as node; the daemon
+// irreducible core (Botmux.exe needs icu + snapshots even as node; the daemon
 // needs its bundle; node-pty needs its native + conpty runtime).
 export const TIER_DEFINITIONS = {
   full: { label: 'TIER_FULL_RUNTIME', dlls: 'all' },
@@ -85,8 +85,8 @@ export function resolveTierFileSet(inv, tier) {
     })
   }
 
-  // Core: exe + runtime data blobs live next to OrcaBotmux.exe in win-unpacked.
-  addFile(inv.hostExe, 'OrcaBotmux.exe')
+  // Core: exe + runtime data blobs live next to Botmux.exe in win-unpacked.
+  addFile(inv.hostExe, 'Botmux.exe')
   for (const entry of inv.runtimeData) {
     addFile(entry, entry.name)
   }

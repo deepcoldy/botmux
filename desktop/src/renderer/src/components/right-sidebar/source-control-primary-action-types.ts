@@ -54,7 +54,7 @@ export type PrimaryActionInputs = {
   // status alone, but it has no branch ref that Publish Branch can push.
   hasCurrentBranch?: boolean
   // Why: linked review branches without upstream counts are pushable only when
-  // OrcaBotmux has a persisted or Git-configured target. Otherwise Push could fall
+  // Botmux has a persisted or Git-configured target. Otherwise Push could fall
   // through to the default publish-to-origin behavior.
   canPushLinkedReviewWithoutUpstream?: boolean
   isPrIntentInFlight?: boolean

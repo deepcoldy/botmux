@@ -152,7 +152,7 @@ async function withPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>):
 }
 
 function dataFile(): string {
-  return join(testState.dir, 'orca-botmux-data.json')
+  return join(testState.dir, 'botmux-data.json')
 }
 
 function writeDataFile(data: unknown): void {
@@ -322,7 +322,7 @@ function makeBalancedLegacyPaneLayout(start: number, end: number): TerminalPaneL
 
 describe('Store', () => {
   beforeEach(() => {
-    testState.dir = mkdtempSync(join(tmpdir(), 'orca-botmux-test-'))
+    testState.dir = mkdtempSync(join(tmpdir(), 'botmux-test-'))
     trackMock.mockReset()
     getCohortAtEmitMock.mockReset()
     getCohortAtEmitMock.mockReturnValue({ nth_repo_added: 2 })
@@ -393,7 +393,7 @@ describe('Store', () => {
 
   it('loads state from an explicit profile data file path', async () => {
     const profileDataDirectory = join(testState.dir, 'profiles', 'local-default')
-    const profileDataFile = join(profileDataDirectory, 'orca-botmux-data.json')
+    const profileDataFile = join(profileDataDirectory, 'botmux-data.json')
     mkdirSync(profileDataDirectory, { recursive: true })
     writeDataFile({
       schemaVersion: 1,
@@ -422,16 +422,16 @@ describe('Store', () => {
       repos: [
         makeRepo({
           id: 'local-repo',
-          path: '/Users/alice/orca_botmux',
-          displayName: 'orca_botmux',
-          upstream: { owner: 'StablyAI', repo: 'orca_botmux' }
+          path: '/Users/alice/botmux',
+          displayName: 'botmux',
+          upstream: { owner: 'StablyAI', repo: 'botmux' }
         }),
         makeRepo({
           id: 'remote-repo',
-          path: '/home/alice/orca_botmux',
-          displayName: 'orca_botmux',
+          path: '/home/alice/botmux',
+          displayName: 'botmux',
           connectionId: 'gpu-vm',
-          upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+          upstream: { owner: 'stablyai', repo: 'botmux' }
         })
       ]
     })
@@ -440,22 +440,22 @@ describe('Store', () => {
 
     expect(store.getProjects()).toEqual([
       expect.objectContaining({
-        id: 'github:stablyai/orca_botmux',
+        id: 'github:stablyai/botmux',
         sourceRepoIds: ['local-repo', 'remote-repo']
       })
     ])
     expect(store.getProjectHostSetups()).toEqual([
       expect.objectContaining({
         id: 'local-repo',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'local',
-        path: '/Users/alice/orca_botmux'
+        path: '/Users/alice/botmux'
       }),
       expect.objectContaining({
         id: 'remote-repo',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:gpu-vm',
-        path: '/home/alice/orca_botmux'
+        path: '/home/alice/botmux'
       })
     ])
 
@@ -1743,7 +1743,7 @@ describe('Store', () => {
     const store = await createStore()
     store.addRepo(
       makeRepo({
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+        upstream: { owner: 'stablyai', repo: 'botmux' },
         connectionId: 'builder'
       })
     )
@@ -1761,7 +1761,7 @@ describe('Store', () => {
 
     expect(automation.runContext).toMatchObject({
       kind: 'workspace-run',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: toSshExecutionHostId('builder'),
       projectHostSetupId: 'r1',
       repoId: 'r1',
@@ -1770,11 +1770,11 @@ describe('Store', () => {
     expect(automation.sourceContext).toMatchObject({
       kind: 'task-source',
       provider: 'github',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: toSshExecutionHostId('builder'),
       projectHostSetupId: 'r1',
       repoId: 'r1',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
   })
 
@@ -1783,7 +1783,7 @@ describe('Store', () => {
     store.addRepo(
       makeRepo({
         executionHostId: toRuntimeExecutionHostId('gpu-server'),
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+        upstream: { owner: 'stablyai', repo: 'botmux' }
       })
     )
 
@@ -1806,7 +1806,7 @@ describe('Store', () => {
 
   it('snapshots automation contexts onto runs', async () => {
     const store = await createStore()
-    store.addRepo(makeRepo({ upstream: { owner: 'stablyai', repo: 'orca_botmux' } }))
+    store.addRepo(makeRepo({ upstream: { owner: 'stablyai', repo: 'botmux' } }))
     const automation = store.createAutomation({
       name: 'Nightly',
       prompt: 'Run checks',
@@ -1834,7 +1834,7 @@ describe('Store', () => {
     const store = await createStore()
     store.addRepo(
       makeRepo({
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+        upstream: { owner: 'stablyai', repo: 'botmux' },
         connectionId: 'builder'
       })
     )
@@ -1869,7 +1869,7 @@ describe('Store', () => {
 
     expect(migratedAutomation?.runContext).toMatchObject({
       kind: 'workspace-run',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: toSshExecutionHostId('builder'),
       projectHostSetupId: 'r1',
       repoId: 'r1',
@@ -1878,11 +1878,11 @@ describe('Store', () => {
     expect(migratedAutomation?.sourceContext).toMatchObject({
       kind: 'task-source',
       provider: 'github',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: toSshExecutionHostId('builder'),
       projectHostSetupId: 'r1',
       repoId: 'r1',
-      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'orca_botmux' }
+      providerIdentity: { provider: 'github', owner: 'stablyai', repo: 'botmux' }
     })
     expect(migratedRun?.runContext).toEqual(migratedAutomation?.runContext)
     expect(migratedRun?.sourceContext).toEqual(migratedAutomation?.sourceContext)
@@ -1892,7 +1892,7 @@ describe('Store', () => {
     const seed = await createStore()
     seed.addRepo(
       makeRepo({
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+        upstream: { owner: 'stablyai', repo: 'botmux' },
         connectionId: 'builder'
       })
     )
@@ -1956,7 +1956,7 @@ describe('Store', () => {
     const store = await createStore()
     store.addRepo(
       makeRepo({
-        upstream: { owner: 'stablyai', repo: 'orca_botmux' },
+        upstream: { owner: 'stablyai', repo: 'botmux' },
         connectionId: 'builder'
       })
     )
@@ -2501,7 +2501,7 @@ describe('Store', () => {
       customAgentCommand: 'claude'
     })
     store.flush()
-    const persisted = JSON.parse(readFileSync(join(testState.dir, 'orca-botmux-data.json'), 'utf-8'))
+    const persisted = JSON.parse(readFileSync(join(testState.dir, 'botmux-data.json'), 'utf-8'))
     expect(persisted.settings.sourceControlAi.actions.commitMessage).toEqual({
       agentId: 'claude',
       commandInputTemplate: '{basePrompt}\n\nRollback commit prompt'
@@ -2660,7 +2660,7 @@ describe('Store', () => {
     })
 
     const store = await createStore()
-    expect(store.getSettings().terminalShortcutPolicy).toBe('orca-botmux-first')
+    expect(store.getSettings().terminalShortcutPolicy).toBe('botmux-first')
   })
 
   it('normalizes malformed source control group order on load', async () => {
@@ -3771,12 +3771,12 @@ describe('Store', () => {
     store.updateRepo('r1', {
       displayName: 'renamed',
       worktreeBasePath: '../new-worktrees',
-      upstream: { owner: 'stablyai', repo: 'orca_botmux' }
+      upstream: { owner: 'stablyai', repo: 'botmux' }
     })
 
     expect(store.getProjects()).toEqual([
       expect.objectContaining({
-        id: 'github:stablyai/orca_botmux',
+        id: 'github:stablyai/botmux',
         displayName: 'renamed',
         sourceRepoIds: ['r1']
       })
@@ -3784,7 +3784,7 @@ describe('Store', () => {
     expect(store.getProjectHostSetups()).toEqual([
       expect.objectContaining({
         id: 'r1',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         displayName: 'renamed',
         worktreeBasePath: '../new-worktrees'
       })
@@ -4094,9 +4094,9 @@ describe('Store', () => {
     store.addRepo(makeRepo())
 
     const updated = store.updateRepo('r1', {
-      upstream: { owner: ' stablyai ', repo: ' orca_botmux ' }
+      upstream: { owner: ' stablyai ', repo: ' botmux ' }
     })
-    expect(updated!.upstream).toEqual({ owner: 'stablyai', repo: 'orca_botmux' })
+    expect(updated!.upstream).toEqual({ owner: 'stablyai', repo: 'botmux' })
 
     store.updateRepo('r1', { upstream: null })
     store.flush()
@@ -4334,8 +4334,8 @@ describe('Store', () => {
   it('setWorktreeMeta refuses synthetic terminal host ids without persisting', async () => {
     const store = await createStore()
     const syntheticIds = [
-      'orca_botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
-      'global-orca-botmux-terminal',
+      'botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013',
+      'global-botmux-terminal',
       'global-floating-terminal'
     ]
     for (const worktreeId of syntheticIds) {
@@ -4346,7 +4346,7 @@ describe('Store', () => {
   })
 
   it('setWorktreeMeta drops a previously polluted synthetic host key', async () => {
-    const polluted = 'orca_botmux:session:e2e9b0d1-c273-471f-937f-a9350cdbd6de'
+    const polluted = 'botmux:session:e2e9b0d1-c273-471f-937f-a9350cdbd6de'
     writeDataFile({
       worktreeMeta: {
         [polluted]: { displayName: 'leaked', comment: '', lastActivityAt: Date.now() }
@@ -4871,7 +4871,7 @@ describe('Store', () => {
 
   it('normalizes disabled TUI agents on load and update', async () => {
     writeFileSync(
-      join(testState.dir, 'orca-botmux-data.json'),
+      join(testState.dir, 'botmux-data.json'),
       JSON.stringify({
         settings: {
           disabledTuiAgents: ['codex', 'not-real', 'codex', 'claude']
@@ -4897,7 +4897,7 @@ describe('Store', () => {
 
   it('migrates yolo default args onto untouched agent launch settings', async () => {
     writeFileSync(
-      join(testState.dir, 'orca-botmux-data.json'),
+      join(testState.dir, 'botmux-data.json'),
       JSON.stringify({
         settings: {
           agentCmdOverrides: {}
@@ -4919,7 +4919,7 @@ describe('Store', () => {
 
   it('does not add yolo defaults for legacy agents with command overrides', async () => {
     writeFileSync(
-      join(testState.dir, 'orca-botmux-data.json'),
+      join(testState.dir, 'botmux-data.json'),
       JSON.stringify({
         settings: {
           agentCmdOverrides: {
@@ -4938,7 +4938,7 @@ describe('Store', () => {
 
   it('removes unsupported TUI skip-permissions args from migrated profiles', async () => {
     writeFileSync(
-      join(testState.dir, 'orca-botmux-data.json'),
+      join(testState.dir, 'botmux-data.json'),
       JSON.stringify({
         settings: {
           agentYoloDefaultsMigrated: true,
@@ -4966,7 +4966,7 @@ describe('Store', () => {
 
   it('normalizes app icon on load and update', async () => {
     writeFileSync(
-      join(testState.dir, 'orca-botmux-data.json'),
+      join(testState.dir, 'botmux-data.json'),
       JSON.stringify({
         settings: {
           appIcon: 'not-real'
@@ -5120,7 +5120,7 @@ describe('Store', () => {
     expect(store.getSettings().terminalShortcutPolicy).toBe('terminal-first')
 
     store.updateSettings({ terminalShortcutPolicy: 'terminal-maybe' as never })
-    expect(store.getSettings().terminalShortcutPolicy).toBe('orca-botmux-first')
+    expect(store.getSettings().terminalShortcutPolicy).toBe('botmux-first')
   })
 
   it('reloads sourceControlViewMode from global settings without touching workspace state', async () => {
@@ -5425,8 +5425,8 @@ describe('Store', () => {
   })
 
   it('GCs synthetic terminal host worktreeMeta keys immediately on load', async () => {
-    const syntheticSession = 'orca_botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013'
-    const mainHost = 'global-orca-botmux-terminal'
+    const syntheticSession = 'botmux:session:87cc0ea8-c94c-4805-baef-13d7bb8bb013'
+    const mainHost = 'global-botmux-terminal'
     const floating = 'global-floating-terminal'
     const realKey = `r1::${join(testState.dir, 'live-wt')}`
     mkdirSync(join(testState.dir, 'live-wt'), { recursive: true })
@@ -5496,7 +5496,7 @@ describe('Store', () => {
     const store = await createStore()
     store.setGitHubCache({ pr: { 'o/r#7': { fetchedAt: 7 } as never }, issue: {} })
     store.flush()
-    expect(existsSync(join(testState.dir, 'orca-botmux-github-cache.json'))).toBe(true)
+    expect(existsSync(join(testState.dir, 'botmux-github-cache.json'))).toBe(true)
 
     const restarted = await createStore()
     expect(restarted.getGitHubCache().pr['o/r#7']).toEqual({ fetchedAt: 7 })
@@ -5505,8 +5505,8 @@ describe('Store', () => {
   it('keeps GitHub cache sidecars scoped to explicit profile data files', async () => {
     const profileADir = join(testState.dir, 'profiles', 'a')
     const profileBDir = join(testState.dir, 'profiles', 'b')
-    const profileADataFile = join(profileADir, 'orca-botmux-data.json')
-    const profileBDataFile = join(profileBDir, 'orca-botmux-data.json')
+    const profileADataFile = join(profileADir, 'botmux-data.json')
+    const profileBDataFile = join(profileBDir, 'botmux-data.json')
     mkdirSync(profileADir, { recursive: true })
     mkdirSync(profileBDir, { recursive: true })
 
@@ -6521,7 +6521,7 @@ describe('Store', () => {
 
   it('missing terminalMacOptionAsAlt in persisted file defaults to "auto" and flags migrated', async () => {
     // Existing file predates the setting entirely. Treat like upgrade from
-    // pre-Option-as-Alt OrcaBotmux: land on 'auto' and mark migrated so we don't
+    // pre-Option-as-Alt Botmux: land on 'auto' and mark migrated so we don't
     // re-examine.
     writeDataFile({
       schemaVersion: 1,
@@ -6996,7 +6996,7 @@ describe('Store', () => {
 
   it('stores terminal scrollback snapshots beside explicit profile data files', async () => {
     const profileDataDirectory = join(testState.dir, 'profiles', 'local-default')
-    const profileDataFile = join(profileDataDirectory, 'orca-botmux-data.json')
+    const profileDataFile = join(profileDataDirectory, 'botmux-data.json')
     mkdirSync(profileDataDirectory, { recursive: true })
 
     vi.resetModules()
@@ -7022,7 +7022,7 @@ describe('Store', () => {
 
   it('reads legacy terminal scrollback snapshots for explicit profile data files', async () => {
     const profileDataDirectory = join(testState.dir, 'profiles', 'local-default')
-    const profileDataFile = join(profileDataDirectory, 'orca-botmux-data.json')
+    const profileDataFile = join(profileDataDirectory, 'botmux-data.json')
     const ref = 'v1-11111111111111111111111111111111'
     const legacySnapshotDir = join(testState.dir, 'terminal-scrollback')
     mkdirSync(profileDataDirectory, { recursive: true })
@@ -9785,7 +9785,7 @@ describe('Store', () => {
   // inference because the `telemetry` field is new in this release: keying
   // on its presence would misclassify every pre-telemetry install as fresh,
   // silently flipping existing users to default-on and violating the social
-  // contract they installed OrcaBotmux under.
+  // contract they installed Botmux under.
 
   it('classifies a truly fresh install as new-user cohort (file absent → optedIn=true)', async () => {
     // No data file written — truly fresh install of the telemetry release.
@@ -9825,7 +9825,7 @@ describe('Store', () => {
   it('still classifies as existing-user cohort when the data file is corrupt', async () => {
     // Load-bearing: `fileExistedOnLoad` stays true even when the parse
     // throws, so the corrupt-file catch path must also apply the migration.
-    // Otherwise a user whose `orca-botmux-data.json` got corrupted would be
+    // Otherwise a user whose `botmux-data.json` got corrupted would be
     // silently opted in as if they were a fresh install.
     mkdirSync(testState.dir, { recursive: true })
     writeFileSync(dataFile(), '{{{corrupt json', 'utf-8')
@@ -9871,7 +9871,7 @@ describe('Store.migrateTabSwitchKeybindings', () => {
   // even after a fresh install writes its own data file on later launches.
 
   beforeEach(() => {
-    testState.dir = mkdtempSync(join(tmpdir(), 'orca-botmux-test-'))
+    testState.dir = mkdtempSync(join(tmpdir(), 'botmux-test-'))
   })
 
   afterEach(() => {
@@ -9929,7 +9929,7 @@ describe('Store.migrateWorktreeIdentity', () => {
   const NEW_WORKSPACE_KEY = worktreeWorkspaceKey(NEW)
 
   beforeEach(() => {
-    testState.dir = mkdtempSync(join(tmpdir(), 'orca-botmux-test-'))
+    testState.dir = mkdtempSync(join(tmpdir(), 'botmux-test-'))
   })
 
   afterEach(() => {
@@ -10089,7 +10089,7 @@ describe('Store.migrateWorktreeIdentity', () => {
 
 describe('Store host-partitioned workspace sessions', () => {
   beforeEach(() => {
-    testState.dir = mkdtempSync(join(tmpdir(), 'orca-botmux-test-'))
+    testState.dir = mkdtempSync(join(tmpdir(), 'botmux-test-'))
   })
 
   afterEach(() => {
@@ -10239,7 +10239,7 @@ describe('Store host-partitioned workspace sessions', () => {
 
 describe('Store native-chat tab viewMode persistence', () => {
   beforeEach(() => {
-    testState.dir = mkdtempSync(join(tmpdir(), 'orca-botmux-test-'))
+    testState.dir = mkdtempSync(join(tmpdir(), 'botmux-test-'))
   })
 
   afterEach(() => {

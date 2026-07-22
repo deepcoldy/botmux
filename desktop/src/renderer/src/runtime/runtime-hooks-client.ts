@@ -1,4 +1,4 @@
-import type { GlobalSettings, OrcaHooks } from '../../../shared/types'
+import type { GlobalSettings, BotmuxHooks } from '../../../shared/types'
 import type { ExecutionHostId } from '../../../shared/execution-host'
 import type { SetupScriptImportCandidate } from '../../../shared/setup-script-imports'
 import { callRuntimeRpc, getActiveRuntimeTarget } from './runtime-rpc-client'
@@ -6,7 +6,7 @@ import { callRuntimeRpc, getActiveRuntimeTarget } from './runtime-rpc-client'
 export type HookCheckResult = {
   status?: 'ok' | 'error'
   hasHooks: boolean
-  hooks: OrcaHooks | null
+  hooks: BotmuxHooks | null
   mayNeedUpdate: boolean
 }
 

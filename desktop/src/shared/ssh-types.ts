@@ -10,7 +10,7 @@ export const SSH_RELAY_CONFIGURE_GRACE_TIME_METHOD = 'relay.configureGraceTime'
 export type SshTarget = {
   id: string
   label: string
-  /** Internal owner for targets that OrcaBotmux creates as implementation details.
+  /** Internal owner for targets that Botmux creates as implementation details.
    *  Owned targets are hidden from normal SSH-host management surfaces. */
   owner?: { type: 'on-demand-runtime'; runtimeId: string }
   /** Host alias to resolve through OpenSSH config (ssh -G). */

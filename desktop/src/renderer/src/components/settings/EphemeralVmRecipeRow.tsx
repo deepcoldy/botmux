@@ -1,13 +1,13 @@
 import { Play } from 'lucide-react'
 import type React from 'react'
-import type { OrcaHooks } from '../../../../shared/types'
+import type { BotmuxHooks } from '../../../../shared/types'
 import { Button } from '../ui/button'
 import { translate } from '@/i18n/i18n'
 
 type RecipeCatalogEntry = Awaited<
   ReturnType<typeof window.api.ephemeralVm.listRecipeCatalog>
 >[number]
-type Recipe = NonNullable<OrcaHooks['environmentRecipes']>[number]
+type Recipe = NonNullable<BotmuxHooks['environmentRecipes']>[number]
 
 export function EphemeralVmRecipeRow({
   entry,

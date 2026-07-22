@@ -40,7 +40,7 @@ describe('splitPaneWithOneShotStartup', () => {
 
     const createdPane = splitPaneWithOneShotStartup(
       deps,
-      { command: 'orca_botmux setup', env: { ORCA_ROLE: 'setup' } },
+      { command: 'botmux setup', env: { BOTMUX_ROLE: 'setup' } },
       () => {
         seenStartupValues.push(deps.startup ?? null)
         return { id: 2 }
@@ -48,7 +48,7 @@ describe('splitPaneWithOneShotStartup', () => {
     )
 
     expect(createdPane).toEqual({ id: 2 })
-    expect(seenStartupValues).toEqual([{ command: 'orca_botmux setup', env: { ORCA_ROLE: 'setup' } }])
+    expect(seenStartupValues).toEqual([{ command: 'botmux setup', env: { BOTMUX_ROLE: 'setup' } }])
     expect(deps.startup).toBeNull()
   })
 
@@ -60,7 +60,7 @@ describe('splitPaneWithOneShotStartup', () => {
 
     splitPaneWithOneShotStartup(
       deps,
-      { command: 'orca_botmux setup', env: { ORCA_ROLE: 'setup' } },
+      { command: 'botmux setup', env: { BOTMUX_ROLE: 'setup' } },
       () => {
         seenStartupValues.push(deps.startup ?? null)
         return { id: 2 }
@@ -69,14 +69,14 @@ describe('splitPaneWithOneShotStartup', () => {
 
     expect(deps.startup).toBeNull()
 
-    splitPaneWithOneShotStartup(deps, { command: 'orca_botmux issue' }, () => {
+    splitPaneWithOneShotStartup(deps, { command: 'botmux issue' }, () => {
       seenStartupValues.push(deps.startup ?? null)
       return { id: 3 }
     })
 
     expect(seenStartupValues).toEqual([
-      { command: 'orca_botmux setup', env: { ORCA_ROLE: 'setup' } },
-      { command: 'orca_botmux issue' }
+      { command: 'botmux setup', env: { BOTMUX_ROLE: 'setup' } },
+      { command: 'botmux issue' }
     ])
     expect(deps.startup).toBeNull()
 
@@ -95,7 +95,7 @@ describe('splitPaneWithOneShotStartup', () => {
       throw new Error('split failed')
     })
 
-    expect(() => splitPaneWithOneShotStartup(deps, { command: 'orca_botmux setup' }, splitPane)).toThrow(
+    expect(() => splitPaneWithOneShotStartup(deps, { command: 'botmux setup' }, splitPane)).toThrow(
       'split failed'
     )
 

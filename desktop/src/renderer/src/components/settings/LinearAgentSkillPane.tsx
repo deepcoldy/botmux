@@ -4,12 +4,12 @@ import type { LucideIcon } from 'lucide-react'
 import { LinearIcon } from '@/components/icons/LinearIcon'
 import {
   LINEAR_AGENT_SKILL_NAMES,
-  ORCA_LINEAR_SKILL_INSTALL_COMMAND,
-  ORCA_LINEAR_SKILL_NAME
+  BOTMUX_LINEAR_SKILL_INSTALL_COMMAND,
+  BOTMUX_LINEAR_SKILL_NAME
 } from '@/lib/agent-feature-install-commands'
 import {
   AGENT_SKILL_CLI_PREREQUISITE_NOTICE,
-  ensureOrcaCliAvailableForAgentSkillTerminal
+  ensureBotmuxCliAvailableForAgentSkillTerminal
 } from '@/lib/agent-skill-cli-prerequisite'
 import { getLinearAgentSkillUpdateTarget } from '@/lib/linear-agent-skill-update-command'
 import { getLinearUsageExamples } from '@/lib/linear-usage-examples'
@@ -44,7 +44,7 @@ function resolveLinearExampleIcon(example: SkillUsageExample): LucideIcon {
 }
 
 // Why: this section is rendered as a Settings section only when the Linear
-// provider is connected, so the orca-botmux-linear agent skill sits beside the
+// provider is connected, so the botmux-linear agent skill sits beside the
 // connection that makes it useful.
 export function LinearAgentSkillPane(): React.JSX.Element {
   const activeSkillRuntime = useActiveProjectSkillRuntime()
@@ -62,9 +62,9 @@ export function LinearAgentSkillPane(): React.JSX.Element {
   const installCommand = useMemo(
     () =>
       activeSkillRuntime.installDisabledReason
-        ? ORCA_LINEAR_SKILL_INSTALL_COMMAND
+        ? BOTMUX_LINEAR_SKILL_INSTALL_COMMAND
         : buildSkillCommandForRuntime(
-            ORCA_LINEAR_SKILL_INSTALL_COMMAND,
+            BOTMUX_LINEAR_SKILL_INSTALL_COMMAND,
             activeSkillRuntime.agentRuntime
           ),
     [activeSkillRuntime.agentRuntime, activeSkillRuntime.installDisabledReason]
@@ -101,7 +101,7 @@ export function LinearAgentSkillPane(): React.JSX.Element {
         )}
         description={translate(
           'auto.components.settings.LinearAgentSkillPane.skillDescription',
-          'Enables agents to read linked tickets and post updates to Linear through OrcaBotmux.'
+          'Enables agents to read linked tickets and post updates to Linear through Botmux.'
         )}
         command={installCommand}
         installedCommand={updateCommand}
@@ -131,7 +131,7 @@ export function LinearAgentSkillPane(): React.JSX.Element {
         onBeforeOpenTerminal={async () => {
           await (activeSkillRuntime.agentRuntime?.runtime === 'wsl'
             ? ensureWslCliAvailableForAgentSkillTerminal(activeSkillRuntime.agentRuntime)
-            : ensureOrcaCliAvailableForAgentSkillTerminal())
+            : ensureBotmuxCliAvailableForAgentSkillTerminal())
         }}
         onRecheck={refreshLinearSkill}
         // Why: the local-host-only freshness scan cannot vouch for a WSL runtime,
@@ -152,7 +152,7 @@ export function LinearAgentSkillPane(): React.JSX.Element {
         )}
         examples={getLinearUsageExamples()}
         resolveIcon={resolveLinearExampleIcon}
-        slashCommand={`/${ORCA_LINEAR_SKILL_NAME}`}
+        slashCommand={`/${BOTMUX_LINEAR_SKILL_NAME}`}
       />
     </SearchableSetting>
   )

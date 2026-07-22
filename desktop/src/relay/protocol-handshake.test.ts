@@ -9,9 +9,9 @@ import {
 } from './protocol'
 
 describe('handshake framing', () => {
-  it('round-trips an orca-botmux-relay-handshake envelope through the existing framing', () => {
+  it('round-trips an botmux-relay-handshake envelope through the existing framing', () => {
     const sent = encodeHandshakeFrame({
-      type: 'orca-botmux-relay-handshake',
+      type: 'botmux-relay-handshake',
       version: '0.1.0+deadbeef'
     })
     expect(sent[0]).toBe(MessageType.Handshake)
@@ -24,24 +24,24 @@ describe('handshake framing', () => {
     expect(frames).toHaveLength(1)
     expect(frames[0].type).toBe(MessageType.Handshake)
     const msg = parseHandshakeMessage(frames[0].payload)
-    expect(msg).toEqual({ type: 'orca-botmux-relay-handshake', version: '0.1.0+deadbeef' })
+    expect(msg).toEqual({ type: 'botmux-relay-handshake', version: '0.1.0+deadbeef' })
   })
 
-  it('round-trips an orca-botmux-relay-handshake-ok reply', () => {
+  it('round-trips an botmux-relay-handshake-ok reply', () => {
     const sent = encodeHandshakeFrame({
-      type: 'orca-botmux-relay-handshake-ok',
+      type: 'botmux-relay-handshake-ok',
       version: '0.1.0+deadbeef'
     })
     const frames: DecodedFrame[] = []
     const decoder = new FrameDecoder((f) => frames.push(f))
     decoder.feed(sent)
     const msg = parseHandshakeMessage(frames[0].payload)
-    expect(msg).toEqual({ type: 'orca-botmux-relay-handshake-ok', version: '0.1.0+deadbeef' })
+    expect(msg).toEqual({ type: 'botmux-relay-handshake-ok', version: '0.1.0+deadbeef' })
   })
 
-  it('round-trips an orca-botmux-relay-handshake-mismatch reply', () => {
+  it('round-trips an botmux-relay-handshake-mismatch reply', () => {
     const sent = encodeHandshakeFrame({
-      type: 'orca-botmux-relay-handshake-mismatch',
+      type: 'botmux-relay-handshake-mismatch',
       expected: '0.1.0+aaa',
       got: '0.1.0+bbb'
     })
@@ -50,14 +50,14 @@ describe('handshake framing', () => {
     decoder.feed(sent)
     const msg = parseHandshakeMessage(frames[0].payload)
     expect(msg).toEqual({
-      type: 'orca-botmux-relay-handshake-mismatch',
+      type: 'botmux-relay-handshake-mismatch',
       expected: '0.1.0+aaa',
       got: '0.1.0+bbb'
     })
   })
 
   it('rejects payloads with unknown type', () => {
-    const bogus = Buffer.from(JSON.stringify({ type: 'orca-botmux-something-else', version: 'x' }))
+    const bogus = Buffer.from(JSON.stringify({ type: 'botmux-something-else', version: 'x' }))
     expect(() => parseHandshakeMessage(bogus)).toThrow(/Unknown handshake type/)
   })
 

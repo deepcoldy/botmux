@@ -36,9 +36,9 @@ function matchesRemoteCommand(commandPath: string[], ...command: string[]): bool
   )
 }
 
-const LINEAR_HELP = `orca_botmux linear
+const LINEAR_HELP = `botmux linear
 
-Usage: orca_botmux linear <command> [options]
+Usage: botmux linear <command> [options]
 
 Commands:
   issue              Read Linear issue context for agents
@@ -65,11 +65,11 @@ Commands:
   attach             Attach a link to a Linear issue
   create             Create a Linear issue
 
-Run \`orca_botmux linear <command> --help\` for command-specific usage.`
+Run \`botmux linear <command> --help\` for command-specific usage.`
 
-const LINEAR_ISSUE_HELP = `orca_botmux linear issue
+const LINEAR_ISSUE_HELP = `botmux linear issue
 
-Usage: orca_botmux linear issue [<id>] [--current] [--comments] [--children] [--depth <n>] [--attachments] [--relations] [--full] [--workspace <id>] [--json]
+Usage: botmux linear issue [<id>] [--current] [--comments] [--children] [--depth <n>] [--attachments] [--relations] [--full] [--workspace <id>] [--json]
 
 Read Linear issue context for agents
 
@@ -78,7 +78,7 @@ Options:
   --json                 Emit machine-readable JSON
   --pairing-code
   --environment
-  --current              Use the current OrcaBotmux worktree linked Linear issue
+  --current              Use the current Botmux worktree linked Linear issue
   --comments             Include threaded Linear comments
   --children             Include recursive child issues
   --depth <n>            Child issue depth for --children/--full
@@ -89,13 +89,13 @@ Options:
   --id <id>             Linear issue key, id, or URL
 
 Examples:
-  $ orca_botmux linear issue ENG-123
-  $ orca_botmux linear issue --current --comments
-  $ orca_botmux linear issue https://linear.app/acme/issue/ENG-123 --full --json`
+  $ botmux linear issue ENG-123
+  $ botmux linear issue --current --comments
+  $ botmux linear issue https://linear.app/acme/issue/ENG-123 --full --json`
 
-const LINEAR_SEARCH_HELP = `orca_botmux linear search
+const LINEAR_SEARCH_HELP = `botmux linear search
 
-Usage: orca_botmux linear search <query> [--limit <n>] [--workspace <id>|all] [--json]
+Usage: botmux linear search <query> [--limit <n>] [--workspace <id>|all] [--json]
 
 Search connected Linear workspaces
 
@@ -109,41 +109,41 @@ Options:
   --query <text>        Text to search across Linear issues
 
 Examples:
-  $ orca_botmux linear search "auth bug"
-  $ orca_botmux linear search ENG --workspace all --json`
+  $ botmux linear search "auth bug"
+  $ botmux linear search ENG --workspace all --json`
 
-const LINEAR_TEAM_LIST_HELP = `orca_botmux linear team list
+const LINEAR_TEAM_LIST_HELP = `botmux linear team list
 
-Usage: orca_botmux linear team list [--workspace <id>|all] [--json]
+Usage: botmux linear team list [--workspace <id>|all] [--json]
 
 List connected Linear teams`
 
-const LINEAR_TEAM_MEMBERS_HELP = `orca_botmux linear team members
+const LINEAR_TEAM_MEMBERS_HELP = `botmux linear team members
 
-Usage: orca_botmux linear team members --team <key|id> [--workspace <id>] [--json]
+Usage: botmux linear team members --team <key|id> [--workspace <id>] [--json]
 
 List Linear team members`
 
-const LINEAR_TEAM_STATES_HELP = `orca_botmux linear team states
+const LINEAR_TEAM_STATES_HELP = `botmux linear team states
 
-Usage: orca_botmux linear team states --team <key|id> [--workspace <id>] [--json]
+Usage: botmux linear team states --team <key|id> [--workspace <id>] [--json]
 
 List Linear team workflow states`
 
-const LINEAR_TEAM_LABELS_HELP = `orca_botmux linear team labels
+const LINEAR_TEAM_LABELS_HELP = `botmux linear team labels
 
-Usage: orca_botmux linear team labels --team <key|id> [--workspace <id>] [--json]
+Usage: botmux linear team labels --team <key|id> [--workspace <id>] [--json]
 
 List Linear team labels`
 
-const LINEAR_PROJECT_LIST_HELP = `orca_botmux linear project list
+const LINEAR_PROJECT_LIST_HELP = `botmux linear project list
 
-Usage: orca_botmux linear project list [--query <text>] [--limit <n>] [--workspace <id>|all] [--json]
+Usage: botmux linear project list [--query <text>] [--limit <n>] [--workspace <id>|all] [--json]
 
 List connected Linear projects`
 
-const LINEAR_LIST_HELP = `orca_botmux linear list
+const LINEAR_LIST_HELP = `botmux linear list
 
-Usage: orca_botmux linear list [--filter assigned|created|all|completed|open] [--team <key|id>] [--limit <n>] [--workspace <id>|all] [--json]
+Usage: botmux linear list [--filter assigned|created|all|completed|open] [--team <key|id>] [--limit <n>] [--workspace <id>|all] [--json]
 
 List Linear issues`

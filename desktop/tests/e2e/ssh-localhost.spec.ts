@@ -1,7 +1,7 @@
 import os from 'node:os'
 
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   UUID_RE,
@@ -20,23 +20,23 @@ type LocalhostSshTarget = {
   identityFile?: string
 }
 
-const RUN_LOCALHOST_SSH = process.env.ORCA_E2E_SSH_LOCALHOST === '1'
+const RUN_LOCALHOST_SSH = process.env.BOTMUX_E2E_SSH_LOCALHOST === '1'
 const RUN_REMOTE_HOOKS =
-  process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS === undefined ||
-  (process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS.trim() !== '' &&
-    process.env.ORCA_FEATURE_REMOTE_AGENT_HOOKS.trim() !== '0')
+  process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS === undefined ||
+  (process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS.trim() !== '' &&
+    process.env.BOTMUX_FEATURE_REMOTE_AGENT_HOOKS.trim() !== '0')
 
 function parsePort(value: string | undefined): number {
   const parsed = Number(value ?? '22')
   if (Number.isInteger(parsed) && parsed > 0 && parsed <= 65535) {
     return parsed
   }
-  throw new Error(`Invalid ORCA_E2E_SSH_PORT: ${value}`)
+  throw new Error(`Invalid BOTMUX_E2E_SSH_PORT: ${value}`)
 }
 
 function currentUsername(): string {
   return (
-    process.env.ORCA_E2E_SSH_USER ??
+    process.env.BOTMUX_E2E_SSH_USER ??
     process.env.USER ??
     process.env.USERNAME ??
     os.userInfo().username
@@ -44,14 +44,14 @@ function currentUsername(): string {
 }
 
 function readLocalhostSshTarget(): LocalhostSshTarget {
-  const configHost = process.env.ORCA_E2E_SSH_CONFIG_HOST?.trim()
-  const host = process.env.ORCA_E2E_SSH_HOST?.trim() ?? (configHost ? '' : '127.0.0.1')
-  const identityFile = process.env.ORCA_E2E_SSH_IDENTITY_FILE?.trim()
+  const configHost = process.env.BOTMUX_E2E_SSH_CONFIG_HOST?.trim()
+  const host = process.env.BOTMUX_E2E_SSH_HOST?.trim() ?? (configHost ? '' : '127.0.0.1')
+  const identityFile = process.env.BOTMUX_E2E_SSH_IDENTITY_FILE?.trim()
 
   return {
     label: `Localhost SSH E2E ${Date.now()}`,
     host,
-    port: parsePort(process.env.ORCA_E2E_SSH_PORT),
+    port: parsePort(process.env.BOTMUX_E2E_SSH_PORT),
     username: currentUsername(),
     ...(configHost ? { configHost } : {}),
     ...(identityFile ? { identityFile } : {})
@@ -63,7 +63,7 @@ function shellQuote(value: string): string {
 }
 
 function marker(name: string): string {
-  return `__ORCA_${name}_${Date.now()}__`
+  return `__BOTMUX_${name}_${Date.now()}__`
 }
 
 function emitMarkerCommand(value: string): string {
@@ -114,20 +114,20 @@ async function postCodexHook(
     page,
     ptyId,
     [
-      'if [ -z "$ORCA_AGENT_HOOK_PORT" ] || [ -z "$ORCA_AGENT_HOOK_TOKEN" ] || [ -z "$ORCA_PANE_KEY" ]; then',
-      '  echo __ORCA_AGENT_HOOK_ENV_MISSING__',
+      'if [ -z "$BOTMUX_AGENT_HOOK_PORT" ] || [ -z "$BOTMUX_AGENT_HOOK_TOKEN" ] || [ -z "$BOTMUX_PANE_KEY" ]; then',
+      '  echo __BOTMUX_AGENT_HOOK_ENV_MISSING__',
       'else',
       `  hook_payload=${shellQuote(JSON.stringify(payload))}`,
       '  (',
       '    sleep 0.1',
-      '    if curl -sS -X POST "http://127.0.0.1:${ORCA_AGENT_HOOK_PORT}/hook/codex" \\',
+      '    if curl -sS -X POST "http://127.0.0.1:${BOTMUX_AGENT_HOOK_PORT}/hook/codex" \\',
       '      -H "Content-Type: application/x-www-form-urlencoded" \\',
-      '      -H "X-OrcaBotmux-Agent-Hook-Token: ${ORCA_AGENT_HOOK_TOKEN}" \\',
-      '      --data-urlencode "paneKey=${ORCA_PANE_KEY}" \\',
-      '      --data-urlencode "tabId=${ORCA_TAB_ID}" \\',
-      '      --data-urlencode "worktreeId=${ORCA_WORKTREE_ID}" \\',
-      '      --data-urlencode "env=${ORCA_AGENT_HOOK_ENV}" \\',
-      '      --data-urlencode "version=${ORCA_AGENT_HOOK_VERSION}" \\',
+      '      -H "X-Botmux-Agent-Hook-Token: ${BOTMUX_AGENT_HOOK_TOKEN}" \\',
+      '      --data-urlencode "paneKey=${BOTMUX_PANE_KEY}" \\',
+      '      --data-urlencode "tabId=${BOTMUX_TAB_ID}" \\',
+      '      --data-urlencode "worktreeId=${BOTMUX_WORKTREE_ID}" \\',
+      '      --data-urlencode "env=${BOTMUX_AGENT_HOOK_ENV}" \\',
+      '      --data-urlencode "version=${BOTMUX_AGENT_HOOK_VERSION}" \\',
       '      --data-urlencode "payload=${hook_payload}" >/dev/null; then',
       `      ${emitMarkerCommand(hookPostedMarker)}`,
       '    fi',
@@ -141,24 +141,24 @@ async function postCodexHook(
 test.describe('Localhost SSH', () => {
   test.skip(
     !RUN_LOCALHOST_SSH,
-    'Set ORCA_E2E_SSH_LOCALHOST=1 to run this local-machine-only SSH E2E test.'
+    'Set BOTMUX_E2E_SSH_LOCALHOST=1 to run this local-machine-only SSH E2E test.'
   )
   test.skip(
     !RUN_REMOTE_HOOKS,
-    'Unset ORCA_FEATURE_REMOTE_AGENT_HOOKS or set it to 1 so remote PTYs keep pane identity and forward hook events.'
+    'Unset BOTMUX_FEATURE_REMOTE_AGENT_HOOKS or set it to 1 so remote PTYs keep pane identity and forward hook events.'
   )
   test.skip(process.platform === 'win32', 'Localhost SSH hook E2E uses POSIX hook scripts.')
 
   test('routes a terminal and agent-hook status over localhost SSH', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
     test.slow()
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
 
     const target = readLocalhostSshTarget()
-    const remote = await orcaBotmuxPage.evaluate(
+    const remote = await botmuxPage.evaluate(
       async ({ remotePath, target }) => {
         const store = window.__store
         if (!store) {
@@ -238,10 +238,10 @@ test.describe('Localhost SSH', () => {
     )
 
     await expect(remote.targetId).toBeTruthy()
-    await ensureTerminalVisible(orcaBotmuxPage, 30_000)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 45_000)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage, 45_000)
-    const paneKey = await orcaBotmuxPage.evaluate(() => {
+    await ensureTerminalVisible(botmuxPage, 30_000)
+    await waitForActiveTerminalManager(botmuxPage, 45_000)
+    const ptyId = await waitForActivePanePtyId(botmuxPage, 45_000)
+    const paneKey = await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('Store unavailable')
@@ -268,7 +268,7 @@ test.describe('Localhost SSH', () => {
     })
     const paneKeyLeafId = paneKey.slice(paneKey.indexOf(':') + 1)
     expect(paneKeyLeafId).toMatch(UUID_RE)
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const state = window as unknown as {
         __sshAgentStatusEvents?: unknown[]
         __sshAgentStatusUnsubscribe?: () => void
@@ -281,33 +281,33 @@ test.describe('Localhost SSH', () => {
     })
 
     const terminalMarker = marker('LOCALHOST_SSH')
-    await execInTerminal(orcaBotmuxPage, ptyId, emitMarkerCommand(terminalMarker))
-    await waitForTerminalOutput(orcaBotmuxPage, terminalMarker, 20_000)
+    await execInTerminal(botmuxPage, ptyId, emitMarkerCommand(terminalMarker))
+    await waitForTerminalOutput(botmuxPage, terminalMarker, 20_000)
 
     const envMarker = marker('AGENT_HOOK_ENV_OK')
     const envFailedMarker = marker('AGENT_HOOK_ENV_BAD')
     await execInTerminal(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       [
-        `if [ "$ORCA_PANE_KEY" = ${shellQuote(paneKey)} ] && [ -n "$ORCA_AGENT_HOOK_PORT" ] && [ -n "$ORCA_AGENT_HOOK_TOKEN" ] && /bin/sh -c 'test -n "$ORCA_PANE_KEY" && test -n "$ORCA_AGENT_HOOK_PORT" && test -n "$ORCA_AGENT_HOOK_TOKEN"'; then`,
+        `if [ "$BOTMUX_PANE_KEY" = ${shellQuote(paneKey)} ] && [ -n "$BOTMUX_AGENT_HOOK_PORT" ] && [ -n "$BOTMUX_AGENT_HOOK_TOKEN" ] && /bin/sh -c 'test -n "$BOTMUX_PANE_KEY" && test -n "$BOTMUX_AGENT_HOOK_PORT" && test -n "$BOTMUX_AGENT_HOOK_TOKEN"'; then`,
         `  ${emitMarkerCommand(envMarker)}`,
         'else',
-        '  token_state=${ORCA_AGENT_HOOK_TOKEN:+set}',
-        `  printf '%s pane=%s port=%s token=%s endpoint=%s\\n' ${shellQuote(envFailedMarker)} "$ORCA_PANE_KEY" "$ORCA_AGENT_HOOK_PORT" "$token_state" "$ORCA_AGENT_HOOK_ENDPOINT"`,
+        '  token_state=${BOTMUX_AGENT_HOOK_TOKEN:+set}',
+        `  printf '%s pane=%s port=%s token=%s endpoint=%s\\n' ${shellQuote(envFailedMarker)} "$BOTMUX_PANE_KEY" "$BOTMUX_AGENT_HOOK_PORT" "$token_state" "$BOTMUX_AGENT_HOOK_ENDPOINT"`,
         'fi'
       ].join('\n')
     )
-    await waitForTerminalOutput(orcaBotmuxPage, envMarker, 20_000)
+    await waitForTerminalOutput(botmuxPage, envMarker, 20_000)
 
     const pluginOverlayMarker = marker('AGENT_PLUGIN_OVERLAYS_OK')
     const pluginOverlayFailedMarker = marker('AGENT_PLUGIN_OVERLAYS_BAD')
     await execInTerminal(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       [
-        'opencode_status_file="$OPENCODE_CONFIG_DIR/plugins/orca-botmux-opencode-status.js"',
-        'pi_status_file="$HOME/.pi/agent/extensions/orca-botmux-agent-status.ts"',
+        'opencode_status_file="$OPENCODE_CONFIG_DIR/plugins/botmux-opencode-status.js"',
+        'pi_status_file="$HOME/.pi/agent/extensions/botmux-agent-status.ts"',
         'if [ -n "$OPENCODE_CONFIG_DIR" ] && [ -f "$opencode_status_file" ] && [ -f "$pi_status_file" ]; then',
         `  ${emitMarkerCommand(pluginOverlayMarker)}`,
         'else',
@@ -315,11 +315,11 @@ test.describe('Localhost SSH', () => {
         'fi'
       ].join('\n')
     )
-    await waitForTerminalOutput(orcaBotmuxPage, pluginOverlayMarker, 20_000)
+    await waitForTerminalOutput(botmuxPage, pluginOverlayMarker, 20_000)
 
-    const prompt = `orca_botmux ssh e2e prompt ${Date.now()}`
+    const prompt = `botmux ssh e2e prompt ${Date.now()}`
     await postCodexHook(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       { hook_event_name: 'UserPromptSubmit', prompt },
       'AGENT_HOOK_POSTED'
@@ -328,7 +328,7 @@ test.describe('Localhost SSH', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             ({ paneKey, prompt, targetId, worktreeId }) => {
               const state = window.__store?.getState()
               const entries = Object.values(state?.agentStatusByPaneKey ?? {})
@@ -353,18 +353,18 @@ test.describe('Localhost SSH', () => {
       )
       .toBe(true)
 
-    const ctrlPrompt = `orca_botmux ssh ctrl-c interrupt ${Date.now()}`
+    const ctrlPrompt = `botmux ssh ctrl-c interrupt ${Date.now()}`
     await postCodexHook(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       { hook_event_name: 'UserPromptSubmit', prompt: ctrlPrompt },
       'AGENT_HOOK_CTRL_WORKING'
     )
-    await focusTerminal(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press('Control+C')
-    await orcaBotmuxPage.waitForTimeout(750)
+    await focusTerminal(botmuxPage)
+    await botmuxPage.keyboard.press('Control+C')
+    await botmuxPage.waitForTimeout(750)
     expect(
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.evaluate(
         ({ paneKey, prompt, targetId, worktreeId }) => {
           const state = window.__store?.getState()
           const entry = state?.agentStatusByPaneKey[paneKey]
@@ -400,7 +400,7 @@ test.describe('Localhost SSH', () => {
     })
 
     await postCodexHook(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       {
         hook_event_name: 'PreToolUse',
@@ -412,7 +412,7 @@ test.describe('Localhost SSH', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate(
+          botmuxPage.evaluate(
             ({ paneKey }) => {
               const entry = window.__store?.getState().agentStatusByPaneKey[paneKey]
               return {
@@ -427,18 +427,18 @@ test.describe('Localhost SSH', () => {
       )
       .toEqual({ state: 'working', interrupted: undefined, prompt: ctrlPrompt })
 
-    const escapePrompt = `orca_botmux ssh escape interrupt ${Date.now()}`
+    const escapePrompt = `botmux ssh escape interrupt ${Date.now()}`
     await postCodexHook(
-      orcaBotmuxPage,
+      botmuxPage,
       ptyId,
       { hook_event_name: 'UserPromptSubmit', prompt: escapePrompt },
       'AGENT_HOOK_ESCAPE_WORKING'
     )
-    await focusTerminal(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press('Escape')
-    await orcaBotmuxPage.waitForTimeout(750)
+    await focusTerminal(botmuxPage)
+    await botmuxPage.keyboard.press('Escape')
+    await botmuxPage.waitForTimeout(750)
     expect(
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.evaluate(
         ({ paneKey }) => {
           const entry = window.__store?.getState().agentStatusByPaneKey[paneKey]
           return {

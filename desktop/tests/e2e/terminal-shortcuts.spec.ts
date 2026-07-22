@@ -14,7 +14,7 @@
  * skipped on the other platform since they'd never fire there at runtime.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
 import { FLOATING_TERMINAL_WORKTREE_ID } from '../../src/shared/constants'
 import {
@@ -107,7 +107,7 @@ async function dispatchCtrlCToActiveTerminalTextarea(
     }
 
     // Why: Electron headless consumes real Ctrl+C before xterm in automation;
-    // synthetic DOM events still exercise OrcaBotmux's installed xterm boundary.
+    // synthetic DOM events still exercise Botmux's installed xterm boundary.
     const keydown = createEvent('keydown', true)
     textarea.dispatchEvent(keydown)
     const keyup = createEvent('keyup', dispatchOptions.keyupCtrlKey !== false)
@@ -456,57 +456,57 @@ async function closeActivePaneAndSettle(page: Page, expectedCount: number): Prom
 // effects and corrupt assertions.
 test.describe.configure({ mode: 'serial' })
 test.describe('Terminal Shortcuts', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    const hasPaneManager = await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    const hasPaneManager = await waitForActiveTerminalManager(botmuxPage, 30_000)
       .then(() => true)
       .catch(() => false)
     test.skip(
       !hasPaneManager,
       'Electron automation in this environment never mounts the live TerminalPane manager.'
     )
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
   })
 
-  test('Shift+Enter follows the pane Kitty keyboard state', async ({ orcaBotmuxPage, electronApp }) => {
+  test('Shift+Enter follows the pane Kitty keyboard state', async ({ botmuxPage, electronApp }) => {
     await installMainProcessPtyWriteSpy(electronApp)
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
 
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
     if (process.platform === 'win32') {
       return
     }
 
     // Why: exercise the production PTY-output tracker, not xterm's renderer-
     // local flag state, so the test covers the bytes the shortcut policy sees.
-    await execInTerminal(orcaBotmuxPage, ptyId, "printf '\\033[>1u'")
-    await expect.poll(() => getKittyKeyboardFlags(orcaBotmuxPage)).toBe(1)
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b[13;2u')
+    await execInTerminal(botmuxPage, ptyId, "printf '\\033[>1u'")
+    await expect.poll(() => getKittyKeyboardFlags(botmuxPage)).toBe(1)
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b[13;2u')
 
     // Clear the shell's unconsumed CSI-u line before resetting flags in a settled
     // command; otherwise its line editor can swallow the reset bytes.
-    await sendToTerminal(orcaBotmuxPage, ptyId, '\x15\x03')
-    await execInTerminal(orcaBotmuxPage, ptyId, "printf '\\033[=0u'")
-    await expect.poll(() => getKittyKeyboardFlags(orcaBotmuxPage)).toBe(0)
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
+    await sendToTerminal(botmuxPage, ptyId, '\x15\x03')
+    await execInTerminal(botmuxPage, ptyId, "printf '\\033[=0u'")
+    await expect.poll(() => getKittyKeyboardFlags(botmuxPage)).toBe(0)
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
   })
 
   test('Droid gets CSI-u Shift+Enter on Windows without changing Antigravity', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     test.skip(process.platform !== 'win32', 'Windows ConPTY encoding contract')
     await installMainProcessPtyWriteSpy(electronApp)
-    await waitForActivePanePtyId(orcaBotmuxPage)
-    const paneKey = await setActivePaneForegroundAgent(orcaBotmuxPage, 'droid')
+    await waitForActivePanePtyId(botmuxPage)
+    const paneKey = await setActivePaneForegroundAgent(botmuxPage, 'droid')
     try {
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b[13;2u', 2)
-      await setActivePaneForegroundAgent(orcaBotmuxPage, 'antigravity')
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b[13;2u', 2)
+      await setActivePaneForegroundAgent(botmuxPage, 'antigravity')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
     } finally {
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.evaluate(
         (key) => window.__store?.getState().clearPaneForegroundAgent(key),
         paneKey
       )
@@ -514,43 +514,43 @@ test.describe('Terminal Shortcuts', () => {
   })
 
   test('Windows forwards genuine Ctrl+Alt text chords to the PTY', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     test.skip(process.platform !== 'win32', 'Windows xterm AltGr classification regression')
     await installMainProcessPtyWriteSpy(electronApp)
-    await waitForActivePanePtyId(orcaBotmuxPage)
+    await waitForActivePanePtyId(botmuxPage)
 
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+Alt+u', '\x1b\x15')
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+Alt+2', '\x1b2')
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+Alt+;', '\x1b;')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Control+Alt+u', '\x1b\x15')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Control+Alt+2', '\x1b2')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Control+Alt+;', '\x1b;')
   })
 
   test('Ctrl+Enter writes the kitty modified-enter chord for terminal TUIs', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     await installMainProcessPtyWriteSpy(electronApp)
-    await waitForActivePanePtyId(orcaBotmuxPage)
+    await waitForActivePanePtyId(botmuxPage)
 
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+Enter', '\x1b[13;5u')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Control+Enter', '\x1b[13;5u')
   })
 
   test('plain Ctrl+C sends ETX under kitty keyboard reporting', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     await installMainProcessPtyWriteSpy(electronApp)
-    await waitForActivePanePtyId(orcaBotmuxPage)
-    await enableKittyKeyboardReporting(orcaBotmuxPage, 31)
+    await waitForActivePanePtyId(botmuxPage)
+    await enableKittyKeyboardReporting(botmuxPage, 31)
     await clearPtyWriteLog(electronApp)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.down('Control')
-    await orcaBotmuxPage.keyboard.up('Control')
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.down('Control')
+    await botmuxPage.keyboard.up('Control')
     expect((await getPtyWrites(electronApp)).join('')).toBe('')
     await clearPtyWriteLog(electronApp)
 
-    expect(await dispatchCtrlCToActiveTerminalTextarea(orcaBotmuxPage, { keyupCtrlKey: false })).toEqual({
+    expect(await dispatchCtrlCToActiveTerminalTextarea(botmuxPage, { keyupCtrlKey: false })).toEqual({
       keydownDefaultPrevented: false,
       keyupDefaultPrevented: false
     })
@@ -566,15 +566,15 @@ test.describe('Terminal Shortcuts', () => {
     expect(writes).not.toContain('\x1b[99')
 
     await expect
-      .poll(async () => await getKittyKeyboardFlags(orcaBotmuxPage), {
+      .poll(async () => await getKittyKeyboardFlags(botmuxPage), {
         timeout: 5_000,
         message: 'Ctrl+C did not clear stale Kitty keyboard flags'
       })
       .toBe(0)
 
     await clearPtyWriteLog(electronApp)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.type('x')
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.type('x')
     await expect
       .poll(async () => (await getPtyWrites(electronApp)).some((write) => write === 'x'), {
         timeout: 5_000,
@@ -583,13 +583,13 @@ test.describe('Terminal Shortcuts', () => {
       .toBe(true)
     const postInterruptWrites = (await getPtyWrites(electronApp)).join('')
     expect(postInterruptWrites).not.toContain('\x1b[')
-    await orcaBotmuxPage.keyboard.press('Backspace')
+    await botmuxPage.keyboard.press('Backspace')
   })
 
   test('@headful Codex-like background output stays visible without disabling WebGL in auto mode', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const hasPane = await orcaBotmuxPage.evaluate(() => {
+    const hasPane = await botmuxPage.evaluate(() => {
       const state = window.__store?.getState()
       const worktreeId = state?.activeWorktreeId
       const tabId =
@@ -604,7 +604,7 @@ test.describe('Terminal Shortcuts', () => {
       return Boolean(pane)
     })
     test.skip(!hasPane, 'No active terminal pane for renderer validation')
-    const webglActive = await orcaBotmuxPage
+    const webglActive = await botmuxPage
       .waitForFunction(
         () => {
           const state = window.__store?.getState()
@@ -626,15 +626,15 @@ test.describe('Terminal Shortcuts', () => {
       .catch(() => false)
     test.skip(!webglActive, 'WebGL was not active in this headful environment')
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = `CODEX_BG_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `printf '\\033[48;2;52;52;52m  ${marker}  \\033[0m\\n'`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await execInTerminal(botmuxPage, ptyId, `printf '\\033[48;2;52;52;52m  ${marker}  \\033[0m\\n'`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((expectedMarker) => {
+          botmuxPage.evaluate((expectedMarker) => {
             const state = window.__store?.getState()
             const worktreeId = state?.activeWorktreeId
             const tabId =
@@ -668,127 +668,127 @@ test.describe('Terminal Shortcuts', () => {
       })
   })
 
-  test('floating terminal owns tab switch shortcuts while focused', async ({ orcaBotmuxPage }) => {
-    const scenario = await seedFloatingTerminalTabSwitchScenario(orcaBotmuxPage)
-    await orcaBotmuxPage.evaluate(async () => {
+  test('floating terminal owns tab switch shortcuts while focused', async ({ botmuxPage }) => {
+    const scenario = await seedFloatingTerminalTabSwitchScenario(botmuxPage)
+    await botmuxPage.evaluate(async () => {
       const state = window.__store?.getState()
       if (state?.settings?.floatingTerminalEnabled !== true) {
         await state?.updateSettings({ floatingTerminalEnabled: true })
       }
       if (!document.querySelector('[data-floating-terminal-panel][aria-hidden="false"]')) {
-        window.dispatchEvent(new CustomEvent('orca-botmux-toggle-floating-terminal'))
+        window.dispatchEvent(new CustomEvent('botmux-toggle-floating-terminal'))
       }
     })
     await expect(
-      orcaBotmuxPage.locator('[data-floating-terminal-panel][aria-hidden="false"]')
+      botmuxPage.locator('[data-floating-terminal-panel][aria-hidden="false"]')
     ).toBeVisible()
-    await focusFloatingTerminal(orcaBotmuxPage)
+    await focusFloatingTerminal(botmuxPage)
 
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+BracketRight`)
+    await botmuxPage.keyboard.press(`${mod}+Shift+BracketRight`)
     await expect
-      .poll(() => getActiveFloatingTerminalTabId(orcaBotmuxPage), {
+      .poll(() => getActiveFloatingTerminalTabId(botmuxPage), {
         timeout: 5_000,
         message: 'floating terminal did not switch to the next tab'
       })
       .toBe(scenario.floatingSecondTabId)
     await expect
-      .poll(() => getActiveBackgroundTerminalTabId(orcaBotmuxPage), {
+      .poll(() => getActiveBackgroundTerminalTabId(botmuxPage), {
         timeout: 1_000,
         message: 'background terminal tab changed while floating terminal was focused'
       })
       .toBe(scenario.backgroundFirstTabId)
 
-    await focusFloatingTerminal(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
+    await focusFloatingTerminal(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
     await expect
-      .poll(() => getActiveFloatingTerminalTabId(orcaBotmuxPage), {
+      .poll(() => getActiveFloatingTerminalTabId(botmuxPage), {
         timeout: 5_000,
         message: 'floating terminal did not switch back to the previous tab'
       })
       .toBe(scenario.floatingFirstTabId)
-    await expect(getActiveBackgroundTerminalTabId(orcaBotmuxPage)).resolves.toBe(
+    await expect(getActiveBackgroundTerminalTabId(botmuxPage)).resolves.toBe(
       scenario.backgroundFirstTabId
     )
   })
 
   test('all terminal chords reach the PTY or fire their action', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     await installMainProcessPtyWriteSpy(electronApp)
 
     // Seed the buffer so Cmd+K has something to clear.
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = `SHORTCUT_TEST_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `echo ${marker}`)
-    await waitForTerminalOutput(orcaBotmuxPage, marker)
+    await execInTerminal(botmuxPage, ptyId, `echo ${marker}`)
+    await waitForTerminalOutput(botmuxPage, marker)
 
     // --- send-input chords (platform-agnostic) ---
 
     // Alt+←/→ → readline backward-word / forward-word (\eb / \ef).
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Alt+ArrowLeft', '\x1bb')
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Alt+ArrowRight', '\x1bf')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Alt+ArrowLeft', '\x1bb')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Alt+ArrowRight', '\x1bf')
 
     // Ctrl+←/→ on non-mac → readline backward-word / forward-word (\eb / \ef).
     // Mac-gated: Ctrl+Arrow on macOS is reserved for Mission Control / Spaces.
     if (!isMac) {
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+ArrowLeft', '\x1bb')
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+ArrowRight', '\x1bf')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Control+ArrowLeft', '\x1bb')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Control+ArrowRight', '\x1bf')
     }
 
     // Alt+Backspace → Esc+DEL (readline backward-kill-word).
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Alt+Backspace', '\x1b\x7f')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Alt+Backspace', '\x1b\x7f')
 
     // Ctrl+Backspace → \x17 (unix-word-rubout).
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Control+Backspace', '\x17')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Control+Backspace', '\x17')
 
     // The shell has not enabled KKP, so Shift+Enter must not leak CSI-u text.
-    await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
+    await pressAndExpectWrite(botmuxPage, electronApp, 'Shift+Enter', '\x1b\r')
 
     // --- send-input chords (macOS-only) ---
 
     if (isMac) {
       // Cmd+←/→ → Ctrl+A / Ctrl+E (beginning/end of line).
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Meta+ArrowLeft', '\x01')
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Meta+ArrowRight', '\x05')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Meta+ArrowLeft', '\x01')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Meta+ArrowRight', '\x05')
 
       // Cmd+Backspace → Ctrl+U (kill line). Cmd+Delete → Ctrl+K (kill to EOL).
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Meta+Backspace', '\x15')
-      await pressAndExpectWrite(orcaBotmuxPage, electronApp, 'Meta+Delete', '\x0b')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Meta+Backspace', '\x15')
+      await pressAndExpectWrite(botmuxPage, electronApp, 'Meta+Delete', '\x0b')
     }
 
     // --- action chords (no PTY byte; assert via visible effect) ---
 
     // Cmd/Ctrl+K clears the pane.
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+k`)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+k`)
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), {
         timeout: 5_000,
         message: 'Cmd+K did not clear the terminal buffer'
       })
       .toBe(false)
 
     // Split vertically (chord varies by platform — see splitVerticalChord).
-    const panesBeforeSplit = await countVisibleTerminalPanes(orcaBotmuxPage)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(splitVerticalChord)
-    await waitForPaneCount(orcaBotmuxPage, panesBeforeSplit + 1)
+    const panesBeforeSplit = await countVisibleTerminalPanes(botmuxPage)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(splitVerticalChord)
+    await waitForPaneCount(botmuxPage, panesBeforeSplit + 1)
     // Why: ensure the new split pane's PTY is actually bound before we later
     // close it, so the close cycle can't race an in-progress split.
-    await waitForActivePanePtyId(orcaBotmuxPage)
+    await waitForActivePanePtyId(botmuxPage)
 
     // Cmd/Ctrl+] and Cmd/Ctrl+[ cycle focus (no pane-count change).
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+BracketRight`)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+BracketLeft`)
-    expect(await countVisibleTerminalPanes(orcaBotmuxPage)).toBe(panesBeforeSplit + 1)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+BracketRight`)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+BracketLeft`)
+    expect(await countVisibleTerminalPanes(botmuxPage)).toBe(panesBeforeSplit + 1)
 
     // Cmd/Ctrl+Shift+Enter toggles expand on the active pane. Requires >1 pane,
     // so it runs while the vertical split from above is still open.
     const readExpanded = async (): Promise<boolean> =>
-      orcaBotmuxPage.evaluate(() => {
+      botmuxPage.evaluate(() => {
         const state = window.__store?.getState()
         const tabId = state?.activeTabId
         if (!state || !tabId) {
@@ -797,61 +797,61 @@ test.describe('Terminal Shortcuts', () => {
         return state.expandedPaneByTabId[tabId] === true
       })
     expect(await readExpanded()).toBe(false)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+Enter`)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+Shift+Enter`)
     await expect
       .poll(readExpanded, { timeout: 3_000, message: 'Cmd+Shift+Enter did not expand pane' })
       .toBe(true)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+Enter`)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+Shift+Enter`)
     await expect
       .poll(readExpanded, { timeout: 3_000, message: 'Cmd+Shift+Enter did not collapse pane' })
       .toBe(false)
 
     // Cmd/Ctrl+W closes the active split pane (not the whole tab: >1 pane).
-    await closeActivePaneAndSettle(orcaBotmuxPage, panesBeforeSplit)
+    await closeActivePaneAndSettle(botmuxPage, panesBeforeSplit)
 
     // Split horizontally (chord varies by platform — see splitHorizontalChord).
-    const panesBeforeHSplit = await countVisibleTerminalPanes(orcaBotmuxPage)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(splitHorizontalChord)
-    await waitForPaneCount(orcaBotmuxPage, panesBeforeHSplit + 1)
-    await waitForActivePanePtyId(orcaBotmuxPage)
-    await closeActivePaneAndSettle(orcaBotmuxPage, panesBeforeHSplit)
+    const panesBeforeHSplit = await countVisibleTerminalPanes(botmuxPage)
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(splitHorizontalChord)
+    await waitForPaneCount(botmuxPage, panesBeforeHSplit + 1)
+    await waitForActivePanePtyId(botmuxPage)
+    await closeActivePaneAndSettle(botmuxPage, panesBeforeHSplit)
 
     // Cmd/Ctrl+F toggles the search overlay.
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press(`${mod}+f`)
-    const searchInput = orcaBotmuxPage.locator('[data-terminal-search-root] input').first()
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press(`${mod}+f`)
+    const searchInput = botmuxPage.locator('[data-terminal-search-root] input').first()
     // Why: Escape is handled by TerminalSearch's React onKeyDown, which only
     // fires when focus is inside the overlay. The overlay auto-focuses its
     // input via a useEffect, but Playwright can press Escape before that
     // effect runs and the keystroke goes to the xterm textarea instead.
     // Wait for the input to actually be focused before pressing Escape.
     await expect(searchInput).toBeFocused({ timeout: 3_000 })
-    await orcaBotmuxPage.keyboard.press('Escape')
-    await expect(orcaBotmuxPage.locator('[data-terminal-search-root]').first()).toBeHidden({
+    await botmuxPage.keyboard.press('Escape')
+    await expect(botmuxPage.locator('[data-terminal-search-root]').first()).toBeHidden({
       timeout: 3_000
     })
   })
 
   test('Cmd+Up/Down scrolls terminal viewport without writing to the PTY on macOS', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     test.skip(!isMac, 'Cmd+Up/Down terminal scroll navigation is macOS-only')
 
     await installMainProcessPtyWriteSpy(electronApp)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = `CMD_ARROW_SCROLL_${Date.now()}`
-    await execInTerminal(orcaBotmuxPage, ptyId, `for i in {1..120}; do echo ${marker}_$i; done`)
-    await waitForTerminalOutput(orcaBotmuxPage, `${marker}_120`)
+    await execInTerminal(botmuxPage, ptyId, `for i in {1..120}; do echo ${marker}_$i; done`)
+    await waitForTerminalOutput(botmuxPage, `${marker}_120`)
 
     await expect
       .poll(
         async () => {
-          const viewport = await getActiveTerminalViewport(orcaBotmuxPage)
+          const viewport = await getActiveTerminalViewport(botmuxPage)
           return viewport.baseY > 0 && viewport.viewportY === viewport.baseY
         },
         {
@@ -862,22 +862,22 @@ test.describe('Terminal Shortcuts', () => {
       .toBe(true)
 
     await clearPtyWriteLog(electronApp)
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press('Meta+ArrowUp')
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press('Meta+ArrowUp')
     await expect
-      .poll(async () => getActiveTerminalViewport(orcaBotmuxPage), {
+      .poll(async () => getActiveTerminalViewport(botmuxPage), {
         timeout: 5_000,
         message: 'Cmd+Up did not scroll the terminal viewport to the top'
       })
       .toMatchObject({ viewportY: 0 })
     expect(await getPtyWrites(electronApp)).toEqual([])
 
-    await focusActiveTerminalInput(orcaBotmuxPage)
-    await orcaBotmuxPage.keyboard.press('Meta+ArrowDown')
+    await focusActiveTerminalInput(botmuxPage)
+    await botmuxPage.keyboard.press('Meta+ArrowDown')
     await expect
       .poll(
         async () => {
-          const viewport = await getActiveTerminalViewport(orcaBotmuxPage)
+          const viewport = await getActiveTerminalViewport(botmuxPage)
           return viewport.viewportY === viewport.baseY
         },
         {
@@ -890,18 +890,18 @@ test.describe('Terminal Shortcuts', () => {
   })
 
   test('Shift with Russian layout text reaches the PTY as Cyrillic under kitty keyboard reporting', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     electronApp
   }) => {
     await installMainProcessPtyWriteSpy(electronApp)
     // Why: CI can mount the xterm surface before the pane transport has a
     // live PTY. Probe first so xterm onData cannot race a disconnected
     // sendInput path, then clear the probe writes before the layout assertion.
-    await waitForActivePanePtyId(orcaBotmuxPage)
-    await enableKittyKeyboardReporting(orcaBotmuxPage, 31)
+    await waitForActivePanePtyId(botmuxPage)
+    await enableKittyKeyboardReporting(botmuxPage, 31)
     await clearPtyWriteLog(electronApp)
 
-    const dispatch = await pressShiftedRussianLayoutKey(orcaBotmuxPage)
+    const dispatch = await pressShiftedRussianLayoutKey(botmuxPage)
 
     expect(dispatch).toEqual({
       keydownDefaultPrevented: false,

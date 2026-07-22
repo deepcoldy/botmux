@@ -2,14 +2,14 @@
    agnostic agent-hook listener. The HTTP request parser, payload normalizer,
    per-CLI extractors, and on-disk endpoint-file writer all share invariants
    (size caps, warn-once Sets, shell-safe value rules) that must not drift
-   between OrcaBotmux's main process and the relay. Splitting by line count would
+   between Botmux's main process and the relay. Splitting by line count would
    force the same invariants to be re-derived in two places. */
 
 // Why: extracted from `src/main/agent-hooks/server.ts` so the relay can host
 // the same listener pipeline on the remote without dragging Electron in. The
 // module uses only Node builtins (http/fs/crypto/net/path/url/os) — none of
 // which pull `electron` — so it is safe to import from `src/relay/`. See
-// docs/design/agent-status-over-ssh.md §3 ("relay normalizes; OrcaBotmux routes").
+// docs/design/agent-status-over-ssh.md §3 ("relay normalizes; Botmux routes").
 import type { IncomingMessage } from 'node:http'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -46,7 +46,7 @@ import {
   upsertWorkingClaudeSubagent,
   type ClaudeSubagentRoster
 } from './claude-subagent-roster'
-import { ORCA_HOOK_PROTOCOL_VERSION } from './agent-hook-types'
+import { BOTMUX_HOOK_PROTOCOL_VERSION } from './agent-hook-types'
 import { REMOTE_AGENT_HOOK_ENV, type AgentHookSource } from './agent-hook-relay'
 import {
   extractAgentProviderSession,
@@ -90,12 +90,12 @@ function capOpenCodeHookText(text: string): string {
 
 /** Bound paneKey size — `${tabId}:${leafUuid}` is well under 200 chars in
  *  practice; cap defends per-pane caches against pathological input.
- *  Exported so non-HTTP ingest paths (e.g. OrcaBotmux's `ingestRemote`) can apply
+ *  Exported so non-HTTP ingest paths (e.g. Botmux's `ingestRemote`) can apply
  *  the same cap as defense-in-depth. */
 export const MAX_PANE_KEY_LEN = 200
 
 /** Per-listener-instance state that holds caches needing per-PTY teardown
- *  (last prompt, last tool snapshot, last status replay). Both OrcaBotmux's main
+ *  (last prompt, last tool snapshot, last status replay). Both Botmux's main
  *  process and the relay get their own instance — they never share. */
 export type HookListenerState = {
   warnedVersions: Set<string>
@@ -248,13 +248,13 @@ export function warnOnHookEnvOrVersionMismatch(
   const { version, env, expectedEnv } = fields
   if (
     version &&
-    version !== ORCA_HOOK_PROTOCOL_VERSION &&
+    version !== BOTMUX_HOOK_PROTOCOL_VERSION &&
     !state.warnedVersions.has(version) &&
     state.warnedVersions.size < MAX_WARNED_KEYS
   ) {
     state.warnedVersions.add(version)
     console.warn(
-      `[agent-hooks] received hook v${version}; server expects v${ORCA_HOOK_PROTOCOL_VERSION}. ` +
+      `[agent-hooks] received hook v${version}; server expects v${BOTMUX_HOOK_PROTOCOL_VERSION}. ` +
         'Reinstall agent hooks from Settings to upgrade the managed script.'
     )
   }
@@ -264,7 +264,7 @@ export function warnOnHookEnvOrVersionMismatch(
       state.warnedEnvs.add(key)
       console.warn(
         `[agent-hooks] received ${env} hook on ${expectedEnv} server. ` +
-          'Likely a stale terminal from another OrcaBotmux install.'
+          'Likely a stale terminal from another Botmux install.'
       )
     }
   }
@@ -272,12 +272,12 @@ export function warnOnHookEnvOrVersionMismatch(
 
 export type AgentHookEventPayload = {
   paneKey: string
-  /** Ephemeral OrcaBotmux launch identity stamped into the PTY env for this process. */
+  /** Ephemeral Botmux launch identity stamped into the PTY env for this process. */
   launchToken?: string
   tabId?: string
   worktreeId?: string
   /** Identifies the SSH connection the event arrived on, or null for local.
-   *  Stamped only on the remote-ingest path (OrcaBotmux's `ingestRemote`); the
+   *  Stamped only on the remote-ingest path (Botmux's `ingestRemote`); the
    *  HTTP path always sets null because it cannot know which mux a request
    *  came from. See docs/design/agent-status-over-ssh.md §5. */
   connectionId: string | null
@@ -2483,7 +2483,7 @@ export function markClaudeLeadTurnInterrupted(state: HookListenerState, paneKey:
 
 /** Rebuild a pane's working roster from a persisted status snapshot. Live
  *  activity confirms a seed after restart; a complete task inventory may reap
- *  an unconfirmed seed whose finish hook arrived while OrcaBotmux was offline. */
+ *  an unconfirmed seed whose finish hook arrived while Botmux was offline. */
 export function seedClaudeSubagentRosterFromSnapshots(
   state: HookListenerState,
   paneKey: string,
@@ -2504,7 +2504,7 @@ export function seedClaudeSubagentRosterFromSnapshots(
       startedAt: snapshot.startedAt,
       agentType: snapshot.agentType,
       description: snapshot.description,
-      // Why: the seed can be a phantom (child finished while OrcaBotmux was down,
+      // Why: the seed can be a phantom (child finished while Botmux was down,
       // its SubagentStop lost). Let a PRESENT background_tasks list that
       // omits the id remove it instead of gating the pane 'working' forever.
       backgroundTasksAuthoritative: true
@@ -2571,7 +2571,7 @@ function buildClaudeChildDrivenStatusPayload(
   hookPayload: Record<string, unknown>
 ): ParsedAgentStatusPayload | null {
   // Why: default 'working' — a spawn is proof of activity even before the
-  // lead's first state-bearing event (e.g. OrcaBotmux restarted mid-session).
+  // lead's first state-bearing event (e.g. Botmux restarted mid-session).
   const lead = state.claudeLeadStateByPaneKey.get(paneKey)
   const leadState = lead?.state ?? 'working'
   const roster = state.claudeSubagentRosterByPaneKey.get(paneKey)
@@ -2600,7 +2600,7 @@ function normalizeClaudeEvent(
 
   // Why: Claude's AskUserQuestion tool is auto-allowed, so it emits PreToolUse
   // (not PermissionRequest) while blocked on a human answer — Claude posts a
-  // Notification instead of PermissionRequest, and OrcaBotmux does not register the
+  // Notification instead of PermissionRequest, and Botmux does not register the
   // Notification hook. Treat that PreToolUse as waiting so the sidebar shows the
   // amber attention state instead of a working spinner that decays to grey while
   // the question sits unanswered. Mirrors normalizeKimiEvent's handling.
@@ -2778,7 +2778,7 @@ function buildClaudeStatusPayload(
 
 // Why: Devin uses Claude-compatible hook payload shapes but has its own
 // documented lifecycle event set. Keep attribution as Devin while normalizing
-// those event names into OrcaBotmux's shared status states.
+// those event names into Botmux's shared status states.
 function normalizeDevinEvent(
   state: HookListenerState,
   eventName: unknown,
@@ -2846,7 +2846,7 @@ function isKimiUserInputTool(toolName: string | undefined): boolean {
 
 // Why: Kimi Code emits Claude-compatible hook payloads and reuses Claude's
 // lifecycle event names (UserPromptSubmit/PreToolUse/Stop/...). Normalize them
-// into OrcaBotmux's shared status states while attributing the status to Kimi so the
+// into Botmux's shared status states while attributing the status to Kimi so the
 // sidebar shows the Kimi icon and label instead of falling back to Claude.
 function normalizeKimiEvent(
   state: HookListenerState,
@@ -3912,7 +3912,7 @@ export function normalizeHookPayload(
   }
 
   // Why: connectionId stays null at the listener layer. The local server keeps
-  // it null; the relay forwards null on the wire and OrcaBotmux's `ingestRemote`
+  // it null; the relay forwards null on the wire and Botmux's `ingestRemote`
   // stamps the real value from `mux` identity on receive. See
   // docs/design/agent-status-over-ssh.md §5.
   const providerSession = extractAgentProviderSession(source, hookPayloadRecord)
@@ -4018,10 +4018,10 @@ export function writeEndpointFile(
   const tmpPath = join(endpointDir, `.endpoint-${process.pid}-${randomUUID()}.tmp`)
   const prefix = process.platform === 'win32' ? 'set ' : ''
   const valuesToWrite: [string, string][] = [
-    ['ORCA_AGENT_HOOK_PORT', String(fields.port)],
-    ['ORCA_AGENT_HOOK_TOKEN', fields.token],
-    ['ORCA_AGENT_HOOK_ENV', fields.env],
-    ['ORCA_AGENT_HOOK_VERSION', fields.version]
+    ['BOTMUX_AGENT_HOOK_PORT', String(fields.port)],
+    ['BOTMUX_AGENT_HOOK_TOKEN', fields.token],
+    ['BOTMUX_AGENT_HOOK_ENV', fields.env],
+    ['BOTMUX_AGENT_HOOK_VERSION', fields.version]
   ]
   for (const [key, value] of valuesToWrite) {
     if (!isShellSafeEndpointValue(value)) {
@@ -4036,7 +4036,7 @@ export function writeEndpointFile(
   let tmpWritten = false
   try {
     // Why: 0o700 — match the file's owner-only policy so the directory does
-    // not leak the existence of this OrcaBotmux/relay install to other local users.
+    // not leak the existence of this Botmux/relay install to other local users.
     mkdirSync(endpointDir, { recursive: true, mode: 0o700 })
     if (process.platform !== 'win32') {
       // Why: mkdirSync's mode only applies on creation — a pre-existing

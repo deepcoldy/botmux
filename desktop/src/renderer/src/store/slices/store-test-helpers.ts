@@ -44,7 +44,7 @@ import { createPullRequestGenerationSlice } from './pull-request-generation'
 import { createCommitMessageGenerationSlice } from './commit-message-generation'
 import { createPinnedTabCloseConfirmSlice } from './pinned-tab-close-confirm'
 import { createRecentlyClosedTabsSlice } from './recently-closed-tabs'
-import { createOrcaProfilesSlice } from './orca-botmux-profiles'
+import { createBotmuxProfilesSlice } from './botmux-profiles'
 import { createNewIssueDraftSlice } from './new-issue-draft'
 import { translate } from '@/i18n/i18n'
 
@@ -94,7 +94,7 @@ export function createTestStore() {
     ...createCommitMessageGenerationSlice(...a),
     ...createPinnedTabCloseConfirmSlice(...a),
     ...createRecentlyClosedTabsSlice(...a),
-    ...createOrcaProfilesSlice(...a),
+    ...createBotmuxProfilesSlice(...a),
     ...createNewIssueDraftSlice(...a)
   }))
 }

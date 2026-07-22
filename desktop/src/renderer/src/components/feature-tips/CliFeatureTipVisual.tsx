@@ -8,10 +8,10 @@ import { usePrefersReducedMotion } from '@/components/feature-wall/feature-wall-
 import { translate } from '@/i18n/i18n'
 
 const CLI_AGENT_COMMANDS = [
-  'orca_botmux worktree create --name auth-pr-1',
-  'orca_botmux worktree create --name auth-pr-2',
-  'orca_botmux orchestration dispatch --task pr1 --to w1',
-  'orca_botmux orchestration dispatch --task pr2 --to w2'
+  'botmux worktree create --name auth-pr-1',
+  'botmux worktree create --name auth-pr-2',
+  'botmux orchestration dispatch --task pr1 --to w1',
+  'botmux orchestration dispatch --task pr2 --to w2'
 ]
 
 export function CliFeatureTipVisual(): JSX.Element {

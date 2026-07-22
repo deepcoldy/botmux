@@ -1,5 +1,5 @@
 /**
- * E2E tests for the "Create Workspace" flow in OrcaBotmux.
+ * E2E tests for the "Create Workspace" flow in Botmux.
  *
  * Why: the old 'create-worktree' modal was replaced by the composer modal
  * (`activeModal === 'new-workspace-composer'`) in #710. A prior version of
@@ -20,7 +20,7 @@
  */
 
 import type { ConsoleMessage } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   waitForSessionReady,
   waitForActiveWorktree,
@@ -30,20 +30,20 @@ import {
 } from './helpers/store'
 
 test.describe('Create Workspace', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('creates a worktree through the composer UI and activates it', async ({ orcaBotmuxPage }) => {
-    const worktreeIdBefore = await getActiveWorktreeId(orcaBotmuxPage)
+  test('creates a worktree through the composer UI and activates it', async ({ botmuxPage }) => {
+    const worktreeIdBefore = await getActiveWorktreeId(botmuxPage)
 
     // Capture render errors for the #1186 guard. React logs "Objects are not
     // valid as a React child" via console.error before throwing the
     // minified-production error #31; capture both paths so the test fails
     // loudly whether the build is dev or prod.
     const pageErrors: Error[] = []
-    orcaBotmuxPage.on('pageerror', (err) => {
+    botmuxPage.on('pageerror', (err) => {
       pageErrors.push(err)
     })
     const consoleErrors: string[] = []
@@ -52,16 +52,16 @@ test.describe('Create Workspace', () => {
         consoleErrors.push(msg.text())
       }
     }
-    orcaBotmuxPage.on('console', onConsole)
+    botmuxPage.on('console', onConsole)
 
     const workspaceName = `e2e-create-${Date.now()}`
 
     try {
       // 1. Open the composer through the visible affordance so the lazy modal
       // mount path stays covered along with the composer body.
-      await orcaBotmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
+      await botmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
 
-      const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
+      const dialog = botmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
 
       // Wait for the composer to settle. The card fires several async effects
@@ -75,14 +75,14 @@ test.describe('Create Workspace', () => {
       // inside the open modal's React tree — the console/pageerror sweep
       // below is what catches #1186-class regressions now that the
       // StartFromField trigger no longer exists (#1191).
-      await orcaBotmuxPage.evaluate(async () => {
+      await botmuxPage.evaluate(async () => {
         const repoId = Object.values(window.__store!.getState().worktreesByRepo).flat()[0]?.repoId
         if (!repoId) {
           return
         }
         await window.api.repos.getBaseRefDefault({ repoId })
       })
-      await orcaBotmuxPage.waitForTimeout(100)
+      await botmuxPage.waitForTimeout(100)
 
       // 3. Type the workspace name into the unified smart-name input.
       // The composer's default mode is 'smart'; its placeholder advertises
@@ -107,7 +107,7 @@ test.describe('Create Workspace', () => {
 
       // 6. The new worktree must actually exist on disk and in the store.
       await expect
-        .poll(async () => worktreeExists(orcaBotmuxPage, workspaceName), {
+        .poll(async () => worktreeExists(botmuxPage, workspaceName), {
           timeout: 10_000,
           message: `Worktree "${workspaceName}" did not appear in the store`
         })
@@ -118,7 +118,7 @@ test.describe('Create Workspace', () => {
       await expect
         .poll(
           async () => {
-            const id = await getActiveWorktreeId(orcaBotmuxPage)
+            const id = await getActiveWorktreeId(botmuxPage)
             return id !== null && id !== worktreeIdBefore
           },
           { timeout: 10_000, message: 'New worktree did not become the active worktree' }
@@ -128,7 +128,7 @@ test.describe('Create Workspace', () => {
       // 8. A terminal tab must auto-create for the new worktree. This is
       // the downstream signal that `activateAndRevealWorktree` actually
       // fired, not just that the store row exists.
-      await ensureTerminalVisible(orcaBotmuxPage)
+      await ensureTerminalVisible(botmuxPage)
 
       // Final render-error sweep. Any render crash during the flow (whether
       // it tore down the modal or bubbled past it) shows up here.
@@ -140,9 +140,9 @@ test.describe('Create Workspace', () => {
       )
       expect(reactChildErrors, `React render error: ${reactChildErrors.join(', ')}`).toEqual([])
     } finally {
-      orcaBotmuxPage.off('console', onConsole)
+      botmuxPage.off('console', onConsole)
       // Best-effort close if the test failed mid-flow and left the modal open.
-      await orcaBotmuxPage
+      await botmuxPage
         .evaluate(() => {
           window.__store?.getState().closeModal()
         })
@@ -152,8 +152,8 @@ test.describe('Create Workspace', () => {
     }
   })
 
-  test('shows a failed workspace entry when worktree creation fails', async ({ orcaBotmuxPage }) => {
-    await orcaBotmuxPage.evaluate(() => {
+  test('shows a failed workspace entry when worktree creation fails', async ({ botmuxPage }) => {
+    await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -176,9 +176,9 @@ test.describe('Create Workspace', () => {
     try {
       const workspaceName = `e2e-create-failure-${Date.now()}`
 
-      await orcaBotmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
+      await botmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
 
-      const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
+      const dialog = botmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
       await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
@@ -191,15 +191,15 @@ test.describe('Create Workspace', () => {
       await createButton.click()
 
       await expect(dialog).toBeHidden()
-      const failedWorkspace = orcaBotmuxPage.getByRole('button', {
+      const failedWorkspace = botmuxPage.getByRole('button', {
         name: new RegExp(`${workspaceName} No base branch found`)
       })
       await expect(failedWorkspace).toBeVisible()
-      await expect(orcaBotmuxPage.getByText('Couldn’t create worktree')).toBeVisible()
+      await expect(botmuxPage.getByText('Couldn’t create worktree')).toBeVisible()
       await expect(failedWorkspace).toContainText('No base branch found')
-      await expect(orcaBotmuxPage.getByRole('button', { name: 'Retry' })).toBeVisible()
+      await expect(botmuxPage.getByRole('button', { name: 'Retry' })).toBeVisible()
     } finally {
-      await orcaBotmuxPage
+      await botmuxPage
         .evaluate(() => {
           ;(
             window as unknown as {
@@ -216,16 +216,16 @@ test.describe('Create Workspace', () => {
 
   test('reuses a resolved pasted GitHub URL when quick create submits', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const title = `E2E smart URL resolution ${Date.now()}`
-    const url = 'https://github.com/stablyai/orca_botmux/pull/2049'
+    const url = 'https://github.com/stablyai/botmux/pull/2049'
     const linkedWorkspacePattern = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 
     try {
-      await orcaBotmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
+      await botmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
 
-      const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
+      const dialog = botmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
       await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
@@ -297,11 +297,11 @@ test.describe('Create Workspace', () => {
       await createButton.click()
 
       await expect(dialog).toBeHidden({ timeout: 15_000 })
-      await expect(orcaBotmuxPage.getByRole('option', { name: linkedWorkspacePattern })).toBeVisible({
+      await expect(botmuxPage.getByRole('option', { name: linkedWorkspacePattern })).toBeVisible({
         timeout: 10_000
       })
-      await expect(orcaBotmuxPage.getByRole('option', { name: url })).toHaveCount(0)
-      await expect(orcaBotmuxPage.getByText('Linked PR #2049')).toBeVisible()
+      await expect(botmuxPage.getByRole('option', { name: url })).toHaveCount(0)
+      await expect(botmuxPage.getByText('Linked PR #2049')).toBeVisible()
       // Why: quick create reuses the single GitHub lookup from typing (no
       // redundant re-fetch), and since #5733 ("Create PR worktrees from the PR
       // head") it resolves the PR start point exactly once at submit time — so
@@ -321,7 +321,7 @@ test.describe('Create Workspace', () => {
         )
         .toEqual({ githubLookupCount: 1, resolvePrBaseCount: 1 })
     } finally {
-      await orcaBotmuxPage
+      await botmuxPage
         .evaluate(() => {
           window.__store?.getState().closeModal()
         })
@@ -333,16 +333,16 @@ test.describe('Create Workspace', () => {
 
   test('names the workspace after the PR title when the pasted URL suggestion is selected', async ({
     electronApp,
-    orcaBotmuxPage
+    botmuxPage
   }) => {
     const title = `E2E selected URL resolution ${Date.now()}`
-    const url = 'https://github.com/stablyai/orca_botmux/pull/2050'
+    const url = 'https://github.com/stablyai/botmux/pull/2050'
     const linkedWorkspacePattern = new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 
     try {
-      await orcaBotmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
+      await botmuxPage.getByRole('button', { name: 'New workspace', exact: true }).click()
 
-      const dialog = orcaBotmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
+      const dialog = botmuxPage.getByRole('dialog', { name: /Create (Workspace|Worktree)/i })
       await expect(dialog).toBeVisible()
       await expect(dialog.locator('[data-workspace-name-input="true"]')).toBeVisible()
 
@@ -381,7 +381,7 @@ test.describe('Create Workspace', () => {
       // suggestion row (instead of submitting the raw URL) must not leave the
       // pasted URL behind as the workspace name. The suggestion popover is
       // portaled outside the dialog element, so locate it page-wide.
-      const suggestion = orcaBotmuxPage.getByRole('option', { name: linkedWorkspacePattern })
+      const suggestion = botmuxPage.getByRole('option', { name: linkedWorkspacePattern })
       await expect(suggestion).toBeVisible()
       await suggestion.click()
 
@@ -390,13 +390,13 @@ test.describe('Create Workspace', () => {
       await createButton.click()
 
       await expect(dialog).toBeHidden({ timeout: 15_000 })
-      await expect(orcaBotmuxPage.getByRole('option', { name: linkedWorkspacePattern })).toBeVisible({
+      await expect(botmuxPage.getByRole('option', { name: linkedWorkspacePattern })).toBeVisible({
         timeout: 10_000
       })
-      await expect(orcaBotmuxPage.getByRole('option', { name: /https-github/i })).toHaveCount(0)
-      await expect(orcaBotmuxPage.getByText('Linked PR #2050')).toBeVisible()
+      await expect(botmuxPage.getByRole('option', { name: /https-github/i })).toHaveCount(0)
+      await expect(botmuxPage.getByText('Linked PR #2050')).toBeVisible()
     } finally {
-      await orcaBotmuxPage
+      await botmuxPage
         .evaluate(() => {
           window.__store?.getState().closeModal()
         })

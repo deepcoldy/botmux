@@ -536,6 +536,7 @@ describe('SSH IPC handlers', () => {
       status: 'connected',
       error: null,
       reconnectAttempt: 0,
+      supportsFolderDownload: true,
       remotePlatform: 'win32'
     })
     expect(mockWindow.webContents.send).toHaveBeenCalledWith('ssh:state-changed', {
@@ -611,7 +612,8 @@ describe('SSH IPC handlers', () => {
         targetId: 'ssh-1',
         status: 'connected',
         error: null,
-        reconnectAttempt: 0
+        reconnectAttempt: 0,
+        supportsFolderDownload: true
       })
     } finally {
       vi.useRealTimers()
@@ -660,7 +662,8 @@ describe('SSH IPC handlers', () => {
         targetId: 'ssh-1',
         status: 'connected',
         error: null,
-        reconnectAttempt: 0
+        reconnectAttempt: 0,
+        supportsFolderDownload: true
       })
 
       expect(mockPortForwardManager.removeAllForwards).toHaveBeenCalledWith('ssh-1')
@@ -669,7 +672,8 @@ describe('SSH IPC handlers', () => {
         targetId: 'ssh-1',
         status: 'connected',
         error: null,
-        reconnectAttempt: 0
+        reconnectAttempt: 0,
+        supportsFolderDownload: true
       })
     } finally {
       vi.useRealTimers()
@@ -708,7 +712,8 @@ describe('SSH IPC handlers', () => {
           targetId: 'ssh-1',
           status: 'connected',
           error: null,
-          reconnectAttempt: 0
+          reconnectAttempt: 0,
+          supportsFolderDownload: true
         })
       }
 
@@ -755,14 +760,17 @@ describe('SSH IPC handlers', () => {
         targetId: 'ssh-1',
         status: 'connected',
         error: null,
-        reconnectAttempt: 0
+        reconnectAttempt: 0,
+        supportsFolderDownload: true
       })
 
       await vi.advanceTimersByTimeAsync(relayLostStabilizedMs + 1)
       mockDeployAndLaunchRelay.mockClear()
       mockPortForwardManager.removeAllForwards.mockClear()
 
-      await expect(handlers.get('ssh:connect')!(null, { targetId: 'ssh-1' })).resolves.toEqual({
+      // Why: reuse path returns connectionManager state as-is (already ready
+      // session short-circuit), which may omit supportsFolderDownload.
+      await expect(handlers.get('ssh:connect')!(null, { targetId: 'ssh-1' })).resolves.toMatchObject({
         targetId: 'ssh-1',
         status: 'connected',
         error: null,
@@ -1678,7 +1686,7 @@ describe('SSH IPC handlers', () => {
   it('ssh:getState returns connection state', async () => {
     const state = {
       targetId: 'ssh-1',
-      status: 'connected',
+      status: 'disconnected',
       error: null,
       reconnectAttempt: 0
     }
@@ -1686,5 +1694,54 @@ describe('SSH IPC handlers', () => {
 
     const result = await handlers.get('ssh:getState')!(null, { targetId: 'ssh-1' })
     expect(result).toEqual(state)
+  })
+
+  it('ssh:getState does not report connected when TCP is up but relay is not ready', async () => {
+    // Why: Explorer/SC need relay FS/git providers. A TCP-only "connected"
+    // status made auto-ensure skip reconnect while readDir failed.
+    mockConnectionManager.getState.mockReturnValue({
+      targetId: 'ssh-1',
+      status: 'connected',
+      error: null,
+      reconnectAttempt: 0
+    })
+
+    const result = await handlers.get('ssh:getState')!(null, { targetId: 'ssh-1' })
+    expect(result).toEqual({
+      targetId: 'ssh-1',
+      status: 'disconnected',
+      error: null,
+      reconnectAttempt: 0
+    })
+  })
+
+  it('ssh:getState reports connected only after the relay session is ready', async () => {
+    const target: SshTarget = {
+      id: 'ssh-1',
+      label: 'Server',
+      host: 'example.com',
+      port: 22,
+      username: 'deploy'
+    }
+    const conn = {}
+    mockSshStore.getTarget.mockReturnValue(target)
+    mockConnectionManager.connect.mockResolvedValue(conn)
+    mockConnectionManager.getConnection.mockReturnValue(conn)
+    mockConnectionManager.getState.mockReturnValue({
+      targetId: 'ssh-1',
+      status: 'connected',
+      error: null,
+      reconnectAttempt: 0
+    })
+
+    await handlers.get('ssh:connect')!(null, { targetId: 'ssh-1' })
+
+    expect(handlers.get('ssh:getState')!(null, { targetId: 'ssh-1' })).toEqual({
+      targetId: 'ssh-1',
+      status: 'connected',
+      error: null,
+      reconnectAttempt: 0,
+      supportsFolderDownload: true
+    })
   })
 })

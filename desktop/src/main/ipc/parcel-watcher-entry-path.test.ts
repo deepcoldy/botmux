@@ -26,12 +26,12 @@ describe('resolveWatcherProcessEntryPath', () => {
   })
 
   it('uses the unpacked nested entry for packaged apps', () => {
-    const appPath = path.join('C:', 'orca_botmux', 'resources', 'app.asar')
+    const appPath = path.join('C:', 'botmux', 'resources', 'app.asar')
 
     expect(resolveWatcherProcessEntryPath(appPath, true, () => true)).toBe(
       path.join(
         'C:',
-        'orca_botmux',
+        'botmux',
         'resources',
         'app.asar.unpacked',
         'out',
@@ -42,7 +42,7 @@ describe('resolveWatcherProcessEntryPath', () => {
   })
 
   it('uses resourcesPath for packaged Electron-as-Node serve processes', () => {
-    const resourcesPath = path.join('Applications', 'OrcaBotmux.app', 'Contents', 'Resources')
+    const resourcesPath = path.join('Applications', 'Botmux.app', 'Contents', 'Resources')
     const packagedEntry = path.join(
       resourcesPath,
       'app.asar.unpacked',
@@ -61,7 +61,7 @@ describe('resolveWatcherProcessEntryPath', () => {
   })
 
   it('keeps the cwd build fallback when resourcesPath has no packaged entry', () => {
-    const appRoot = path.join('workspace', 'orca_botmux')
+    const appRoot = path.join('workspace', 'botmux')
 
     expect(
       resolveWatcherProcessEntryPathWithoutApp(

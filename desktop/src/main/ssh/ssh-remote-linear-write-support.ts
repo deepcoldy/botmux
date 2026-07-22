@@ -57,8 +57,8 @@ export function buildRemoteTargetRequest(
 export function buildRemoteContext(env: Record<string, string>): Record<string, unknown> {
   return {
     remote: true,
-    ...(env.ORCA_WORKTREE_ID ? { worktreeId: env.ORCA_WORKTREE_ID } : {}),
-    ...(env.ORCA_TERMINAL_HANDLE ? { terminalHandle: env.ORCA_TERMINAL_HANDLE } : {})
+    ...(env.BOTMUX_WORKTREE_ID ? { worktreeId: env.BOTMUX_WORKTREE_ID } : {}),
+    ...(env.BOTMUX_TERMINAL_HANDLE ? { terminalHandle: env.BOTMUX_TERMINAL_HANDLE } : {})
   }
 }
 

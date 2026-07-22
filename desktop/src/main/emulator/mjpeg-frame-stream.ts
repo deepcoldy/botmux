@@ -22,7 +22,7 @@ function normalizeStreamUrl(streamUrl: string, streamKey?: string): URL {
   }
   url.searchParams.set('raw', '1')
   if (streamKey) {
-    url.searchParams.set('_orca', streamKey)
+    url.searchParams.set('_botmux', streamKey)
   }
   return url
 }

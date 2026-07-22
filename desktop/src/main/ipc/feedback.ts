@@ -6,14 +6,33 @@ import { app, ipcMain, net } from 'electron'
 // endpoint rejects. Electron's net module runs in the main process and is not
 // subject to CORS, so we proxy the submission through IPC. This mirrors the
 // same pattern used by updater-changelog.ts and updater-nudge.ts.
-const FEEDBACK_API_URL = 'https://www.onorca.dev/v1/feedback'
-const FEEDBACK_API_FALLBACK_URL = 'https://api.onorca.dev/v1/feedback'
+//
+// Hosts are env-only so open-source trees never embed private infrastructure:
+//   BOTMUX_FEEDBACK_API_URL           primary POST target
+//   BOTMUX_FEEDBACK_API_FALLBACK_URL  optional fallback (5xx / network errors)
 const FEEDBACK_REQUEST_TIMEOUT_MS = 10_000
 const FEEDBACK_ATTACHMENT_REQUEST_TIMEOUT_MS = 60_000
 const DIAGNOSTIC_BUNDLE_CONTENT_TYPE = 'application/x-ndjson'
 // Why: corporate filters can reject multipart with 403 while allowing the
 // small JSON report, so content-shaped failures should shed the attachment.
 const DIAGNOSTIC_BUNDLE_JSON_RETRY_STATUSES = new Set([400, 403, 408, 413, 415, 422])
+
+export type FeedbackApiEndpoints = {
+  primary: string
+  fallback: string | null
+}
+
+/** Resolve feedback endpoints from env (no hardcoded hosts). */
+export function getFeedbackApiEndpoints(
+  env: NodeJS.ProcessEnv = process.env
+): FeedbackApiEndpoints | null {
+  const primary = env.BOTMUX_FEEDBACK_API_URL?.trim() ?? ''
+  if (!primary) {
+    return null
+  }
+  const fallback = env.BOTMUX_FEEDBACK_API_FALLBACK_URL?.trim() || null
+  return { primary, fallback: fallback && fallback !== primary ? fallback : null }
+}
 
 export type FeedbackSubmissionType = 'feedback' | 'crash'
 
@@ -61,7 +80,7 @@ type InternalFeedbackSubmitArgs = FeedbackSubmitArgs & {
 }
 
 // Why: the Slack notification and any follow-up investigation need to know
-// which OrcaBotmux build and which OS the feedback came from. The main process is
+// which Botmux build and which OS the feedback came from. The main process is
 // the only place with trusted access to these values (app.getVersion and the
 // node os module), so we enrich the payload here rather than trusting the
 // renderer.
@@ -145,7 +164,7 @@ function feedbackRequestBodyInit(body: FeedbackSubmitBody): Pick<RequestInit, 'b
   formData.append(
     'diagnosticBundleFile',
     new Blob([body.diagnosticBundle.content], { type: DIAGNOSTIC_BUNDLE_CONTENT_TYPE }),
-    `orca-botmux-diagnostics-${body.diagnosticBundle.bundleSubmissionId}.ndjson`
+    `botmux-diagnostics-${body.diagnosticBundle.bundleSubmissionId}.ndjson`
   )
 
   // Why: multipart avoids JSON-escaping a near-cap NDJSON bundle over the
@@ -173,10 +192,17 @@ function errorFailure(error: unknown): FeedbackRequestFailure {
 
 async function submitFallbackFeedback(
   body: FeedbackSubmitBody,
+  fallbackUrl: string | null,
   primaryError?: unknown
 ): Promise<FeedbackSubmitResult> {
+  if (!fallbackUrl) {
+    if (primaryError === undefined) {
+      return { ok: false, status: null, error: 'feedback fallback is not configured' }
+    }
+    return { ok: false, status: null, error: messageFromError(primaryError) }
+  }
   try {
-    const fallback = await postFeedback(FEEDBACK_API_FALLBACK_URL, body)
+    const fallback = await postFeedback(fallbackUrl, body)
     if (fallback.ok) {
       return { ok: true }
     }
@@ -194,12 +220,15 @@ async function submitFallbackFeedback(
   }
 }
 
-function diagnosticRetryUrl(status: number): string | null {
+function diagnosticRetryUrl(
+  status: number,
+  endpoints: FeedbackApiEndpoints
+): string | null {
   if (DIAGNOSTIC_BUNDLE_JSON_RETRY_STATUSES.has(status)) {
-    return FEEDBACK_API_URL
+    return endpoints.primary
   }
-  if (status === 404 || status >= 500) {
-    return FEEDBACK_API_FALLBACK_URL
+  if ((status === 404 || status >= 500) && endpoints.fallback) {
+    return endpoints.fallback
   }
   return null
 }
@@ -222,13 +251,14 @@ async function submitFeedbackWithoutDiagnosticBundle(
 
 async function submitFeedbackWithDiagnosticBundle(
   body: FeedbackSubmitBody,
-  bodyWithoutDiagnosticBundle: FeedbackSubmitBody | null
+  bodyWithoutDiagnosticBundle: FeedbackSubmitBody | null,
+  endpoints: FeedbackApiEndpoints
 ): Promise<FeedbackSubmitResult> {
   try {
     // Why: diagnostic bundles can approach 4 MiB and need more upload time than
     // the small JSON report-only path, especially on constrained connections.
     const response = await postFeedback(
-      FEEDBACK_API_URL,
+      endpoints.primary,
       body,
       FEEDBACK_ATTACHMENT_REQUEST_TIMEOUT_MS
     )
@@ -237,7 +267,7 @@ async function submitFeedbackWithDiagnosticBundle(
     }
     const failure = responseFailure(response)
     if (bodyWithoutDiagnosticBundle) {
-      const retryUrl = diagnosticRetryUrl(response.status)
+      const retryUrl = diagnosticRetryUrl(response.status, endpoints)
       if (retryUrl) {
         return submitFeedbackWithoutDiagnosticBundle(retryUrl, bodyWithoutDiagnosticBundle, failure)
       }
@@ -245,19 +275,27 @@ async function submitFeedbackWithDiagnosticBundle(
     return { ok: false, ...failure }
   } catch (error) {
     const failure = errorFailure(error)
-    return bodyWithoutDiagnosticBundle
-      ? submitFeedbackWithoutDiagnosticBundle(
-          FEEDBACK_API_FALLBACK_URL,
-          bodyWithoutDiagnosticBundle,
-          failure
-        )
-      : { ok: false, ...failure }
+    if (!bodyWithoutDiagnosticBundle) {
+      return { ok: false, ...failure }
+    }
+    const retryUrl = endpoints.fallback ?? endpoints.primary
+    return submitFeedbackWithoutDiagnosticBundle(retryUrl, bodyWithoutDiagnosticBundle, failure)
   }
 }
 
 export async function submitFeedback(
-  args: InternalFeedbackSubmitArgs
+  args: InternalFeedbackSubmitArgs,
+  env: NodeJS.ProcessEnv = process.env
 ): Promise<FeedbackSubmitResult> {
+  const endpoints = getFeedbackApiEndpoints(env)
+  if (!endpoints) {
+    return {
+      ok: false,
+      status: null,
+      error: 'Feedback is not configured. Set BOTMUX_FEEDBACK_API_URL.'
+    }
+  }
+
   const body = buildSubmitBody(args)
   if (body.diagnosticBundle) {
     const bodyWithoutDiagnosticBundle =
@@ -268,24 +306,21 @@ export async function submitFeedback(
             diagnosticBundle: undefined
           })
         : null
-    return submitFeedbackWithDiagnosticBundle(body, bodyWithoutDiagnosticBundle)
+    return submitFeedbackWithDiagnosticBundle(body, bodyWithoutDiagnosticBundle, endpoints)
   }
   try {
-    const res = await postFeedback(FEEDBACK_API_URL, body)
+    const res = await postFeedback(endpoints.primary, body)
     if (res.ok) {
       return { ok: true }
     }
-    // Why: keep api.onorca.dev as a compatibility fallback, but prefer the
-    // website API because it owns the Slack file/snippet crash delivery path.
-    if (res.status === 404 || res.status >= 500) {
-      return submitFallbackFeedback(body)
+    // Why: optional fallback host for 5xx / missing primary route.
+    if ((res.status === 404 || res.status >= 500) && endpoints.fallback) {
+      return submitFallbackFeedback(body, endpoints.fallback)
     }
     return { ok: false, status: res.status, error: `status ${res.status}` }
   } catch (error) {
-    // Why: falling back on any network-level failure preserves the prior
-    // behavior where DNS/connect failures on the primary host transparently
-    // try the legacy API endpoint.
-    return submitFallbackFeedback(body, error)
+    // Why: falling back on network-level failure when a fallback URL is set.
+    return submitFallbackFeedback(body, endpoints.fallback, error)
   }
 }
 

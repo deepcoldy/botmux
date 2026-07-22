@@ -17,42 +17,47 @@ import type {
   SleepingAgentLaunchConfig
 } from '../../../../shared/agent-session-resume'
 import {
-  ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
+  BOTMUX_MAIN_TERMINAL_WORKTREE_ID,
   DEFAULT_REPO_BADGE_COLOR,
   FLOATING_TERMINAL_WORKTREE_ID
 } from '../../../../shared/constants'
 import {
-  getOrcaBotmuxSessionHostMeta,
-  isOrcaBotmuxControlPlaneHostId,
-  setOrcaBotmuxHostActiveSession
-} from '../../../../shared/orca-botmux-main-terminal-host'
+  getBotmuxSessionHostMeta,
+  isBotmuxControlPlaneHostId,
+  setBotmuxHostActiveSession
+} from '../../../../shared/botmux-main-terminal-host'
+import { resolveBotmuxHostSurfaceForTerminalTab } from '@/lib/sync-botmux-host-surface-for-terminal-tab'
 import {
-  orcaBotmuxHostIdForRepoConnection,
+  botmuxHostIdForRepoConnection,
   isPathInsideOrEqual,
   normalizeMatchPath
-} from '@/lib/match-orca-botmux-sessions-to-worktree'
+} from '@/lib/match-botmux-sessions-to-worktree'
+import {
+  ensureBotmuxBridgeEndpointConnected,
+  recoverBotmuxAttachOnReconnect
+} from '@/lib/recover-botmux-attach-on-reconnect'
 
-/** Per agent/session host: which orca_botmux session drives FileExplorer path. */
-export type OrcaBotmuxHostSurface = {
+/** Per agent/session host: which botmux session drives FileExplorer path. */
+export type BotmuxHostSurface = {
   sessionId: string
   /** Remote cwd for the active session (FileExplorer root). */
   cwd: string
-  /** OrcaBotmux bridge hostId (`ssh:…` / `local`) for session-tree highlight. */
+  /** Botmux bridge hostId (`ssh:…` / `local`) for session-tree highlight. */
   hostId?: string
 }
 
-/** Deepest project worktree whose path contains the active orca_botmux session cwd. */
+/** Deepest project worktree whose path contains the active botmux session cwd. */
 function findWorktreeIdMatchingBotmuxCwd(
   state: Pick<AppState, 'repos' | 'worktreesByRepo'>,
   cwd: string,
-  orcaBotmuxHostId?: string
+  botmuxHostId?: string
 ): string | null {
   const target = normalizeMatchPath(cwd)
   if (!target) return null
   let best: { id: string; len: number } | null = null
   for (const repo of state.repos) {
-    const host = orcaBotmuxHostIdForRepoConnection(repo.connectionId)
-    if (orcaBotmuxHostId && host !== orcaBotmuxHostId) continue
+    const host = botmuxHostIdForRepoConnection(repo.connectionId)
+    if (botmuxHostId && host !== botmuxHostId) continue
     const trees = state.worktreesByRepo[repo.id] ?? []
     for (const wt of trees) {
       const p = normalizeMatchPath(wt.path || '')
@@ -424,11 +429,11 @@ function getRemoteConnectionIdForWorktree(
   state: Pick<AppState, 'folderWorkspaces' | 'projectGroups' | 'repos' | 'worktreesByRepo'>,
   worktreeId: string
 ): string | null {
-  // Why: orca_botmux synthetic hosts (orca_botmux:session:* / global-orca-botmux-terminal) must
+  // Why: botmux synthetic hosts (botmux:session:* / global-botmux-terminal) must
   // spawn a **local** PTY and run `ssh -tt … tmux attach` in the shell.
   // Returning an SSH connectionId here forces pty:spawn through SshPtyProvider;
   // when the relay is mid-reconnect that yields "No PTY provider" → black/flash.
-  if (isOrcaBotmuxControlPlaneHostId(worktreeId)) {
+  if (isBotmuxControlPlaneHostId(worktreeId)) {
     return null
   }
   const parsedWorkspaceKey = parseWorkspaceKey(worktreeId)
@@ -507,20 +512,20 @@ export type TerminalSlice = {
   tabsByWorktree: Record<string, TerminalTab[]>
   activeTabId: string | null
   /**
-   * Active OrcaBotmux session surface per control-plane host. Written on open and
+   * Active Botmux session surface per control-plane host. Written on open and
    * tab switch so FileExplorer can re-render when session cwd changes (mutating
    * the cached Worktree.path alone does not notify Zustand).
    */
-  orcaBotmuxSurfaceByHostId: Record<string, OrcaBotmuxHostSurface>
-  setOrcaBotmuxHostSurface: (
+  botmuxSurfaceByHostId: Record<string, BotmuxHostSurface>
+  setBotmuxHostSurface: (
     worktreeId: string,
     surface: { sessionId: string; cwd?: string | null }
   ) => void
   /**
-   * Project worktree id matched to the active orca_botmux session cwd (for sidebar
+   * Project worktree id matched to the active botmux session cwd (for sidebar
    * highlight while the terminal host stays on the synthetic agent surface).
    */
-  orcaBotmuxHighlightedWorktreeId: string | null
+  botmuxHighlightedWorktreeId: string | null
   /** Per-worktree last-active terminal tab — restored on worktree switch so
    *  the user returns to the same tab they left, not always tabs[0]. */
   activeTabIdByWorktree: Record<string, string | null>
@@ -609,7 +614,7 @@ export type TerminalSlice = {
   defaultTerminalTabsAppliedByWorktreeId: Record<string, true>
   markDefaultTerminalTabsApplied: (worktreeId: string) => void
   /** True only after hydrateWorkspaceSession ran from a real load of
-   *  orca-botmux-data.json. Guards the debounced session writer so that a crash
+   *  botmux-data.json. Guards the debounced session writer so that a crash
    *  during early startup (fetchRepos / fetchAllWorktrees / session.get /
    *  hydrateWorkspaceSession itself) cannot cause an empty in-memory state
    *  to be serialized back over the user's good data on disk.
@@ -668,8 +673,8 @@ export type TerminalSlice = {
        *  so the tab keeps the implicit `'terminal'` default. */
       viewMode?: Tab['viewMode']
       startupCwd?: string
-      /** OrcaBotmux attach: bind this tab to a sessionId for same-session re-open. */
-      orcaBotmuxSessionId?: string | null
+      /** Botmux attach: bind this tab to a sessionId for same-session re-open. */
+      botmuxSessionId?: string | null
     }
   ) => TerminalTab
   openNewTerminalTabInActiveWorkspace: (groupId: string) => Promise<void>
@@ -852,36 +857,36 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
   expandedPaneByTabId: {},
   canExpandPaneByTabId: {},
   terminalLayoutsByTabId: {},
-  orcaBotmuxSurfaceByHostId: {},
-  orcaBotmuxHighlightedWorktreeId: null,
-  setOrcaBotmuxHostSurface: (worktreeId, surface) => {
-    if (!isOrcaBotmuxControlPlaneHostId(worktreeId)) return
+  botmuxSurfaceByHostId: {},
+  botmuxHighlightedWorktreeId: null,
+  setBotmuxHostSurface: (worktreeId, surface) => {
+    if (!isBotmuxControlPlaneHostId(worktreeId)) return
     const sessionId = String(surface.sessionId ?? '').trim()
     if (!sessionId) return
-    setOrcaBotmuxHostActiveSession(worktreeId, {
+    setBotmuxHostActiveSession(worktreeId, {
       sessionId,
       cwd: surface.cwd
     })
-    const meta = getOrcaBotmuxSessionHostMeta(worktreeId)
+    const meta = getBotmuxSessionHostMeta(worktreeId)
     const cwd = (surface.cwd ?? meta?.cwdBySessionId[sessionId] ?? '').trim()
     const hostId = meta?.hostId?.trim() || undefined
     set((s) => {
-      const prev = s.orcaBotmuxSurfaceByHostId[worktreeId]
+      const prev = s.botmuxSurfaceByHostId[worktreeId]
       const matched = cwd ? findWorktreeIdMatchingBotmuxCwd(s, cwd, hostId) : null
       if (
         prev?.sessionId === sessionId &&
         prev.cwd === cwd &&
         prev.hostId === hostId &&
-        s.orcaBotmuxHighlightedWorktreeId === matched
+        s.botmuxHighlightedWorktreeId === matched
       ) {
         return {}
       }
       return {
-        orcaBotmuxSurfaceByHostId: {
-          ...s.orcaBotmuxSurfaceByHostId,
+        botmuxSurfaceByHostId: {
+          ...s.botmuxSurfaceByHostId,
           [worktreeId]: { sessionId, cwd, hostId }
         },
-        orcaBotmuxHighlightedWorktreeId: matched
+        botmuxHighlightedWorktreeId: matched
       }
     })
   },
@@ -1093,10 +1098,10 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       const defaultTitle = `Terminal ${nextOrdinal}`
       const quickCommandLabel = options?.quickCommandLabel?.trim()
       const startupCwd = options?.startupCwd
-      const orcaBotmuxSessionId =
-        typeof options?.orcaBotmuxSessionId === 'string' && options.orcaBotmuxSessionId.trim()
-          ? options.orcaBotmuxSessionId.trim()
-          : options?.orcaBotmuxSessionId === null
+      const botmuxSessionId =
+        typeof options?.botmuxSessionId === 'string' && options.botmuxSessionId.trim()
+          ? options.botmuxSessionId.trim()
+          : options?.botmuxSessionId === null
             ? null
             : undefined
       const remoteConnectionId = getRemoteConnectionIdForWorktree(s, worktreeId)
@@ -1136,7 +1141,7 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         createdAt: Date.now(),
         ...(createdShellOverride !== undefined ? { shellOverride: createdShellOverride } : {}),
         ...(startupCwd && startupCwd.length > 0 ? { startupCwd } : {}),
-        ...(orcaBotmuxSessionId !== undefined ? { orcaBotmuxSessionId } : {}),
+        ...(botmuxSessionId !== undefined ? { botmuxSessionId } : {}),
         ...(options?.launchAgent ? { launchAgent: options.launchAgent } : {}),
         // Why: when Terminal.tsx's activation fallback auto-creates a tab for a
         // first-visit worktree, the resulting PTY spawn is caused by the user
@@ -1715,22 +1720,19 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
         unreadTerminalTabs: nextUnreadTerminalTabs
       }
     })
-    // Why: agent-scoped orca_botmux hosts share one worktree for many sessions.
+    // Why: agent-scoped botmux hosts share one worktree for many sessions.
     // Switching tabs must retarget FileExplorer path to that session's cwd
     // and notify Zustand (in-place Worktree.path mutation alone is invisible).
-    if (tabOwnerWorktreeId && isOrcaBotmuxControlPlaneHostId(tabOwnerWorktreeId)) {
+    // Same resolver as focusGroup so split-body clicks stay in sync with tab chrome.
+    if (tabOwnerWorktreeId) {
       const state = get()
-      const hostTabs = state.tabsByWorktree[tabOwnerWorktreeId] ?? []
-      const tab = hostTabs.find((t) => t.id === tabId)
-      const meta = getOrcaBotmuxSessionHostMeta(tabOwnerWorktreeId)
-      const sessionId =
-        (typeof tab?.orcaBotmuxSessionId === 'string' && tab.orcaBotmuxSessionId.trim()) ||
-        meta?.sessionIdsByTabId[tabId] ||
-        meta?.sessionId ||
-        ''
-      if (sessionId) {
-        const cwd = meta?.cwdBySessionId[sessionId] ?? null
-        state.setOrcaBotmuxHostSurface(tabOwnerWorktreeId, { sessionId, cwd })
+      const surface = resolveBotmuxHostSurfaceForTerminalTab({
+        worktreeId: tabOwnerWorktreeId,
+        terminalTabId: tabId,
+        hostTabs: state.tabsByWorktree[tabOwnerWorktreeId] ?? []
+      })
+      if (surface) {
+        state.setBotmuxHostSurface(tabOwnerWorktreeId, surface)
       }
     }
     const item = Object.values(get().unifiedTabsByWorktree)
@@ -3287,14 +3289,14 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       // its tabs still use the normal terminal session pipeline so daemon PTYs
       // can survive app restart just like workspace terminals.
       validWorktreeIds.add(FLOATING_TERMINAL_WORKTREE_ID)
-      // OrcaBotmux control-plane hosts (main + per-session synthetics).
-      validWorktreeIds.add(ORCA_BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
+      // Botmux control-plane hosts (main + per-session synthetics).
+      validWorktreeIds.add(BOTMUX_MAIN_TERMINAL_WORKTREE_ID)
       for (const workspace of s.folderWorkspaces) {
         validWorktreeIds.add(folderWorkspaceKey(workspace.id))
       }
       addAdditionalValidWorkspaceKeys(validWorktreeIds, options)
       for (const worktreeId of Object.keys(session.tabsByWorktree)) {
-        if (isOrcaBotmuxControlPlaneHostId(worktreeId)) {
+        if (isBotmuxControlPlaneHostId(worktreeId)) {
           validWorktreeIds.add(worktreeId)
           continue
         }
@@ -3650,6 +3652,11 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
     // ptyId as a sentinel so connectPanePty knows to reattach.
     let reconnectedTabsByWorktree: Record<string, TerminalTab[]> | null = null
     let reconnectedPtyIdsByTabId: Record<string, string[]> | null = null
+    let recoveredLayoutsByTabId: Record<string, TerminalLayoutSnapshot> | null = null
+    // Why: botmux agent/session tabs use local PTY + ssh/tmux attach. After
+    // restart, reattaching the old daemon sessionId only restores a bare local
+    // shell (startup command was one-shot). Recover attach before panes mount.
+    const botmuxAttachRecovery: Array<{ worktreeId: string; tabs: TerminalTab[] }> = []
     for (const worktreeId of ids) {
       const tabs = tabsByWorktree[worktreeId] ?? []
       const worktree = Object.values(get().worktreesByRepo)
@@ -3676,6 +3683,34 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
               .filter((t): t is TerminalTab => t != null)
           : tabs.slice(0, 1)
       if (tabsToReconnect.length === 0) {
+        continue
+      }
+
+      // Botmux control-plane: never restore daemon session ids for reattach.
+      // Clear tab.ptyId / layout leaf maps and re-queue ssh/tmux attach so
+      // connectPanePty takes FRESH SPAWN with the attach startup line.
+      if (isBotmuxControlPlaneHostId(worktreeId)) {
+        console.debug(
+          `[reconnect-terminals] botmux control-plane skip reattach worktree=${worktreeId} tabs=${tabsToReconnect.length}`
+        )
+        reconnectedTabsByWorktree ??= { ...tabsByWorktree }
+        const nextTabs = reconnectedTabsByWorktree[worktreeId]
+        if (nextTabs) {
+          const clearIds = new Set(tabsToReconnect.map((t) => t.id))
+          reconnectedTabsByWorktree[worktreeId] = nextTabs.map((t) =>
+            clearIds.has(t.id) ? { ...t, ptyId: null } : t
+          )
+        }
+        reconnectedPtyIdsByTabId ??= { ...ptyIdsByTabId }
+        recoveredLayoutsByTabId ??= { ...terminalLayoutsByTabId }
+        for (const tab of tabsToReconnect) {
+          reconnectedPtyIdsByTabId[tab.id] = []
+          const layout = recoveredLayoutsByTabId[tab.id] ?? terminalLayoutsByTabId[tab.id]
+          if (layout?.ptyIdsByLeafId && Object.keys(layout.ptyIdsByLeafId).length > 0) {
+            recoveredLayoutsByTabId[tab.id] = { ...layout, ptyIdsByLeafId: {} }
+          }
+        }
+        botmuxAttachRecovery.push({ worktreeId, tabs: tabsToReconnect })
         continue
       }
 
@@ -3725,6 +3760,100 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
       }
     }
 
+    // Re-queue ssh/tmux attach for botmux control-plane tabs before panes mount.
+    if (botmuxAttachRecovery.length > 0) {
+      // Why: preload exposes this under botmuxBridge, not top-level window.api
+      // (open-botmux-session-in-workspace uses the same nested path).
+      const tmuxAttachSpec = (
+        window as unknown as {
+          api?: {
+            botmuxBridge?: {
+              tmuxAttachSpec?: (args: {
+                sessionId: string
+                hostId?: string
+              }) => Promise<
+                | {
+                    ok: true
+                    shellCommand: string
+                    cliShellCommand?: string
+                  }
+                | { ok: false; reason?: string; message?: string }
+              >
+            }
+            tmuxAttachSpec?: (args: {
+              sessionId: string
+              hostId?: string
+            }) => Promise<
+              | {
+                  ok: true
+                  shellCommand: string
+                  cliShellCommand?: string
+                }
+              | { ok: false; reason?: string; message?: string }
+            >
+          }
+        }
+      ).api?.botmuxBridge?.tmuxAttachSpec ??
+        (
+          window as unknown as {
+            api?: {
+              tmuxAttachSpec?: (args: {
+                sessionId: string
+                hostId?: string
+              }) => Promise<
+                | {
+                    ok: true
+                    shellCommand: string
+                    cliShellCommand?: string
+                  }
+                | { ok: false; reason?: string; message?: string }
+              >
+            }
+          }
+        ).api?.tmuxAttachSpec
+
+      if (typeof tmuxAttachSpec === 'function') {
+        for (const job of botmuxAttachRecovery) {
+          await recoverBotmuxAttachOnReconnect({
+            worktreeId: job.worktreeId,
+            tabs: job.tabs,
+            deps: {
+              queueTabStartupCommand: (tabId, startup) => {
+                get().queueTabStartupCommand(tabId, startup)
+              },
+              tmuxAttachSpec,
+              ensureBridgeEndpoint: ensureBotmuxBridgeEndpointConnected,
+              clearTabPtyBindings: (tabId) => {
+                reconnectedPtyIdsByTabId ??= { ...get().ptyIdsByTabId }
+                reconnectedPtyIdsByTabId[tabId] = []
+                if (reconnectedTabsByWorktree) {
+                  for (const [wtId, list] of Object.entries(reconnectedTabsByWorktree)) {
+                    reconnectedTabsByWorktree[wtId] = list.map((t) =>
+                      t.id === tabId ? { ...t, ptyId: null } : t
+                    )
+                  }
+                }
+                // Clear leaf maps so connectPanePty cannot REATTACH.
+                const layout =
+                  recoveredLayoutsByTabId?.[tabId] ?? get().terminalLayoutsByTabId[tabId]
+                if (layout?.ptyIdsByLeafId && Object.keys(layout.ptyIdsByLeafId).length > 0) {
+                  recoveredLayoutsByTabId ??= { ...get().terminalLayoutsByTabId }
+                  recoveredLayoutsByTabId[tabId] = {
+                    ...layout,
+                    ptyIdsByLeafId: {}
+                  }
+                }
+              }
+            }
+          })
+        }
+      } else {
+        console.warn(
+          '[reconnect-terminals] botmux attach recovery skipped: tmuxAttachSpec unavailable'
+        )
+      }
+    }
+
     // Why: deferred SSH targets (passphrase-protected) haven't connected
     // yet, so their tabs' ptyIds were never restored above. Stash the
     // session IDs in a separate map that survives this cleanup so the
@@ -3759,6 +3888,9 @@ export const createTerminalSlice: StateCreator<AppState, [], [], TerminalSlice> 
     set({
       ...(reconnectedTabsByWorktree ? { tabsByWorktree: reconnectedTabsByWorktree } : {}),
       ...(reconnectedPtyIdsByTabId ? { ptyIdsByTabId: reconnectedPtyIdsByTabId } : {}),
+      ...(recoveredLayoutsByTabId
+        ? { terminalLayoutsByTabId: recoveredLayoutsByTabId }
+        : {}),
       workspaceSessionReady: true,
       pendingReconnectWorktreeIds: [],
       pendingReconnectTabByWorktree: {},

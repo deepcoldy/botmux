@@ -56,7 +56,7 @@ function deferred<T>(): {
 
 describe('hasInstalledAgentSkill', () => {
   it('matches installed skills by summarized name', () => {
-    expect(hasInstalledAgentSkill([skill({ name: 'orca-botmux-cli' })], 'orca-botmux-cli')).toBe(true)
+    expect(hasInstalledAgentSkill([skill({ name: 'botmux-cli' })], 'botmux-cli')).toBe(true)
   })
 
   it('matches installed skills by directory name when frontmatter has a display name', () => {
@@ -64,18 +64,18 @@ describe('hasInstalledAgentSkill', () => {
       hasInstalledAgentSkill(
         [
           skill({
-            name: 'OrcaBotmux CLI',
-            directoryPath: 'C:\\Users\\test\\.agents\\skills\\orca-botmux-cli'
+            name: 'Botmux CLI',
+            directoryPath: 'C:\\Users\\test\\.agents\\skills\\botmux-cli'
           })
         ],
-        'orca-botmux-cli'
+        'botmux-cli'
       )
     ).toBe(true)
   })
 
   it('ignores non-installed discovery entries', () => {
     expect(
-      hasInstalledAgentSkill([skill({ name: 'orca-botmux-cli', installed: false })], 'orca-botmux-cli')
+      hasInstalledAgentSkill([skill({ name: 'botmux-cli', installed: false })], 'botmux-cli')
     ).toBe(false)
   })
 
@@ -84,24 +84,24 @@ describe('hasInstalledAgentSkill', () => {
       hasInstalledAgentSkill(
         [
           skill({
-            name: 'orca-botmux-cli',
+            name: 'botmux-cli',
             sourceKind: 'repo',
             sourceLabel: 'Repo test .agents',
             rootPath: '/repo/.agents/skills',
-            directoryPath: '/repo/.agents/skills/orca-botmux-cli',
-            skillFilePath: '/repo/.agents/skills/orca-botmux-cli/SKILL.md'
+            directoryPath: '/repo/.agents/skills/botmux-cli',
+            skillFilePath: '/repo/.agents/skills/botmux-cli/SKILL.md'
           }),
           skill({
             id: 'skill-2',
-            name: 'orca-botmux-cli',
+            name: 'botmux-cli',
             sourceKind: 'plugin',
             sourceLabel: 'Codex plugin cache',
             rootPath: '/Users/test/.codex/plugins/cache',
-            directoryPath: '/Users/test/.codex/plugins/cache/vendor/orca-botmux-cli',
-            skillFilePath: '/Users/test/.codex/plugins/cache/vendor/orca-botmux-cli/SKILL.md'
+            directoryPath: '/Users/test/.codex/plugins/cache/vendor/botmux-cli',
+            skillFilePath: '/Users/test/.codex/plugins/cache/vendor/botmux-cli/SKILL.md'
           })
         ],
-        'orca-botmux-cli',
+        'botmux-cli',
         { sourceKinds: GLOBAL_AGENT_SKILL_SOURCE_KINDS }
       )
     ).toBe(false)
@@ -109,7 +109,7 @@ describe('hasInstalledAgentSkill', () => {
 
   it('counts home skills when matching global installs', () => {
     expect(
-      hasInstalledAgentSkill([skill({ name: 'orca-botmux-cli' })], 'orca-botmux-cli', {
+      hasInstalledAgentSkill([skill({ name: 'botmux-cli' })], 'botmux-cli', {
         sourceKinds: GLOBAL_AGENT_SKILL_SOURCE_KINDS
       })
     ).toBe(true)
@@ -119,7 +119,7 @@ describe('hasInstalledAgentSkill', () => {
     expect(
       hasInstalledAgentSkillNamed(
         [skill({ name: 'linear-tickets' })],
-        ['orca-botmux-linear', 'linear-tickets']
+        ['botmux-linear', 'linear-tickets']
       )
     ).toBe(true)
   })
@@ -133,7 +133,7 @@ describe('hasInstalledAgentSkill', () => {
             directoryPath: '/Users/test/.agents/skills/linear-tickets'
           })
         ],
-        ['orca-botmux-linear', 'linear-tickets']
+        ['botmux-linear', 'linear-tickets']
       )
     ).toBe(true)
   })
@@ -144,16 +144,16 @@ describe('hasInstalledAgentSkill', () => {
         [
           skill({
             name: 'Linear Tickets',
-            directoryPath: 'C:\\Users\\test\\.agents\\skills\\orca-botmux-linear'
+            directoryPath: 'C:\\Users\\test\\.agents\\skills\\botmux-linear'
           })
         ],
-        ['orca-botmux-linear', 'linear-tickets']
+        ['botmux-linear', 'linear-tickets']
       )
     ).toBe(true)
   })
 
   it('keeps aliases opt-in for unrelated single-name checks', () => {
-    expect(hasInstalledAgentSkill([skill({ name: 'linear-tickets' })], 'orca-botmux-linear')).toBe(false)
+    expect(hasInstalledAgentSkill([skill({ name: 'linear-tickets' })], 'botmux-linear')).toBe(false)
   })
 })
 
@@ -218,7 +218,7 @@ describe('discoverInstalledAgentSkills', () => {
 
     expect(discover).toHaveBeenCalledTimes(2)
 
-    const freshResult = discoveryResult([skill({ name: 'orca-botmux-cli' })])
+    const freshResult = discoveryResult([skill({ name: 'botmux-cli' })])
     secondScan.resolve(freshResult)
     await expect(forcedRefresh).resolves.toBe(freshResult)
   })

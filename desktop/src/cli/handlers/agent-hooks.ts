@@ -22,7 +22,7 @@ type AgentHookCommandResult = {
 }
 
 function getDataPath(): string {
-  return join(getDefaultUserDataPath(), 'orca-botmux-data.json')
+  return join(getDefaultUserDataPath(), 'botmux-data.json')
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

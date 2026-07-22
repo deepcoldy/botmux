@@ -2,7 +2,7 @@ import type { ProjectExecutionRuntimeResolution } from '../../../shared/project-
 import { isWslUncPath } from '../../../shared/wsl-paths'
 import { splitWorktreeIdForFilesystem } from '../../../shared/worktree-id'
 
-export type OrchestrationCliCommand = 'orca_botmux' | 'orca-botmux-ide'
+export type OrchestrationCliCommand = 'botmux' | 'botmux-ide'
 
 export function resolveTerminalOrchestrationCliCommand(args: {
   connectionId: string | null
@@ -11,15 +11,15 @@ export function resolveTerminalOrchestrationCliCommand(args: {
   projectRuntime?: ProjectExecutionRuntimeResolution
 }): OrchestrationCliCommand {
   if (args.connectionId) {
-    return 'orca_botmux'
+    return 'botmux'
   }
   if (args.isWsl !== null && args.isWsl !== undefined) {
-    return args.isWsl ? 'orca-botmux-ide' : 'orca_botmux'
+    return args.isWsl ? 'botmux-ide' : 'botmux'
   }
   if (args.projectRuntime?.status === 'resolved' && args.projectRuntime.runtime.kind === 'wsl') {
-    return 'orca-botmux-ide'
+    return 'botmux-ide'
   }
 
   const worktreePath = splitWorktreeIdForFilesystem(args.worktreeId)?.worktreePath
-  return worktreePath && isWslUncPath(worktreePath) ? 'orca-botmux-ide' : 'orca_botmux'
+  return worktreePath && isWslUncPath(worktreePath) ? 'botmux-ide' : 'botmux'
 }

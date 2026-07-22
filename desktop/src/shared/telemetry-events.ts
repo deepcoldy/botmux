@@ -108,10 +108,10 @@ export const AGENT_KIND_VALUES = [
 export const agentKindSchema = z.enum(AGENT_KIND_VALUES)
 export type AgentKind = z.infer<typeof agentKindSchema>
 
-// Trimmed to a small set of values OrcaBotmux's PTY-typed-command launch architecture
+// Trimmed to a small set of values Botmux's PTY-typed-command launch architecture
 // can emit:
 //   - `binary_not_found` — `provider.spawn` ENOENT (the *shell* binary is
-//     missing). The agent CLI being missing is invisible: OrcaBotmux spawns a
+//     missing). The agent CLI being missing is invisible: Botmux spawns a
 //     healthy shell and types the command, and bash/zsh's "command not found"
 //     surfaces only as terminal output.
 //   - `paste_readiness_timeout` — bracketed-paste readiness wait timed out.
@@ -121,7 +121,7 @@ export type AgentKind = z.infer<typeof agentKindSchema>
 //     unclassifiable shell-spawn errors).
 // Provider-side errors (`auth_expired`, `rate_limited`, `network_timeout`,
 // `provider_*`) happen inside the agent CLI subprocess and are not observable
-// to OrcaBotmux — see telemetry-plan.md §Decision: Defer per-incident error fields.
+// to Botmux — see telemetry-plan.md §Decision: Defer per-incident error fields.
 // Adding a new value is additive-safe; do it when the call site lands, not in
 // anticipation.
 export const errorClassSchema = z.enum(['binary_not_found', 'paste_readiness_timeout', 'unknown'])
@@ -273,8 +273,8 @@ export type OptInVia = z.infer<typeof optInViaSchema>
 // `settings_changed`. If a setting isn't in this list, we do not emit.
 //
 // Keys are camelCase to match the actual field names in `GlobalSettings`.
-// `orca_botmux_channel` is intentionally absent — it is a build-time common
-// property baked in from `ORCA_BUILD_IDENTITY`, not a user-togglable setting.
+// `botmux_channel` is intentionally absent — it is a build-time common
+// property baked in from `BOTMUX_BUILD_IDENTITY`, not a user-togglable setting.
 //
 // Intentionally does NOT include the telemetry opt-in toggle — that is
 // covered by the dedicated `telemetry_opted_in` / `telemetry_opted_out`
@@ -356,7 +356,7 @@ const repoAddedSchema = z
   })
   .strict()
 
-const appStarredOrcaSchema = z
+const appStarredBotmuxSchema = z
   .object({
     source: appStarSourceSchema,
     nth_repo_added: nthRepoAddedSchema
@@ -490,22 +490,22 @@ const nativeChatSkillDiscoverySchema = z
 const telemetryOptedInSchema = z.object({ via: optInViaSchema }).strict()
 const telemetryOptedOutSchema = z.object({ via: optInViaSchema }).strict()
 
-const orcaCliFeatureTipSourceSchema = z.enum(['app_open', 'manual'])
-const orcaCliFeatureTipShownSchema = z
+const botmuxCliFeatureTipSourceSchema = z.enum(['app_open', 'manual'])
+const botmuxCliFeatureTipShownSchema = z
   .object({
-    source: orcaCliFeatureTipSourceSchema,
+    source: botmuxCliFeatureTipSourceSchema,
     nth_repo_added: nthRepoAddedSchema
   })
   .strict()
-const orcaCliFeatureTipSetupClickedSchema = z
+const botmuxCliFeatureTipSetupClickedSchema = z
   .object({
-    source: orcaCliFeatureTipSourceSchema,
+    source: botmuxCliFeatureTipSourceSchema,
     nth_repo_added: nthRepoAddedSchema
   })
   .strict()
-const orcaCliFeatureTipSetupResultSchema = z
+const botmuxCliFeatureTipSetupResultSchema = z
   .object({
-    source: orcaCliFeatureTipSourceSchema,
+    source: botmuxCliFeatureTipSourceSchema,
     result: z.enum(['installed', 'needs_attention', 'dev_preview', 'failed']),
     nth_repo_added: nthRepoAddedSchema
   })
@@ -513,13 +513,13 @@ const orcaCliFeatureTipSetupResultSchema = z
 
 const cmdJPaletteFeatureTipShownSchema = z
   .object({
-    source: orcaCliFeatureTipSourceSchema,
+    source: botmuxCliFeatureTipSourceSchema,
     nth_repo_added: nthRepoAddedSchema
   })
   .strict()
 const cmdJPaletteFeatureTipAcknowledgedSchema = z
   .object({
-    source: orcaCliFeatureTipSourceSchema,
+    source: botmuxCliFeatureTipSourceSchema,
     nth_repo_added: nthRepoAddedSchema
   })
   .strict()
@@ -1123,7 +1123,7 @@ const activationChecklistItemCompletedSchema = z
 
 // Why: see docs/agent-on-path-detection.md. Disambiguates `on_path: false`
 // rows on dashboard 1562016 — distinguishes shell-hydration failure (where
-// `on_path` is misleading because OrcaBotmux's view of PATH is incomplete) from
+// `on_path` is misleading because Botmux's view of PATH is incomplete) from
 // genuinely-not-on-PATH (where the field is reporting accurately). Closed
 // enum kept in lockstep with `ShellHydrationFailureReason` via a compile-time
 // guard below.
@@ -1420,7 +1420,7 @@ const editorExternalChangeConflictActionSchema = z
 // which cannot be unmixed after the fact.
 export const eventSchemas = {
   app_opened: appOpenedSchema,
-  app_starred_orca: appStarredOrcaSchema,
+  app_starred_botmux: appStarredBotmuxSchema,
   star_nag_outcome: starNagOutcomeEventSchema,
   feature_interaction_usage_bucket_reached: featureInteractionUsageBucketReachedSchema,
 
@@ -1456,9 +1456,9 @@ export const eventSchemas = {
   telemetry_opted_in: telemetryOptedInSchema,
   telemetry_opted_out: telemetryOptedOutSchema,
 
-  orca_botmux_cli_feature_tip_shown: orcaCliFeatureTipShownSchema,
-  orca_botmux_cli_feature_tip_setup_clicked: orcaCliFeatureTipSetupClickedSchema,
-  orca_botmux_cli_feature_tip_setup_result: orcaCliFeatureTipSetupResultSchema,
+  botmux_cli_feature_tip_shown: botmuxCliFeatureTipShownSchema,
+  botmux_cli_feature_tip_setup_clicked: botmuxCliFeatureTipSetupClickedSchema,
+  botmux_cli_feature_tip_setup_result: botmuxCliFeatureTipSetupResultSchema,
   cmd_j_palette_feature_tip_shown: cmdJPaletteFeatureTipShownSchema,
   cmd_j_palette_feature_tip_acknowledged: cmdJPaletteFeatureTipAcknowledgedSchema,
 
@@ -1560,7 +1560,7 @@ export const COHORT_EXTENDED: readonly EventName[] = Array.from(COHORT_EXTENDED_
 // injection set against silent schema drift.
 type _CohortExtendedRoster =
   | 'app_opened'
-  | 'app_starred_orca'
+  | 'app_starred_botmux'
   | 'star_nag_outcome'
   | 'feature_interaction_usage_bucket_reached'
   | 'repo_added'
@@ -1577,9 +1577,9 @@ type _CohortExtendedRoster =
   | 'agent_started'
   | 'agent_prompt_sent'
   | 'agent_error'
-  | 'orca_botmux_cli_feature_tip_shown'
-  | 'orca_botmux_cli_feature_tip_setup_clicked'
-  | 'orca_botmux_cli_feature_tip_setup_result'
+  | 'botmux_cli_feature_tip_shown'
+  | 'botmux_cli_feature_tip_setup_clicked'
+  | 'botmux_cli_feature_tip_setup_result'
   | 'cmd_j_palette_feature_tip_shown'
   | 'cmd_j_palette_feature_tip_acknowledged'
 // Why: `z.object({}).strict()` infers a string index signature, which would
@@ -1682,7 +1682,7 @@ export const commonPropsSchema = z
     // scheme is cheap to preserve).
     install_id: z.string().min(1).max(64),
     session_id: z.string().min(1).max(64),
-    orca_botmux_channel: z.enum(['stable', 'rc'])
+    botmux_channel: z.enum(['stable', 'rc'])
   })
   .strict()
 export type CommonProps = z.infer<typeof commonPropsSchema>

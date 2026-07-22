@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   ensureTerminalVisible,
   getActiveWorktreeId,
@@ -58,14 +58,14 @@ async function mainSnapshotContains(
 
 test.describe('Automation hidden terminal first mount', () => {
   test('background-mounted hidden worktree replays startup output on the first visible mount', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'background first-mount repro needs the seeded secondary worktree')
@@ -75,7 +75,7 @@ test.describe('Automation hidden terminal first mount', () => {
 
     const runId = Date.now()
     const marker = `AUTO_FIRST_MOUNT_${runId}`
-    const hiddenTabId = await orcaBotmuxPage.evaluate(
+    const hiddenTabId = await botmuxPage.evaluate(
       ({ worktreeId, marker, eventName }) => {
         const store = window.__store
         if (!store) {
@@ -112,23 +112,23 @@ test.describe('Automation hidden terminal first mount', () => {
       }
     )
 
-    const hiddenPtyId = await waitForHiddenTabPtyId(orcaBotmuxPage, hiddenTabId)
+    const hiddenPtyId = await waitForHiddenTabPtyId(botmuxPage, hiddenTabId)
     await expect
-      .poll(() => mainSnapshotContains(orcaBotmuxPage, hiddenPtyId, marker), {
+      .poll(() => mainSnapshotContains(botmuxPage, hiddenPtyId, marker), {
         timeout: 20_000,
         message: 'Hidden automation terminal did not buffer startup output while off-screen'
       })
       .toBe(true)
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'Hidden worktree did not become active for first-mount verification'
       })
       .toBe(secondWorktreeId)
 
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       const store = window.__store
       if (!store) {
         throw new Error('Store unavailable')
@@ -138,11 +138,11 @@ test.describe('Automation hidden terminal first mount', () => {
       state.setActiveTabType('terminal')
     }, hiddenTabId)
 
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     await expect
-      .poll(async () => (await getTerminalContent(orcaBotmuxPage)).includes(marker), {
+      .poll(async () => (await getTerminalContent(botmuxPage)).includes(marker), {
         timeout: 10_000,
         message: 'First visible mount did not replay the hidden automation terminal output'
       })

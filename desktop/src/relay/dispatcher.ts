@@ -115,7 +115,7 @@ export class RelayDispatcher {
     this.notifyClientDetached(this.primaryClient.id)
   }
 
-  // Why: synced remote workspaces can have more than one OrcaBotmux client attached
+  // Why: synced remote workspaces can have more than one Botmux client attached
   // to the same relay. Frame sequence numbers and JSON-RPC request ids are per
   // SSH channel, so each socket client needs independent protocol state.
   attachClient(write: RelayClientWrite, sinkOptions?: RelayClientSinkOptions): number {
@@ -305,11 +305,11 @@ export class RelayDispatcher {
       (client) => !client.closed && client.id !== options?.excludeClientId
     )
     // Why: detached relays keep the synthetic primary client object around even
-    // though the owning OrcaBotmux is attached through a Unix-socket client. Prefer a
-    // real attached client so remote `orca_botmux` shims do not forward to dead stdout.
+    // though the owning Botmux is attached through a Unix-socket client. Prefer a
+    // real attached client so remote `botmux` shims do not forward to dead stdout.
     const target = candidates.find((client) => client !== this.primaryClient) ?? candidates[0]
     if (!target) {
-      return Promise.reject(new Error('No owning OrcaBotmux client is connected to the relay'))
+      return Promise.reject(new Error('No owning Botmux client is connected to the relay'))
     }
     return this.requestClient(target.id, method, params, options)
   }
@@ -555,7 +555,7 @@ export class RelayDispatcher {
       this.flushDrainWaiters(client)
       // Why: a write throw means this frame (possibly pty.data or pty.exit) was
       // lost with no resend — the framing carries seq/ack but no retransmit
-      // buffer. Detach so the owning OrcaBotmux's reconnect + PTY-reattach path runs
+      // buffer. Detach so the owning Botmux's reconnect + PTY-reattach path runs
       // promptly (regenerating dropped pty.data from the replay buffer and pane
       // death via reattach-not-found), instead of silently dropping frames until
       // the ~20s keepalive timeout notices. The primary client stays in the map

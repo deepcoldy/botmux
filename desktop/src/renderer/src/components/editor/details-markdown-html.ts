@@ -55,7 +55,7 @@ export function parseDetailsAttributes(rawAttributes: string): Record<string, un
   // Why: validation accepts normal HTML whitespace around `=`, so parsing
   // must accept it too or an editable toggle loses its heading variant.
   const variantMatch = rawAttributes.match(
-    /\sdata-orca-botmux-toggle\s*=\s*(?:"(heading-[1-5])"|'(heading-[1-5])'|(heading-[1-5]))(?:\s|$)/i
+    /\sdata-botmux-toggle\s*=\s*(?:"(heading-[1-5])"|'(heading-[1-5])'|(heading-[1-5]))(?:\s|$)/i
   )
   return {
     open: /\sopen(?:\s|=|$)/i.test(rawAttributes),
@@ -74,11 +74,11 @@ export function detailsBodyHtmlToMarkdown(body: string): string {
 }
 
 export function renderDetailsAttributes(attrs: Record<string, unknown> | undefined): string {
-  const attributes = ['class="orca-botmux-details"']
+  const attributes = ['class="botmux-details"']
 
   const variant = parseToggleHeadingVariant(attrs?.variant)
   if (variant) {
-    attributes.push(`data-orca-botmux-toggle="${variant}"`)
+    attributes.push(`data-botmux-toggle="${variant}"`)
   }
 
   if (attrs?.open === true) {
@@ -184,9 +184,9 @@ function hasOnlySupportedDetailsAttributes(rawAttributes: string): boolean {
   return (
     rawAttributes
       .replace(/\s+open(?:\s*=\s*(?:""|"open"|''|'open'|open))?(?=\s|$)/giu, '')
-      .replace(/\s+class\s*=\s*(?:"orca-botmux-details"|'orca-botmux-details'|orca-botmux-details)(?=\s|$)/giu, '')
+      .replace(/\s+class\s*=\s*(?:"botmux-details"|'botmux-details'|botmux-details)(?=\s|$)/giu, '')
       .replace(
-        /\s+data-orca-botmux-toggle\s*=\s*(?:"heading-[1-5]"|'heading-[1-5]'|heading-[1-5])(?=\s|$)/giu,
+        /\s+data-botmux-toggle\s*=\s*(?:"heading-[1-5]"|'heading-[1-5]'|heading-[1-5])(?=\s|$)/giu,
         ''
       )
       .trim() === ''

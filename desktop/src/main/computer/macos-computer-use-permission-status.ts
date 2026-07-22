@@ -35,13 +35,13 @@ async function getComputerUsePermissionStatusAsync(): Promise<ComputerUsePermiss
 
   const helperAppPath = resolveMacOSComputerUseAppPath()
   if (!helperAppPath) {
-    return createUnavailablePermissionStatus('OrcaBotmux Computer Use.app was not found', null)
+    return createUnavailablePermissionStatus('Botmux Computer Use.app was not found', null)
   }
 
   const executablePath = resolveMacOSComputerUseExecutablePath()
   if (!executablePath) {
     return createUnavailablePermissionStatus(
-      `${helperAppPath}/Contents/MacOS/orca-botmux-computer-use-macos was not found`,
+      `${helperAppPath}/Contents/MacOS/botmux-computer-use-macos was not found`,
       helperAppPath
     )
   }
@@ -77,7 +77,7 @@ function createUnavailablePermissionStatus(
 async function readPermissionStatusFromHelperApp(
   helperAppPath: string
 ): Promise<Partial<Record<ComputerUsePermissionId, ComputerUsePermissionStatus>>> {
-  const tempDir = await mkdtemp(join(tmpdir(), 'orca-botmux-computer-use-permissions-'))
+  const tempDir = await mkdtemp(join(tmpdir(), 'botmux-computer-use-permissions-'))
   const statusPath = join(tempDir, 'status.json')
   try {
     // Why: TCC status must be checked through the helper app identity. Directly

@@ -1,6 +1,6 @@
 import { rmSync, writeFileSync } from 'node:fs'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 import { getLargeDiffRenderLimit } from '../../src/shared/large-diff-render-limit'
 import {
@@ -9,8 +9,8 @@ import {
   createIsolatedStagedLocaleDiffRepo
 } from './large-diff-repro-fixtures'
 
-async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promise<string> {
-  const repoId = await orcaBotmuxPage.evaluate(async (pathToRepo: string) => {
+async function addAndActivateRepo(botmuxPage: Page, repoPath: string): Promise<string> {
+  const repoId = await botmuxPage.evaluate(async (pathToRepo: string) => {
     const store = window.__store
     if (!store) {
       throw new Error('window.__store is not available')
@@ -29,7 +29,7 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
   await expect
     .poll(
       () =>
-        orcaBotmuxPage.evaluate(async (targetRepoId: string) => {
+        botmuxPage.evaluate(async (targetRepoId: string) => {
           const store = window.__store
           if (!store) {
             return 0
@@ -44,7 +44,7 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
     )
     .toBeGreaterThan(0)
 
-  const worktreeId = await orcaBotmuxPage.evaluate(
+  const worktreeId = await botmuxPage.evaluate(
     ({ targetRepoId, pathToRepo }) => {
       const store = window.__store
       if (!store) {
@@ -70,13 +70,13 @@ async function addAndActivateRepo(orcaBotmuxPage: Page, repoPath: string): Promi
 test.describe('Large diff freeze repro', () => {
   test.describe.configure({ mode: 'serial' })
   test.use({ seedTestRepo: false })
-  test('opening a large single-file diff keeps the renderer responsive', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test('opening a large single-file diff keeps the renderer responsive', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
     const fixture = createIsolatedLargeDiffRepo()
-    const lineCount = Number(process.env.ORCA_LARGE_DIFF_REPRO_LINES ?? '60000')
+    const lineCount = Number(process.env.BOTMUX_LARGE_DIFF_REPRO_LINES ?? '60000')
     if (!Number.isFinite(lineCount) || lineCount < 0) {
       throw new Error(
-        `Invalid ORCA_LARGE_DIFF_REPRO_LINES: ${process.env.ORCA_LARGE_DIFF_REPRO_LINES}`
+        `Invalid BOTMUX_LARGE_DIFF_REPRO_LINES: ${process.env.BOTMUX_LARGE_DIFF_REPRO_LINES}`
       )
     }
     const modifiedContent = buildLargeTypeScriptFile(lineCount)
@@ -86,9 +86,9 @@ test.describe('Large diff freeze repro', () => {
     }).limited
 
     try {
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
       writeFileSync(fixture.absolutePath, modifiedContent)
-      const measurement = await orcaBotmuxPage.evaluate(
+      const measurement = await botmuxPage.evaluate(
         async ({ wId, absolutePath, relativePath, expectFallback }) => {
           const store = window.__store
           if (!store) {
@@ -161,14 +161,14 @@ test.describe('Large diff freeze repro', () => {
   })
 
   test('opening stale unstaged combined diffs after staging keeps the renderer responsive', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const fixture = createIsolatedStagedLocaleDiffRepo()
 
     try {
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
-      const measurement = await orcaBotmuxPage.evaluate(
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
+      const measurement = await botmuxPage.evaluate(
         async ({ wId, repoPath, expectedPaths }) => {
           const store = window.__store
           if (!store) {

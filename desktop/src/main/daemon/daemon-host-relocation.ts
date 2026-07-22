@@ -18,7 +18,7 @@ import { parseDaemonPidFile, startTimeMatches } from './daemon-health'
  * directory into userData so it survives Windows auto-updates.
  *
  * Why: the daemon is forked as plain Node via ELECTRON_RUN_AS_NODE, so its
- * image is the install-dir OrcaBotmux.exe and its loaded modules (node-pty native,
+ * image is the install-dir Botmux.exe and its loaded modules (node-pty native,
  * ConPTY runtime) map from the install dir. On update, electron-builder's NSIS
  * installer deletes the old install and force-closes every process whose image
  * lives under it — killing the daemon and every live terminal it owns. Copying
@@ -26,7 +26,7 @@ import { parseDaemonPidFile, startTimeMatches } from './daemon-health'
  * from that copy takes its image + loaded modules out of the installer's reach.
  *
  * The copy keeps the ELECTRON binary run as node (not stock node.exe): a copy
- * of OrcaBotmux.exe (renamed to a distinct image name) is byte-identical, so
+ * of Botmux.exe (renamed to a distinct image name) is byte-identical, so
  * run-as-node behavior — no console flashing, asar-correct — matches the in-dir
  * fork exactly. The win-unpacked layout is mirrored verbatim so
  * require('node-pty') and node-pty's native loader resolve the relocated tree
@@ -52,16 +52,16 @@ const MARKER_NAME = '.materialized.json'
 // name is shared verbatim with the NSIS uninstall cleanup
 // (config/nsis/daemon-host-uninstall.nsh), which removes
 // %LOCALAPPDATA%\<LOCAL_HOST_ROOT_NAME>\daemon-host — keep the two in sync.
-const LOCAL_HOST_ROOT_NAME = 'orca_botmux'
+const LOCAL_HOST_ROOT_NAME = 'botmux'
 
-// The relocated host exe is a copy of OrcaBotmux.exe renamed to a distinct image
-// name. The NSIS updater's name-based kill (`taskkill /IM OrcaBotmux.exe`) matches by
+// The relocated host exe is a copy of Botmux.exe renamed to a distinct image
+// name. The NSIS updater's name-based kill (`taskkill /IM Botmux.exe`) matches by
 // image name, so a distinct name spares the daemon from that branch, while the
 // userData path (outside $INSTDIR) spares it from the path-based branch.
-const DAEMON_HOST_EXE_NAME = 'orca-botmux-terminal-daemon.exe'
+const DAEMON_HOST_EXE_NAME = 'botmux-terminal-daemon.exe'
 
 // V8 snapshots + ICU data the Electron bootstrap reads even under
-// ELECTRON_RUN_AS_NODE; siblings of OrcaBotmux.exe in win-unpacked.
+// ELECTRON_RUN_AS_NODE; siblings of Botmux.exe in win-unpacked.
 const RUNTIME_DATA_FILES = ['icudtl.dat', 'snapshot_blob.bin', 'v8_context_snapshot.bin']
 
 type CopyOp = {
@@ -162,7 +162,7 @@ export function buildDaemonHostManifest(sources: DaemonHostSources): CopyOp[] {
 
   // Electron host binary + V8/ICU data blobs at the dest root. The exe is
   // renamed to a distinct image name so the NSIS updater's name-based
-  // `taskkill /IM OrcaBotmux.exe` can't match it; the blobs beside it are read by the
+  // `taskkill /IM Botmux.exe` can't match it; the blobs beside it are read by the
   // Electron bootstrap by fixed name. Top-level DLLs are deliberately NOT copied
   // — they are all GPU/graphics/media (swiftshader, vulkan, d3d, dxcompiler,
   // ffmpeg) that a windowless run-as-node host never loads (verified empirically

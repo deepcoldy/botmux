@@ -42,7 +42,7 @@ import { translate } from '@/i18n/i18n'
 import { recordTerminalUserInputForLeaf } from './terminal-input-activity'
 import { copyTerminalHandleForPane } from './terminal-handle-copy'
 
-const CLOSE_ALL_CONTEXT_MENUS_EVENT = 'orca-botmux-close-all-context-menus'
+const CLOSE_ALL_CONTEXT_MENUS_EVENT = 'botmux-close-all-context-menus'
 
 export function recordContextMenuCreatedTerminalPaneSplit(
   createdPane: unknown,
@@ -170,7 +170,7 @@ export function useTerminalPaneContextMenu({
     if (!pane) {
       return
     }
-    // Why: orchestration targets use ORCA_PANE_KEY, which survives renderer
+    // Why: orchestration targets use BOTMUX_PANE_KEY, which survives renderer
     // remounts; the numeric PaneManager id is only a local runtime handle.
     await window.api.ui.writeClipboardText(makePaneKey(tabId, pane.leafId))
     toast.success(

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from '../dispatcher'
 import type { RpcRequest } from '../core'
-import type { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../../botmux-runtime'
 import {
   CLIPBOARD_TEXT_MEASURE_YIELD_CODE_UNITS,
   CLIPBOARD_TEXT_WRITE_MAX_BYTES,
@@ -26,7 +26,7 @@ describe('browser RPC methods', () => {
       browserProfileImportFromBrowser: vi.fn().mockResolvedValue({ ok: false, reason: 'empty' }),
       browserTabCreate: vi.fn().mockResolvedValue({ browserPageId: 'page-1' }),
       browserTabSwitch: vi.fn().mockResolvedValue({ browserPageId: 'page-1' })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_CORE_METHODS })
 
     await dispatcher.dispatch(makeRequest('browser.snapshot', { worktree: 'id:wt-1' }))
@@ -93,7 +93,7 @@ describe('browser RPC methods', () => {
           options.emit({ type: 'end', subscriptionId: 'browser-screencast:page-1:test' })
         }
       )
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_SCREENCAST_METHODS })
     const replies: string[] = []
 
@@ -139,7 +139,7 @@ describe('browser RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       cleanupSubscription: vi.fn()
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_SCREENCAST_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -162,7 +162,7 @@ describe('browser RPC methods', () => {
       browserSetViewport: vi.fn().mockResolvedValue({ ok: true }),
       browserMouseWheel: vi.fn().mockResolvedValue({ ok: true }),
       browserStorageLocalSet: vi.fn().mockResolvedValue({ ok: true })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_EXTRA_METHODS })
 
     await dispatcher.dispatch(
@@ -191,7 +191,7 @@ describe('browser RPC methods', () => {
       makeRequest('browser.storage.local.set', {
         worktree: 'id:wt-1',
         page: 'page-1',
-        key: 'orca_botmux',
+        key: 'botmux',
         value: 'enabled'
       })
     )
@@ -215,7 +215,7 @@ describe('browser RPC methods', () => {
     expect(runtime.browserStorageLocalSet).toHaveBeenCalledWith({
       worktree: 'id:wt-1',
       page: 'page-1',
-      key: 'orca_botmux',
+      key: 'botmux',
       value: 'enabled'
     })
   })
@@ -224,7 +224,7 @@ describe('browser RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       browserCheck: vi.fn().mockResolvedValue({ ok: true })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_CORE_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -247,7 +247,7 @@ describe('browser RPC methods', () => {
     const runtime = {
       getRuntimeId: () => 'test-runtime',
       browserClipboardWrite: vi.fn().mockResolvedValue({ ok: true })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_EXTRA_METHODS })
 
     const response = await dispatcher.dispatch(
@@ -284,7 +284,7 @@ describe('browser RPC methods', () => {
       const runtime = {
         getRuntimeId: () => 'test-runtime',
         browserType: vi.fn().mockResolvedValue({ typed: true })
-      } as unknown as OrcaRuntimeService
+      } as unknown as BotmuxRuntimeService
       const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_CORE_METHODS })
 
       const responsePromise = dispatcher.dispatch(makeRequest('browser.type', { input: text }))
@@ -312,7 +312,7 @@ describe('browser RPC methods', () => {
       browserFill: vi.fn().mockResolvedValue({ filled: '@e1' }),
       browserType: vi.fn().mockResolvedValue({ typed: true }),
       browserKeyboardInsertText: vi.fn().mockResolvedValue({ inserted: true })
-    } as unknown as OrcaRuntimeService
+    } as unknown as BotmuxRuntimeService
     const dispatcher = new RpcDispatcher({ runtime, methods: BROWSER_CORE_METHODS })
     const text = [secret, 'x'.repeat(CLIPBOARD_TEXT_WRITE_MAX_BYTES + 1)].join('')
 

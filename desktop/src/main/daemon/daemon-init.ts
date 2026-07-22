@@ -125,10 +125,10 @@ function getDaemonEntryPath(): string {
 
 // Why: the detached daemon writes lifecycle events to a rotated file so field
 // failures are diagnosable from a bundle. Honor the same hard privacy switch
-// the local trace sink honors (ORCA_DIAGNOSTICS_DISABLED); absence of the arg
+// the local trace sink honors (BOTMUX_DIAGNOSTICS_DISABLED); absence of the arg
 // is fully supported, so gating it off is safe and adoption-neutral.
 function daemonLogArgs(): string[] {
-  const disabled = (process.env.ORCA_DIAGNOSTICS_DISABLED ?? '').trim().toLowerCase()
+  const disabled = (process.env.BOTMUX_DIAGNOSTICS_DISABLED ?? '').trim().toLowerCase()
   if (disabled === '1' || disabled === 'true') {
     return []
   }
@@ -401,7 +401,7 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
           // Why: a protocol-healthy daemon can outlive the app bundle that
           // launched it. In dev this happens after deleting/rebuilding a
           // worktree; in packaged apps it happens when the stable
-          // /Applications/OrcaBotmux.app path is replaced during update.
+          // /Applications/Botmux.app path is replaced during update.
           const identity = await getDaemonLaunchIdentity(
             runtimeDir,
             socketPath,
@@ -520,7 +520,7 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
           // because stderr was thrown away). The pipe is destroyed on readiness.
           detached: true,
           stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-          // Why: run the relocated OrcaBotmux.exe copy instead of the install-dir one.
+          // Why: run the relocated Botmux.exe copy instead of the install-dir one.
           // It is byte-identical, so run-as-node behavior is unchanged; only the
           // image path moves out of the updater's kill zone.
           ...(relocatedHost ? { execPath: relocatedHost.execPath } : {}),
@@ -533,7 +533,7 @@ function createOutOfProcessLauncher(runtimeDir: string): DaemonLauncher {
             ELECTRON_RUN_AS_NODE: '1',
             // Why: the detached daemon is plain Node and cannot call Electron's
             // app.getPath(), but shell-ready rcfiles must live outside swept tmp.
-            ORCA_USER_DATA_PATH: userDataPath
+            BOTMUX_USER_DATA_PATH: userDataPath
           }
         }
       )
@@ -711,7 +711,7 @@ export async function initDaemonPtyProvider(signal?: AbortSignal): Promise<void>
   // that deterministically outlasts the first-window timeout. Real triggers
   // (stale-daemon cleanup, legacy probes on a busy disk) are not controllable
   // from a test.
-  const e2eInitDelayMs = Number(process.env.ORCA_E2E_DAEMON_INIT_DELAY_MS)
+  const e2eInitDelayMs = Number(process.env.BOTMUX_E2E_DAEMON_INIT_DELAY_MS)
   if (Number.isFinite(e2eInitDelayMs) && e2eInitDelayMs > 0) {
     await new Promise((resolve) => setTimeout(resolve, e2eInitDelayMs))
   }
@@ -1031,7 +1031,7 @@ async function runRestartDaemon(): Promise<RestartDaemonResult> {
 // Why: disconnect from the daemon without killing it. The daemon runs as a
 // separate process and survives app quit — sessions stay alive for warm
 // reattach on next launch. Leave history sessions marked "unclean" here so a
-// later daemon crash while OrcaBotmux is closed is still recoverable on next launch.
+// later daemon crash while Botmux is closed is still recoverable on next launch.
 export async function disconnectDaemon(): Promise<void> {
   await adapter?.disconnectOnly()
   adapter = null

@@ -139,7 +139,7 @@ async function flushPromises(): Promise<void> {
 function seedRemoteWorkspace(environmentId = 'env-1'): void {
   useAppStore.setState({
     settings: {
-      ...getDefaultSettings('/tmp/orca-botmux-workspaces'),
+      ...getDefaultSettings('/tmp/botmux-workspaces'),
       activeRuntimeEnvironmentId: environmentId
     },
     repos: [
@@ -238,7 +238,7 @@ describe('WorkspacePortScanner', () => {
     await act(async () => {
       useAppStore.setState({
         settings: {
-          ...getDefaultSettings('/tmp/orca-botmux-workspaces'),
+          ...getDefaultSettings('/tmp/botmux-workspaces'),
           activeRuntimeEnvironmentId: 'env-1'
         }
       })
@@ -402,7 +402,7 @@ describe('WorkspacePortScanner', () => {
     await act(async () => {
       useAppStore.setState({
         settings: {
-          ...getDefaultSettings('/tmp/orca-botmux-workspaces'),
+          ...getDefaultSettings('/tmp/botmux-workspaces'),
           activeRuntimeEnvironmentId: 'env-2'
         }
       })

@@ -151,37 +151,37 @@ describe('buildDispatchPreamble', () => {
     expect(result).toContain('refactor the auth module')
   })
 
-  it('uses orca_botmux CLI by default when devMode is not set', () => {
+  it('uses botmux CLI by default when devMode is not set', () => {
     const result = buildDispatchPreamble(baseParams())
-    expect(result).toContain('orca_botmux orchestration send')
-    expect(result).toContain('orca_botmux orchestration check')
-    expect(result).toContain('orca_botmux orchestration ask')
+    expect(result).toContain('botmux orchestration send')
+    expect(result).toContain('botmux orchestration check')
+    expect(result).toContain('botmux orchestration ask')
   })
 
-  it('uses orca-botmux-desktop-dev CLI when devMode is true', () => {
-    const result = buildDispatchPreamble(baseParams({ devMode: true, cliCommand: 'orca-botmux-ide' }))
-    expect(result).toContain('orca-botmux-desktop-dev orchestration send')
-    expect(result).toContain('orca-botmux-desktop-dev orchestration check')
-    expect(result).toContain('orca-botmux-desktop-dev orchestration ask')
-    const fragments = result.split('orca-botmux-desktop-dev')
+  it('uses botmux-desktop-dev CLI when devMode is true', () => {
+    const result = buildDispatchPreamble(baseParams({ devMode: true, cliCommand: 'botmux-ide' }))
+    expect(result).toContain('botmux-desktop-dev orchestration send')
+    expect(result).toContain('botmux-desktop-dev orchestration check')
+    expect(result).toContain('botmux-desktop-dev orchestration ask')
+    const fragments = result.split('botmux-desktop-dev')
     for (const fragment of fragments) {
-      expect(fragment).not.toMatch(/orca_botmux orchestration/)
+      expect(fragment).not.toMatch(/botmux orchestration/)
     }
   })
 
-  it('uses orca_botmux CLI when devMode is false', () => {
+  it('uses botmux CLI when devMode is false', () => {
     const result = buildDispatchPreamble(baseParams({ devMode: false }))
-    expect(result).toContain('orca_botmux orchestration send')
-    expect(result).toContain('orca_botmux orchestration check')
+    expect(result).toContain('botmux orchestration send')
+    expect(result).toContain('botmux orchestration check')
   })
 
-  it('uses the exact orca-botmux-ide command for packaged WSL workers', () => {
-    const result = buildDispatchPreamble(baseParams({ cliCommand: 'orca-botmux-ide' }))
+  it('uses the exact botmux-ide command for packaged WSL workers', () => {
+    const result = buildDispatchPreamble(baseParams({ cliCommand: 'botmux-ide' }))
 
-    expect(result).toContain('orca-botmux-ide orchestration send')
-    expect(result).toContain('orca-botmux-ide orchestration check')
-    expect(result).toContain('orca-botmux-ide orchestration ask')
-    expect(result).not.toMatch(/(^|\s)orca_botmux orchestration/m)
+    expect(result).toContain('botmux-ide orchestration send')
+    expect(result).toContain('botmux-ide orchestration check')
+    expect(result).toContain('botmux-ide orchestration ask')
+    expect(result).not.toMatch(/(^|\s)botmux orchestration/m)
   })
 
   it('appends a BASE DRIFT section when baseDrift.behind > 0', () => {

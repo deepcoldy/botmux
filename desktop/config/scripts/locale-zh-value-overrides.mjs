@@ -133,17 +133,17 @@ export const ZH_VALUE_OVERRIDES = {
     '编辑器打开时运行一次托管评审详情生成。',
   'Show local Markdown review notes controls in rich editor mode.':
     '在富文本编辑器模式下显示本地 Markdown 评审笔记控件。',
-  'OrcaBotmux IDE': 'OrcaBotmux IDE',
-  'OrcaBotmux first': 'OrcaBotmux 优先',
-  'OrcaBotmux Mobile': 'OrcaBotmux Mobile',
-  'OrcaBotmux logo': 'OrcaBotmux 标志',
-  'Enjoying OrcaBotmux?': '喜欢 OrcaBotmux 吗？',
-  'Get to know OrcaBotmux': '了解 OrcaBotmux',
-  'Expand OrcaBotmux': '展开 OrcaBotmux',
-  'Support OrcaBotmux': '支持 OrcaBotmux',
-  'Restarting OrcaBotmux…': '正在重启 OrcaBotmux…',
-  'OrcaBotmux Attribution': 'OrcaBotmux 归因',
-  'Show OrcaBotmux Mobile Button': '显示 OrcaBotmux Mobile 按钮',
+  'Botmux IDE': 'Botmux IDE',
+  'Botmux first': 'Botmux 优先',
+  'Botmux Mobile': 'Botmux Mobile',
+  'Botmux logo': 'Botmux 标志',
+  'Enjoying Botmux?': '喜欢 Botmux 吗？',
+  'Get to know Botmux': '了解 Botmux',
+  'Expand Botmux': '展开 Botmux',
+  'Support Botmux': '支持 Botmux',
+  'Restarting Botmux…': '正在重启 Botmux…',
+  'Botmux Attribution': 'Botmux 归因',
+  'Show Botmux Mobile Button': '显示 Botmux Mobile 按钮',
   'Codex Accounts': 'Codex 账户',
   'Codex Account': 'Codex 账户',
   'Active Codex Account': '活跃 Codex 账户',
@@ -181,8 +181,8 @@ export const ZH_VALUE_OVERRIDES = {
   'Leave empty to use system proxy settings and inherited proxy environment variables.':
     '留空以使用系统代理设置和继承的代理环境变量。',
   'Proxy Command': '代理命令',
-  "Give agents direct access to OrcaBotmux's browser so they can test pages, capture screenshots, and act on what they see.":
-    '让代理直接访问 OrcaBotmux 的浏览器，以便测试页面、捕获屏幕截图并根据所见内容执行操作。',
+  "Give agents direct access to Botmux's browser so they can test pages, capture screenshots, and act on what they see.":
+    '让代理直接访问 Botmux 的浏览器，以便测试页面、捕获屏幕截图并根据所见内容执行操作。',
   'X finishes, send it the review task.”': 'X 完成后，把评审任务发给它。”',
   'Branch naming, base refs, attribution, and Git AI Author.':
     '分支命名、基础引用、归因和 Git AI Author。',
@@ -218,7 +218,7 @@ export const ZH_VALUE_OVERRIDES = {
     '显示提示词缓存到期倒计时的计时器（Claude 代理）。',
   'Claude caches your conversation to reduce costs. When idle too long the cache expires and the next message resends full context at higher cost. This shows a countdown so you know when to resume.':
     'Claude 会缓存对话以降低成本。空闲过久后缓存会过期，下一条消息将以更高成本重新发送完整上下文。此倒计时可帮助您了解何时继续。',
-  'from OrcaBotmux. It is still on your disk.': '来自 OrcaBotmux。它仍保留在您的磁盘上。',
+  'from Botmux. It is still on your disk.': '来自 Botmux。它仍保留在您的磁盘上。',
   'Pull request reopened': '拉取请求已重新打开',
   'Reopen PR': '重新打开 PR',
   'Reopened MR !{{value0}}': '已重新打开 MR !{{value0}}',

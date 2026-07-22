@@ -1,4 +1,4 @@
-// Why: the host bridges the full OrcaBotmux CLI over the relay (#7716), so mutation
+// Why: the host bridges the full Botmux CLI over the relay (#7716), so mutation
 // commands (worktree create, orchestration dispatch, Linear writes, ...) can
 // legitimately outlive the relay's 30 s default request timeout. Long-poll
 // commands carry their waiter budget in --timeout-ms; extend past it so the

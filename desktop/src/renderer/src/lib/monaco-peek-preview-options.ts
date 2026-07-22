@@ -17,12 +17,12 @@ type ReferenceWidgetInstance = {
 
 type ReferenceWidgetConstructor = {
   prototype: ReferenceWidgetInstance & {
-    __orcaPeekPreviewOptionsInstalled?: true
+    __botmuxPeekPreviewOptionsInstalled?: true
   }
 }
 
 function applyPeekReferencesPreviewOptions(editor: PeekPreviewEditor | undefined): void {
-  // Why: Monaco embedded editors inherit OrcaBotmux's full-editor options first.
+  // Why: Monaco embedded editors inherit Botmux's full-editor options first.
   // Peek previews are transient readers, so keep scroll/wrap widgets out of them.
   editor?.updateOptions(PEEK_REFERENCES_PREVIEW_OPTIONS)
 }
@@ -31,7 +31,7 @@ export function installMonacoPeekReferencesPreviewOptions(
   referenceWidget: ReferenceWidgetConstructor = MonacoReferenceWidget as unknown as ReferenceWidgetConstructor
 ): void {
   const prototype = referenceWidget.prototype
-  if (prototype.__orcaPeekPreviewOptionsInstalled) {
+  if (prototype.__botmuxPeekPreviewOptionsInstalled) {
     return
   }
 
@@ -63,5 +63,5 @@ export function installMonacoPeekReferencesPreviewOptions(
     }
   }
 
-  prototype.__orcaPeekPreviewOptionsInstalled = true
+  prototype.__botmuxPeekPreviewOptionsInstalled = true
 }

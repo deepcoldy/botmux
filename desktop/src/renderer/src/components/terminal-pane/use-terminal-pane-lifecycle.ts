@@ -1156,7 +1156,7 @@ export function useTerminalPaneLifecycle({
               runtimeEnvironmentId: linkDeps.getRuntimeEnvironmentIdForPane?.(pane.id) ?? null,
               requestOpenLinksInAppPreference
             })
-            // Why: Cmd/Ctrl+clicking a link activates OrcaBotmux handling (open file,
+            // Why: Cmd/Ctrl+clicking a link activates Botmux handling (open file,
             // new browser tab, system browser) which can steal focus from the
             // terminal before the click's mouseup reaches ownerDocument. Without
             // that mouseup, xterm's SelectionService leaves its drag-select
@@ -1625,7 +1625,7 @@ export function useTerminalPaneLifecycle({
     // Why: when the user links a GitHub issue during worktree creation and has
     // enabled that repo's issue automation, spawn a separate split pane to run
     // the agent command. This runs independently from setup: the issue command
-    // is a per-user prompt/template rather than repo bootstrap, so OrcaBotmux should
+    // is a per-user prompt/template rather than repo bootstrap, so Botmux should
     // not guess at ordering requirements that vary by user workflow.
     if (issueCommandSplit) {
       let targetPane = manager.getActivePane() ?? manager.getPanes()[0] ?? null

@@ -29,7 +29,7 @@ const hiddenWorktrees = [
   {
     id: 'hidden-4',
     displayName: 'ssh-worktree',
-    path: '/srv/repos/orca_botmux/ssh-worktree',
+    path: '/srv/repos/botmux/ssh-worktree',
     branch: 'refs/heads/ssh-worktree'
   }
 ]
@@ -40,7 +40,7 @@ function renderLine(
   return renderToStaticMarkup(
     <TooltipProvider>
       <ImportedWorktreesVisibilityLine
-        repoDisplayName="orca_botmux"
+        repoDisplayName="botmux"
         hiddenWorktrees={hiddenWorktrees}
         placement="repo-group"
         pending={false}
@@ -58,13 +58,13 @@ describe('ImportedWorktreesVisibilityLine', () => {
     const markup = renderLine()
 
     expect(markup).toContain('Hiding 4 discovered worktrees')
-    expect(markup).toContain('Expand hidden worktrees for orca_botmux')
+    expect(markup).toContain('Expand hidden worktrees for botmux')
     expect(markup).toContain(
-      'Keep 4 discovered worktrees hidden for orca_botmux; recover from the project menu'
+      'Keep 4 discovered worktrees hidden for botmux; recover from the project menu'
     )
     expect(markup).toContain('aria-expanded="false"')
     expect(markup).not.toContain('Imported 4 existing worktrees')
-    expect(markup).not.toContain('OrcaBotmux found 4 worktrees')
+    expect(markup).not.toContain('Botmux found 4 worktrees')
     expect(markup).not.toContain('repo options')
     expect(markup).not.toContain('Reveal')
     expect(markup).not.toContain('Always show')
@@ -76,7 +76,7 @@ describe('ImportedWorktreesVisibilityLine', () => {
   it('scopes pinned fallback copy to the repo name without a dismiss action', () => {
     const markup = renderLine({ placement: 'pinned-fallback', onKeepHidden: undefined })
 
-    expect(markup).toContain('Hiding 4 discovered worktrees in orca_botmux')
+    expect(markup).toContain('Hiding 4 discovered worktrees in botmux')
     expect(markup).not.toContain('Review')
     expect(markup).not.toContain('Keep hidden - recover from the project menu')
   })
@@ -86,12 +86,12 @@ describe('ImportedWorktreesVisibilityLine', () => {
       {
         id: 'windows-hidden',
         displayName: 'FeatureX',
-        path: 'C:\\Repos\\OrcaBotmux\\FeatureX'
+        path: 'C:\\Repos\\Botmux\\FeatureX'
       }
     ])
 
-    expect(groups).toMatchObject([{ path: 'C:/Repos/OrcaBotmux' }])
-    expect(groups[0]?.path).not.toBe('C:\\Repos\\OrcaBotmux')
+    expect(groups).toMatchObject([{ path: 'C:/Repos/Botmux' }])
+    expect(groups[0]?.path).not.toBe('C:\\Repos\\Botmux')
   })
 
   it('keeps Windows drive roots as parent path labels', () => {

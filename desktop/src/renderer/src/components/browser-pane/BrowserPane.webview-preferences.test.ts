@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ORCA_BROWSER_GUEST_WEB_PREFERENCES_ATTRIBUTE } from '../../../../shared/browser-guest-web-preferences'
+import { BOTMUX_BROWSER_GUEST_WEB_PREFERENCES_ATTRIBUTE } from '../../../../shared/browser-guest-web-preferences'
 
 const registryMocks = vi.hoisted(() => ({
   destroyPersistentWebview: vi.fn(),
@@ -42,7 +42,7 @@ describe('BrowserPane webview preferences', () => {
       browserTabId: 'browser-page-1',
       container,
       inputLocked: false,
-      webviewPartition: 'persist:orca-botmux-browser-session-profile-1',
+      webviewPartition: 'persist:botmux-browser-session-profile-1',
       resolveContainer: () => container
     })
 
@@ -50,10 +50,10 @@ describe('BrowserPane webview preferences', () => {
     expect(ensuredWebview?.created).toBe(true)
     expect(ensuredWebview?.container).toBe(container)
     expect(ensuredWebview?.webview.getAttribute('partition')).toBe(
-      'persist:orca-botmux-browser-session-profile-1'
+      'persist:botmux-browser-session-profile-1'
     )
     expect(ensuredWebview?.webview.getAttribute('webpreferences')).toBe(
-      ORCA_BROWSER_GUEST_WEB_PREFERENCES_ATTRIBUTE
+      BOTMUX_BROWSER_GUEST_WEB_PREFERENCES_ATTRIBUTE
     )
     expect(registryMocks.registerPersistentWebview).toHaveBeenCalledWith(
       'browser-page-1',
@@ -65,7 +65,7 @@ describe('BrowserPane webview preferences', () => {
   it('remounts the webview in a refreshed container when the stored resolved partition changes', () => {
     const staleContainer = createContainer('stale')
     const staleWebview = document.createElement('webview') as Electron.WebviewTag
-    staleWebview.setAttribute('partition', 'persist:orca-botmux-browser')
+    staleWebview.setAttribute('partition', 'persist:botmux-browser')
     staleContainer.appendChild(staleWebview)
     registryMocks.webviewRegistry.set('browser-page-1', staleWebview)
 
@@ -87,7 +87,7 @@ describe('BrowserPane webview preferences', () => {
       browserTabId: 'browser-page-1',
       container: staleContainer,
       inputLocked: true,
-      webviewPartition: 'persist:orca-botmux-browser-session-profile-1',
+      webviewPartition: 'persist:botmux-browser-session-profile-1',
       resolveContainer
     })
 
@@ -98,7 +98,7 @@ describe('BrowserPane webview preferences', () => {
     expect(ensuredWebview?.container).toBe(refreshedContainer)
     expect(ensuredWebview?.webview).not.toBe(staleWebview)
     expect(ensuredWebview?.webview.getAttribute('partition')).toBe(
-      'persist:orca-botmux-browser-session-profile-1'
+      'persist:botmux-browser-session-profile-1'
     )
     expect(ensuredWebview?.webview.style.pointerEvents).toBe('none')
     expect(refreshedContainer.lastElementChild).toBe(ensuredWebview?.webview as unknown as Element)

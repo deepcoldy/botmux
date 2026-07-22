@@ -27,7 +27,7 @@ export function normalizeRightSidebarRoute(
     tab === 'ports' ||
     // Why: botmux control-plane panel is a first-class activity tab; omitting it
     // made normalize fall back to explorer so clicking the radio icon never stuck.
-    tab === 'orca_botmux'
+    tab === 'botmux'
   ) {
     return {
       rightSidebarTab: tab,

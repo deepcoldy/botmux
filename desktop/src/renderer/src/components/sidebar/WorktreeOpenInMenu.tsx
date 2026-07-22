@@ -66,7 +66,7 @@ function showOpenFailureToast(reason: ShellOpenLocalPathFailureReason): void {
       {
         description: translate(
           'auto.components.sidebar.WorktreeOpenInMenu.0bed8727db',
-          'It may have been moved or deleted. Refresh workspaces or remove it from OrcaBotmux.'
+          'It may have been moved or deleted. Refresh workspaces or remove it from Botmux.'
         )
       }
     )

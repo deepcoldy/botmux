@@ -1,5 +1,5 @@
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   splitActiveTerminalPane,
   waitForActiveTerminalManager,
@@ -252,36 +252,36 @@ async function createTerminalInNewSplitGroup(page: Page): Promise<SplitGroupTerm
 }
 
 test.describe('Activity Agent Pane Isolation', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await enableActivityAgentsView(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    const hasPaneManager = await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await enableActivityAgentsView(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    const hasPaneManager = await waitForActiveTerminalManager(botmuxPage, 30_000)
       .then(() => true)
       .catch(() => false)
     test.skip(
       !hasPaneManager,
       'Electron automation in this environment never mounts the live TerminalPane manager, so Activity pane isolation would only fail on harness setup.'
     )
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
   })
 
   test('selecting agent rows isolates the matching split pane by stable leaf id', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
-    const [first, second] = await seedActivityThreadsForSplitPanes(orcaBotmuxPage, snapshot)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
+    const [first, second] = await seedActivityThreadsForSplitPanes(botmuxPage, snapshot)
 
-    await agentsSidebarButton(orcaBotmuxPage).click()
-    await expect(orcaBotmuxPage.getByText(first.prompt)).toBeVisible()
-    await expect(orcaBotmuxPage.getByText(second.prompt)).toBeVisible()
+    await agentsSidebarButton(botmuxPage).click()
+    await expect(botmuxPage.getByText(first.prompt)).toBeVisible()
+    await expect(botmuxPage.getByText(second.prompt)).toBeVisible()
 
-    await orcaBotmuxPage.getByRole('button').filter({ hasText: first.prompt }).first().click()
+    await botmuxPage.getByRole('button').filter({ hasText: first.prompt }).first().click()
     await expect
-      .poll(async () => readActivityPaneVisibility(orcaBotmuxPage), {
+      .poll(async () => readActivityPaneVisibility(botmuxPage), {
         timeout: 10_000,
         message: 'Activity did not isolate the first selected split pane'
       })
@@ -290,9 +290,9 @@ test.describe('Activity Agent Pane Isolation', () => {
         visibleLeafIds: [first.leafId]
       })
 
-    await orcaBotmuxPage.getByRole('button').filter({ hasText: second.prompt }).first().click()
+    await botmuxPage.getByRole('button').filter({ hasText: second.prompt }).first().click()
     await expect
-      .poll(async () => readActivityPaneVisibility(orcaBotmuxPage), {
+      .poll(async () => readActivityPaneVisibility(botmuxPage), {
         timeout: 10_000,
         message: 'Activity did not switch isolation to the second selected split pane'
       })
@@ -302,17 +302,17 @@ test.describe('Activity Agent Pane Isolation', () => {
       })
   })
 
-  test('acknowledged stable pane keys clear the Agents unread badge', async ({ orcaBotmuxPage }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
+  test('acknowledged stable pane keys clear the Agents unread badge', async ({ botmuxPage }) => {
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
     // Why: useAutoAckViewedAgent (App.tsx) auto-acknowledges the agent on the
     // store's *active* visible terminal leaf the instant its status lands, which
     // clears the unread badge before we can assert it (flaky on focused xvfb CI
     // windows). Seed on the non-active split pane — auto-ack only ever targets the
     // active leaf — so the badge stays unread until the explicit acknowledgeAgents()
     // call under test.
-    const activeLeafId = await orcaBotmuxPage.evaluate(
+    const activeLeafId = await botmuxPage.evaluate(
       (tabId) => window.__store?.getState().terminalLayoutsByTabId[tabId]?.activeLeafId ?? null,
       snapshot.tabId
     )
@@ -328,7 +328,7 @@ test.describe('Activity Agent Pane Isolation', () => {
       prompt: `ACTIVITY_ACK_STABLE_PANE_${now}`
     }
 
-    await orcaBotmuxPage.evaluate(() => {
+    await botmuxPage.evaluate(() => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -340,7 +340,7 @@ test.describe('Activity Agent Pane Isolation', () => {
     })
 
     await seedActivityThread(
-      orcaBotmuxPage,
+      botmuxPage,
       thread,
       'Codex acknowledged pane',
       'blocked',
@@ -348,9 +348,9 @@ test.describe('Activity Agent Pane Isolation', () => {
       now - 5_000
     )
 
-    await expect(agentsSidebarButton(orcaBotmuxPage)).toHaveAccessibleName(/^Agents\s+1$/)
+    await expect(agentsSidebarButton(botmuxPage)).toHaveAccessibleName(/^Agents\s+1$/)
 
-    await orcaBotmuxPage.evaluate((paneKey) => {
+    await botmuxPage.evaluate((paneKey) => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available')
@@ -358,21 +358,21 @@ test.describe('Activity Agent Pane Isolation', () => {
       store.getState().acknowledgeAgents([paneKey])
     }, thread.paneKey)
 
-    await expect(agentsSidebarButton(orcaBotmuxPage)).toHaveAccessibleName(/^Agents$/)
-    await expect(orcaBotmuxPage.getByRole('button', { name: /^Agents\s+1$/ })).toHaveCount(0)
+    await expect(agentsSidebarButton(botmuxPage)).toHaveAccessibleName(/^Agents$/)
+    await expect(botmuxPage.getByRole('button', { name: /^Agents\s+1$/ })).toHaveCount(0)
   })
 
-  test('workspace card agent rows focus the matching terminal split pane', async ({ orcaBotmuxPage }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
-    const [first, second] = await seedActivityThreadsForSplitPanes(orcaBotmuxPage, snapshot)
+  test('workspace card agent rows focus the matching terminal split pane', async ({ botmuxPage }) => {
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
+    const [first, second] = await seedActivityThreadsForSplitPanes(botmuxPage, snapshot)
 
-    await enableInlineAgentCards(orcaBotmuxPage)
+    await enableInlineAgentCards(botmuxPage)
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, first.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, first.prompt)
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not focus the first split pane'
       })
@@ -381,9 +381,9 @@ test.describe('Activity Agent Pane Isolation', () => {
         activeLeafId: first.leafId
       })
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, second.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, second.prompt)
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not focus the second split pane'
       })
@@ -394,30 +394,30 @@ test.describe('Activity Agent Pane Isolation', () => {
   })
 
   test('workspace card agent rows reveal terminal logs from a non-terminal surface', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const snapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
-    const [first] = await seedActivityThreadsForSplitPanes(orcaBotmuxPage, snapshot)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const snapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
+    const [first] = await seedActivityThreadsForSplitPanes(botmuxPage, snapshot)
 
-    await enableInlineAgentCards(orcaBotmuxPage)
-    await expect(terminalPaneForLeaf(orcaBotmuxPage, first.leafId)).toBeVisible()
+    await enableInlineAgentCards(botmuxPage)
+    await expect(terminalPaneForLeaf(botmuxPage, first.leafId)).toBeVisible()
     // Why: this reproduces the user-visible failure mode: the agent row is
     // visible in the sidebar while the main workspace surface is not Terminal.
-    await expect(await clickFileInExplorer(orcaBotmuxPage, ['README.md'])).toBe('README.md')
+    await expect(await clickFileInExplorer(botmuxPage, ['README.md'])).toBe('README.md')
     await expect
-      .poll(() => readActivePaneSelection(orcaBotmuxPage))
+      .poll(() => readActivePaneSelection(botmuxPage))
       .toMatchObject({
         activeTabType: 'editor',
         activeTabId: snapshot.tabId
       })
-    await expect(terminalPaneForLeaf(orcaBotmuxPage, first.leafId)).toBeHidden()
+    await expect(terminalPaneForLeaf(botmuxPage, first.leafId)).toBeHidden()
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, first.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, first.prompt)
 
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not reveal the terminal log surface'
       })
@@ -426,21 +426,21 @@ test.describe('Activity Agent Pane Isolation', () => {
         activeTabId: snapshot.tabId,
         activeLeafId: first.leafId
       })
-    await expect(terminalPaneForLeaf(orcaBotmuxPage, first.leafId)).toBeVisible()
+    await expect(terminalPaneForLeaf(botmuxPage, first.leafId)).toBeVisible()
   })
 
   test('workspace card agent rows focus the matching split-group terminal pane', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-    await waitForPaneCount(orcaBotmuxPage, 2)
-    const firstGroupSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 2)
-    const [first, second] = await seedActivityThreadsForSplitPanes(orcaBotmuxPage, firstGroupSnapshot)
+    await splitActiveTerminalPane(botmuxPage, 'vertical')
+    await waitForPaneCount(botmuxPage, 2)
+    const firstGroupSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 2)
+    const [first, second] = await seedActivityThreadsForSplitPanes(botmuxPage, firstGroupSnapshot)
 
-    const splitGroup = await createTerminalInNewSplitGroup(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPaneCount(orcaBotmuxPage, 1, 30_000)
-    const secondGroupSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    const splitGroup = await createTerminalInNewSplitGroup(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPaneCount(botmuxPage, 1, 30_000)
+    const secondGroupSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const secondGroupPane = secondGroupSnapshot.panes[0]
     if (!secondGroupPane) {
       throw new Error('Split-group terminal did not mount a pane')
@@ -452,7 +452,7 @@ test.describe('Activity Agent Pane Isolation', () => {
       prompt: `ACTIVITY_UUID_SPLIT_GROUP_${now}`
     }
     await seedActivityThread(
-      orcaBotmuxPage,
+      botmuxPage,
       splitGroupThread,
       'Codex split group pane',
       'blocked',
@@ -460,11 +460,11 @@ test.describe('Activity Agent Pane Isolation', () => {
       now
     )
 
-    await enableInlineAgentCards(orcaBotmuxPage)
+    await enableInlineAgentCards(botmuxPage)
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, splitGroupThread.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, splitGroupThread.prompt)
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not focus the split-group terminal pane'
       })
@@ -474,9 +474,9 @@ test.describe('Activity Agent Pane Isolation', () => {
         activeLeafId: splitGroupThread.leafId
       })
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, first.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, first.prompt)
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not return to the first split group'
       })
@@ -486,9 +486,9 @@ test.describe('Activity Agent Pane Isolation', () => {
         activeLeafId: first.leafId
       })
 
-    await clickWorkspaceCardAgentRow(orcaBotmuxPage, second.prompt)
+    await clickWorkspaceCardAgentRow(botmuxPage, second.prompt)
     await expect
-      .poll(async () => readActivePaneSelection(orcaBotmuxPage), {
+      .poll(async () => readActivePaneSelection(botmuxPage), {
         timeout: 10_000,
         message: 'Workspace-card row did not focus the sibling pane after group switch'
       })

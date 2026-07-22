@@ -43,15 +43,15 @@ const SSH_FORK_PATH = '/tmp/ssh-fork-checkout'
 // origin -> personal fork, upstream -> parent (the classic fork checkout).
 const REMOTE_URLS_BY_REPO: Record<string, Record<string, string>> = {
   [FORK_PATH]: {
-    origin: 'https://github.com/fsdwen/orca_botmux.git',
-    upstream: 'https://github.com/stablyai/orca_botmux.git'
+    origin: 'https://github.com/fsdwen/botmux.git',
+    upstream: 'https://github.com/stablyai/botmux.git'
   },
   [NON_FORK_PATH]: {
-    origin: 'https://github.com/stablyai/orca_botmux.git'
+    origin: 'https://github.com/stablyai/botmux.git'
   },
   [SSH_FORK_PATH]: {
-    origin: 'git@github.com:fsdwen/orca_botmux.git',
-    upstream: 'git@github.com:stablyai/orca_botmux.git'
+    origin: 'git@github.com:fsdwen/botmux.git',
+    upstream: 'git@github.com:stablyai/botmux.git'
   }
 }
 
@@ -80,7 +80,7 @@ describe('issue #7331: fork PR owner/repo resolution', () => {
 
     // PRs live on the parent, so PR lookups must target it (matches
     // getIssueOwnerRepo).
-    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'orca_botmux' })
+    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'botmux' })
   })
 
   it('getOwnerRepo and getIssueOwnerRepo agree on a fork checkout', async () => {
@@ -93,7 +93,7 @@ describe('issue #7331: fork PR owner/repo resolution', () => {
   it('getOwnerRepo falls back to origin when there is no upstream remote', async () => {
     const prRepo = await getOwnerRepo(NON_FORK_PATH)
 
-    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'orca_botmux' })
+    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'botmux' })
   })
 
   it('caches the missing-upstream probe so repeat lookups skip the git spawn', async () => {
@@ -111,7 +111,7 @@ describe('issue #7331: fork PR owner/repo resolution', () => {
   it('resolves the upstream parent for SSH-style remote URLs', async () => {
     const prRepo = await getOwnerRepo(SSH_FORK_PATH)
 
-    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'orca_botmux' })
+    expect(prRepo).toEqual({ owner: 'stablyai', repo: 'botmux' })
   })
 
   it('getOwnerRepoForRemote(origin) still resolves the fork itself', async () => {
@@ -119,7 +119,7 @@ describe('issue #7331: fork PR owner/repo resolution', () => {
     // resolvePrWorkItemSource) depend on an origin-only primitive.
     const origin = await getOwnerRepoForRemote(FORK_PATH, 'origin')
 
-    expect(origin).toEqual({ owner: 'fsdwen', repo: 'orca_botmux' })
+    expect(origin).toEqual({ owner: 'fsdwen', repo: 'botmux' })
   })
 
   it('getRepoUpstream still resolves the fork parent offline (regression)', async () => {
@@ -128,7 +128,7 @@ describe('issue #7331: fork PR owner/repo resolution', () => {
     // fast-path would be skipped.
     const upstream = await getRepoUpstream(FORK_PATH)
 
-    expect(upstream).toEqual({ owner: 'stablyai', repo: 'orca_botmux' })
+    expect(upstream).toEqual({ owner: 'stablyai', repo: 'botmux' })
     expect(ghExecFileAsyncMock).not.toHaveBeenCalled()
   })
 })

@@ -99,7 +99,7 @@ export async function runMainPressureScenario<
   pressureOutputChars,
   testInfo,
   testRepoPath,
-  orcaBotmuxPage
+  botmuxPage
 }: {
   annotationSuffix: string
   backgroundPaneCount: number
@@ -111,58 +111,58 @@ export async function runMainPressureScenario<
   pressureOutputChars: number
   testInfo: TestInfo
   testRepoPath: string
-  orcaBotmuxPage: Page
+  botmuxPage: Page
 }): Promise<void> {
-  await deps.waitForSessionReady(orcaBotmuxPage)
-  await deps.waitForActiveWorktree(orcaBotmuxPage)
-  const panes = await deps.ensureActiveWorktreePaneLoad(orcaBotmuxPage, backgroundPaneCount + 1)
+  await deps.waitForSessionReady(botmuxPage)
+  await deps.waitForActiveWorktree(botmuxPage)
+  const panes = await deps.ensureActiveWorktreePaneLoad(botmuxPage, backgroundPaneCount + 1)
   const [typingPane, ...loadPanes] = panes
-  await deps.focusPane(orcaBotmuxPage, typingPane.paneKey)
+  await deps.focusPane(botmuxPage, typingPane.paneKey)
 
   const runId = randomUUID()
   const scrollRunId = randomUUID()
-  const typingScriptPath = path.join(testRepoPath, `.orca-botmux-opencode-pressure-typing-${runId}.mjs`)
-  const pressureScriptPath = path.join(testRepoPath, `.orca-botmux-opencode-pressure-load-${runId}.mjs`)
-  await seedActiveTerminalScrollback(orcaBotmuxPage, typingPane.ptyId, scrollRunId)
+  const typingScriptPath = path.join(testRepoPath, `.botmux-opencode-pressure-typing-${runId}.mjs`)
+  const pressureScriptPath = path.join(testRepoPath, `.botmux-opencode-pressure-load-${runId}.mjs`)
+  await seedActiveTerminalScrollback(botmuxPage, typingPane.ptyId, scrollRunId)
   deps.writeInteractivePromptScript(typingScriptPath, runId)
   writePressureOutputScript(pressureScriptPath, runId, 'tui')
-  await deps.resetTerminalPtyOutputDebug(orcaBotmuxPage)
+  await deps.resetTerminalPtyOutputDebug(botmuxPage)
   await deps.holdTerminalAckGate(
-    orcaBotmuxPage,
+    botmuxPage,
     loadPanes.map((pane) => pane.ptyId)
   )
   try {
     await startPressureCommands({
       loadPanes,
-      orcaBotmuxPage,
+      botmuxPage,
       pressureOutputChars,
       pressureScriptPath
     })
-    const pressureBeforeTyping = await deps.waitForMainPtyPressureBacklog(orcaBotmuxPage)
+    const pressureBeforeTyping = await deps.waitForMainPtyPressureBacklog(botmuxPage)
     await measureAndAnnotateScroll({
       annotationSuffix,
       deps,
       maxScrollLatencyMs,
       maxTimerDriftMs,
-      orcaBotmuxPage,
+      botmuxPage,
       panes,
       testInfo
     })
     const measurement = await deps.measureTypingDuringLoad(
-      orcaBotmuxPage,
+      botmuxPage,
       typingScriptPath,
       typingPane.ptyId,
       runId
     )
-    const mainPressure = await deps.readMainPtyPressureDebug(orcaBotmuxPage)
-    const ackGate = await deps.readTerminalAckGateDebug(orcaBotmuxPage)
-    const scheduler = await deps.readTerminalOutputSchedulerDebug(orcaBotmuxPage)
+    const mainPressure = await deps.readMainPtyPressureDebug(botmuxPage)
+    const ackGate = await deps.readTerminalAckGateDebug(botmuxPage)
+    const scheduler = await deps.readTerminalOutputSchedulerDebug(botmuxPage)
     deps.annotateTypingMeasurement(
       testInfo,
       `opencode-main-pressure-active-typing${annotationSuffix}`,
       panes.length,
       measurement,
-      await deps.readTerminalPtyOutputDebug(orcaBotmuxPage),
+      await deps.readTerminalPtyOutputDebug(botmuxPage),
       scheduler,
       mainPressure,
       ackGate
@@ -178,10 +178,10 @@ export async function runMainPressureScenario<
       scheduler
     })
   } finally {
-    await deps.releaseTerminalAckGate(orcaBotmuxPage)
-    await sendToTerminal(orcaBotmuxPage, typingPane.ptyId, '\x03').catch(() => undefined)
+    await deps.releaseTerminalAckGate(botmuxPage)
+    await sendToTerminal(botmuxPage, typingPane.ptyId, '\x03').catch(() => undefined)
     await Promise.all(
-      loadPanes.map((pane) => sendToTerminal(orcaBotmuxPage, pane.ptyId, '\x03').catch(() => undefined))
+      loadPanes.map((pane) => sendToTerminal(botmuxPage, pane.ptyId, '\x03').catch(() => undefined))
     )
     rmSync(typingScriptPath, { force: true })
     rmSync(pressureScriptPath, { force: true })
@@ -190,19 +190,19 @@ export async function runMainPressureScenario<
 
 async function startPressureCommands({
   loadPanes,
-  orcaBotmuxPage,
+  botmuxPage,
   pressureOutputChars,
   pressureScriptPath
 }: {
   loadPanes: MainPressurePane[]
-  orcaBotmuxPage: Page
+  botmuxPage: Page
   pressureOutputChars: number
   pressureScriptPath: string
 }): Promise<void> {
   await Promise.all(
     loadPanes.map((pane, paneIndex) =>
       sendToTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         pane.ptyId,
         `node ${JSON.stringify(pressureScriptPath)} ${paneIndex} ${pressureOutputChars}\r`
       )
@@ -221,7 +221,7 @@ async function measureAndAnnotateScroll<
   deps,
   maxScrollLatencyMs,
   maxTimerDriftMs,
-  orcaBotmuxPage,
+  botmuxPage,
   panes,
   testInfo
 }: {
@@ -229,13 +229,13 @@ async function measureAndAnnotateScroll<
   deps: MainPressureDeps<TMeasurement, TDebug, TScheduler, TMainPressure, TAckGate>
   maxScrollLatencyMs: number
   maxTimerDriftMs: number
-  orcaBotmuxPage: Page
+  botmuxPage: Page
   panes: MainPressurePane[]
   testInfo: TestInfo
 }): Promise<void> {
-  const scrollMeasurement = await measureActiveTerminalWheelScroll(orcaBotmuxPage)
-  const mainPressureAfterScroll = await deps.readMainPtyPressureDebug(orcaBotmuxPage)
-  const ackGateAfterScroll = await deps.readTerminalAckGateDebug(orcaBotmuxPage)
+  const scrollMeasurement = await measureActiveTerminalWheelScroll(botmuxPage)
+  const mainPressureAfterScroll = await deps.readMainPtyPressureDebug(botmuxPage)
+  const ackGateAfterScroll = await deps.readTerminalAckGateDebug(botmuxPage)
   annotateScrollMeasurement(
     testInfo,
     `opencode-main-pressure-active-scroll${annotationSuffix}`,
@@ -249,7 +249,7 @@ async function measureAndAnnotateScroll<
     expect(responsivePath.latencyMs).toBeLessThan(maxScrollLatencyMs)
   }
   expect(scrollMeasurement.maxTimerDriftMs).toBeLessThan(maxTimerDriftMs)
-  await scrollActiveTerminalToBottom(orcaBotmuxPage)
+  await scrollActiveTerminalToBottom(botmuxPage)
 }
 
 function expectMainPressureAndTyping<TMeasurement extends MainPressureMeasurement>({

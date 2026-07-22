@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process'
 
 const repoRoot = resolve(import.meta.dirname, '..', '..')
 const cliPath =
-  process.env.ORCA_COMPUTER_SMOKE_CLI_PATH ?? resolve(repoRoot, 'out', 'cli', 'index.js')
+  process.env.BOTMUX_COMPUTER_SMOKE_CLI_PATH ?? resolve(repoRoot, 'out', 'cli', 'index.js')
 const args = new Set(process.argv.slice(2))
 const requestedApps = valueFlag('--apps')
 const includeScreenshot = args.has('--screenshot')
@@ -16,7 +16,7 @@ const requireTarget = args.has('--require-target')
 const session = valueFlag('--session') ?? `computer-smoke-${process.pid}`
 const preferredApps = (
   requestedApps ??
-  process.env.ORCA_COMPUTER_SMOKE_APPS ??
+  process.env.BOTMUX_COMPUTER_SMOKE_APPS ??
   'Finder,TextEdit,Text Editor,gedit,Notepad,Calculator,Microsoft Edge,Google Chrome,Safari,Slack,Spotify'
 )
   .split(',')
@@ -147,8 +147,8 @@ function runCli(cliArgs, options = {}) {
     encoding: 'utf8',
     env: {
       ...process.env,
-      ORCA_USER_DATA_PATH:
-        process.env.ORCA_COMPUTER_SMOKE_USER_DATA_PATH ?? defaultDevUserDataPath()
+      BOTMUX_USER_DATA_PATH:
+        process.env.BOTMUX_COMPUTER_SMOKE_USER_DATA_PATH ?? defaultDevUserDataPath()
     }
   })
   if (child.status !== 0) {
@@ -170,12 +170,12 @@ function runCli(cliArgs, options = {}) {
 
 function defaultDevUserDataPath() {
   if (process.platform === 'darwin') {
-    return resolve(homedir(), 'Library', 'Application Support', 'orca-botmux-desktop-dev')
+    return resolve(homedir(), 'Library', 'Application Support', 'botmux-desktop-dev')
   }
   if (process.platform === 'win32') {
-    return resolve(process.env.APPDATA ?? resolve(homedir(), 'AppData', 'Roaming'), 'orca-botmux-desktop-dev')
+    return resolve(process.env.APPDATA ?? resolve(homedir(), 'AppData', 'Roaming'), 'botmux-desktop-dev')
   }
-  return resolve(process.env.XDG_CONFIG_HOME ?? resolve(homedir(), '.config'), 'orca-botmux-desktop-dev')
+  return resolve(process.env.XDG_CONFIG_HOME ?? resolve(homedir(), '.config'), 'botmux-desktop-dev')
 }
 
 function unwrapResult(value) {

@@ -37,7 +37,7 @@ describe('createSetupRunnerScript', () => {
     const fs = await import('node:fs')
     const originalPlatform = process.platform
 
-    execFileSyncMock.mockReturnValue('C:\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.cmd')
+    execFileSyncMock.mockReturnValue('C:\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.cmd')
     Object.defineProperty(process, 'platform', {
       configurable: true,
       value: 'win32'
@@ -52,15 +52,15 @@ describe('createSetupRunnerScript', () => {
       )
 
       expect(result).toEqual({
-        runnerScriptPath: 'C:\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.cmd',
+        runnerScriptPath: 'C:\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.cmd',
         envVars: expect.objectContaining({
-          ORCA_ROOT_PATH: '/test/repo',
-          ORCA_WORKTREE_PATH: 'C:\\repo\\feature\\',
-          ORCA_WORKSPACE_NAME: 'feature'
+          BOTMUX_ROOT_PATH: '/test/repo',
+          BOTMUX_WORKTREE_PATH: 'C:\\repo\\feature\\',
+          BOTMUX_WORKSPACE_NAME: 'feature'
         })
       })
       expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
-        'C:\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.cmd',
+        'C:\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.cmd',
         [
           '@echo off',
           'setlocal EnableExtensions',
@@ -80,10 +80,10 @@ describe('createSetupRunnerScript', () => {
     }
   })
 
-  it('derives ORCA_WORKSPACE_NAME from a POSIX worktree path', async () => {
+  it('derives BOTMUX_WORKSPACE_NAME from a POSIX worktree path', async () => {
     const originalPlatform = process.platform
 
-    execFileSyncMock.mockReturnValue('/test/repo/.git/worktrees/feature/orca_botmux/setup-runner.sh')
+    execFileSyncMock.mockReturnValue('/test/repo/.git/worktrees/feature/botmux/setup-runner.sh')
     Object.defineProperty(process, 'platform', {
       configurable: true,
       value: 'linux'
@@ -95,8 +95,8 @@ describe('createSetupRunnerScript', () => {
 
       expect(result.envVars).toEqual(
         expect.objectContaining({
-          ORCA_WORKTREE_PATH: '/test/repo-feature',
-          ORCA_WORKSPACE_NAME: 'repo-feature'
+          BOTMUX_WORKTREE_PATH: '/test/repo-feature',
+          BOTMUX_WORKSPACE_NAME: 'repo-feature'
         })
       )
     } finally {
@@ -111,7 +111,7 @@ describe('createSetupRunnerScript', () => {
     const fs = await import('node:fs')
     const originalPlatform = process.platform
 
-    execFileSyncMock.mockReturnValue('/home/jin/.git/worktrees/feature/orca_botmux/setup-runner.sh')
+    execFileSyncMock.mockReturnValue('/home/jin/.git/worktrees/feature/botmux/setup-runner.sh')
     Object.defineProperty(process, 'platform', {
       configurable: true,
       value: 'win32'
@@ -122,7 +122,7 @@ describe('createSetupRunnerScript', () => {
       const result = createSetupRunnerScript(
         {
           ...makeRepo(),
-          path: 'C:\\Users\\jinwo\\git\\orca_botmux'
+          path: 'C:\\Users\\jinwo\\git\\botmux'
         },
         '\\\\wsl.localhost\\Ubuntu\\home\\jin\\feature',
         'pnpm install'
@@ -130,22 +130,22 @@ describe('createSetupRunnerScript', () => {
 
       expect(result).toEqual({
         runnerScriptPath:
-          '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+          '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         envVars: expect.objectContaining({
-          ORCA_ROOT_PATH: '/mnt/c/Users/jinwo/git/orca_botmux',
-          ORCA_WORKTREE_PATH: '/home/jin/feature',
-          ORCA_WORKSPACE_NAME: 'feature',
-          CONDUCTOR_ROOT_PATH: '/mnt/c/Users/jinwo/git/orca_botmux',
-          GHOSTX_ROOT_PATH: '/mnt/c/Users/jinwo/git/orca_botmux'
+          BOTMUX_ROOT_PATH: '/mnt/c/Users/jinwo/git/botmux',
+          BOTMUX_WORKTREE_PATH: '/home/jin/feature',
+          BOTMUX_WORKSPACE_NAME: 'feature',
+          CONDUCTOR_ROOT_PATH: '/mnt/c/Users/jinwo/git/botmux',
+          GHOSTX_ROOT_PATH: '/mnt/c/Users/jinwo/git/botmux'
         })
       })
       expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
-        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         '#!/usr/bin/env bash\nset -e\npnpm install\n',
         'utf-8'
       )
       expect(vi.mocked(fs.chmodSync)).toHaveBeenCalledWith(
-        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         0o755
       )
     } finally {
@@ -160,7 +160,7 @@ describe('createSetupRunnerScript', () => {
     const fs = await import('node:fs')
     const originalPlatform = process.platform
 
-    execFileSyncMock.mockReturnValue('/home/jin/repo/.git/worktrees/feature/orca_botmux/setup-runner.sh')
+    execFileSyncMock.mockReturnValue('/home/jin/repo/.git/worktrees/feature/botmux/setup-runner.sh')
     Object.defineProperty(process, 'platform', {
       configurable: true,
       value: 'win32'
@@ -176,22 +176,22 @@ describe('createSetupRunnerScript', () => {
 
       expect(result).toEqual({
         runnerScriptPath:
-          '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+          '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         envVars: expect.objectContaining({
-          ORCA_ROOT_PATH: '/test/repo',
-          ORCA_WORKTREE_PATH: '/home/jin/repo/feature',
-          ORCA_WORKSPACE_NAME: 'feature',
+          BOTMUX_ROOT_PATH: '/test/repo',
+          BOTMUX_WORKTREE_PATH: '/home/jin/repo/feature',
+          BOTMUX_WORKSPACE_NAME: 'feature',
           CONDUCTOR_ROOT_PATH: '/test/repo',
           GHOSTX_ROOT_PATH: '/test/repo'
         })
       })
       expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
-        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         '#!/usr/bin/env bash\nset -e\npnpm install\n',
         'utf-8'
       )
       expect(vi.mocked(fs.chmodSync)).toHaveBeenCalledWith(
-        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\orca_botmux\\setup-runner.sh',
+        '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo\\.git\\worktrees\\feature\\botmux\\setup-runner.sh',
         0o755
       )
     } finally {
@@ -218,7 +218,7 @@ describe('createIssueCommandRunnerScript', () => {
     const originalPlatform = process.platform
 
     execFileSyncMock.mockReturnValue(
-      '/test/repo/.git/worktrees/feature/orca_botmux/issue-command-runner.sh'
+      '/test/repo/.git/worktrees/feature/botmux/issue-command-runner.sh'
     )
     Object.defineProperty(process, 'platform', {
       configurable: true,
@@ -234,19 +234,19 @@ describe('createIssueCommandRunnerScript', () => {
       )
 
       expect(result).toEqual({
-        runnerScriptPath: '/test/repo/.git/worktrees/feature/orca_botmux/issue-command-runner.sh',
+        runnerScriptPath: '/test/repo/.git/worktrees/feature/botmux/issue-command-runner.sh',
         envVars: expect.objectContaining({
-          ORCA_ROOT_PATH: '/test/repo',
-          ORCA_WORKTREE_PATH: '/test/repo-feature'
+          BOTMUX_ROOT_PATH: '/test/repo',
+          BOTMUX_WORKTREE_PATH: '/test/repo-feature'
         })
       })
       expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
-        '/test/repo/.git/worktrees/feature/orca_botmux/issue-command-runner.sh',
+        '/test/repo/.git/worktrees/feature/botmux/issue-command-runner.sh',
         '#!/usr/bin/env bash\nset -e\ncodex exec "long command"\nclaude -p "review it"\n',
         'utf-8'
       )
       expect(vi.mocked(fs.chmodSync)).toHaveBeenCalledWith(
-        '/test/repo/.git/worktrees/feature/orca_botmux/issue-command-runner.sh',
+        '/test/repo/.git/worktrees/feature/botmux/issue-command-runner.sh',
         0o755
       )
     } finally {

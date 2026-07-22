@@ -3,6 +3,6 @@ import type { editor } from 'monaco-editor'
 export function buildFileEditorWordWrapOptions(
   editorWordWrap: boolean | undefined
 ): Pick<editor.IStandaloneEditorConstructionOptions, 'wordWrap'> {
-  // Why: profiles saved before this preference existed must retain OrcaBotmux's previous wrapped default.
+  // Why: profiles saved before this preference existed must retain Botmux's previous wrapped default.
   return { wordWrap: editorWordWrap === false ? 'off' : 'on' }
 }

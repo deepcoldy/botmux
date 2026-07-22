@@ -67,7 +67,7 @@ export function KeybindingsFileActions(): React.JSX.Element {
     return snapshot?.path ?? keybindingSnapshot?.path ?? null
   }
 
-  const editKeybindingsInOrca = async (): Promise<void> => {
+  const editKeybindingsInBotmux = async (): Promise<void> => {
     try {
       const filePath = await prepareKeybindingsPath()
       if (!filePath) {
@@ -114,7 +114,7 @@ export function KeybindingsFileActions(): React.JSX.Element {
           ? error.message
           : translate(
               'auto.components.settings.KeybindingsFileActions.dd532a01ce',
-              'Failed to open keybindings in OrcaBotmux.'
+              'Failed to open keybindings in Botmux.'
             )
       )
     }
@@ -158,12 +158,12 @@ export function KeybindingsFileActions(): React.JSX.Element {
         variant="ghost"
         size="xs"
         className="rounded-none border-0 shadow-none"
-        onClick={() => void editKeybindingsInOrca()}
+        onClick={() => void editKeybindingsInBotmux()}
       >
         <FileText className="size-3" />
         {translate(
           'auto.components.settings.KeybindingsFileActions.1c2be2b2c6',
-          'Edit File in OrcaBotmux'
+          'Edit File in Botmux'
         )}
       </Button>
       <DropdownMenu>

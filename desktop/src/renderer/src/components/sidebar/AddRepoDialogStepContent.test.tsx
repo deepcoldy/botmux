@@ -265,7 +265,7 @@ describe('AddRepoDialogStepContent nested imports', () => {
     expect(html).not.toContain('Local project, Git repo, or folder with many repos')
   })
 
-  it('uses the standard add step for remote OrcaBotmux server hosts', () => {
+  it('uses the standard add step for remote Botmux server hosts', () => {
     const html = renderStepContent({
       step: 'add',
       isRuntimeEnvironmentActive: true,

@@ -158,7 +158,7 @@ describe('AgentsPane', () => {
     expect(markup).not.toContain('aria-label="Agent runtime"')
     expect(markup).toContain('Keep computer awake while agents are working')
     expect(markup).toContain(
-      'Keeps this computer and display awake while agents are working. OrcaBotmux also asks this device to stay awake when the lid is closed, subject to its power policy.'
+      'Keeps this computer and display awake while agents are working. Botmux also asks this device to stay awake when the lid is closed, subject to its power policy.'
     )
     expect(markup).toContain('aria-checked="false"')
   })

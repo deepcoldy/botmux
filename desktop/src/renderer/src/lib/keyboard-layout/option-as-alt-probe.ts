@@ -9,9 +9,9 @@
  * (chromium/src/third_party/blink/renderer/modules/keyboard/keyboard.idl).
  * Subscribing to `layoutchange` is a no-op. Fortunately every real-world
  * path to switching OS keyboard layout on macOS (Input Menu, Cmd+Space,
- * global shortcut) transfers focus out of OrcaBotmux and back, so focus-in is a
+ * global shortcut) transfers focus out of Botmux and back, so focus-in is a
  * reliable proxy. The only missed case is a layout change triggered by a
- * key pressed while OrcaBotmux is focused (e.g. a Karabiner rule), which is
+ * key pressed while Botmux is focused (e.g. a Karabiner rule), which is
  * exceedingly rare and self-heals on the next blur/focus cycle.
  *
  * Why two signals (input source ID + fingerprint): the fingerprint can

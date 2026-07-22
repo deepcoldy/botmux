@@ -85,7 +85,7 @@ describe('filesystem-watcher real @parcel/watcher integration', () => {
     async () => {
       // Why: macOS reports temp watcher events under /private/var while
       // tmpdir() returns /var, so compare canonical paths instead of aliases.
-      tempDir = await realpath(await mkdtemp(join(tmpdir(), 'orca-botmux-fswatch-real-')))
+      tempDir = await realpath(await mkdtemp(join(tmpdir(), 'botmux-fswatch-real-')))
       const sendMock = vi.fn()
       const sender = {
         isDestroyed: () => false,

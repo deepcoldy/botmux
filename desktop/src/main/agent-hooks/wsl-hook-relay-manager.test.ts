@@ -124,7 +124,7 @@ describe.skipIf(process.platform === 'win32')(
         readFileSync(join(home, '.claude', 'settings.json'), 'utf8')
       )
       expect(claudeSettings.hooks).toBeTruthy()
-      const script = readFileSync(join(home, '.orca_botmux', 'agent-hooks', 'claude-hook.sh'), 'utf8')
+      const script = readFileSync(join(home, '.botmux', 'agent-hooks', 'claude-hook.sh'), 'utf8')
       expect(script).toContain('/hook/claude')
     }, 20_000)
   }
@@ -188,10 +188,10 @@ describe('WslHookRelayManager', () => {
       platform: () => 'win32',
       remoteHooksEnabled: () => true,
       hookCoordsEnv: () => ({
-        ORCA_AGENT_HOOK_PORT: '43117',
-        ORCA_AGENT_HOOK_TOKEN: 'tok',
-        ORCA_AGENT_HOOK_ENV: 'production',
-        ORCA_AGENT_HOOK_VERSION: '1'
+        BOTMUX_AGENT_HOOK_PORT: '43117',
+        BOTMUX_AGENT_HOOK_TOKEN: 'tok',
+        BOTMUX_AGENT_HOOK_ENV: 'production',
+        BOTMUX_AGENT_HOOK_VERSION: '1'
       }),
       instanceKey: () => 'testinstance',
       resolveBundle: () => ({ jsPath: '/fake/wsl-agent-hook-relay.js', version: '0.1.0+abc' }),
@@ -216,13 +216,13 @@ describe('WslHookRelayManager', () => {
     manager.ensureForDistro('Ubuntu')
     await vi.waitFor(() => expect(deps.installHooks).toHaveBeenCalledTimes(1))
     expect(deps.spawnRelay).toHaveBeenCalledTimes(1)
-    // Codex is the one agent whose home OrcaBotmux redirects for WSL sessions.
+    // Codex is the one agent whose home Botmux redirects for WSL sessions.
     expect(deps.installHooks).toHaveBeenCalledWith(expect.anything(), home, {
-      codexHomeDir: `${home}/.local/share/orca_botmux/codex-runtime-home/home`
+      codexHomeDir: `${home}/.local/share/botmux/codex-runtime-home/home`
     })
 
     expect(manager.getGuestEndpointFilePath('Ubuntu')).toBe(
-      `${home}/.orca-botmux-wsl/agent-hooks/instance-testinstance/endpoint.env`
+      `${home}/.botmux-wsl/agent-hooks/instance-testinstance/endpoint.env`
     )
 
     const guest = harnesses[0].guestDispatcher
@@ -252,7 +252,7 @@ describe('WslHookRelayManager', () => {
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(deps.spawnRelay).toHaveBeenCalledTimes(1)
     expect(manager.getGuestEndpointFilePath(null)).toBe(
-      `${home}/.orca-botmux-wsl/agent-hooks/instance-testinstance/endpoint.env`
+      `${home}/.botmux-wsl/agent-hooks/instance-testinstance/endpoint.env`
     )
     manager.disposeAll()
   })

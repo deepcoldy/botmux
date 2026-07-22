@@ -3,9 +3,9 @@ import { createPortal } from 'react-dom'
 import { useShallow } from 'zustand/react/shallow'
 import type { Tab, TabGroup, TerminalTab } from '../../../../shared/types'
 import {
-  isOrcaBotmuxControlPlaneHostId,
-  resolveOrcaBotmuxTerminalSpawnPath
-} from '../../../../shared/orca-botmux-main-terminal-host'
+  isBotmuxControlPlaneHostId,
+  resolveBotmuxTerminalSpawnPath
+} from '../../../../shared/botmux-main-terminal-host'
 import { useAppStore } from '../../store'
 import { SYNC_FIT_PANES_EVENT } from '@/constants/terminal'
 import { tabGroupBodyAnchorName } from '../tab-group/tab-group-body-anchor'
@@ -32,16 +32,16 @@ const EMPTY_GROUPS: readonly TabGroup[] = []
 const EMPTY_ACTIVITY_PORTALS: ActivityTerminalPortalTarget[] = []
 const HAS_CSS_ANCHOR_POSITIONING =
   typeof CSS !== 'undefined' &&
-  CSS.supports('position-anchor', '--orca-botmux-terminal-overlay-probe') &&
-  CSS.supports('top', 'anchor(--orca-botmux-terminal-overlay-probe top)') &&
-  CSS.supports('width', 'anchor-size(--orca-botmux-terminal-overlay-probe width)')
+  CSS.supports('position-anchor', '--botmux-terminal-overlay-probe') &&
+  CSS.supports('top', 'anchor(--botmux-terminal-overlay-probe top)') &&
+  CSS.supports('width', 'anchor-size(--botmux-terminal-overlay-probe width)')
 const MIN_OVERLAY_FIT_WIDTH_PX = 48
 const MIN_OVERLAY_FIT_HEIGHT_PX = 24
 
 function shouldUseCssAnchorPositioning(): boolean {
   return (
     HAS_CSS_ANCHOR_POSITIONING &&
-    (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ !== true
+    (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ !== true
   )
 }
 
@@ -379,15 +379,15 @@ const TerminalPaneOverlayLayer = memo(function TerminalPaneOverlayLayer({
     activationDeferredMountTabIds
   })
 
-  // Why: orca_botmux synthetic hosts keep path '' for FileExplorer; still mount
-  // with a local spawn cwd (see resolveOrcaBotmuxTerminalSpawnPath).
+  // Why: botmux synthetic hosts keep path '' for FileExplorer; still mount
+  // with a local spawn cwd (see resolveBotmuxTerminalSpawnPath).
   // Prefix fallback: dual Vite module instances must never leave agent hosts
   // with null spawn path (no TerminalPane → no pty:spawn).
   const effectiveWorktreePath =
-    resolveOrcaBotmuxTerminalSpawnPath(worktreeId, worktreePath) ??
-    (worktreeId.startsWith('orca_botmux:agent:') ||
-    worktreeId.startsWith('orca_botmux:session:') ||
-    worktreeId === 'global-orca-botmux-terminal'
+    resolveBotmuxTerminalSpawnPath(worktreeId, worktreePath) ??
+    (worktreeId.startsWith('botmux:agent:') ||
+    worktreeId.startsWith('botmux:session:') ||
+    worktreeId === 'global-botmux-terminal'
       ? '.'
       : null)
   if (!effectiveWorktreePath) {
@@ -398,17 +398,17 @@ const TerminalPaneOverlayLayer = memo(function TerminalPaneOverlayLayer({
     <>
       {terminalTabs
         .filter((terminalTab) => {
-          // Why: orca_botmux agent/session attach tabs must always mount (queued
+          // Why: botmux agent/session attach tabs must always mount (queued
           // ssh-tt startup). Use string prefixes so dual Vite module copies
-          // of isOrcaBotmuxControlPlaneHostId cannot drop agent hosts. CDP:
+          // of isBotmuxControlPlaneHostId cannot drop agent hosts. CDP:
           // without this, Overlay filtered every tab → pty.spawn never ran.
-          const orcaBotmuxHost =
-            worktreeId.startsWith('orca_botmux:agent:') ||
-            worktreeId.startsWith('orca_botmux:session:') ||
-            worktreeId === 'global-orca-botmux-terminal' ||
-            isOrcaBotmuxControlPlaneHostId(worktreeId)
+          const botmuxHost =
+            worktreeId.startsWith('botmux:agent:') ||
+            worktreeId.startsWith('botmux:session:') ||
+            worktreeId === 'global-botmux-terminal' ||
+            isBotmuxControlPlaneHostId(worktreeId)
           return (
-            orcaBotmuxHost ||
+            botmuxHost ||
             shouldMountBackgroundWorktreeTab(backgroundMountTabIds, terminalTab.id)
           )
         })

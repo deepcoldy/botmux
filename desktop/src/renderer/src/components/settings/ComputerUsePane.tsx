@@ -92,7 +92,7 @@ export function ComputerUsePane(): React.JSX.Element {
         ? 'Computer Use is ready.'
         : 'Finish setup to use local apps.'
   const summaryDescription = checking
-    ? 'OrcaBotmux is checking macOS privacy permissions for the Computer Use helper.'
+    ? 'Botmux is checking macOS privacy permissions for the Computer Use helper.'
     : setupUnavailable
       ? `Computer Use permissions are unavailable because ${helperUnavailableReason}.`
       : allGranted

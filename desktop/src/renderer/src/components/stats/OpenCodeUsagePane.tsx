@@ -34,9 +34,9 @@ import { translate } from '@/i18n/i18n'
 const RANGE_OPTIONS: OpenCodeUsageRange[] = ['7d', '30d', '90d', 'all']
 const SCOPE_OPTIONS: { value: OpenCodeUsageScope; label: string }[] = [
   {
-    value: 'orca_botmux',
+    value: 'botmux',
     get label() {
-      return translate('auto.components.stats.OpenCodeUsagePane.e04c58327c', 'OrcaBotmux worktrees only')
+      return translate('auto.components.stats.OpenCodeUsagePane.e04c58327c', 'Botmux worktrees only')
     }
   },
   {

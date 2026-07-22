@@ -296,7 +296,7 @@ export function requestGitStreamable(
           succeed(result)
           return
         }
-        const marker = result.__orcaGitResponseStream
+        const marker = result.__botmuxGitResponseStream
         totalBytes = marker.totalBytes
         chunkCount = marker.chunkCount
         streamIdRef.current = marker.streamId

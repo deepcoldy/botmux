@@ -25,8 +25,8 @@ vi.mock('../git/worktree', () => ({
 import { BrowserManager } from './browser-manager'
 import { CdpBridge } from './cdp-bridge'
 import { BROWSER_TEXT_INSERT_CHUNK_BYTES } from './browser-text-insertion'
-import { OrcaRuntimeService } from '../runtime/orca-botmux-runtime'
-import { OrcaRuntimeRpcServer } from '../runtime/runtime-rpc'
+import { BotmuxRuntimeService } from '../runtime/botmux-runtime'
+import { BotmuxRuntimeRpcServer } from '../runtime/runtime-rpc'
 import { readRuntimeMetadata } from '../runtime/runtime-metadata'
 
 // ── CDP response builders ──
@@ -269,7 +269,7 @@ async function sendRequest(
 // ── Tests ──
 
 describe('Browser automation pipeline (integration)', () => {
-  let server: OrcaRuntimeRpcServer
+  let server: BotmuxRuntimeRpcServer
   let endpoint: string
   let authToken: string
   let activeGuest: ReturnType<typeof createMockGuest>['guest']
@@ -303,11 +303,11 @@ describe('Browser automation pipeline (integration)', () => {
     cdpBridge.setActiveTab(GUEST_WC_ID)
 
     const userDataPath = mkdtempSync(join(tmpdir(), 'browser-e2e-'))
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     runtime.setAgentBrowserBridge(cdpBridge as any)
 
-    server = new OrcaRuntimeRpcServer({ runtime, userDataPath })
+    server = new BotmuxRuntimeRpcServer({ runtime, userDataPath })
     await server.start()
 
     const metadata = readRuntimeMetadata(userDataPath)!
@@ -680,11 +680,11 @@ describe('Browser automation pipeline (integration)', () => {
     const emptyBridge = new CdpBridge(emptyManager)
 
     const userDataPath2 = mkdtempSync(join(tmpdir(), 'browser-e2e-empty-'))
-    const runtime2 = new OrcaRuntimeService()
+    const runtime2 = new BotmuxRuntimeService()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     runtime2.setAgentBrowserBridge(emptyBridge as any)
 
-    const server2 = new OrcaRuntimeRpcServer({ runtime: runtime2, userDataPath: userDataPath2 })
+    const server2 = new BotmuxRuntimeRpcServer({ runtime: runtime2, userDataPath: userDataPath2 })
     await server2.start()
 
     const metadata2 = readRuntimeMetadata(userDataPath2)!

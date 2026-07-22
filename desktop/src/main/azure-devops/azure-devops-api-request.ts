@@ -30,10 +30,10 @@ export function normalizeAzureDevOpsApiBaseUrl(value: string): string {
 
 export function getAzureDevOpsAuthConfig(): AzureDevOpsAuthConfig {
   return {
-    apiBaseUrl: envValue('ORCA_AZURE_DEVOPS_API_BASE_URL'),
-    pat: envValue('ORCA_AZURE_DEVOPS_TOKEN') ?? envValue('ORCA_AZURE_DEVOPS_PAT'),
-    accessToken: envValue('ORCA_AZURE_DEVOPS_ACCESS_TOKEN'),
-    username: envValue('ORCA_AZURE_DEVOPS_USERNAME')
+    apiBaseUrl: envValue('BOTMUX_AZURE_DEVOPS_API_BASE_URL'),
+    pat: envValue('BOTMUX_AZURE_DEVOPS_TOKEN') ?? envValue('BOTMUX_AZURE_DEVOPS_PAT'),
+    accessToken: envValue('BOTMUX_AZURE_DEVOPS_ACCESS_TOKEN'),
+    username: envValue('BOTMUX_AZURE_DEVOPS_USERNAME')
   }
 }
 

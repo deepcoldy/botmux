@@ -1,14 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
   filterBotmuxSessionsForWorktree,
-  orcaBotmuxHostIdFromExecutionHost
+  botmuxHostIdFromExecutionHost
 } from './botmux-session-worktree-match'
 
 describe('mobile botmux session worktree match', () => {
   it('maps execution host / connection to bridge host id', () => {
-    expect(orcaBotmuxHostIdFromExecutionHost('local')).toBe('local')
-    expect(orcaBotmuxHostIdFromExecutionHost(undefined, 'ssh-1')).toBe('ssh:ssh-1')
-    expect(orcaBotmuxHostIdFromExecutionHost('ssh:ssh-1')).toBe('ssh:ssh-1')
+    expect(botmuxHostIdFromExecutionHost('local')).toBe('local')
+    expect(botmuxHostIdFromExecutionHost(undefined, 'ssh-1')).toBe('ssh:ssh-1')
+    expect(botmuxHostIdFromExecutionHost('ssh:ssh-1')).toBe('ssh:ssh-1')
   })
 
   it('filters sessions under worktree path on same host', () => {
@@ -20,7 +20,7 @@ describe('mobile botmux session worktree match', () => {
     expect(
       filterBotmuxSessionsForWorktree(sessions, {
         path: '/proj',
-        orcaBotmuxHostId: host
+        botmuxHostId: host
       }).map((s) => s.sessionId)
     ).toEqual(['a'])
   })

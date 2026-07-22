@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, Text, View } from 'react-native'
 import { ShieldQuestion } from 'lucide-react-native'
 import { colors, radii, spacing, typography } from '../theme/mobile-theme'
 import type { MobileChatPermission } from './mobile-native-chat-permission'
+import { useMobileI18n } from '../i18n/mobile-i18n'
 
 // Renders a detected agent permission ask as a card with tappable options.
 // The first option is treated as the primary (allow) action and gets a filled
@@ -14,6 +15,7 @@ function MobileNativeChatPermissionImpl({
   permission: MobileChatPermission
   onRespond: (send: string) => Promise<boolean>
 }): React.JSX.Element {
+  const { t } = useMobileI18n()
   const [submitting, setSubmitting] = useState(false)
   const submittingRef = useRef(false)
   const respond = async (send: string): Promise<void> => {
@@ -32,9 +34,9 @@ function MobileNativeChatPermissionImpl({
     <View style={styles.card}>
       <View style={styles.header}>
         <ShieldQuestion size={16} color={colors.accentBlue} strokeWidth={2} />
-        <Text style={styles.title}>{permission.title}</Text>
+        <Text style={styles.title}>{t(permission.title)}</Text>
       </View>
-      {permission.detail ? <Text style={styles.detail}>{permission.detail}</Text> : null}
+      {permission.detail ? <Text style={styles.detail}>{t(permission.detail)}</Text> : null}
       <View style={styles.options}>
         {permission.options.map((option, index) => {
           const isPrimary = index === 0
@@ -51,7 +53,7 @@ function MobileNativeChatPermissionImpl({
               disabled={submitting}
             >
               <Text style={[styles.optionText, isPrimary && styles.optionTextPrimary]}>
-                {option.label}
+                {t(option.label)}
               </Text>
             </Pressable>
           )

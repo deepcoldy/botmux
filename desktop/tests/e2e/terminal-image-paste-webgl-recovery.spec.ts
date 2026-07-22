@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   sendToTerminal,
@@ -108,25 +108,25 @@ async function readAtlasResetCount(page: Page): Promise<number> {
 
 test.describe('terminal image paste WebGL recovery @headful', () => {
   test('clears the WebGL atlas after a real image clipboard paste', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const ptyId = await waitForActivePanePtyId(orcaBotmuxPage)
+    const ptyId = await waitForActivePanePtyId(botmuxPage)
     const marker = randomUUID()
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-image-paste-redraw-${marker}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-image-paste-redraw-${marker}.mjs`)
     writeFileSync(scriptPath, imagePasteRedrawScript(marker))
 
     try {
-      await sendToTerminal(orcaBotmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
-      await waitForTerminalOutput(orcaBotmuxPage, `READY_${marker}`, 10_000)
+      await sendToTerminal(botmuxPage, ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+      await waitForTerminalOutput(botmuxPage, `READY_${marker}`, 10_000)
 
-      await forceWebgl(orcaBotmuxPage)
-      const webglActive = await orcaBotmuxPage
+      await forceWebgl(botmuxPage)
+      const webglActive = await botmuxPage
         .waitForFunction(
           () => {
             const state = window.__store?.getState()
@@ -147,19 +147,19 @@ test.describe('terminal image paste WebGL recovery @headful', () => {
         .then(() => true)
         .catch(() => false)
       test.skip(!webglActive, 'WebGL was not active in this headful environment')
-      expect(await patchAtlasCounter(orcaBotmuxPage)).toBe(true)
+      expect(await patchAtlasCounter(botmuxPage)).toBe(true)
 
-      await orcaBotmuxPage.locator('.xterm-helper-textarea').first().focus()
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.locator('.xterm-helper-textarea').first().focus()
+      await botmuxPage.evaluate(
         (dataUrl) => window.api.ui.writeClipboardImage(dataUrl),
         CLIPBOARD_IMAGE_DATA_URL
       )
-      await orcaBotmuxPage.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V')
-      await waitForTerminalOutput(orcaBotmuxPage, `DONE_${marker}`, 10_000)
+      await botmuxPage.keyboard.press(process.platform === 'darwin' ? 'Meta+V' : 'Control+V')
+      await waitForTerminalOutput(botmuxPage, `DONE_${marker}`, 10_000)
 
-      await expect.poll(() => readAtlasResetCount(orcaBotmuxPage), { timeout: 2_000 }).toBeGreaterThan(0)
+      await expect.poll(() => readAtlasResetCount(botmuxPage), { timeout: 2_000 }).toBeGreaterThan(0)
     } finally {
-      await sendToTerminal(orcaBotmuxPage, ptyId, '\x03').catch(() => undefined)
+      await sendToTerminal(botmuxPage, ptyId, '\x03').catch(() => undefined)
       rmSync(scriptPath, { force: true })
     }
   })

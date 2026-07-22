@@ -2,7 +2,7 @@ import type { Page, TestInfo } from '@stablyai/playwright-test'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { runNodeScriptInTerminal } from './helpers/run-node-script-in-terminal'
 import {
   ensureTerminalVisible,
@@ -207,17 +207,17 @@ async function writeHiddenSideEffectBurst(
   const payload = `\x07\x1b]0;${title}\x07${marker}\n`
   const script = `process.stdout.write(${JSON.stringify(payload)}); setTimeout(() => process.exit(0), 30000)`
   // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-  await runNodeScriptInTerminal(page, ptyId, script, { prefix: 'orca-botmux-hidden-side-effect' })
+  await runNodeScriptInTerminal(page, ptyId, script, { prefix: 'botmux-hidden-side-effect' })
 }
 
 test.describe('Hidden terminal TUI visual restore', () => {
   test('restores hidden full-screen TUI output without visible corruption', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'hidden TUI restore needs the seeded secondary worktree')
@@ -225,17 +225,17 @@ test.describe('Hidden terminal TUI visual restore', () => {
       return
     }
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const hiddenSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const hiddenSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const hiddenPane = hiddenSnapshot.panes[0]
     if (!hiddenPane?.ptyId) {
       throw new Error('hidden visual restore pane did not bind a PTY')
     }
-    await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+    await switchToWorktree(botmuxPage, firstWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'first worktree did not become active before hidden TUI injection'
       })
@@ -243,47 +243,47 @@ test.describe('Hidden terminal TUI visual restore', () => {
 
     const runId = randomUUID()
     const finalMarker = `VISUAL_RESTORE_FINAL_${runId}_24`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-hidden-tui-visual-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-hidden-tui-visual-${runId}.mjs`)
     writeHiddenFrameScript(scriptPath, runId)
-    await resetHiddenDebug(orcaBotmuxPage)
-    await writeHiddenFrames(orcaBotmuxPage, hiddenPane.ptyId, scriptPath)
-    await resetHiddenDebug(orcaBotmuxPage)
+    await resetHiddenDebug(botmuxPage)
+    await writeHiddenFrames(botmuxPage, hiddenPane.ptyId, scriptPath)
+    await resetHiddenDebug(botmuxPage)
 
     // Why: hidden-delivery gate contract — the bulk TUI frames must be
     // withheld in main (dropped after model ingestion), not delivered and
     // skipped renderer-side.
     await expect
-      .poll(() => readMainHiddenDeliveryDroppedChars(orcaBotmuxPage), {
+      .poll(() => readMainHiddenDeliveryDroppedChars(botmuxPage), {
         timeout: 10_000,
         message: 'visually rich hidden TUI output was not withheld from the renderer'
       })
       .toBeGreaterThan(1024)
     await expect
-      .poll(() => readMainSnapshotSource(orcaBotmuxPage, hiddenPane.ptyId!), {
+      .poll(() => readMainSnapshotSource(botmuxPage, hiddenPane.ptyId!), {
         timeout: 10_000,
         message: 'visually rich hidden TUI source did not come from headless model'
       })
       .toBe('headless')
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+      .poll(() => getTerminalContent(botmuxPage, 12_000), {
         timeout: 10_000,
         message: 'hidden TUI final frame did not restore when the workspace became visible'
       })
       .toContain(finalMarker)
 
-    const content = await getTerminalContent(orcaBotmuxPage, 12_000)
+    const content = await getTerminalContent(botmuxPage, 12_000)
     expect(content).toContain(`Frame 024`)
     expect(content).toContain('╭')
     expect(content).toContain('├')
     expect(content).toContain('█')
-    expect(content).not.toContain('OrcaBotmux skipped hidden terminal output')
+    expect(content).not.toContain('Botmux skipped hidden terminal output')
     await expect
-      .poll(() => readTuiCursorState(orcaBotmuxPage), {
+      .poll(() => readTuiCursorState(botmuxPage), {
         timeout: 5_000,
         message: 'restored TUI cursor stayed hidden after final frame'
       })
@@ -293,7 +293,7 @@ test.describe('Hidden terminal TUI visual restore', () => {
       })
 
     const screenshotPath = testInfo.outputPath('hidden-tui-restore-final.png')
-    await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+    await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
     await testInfo.attach('hidden-tui-restore-final.png', {
       path: screenshotPath,
       contentType: 'image/png'
@@ -302,12 +302,12 @@ test.describe('Hidden terminal TUI visual restore', () => {
   })
 
   test('keeps newer live output correct after plain hidden output restores', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'hidden TUI restore needs the seeded secondary worktree')
@@ -315,19 +315,19 @@ test.describe('Hidden terminal TUI visual restore', () => {
       return
     }
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const hiddenSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const hiddenSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const hiddenPane = hiddenSnapshot.panes[0]
     if (!hiddenPane?.ptyId) {
       throw new Error('hidden visual restore pane did not bind a PTY')
     }
     const paneKey = `${hiddenSnapshot.tabId}:${hiddenPane.leafId}`
 
-    await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+    await switchToWorktree(botmuxPage, firstWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'first worktree did not become active before hidden TUI injection'
       })
@@ -337,45 +337,45 @@ test.describe('Hidden terminal TUI visual restore', () => {
     const hiddenFrame = lowRiskRestoreFrame(runId, 40)
     const liveFrame = lowRiskRestoreFrame(runId, 41)
     const finalMarker = `VISUAL_RESTORE_FINAL_${runId}_41`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-low-risk-hidden-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-low-risk-hidden-${runId}.mjs`)
     writeLowRiskFrameScript(scriptPath, hiddenFrame)
-    await resetHiddenDebug(orcaBotmuxPage)
-    await sendToTerminal(orcaBotmuxPage, hiddenPane.ptyId, `node ${JSON.stringify(scriptPath)}\r`)
-    await resetHiddenDebug(orcaBotmuxPage)
+    await resetHiddenDebug(botmuxPage)
+    await sendToTerminal(botmuxPage, hiddenPane.ptyId, `node ${JSON.stringify(scriptPath)}\r`)
+    await resetHiddenDebug(botmuxPage)
 
     // Why: hidden-delivery gate contract — even plain hidden output is
     // dropped in main, so the withheld signal is main's dropped counter.
     await expect
-      .poll(() => readMainHiddenDeliveryDroppedChars(orcaBotmuxPage), {
+      .poll(() => readMainHiddenDeliveryDroppedChars(botmuxPage), {
         timeout: 10_000,
         message: 'plain hidden injected output was not withheld from the renderer'
       })
       .toBeGreaterThan(0)
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await injectPaneData(orcaBotmuxPage, paneKey, liveFrame, {
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await injectPaneData(botmuxPage, paneKey, liveFrame, {
       seq: hiddenFrame.length + liveFrame.length,
       rawLength: liveFrame.length
     })
 
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+      .poll(() => getTerminalContent(botmuxPage, 12_000), {
         timeout: 10_000,
         message: 'newer live TUI frame did not render after hidden output restored'
       })
       .toContain(finalMarker)
 
-    const content = await getTerminalContent(orcaBotmuxPage, 12_000)
+    const content = await getTerminalContent(botmuxPage, 12_000)
     expect(content).toContain(`LOW_RISK_RESTORE_FRAME_${runId}_41`)
     expect(content).toContain('progress=041')
     expect(content.indexOf(`LOW_RISK_RESTORE_FRAME_${runId}_41`)).toBeGreaterThan(
       content.indexOf(`LOW_RISK_RESTORE_FRAME_${runId}_40`)
     )
-    expect(content).not.toContain('OrcaBotmux skipped hidden terminal output')
+    expect(content).not.toContain('Botmux skipped hidden terminal output')
     await expect
-      .poll(() => readTuiCursorState(orcaBotmuxPage), {
+      .poll(() => readTuiCursorState(botmuxPage), {
         timeout: 5_000,
         message: 'live TUI cursor stayed hidden after hidden output restored'
       })
@@ -384,7 +384,7 @@ test.describe('Hidden terminal TUI visual restore', () => {
         initialized: true
       })
     const screenshotPath = testInfo.outputPath('hidden-tui-live-output-final.png')
-    await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+    await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
     await testInfo.attach('hidden-tui-live-output-final.png', {
       path: screenshotPath,
       contentType: 'image/png'
@@ -393,12 +393,12 @@ test.describe('Hidden terminal TUI visual restore', () => {
   })
 
   test('restores rich synchronized TUI output from the headless model', async ({
-    orcaBotmuxPage,
+    botmuxPage,
     testRepoPath
   }, testInfo: TestInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'hidden TUI restore needs the seeded secondary worktree')
@@ -406,17 +406,17 @@ test.describe('Hidden terminal TUI visual restore', () => {
       return
     }
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const hiddenSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const hiddenSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const hiddenPane = hiddenSnapshot.panes[0]
     if (!hiddenPane?.ptyId) {
       throw new Error('hidden rich model pane did not bind a PTY')
     }
-    await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+    await switchToWorktree(botmuxPage, firstWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'first worktree did not become active before hidden rich model restore'
       })
@@ -424,47 +424,47 @@ test.describe('Hidden terminal TUI visual restore', () => {
 
     const runId = randomUUID()
     const finalMarker = `VISUAL_RESTORE_FINAL_${runId}_24`
-    const scriptPath = path.join(testRepoPath, `.orca-botmux-hidden-rich-model-${runId}.mjs`)
+    const scriptPath = path.join(testRepoPath, `.botmux-hidden-rich-model-${runId}.mjs`)
     writeHiddenFrameScript(scriptPath, runId)
-    await resetHiddenDebug(orcaBotmuxPage)
+    await resetHiddenDebug(botmuxPage)
     try {
-      await writeHiddenFrames(orcaBotmuxPage, hiddenPane.ptyId, scriptPath)
-      await resetHiddenDebug(orcaBotmuxPage)
+      await writeHiddenFrames(botmuxPage, hiddenPane.ptyId, scriptPath)
+      await resetHiddenDebug(botmuxPage)
 
       // Why: hidden-delivery gate contract — synchronized rich frames are
       // withheld in main; the headless model snapshot is the restore source.
       await expect
-        .poll(() => readMainHiddenDeliveryDroppedChars(orcaBotmuxPage), {
+        .poll(() => readMainHiddenDeliveryDroppedChars(botmuxPage), {
           timeout: 10_000,
           message: 'rich hidden TUI output was not withheld from the renderer'
         })
         .toBeGreaterThan(0)
       await expect
-        .poll(() => readMainSnapshotSource(orcaBotmuxPage, hiddenPane.ptyId!), {
+        .poll(() => readMainSnapshotSource(botmuxPage, hiddenPane.ptyId!), {
           timeout: 10_000,
           message: 'rich hidden TUI source did not come from headless model'
         })
         .toBe('headless')
 
-      await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-      await ensureTerminalVisible(orcaBotmuxPage)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+      await switchToWorktree(botmuxPage, secondWorktreeId)
+      await ensureTerminalVisible(botmuxPage)
+      await waitForActiveTerminalManager(botmuxPage, 30_000)
 
       await expect
-        .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+        .poll(() => getTerminalContent(botmuxPage, 12_000), {
           timeout: 10_000,
           message: 'rich headless TUI frame did not restore when visible'
         })
         .toContain(finalMarker)
 
-      const content = await getTerminalContent(orcaBotmuxPage, 12_000)
+      const content = await getTerminalContent(botmuxPage, 12_000)
       expect(content).toContain(`Frame 024`)
       expect(content).toContain('╭')
       expect(content).toContain('├')
       expect(content).toContain('█')
-      expect(content).not.toContain('OrcaBotmux skipped hidden terminal output')
+      expect(content).not.toContain('Botmux skipped hidden terminal output')
       await expect
-        .poll(() => readTuiCursorState(orcaBotmuxPage), {
+        .poll(() => readTuiCursorState(botmuxPage), {
           timeout: 5_000,
           message: 'rich headless TUI cursor stayed hidden after restore'
         })
@@ -474,7 +474,7 @@ test.describe('Hidden terminal TUI visual restore', () => {
         })
 
       const screenshotPath = testInfo.outputPath('hidden-rich-model-restore-final.png')
-      await orcaBotmuxPage.screenshot({ path: screenshotPath, fullPage: true })
+      await botmuxPage.screenshot({ path: screenshotPath, fullPage: true })
       await testInfo.attach('hidden-rich-model-restore-final.png', {
         path: screenshotPath,
         contentType: 'image/png'
@@ -485,11 +485,11 @@ test.describe('Hidden terminal TUI visual restore', () => {
   })
 
   test('keeps hidden terminal side effects live while hidden output may restore', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    const firstWorktreeId = await waitForActiveWorktree(orcaBotmuxPage)
-    const secondWorktreeId = (await getAllWorktreeIds(orcaBotmuxPage)).find(
+    await waitForSessionReady(botmuxPage)
+    const firstWorktreeId = await waitForActiveWorktree(botmuxPage)
+    const secondWorktreeId = (await getAllWorktreeIds(botmuxPage)).find(
       (id) => id !== firstWorktreeId
     )
     test.skip(!secondWorktreeId, 'hidden side-effect guard needs the seeded secondary worktree')
@@ -497,18 +497,18 @@ test.describe('Hidden terminal TUI visual restore', () => {
       return
     }
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    const hiddenSnapshot = await waitForPaneIdentitySnapshot(orcaBotmuxPage, 1)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    const hiddenSnapshot = await waitForPaneIdentitySnapshot(botmuxPage, 1)
     const hiddenPane = hiddenSnapshot.panes[0]
     if (!hiddenPane?.ptyId) {
       throw new Error('hidden side-effect pane did not bind a PTY')
     }
 
-    await switchToWorktree(orcaBotmuxPage, firstWorktreeId)
+    await switchToWorktree(botmuxPage, firstWorktreeId)
     await expect
-      .poll(() => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(() => getActiveWorktreeId(botmuxPage), {
         timeout: 10_000,
         message: 'first worktree did not become active before hidden side-effect burst'
       })
@@ -517,33 +517,33 @@ test.describe('Hidden terminal TUI visual restore', () => {
     const runId = randomUUID()
     const hiddenTitle = `Hidden model side effects ${runId}`
     const marker = `HIDDEN_SIDE_EFFECT_MARKER_${runId}`
-    await resetHiddenDebug(orcaBotmuxPage)
-    await writeHiddenSideEffectBurst(orcaBotmuxPage, hiddenPane.ptyId, hiddenTitle, marker)
+    await resetHiddenDebug(botmuxPage)
+    await writeHiddenSideEffectBurst(botmuxPage, hiddenPane.ptyId, hiddenTitle, marker)
 
     await expect
-      .poll(() => getRuntimePaneTitle(orcaBotmuxPage, hiddenSnapshot.tabId, hiddenPane.numericPaneId), {
+      .poll(() => getRuntimePaneTitle(botmuxPage, hiddenSnapshot.tabId, hiddenPane.numericPaneId), {
         timeout: 10_000,
         message: 'hidden OSC title did not update renderer-visible model state'
       })
       .toBe(hiddenTitle)
     await expect
-      .poll(async () => (await getUnreadTerminalTabIds(orcaBotmuxPage)).includes(hiddenSnapshot.tabId), {
+      .poll(async () => (await getUnreadTerminalTabIds(botmuxPage)).includes(hiddenSnapshot.tabId), {
         timeout: 10_000,
         message: 'hidden BEL did not mark the hidden terminal tab unread'
       })
       .toBe(true)
     await expect
-      .poll(() => readMainSnapshotSource(orcaBotmuxPage, hiddenPane.ptyId!), {
+      .poll(() => readMainSnapshotSource(botmuxPage, hiddenPane.ptyId!), {
         timeout: 10_000,
         message: 'hidden side-effect restore did not use the runtime headless snapshot'
       })
       .toBe('headless')
 
-    await switchToWorktree(orcaBotmuxPage, secondWorktreeId)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await switchToWorktree(botmuxPage, secondWorktreeId)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 12_000), {
+      .poll(() => getTerminalContent(botmuxPage, 12_000), {
         timeout: 10_000,
         message: 'hidden side-effect marker did not restore when the workspace became visible'
       })

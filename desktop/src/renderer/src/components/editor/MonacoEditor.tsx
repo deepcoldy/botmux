@@ -457,7 +457,7 @@ export default function MonacoEditor({
         return true
       })
       const searchInFilesAction = editorInstance.addAction({
-        id: 'orca_botmux.searchInFiles',
+        id: 'botmux.searchInFiles',
         label: translate('auto.components.editor.MonacoEditor.fd68ae03b3', 'Search in Files'),
         contextMenuGroupId: 'navigation',
         contextMenuOrder: 2,
@@ -854,7 +854,7 @@ export default function MonacoEditor({
       {selectionAnnotationTarget && shouldShowMarkdownAnnotations && !commentPopover ? (
         <button
           type="button"
-          className="orca-botmux-diff-comment-add-btn"
+          className="botmux-diff-comment-add-btn"
           style={{
             display: 'flex',
             top: Math.max(4, selectionAnnotationTarget.top - 22),
@@ -885,7 +885,7 @@ export default function MonacoEditor({
       <Editor
         height={renderedEditorHeight === null ? '100%' : `${renderedEditorHeight}px`}
         language={language}
-        // Why: OrcaBotmux's mount/layout reconciliation is the sole post-mount content
+        // Why: Botmux's mount/layout reconciliation is the sole post-mount content
         // owner; the wrapper's controlled read-only path would also call setValue.
         defaultValue={content}
         theme={isDark ? 'vs-dark' : 'vs'}
@@ -921,14 +921,14 @@ export default function MonacoEditor({
             seedSearchStringFromSelection: 'never'
           },
           // Why: Monaco has its own Linux primary-selection integration; keep
-          // it aligned with OrcaBotmux's app-level opt-out instead of relying on the
+          // it aligned with Botmux's app-level opt-out instead of relying on the
           // global DOM hook, which does not own Monaco's rendered line surface.
           selectionClipboard: settings?.primarySelectionMiddleClickPaste ?? isLinuxUserAgent()
         }}
         path={filePath}
         // Why: keepCurrentModel preserves the Monaco text model so undo/redo
         // survives tab switches, but @monaco-editor/react's own view-state Map
-        // would become a second state owner. OrcaBotmux restores cursor/scroll from
+        // would become a second state owner. Botmux restores cursor/scroll from
         // its explicit caches so close/reopen semantics stay under app control.
         saveViewState={false}
         keepCurrentModel

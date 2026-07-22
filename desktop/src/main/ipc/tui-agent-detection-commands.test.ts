@@ -14,36 +14,36 @@ describe('tui agent detection commands', () => {
     expect(commands).toEqual([
       {
         id: 'claude-agent-teams',
-        cmd: 'orca_botmux',
+        cmd: 'botmux',
         requiredCommands: ['claude'],
         unsupportedRuntimes: ['win32', 'wsl']
       },
       {
         id: 'claude-agent-teams',
-        cmd: 'orca-botmux-desktop-dev',
+        cmd: 'botmux-desktop-dev',
         requiredCommands: ['claude'],
         unsupportedRuntimes: ['win32', 'wsl']
       },
       {
         id: 'claude-agent-teams',
-        cmd: 'orca-botmux-ide',
+        cmd: 'botmux-ide',
         requiredCommands: ['claude'],
         unsupportedRuntimes: ['win32', 'wsl']
       }
     ])
     expect(getTuiAgentDetectionProbeCommands(commands, 'linux')).toEqual([
-      'orca_botmux',
+      'botmux',
       'claude',
-      'orca-botmux-desktop-dev',
-      'orca-botmux-ide'
+      'botmux-desktop-dev',
+      'botmux-ide'
     ])
-    expect(resolveDetectedTuiAgentIds(commands, new Set(['orca_botmux']), 'linux')).toEqual([])
-    expect(resolveDetectedTuiAgentIds(commands, new Set(['orca_botmux', 'claude']), 'linux')).toEqual([
+    expect(resolveDetectedTuiAgentIds(commands, new Set(['botmux']), 'linux')).toEqual([])
+    expect(resolveDetectedTuiAgentIds(commands, new Set(['botmux', 'claude']), 'linux')).toEqual([
       'claude-agent-teams'
     ])
     expect(getTuiAgentDetectionProbeCommands(commands, 'win32')).toEqual([])
-    expect(resolveDetectedTuiAgentIds(commands, new Set(['orca_botmux', 'claude']), 'win32')).toEqual([])
+    expect(resolveDetectedTuiAgentIds(commands, new Set(['botmux', 'claude']), 'win32')).toEqual([])
     expect(getTuiAgentDetectionProbeCommands(commands, 'wsl')).toEqual([])
-    expect(resolveDetectedTuiAgentIds(commands, new Set(['orca-botmux-ide', 'claude']), 'wsl')).toEqual([])
+    expect(resolveDetectedTuiAgentIds(commands, new Set(['botmux-ide', 'claude']), 'wsl')).toEqual([])
   })
 })

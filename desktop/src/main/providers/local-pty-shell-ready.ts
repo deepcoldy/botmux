@@ -4,7 +4,7 @@
 /**
  * Shell-ready startup command support for local PTYs.
  *
- * Why: when OrcaBotmux needs to inject a startup command (e.g. issue command runner),
+ * Why: when Botmux needs to inject a startup command (e.g. issue command runner),
  * it must wait until the shell has fully initialized before writing. This module
  * provides shell wrapper rcfiles that emit an OSC 777 marker after startup,
  * and a data scanner that detects that marker so the command can be written at
@@ -40,7 +40,7 @@ let didEnsureShellReadyWrappers = false
 const STARTUP_COMMAND_READY_MAX_WAIT_MS = 1500
 const POST_SHELL_READY_STARTUP_COMMAND_DELAY_MS = 30
 const POST_SHELL_READY_STARTUP_COMMAND_FALLBACK_MS = 200
-const SHELL_READY_MARKER_ESCAPED = '\\033]777;orca-botmux-shell-ready\\007'
+const SHELL_READY_MARKER_ESCAPED = '\\033]777;botmux-shell-ready\\007'
 
 export type ShellReadySignal = {
   postMarkerBytesObserved: boolean
@@ -51,9 +51,9 @@ export type ShellReadySignal = {
 function getShellReadyWrapperRoot(): string {
   // Why: bundled into daemon-entry.js (a plain-node fork with no electron
   // require), so this must not import electron. Main canonicalizes
-  // ORCA_USER_DATA_PATH to its own userData at startup (configureOrcaUserDataPathEnv)
+  // BOTMUX_USER_DATA_PATH to its own userData at startup (configureBotmuxUserDataPathEnv)
   // and the daemon fork sets it explicitly, so the env value matches this root.
-  const userDataPath = process.env.ORCA_USER_DATA_PATH ?? tmpdir()
+  const userDataPath = process.env.BOTMUX_USER_DATA_PATH ?? tmpdir()
   return `${userDataPath}/shell-ready`
 }
 
@@ -72,15 +72,15 @@ function shellReadyWrappersExist(root = getShellReadyWrapperRoot()): boolean {
 }
 
 // Why: if our own process inherited ZDOTDIR from a parent shell that was
-// itself an OrcaBotmux PTY (e.g. the user launched `pn dev` from a terminal inside
-// a running OrcaBotmux), that ZDOTDIR points at an OrcaBotmux shell-ready wrapper dir.
-// Propagating it as the new PTY's ORCA_ORIG_ZDOTDIR makes the wrapper's
-// `source "$ORCA_ORIG_ZDOTDIR/.zshenv"` line source itself recursively —
+// itself an Botmux PTY (e.g. the user launched `pn dev` from a terminal inside
+// a running Botmux), that ZDOTDIR points at an Botmux shell-ready wrapper dir.
+// Propagating it as the new PTY's BOTMUX_ORIG_ZDOTDIR makes the wrapper's
+// `source "$BOTMUX_ORIG_ZDOTDIR/.zshenv"` line source itself recursively —
 // zsh gives "job table full or recursion limit exceeded" and the shell
 // never reaches a usable prompt.
 //
-// Any path component ending in `/shell-ready/zsh` is an OrcaBotmux wrapper dir
-// (regardless of whether it came from this app's userData, a packaged OrcaBotmux,
+// Any path component ending in `/shell-ready/zsh` is an Botmux wrapper dir
+// (regardless of whether it came from this app's userData, a packaged Botmux,
 // or a different dev build). Treat it as if ZDOTDIR were unset so the caller
 // falls back to HOME for the user's real config root.
 function normalizeOriginalZdotdirCandidate(value: string | undefined): string | null {
@@ -102,7 +102,7 @@ function normalizeOriginalZdotdirCandidate(value: string | undefined): string | 
 function resolveOriginalZdotdir(): string {
   return (
     normalizeOriginalZdotdirCandidate(process.env.ZDOTDIR) ||
-    normalizeOriginalZdotdirCandidate(process.env.ORCA_ORIG_ZDOTDIR) ||
+    normalizeOriginalZdotdirCandidate(process.env.BOTMUX_ORIG_ZDOTDIR) ||
     process.env.HOME ||
     ''
   )
@@ -113,7 +113,7 @@ function resolveOriginalZshenvSourceDir(): string {
 }
 
 export function getBashShellReadyRcfileContent(): string {
-  return `# OrcaBotmux bash shell-ready wrapper
+  return `# Botmux bash shell-ready wrapper
 [[ -f /etc/profile ]] && source /etc/profile
 if [[ -f "$HOME/.bash_profile" ]]; then
   source "$HOME/.bash_profile"
@@ -122,169 +122,169 @@ elif [[ -f "$HOME/.bash_login" ]]; then
 elif [[ -f "$HOME/.profile" ]]; then
   source "$HOME/.profile"
 fi
-# Why: enable bracketed paste so OrcaBotmux can deliver a multiline startup prompt as
+# Why: enable bracketed paste so Botmux can deliver a multiline startup prompt as
 # a single literal paste (ESC[200~…ESC[201~). Without it, older readline builds
 # treat each embedded newline as Enter and mangle the prompt into PS2
 # continuation. Modern readline defaults this on; force it for the rest.
 [[ $- == *i* ]] && bind 'set enable-bracketed-paste on' 2>/dev/null
 # Why: preserve bash's normal login-shell contract. Many users already source
 # ~/.bashrc from ~/.bash_profile; forcing ~/.bashrc again here would duplicate
-# PATH edits, hooks, and prompt init in OrcaBotmux startup-command shells.
-__orca_restore_attribution_path() {
-  [[ -n "\${ORCA_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
+# PATH edits, hooks, and prompt init in Botmux startup-command shells.
+__botmux_restore_attribution_path() {
+  [[ -n "\${BOTMUX_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_ATTRIBUTION_SHIM_DIR}"|"\${ORCA_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_ATTRIBUTION_SHIM_DIR}"|"\${BOTMUX_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_ATTRIBUTION_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_ATTRIBUTION_SHIM_DIR}:$PATH"
 }
-__orca_restore_attribution_path
-__orca_restore_agent_teams_path() {
-  [[ -n "\${ORCA_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
+__botmux_restore_attribution_path
+__botmux_restore_agent_teams_path() {
+  [[ -n "\${BOTMUX_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_AGENT_TEAMS_SHIM_DIR}"|"\${ORCA_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_AGENT_TEAMS_SHIM_DIR}"|"\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_AGENT_TEAMS_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:$PATH"
 }
-__orca_restore_agent_teams_path
-# Why: user startup files may set the default OpenCode config after OrcaBotmux's
-# spawn env; restore the OrcaBotmux-managed config dir before the first prompt.
-[[ -n "\${ORCA_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${ORCA_OPENCODE_CONFIG_DIR}"
-[[ -n "\${ORCA_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${ORCA_MIMOCODE_HOME}"
+__botmux_restore_agent_teams_path
+# Why: user startup files may set the default OpenCode config after Botmux's
+# spawn env; restore the Botmux-managed config dir before the first prompt.
+[[ -n "\${BOTMUX_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${BOTMUX_OPENCODE_CONFIG_DIR}"
+[[ -n "\${BOTMUX_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${BOTMUX_MIMOCODE_HOME}"
 ${getPosixOmpShellWrapper()}
-# Why: Codex must keep using OrcaBotmux's runtime CODEX_HOME after profile scripts.
-[[ -n "\${ORCA_CODEX_HOME:-}" ]] && export CODEX_HOME="\${ORCA_CODEX_HOME}"
+# Why: Codex must keep using Botmux's runtime CODEX_HOME after profile scripts.
+[[ -n "\${BOTMUX_CODEX_HOME:-}" ]] && export CODEX_HOME="\${BOTMUX_CODEX_HOME}"
 # Why: emit OSC 133 C/D so terminal-command-lifecycle can drop stale agent
 # status when the foreground command (e.g. an interrupted Claude/Codex CLI)
 # exits — mirrors the zsh wrapper. Without this, bash users (default on most
 # Linux distros) keep a stuck 'working' spinner for up to 30 min after the
 # CLI exits without sending a Stop/SessionEnd hook.
-__orca_osc133_precmd() {
+__botmux_osc133_precmd() {
   local exit_code=$?
-  __orca_in_prompt_command=1
-  if [[ -n "\${__orca_in_command:-}" ]]; then
+  __botmux_in_prompt_command=1
+  if [[ -n "\${__botmux_in_command:-}" ]]; then
     printf "\\033]133;D;%s\\007" "$exit_code"
-    unset __orca_in_command
+    unset __botmux_in_command
   fi
   printf "\\033]133;A\\007"
 }
-__orca_osc133_prompt_done() {
-  unset __orca_in_prompt_command
+__botmux_osc133_prompt_done() {
+  unset __botmux_in_prompt_command
 }
-__orca_run_user_debug_trap() {
-  if [[ -n "\${__orca_user_debug_trap:-}" ]]; then
-    eval "$__orca_user_debug_trap" || true
+__botmux_run_user_debug_trap() {
+  if [[ -n "\${__botmux_user_debug_trap:-}" ]]; then
+    eval "$__botmux_user_debug_trap" || true
   fi
 }
-__orca_osc133_preexec() {
-  __orca_run_user_debug_trap
-  [[ -z "\${__orca_in_prompt_command:-}" ]] || return
+__botmux_osc133_preexec() {
+  __botmux_run_user_debug_trap
+  [[ -z "\${__botmux_in_prompt_command:-}" ]] || return
   # Why: bash DEBUG fires for every simple command, including PROMPT_COMMAND
   # bodies. Skip our own prompt-time helpers so they don't mark the shell as
   # "in command" before the prompt has even drawn.
   case "$BASH_COMMAND" in
-    *__orca_osc133_precmd*|*__orca_osc133_prompt_done*|*__orca_prompt_mark*) return ;;
+    *__botmux_osc133_precmd*|*__botmux_osc133_prompt_done*|*__botmux_prompt_mark*) return ;;
   esac
   printf "\\033]133;C\\007"
-  __orca_in_command=1
+  __botmux_in_command=1
 }
 # Why: prepend so we capture $? before the user's PROMPT_COMMAND chain mutates it.
-__orca_normalize_prompt_command() {
-  local __orca_joined="" __orca_prompt_part
+__botmux_normalize_prompt_command() {
+  local __botmux_joined="" __botmux_prompt_part
   if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
-    for __orca_prompt_part in "\${PROMPT_COMMAND[@]}"; do
-      [[ -n "$__orca_prompt_part" ]] || continue
-      if [[ -n "$__orca_joined" ]]; then
-        __orca_joined="$__orca_joined;$__orca_prompt_part"
+    for __botmux_prompt_part in "\${PROMPT_COMMAND[@]}"; do
+      [[ -n "$__botmux_prompt_part" ]] || continue
+      if [[ -n "$__botmux_joined" ]]; then
+        __botmux_joined="$__botmux_joined;$__botmux_prompt_part"
       else
-        __orca_joined="$__orca_prompt_part"
+        __botmux_joined="$__botmux_prompt_part"
       fi
     done
-    PROMPT_COMMAND="$__orca_joined"
+    PROMPT_COMMAND="$__botmux_joined"
   fi
 }
-__orca_prepend_prompt_command() {
-  __orca_normalize_prompt_command
-  PROMPT_COMMAND="__orca_osc133_precmd\${PROMPT_COMMAND:+;\${PROMPT_COMMAND}}"
+__botmux_prepend_prompt_command() {
+  __botmux_normalize_prompt_command
+  PROMPT_COMMAND="__botmux_osc133_precmd\${PROMPT_COMMAND:+;\${PROMPT_COMMAND}}"
 }
-__orca_append_prompt_command() {
+__botmux_append_prompt_command() {
   local command="$1"
-  __orca_normalize_prompt_command
+  __botmux_normalize_prompt_command
   if [[ -n "\${PROMPT_COMMAND:-}" ]]; then
     PROMPT_COMMAND="\${PROMPT_COMMAND};$command"
   else
     PROMPT_COMMAND="$command"
   fi
 }
-__orca_prepend_prompt_command
+__botmux_prepend_prompt_command
 # Why: append the marker through PROMPT_COMMAND so it fires after the login
 # startup files have rebuilt the prompt, without re-running user rc files.
-if [[ "\${ORCA_SHELL_READY_MARKER:-0}" == "1" ]]; then
-  __orca_prompt_mark() {
+if [[ "\${BOTMUX_SHELL_READY_MARKER:-0}" == "1" ]]; then
+  __botmux_prompt_mark() {
     printf "${SHELL_READY_MARKER_ESCAPED}"
   }
-  __orca_append_prompt_command "__orca_prompt_mark"
+  __botmux_append_prompt_command "__botmux_prompt_mark"
 fi
-__orca_append_prompt_command "__orca_osc133_prompt_done"
-__orca_debug_trap_spec="$(trap -p DEBUG)"
-if [[ -n "$__orca_debug_trap_spec" ]]; then
-  __orca_debug_trap_command="\${__orca_debug_trap_spec#trap -- }"
-  __orca_debug_trap_command="\${__orca_debug_trap_command% DEBUG}"
-  eval "__orca_user_debug_trap=$__orca_debug_trap_command"
+__botmux_append_prompt_command "__botmux_osc133_prompt_done"
+__botmux_debug_trap_spec="$(trap -p DEBUG)"
+if [[ -n "$__botmux_debug_trap_spec" ]]; then
+  __botmux_debug_trap_command="\${__botmux_debug_trap_spec#trap -- }"
+  __botmux_debug_trap_command="\${__botmux_debug_trap_command% DEBUG}"
+  eval "__botmux_user_debug_trap=$__botmux_debug_trap_command"
 fi
-unset __orca_debug_trap_spec __orca_debug_trap_command
-unset -f __orca_normalize_prompt_command __orca_prepend_prompt_command __orca_append_prompt_command
+unset __botmux_debug_trap_spec __botmux_debug_trap_command
+unset -f __botmux_normalize_prompt_command __botmux_prepend_prompt_command __botmux_append_prompt_command
 # Why: arm DEBUG after wrapper setup; otherwise bash treats our own rcfile
 # commands as a foreground command and emits a fake C/D before the first prompt.
-trap '__orca_osc133_preexec' DEBUG
+trap '__botmux_osc133_preexec' DEBUG
 `
 }
 
 export function getZshShellReadyRcfileContent(): string {
-  return `# OrcaBotmux zsh shell-ready wrapper
+  return `# Botmux zsh shell-ready wrapper
 ${getZshStartupFileSourceBlock({
   fileName: '.zshrc',
   interactiveOnly: true,
   skipWhenHomeIsCurrentZdotdir: true
 })}
-__orca_restore_attribution_path() {
-  [[ -n "\${ORCA_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
+__botmux_restore_attribution_path() {
+  [[ -n "\${BOTMUX_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_ATTRIBUTION_SHIM_DIR}"|"\${ORCA_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_ATTRIBUTION_SHIM_DIR}"|"\${BOTMUX_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_ATTRIBUTION_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_ATTRIBUTION_SHIM_DIR}:$PATH"
 }
-[[ ! -o login ]] && __orca_restore_attribution_path
-__orca_restore_agent_teams_path() {
-  [[ -n "\${ORCA_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
+[[ ! -o login ]] && __botmux_restore_attribution_path
+__botmux_restore_agent_teams_path() {
+  [[ -n "\${BOTMUX_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_AGENT_TEAMS_SHIM_DIR}"|"\${ORCA_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_AGENT_TEAMS_SHIM_DIR}"|"\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_AGENT_TEAMS_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:$PATH"
 }
-[[ ! -o login ]] && __orca_restore_agent_teams_path
+[[ ! -o login ]] && __botmux_restore_agent_teams_path
 if [[ ! -o login ]]; then
   # Why: ~/.zshrc can export the user's default OpenCode config after spawn.
-  [[ -n "\${ORCA_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${ORCA_OPENCODE_CONFIG_DIR}"
-[[ -n "\${ORCA_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${ORCA_MIMOCODE_HOME}"
+  [[ -n "\${BOTMUX_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${BOTMUX_OPENCODE_CONFIG_DIR}"
+[[ -n "\${BOTMUX_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${BOTMUX_MIMOCODE_HOME}"
   ${getPosixOmpShellWrapper()}
-  # Why: Codex must keep using OrcaBotmux's runtime CODEX_HOME after rc files.
-  [[ -n "\${ORCA_CODEX_HOME:-}" ]] && export CODEX_HOME="\${ORCA_CODEX_HOME}"
+  # Why: Codex must keep using Botmux's runtime CODEX_HOME after rc files.
+  [[ -n "\${BOTMUX_CODEX_HOME:-}" ]] && export CODEX_HOME="\${BOTMUX_CODEX_HOME}"
 fi
-__orca_osc133_precmd() {
+__botmux_osc133_precmd() {
   local exit_code=$?
-  if [[ -n "\${__orca_in_command:-}" ]]; then
+  if [[ -n "\${__botmux_in_command:-}" ]]; then
     printf "\\033]133;D;%s\\007" "$exit_code"
-    unset __orca_in_command
+    unset __botmux_in_command
   fi
   printf "\\033]133;A\\007"
 }
-__orca_osc133_preexec() {
+__botmux_osc133_preexec() {
   printf "\\033]133;C\\007"
-  __orca_in_command=1
+  __botmux_in_command=1
 }
-# Why: prepend so OrcaBotmux captures $? before user prompt hooks can overwrite it.
-precmd_functions=(__orca_osc133_precmd \${precmd_functions[@]})
-preexec_functions=(__orca_osc133_preexec \${preexec_functions[@]})
+# Why: prepend so Botmux captures $? before user prompt hooks can overwrite it.
+precmd_functions=(__botmux_osc133_precmd \${precmd_functions[@]})
+preexec_functions=(__botmux_osc133_preexec \${preexec_functions[@]})
 if [[ ! -o login ]]; then
 ${getZshFinalZdotdirRestoreBlock()}
 fi
@@ -301,33 +301,33 @@ export function ensureShellReadyWrappersAt(root = getShellReadyWrapperRoot()): v
   const bashDir = `${root}/bash`
 
   const zshEnv = getZshEnvTemplate(zshDir)
-  const zshProfile = `# OrcaBotmux zsh shell-ready wrapper
+  const zshProfile = `# Botmux zsh shell-ready wrapper
 ${getZshStartupFileSourceBlock({ fileName: '.zprofile' })}
 `
   const zshRc = getZshShellReadyRcfileContent()
-  const zshLogin = `# OrcaBotmux zsh shell-ready wrapper
+  const zshLogin = `# Botmux zsh shell-ready wrapper
 ${getZshStartupFileSourceBlock({ fileName: '.zlogin', interactiveOnly: true })}
-__orca_restore_attribution_path() {
-  [[ -n "\${ORCA_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
+__botmux_restore_attribution_path() {
+  [[ -n "\${BOTMUX_ATTRIBUTION_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_ATTRIBUTION_SHIM_DIR}"|"\${ORCA_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_ATTRIBUTION_SHIM_DIR}"|"\${BOTMUX_ATTRIBUTION_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_ATTRIBUTION_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_ATTRIBUTION_SHIM_DIR}:$PATH"
 }
-__orca_restore_attribution_path
-__orca_restore_agent_teams_path() {
-  [[ -n "\${ORCA_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
+__botmux_restore_attribution_path
+__botmux_restore_agent_teams_path() {
+  [[ -n "\${BOTMUX_AGENT_TEAMS_SHIM_DIR:-}" ]] || return 0
   case "$PATH" in
-    "\${ORCA_AGENT_TEAMS_SHIM_DIR}"|"\${ORCA_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
+    "\${BOTMUX_AGENT_TEAMS_SHIM_DIR}"|"\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:"*) return 0 ;;
   esac
-  export PATH="\${ORCA_AGENT_TEAMS_SHIM_DIR}:$PATH"
+  export PATH="\${BOTMUX_AGENT_TEAMS_SHIM_DIR}:$PATH"
 }
-__orca_restore_agent_teams_path
+__botmux_restore_agent_teams_path
 # Why: .zlogin is the final login startup file before the prompt is shown.
-[[ -n "\${ORCA_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${ORCA_OPENCODE_CONFIG_DIR}"
-[[ -n "\${ORCA_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${ORCA_MIMOCODE_HOME}"
+[[ -n "\${BOTMUX_OPENCODE_CONFIG_DIR:-}" ]] && export OPENCODE_CONFIG_DIR="\${BOTMUX_OPENCODE_CONFIG_DIR}"
+[[ -n "\${BOTMUX_MIMOCODE_HOME:-}" ]] && export MIMOCODE_HOME="\${BOTMUX_MIMOCODE_HOME}"
 ${getPosixOmpShellWrapper()}
-[[ -n "\${ORCA_CODEX_HOME:-}" ]] && export CODEX_HOME="\${ORCA_CODEX_HOME}"
+[[ -n "\${BOTMUX_CODEX_HOME:-}" ]] && export CODEX_HOME="\${BOTMUX_CODEX_HOME}"
 ${getZshShellReadyMarkerRegistrationBlock(SHELL_READY_MARKER_ESCAPED)}
 ${getZshFinalZdotdirRestoreBlock()}
 `
@@ -390,10 +390,10 @@ function getWrappedShellLaunchConfig(
     return {
       args: ['-l'],
       env: {
-        ORCA_ORIG_ZDOTDIR: resolveOriginalZdotdir(),
-        ORCA_ZSHENV_SOURCE_DIR: resolveOriginalZshenvSourceDir(),
+        BOTMUX_ORIG_ZDOTDIR: resolveOriginalZdotdir(),
+        BOTMUX_ZSHENV_SOURCE_DIR: resolveOriginalZshenvSourceDir(),
         ZDOTDIR: `${getShellReadyWrapperRoot()}/zsh`,
-        ORCA_SHELL_READY_MARKER: options.emitReadyMarker ? '1' : '0'
+        BOTMUX_SHELL_READY_MARKER: options.emitReadyMarker ? '1' : '0'
       },
       supportsReadyMarker: options.emitReadyMarker
     }
@@ -404,7 +404,7 @@ function getWrappedShellLaunchConfig(
     return {
       args: ['--rcfile', `${getShellReadyWrapperRoot()}/bash/rcfile`],
       env: {
-        ORCA_SHELL_READY_MARKER: options.emitReadyMarker ? '1' : '0'
+        BOTMUX_SHELL_READY_MARKER: options.emitReadyMarker ? '1' : '0'
       },
       supportsReadyMarker: options.emitReadyMarker
     }
@@ -445,7 +445,7 @@ export function writeStartupCommandWhenShellReady(
   proc: pty.IPty,
   startupCommand: string,
   onExit: (cleanup: () => void) => void,
-  // Why: only OrcaBotmux-wrapped bash/zsh have bracketed-paste mode active, so
+  // Why: only Botmux-wrapped bash/zsh have bracketed-paste mode active, so
   // multiline startup commands are wrapped in ESC[200~/ESC[201~ only there;
   // other shells keep the raw submit path to avoid echoing the markers.
   options: { bracketedPasteSafe?: boolean } = {}
@@ -475,13 +475,13 @@ export function writeStartupCommandWhenShellReady(
       clearTimeout(postReadyTimer)
       postReadyTimer = null
     }
-    // Why: run startup commands inside the same interactive shell OrcaBotmux keeps
+    // Why: run startup commands inside the same interactive shell Botmux keeps
     // open for the pane. Spawning `shell -c <command>; exec shell -l` would
     // avoid the race, but it would also replace the session after the agent
     // exits and break "stay in this terminal" workflows.
     // Why CR on Windows: PowerShell's PSReadLine and cmd.exe submit the line
     // on CR (`\r`) — a bare LF leaves the command typed at the prompt but
-    // unsubmitted, forcing the user to press Enter after OrcaBotmux launches the
+    // unsubmitted, forcing the user to press Enter after Botmux launches the
     // agent or setup script. POSIX shells (bash/zsh) treat either CR or LF as
     // Enter under ICRNL, so CR works there too, but this code path is reached
     // on Windows as well as POSIX via writeStartupCommandWhenShellReady.

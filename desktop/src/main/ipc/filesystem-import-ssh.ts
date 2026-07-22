@@ -42,8 +42,8 @@ export async function importExternalPathsSsh(
   const provider = requireSshFilesystemProvider(connectionId)
 
   if (options?.ensureDir) {
-    // Why: terminal-drop staging needs `${worktree}/.orca_botmux/drops` to exist
-    // before the first upload. .orca_botmux/ is reserved as OrcaBotmux-owned remote state;
+    // Why: terminal-drop staging needs `${worktree}/.botmux/drops` to exist
+    // before the first upload. .botmux/ is reserved as Botmux-owned remote state;
     // see docs/terminal-drop-ssh.md.
     await ensureDropStagingDir(provider, destDir)
   }

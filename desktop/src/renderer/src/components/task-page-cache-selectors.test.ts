@@ -77,20 +77,20 @@ describe('task page cache selectors', () => {
     const localRepo = {
       id: 'repo-1',
       path: '/same/path',
-      sourceCacheScope: 'source:local:github:stablyai/orca_botmux'
+      sourceCacheScope: 'source:local:github:stablyai/botmux'
     }
     const sshRepo = {
       id: 'repo-1',
       path: '/same/path',
-      sourceCacheScope: 'source:ssh:devbox:github:stablyai/orca_botmux'
+      sourceCacheScope: 'source:ssh:devbox:github:stablyai/botmux'
     }
 
     expect(buildTaskPageRepoSourceState([localRepo, sshRepo], [])).toMatchObject([
       {
-        sourceKey: 'repo-1::source:local:github:stablyai/orca_botmux'
+        sourceKey: 'repo-1::source:local:github:stablyai/botmux'
       },
       {
-        sourceKey: 'repo-1::source:ssh:devbox:github:stablyai/orca_botmux'
+        sourceKey: 'repo-1::source:ssh:devbox:github:stablyai/botmux'
       }
     ])
   })

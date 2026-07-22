@@ -53,11 +53,11 @@ function makeAutomation(overrides: Partial<Automation> = {}): Automation {
     updatedAt: 1,
     runContext: {
       kind: 'workspace-run',
-      projectId: 'github:stablyai/orca_botmux',
+      projectId: 'github:stablyai/botmux',
       hostId: 'runtime:gpu',
       projectHostSetupId: 'setup-gpu',
       repoId: 'repo-1',
-      path: '/srv/orca_botmux'
+      path: '/srv/botmux'
     },
     ...overrides
   }
@@ -134,11 +134,11 @@ describe('automation host client', () => {
     const automation = makeAutomation({
       runContext: {
         kind: 'workspace-run',
-        projectId: 'github:stablyai/orca_botmux',
+        projectId: 'github:stablyai/botmux',
         hostId: 'ssh:devbox',
         projectHostSetupId: 'setup-devbox',
         repoId: 'repo-1',
-        path: '/srv/orca_botmux'
+        path: '/srv/botmux'
       }
     })
     const sourceTarget = { kind: 'environment' as const, environmentId: 'gpu' }

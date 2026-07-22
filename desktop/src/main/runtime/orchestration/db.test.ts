@@ -826,7 +826,7 @@ describe('OrchestrationDb', () => {
     })
 
     function createV1Snapshot(): string {
-      tempDir = mkdtempSync(join(tmpdir(), 'orca-botmux-db-migrate-'))
+      tempDir = mkdtempSync(join(tmpdir(), 'botmux-db-migrate-'))
       dbPath = join(tempDir, 'test.db')
       const raw = new Database(dbPath)
       // v1 schema: pre-heartbeat CHECK, no last_heartbeat_at column.

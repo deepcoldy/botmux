@@ -17,11 +17,11 @@ import {
 import { createHash } from 'node:crypto'
 import { mirrorEntry, safeRemoveTree } from '../pty/overlay-mirror'
 
-const ORCA_OPENCODE_PLUGIN_FILE = 'orca-botmux-opencode-status.js'
+const BOTMUX_OPENCODE_PLUGIN_FILE = 'botmux-opencode-status.js'
 const OPENCODE_LEGACY_HOOKS_DIR = 'opencode-hooks'
 const OPENCODE_OVERLAY_DIR = 'opencode-config-overlays'
 const OPENCODE_SHARED_CONFIG_DIR = 'shared'
-const OPENCODE_OVERLAY_MANIFEST_FILE = '.orca-botmux-opencode-overlay-manifest.json'
+const OPENCODE_OVERLAY_MANIFEST_FILE = '.botmux-opencode-overlay-manifest.json'
 
 type OpenCodeOverlayManifest = {
   topLevelEntries: string[]
@@ -65,8 +65,8 @@ export function getOpenCodePluginSource(): string {
 export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
   // Why: the plugin runs inside the OpenCode Node process and POSTs to the
   // unified agent-hooks server shared with Claude/Codex/Gemini. It reads the
-  // same ORCA_PANE_KEY / ORCA_TAB_ID / ORCA_WORKTREE_ID / ORCA_AGENT_HOOK_*
-  // env vars that OrcaBotmux injects into every PTY, so OpenCode panes flow into
+  // same BOTMUX_PANE_KEY / BOTMUX_TAB_ID / BOTMUX_WORKTREE_ID / BOTMUX_AGENT_HOOK_*
+  // env vars that Botmux injects into every PTY, so OpenCode panes flow into
   // agentStatusByPaneKey via the same IPC path as every other agent. Event
   // mapping is done plugin-side (SessionBusy / SessionIdle / PermissionRequest)
   // so the server-side normalizer can keep its one-event-per-case switch shape.
@@ -74,13 +74,13 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '// Why: process-lifetime guard so a recurring parse error on a malformed',
     "// endpoint file does not spam OpenCode's stderr once per hook post.",
     '// This guard lives inside the plugin source because the plugin runs in',
-    "// OpenCode's Node process (not OrcaBotmux's) and has no access to server.ts's",
+    "// OpenCode's Node process (not Botmux's) and has no access to server.ts's",
     '// equivalent warnedVersions / warnedEnvs Sets.',
     'let warnedBadEndpoint = false;',
     '',
     '// Why: message.part.updated can fire many times per second during a',
     '// streaming assistant reply, and each post() calls resolveHookCoords()',
-    '// which reads the endpoint file. The file only changes on OrcaBotmux restart',
+    '// which reads the endpoint file. The file only changes on Botmux restart',
     '// (rare), so a stat+mtime check is substantially cheaper than a full',
     '// readFileSync+parse on every streamed part. On stat error we fall',
     '// through to parse so the fail-open behavior is preserved.',
@@ -88,14 +88,14 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     'let cachedEndpointValues = null;',
     '',
     'function readEndpointFile() {',
-    '  const path = process.env.ORCA_AGENT_HOOK_ENDPOINT;',
+    '  const path = process.env.BOTMUX_AGENT_HOOK_ENDPOINT;',
     '  if (!path) return null;',
     '  try {',
     '    const fs = require("fs");',
     '    try {',
     '      const stat = fs.statSync(path);',
     '      // Why: cache key combines mtime + size + inode. renameSync (used by',
-    '      // writeEndpointFile on the OrcaBotmux side) allocates a fresh inode on',
+    '      // writeEndpointFile on the Botmux side) allocates a fresh inode on',
     '      // POSIX and a new Windows file ID on NTFS, so ino changes on every',
     '      // legitimate rewrite even when mtimeMs resolution is coarse and size',
     '      // happens to match.',
@@ -109,7 +109,7 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '        // Why: Windows endpoint.cmd uses `set KEY=VALUE`; Unix endpoint.env',
     '        // uses `KEY=VALUE`. Making `set ` optional lets the same parser',
     '        // handle both without platform detection in the plugin. Allow',
-    '        // digits in the key for forward-compat with future ORCA_AGENT_HOOK_*',
+    '        // digits in the key for forward-compat with future BOTMUX_AGENT_HOOK_*',
     '        // names that may contain numerics, and strip a trailing CR so',
     '        // mixed-EOL files with lone `\\r` do not leak CR into the value.',
     '        const m = line.match(/^(?:set\\s+)?([A-Z0-9_]+)=(.*)$/);',
@@ -135,7 +135,7 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '    // pre-install case; stay silent for it.',
     '    if (err && err.code !== "ENOENT" && !warnedBadEndpoint) {',
     '      warnedBadEndpoint = true;',
-    '      console.warn("[orca-botmux-hook] failed to parse endpoint file:", err.message);',
+    '      console.warn("[botmux-hook] failed to parse endpoint file:", err.message);',
     '    }',
     '    return null;',
     '  }',
@@ -143,17 +143,17 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '',
     'function resolveHookCoords() {',
     '  // Why: prefer the on-disk endpoint file over process.env because env was',
-    '  // frozen when OpenCode was fork()ed — stale after an OrcaBotmux restart. The',
-    '  // file is rewritten on every OrcaBotmux start(), so sourcing it per post lets',
+    '  // frozen when OpenCode was fork()ed — stale after an Botmux restart. The',
+    '  // file is rewritten on every Botmux start(), so sourcing it per post lets',
     '  // a long-running OpenCode session reach the current server. Falls back',
-    '  // to process.env when the file is absent (first-run / pre-endpoint-file / OrcaBotmux',
+    '  // to process.env when the file is absent (first-run / pre-endpoint-file / Botmux',
     '  // never started writing the file).',
     '  const fileEnv = readEndpointFile() || {};',
     '  return {',
-    '    port: fileEnv.ORCA_AGENT_HOOK_PORT || process.env.ORCA_AGENT_HOOK_PORT,',
-    '    token: fileEnv.ORCA_AGENT_HOOK_TOKEN || process.env.ORCA_AGENT_HOOK_TOKEN,',
-    '    env: fileEnv.ORCA_AGENT_HOOK_ENV || process.env.ORCA_AGENT_HOOK_ENV || "",',
-    '    version: fileEnv.ORCA_AGENT_HOOK_VERSION || process.env.ORCA_AGENT_HOOK_VERSION || "",',
+    '    port: fileEnv.BOTMUX_AGENT_HOOK_PORT || process.env.BOTMUX_AGENT_HOOK_PORT,',
+    '    token: fileEnv.BOTMUX_AGENT_HOOK_TOKEN || process.env.BOTMUX_AGENT_HOOK_TOKEN,',
+    '    env: fileEnv.BOTMUX_AGENT_HOOK_ENV || process.env.BOTMUX_AGENT_HOOK_ENV || "",',
+    '    version: fileEnv.BOTMUX_AGENT_HOOK_VERSION || process.env.BOTMUX_AGENT_HOOK_VERSION || "",',
     '  };',
     '}',
     '',
@@ -166,7 +166,7 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '',
     '// Why: message.part.updated re-sends the FULL accumulated text of the part',
     '// after every streamed append, so posting each event forwards O(n^2) bytes',
-    '// per turn through OrcaBotmux (loopback HTTP -> main JSON parse -> status compare',
+    '// per turn through Botmux (loopback HTTP -> main JSON parse -> status compare',
     '// -> IPC -> renderer store update -> React commit). On Windows that flood',
     '// saturated both event loops and froze the whole UI a few seconds into a',
     '// streaming reply. The dashboard only needs a bounded preview at a human',
@@ -232,7 +232,7 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '',
     '// Why: oh-my-opencode style tools spawn child sessions that emit their',
     '// own session.idle / message events. Those child completions must not',
-    '// flip the root OrcaBotmux pane to done or overwrite the parent turn preview.',
+    '// flip the root Botmux pane to done or overwrite the parent turn preview.',
     '// Detect child sessions by checking `parentID` via client.session.list(),',
     '// cache the result per session, and fail closed (assume child) on lookup errors',
     '// so a transient SDK failure cannot create false "done" transitions.',
@@ -258,18 +258,18 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '',
     'async function post(hookEventName, extraProperties) {',
     '  // Why: resolve coords per post — the endpoint file may have been',
-    '  // rewritten by a newer OrcaBotmux since the last call. Pane/tab/worktree IDs',
+    '  // rewritten by a newer Botmux since the last call. Pane/tab/worktree IDs',
     '  // stay on process.env because they are per-PTY (stable for the life of',
-    '  // the OpenCode process), not per-OrcaBotmux-instance.',
+    '  // the OpenCode process), not per-Botmux-instance.',
     '  const coords = resolveHookCoords();',
-    '  const paneKey = process.env.ORCA_PANE_KEY;',
+    '  const paneKey = process.env.BOTMUX_PANE_KEY;',
     '  if (!coords.port || !coords.token || !paneKey) return;',
     `  const url = \`http://127.0.0.1:\${coords.port}${hookPathname}\`;`,
     '  const body = JSON.stringify({',
     '    paneKey,',
-    '    launchToken: process.env.ORCA_AGENT_LAUNCH_TOKEN || "",',
-    '    tabId: process.env.ORCA_TAB_ID || "",',
-    '    worktreeId: process.env.ORCA_WORKTREE_ID || "",',
+    '    launchToken: process.env.BOTMUX_AGENT_LAUNCH_TOKEN || "",',
+    '    tabId: process.env.BOTMUX_TAB_ID || "",',
+    '    worktreeId: process.env.BOTMUX_WORKTREE_ID || "",',
     '    env: coords.env,',
     '    version: coords.version,',
     '    payload: { hook_event_name: hookEventName, ...(extraProperties || {}) },',
@@ -279,13 +279,13 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '      method: "POST",',
     '      headers: {',
     '        "Content-Type": "application/json",',
-    '        "X-OrcaBotmux-Agent-Hook-Token": coords.token,',
+    '        "X-Botmux-Agent-Hook-Token": coords.token,',
     '      },',
     '      body,',
     '    });',
     '  } catch {',
     '    // Why: OpenCode session events must never fail the agent run just',
-    '    // because OrcaBotmux is unavailable or the local loopback request failed.',
+    '    // because Botmux is unavailable or the local loopback request failed.',
     '  }',
     '}',
     '',
@@ -303,7 +303,7 @@ export function getOpenCodeFamilyPluginSource(hookPathname: string): string {
     '// plugin factory with undefined during startup, which makes the',
     '// destructuring form throw synchronously and crash OpenCode with an opaque',
     '// UnknownError before any event is ever dispatched.',
-    'export const OrcaOpenCodeStatusPlugin = async (_ctx) => {',
+    'export const BotmuxOpenCodeStatusPlugin = async (_ctx) => {',
     '  const client = _ctx?.client;',
     '  return {',
     '  event: async ({ event }) => {',
@@ -426,7 +426,7 @@ export class OpenCodeHookService {
     if (!isUsableId(ptyId)) {
       // Why: defense-in-depth. If the id fails the bounds guard, a user-set
       // OPENCODE_CONFIG_DIR should still be preserved so OpenCode loads the
-      // user's own config — only the OrcaBotmux status plugin is forfeited.
+      // user's own config — only the Botmux status plugin is forfeited.
       return existingConfigDir ? { OPENCODE_CONFIG_DIR: existingConfigDir } : {}
     }
 
@@ -441,7 +441,7 @@ export class OpenCodeHookService {
     }
 
     // Why: do NOT `mkdir -p` the user's typoed path — overriding it with an
-    // OrcaBotmux-owned dir is the exact config-replacement failure mode documented in
+    // Botmux-owned dir is the exact config-replacement failure mode documented in
     // docs/opencode-config-dir-collision.md. Let OpenCode surface the typo on
     // its own; we only forfeit our status plugin for this pane.
     if (!existsSync(existingConfigDir)) {
@@ -506,7 +506,7 @@ export class OpenCodeHookService {
 
     const overlayPluginsDir = join(overlayDir, 'plugins')
     for (const entryName of manifest.pluginEntries) {
-      if (entryName === ORCA_OPENCODE_PLUGIN_FILE) {
+      if (entryName === BOTMUX_OPENCODE_PLUGIN_FILE) {
         continue
       }
       safeRemoveTree(join(overlayPluginsDir, entryName))
@@ -515,14 +515,14 @@ export class OpenCodeHookService {
 
   // Why: walks the user's OPENCODE_CONFIG_DIR top-level entries. The
   // `plugins/` subdirectory gets created as a real directory in the overlay
-  // so OrcaBotmux can drop a sibling file alongside the user's plugins; everything
+  // so Botmux can drop a sibling file alongside the user's plugins; everything
   // else (opencode.json, auth.json, themes/, etc.) is mirrored as a single
   // top-level entry via symlink/junction so user edits propagate live on
   // POSIX (and on Windows-with-developer-mode) without copying files.
   private mirrorUserConfig(sourceDir: string, overlayDir: string): void {
     const previousManifest = this.readOverlayManifest(overlayDir)
     // Why: source-scoped overlays persist across terminals. Only remove paths
-    // OrcaBotmux previously mirrored, so deleted/replaced user config cannot stay
+    // Botmux previously mirrored, so deleted/replaced user config cannot stay
     // stale while OpenCode-owned runtime dirs such as node_modules survive.
     this.clearManifestEntries(overlayDir, previousManifest)
 
@@ -560,16 +560,16 @@ export class OpenCodeHookService {
           const overlayPluginsDir = join(overlayDir, 'plugins')
           mkdirSync(overlayPluginsDir, { recursive: true })
           for (const pluginEntry of readdirSync(resolvedSource, { withFileTypes: true })) {
-            // Why: skip a user file with the same filename as OrcaBotmux's plugin —
+            // Why: skip a user file with the same filename as Botmux's plugin —
             // mirroring it here would either resolve a same-named target via
             // symlink (writePluginIntoOverlay then clobbers the user's file
             // through the link) or collide on Windows with the directory entry
             // about to be created by writePluginIntoOverlay. Either way the
             // user's plugin would be lost. Skipping yields the desired
-            // semantics: OrcaBotmux's status plugin runs and the user's same-named
+            // semantics: Botmux's status plugin runs and the user's same-named
             // plugin is shadowed for this PTY only — their source file on disk
             // is untouched.
-            if (pluginEntry.name === ORCA_OPENCODE_PLUGIN_FILE) {
+            if (pluginEntry.name === BOTMUX_OPENCODE_PLUGIN_FILE) {
               continue
             }
             mirrorEntry(
@@ -589,7 +589,7 @@ export class OpenCodeHookService {
     this.writeOverlayManifest(overlayDir, nextManifest)
   }
 
-  // Why: write OrcaBotmux's status plugin into the overlay's plugins/ dir. The
+  // Why: write Botmux's status plugin into the overlay's plugins/ dir. The
   // pre-write unlink is the load-bearing part — POSIX writeFileSync over a
   // symlink writes through to the link target, so without it a user-owned
   // plugin with this filename would be clobbered through a mirrored link.
@@ -599,7 +599,7 @@ export class OpenCodeHookService {
   private writePluginIntoOverlay(overlayDir: string): void {
     const pluginsDir = join(overlayDir, 'plugins')
     mkdirSync(pluginsDir, { recursive: true })
-    const pluginPath = join(pluginsDir, ORCA_OPENCODE_PLUGIN_FILE)
+    const pluginPath = join(pluginsDir, BOTMUX_OPENCODE_PLUGIN_FILE)
     try {
       unlinkSync(pluginPath)
     } catch {
@@ -614,7 +614,7 @@ export class OpenCodeHookService {
     const pluginsDir = join(configDir, 'plugins')
     try {
       mkdirSync(pluginsDir, { recursive: true })
-      writeFileSync(join(pluginsDir, ORCA_OPENCODE_PLUGIN_FILE), getOpenCodePluginSource())
+      writeFileSync(join(pluginsDir, BOTMUX_OPENCODE_PLUGIN_FILE), getOpenCodePluginSource())
     } catch {
       // Why: on Windows, userData directories can be locked by antivirus or
       // indexers (EPERM/EBUSY). Plugin config is non-critical — the PTY should

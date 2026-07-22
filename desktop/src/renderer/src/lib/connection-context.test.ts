@@ -388,7 +388,7 @@ describe('getConnectionId', () => {
     useAppStore.setState({ repos: [], worktreesByRepo: {} })
 
     expect(getConnectionId(FLOATING_TERMINAL_WORKTREE_ID)).toBeNull()
-    expect(getConnectionIdForFile(FLOATING_TERMINAL_WORKTREE_ID, '/tmp/orca_botmux/note.md')).toBeNull()
+    expect(getConnectionIdForFile(FLOATING_TERMINAL_WORKTREE_ID, '/tmp/botmux/note.md')).toBeNull()
     expect(isWorktreeConnectionResolved(FLOATING_TERMINAL_WORKTREE_ID)).toBe(true)
   })
 

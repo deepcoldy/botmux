@@ -40,7 +40,7 @@ function titleMatchesAgentNameGroup(title: string, agentName: string): boolean {
     return identityMatcher(title)
   }
   // Why: reuse the shared whole-token matcher so orchestration groups honor the
-  // same Windows launcher-suffix rule (e.g. `grok.exe`) as the rest of OrcaBotmux's
+  // same Windows launcher-suffix rule (e.g. `grok.exe`) as the rest of Botmux's
   // agent-title detection, instead of maintaining a divergent regex here.
   return buildAgentNameRe(agentName).test(title)
 }

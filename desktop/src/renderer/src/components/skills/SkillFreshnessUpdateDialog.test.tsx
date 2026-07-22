@@ -119,8 +119,8 @@ function placement(
 function eligibleInventory(): SkillFreshnessInventory {
   return {
     schemaVersion: 1,
-    installations: [placement('orca-botmux-cli')],
-    eligibleUpdateNames: ['orca-botmux-cli'],
+    installations: [placement('botmux-cli')],
+    eligibleUpdateNames: ['botmux-cli'],
     scannedAt: 1
   }
 }
@@ -192,7 +192,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     expect(container?.textContent).toContain('Update skills')
     expect(container?.textContent).toContain('1 skill can be updated safely')
     expect(mocks.terminalProps.at(-1)).toMatchObject({
-      command: 'npx skills update orca-botmux-cli --global',
+      command: 'npx skills update botmux-cli --global',
       description: 'Review the pre-filled command, then press Enter to run it.'
     })
   })
@@ -208,7 +208,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     mocks.inventory = eligibleInventory()
     await rerender()
 
-    expect(mocks.terminalProps.at(-1)?.command).toBe('npx skills update orca-botmux-cli --global')
+    expect(mocks.terminalProps.at(-1)?.command).toBe('npx skills update botmux-cli --global')
   })
 
   it('shows the up-to-date state once every installation is current', async () => {
@@ -219,15 +219,15 @@ describe('SkillFreshnessUpdateDialog', () => {
     mocks.inventory = {
       schemaVersion: 1,
       installations: [
-        placement('orca-botmux-cli', { status: 'current', observedPackageDigest: 'current' })
+        placement('botmux-cli', { status: 'current', observedPackageDigest: 'current' })
       ],
       eligibleUpdateNames: [],
       scannedAt: 2
     }
     await rerender()
 
-    expect(mocks.terminalCommits).toContainEqual(['npx skills update orca-botmux-cli --global', true])
-    expect(container?.textContent).toContain('All installed OrcaBotmux skills are up to date.')
+    expect(mocks.terminalCommits).toContainEqual(['npx skills update botmux-cli --global', true])
+    expect(container?.textContent).toContain('All installed Botmux skills are up to date.')
     expect(container?.querySelector('[data-testid="update-terminal"]')).toBeNull()
   })
 
@@ -238,7 +238,7 @@ describe('SkillFreshnessUpdateDialog', () => {
 
     mocks.inventory = {
       schemaVersion: 1,
-      installations: [placement('orca-botmux-cli', { topology: 'read-only' })],
+      installations: [placement('botmux-cli', { topology: 'read-only' })],
       eligibleUpdateNames: [],
       scannedAt: 2
     }
@@ -259,13 +259,13 @@ describe('SkillFreshnessUpdateDialog', () => {
     await rerender()
 
     expect(container?.querySelector('[data-testid="update-terminal"]')?.textContent).toBe(
-      'npx skills update orca-botmux-cli --global'
+      'npx skills update botmux-cli --global'
     )
 
     mocks.inventory = {
       schemaVersion: 1,
       installations: [
-        placement('orca-botmux-cli', { status: 'current', observedPackageDigest: 'current' })
+        placement('botmux-cli', { status: 'current', observedPackageDigest: 'current' })
       ],
       eligibleUpdateNames: [],
       scannedAt: 2
@@ -273,9 +273,9 @@ describe('SkillFreshnessUpdateDialog', () => {
     mocks.loading = false
     await rerender()
 
-    expect(container?.textContent).toContain('All installed OrcaBotmux skills are up to date.')
+    expect(container?.textContent).toContain('All installed Botmux skills are up to date.')
     expect(container?.querySelector('[data-testid="update-terminal"]')?.textContent).toBe(
-      'npx skills update orca-botmux-cli --global'
+      'npx skills update botmux-cli --global'
     )
   })
 
@@ -295,7 +295,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     mocks.loading = true
     await rerender()
 
-    expect(container?.textContent).toContain('Checking installed OrcaBotmux skills')
+    expect(container?.textContent).toContain('Checking installed Botmux skills')
     expect(container?.querySelector('[data-testid="update-terminal"]')).toBe(firstTerminal)
     expect(terminalWrapper?.hasAttribute('inert')).toBe(true)
     terminalInput?.blur()
@@ -329,7 +329,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     await openViaRequest()
 
     expect(container?.textContent).toContain('Could not inspect installed skills.')
-    expect(container?.textContent).not.toContain('Checking installed OrcaBotmux skills')
+    expect(container?.textContent).not.toContain('Checking installed Botmux skills')
     expect(container?.querySelector('[data-testid="update-terminal"]')).toBeNull()
   })
 
@@ -348,7 +348,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     await rerender()
 
     expect(container?.querySelector('[data-testid="update-terminal"]')?.textContent).toBe(
-      'npx skills update orca-botmux-cli --global'
+      'npx skills update botmux-cli --global'
     )
     expect(mocks.terminalProps.at(-1)).not.toBe(firstTerminal)
   })
@@ -357,14 +357,14 @@ describe('SkillFreshnessUpdateDialog', () => {
     mocks.inventory = {
       schemaVersion: 1,
       installations: [
-        placement('orca-botmux-cli'),
-        placement('orca-botmux-cli', {
+        placement('botmux-cli'),
+        placement('botmux-cli', {
           id: 'repo-copy',
           rootId: 'repo',
           sourceKind: 'repo',
           topology: 'repo-scope',
           status: 'unrecognized',
-          unresolvedPath: '/repo/.agents/skills/orca-botmux-cli'
+          unresolvedPath: '/repo/.agents/skills/botmux-cli'
         })
       ],
       eligibleUpdateNames: [],
@@ -383,7 +383,7 @@ describe('SkillFreshnessUpdateDialog', () => {
   it('explains a self-blocked read-only placement without blaming a sibling', async () => {
     mocks.inventory = {
       schemaVersion: 1,
-      installations: [placement('orca-botmux-cli', { topology: 'read-only' })],
+      installations: [placement('botmux-cli', { topology: 'read-only' })],
       eligibleUpdateNames: [],
       scannedAt: 1
     }
@@ -391,7 +391,7 @@ describe('SkillFreshnessUpdateDialog', () => {
     await openViaRequest()
 
     expect(container?.textContent).toContain(
-      'read-only location, so OrcaBotmux left it out of the update'
+      'read-only location, so Botmux left it out of the update'
     )
     expect(container?.textContent).toContain('Read only')
   })

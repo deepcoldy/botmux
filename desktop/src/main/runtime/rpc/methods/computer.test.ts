@@ -88,7 +88,7 @@ describe('computer RPC methods', () => {
   })
 
   it('returns provider capabilities through the sidecar', async () => {
-    const result = { platform: 'darwin', provider: 'orca-botmux-computer-use-macos', protocolVersion: 1 }
+    const result = { platform: 'darwin', provider: 'botmux-computer-use-macos', protocolVersion: 1 }
     computerMocks.callComputerSidecarCapabilities.mockResolvedValue(result)
 
     await expect(call('computer.capabilities', {})).resolves.toBe(result)
@@ -98,7 +98,7 @@ describe('computer RPC methods', () => {
   it('opens computer-use permission setup', async () => {
     const result = {
       platform: 'darwin',
-      helperAppPath: '/Applications/OrcaBotmux Computer Use.app',
+      helperAppPath: '/Applications/Botmux Computer Use.app',
       openedSettings: false,
       launchedHelper: true
     }
@@ -111,7 +111,7 @@ describe('computer RPC methods', () => {
   it('returns computer-use permission status', async () => {
     const result = {
       platform: 'darwin',
-      helperAppPath: '/Applications/OrcaBotmux Computer Use.app',
+      helperAppPath: '/Applications/Botmux Computer Use.app',
       helperUnavailableReason: null,
       permissions: [{ id: 'accessibility', status: 'granted' }]
     }

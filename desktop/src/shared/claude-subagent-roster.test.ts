@@ -296,7 +296,7 @@ describe('claude-subagent-roster', () => {
 
   it('removes a seeded phantom missing from a present list', () => {
     const roster: ClaudeSubagentRoster = new Map()
-    // A snapshot-seeded entry (child finished while OrcaBotmux was down) is
+    // A snapshot-seeded entry (child finished while Botmux was down) is
     // authoritative — a present list omitting it removes it even though its
     // id is teammate-shaped.
     roster.set('aprobe1-6d3cb5b5', {

@@ -613,15 +613,15 @@ function getWorktreeVisibilityMenuLabel(repo: Repo): string {
     repo,
     isLegacyRepoForExternalWorktreeVisibility(repo)
   )
-  return visibility === 'show' ? 'Hide non-OrcaBotmux worktrees' : 'Show hidden worktrees'
+  return visibility === 'show' ? 'Hide non-Botmux worktrees' : 'Show hidden worktrees'
 }
 
 const SIDEBAR_POINTER_DRAG_THRESHOLD_PX = 4
 type VirtualizedWorktreeViewportProps = {
   rows: HostSectionRow[]
   activeWorktreeId: string | null
-  /** Project worktree matched to active orca_botmux session cwd (secondary highlight). */
-  orcaBotmuxHighlightedWorktreeId: string | null
+  /** Project worktree matched to active botmux session cwd (secondary highlight). */
+  botmuxHighlightedWorktreeId: string | null
   currentWorktreeId: string | null
   groupBy: WorktreeGroupBy
   pinnedDisplayPolicy: PinnedWorktreeDisplayPolicy
@@ -728,13 +728,14 @@ function SectionMetricsBadge({ count }: { count: number }): React.JSX.Element {
   const totalLabel = formatSectionActivityLabel(count, 'workspace')
 
   return (
+    // Why: Apple-style count — plain tabular secondary text, no pill chrome.
     <span
-      className="inline-flex h-4 shrink-0 overflow-hidden rounded-full border border-worktree-sidebar-border bg-worktree-sidebar-accent text-[9px] font-medium leading-none text-muted-foreground/90"
+      className="inline-flex h-4 shrink-0 items-center overflow-hidden text-[10px] font-normal tabular-nums leading-none text-muted-foreground/70"
       aria-label={totalLabel}
     >
       <Tooltip>
         <TooltipTrigger asChild>
-          <span className="inline-flex h-full min-w-4 items-center justify-center px-1.5">
+          <span className="inline-flex h-full min-w-4 items-center justify-center px-1">
             {count}
           </span>
         </TooltipTrigger>
@@ -821,13 +822,16 @@ function HostSectionHeader({
         data-host-header-drag-id={row.hostId}
         aria-expanded={!row.collapsed}
         className={cn(
-          'group/host-header flex h-8 w-full cursor-pointer items-center gap-2 rounded-md border px-2 text-left transition-all',
+          'group/host-header flex h-8 w-full cursor-pointer items-center gap-2 rounded-lg border px-2 text-left transition-all duration-200 ease-[cubic-bezier(0.32,0.72,0,1)]',
+          'active:scale-[0.99] active:transition-transform active:duration-[80ms] active:ease-[cubic-bezier(0.25,0.46,0.45,0.94)]',
           onDragPointerDown && 'cursor-grab active:cursor-grabbing',
           isBlocked
             ? 'border-destructive/40 bg-destructive/10'
             : isDisconnected
-              ? 'border-worktree-sidebar-border/70 bg-worktree-sidebar-accent/35 text-muted-foreground'
-              : 'border-worktree-sidebar-border bg-worktree-sidebar-accent/70',
+              ? 'border-black/[0.04] bg-black/[0.015] text-muted-foreground dark:border-white/[0.05] dark:bg-white/[0.03]'
+              : // Why: Apple grouped-list material — whisper-light fill +
+                // hairline border; hover deepens a notch.
+                'border-black/[0.05] bg-black/[0.025] hover:bg-black/[0.045] dark:border-white/[0.07] dark:bg-white/[0.05] dark:hover:bg-white/[0.08]',
           dragging && 'pointer-events-none opacity-0'
         )}
         onPointerDown={onDragPointerDown}
@@ -870,7 +874,10 @@ function HostSectionHeader({
         </div>
         <div className="flex size-4 shrink-0 items-center justify-center text-muted-foreground/60 can-hover:opacity-0 transition-opacity group-hover/host-header:opacity-100">
           <ChevronDown
-            className={cn('size-3.5 transition-transform', row.collapsed && '-rotate-90')}
+            className={cn(
+              'size-3.5 transition-transform duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]',
+              row.collapsed && '-rotate-90'
+            )}
           />
         </div>
         <span data-host-header-action="">
@@ -1325,7 +1332,7 @@ function getVirtualRowKey(element: Element): string | null {
 const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewport({
   rows,
   activeWorktreeId,
-  orcaBotmuxHighlightedWorktreeId,
+  botmuxHighlightedWorktreeId,
   currentWorktreeId,
   groupBy,
   pinnedDisplayPolicy,
@@ -4870,11 +4877,11 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                   nativeLineageDropTargetId === itemRow.worktree.id)
               const isPinnedOverlayRow = itemRow.sectionKey === PINNED_GROUP_KEY
               const isActiveWorktree = activeWorktreeId === itemRow.worktree.id
-              // Why: orca_botmux agent host stays activeWorktreeId for terminals, but
+              // Why: botmux agent host stays activeWorktreeId for terminals, but
               // session cwd may map to a project worktree — show secondary
               // selection so left sidebar tracks tab/session switches.
-              const isOrcaBotmuxPathHighlight =
-                orcaBotmuxHighlightedWorktreeId === itemRow.worktree.id && !isActiveWorktree
+              const isBotmuxPathHighlight =
+                botmuxHighlightedWorktreeId === itemRow.worktree.id && !isActiveWorktree
               const activeSurfaceVariant = getActiveSurfaceVariant(itemRow)
               return (
                 <div
@@ -4882,7 +4889,7 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                   id={getWorktreeOptionId(itemRow.rowKey)}
                   role="option"
                   aria-selected={selectedWorktreeIds.has(itemRow.worktree.id)}
-                  aria-current={isActiveWorktree || isOrcaBotmuxPathHighlight ? 'page' : undefined}
+                  aria-current={isActiveWorktree || isBotmuxPathHighlight ? 'page' : undefined}
                   data-worktree-id={itemRow.worktree.id}
                   data-worktree-row-key={itemRow.rowKey}
                   data-worktree-section-key={itemRow.sectionKey}
@@ -4925,10 +4932,10 @@ const VirtualizedWorktreeViewport = React.memo(function VirtualizedWorktreeViewp
                     // Why: a child-active parent should look active without
                     // running active-card side effects such as SSH reconnect UI.
                     isActiveSurface={
-                      forceActiveSurface || isActiveWorktree || isOrcaBotmuxPathHighlight
+                      forceActiveSurface || isActiveWorktree || isBotmuxPathHighlight
                     }
                     activeSurfaceVariant={
-                      isOrcaBotmuxPathHighlight
+                      isBotmuxPathHighlight
                         ? 'secondary'
                         : isActiveWorktree && !forceActiveSurface
                           ? activeSurfaceVariant
@@ -5280,7 +5287,7 @@ const WorktreeList = React.memo(function WorktreeList({
   const worktreesByRepo = useAppStore((s) => s.worktreesByRepo)
   const detectedWorktreesByRepo = useAppStore((s) => s.detectedWorktreesByRepo)
   const activeWorktreeId = useAppStore((s) => s.activeWorktreeId)
-  const orcaBotmuxHighlightedWorktreeId = useAppStore((s) => s.orcaBotmuxHighlightedWorktreeId)
+  const botmuxHighlightedWorktreeId = useAppStore((s) => s.botmuxHighlightedWorktreeId)
   const activeWorkspaceKey = useAppStore((s) => s.activeWorkspaceKey)
   const currentSidebarWorktreeId = useMemo(
     () => getActiveSidebarWorkspaceId(activeWorkspaceKey, activeWorktreeId),
@@ -5763,19 +5770,19 @@ const WorktreeList = React.memo(function WorktreeList({
     return visibleHostIds ? new Set<ExecutionHostId>(visibleHostIds) : null
   }, [visibleWorkspaceHostIds, workspaceHostScope])
   const visibleReposForRows = useMemo(() => {
-    // Why: OrcaBotmux tab-host folder (~/.orca_botmux/desktop-workspace) is only a silent
-    // surface for browser/PTY tabs — sessions appear under OrcaBotmuxSessionsTree.
-    const notOrcaBotmuxTabHost = (repo: (typeof repos)[number]) => {
+    // Why: Botmux tab-host folder (~/.botmux/desktop-workspace) is only a silent
+    // surface for browser/PTY tabs — sessions appear under BotmuxSessionsTree.
+    const notBotmuxTabHost = (repo: (typeof repos)[number]) => {
       const p = (repo.path ?? '').replace(/\\/g, '/')
-      if (p.endsWith('/.orca_botmux/desktop-workspace') || p.endsWith('.orca_botmux/desktop-workspace')) {
+      if (p.endsWith('/.botmux/desktop-workspace') || p.endsWith('.botmux/desktop-workspace')) {
         return false
       }
-      if (repo.displayName === 'OrcaBotmux Sessions' && isFolderRepo(repo)) {
+      if (repo.displayName === 'Botmux Sessions' && isFolderRepo(repo)) {
         return false
       }
       return true
     }
-    const base = repos.filter(notOrcaBotmuxTabHost)
+    const base = repos.filter(notBotmuxTabHost)
     if (!visibleHostIdSet) {
       return base
     }
@@ -6454,7 +6461,7 @@ const WorktreeList = React.memo(function WorktreeList({
         toast.error(
           translate(
             'auto.components.sidebar.WorktreeList.b667b59632',
-            'Some projects could not be removed from OrcaBotmux'
+            'Some projects could not be removed from Botmux'
           ),
           {
             description: translate(
@@ -6937,7 +6944,7 @@ const WorktreeList = React.memo(function WorktreeList({
         key={viewportResetKey}
         rows={sectionRows}
         activeWorktreeId={selectedSidebarWorktreeId}
-        orcaBotmuxHighlightedWorktreeId={orcaBotmuxHighlightedWorktreeId}
+        botmuxHighlightedWorktreeId={botmuxHighlightedWorktreeId}
         currentWorktreeId={currentSidebarWorktreeId}
         groupBy={groupBy}
         pinnedDisplayPolicy={pinnedDisplayPolicy}

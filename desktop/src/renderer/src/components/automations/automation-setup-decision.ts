@@ -1,6 +1,6 @@
 import type { AutomationWorkspaceMode } from '../../../../shared/automations-types'
 import type {
-  OrcaHooks,
+  BotmuxHooks,
   ProjectHostSetup,
   Repo,
   SetupDecision,
@@ -17,7 +17,7 @@ function getAutomationSetupSource(
   repoId: string,
   repos: readonly Repo[],
   projectHostSetups: readonly ProjectHostSetup[],
-  yamlHooks: OrcaHooks | null | undefined
+  yamlHooks: BotmuxHooks | null | undefined
 ): AutomationSetupSource | null {
   const setup = projectHostSetups.find(
     (candidate) => candidate.repoId === repoId && candidate.setupState === 'ready'
@@ -47,14 +47,14 @@ export function getAutomationSetupDefaultDecision(
 }
 
 export function getVisibleAutomationSetupDecision(args: {
-  createTarget: 'orca_botmux' | 'hermes'
+  createTarget: 'botmux' | 'hermes'
   workspaceMode: AutomationWorkspaceMode
   repoId: string
   repos: readonly Repo[]
   projectHostSetups: readonly ProjectHostSetup[]
-  yamlHooks?: OrcaHooks | null
+  yamlHooks?: BotmuxHooks | null
 }): Extract<SetupDecision, 'run' | 'skip'> | undefined {
-  if (args.createTarget !== 'orca_botmux' || args.workspaceMode !== 'new_per_run') {
+  if (args.createTarget !== 'botmux' || args.workspaceMode !== 'new_per_run') {
     return undefined
   }
   return getAutomationSetupDefaultDecision(
@@ -63,15 +63,15 @@ export function getVisibleAutomationSetupDecision(args: {
 }
 
 export function resolveAutomationSetupDecisionForSave(args: {
-  createTarget: 'orca_botmux' | 'hermes'
+  createTarget: 'botmux' | 'hermes'
   workspaceMode: AutomationWorkspaceMode
   repoId: string
   repos: readonly Repo[]
   projectHostSetups: readonly ProjectHostSetup[]
-  yamlHooks?: OrcaHooks | null
+  yamlHooks?: BotmuxHooks | null
   draftSetupDecision: Extract<SetupDecision, 'run' | 'skip'> | undefined
 }): Extract<SetupDecision, 'run' | 'skip'> | undefined {
-  if (args.createTarget !== 'orca_botmux' || args.workspaceMode !== 'new_per_run') {
+  if (args.createTarget !== 'botmux' || args.workspaceMode !== 'new_per_run') {
     return undefined
   }
 
@@ -81,7 +81,7 @@ export function resolveAutomationSetupDecisionForSave(args: {
   }
 
   if (args.yamlHooks === undefined) {
-    // Why: automations cannot pause later for an orca_botmux.yaml trust prompt; when
+    // Why: automations cannot pause later for an botmux.yaml trust prompt; when
     // hook inspection is unavailable, fail closed instead of inheriting setup.
     return 'skip'
   }

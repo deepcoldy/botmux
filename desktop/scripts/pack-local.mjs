@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * Local unpackaged OrcaBotmux.app for dogfood (ad-hoc sign on macOS).
+ * Local unpackaged Botmux.app for dogfood (ad-hoc sign on macOS).
  * Does not require Apple Developer ID.
  *
  *   node scripts/pack-local.mjs
- *   node scripts/pack-local.mjs --install   # copy to /Applications/OrcaBotmux.app
+ *   node scripts/pack-local.mjs --install   # copy to /Applications/Botmux.app
  */
 import { execFileSync, spawnSync } from 'node:child_process'
 import { cpSync, existsSync, rmSync } from 'node:fs'
@@ -50,8 +50,8 @@ run('pnpm', [
 
 const appOut =
   process.arch === 'arm64'
-    ? join(root, 'dist', 'mac-arm64', 'OrcaBotmux.app')
-    : join(root, 'dist', 'mac', 'OrcaBotmux.app')
+    ? join(root, 'dist', 'mac-arm64', 'Botmux.app')
+    : join(root, 'dist', 'mac', 'Botmux.app')
 
 if (!existsSync(appOut)) {
   console.error(`[pack-local] expected app not found at ${appOut}`)
@@ -68,7 +68,7 @@ try {
 console.log(`[pack-local] built ${appOut}`)
 
 if (install) {
-  const dest = '/Applications/OrcaBotmux.app'
+  const dest = '/Applications/Botmux.app'
   rmSync(dest, { recursive: true, force: true })
   cpSync(appOut, dest, { recursive: true })
   try {

@@ -24,24 +24,24 @@ const AUTOMATION_STATE_FLAGS = [
 export const AUTOMATION_COMMAND_SPECS: CommandSpec[] = [
   {
     path: ['automations', 'list'],
-    summary: 'List scheduled OrcaBotmux automations',
-    usage: 'orca_botmux automations list [--json]',
+    summary: 'List scheduled Botmux automations',
+    usage: 'botmux automations list [--json]',
     allowedFlags: [...GLOBAL_FLAGS],
-    examples: ['orca_botmux automations list', 'orca_botmux automations list --json']
+    examples: ['botmux automations list', 'botmux automations list --json']
   },
   {
     path: ['automations', 'show'],
-    summary: 'Show one OrcaBotmux automation',
-    usage: 'orca_botmux automations show <id> [--json]',
+    summary: 'Show one Botmux automation',
+    usage: 'botmux automations show <id> [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'id'],
     positionalArgs: ['id'],
-    examples: ['orca_botmux automations show 2f9e...', 'orca_botmux automations show --id 2f9e... --json']
+    examples: ['botmux automations show 2f9e...', 'botmux automations show --id 2f9e... --json']
   },
   {
     path: ['automations', 'create'],
-    summary: 'Create a scheduled OrcaBotmux automation',
+    summary: 'Create a scheduled Botmux automation',
     usage:
-      'orca_botmux automations create --name <name> --trigger <preset|cron|rrule> --prompt <text> --provider <agent> [--precheck <command>] [--repo <selector>|--workspace <selector>|--project <id> [--host <id>]|--project-host-setup <id>] [--json]',
+      'botmux automations create --name <name> --trigger <preset|cron|rrule> --prompt <text> --provider <agent> [--precheck <command>] [--repo <selector>|--workspace <selector>|--project <id> [--host <id>]|--project-host-setup <id>] [--json]',
     allowedFlags: [
       ...GLOBAL_FLAGS,
       'name',
@@ -54,7 +54,7 @@ export const AUTOMATION_COMMAND_SPECS: CommandSpec[] = [
     ],
     notes: [
       'Trigger accepts hourly, daily, weekdays, weekly, a 5-field cron expression, or an RRULE string.',
-      'When --repo is omitted, the CLI uses the enclosing OrcaBotmux worktree when one can be resolved from cwd.',
+      'When --repo is omitted, the CLI uses the enclosing Botmux worktree when one can be resolved from cwd.',
       'Use --project with --host, or --project-host-setup, to run on a specific project host setup.',
       'Use --source-context with a JSON TaskSourceContext when task/provider data should come from a specific host/account; pass null on edit to clear it.',
       'Use --workspace to run in an existing worktree; otherwise the automation creates a new worktree per run.',
@@ -62,15 +62,15 @@ export const AUTOMATION_COMMAND_SPECS: CommandSpec[] = [
       'Use --reuse-session only with existing-workspace automations to submit later runs to the previous live automation session when it is still available. Use --fresh-session to disable reuse.'
     ],
     examples: [
-      'orca_botmux automations create --name "Daily review" --trigger daily --prompt "Review open changes" --provider codex',
-      'orca_botmux automations create --name "Weekday triage" --trigger "0 9 * * 1-5" --prompt "Triage issues" --provider claude --repo my-repo',
-      'orca_botmux automations create --name "PR review" --trigger hourly --precheck "gh pr list --json number -q .[0].number" --prompt "Review requested PRs" --provider codex'
+      'botmux automations create --name "Daily review" --trigger daily --prompt "Review open changes" --provider codex',
+      'botmux automations create --name "Weekday triage" --trigger "0 9 * * 1-5" --prompt "Triage issues" --provider claude --repo my-repo',
+      'botmux automations create --name "PR review" --trigger hourly --precheck "gh pr list --json number -q .[0].number" --prompt "Review requested PRs" --provider codex'
     ]
   },
   {
     path: ['automations', 'edit'],
-    summary: 'Edit an OrcaBotmux automation',
-    usage: 'orca_botmux automations edit <id> [--name <name>] [--trigger <preset|cron|rrule>] [--json]',
+    summary: 'Edit an Botmux automation',
+    usage: 'botmux automations edit <id> [--name <name>] [--trigger <preset|cron|rrule>] [--json]',
     allowedFlags: [
       ...GLOBAL_FLAGS,
       'id',
@@ -84,32 +84,32 @@ export const AUTOMATION_COMMAND_SPECS: CommandSpec[] = [
     ],
     positionalArgs: ['id'],
     examples: [
-      'orca_botmux automations edit 2f9e... --disabled',
-      'orca_botmux automations edit --id 2f9e... --trigger "30 * * * *" --json'
+      'botmux automations edit 2f9e... --disabled',
+      'botmux automations edit --id 2f9e... --trigger "30 * * * *" --json'
     ]
   },
   {
     path: ['automations', 'remove'],
     destructive: true,
-    summary: 'Remove an OrcaBotmux automation and its run history',
-    usage: 'orca_botmux automations remove <id> [--json]',
+    summary: 'Remove an Botmux automation and its run history',
+    usage: 'botmux automations remove <id> [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'id'],
     positionalArgs: ['id'],
-    examples: ['orca_botmux automations remove 2f9e...', 'orca_botmux automations remove --id 2f9e... --json']
+    examples: ['botmux automations remove 2f9e...', 'botmux automations remove --id 2f9e... --json']
   },
   {
     path: ['automations', 'run'],
-    summary: 'Run an OrcaBotmux automation now',
-    usage: 'orca_botmux automations run <id> [--json]',
+    summary: 'Run an Botmux automation now',
+    usage: 'botmux automations run <id> [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'id'],
     positionalArgs: ['id'],
-    examples: ['orca_botmux automations run 2f9e...', 'orca_botmux automations run --id 2f9e... --json']
+    examples: ['botmux automations run 2f9e...', 'botmux automations run --id 2f9e... --json']
   },
   {
     path: ['automations', 'runs'],
     summary: 'List automation run history',
-    usage: 'orca_botmux automations runs [--id <automation-id>] [--json]',
+    usage: 'botmux automations runs [--id <automation-id>] [--json]',
     allowedFlags: [...GLOBAL_FLAGS, 'id'],
-    examples: ['orca_botmux automations runs', 'orca_botmux automations runs --id 2f9e... --json']
+    examples: ['botmux automations runs', 'botmux automations runs --id 2f9e... --json']
   }
 ]

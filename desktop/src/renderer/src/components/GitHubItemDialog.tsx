@@ -7350,7 +7350,7 @@ export default function GitHubItemDialog({
                 <span className="ml-2 font-light text-muted-foreground">#{workItem.number}</span>
               </h1>
               <div className="flex shrink-0 items-center gap-2">
-                {/* Why: OrcaBotmux's signature affordance — keep this primary so it
+                {/* Why: Botmux's signature affordance — keep this primary so it
                     stands out against GitHub's familiar surface. */}
                 {issueAttachedWorkspace ? (
                   <DropdownMenu modal={false}>

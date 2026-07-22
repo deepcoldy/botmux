@@ -14,7 +14,7 @@ export const FIXTURE_COMMENTS: PRComment[] = [
     authorAvatarUrl: '',
     body: 'Please update this handler before merge.',
     createdAt: '2026-05-14T10:00:00.000Z',
-    url: 'https://github.com/acme/orca_botmux/pull/73#discussion_r101',
+    url: 'https://github.com/acme/botmux/pull/73#discussion_r101',
     threadId: 'thread-open',
     path: 'src/handler.ts',
     isResolved: false
@@ -25,7 +25,7 @@ export const FIXTURE_COMMENTS: PRComment[] = [
     authorAvatarUrl: '',
     body: 'LGTM on the overall approach.',
     createdAt: '2026-05-14T11:00:00.000Z',
-    url: 'https://github.com/acme/orca_botmux/pull/73#issuecomment-102'
+    url: 'https://github.com/acme/botmux/pull/73#issuecomment-102'
   },
   {
     id: 103,
@@ -33,7 +33,7 @@ export const FIXTURE_COMMENTS: PRComment[] = [
     authorAvatarUrl: '',
     body: 'Already fixed upstream.',
     createdAt: '2026-05-13T09:00:00.000Z',
-    url: 'https://github.com/acme/orca_botmux/pull/73#discussion_r103',
+    url: 'https://github.com/acme/botmux/pull/73#discussion_r103',
     threadId: 'thread-resolved',
     path: 'src/legacy.ts',
     isResolved: true
@@ -69,7 +69,7 @@ export async function seedPRCommentsSidebarFixture(page: Page): Promise<PRCommen
       number: prNumber,
       title: 'E2E PR comments sidebar',
       state: 'open',
-      url: `https://github.com/acme/orca_botmux/pull/${prNumber}`,
+      url: `https://github.com/acme/botmux/pull/${prNumber}`,
       checksStatus: 'pending',
       updatedAt: '2026-05-15T00:00:00.000Z',
       mergeable: 'MERGEABLE'
@@ -135,7 +135,7 @@ export async function seedPRCommentsSidebarFixture(page: Page): Promise<PRCommen
       setUpstreamStatus: () => undefined
     }))
 
-    window.localStorage.setItem('orca_botmux:pr-comment-presentation', 'cards')
+    window.localStorage.setItem('botmux:pr-comment-presentation', 'cards')
 
     return { worktreeId: worktree.id, branch, prNumber }
   }, FIXTURE_COMMENTS)

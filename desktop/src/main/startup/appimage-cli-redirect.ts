@@ -108,7 +108,7 @@ export function maybeRedirectAppImageCliLaunch(options: RedirectOptions = {}): R
 
   const cliEntryPath = join(resourcesPath, 'app.asar.unpacked', 'out', 'cli', 'index.js')
   if (!existsSync(cliEntryPath)) {
-    process.stderr.write(`Unable to locate the OrcaBotmux CLI entrypoint at ${cliEntryPath}\n`)
+    process.stderr.write(`Unable to locate the Botmux CLI entrypoint at ${cliEntryPath}\n`)
     return { redirected: true, status: 1 }
   }
 
@@ -171,8 +171,8 @@ function findFirstCommandCandidate(args: string[]): string | null {
 
 function buildElectronRunAsNodeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const childEnv = { ...env }
-  childEnv.ORCA_NODE_OPTIONS = env.NODE_OPTIONS ?? ''
-  childEnv.ORCA_NODE_REPL_EXTERNAL_MODULE = env.NODE_REPL_EXTERNAL_MODULE ?? ''
+  childEnv.BOTMUX_NODE_OPTIONS = env.NODE_OPTIONS ?? ''
+  childEnv.BOTMUX_NODE_REPL_EXTERNAL_MODULE = env.NODE_REPL_EXTERNAL_MODULE ?? ''
   childEnv.ELECTRON_RUN_AS_NODE = '1'
   delete childEnv.NODE_OPTIONS
   delete childEnv.NODE_REPL_EXTERNAL_MODULE

@@ -8,25 +8,25 @@ import {
 
 describe('create project defaults', () => {
   it('builds the POSIX default project parent', () => {
-    expect(getDefaultCreateProjectParent('/Users/alice')).toBe('/Users/alice/orca_botmux/projects')
+    expect(getDefaultCreateProjectParent('/Users/alice')).toBe('/Users/alice/botmux/projects')
   })
 
   it('builds the Windows default project parent', () => {
     expect(getDefaultCreateProjectParent('C:\\Users\\alice')).toBe(
-      'C:\\Users\\alice\\orca_botmux\\projects'
+      'C:\\Users\\alice\\botmux\\projects'
     )
   })
 
   it('derives the runtime project default from a resolved server home', () => {
-    expect(getDefaultCreateProjectParent('/home/alice')).toBe('/home/alice/orca_botmux/projects')
+    expect(getDefaultCreateProjectParent('/home/alice')).toBe('/home/alice/botmux/projects')
   })
 
   it('joins path previews without mixing separators', () => {
-    expect(joinCreateProjectPath('/home/alice/orca_botmux/projects', 'demo')).toBe(
-      '/home/alice/orca_botmux/projects/demo'
+    expect(joinCreateProjectPath('/home/alice/botmux/projects', 'demo')).toBe(
+      '/home/alice/botmux/projects/demo'
     )
-    expect(joinCreateProjectPath('C:\\Users\\alice\\orca_botmux\\projects', 'demo')).toBe(
-      'C:\\Users\\alice\\orca_botmux\\projects\\demo'
+    expect(joinCreateProjectPath('C:\\Users\\alice\\botmux\\projects', 'demo')).toBe(
+      'C:\\Users\\alice\\botmux\\projects\\demo'
     )
   })
 
@@ -36,16 +36,16 @@ describe('create project defaults', () => {
         step: 'create',
         createParent: '',
         activeRuntimeEnvironmentId: null,
-        defaultParent: '/Users/alice/orca_botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects',
         createStepAutoFilled: false
       })
-    ).toEqual({ parent: '/Users/alice/orca_botmux/projects' })
+    ).toEqual({ parent: '/Users/alice/botmux/projects' })
     expect(
       getCreateProjectDefaultParentAutoFill({
         step: 'create',
         createParent: '/tmp/project',
         activeRuntimeEnvironmentId: null,
-        defaultParent: '/Users/alice/orca_botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects',
         createStepAutoFilled: false
       })
     ).toBeNull()
@@ -54,7 +54,7 @@ describe('create project defaults', () => {
         step: 'create',
         createParent: '',
         activeRuntimeEnvironmentId: null,
-        defaultParent: '/Users/alice/orca_botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects',
         createStepAutoFilled: true
       })
     ).toBeNull()
@@ -66,7 +66,7 @@ describe('create project defaults', () => {
         step: 'create',
         createParent: '',
         activeRuntimeEnvironmentId: 'env-1',
-        defaultParent: '/Users/alice/orca_botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects',
         createStepAutoFilled: false
       })
     ).toBeNull()
@@ -75,10 +75,10 @@ describe('create project defaults', () => {
   it('uses a short local summary only for the local default parent', () => {
     expect(
       formatCreateProjectParentSummary({
-        parent: '/Users/alice/orca_botmux/projects',
-        defaultParent: '/Users/alice/orca_botmux/projects'
+        parent: '/Users/alice/botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects'
       })
-    ).toBe('~/orca_botmux/projects')
+    ).toBe('~/botmux/projects')
     expect(
       formatCreateProjectParentSummary({
         parent: '',
@@ -88,11 +88,11 @@ describe('create project defaults', () => {
     ).toBe('host folder not selected')
     expect(
       formatCreateProjectParentSummary({
-        parent: '/Users/alice/orca_botmux/projects',
-        defaultParent: '/Users/alice/orca_botmux/projects',
+        parent: '/Users/alice/botmux/projects',
+        defaultParent: '/Users/alice/botmux/projects',
         isRemoteHost: true
       })
-    ).toBe('/Users/alice/orca_botmux/projects')
+    ).toBe('/Users/alice/botmux/projects')
     expect(
       formatCreateProjectParentSummary({
         parent: '',

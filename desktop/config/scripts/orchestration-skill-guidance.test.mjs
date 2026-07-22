@@ -21,23 +21,23 @@ function getSection(markdown, heading) {
 }
 
 describe('orchestration skill guidance', () => {
-  it('requires OrcaBotmux runtime state before claiming a worker was orchestrated', () => {
+  it('requires Botmux runtime state before claiming a worker was orchestrated', () => {
     const skill = readSkill()
     const toolBoundary = getSection(skill, 'Tool Boundary')
 
     expect(toolBoundary).toContain(
-      'must create OrcaBotmux runtime state with `orca_botmux orchestration task-create` and `orca_botmux orchestration dispatch --inject`'
+      'must create Botmux runtime state with `botmux orchestration task-create` and `botmux orchestration dispatch --inject`'
     )
-    expect(toolBoundary).toContain('or `orca_botmux orchestration run`')
+    expect(toolBoundary).toContain('or `botmux orchestration run`')
     expect(toolBoundary).toContain(
-      'Do not substitute non-OrcaBotmux subagent tools, generic agent-spawn APIs, or chat-only parallel worker features'
+      'Do not substitute non-Botmux subagent tools, generic agent-spawn APIs, or chat-only parallel worker features'
     )
-    expect(toolBoundary).toContain('do not create OrcaBotmux task/dispatch provenance')
+    expect(toolBoundary).toContain('do not create Botmux task/dispatch provenance')
     expect(toolBoundary).toContain('injected lifecycle preambles')
     expect(toolBoundary).toContain('`worker_done` authority')
     expect(toolBoundary).toContain('decision gates')
-    expect(toolBoundary).toContain('orca_botmux orchestration task-list --json')
-    expect(toolBoundary).toContain('orca_botmux orchestration dispatch-show --task <task_id> --json')
+    expect(toolBoundary).toContain('botmux orchestration task-list --json')
+    expect(toolBoundary).toContain('botmux orchestration dispatch-show --task <task_id> --json')
     expect(toolBoundary).toContain(
       'do not retroactively describe the external worker as orchestrated'
     )
@@ -60,7 +60,7 @@ describe('orchestration skill guidance', () => {
 
     expect(skill).toContain('Full handoff means ownership transfer, not supervised dispatch.')
     expect(fullHandoffs).toContain(
-      'Do not run `orca_botmux orchestration task-create`, `orca_botmux orchestration dispatch --inject`, or `orca_botmux orchestration check --wait` for full handoffs.'
+      'Do not run `botmux orchestration task-create`, `botmux orchestration dispatch --inject`, or `botmux orchestration check --wait` for full handoffs.'
     )
     expect(fullHandoffs).toContain(
       '`task-create` is also forbidden because it records coordinator-owned tracking state'
@@ -70,16 +70,16 @@ describe('orchestration skill guidance', () => {
       'read the worker terminal after prompt delivery except to avoid losing the initial prompt'
     )
     expect(skill).toContain(
-      '`--no-parent` only controls OrcaBotmux lineage; it does not choose the Git base.'
+      '`--no-parent` only controls Botmux lineage; it does not choose the Git base.'
     )
     expect(skill).toContain(
       'never base it on the current feature branch unless the user explicitly asks'
     )
     expect(skill).toContain(
-      'orca_botmux worktree create --name <task-name> --no-parent --agent codex --prompt'
+      'botmux worktree create --name <task-name> --no-parent --agent codex --prompt'
     )
     expect(fullHandoffs).toContain(
-      'Before creating a new worktree from an active feature branch, decide and state whether the desired OrcaBotmux lineage is child or top-level'
+      'Before creating a new worktree from an active feature branch, decide and state whether the desired Botmux lineage is child or top-level'
     )
     expect(fullHandoffs).toContain(
       'Use child worktree lineage only when the new work is conceptually stacked under or dependent on the active worktree'
@@ -184,7 +184,7 @@ describe('orchestration skill guidance', () => {
 
     expect(agentGuidance).toContain('After sending `worker_done`, end your turn')
     expect(agentGuidance).toContain('idle at the agent prompt')
-    expect(agentGuidance).toContain('Do not poll or keep calling `orca_botmux orchestration check`')
+    expect(agentGuidance).toContain('Do not poll or keep calling `botmux orchestration check`')
     expect(agentGuidance).toContain('fresh preamble + TASK block delivered as new terminal input')
     expect(skill).not.toContain('post-completion polling messages')
     expect(skill).not.toContain('every 2 minutes')
@@ -209,7 +209,7 @@ describe('orchestration skill guidance', () => {
     const messaging = getSection(skill, 'Messaging')
     const workerTerminals = getSection(skill, 'Worker Terminals')
     const agentFirstExample = workerTerminals.match(
-      /```bash\norca worktree create --name <task-name> --agent codex --json\n[\s\S]*?```/
+      /```bash\nbotmux worktree create --name <task-name> --agent codex --json\n[\s\S]*?```/
     )?.[0]
 
     expect(workerTerminals).toContain('For an allowed new worktree, use agent-first:')
@@ -224,7 +224,7 @@ describe('orchestration skill guidance', () => {
     expect(workerTerminals).not.toContain('bare create opens a default shell')
     expect(workerTerminals).not.toContain('ends with **one** agent tab')
     expect(agentFirstExample).toBeDefined()
-    expect(agentFirstExample).not.toContain('orca_botmux terminal list')
+    expect(agentFirstExample).not.toContain('botmux terminal list')
     expect(agentFirstExample).toContain('startupTerminal.handle')
     expect(messaging).toContain(
       'Use `startupTerminal.handle` from the create response when present'

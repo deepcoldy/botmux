@@ -12,6 +12,12 @@ export function AgentWorkingSpinner({ className }: { className?: string }): Reac
       ref={agentSpinnerRef}
       data-agent-spinner=""
       className={cn(
+        // Why: the shared clock steps the ring 30° every ~83ms; without a
+        // transition that reads as stop-motion (perceived frame drops). A
+        // linear transform transition ≈ the tick interval makes the browser
+        // interpolate between steps — continuous rotation while the main
+        // thread still only wakes 12×/s for N spinners.
+        'transition-transform duration-[83ms] ease-linear motion-reduce:transition-none',
         // Why: under reduced motion the clock never ticks, so fill the top
         // border too — a frozen transparent-top ring reads as a broken
         // spinner; a complete ring reads as an intentional static marker (#9515).

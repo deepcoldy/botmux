@@ -1,20 +1,20 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady, waitForActiveWorktree } from './helpers/store'
 
 test.describe('Diff note edit', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('editing a saved inline note updates the open diff card', async ({ orcaBotmuxPage }) => {
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+  test('editing a saved inline note updates the open diff card', async ({ botmuxPage }) => {
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
     const seededBody = 'edit-me note'
     const editedBody = 'edited note from the inline card'
 
     // Why: create a real modified-file diff so Monaco mounts the saved-note
     // view zone on the same local surface that wires updateDiffComment.
-    const { relativePath } = await orcaBotmuxPage.evaluate(async (wId) => {
+    const { relativePath } = await botmuxPage.evaluate(async (wId) => {
       const store = window.__store
       if (!store) {
         throw new Error('window.__store is not available - is the app in dev mode?')
@@ -36,7 +36,7 @@ test.describe('Diff note edit', () => {
       return { relativePath: rel }
     }, worktreeId)
 
-    const addResult = await orcaBotmuxPage.evaluate(
+    const addResult = await botmuxPage.evaluate(
       async ({ wId, rel, body }) => {
         const store = window.__store
         if (!store) {
@@ -56,7 +56,7 @@ test.describe('Diff note edit', () => {
     expect(addResult, 'addDiffComment returned null').not.toBeNull()
     const commentId = addResult!.id
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ wId, rel }) => {
         const store = window.__store
         if (!store) {
@@ -75,18 +75,18 @@ test.describe('Diff note edit', () => {
       { wId: worktreeId, rel: relativePath }
     )
 
-    const card = orcaBotmuxPage.locator('.orca-botmux-diff-comment-card').first()
+    const card = botmuxPage.locator('.botmux-diff-comment-card').first()
     await expect(card, 'seeded inline note did not render').toBeVisible({ timeout: 15_000 })
-    await expect(card.locator('.orca-botmux-diff-comment-body')).toHaveText(seededBody)
+    await expect(card.locator('.botmux-diff-comment-body')).toHaveText(seededBody)
 
     await card.getByTitle('Edit note').click()
 
-    const textarea = card.locator('.orca-botmux-diff-comment-popover-textarea')
+    const textarea = card.locator('.botmux-diff-comment-popover-textarea')
     await expect(textarea).toBeVisible()
     await expect(textarea).toHaveValue(seededBody)
 
     const saveButton = card
-      .locator('.orca-botmux-diff-comment-popover-footer button')
+      .locator('.botmux-diff-comment-popover-footer button')
       .filter({ hasText: 'Save' })
     await expect(saveButton, 'Save should be disabled before the body changes').toBeDisabled()
 
@@ -101,7 +101,7 @@ test.describe('Diff note edit', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.evaluate((id: string) => {
+          botmuxPage.evaluate((id: string) => {
             const store = window.__store
             if (!store) {
               return null
@@ -119,13 +119,13 @@ test.describe('Diff note edit', () => {
       )
       .toBe(editedBody)
 
-    const updatedCard = orcaBotmuxPage
-      .locator('.orca-botmux-diff-comment-card')
-      .filter({ has: orcaBotmuxPage.locator('.orca-botmux-diff-comment-body', { hasText: editedBody }) })
+    const updatedCard = botmuxPage
+      .locator('.botmux-diff-comment-card')
+      .filter({ has: botmuxPage.locator('.botmux-diff-comment-body', { hasText: editedBody }) })
       .first()
     await expect(updatedCard, 'inline card did not update in the open diff').toBeVisible()
-    await expect(updatedCard.locator('.orca-botmux-diff-comment-body')).toHaveText(editedBody)
-    await expect(updatedCard.locator('.orca-botmux-diff-comment-body')).not.toHaveText(seededBody)
+    await expect(updatedCard.locator('.botmux-diff-comment-body')).toHaveText(editedBody)
+    await expect(updatedCard.locator('.botmux-diff-comment-body')).not.toHaveText(seededBody)
     await expect(updatedCard.getByTitle('Edit note')).toBeVisible()
   })
 })

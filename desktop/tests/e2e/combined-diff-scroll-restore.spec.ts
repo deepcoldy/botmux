@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os'
 import path from 'node:path'
 import type { Page } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 
 type CombinedDiffScrollRepo = {
@@ -48,7 +48,7 @@ function buildModifiedFile(fileIndex: number): string {
 }
 
 function createCombinedDiffScrollRepo(): CombinedDiffScrollRepo {
-  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'orca-botmux-combined-diff-scroll-')))
+  const repoPath = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'botmux-combined-diff-scroll-')))
   runGit(repoPath, ['init'])
   runGit(repoPath, ['config', 'user.email', 'e2e@test.local'])
   runGit(repoPath, ['config', 'user.name', 'E2E Test'])
@@ -407,19 +407,19 @@ test.describe('Combined diff scroll restore', () => {
   test.describe.configure({ mode: 'serial' })
   test.use({ seedTestRepo: false })
 
-  test('keeps the visible section anchored after switching tabs', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+  test('keeps the visible section anchored after switching tabs', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
     const fixture = createCombinedDiffScrollRepo()
 
     try {
-      const worktreeId = await addAndActivateRepo(orcaBotmuxPage, fixture.repoPath)
-      const diffTabId = await openCombinedDiff(orcaBotmuxPage, worktreeId, fixture.repoPath)
-      await expect(orcaBotmuxPage.locator('.combined-diff-scroll-container')).toBeVisible()
-      await expect(orcaBotmuxPage.getByText(`${FILE_COUNT} changed files`)).toBeVisible()
+      const worktreeId = await addAndActivateRepo(botmuxPage, fixture.repoPath)
+      const diffTabId = await openCombinedDiff(botmuxPage, worktreeId, fixture.repoPath)
+      await expect(botmuxPage.locator('.combined-diff-scroll-container')).toBeVisible()
+      await expect(botmuxPage.getByText(`${FILE_COUNT} changed files`)).toBeVisible()
 
-      await scrollCombinedDiffDeep(orcaBotmuxPage)
-      await waitForStableViewportAnchor(orcaBotmuxPage)
-      const activeScrollSamples = await wheelCombinedDiffDown(orcaBotmuxPage)
+      await scrollCombinedDiffDeep(botmuxPage)
+      await waitForStableViewportAnchor(botmuxPage)
+      const activeScrollSamples = await wheelCombinedDiffDown(botmuxPage)
       expect(activeScrollSamples.length).toBeGreaterThan(2)
       expect(
         getLargestBackwardScrollJump(activeScrollSamples),
@@ -428,27 +428,27 @@ test.describe('Combined diff scroll restore', () => {
         )}`
       ).toBeLessThan(120)
 
-      const beforeSwitch = await waitForStableViewportAnchor(orcaBotmuxPage)
+      const beforeSwitch = await waitForStableViewportAnchor(botmuxPage)
       expect(beforeSwitch.index).toBeGreaterThan(0)
 
-      await orcaBotmuxPage.evaluate((wId) => {
+      await botmuxPage.evaluate((wId) => {
         const store = window.__store
         if (!store) {
           throw new Error('window.__store is not available')
         }
         store.getState().createTab(wId)
       }, worktreeId)
-      await expect(orcaBotmuxPage.locator('.combined-diff-scroll-container')).toHaveCount(0)
+      await expect(botmuxPage.locator('.combined-diff-scroll-container')).toHaveCount(0)
 
-      await orcaBotmuxPage.locator(`[data-tab-id="${diffTabId}"]`).click({ force: true })
-      await expect(orcaBotmuxPage.locator('.combined-diff-scroll-container')).toBeVisible()
-      const afterSwitch = await waitForRestoredViewportAnchor(orcaBotmuxPage, beforeSwitch)
+      await botmuxPage.locator(`[data-tab-id="${diffTabId}"]`).click({ force: true })
+      await expect(botmuxPage.locator('.combined-diff-scroll-container')).toBeVisible()
+      const afterSwitch = await waitForRestoredViewportAnchor(botmuxPage, beforeSwitch)
 
       expect(afterSwitch.key).toBe(beforeSwitch.key)
       expect(Math.abs(afterSwitch.top - beforeSwitch.top)).toBeLessThan(80)
 
-      await clickVisibleDiffLine(orcaBotmuxPage)
-      const afterLineClick = await waitForStableViewportAnchor(orcaBotmuxPage)
+      await clickVisibleDiffLine(botmuxPage)
+      const afterLineClick = await waitForStableViewportAnchor(botmuxPage)
 
       // Assert the viewport barely moved rather than an exact anchor key: sections
       // are ~viewport-sized, so a sub-pixel focus scroll from the click can flip the

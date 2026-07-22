@@ -55,7 +55,7 @@ function detectTitleHintPaneEvidence(
  * sees panes with a live status entry, so a freshly launched (still idle) agent
  * stays invisible until its first hook event — i.e. until the user talks to it.
  * We augment it with recognized agent-title tabs whose pane still has a live
- * PTY. TerminalTab.launchAgent records the harness OrcaBotmux started; manually typed
+ * PTY. TerminalTab.launchAgent records the harness Botmux started; manually typed
  * CLIs do not have that owner bit, so their runtime title is the only pre-hook
  * signal available.
  *
@@ -129,7 +129,7 @@ function deriveTitleHintAgentTarget(
   const paneTitleResolution = resolveRuntimePaneTitleLeafResolution(layout, paneTitles, leafId)
   const titleEvidence = detectTitleHintPaneEvidence(paneTitleResolution, tab.title)
   if (!titleEvidence) {
-    // Why: launchAgent is set the instant OrcaBotmux spawns the tab, but the runtime
+    // Why: launchAgent is set the instant Botmux spawns the tab, but the runtime
     // only accepts a send once the pane reads as an agent; manually started
     // CLIs need the same title proof before appearing in the send menu.
     return null

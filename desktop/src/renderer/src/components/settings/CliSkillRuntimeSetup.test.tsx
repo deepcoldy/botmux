@@ -42,7 +42,7 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
       `& { $PSNativeCommandArgumentPassing = 'Legacy'; wsl.exe -d 'Ubuntu' -- sh -c 'eval \\"\`printf %s ${encoded} | base64 -d\`\\"' } # Runs: ${skillCommand}`
     )
     expect(decodeWslLoginShellScript(command)).toContain(
-      'exec "$_orca_wsl_shell" -ilc \'npx skills add orchestration --global\''
+      'exec "$_botmux_wsl_shell" -ilc \'npx skills add orchestration --global\''
     )
   })
 
@@ -54,7 +54,7 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
     })
 
     expect(decodeWslLoginShellScript(command)).toContain(
-      'exec "$_orca_wsl_shell" -ilc \'npx skills update orchestration --global\''
+      'exec "$_botmux_wsl_shell" -ilc \'npx skills update orchestration --global\''
     )
   })
 
@@ -73,7 +73,7 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
   it.skipIf(process.platform === 'win32')(
     'runs skill commands with npx from the configured WSL login-shell PATH',
     () => {
-      const root = mkdtempSync(join(tmpdir(), 'orca-botmux-wsl-skill-command-'))
+      const root = mkdtempSync(join(tmpdir(), 'botmux-wsl-skill-command-'))
       const tools = join(root, 'tools')
       const npxBin = join(root, 'npx-bin')
       const loginShell = join(root, 'zsh')
@@ -81,11 +81,11 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
       mkdirSync(npxBin)
       writeFileSync(
         join(tools, 'getent'),
-        '#!/bin/sh\nprintf \'%s\\n\' "user:x:1000:1000::/home/user:$ORCA_TEST_LOGIN_SHELL"\n'
+        '#!/bin/sh\nprintf \'%s\\n\' "user:x:1000:1000::/home/user:$BOTMUX_TEST_LOGIN_SHELL"\n'
       )
       writeFileSync(
         loginShell,
-        '#!/bin/sh\nexport PATH="$ORCA_TEST_NPX_BIN:/usr/bin:/bin"\nexec /bin/sh -c "$2"\n'
+        '#!/bin/sh\nexport PATH="$BOTMUX_TEST_NPX_BIN:/usr/bin:/bin"\nexec /bin/sh -c "$2"\n'
       )
       writeFileSync(
         join(npxBin, 'npx'),
@@ -107,8 +107,8 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
             env: {
               ...process.env,
               PATH: `${tools}:/usr/bin:/bin`,
-              ORCA_TEST_LOGIN_SHELL: loginShell,
-              ORCA_TEST_NPX_BIN: npxBin
+              BOTMUX_TEST_LOGIN_SHELL: loginShell,
+              BOTMUX_TEST_NPX_BIN: npxBin
             }
           })
         ).toBe('skills update orchestration --global:terminal-input')
@@ -133,8 +133,8 @@ describe('CliSkillRuntimeSetup runtime helpers', () => {
 
   it('treats missing runtime as a Windows host fallback for skill updates', () => {
     expect(
-      buildSkillCommandForRuntime('npx skills update orca-botmux-cli --global', undefined, 'win32')
-    ).toBe(buildAgentFeatureSkillInstallCommand(['orca-botmux-cli']))
+      buildSkillCommandForRuntime('npx skills update botmux-cli --global', undefined, 'win32')
+    ).toBe(buildAgentFeatureSkillInstallCommand(['botmux-cli']))
   })
 
   it('keeps non-Windows host skill updates on the update path', () => {

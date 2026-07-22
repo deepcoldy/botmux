@@ -675,7 +675,7 @@ describe('buildWorktreeComparator — recent (lastActivityAt)', () => {
   it('ignores sortOrder entirely — activity alone determines the order', () => {
     const staleHighOrder = makeWorktree({
       id: 'stale-high-order',
-      displayName: 'OrcaBotmux main',
+      displayName: 'Botmux main',
       sortOrder: 9_999_999_999_999,
       lastActivityAt: 1000
     })

@@ -69,7 +69,7 @@ export function WslCliRegistration({
 
   const isEnabled = status?.state === 'installed'
   const isSupported = status?.supported ?? false
-  const commandName = status?.commandName ?? 'orca-botmux-ide'
+  const commandName = status?.commandName ?? 'botmux-ide'
 
   const handleInstall = async (): Promise<void> => {
     setBusyAction('install')
@@ -161,7 +161,7 @@ export function WslCliRegistration({
                 : (status?.detail ??
                   translate(
                     'auto.components.settings.WslCliRegistration.7aa456a460',
-                    'Register `orca-botmux-ide` in ~/.local/bin inside WSL.'
+                    'Register `botmux-ide` in ~/.local/bin inside WSL.'
                   ))}
             </p>
           </div>
@@ -243,11 +243,11 @@ export function WslCliRegistration({
               {isEnabled
                 ? translate(
                     'auto.components.settings.WslCliRegistration.d8216eb22e',
-                    'This removes the WSL shell command. OrcaBotmux itself remains installed on Windows.'
+                    'This removes the WSL shell command. Botmux itself remains installed on Windows.'
                   )
                 : translate(
                     'auto.components.settings.WslCliRegistration.7ee4e52b99',
-                    'OrcaBotmux will register {{value0}} so the command works from WSL terminals.',
+                    'Botmux will register {{value0}} so the command works from WSL terminals.',
                     { value0: status?.commandPath ?? commandName }
                   )}
             </DialogDescription>

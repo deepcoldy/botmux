@@ -30,8 +30,8 @@ import type { TerminalTab } from '../../../../shared/types'
 import { isExplicitAgentStatusFresh } from '@/lib/agent-status'
 import {
   getAgentRowGeneratedTitleText,
-  getOrcaDispatchTaskId,
-  isOrcaDispatchPrompt,
+  getBotmuxDispatchTaskId,
+  isBotmuxDispatchPrompt,
   orchestrationLabelsMatchLiveDispatch
 } from '@/lib/agent-row-primary-text'
 import {
@@ -134,7 +134,7 @@ export type AgentStatusSlice = {
   sleepingAgentSessionsByPaneKey: Record<string, SleepingAgentSessionRecord>
 
   /** Ephemeral launch snapshots keyed by concrete pane. Hook payloads do not
-   *  carry OrcaBotmux launch settings, so the renderer supplies them from startup. */
+   *  carry Botmux launch settings, so the renderer supplies them from startup. */
   agentLaunchConfigByPaneKey: Record<string, AgentLaunchConfigRegistryEntry>
 
   /** Pane keys explicitly torn down (pane close, tab close, PTY exit, manual
@@ -1776,7 +1776,7 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
             ? existingSleepingRecord.launchConfig
             : undefined
         // Why: pane keys can be reused after a manually-started agent replaces
-        // an OrcaBotmux-launched one. Once the provider session changes, the old
+        // an Botmux-launched one. Once the provider session changes, the old
         // pane-key launch registry must not bleed options into the new session.
         const launchConfigSource =
           (payload.state !== 'done' && !providerSessionChanged && metadata?.launchToken
@@ -1965,7 +1965,7 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
             }
           }
         }
-        // Why: launch tokens can remain in a shell after an OrcaBotmux-started TUI exits;
+        // Why: launch tokens can remain in a shell after an Botmux-started TUI exits;
         // once the original session is done they must no longer authorize config reuse.
         if (
           (providerSessionChanged || entry.state === 'done') &&
@@ -2014,9 +2014,9 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
             entryForGeneratedTitle.orchestration?.taskTitle?.trim()) &&
           orchestrationLabelsMatchLiveDispatch(entryForGeneratedTitle)
         )
-        const liveIsDispatchPrompt = isOrcaDispatchPrompt(entryForGeneratedTitle.prompt)
+        const liveIsDispatchPrompt = isBotmuxDispatchPrompt(entryForGeneratedTitle.prompt)
         const liveDispatchTaskId = liveIsDispatchPrompt
-          ? getOrcaDispatchTaskId(entryForGeneratedTitle.prompt)
+          ? getBotmuxDispatchTaskId(entryForGeneratedTitle.prompt)
           : null
         const stickyOrchestrationTaskId =
           entryForGeneratedTitle.orchestration?.taskId?.trim() || null
@@ -2054,7 +2054,7 @@ export const createAgentStatusSlice: StateCreator<AppState, [], [], AgentStatusS
       queueMicrotask(() => freshness.schedule())
       if (completionRefreshWorktreeId) {
         const worktreeId = completionRefreshWorktreeId
-        // Why: agents can create a PR via `gh pr create`, bypassing OrcaBotmux's
+        // Why: agents can create a PR via `gh pr create`, bypassing Botmux's
         // create-PR flow and leaving a fresh "no PR" cache entry in place.
         queueMicrotask(() => get().refreshGitHubForWorktreeIfStale(worktreeId))
       }

@@ -331,7 +331,7 @@ export function shouldShowRemoteDownloadAction(
     : Boolean(connectionId || runtimeDownloadContext)
   return (
     hasDownloadCapability &&
-    (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ !== true
+    (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ !== true
   )
 }
 
@@ -345,7 +345,7 @@ export function shouldShowCopyFileAction(
   return (
     (!connectionId || !node.isDirectory) &&
     selectionSize === 1 &&
-    (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ !== true
+    (globalThis as { __BOTMUX_WEB_CLIENT__?: boolean }).__BOTMUX_WEB_CLIENT__ !== true
   )
 }
 
@@ -496,7 +496,7 @@ export function FileExplorerRow({
       onNativeDragExpandDir,
       onMoveDrop
     })
-  const handleOpenInOrcaBrowser = useCallback(() => {
+  const handleOpenInBotmuxBrowser = useCallback(() => {
     if (!activeWorktreeId) {
       return
     }
@@ -751,11 +751,11 @@ export function FileExplorerRow({
           </ContextMenuItem>
         )}
         {!node.isDirectory && activeWorktreeId && (
-          <ContextMenuItem onSelect={handleOpenInOrcaBrowser}>
+          <ContextMenuItem onSelect={handleOpenInBotmuxBrowser}>
             <Globe />
             {translate(
               'auto.components.right.sidebar.FileExplorerRow.dd112c81d2',
-              'Open in OrcaBotmux Browser'
+              'Open in Botmux Browser'
             )}
           </ContextMenuItem>
         )}

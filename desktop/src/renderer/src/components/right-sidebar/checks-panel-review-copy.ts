@@ -22,28 +22,28 @@ export function concurrentLookupDetail(input: ChecksPanelReviewStateInput): stri
   if (input.reviewLookup === 'positive_unresolved') {
     return translate(
       'auto.components.right.sidebar.checks.panel.review.detail.positive',
-      'OrcaBotmux also has saved {{reviewLabel}} information that it could not verify.',
+      'Botmux also has saved {{reviewLabel}} information that it could not verify.',
       { reviewLabel }
     )
   }
   if (isRateLimitRefresh(refresh)) {
     return translate(
       'auto.components.right.sidebar.checks.panel.review.detail.rate_limited',
-      'OrcaBotmux also could not check {{reviewLabel}} status because {{provider}} is temporarily limiting requests.',
+      'Botmux also could not check {{reviewLabel}} status because {{provider}} is temporarily limiting requests.',
       { reviewLabel, provider: providerName }
     )
   }
   if (refresh?.errorType === 'network') {
     return translate(
       'auto.components.right.sidebar.checks.panel.review.detail.network',
-      'OrcaBotmux also could not check {{reviewLabel}} status because this environment could not reach {{provider}}.',
+      'Botmux also could not check {{reviewLabel}} status because this environment could not reach {{provider}}.',
       { reviewLabel, provider: providerName }
     )
   }
   if (refresh?.status === 'error' || isHardRefreshError(refresh)) {
     return translate(
       'auto.components.right.sidebar.checks.panel.review.detail.untyped',
-      'OrcaBotmux also could not confirm whether this branch already has a {{reviewLabel}}.',
+      'Botmux also could not confirm whether this branch already has a {{reviewLabel}}.',
       { reviewLabel }
     )
   }
@@ -112,7 +112,7 @@ export function transientRefreshState(
       ),
       description: translate(
         'auto.components.right.sidebar.checks.panel.review.unknown_error.body',
-        'The lookup failed, so OrcaBotmux could not confirm whether this branch already has a {{reviewLabel}}.',
+        'The lookup failed, so Botmux could not confirm whether this branch already has a {{reviewLabel}}.',
         { reviewLabel }
       )
     }
@@ -126,7 +126,7 @@ export function transientRefreshState(
     ),
     description: translate(
       'auto.components.right.sidebar.checks.panel.review.untyped.body',
-      'OrcaBotmux could not confirm whether this branch already has a {{reviewLabel}}. Retry to check again.',
+      'Botmux could not confirm whether this branch already has a {{reviewLabel}}. Retry to check again.',
       { reviewLabel }
     )
   }
@@ -180,7 +180,7 @@ const HARD_ERROR_COPY: Record<
     body: {
       key: 'auto.components.right.sidebar.checks.panel.review.cli.body',
       fallback:
-        'OrcaBotmux could not run {{provider}} CLI in this environment. Set it up here, then retry.'
+        'Botmux could not run {{provider}} CLI in this environment. Set it up here, then retry.'
     }
   }
 }
@@ -215,7 +215,7 @@ const SKIPPED_COPY: Partial<
     body: {
       key: 'auto.components.right.sidebar.checks.panel.review.skipped.disconnected.body',
       fallback:
-        "This repository's execution host is disconnected, so OrcaBotmux cannot refresh {{reviewLabel}} status."
+        "This repository's execution host is disconnected, so Botmux cannot refresh {{reviewLabel}} status."
     },
     recovery: ['retry']
   },
@@ -237,7 +237,7 @@ const SKIPPED_COPY: Partial<
     },
     body: {
       key: 'auto.components.right.sidebar.checks.panel.review.skipped.archived.body',
-      fallback: 'This repository is archived, so OrcaBotmux is not refreshing {{reviewLabel}} status.'
+      fallback: 'This repository is archived, so Botmux is not refreshing {{reviewLabel}} status.'
     },
     recovery: []
   },
@@ -248,7 +248,7 @@ const SKIPPED_COPY: Partial<
     },
     body: {
       key: 'auto.components.right.sidebar.checks.panel.review.skipped.not_git.body',
-      fallback: 'OrcaBotmux could not treat this folder as a Git repository for {{reviewLabel}} status.'
+      fallback: 'Botmux could not treat this folder as a Git repository for {{reviewLabel}} status.'
     },
     recovery: []
   },
@@ -260,7 +260,7 @@ const SKIPPED_COPY: Partial<
     body: {
       key: 'auto.components.right.sidebar.checks.panel.review.skipped.remote.body',
       fallback:
-        'OrcaBotmux could not refresh {{reviewLabel}} status for this remote context. Retry after the host is available.'
+        'Botmux could not refresh {{reviewLabel}} status for this remote context. Retry after the host is available.'
     },
     recovery: ['retry']
   }

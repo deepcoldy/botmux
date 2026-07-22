@@ -18,7 +18,7 @@
  * (dnd-kit reorder); in those cases a DOM assertion still follows.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import type { Page } from '@stablyai/playwright-test'
 import {
   waitForSessionReady,
@@ -66,10 +66,10 @@ async function getFocusedTerminalTabId(page: Page): Promise<string | null> {
 }
 
 test.describe('Tabs', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   /**
@@ -81,37 +81,37 @@ test.describe('Tabs', () => {
    * a tab-bar render regression. Clicking the real "+" button and then "New
    * Terminal" drives the same code path a user takes.
    */
-  test('clicking "+" then "New Terminal" creates a new terminal tab', async ({ orcaBotmuxPage }) => {
-    const tabsBefore = await countRenderedTabs(orcaBotmuxPage)
+  test('clicking "+" then "New Terminal" creates a new terminal tab', async ({ botmuxPage }) => {
+    const tabsBefore = await countRenderedTabs(botmuxPage)
 
     // Why: hidden-window Electron can keep the animated terminal surface
     // invalidating Playwright's "stable" actionability check even though the
     // tab-bar button is visible and enabled.
-    await orcaBotmuxPage.getByRole('button', { name: 'New tab' }).click({ force: true })
+    await botmuxPage.getByRole('button', { name: 'New tab' }).click({ force: true })
     // Why: the "+" dropdown uses Radix <DropdownMenuItem>, which exposes the
     // label text as the accessible name once the menu is open.
-    const newTerminalMenuItem = orcaBotmuxPage.getByRole('menuitem', { name: /New Terminal/i }).first()
+    const newTerminalMenuItem = botmuxPage.getByRole('menuitem', { name: /New Terminal/i }).first()
     await newTerminalMenuItem.click({ force: true })
     await expect(newTerminalMenuItem).toBeHidden({ timeout: 3_000 })
 
     // Final assertion is on the rendered tab count — the tab bar itself must
     // gain an element, not just the store.
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), {
+      .poll(() => countRenderedTabs(botmuxPage), {
         timeout: 5_000,
         message: 'Clicking + → New Terminal did not render a new tab in the tab bar'
       })
       .toBeGreaterThan(tabsBefore)
 
-    const activeType = await getActiveTabType(orcaBotmuxPage)
+    const activeType = await getActiveTabType(botmuxPage)
     expect(activeType).toBe('terminal')
 
-    const storeActiveId = await getActiveTabId(orcaBotmuxPage)
+    const storeActiveId = await getActiveTabId(botmuxPage)
     expect(storeActiveId).not.toBeNull()
-    await expect(tabLocator(orcaBotmuxPage, storeActiveId!)).toBeVisible()
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(storeActiveId)
+    await expect(tabLocator(botmuxPage, storeActiveId!)).toBeVisible()
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(storeActiveId)
     await expect
-      .poll(() => getFocusedTerminalTabId(orcaBotmuxPage), {
+      .poll(() => getFocusedTerminalTabId(botmuxPage), {
         timeout: 5_000,
         message: 'Menu-created terminal tab did not receive keyboard focus'
       })
@@ -122,20 +122,20 @@ test.describe('Tabs', () => {
    * User Prompt:
    * - New tab works
    */
-  test('Cmd/Ctrl+T creates a new terminal tab', async ({ orcaBotmuxPage }) => {
+  test('Cmd/Ctrl+T creates a new terminal tab', async ({ botmuxPage }) => {
     const isMac = process.platform === 'darwin'
     const mod = isMac ? 'Meta' : 'Control'
-    const tabsBefore = await countRenderedTabs(orcaBotmuxPage)
+    const tabsBefore = await countRenderedTabs(botmuxPage)
 
     // Why: focus body first so the window-level keydown handler on Terminal.tsx
     // actually sees the event. Without focus the key may be eaten by an
     // unrelated input (e.g. a stale search field from a previous test).
-    await orcaBotmuxPage.evaluate(() => document.body.focus())
-    await orcaBotmuxPage.keyboard.press(`${mod}+t`)
+    await botmuxPage.evaluate(() => document.body.focus())
+    await botmuxPage.keyboard.press(`${mod}+t`)
 
     // DOM-level count increased — confirms a new tab actually rendered.
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), {
+      .poll(() => countRenderedTabs(botmuxPage), {
         timeout: 5_000,
         message: `${mod}+T did not add a tab to the tab bar`
       })
@@ -145,15 +145,15 @@ test.describe('Tabs', () => {
     // the active surface behind the strip; we rely on the store flag here only
     // to disambiguate terminal vs. editor vs. browser — the fact that *some*
     // tab is active is already proved by the DOM assertion below).
-    const activeType = await getActiveTabType(orcaBotmuxPage)
+    const activeType = await getActiveTabType(botmuxPage)
     expect(activeType).toBe('terminal')
 
     // The DOM must have exactly one active tab and it must match the store's
     // activeTabId — this is the load-bearing check that the render layer and
     // the state layer agree on what is selected.
-    const storeActiveId = await getActiveTabId(orcaBotmuxPage)
+    const storeActiveId = await getActiveTabId(botmuxPage)
     expect(storeActiveId).not.toBeNull()
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(storeActiveId)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(storeActiveId)
   })
 
   /**
@@ -166,39 +166,39 @@ test.describe('Tabs', () => {
    * checks DOM `data-active` to prove the selection actually paints onto the
    * right tab element.
    */
-  test('Cmd/Ctrl+Shift+] and Cmd/Ctrl+Shift+[ switch between tabs', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('Cmd/Ctrl+Shift+] and Cmd/Ctrl+Shift+[ switch between tabs', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
     // Ensure we have at least 2 tabs — use the real "+" flow so a render
     // regression would fail setup before we even start the cycle check.
-    if ((await countRenderedTabs(orcaBotmuxPage)) < 2) {
-      await orcaBotmuxPage.getByRole('button', { name: 'New tab' }).click()
-      await orcaBotmuxPage
+    if ((await countRenderedTabs(botmuxPage)) < 2) {
+      await botmuxPage.getByRole('button', { name: 'New tab' }).click()
+      await botmuxPage
         .getByRole('menuitem', { name: /New Terminal/i })
         .first()
         .click()
       await expect
-        .poll(() => countRenderedTabs(orcaBotmuxPage), { timeout: 5_000 })
+        .poll(() => countRenderedTabs(botmuxPage), { timeout: 5_000 })
         .toBeGreaterThanOrEqual(2)
     }
 
-    const firstTabId = await getActiveTabId(orcaBotmuxPage)
-    const orderedTabs = await getWorktreeTabs(orcaBotmuxPage, worktreeId)
+    const firstTabId = await getActiveTabId(botmuxPage)
+    const orderedTabs = await getWorktreeTabs(botmuxPage, worktreeId)
     const secondTabId = orderedTabs.find((tab) => tab.id !== firstTabId)?.id
     expect(secondTabId).toBeTruthy()
 
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       window.__store?.getState().setActiveTab(tabId)
     }, secondTabId)
 
     // DOM assertion — the second tab must actually show the active indicator.
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(secondTabId)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(secondTabId)
 
     // Switch back.
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       window.__store?.getState().setActiveTab(tabId)
     }, firstTabId)
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(firstTabId)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(firstTabId)
   })
 
   /**
@@ -214,26 +214,26 @@ test.describe('Tabs', () => {
    * a real test: a pure store round-trip would not catch a regression where
    * the tab strip stopped re-rendering in the store's new order.
    */
-  test('dragging a tab to a new position reorders it', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('dragging a tab to a new position reorders it', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    if ((await countRenderedTabs(orcaBotmuxPage)) < 2) {
-      await orcaBotmuxPage.getByRole('button', { name: 'New tab' }).click()
-      await orcaBotmuxPage
+    if ((await countRenderedTabs(botmuxPage)) < 2) {
+      await botmuxPage.getByRole('button', { name: 'New tab' }).click()
+      await botmuxPage
         .getByRole('menuitem', { name: /New Terminal/i })
         .first()
         .click()
       await expect
-        .poll(() => countRenderedTabs(orcaBotmuxPage), { timeout: 5_000 })
+        .poll(() => countRenderedTabs(botmuxPage), { timeout: 5_000 })
         .toBeGreaterThanOrEqual(2)
     }
 
-    const domOrderBefore = await orcaBotmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
+    const domOrderBefore = await botmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
       nodes.map((n) => (n as HTMLElement).dataset.tabId ?? '')
     )
     expect(domOrderBefore.length).toBeGreaterThanOrEqual(2)
 
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -271,7 +271,7 @@ test.describe('Tabs', () => {
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
+          botmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
             nodes.map((n) => (n as HTMLElement).dataset.tabId ?? '')
           ),
         { timeout: 3_000, message: 'Tab bar DOM order did not reflect the reorder' }
@@ -280,11 +280,11 @@ test.describe('Tabs', () => {
   })
 
   test('clicking tabs still switches after dragging a terminal tab to reorder', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -296,50 +296,50 @@ test.describe('Tabs', () => {
       }
     }, worktreeId)
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), { timeout: 5_000 })
+      .poll(() => countRenderedTabs(botmuxPage), { timeout: 5_000 })
       .toBeGreaterThanOrEqual(2)
 
-    const domOrderBefore = await orcaBotmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
+    const domOrderBefore = await botmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
       nodes.map((n) => (n as HTMLElement).dataset.tabId ?? '')
     )
     const [firstTabId, secondTabId] = domOrderBefore
     expect(firstTabId).toBeTruthy()
     expect(secondTabId).toBeTruthy()
 
-    await tabLocator(orcaBotmuxPage, firstTabId).click({ force: true })
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(firstTabId)
+    await tabLocator(botmuxPage, firstTabId).click({ force: true })
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(firstTabId)
 
-    const firstTabBox = await tabLocator(orcaBotmuxPage, firstTabId).boundingBox()
-    const secondTabBox = await tabLocator(orcaBotmuxPage, secondTabId).boundingBox()
+    const firstTabBox = await tabLocator(botmuxPage, firstTabId).boundingBox()
+    const secondTabBox = await tabLocator(botmuxPage, secondTabId).boundingBox()
     expect(firstTabBox).not.toBeNull()
     expect(secondTabBox).not.toBeNull()
     const startX = firstTabBox!.x + firstTabBox!.width / 2
     const startY = firstTabBox!.y + firstTabBox!.height / 2
     const endX = secondTabBox!.x + secondTabBox!.width * 0.75
     const endY = secondTabBox!.y + secondTabBox!.height / 2
-    await orcaBotmuxPage.mouse.move(startX, startY)
-    await orcaBotmuxPage.mouse.down()
+    await botmuxPage.mouse.move(startX, startY)
+    await botmuxPage.mouse.down()
     // Why: this mirrors the release repro: drag a terminal tab across another
     // tab far enough for dnd-kit to commit a reorder, then release on the tab
     // strip before clicking tabs again.
-    await orcaBotmuxPage.mouse.move(endX, endY, { steps: 8 })
-    await orcaBotmuxPage.mouse.up()
+    await botmuxPage.mouse.move(endX, endY, { steps: 8 })
+    await botmuxPage.mouse.up()
 
     await expect
       .poll(
         async () =>
-          orcaBotmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
+          botmuxPage.$$eval(SORTABLE_TAB, (nodes) =>
             nodes.map((n) => (n as HTMLElement).dataset.tabId ?? '')
           ),
         { timeout: 5_000, message: 'Terminal tab drag did not reorder the tab strip' }
       )
       .toEqual([secondTabId, firstTabId, ...domOrderBefore.slice(2)])
 
-    await tabLocator(orcaBotmuxPage, firstTabId).click({ force: true })
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(firstTabId)
-    await tabLocator(orcaBotmuxPage, secondTabId).click({ force: true })
+    await tabLocator(botmuxPage, firstTabId).click({ force: true })
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(firstTabId)
+    await tabLocator(botmuxPage, secondTabId).click({ force: true })
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'Tab click did not activate after a terminal tab reorder drag'
       })
@@ -356,15 +356,15 @@ test.describe('Tabs', () => {
    * the load-bearing check — it fails if the shortcut walks the right store
    * id but the tab bar stops painting the active indicator on that tab.
    */
-  test('Cmd/Ctrl+Shift+[ walks tabs in drag-reordered order', async ({ orcaBotmuxPage }) => {
+  test('Cmd/Ctrl+Shift+[ walks tabs in drag-reordered order', async ({ botmuxPage }) => {
     const isMac = process.platform === 'darwin'
     const mod = isMac ? 'Meta' : 'Control'
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
     // Ensure at least 3 terminal tabs so the order cycle is non-trivial.
     // Why store-driven: we only need >=3 tabs to exist; the "+" flow is
     // already exercised by other tests in this file.
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -376,16 +376,16 @@ test.describe('Tabs', () => {
       }
     }, worktreeId)
     await expect
-      .poll(async () => (await getWorktreeTabs(orcaBotmuxPage, worktreeId)).length, { timeout: 5_000 })
+      .poll(async () => (await getWorktreeTabs(botmuxPage, worktreeId)).length, { timeout: 5_000 })
       .toBeGreaterThanOrEqual(3)
 
-    const initialOrder = await getTabBarOrder(orcaBotmuxPage, worktreeId)
+    const initialOrder = await getTabBarOrder(botmuxPage, worktreeId)
     expect(initialOrder.length).toBeGreaterThanOrEqual(3)
     const [a, b, c] = initialOrder
 
     // Reorder via the same store call drag/drop uses: move the first tab to
     // the end so the visible order becomes [b, c, a].
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -403,23 +403,23 @@ test.describe('Tabs', () => {
       state.reorderUnifiedTabs(activeGroup.id, [...rest, first])
     }, worktreeId)
     await expect
-      .poll(async () => getTabBarOrder(orcaBotmuxPage, worktreeId), { timeout: 3_000 })
+      .poll(async () => getTabBarOrder(botmuxPage, worktreeId), { timeout: 3_000 })
       .toEqual([b, c, a])
 
     // Activate the last tab in the new visible order, then walk left twice.
     // Expected cycle: a → c → b (i.e. walks the *new* order in reverse).
-    await orcaBotmuxPage.evaluate((tabId) => {
+    await botmuxPage.evaluate((tabId) => {
       window.__store?.getState().setActiveTab(tabId)
     }, a)
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(a)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(a)
 
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(c)
-    await expect(tabLocator(orcaBotmuxPage, c)).toHaveAttribute('data-active', 'true')
+    await botmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(c)
+    await expect(tabLocator(botmuxPage, c)).toHaveAttribute('data-active', 'true')
 
-    await orcaBotmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 3_000 }).toBe(b)
-    await expect(tabLocator(orcaBotmuxPage, b)).toHaveAttribute('data-active', 'true')
+    await botmuxPage.keyboard.press(`${mod}+Shift+BracketLeft`)
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 3_000 }).toBe(b)
+    await expect(tabLocator(botmuxPage, b)).toHaveAttribute('data-active', 'true')
   })
 
   /**
@@ -432,11 +432,11 @@ test.describe('Tabs', () => {
    * so the test fails if the store cleared the tab but the DOM didn't
    * re-render.
    */
-  test('closing a tab removes it from the tab bar', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('closing a tab removes it from the tab bar', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
     // Need a second tab so we can close one without deactivating the worktree.
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -447,13 +447,13 @@ test.describe('Tabs', () => {
       }
     }, worktreeId)
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), { timeout: 5_000 })
+      .poll(() => countRenderedTabs(botmuxPage), { timeout: 5_000 })
       .toBeGreaterThanOrEqual(2)
 
-    const tabsBefore = await countRenderedTabs(orcaBotmuxPage)
-    const activeId = await getActiveTabId(orcaBotmuxPage)
+    const tabsBefore = await countRenderedTabs(botmuxPage)
+    const activeId = await getActiveTabId(botmuxPage)
     expect(activeId).not.toBeNull()
-    const activeTab = tabLocator(orcaBotmuxPage, activeId!)
+    const activeTab = tabLocator(botmuxPage, activeId!)
     // Why: hover the tab first so the close button reveals its hover style.
     // The button is interactive regardless but hovering matches real user
     // behaviour and keeps click coordinates stable.
@@ -461,7 +461,7 @@ test.describe('Tabs', () => {
     await activeTab.getByRole('button', { name: /^Close tab /i }).click()
 
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), {
+      .poll(() => countRenderedTabs(botmuxPage), {
         timeout: 5_000,
         message: 'Clicking close did not remove the tab element from the DOM'
       })
@@ -476,10 +476,10 @@ test.describe('Tabs', () => {
    * the tab bar re-paints the active indicator after a close — a store-only
    * check would pass even if the indicator failed to shift.
    */
-  test('closing the active tab activates a neighbor tab', async ({ orcaBotmuxPage }) => {
-    const worktreeId = (await getActiveWorktreeId(orcaBotmuxPage))!
+  test('closing the active tab activates a neighbor tab', async ({ botmuxPage }) => {
+    const worktreeId = (await getActiveWorktreeId(botmuxPage))!
 
-    await orcaBotmuxPage.evaluate((targetWorktreeId) => {
+    await botmuxPage.evaluate((targetWorktreeId) => {
       const store = window.__store
       if (!store) {
         return
@@ -490,23 +490,23 @@ test.describe('Tabs', () => {
       }
     }, worktreeId)
     await expect
-      .poll(() => countRenderedTabs(orcaBotmuxPage), { timeout: 5_000 })
+      .poll(() => countRenderedTabs(botmuxPage), { timeout: 5_000 })
       .toBeGreaterThanOrEqual(2)
 
-    const activeTabBefore = await getActiveTabId(orcaBotmuxPage)
+    const activeTabBefore = await getActiveTabId(botmuxPage)
     expect(activeTabBefore).not.toBeNull()
 
-    const activeTab = tabLocator(orcaBotmuxPage, activeTabBefore!)
+    const activeTab = tabLocator(botmuxPage, activeTabBefore!)
     await activeTab.hover()
     await activeTab.getByRole('button', { name: /^Close tab /i }).click()
 
     // Final DOM assertion: some *other* tab element now carries data-active.
     await expect
-      .poll(() => getDomActiveTabId(orcaBotmuxPage), {
+      .poll(() => getDomActiveTabId(botmuxPage), {
         timeout: 5_000,
         message: 'After closing the active tab, no neighbor tab took over the active indicator'
       })
       .not.toBe(activeTabBefore)
-    await expect.poll(() => getDomActiveTabId(orcaBotmuxPage), { timeout: 5_000 }).not.toBeNull()
+    await expect.poll(() => getDomActiveTabId(botmuxPage), { timeout: 5_000 }).not.toBeNull()
   })
 })

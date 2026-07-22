@@ -18,7 +18,7 @@ export type KeybindingContext = 'app' | 'terminal' | 'browser'
 
 export type KeybindingPlatform = 'darwin' | 'linux' | 'win32'
 
-export type TerminalShortcutPolicy = 'orca-botmux-first' | 'terminal-first'
+export type TerminalShortcutPolicy = 'botmux-first' | 'terminal-first'
 
 export type KeybindingMatchOptions = {
   context?: KeybindingContext
@@ -1069,7 +1069,7 @@ export const KEYBINDING_DEFINITIONS: readonly KeybindingDefinition[] = [
       win32: []
     },
     // Why: macOS permits Shift+Space as an input-source shortcut, while normal
-    // OrcaBotmux actions reject Shift-only bindings to avoid stealing typed text.
+    // Botmux actions reject Shift-only bindings to avoid stealing typed text.
     allowShiftOnlyKeybindings: true
   },
   ...buildAgentTabKeybindingDefinitions()
@@ -1870,7 +1870,7 @@ export function getKeybindingDefinition(actionId: KeybindingActionId): Keybindin
 export function normalizeTerminalShortcutPolicy(
   policy: TerminalShortcutPolicy | null | undefined
 ): TerminalShortcutPolicy {
-  return policy === 'terminal-first' ? 'terminal-first' : 'orca-botmux-first'
+  return policy === 'terminal-first' ? 'terminal-first' : 'botmux-first'
 }
 
 export function isKeybindingAllowedInTerminal(definition: KeybindingDefinition): boolean {
@@ -1888,9 +1888,9 @@ export function keybindingIsActiveInContext(
   if (options.context !== 'terminal') {
     return true
   }
-  // Why: OrcaBotmux-first preserves existing app shortcut behavior inside terminals.
+  // Why: Botmux-first preserves existing app shortcut behavior inside terminals.
   // Terminal-first is the explicit escape hatch for shells and TUIs.
-  if (normalizeTerminalShortcutPolicy(options.terminalShortcutPolicy) === 'orca-botmux-first') {
+  if (normalizeTerminalShortcutPolicy(options.terminalShortcutPolicy) === 'botmux-first') {
     return true
   }
   return isKeybindingAllowedInTerminal(definition)

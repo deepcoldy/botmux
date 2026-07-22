@@ -1,5 +1,5 @@
 import type { Page, TestInfo } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { runNodeScriptInTerminal } from './helpers/run-node-script-in-terminal'
 import {
   ensureTerminalVisible,
@@ -362,7 +362,7 @@ async function startHiddenPtyOutputBurst(page: Page, ptyId: string, runId: strin
     '},30);'
   ].join('')
   // Why: delivered via a temp file — `node -e` quoting is not PowerShell-safe (#8521).
-  await runNodeScriptInTerminal(page, ptyId, script, { prefix: 'orca-botmux-tab-switch-burst' })
+  await runNodeScriptInTerminal(page, ptyId, script, { prefix: 'botmux-tab-switch-burst' })
 }
 
 async function writeStaticTabContent(
@@ -525,68 +525,68 @@ test.describe('Terminal tab switch visual restore', () => {
   test.describe.configure({ mode: 'serial' })
 
   test('keeps full-width geometry after switching away and back', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(orcaBotmuxPage)
-    await forceWebglOnActiveTab(orcaBotmuxPage)
+    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(botmuxPage)
+    await forceWebglOnActiveTab(botmuxPage)
 
     const runId = `${Date.now()}`
     const marker = `${TAB_SWITCH_MARKER_PREFIX}_${runId}`
-    const firstPtyId = await waitForPanePtyIdOnTab(orcaBotmuxPage, firstTabId)
-    await writeStaticTabContent(orcaBotmuxPage, firstTabId, marker, TAB_A_GLYPH_ROW)
+    const firstPtyId = await waitForPanePtyIdOnTab(botmuxPage, firstTabId)
+    await writeStaticTabContent(botmuxPage, firstTabId, marker, TAB_A_GLYPH_ROW)
 
-    const baseline = await readTabTerminalGeometry(orcaBotmuxPage, firstTabId, runId)
+    const baseline = await readTabTerminalGeometry(botmuxPage, firstTabId, runId)
     expect(baseline.markerPresent).toBe(true)
     expect(baseline.overlayWidth).toBeGreaterThan(300)
     expect(geometryLooksCorrupted(baseline)).toBeNull()
 
     const corruptionReports: string[] = []
-    await resetTerminalOutputSchedulerDebug(orcaBotmuxPage)
-    await startHiddenPtyOutputBurst(orcaBotmuxPage, firstPtyId, runId)
+    await resetTerminalOutputSchedulerDebug(botmuxPage)
+    await startHiddenPtyOutputBurst(botmuxPage, firstPtyId, runId)
 
     for (let cycle = 0; cycle < 12; cycle += 1) {
-      await activateTerminalTab(orcaBotmuxPage, secondTabId)
-      await injectHiddenStreamingBurst(orcaBotmuxPage, firstTabId, runId)
+      await activateTerminalTab(botmuxPage, secondTabId)
+      await injectHiddenStreamingBurst(botmuxPage, firstTabId, runId)
       // Why: rapid back-to-back switches mirror the user's leave/return pattern
       // and race the overlay's rAF/50ms refit retries.
-      await activateTerminalTab(orcaBotmuxPage, firstTabId)
+      await activateTerminalTab(botmuxPage, firstTabId)
       if (cycle % 3 === 0) {
-        await activateTerminalTab(orcaBotmuxPage, secondTabId)
-        await activateTerminalTab(orcaBotmuxPage, firstTabId)
+        await activateTerminalTab(botmuxPage, secondTabId)
+        await activateTerminalTab(botmuxPage, firstTabId)
       }
 
       // Sample immediately — bug often shows before the 50ms overlay refit retry.
-      const immediate = await readTabTerminalGeometry(orcaBotmuxPage, firstTabId, runId)
+      const immediate = await readTabTerminalGeometry(botmuxPage, firstTabId, runId)
       const immediateIssue = geometryLooksCorrupted(immediate)
       if (immediateIssue) {
         corruptionReports.push(`cycle ${cycle} immediate: ${immediateIssue}`)
         await captureTabScreenshot(
-          orcaBotmuxPage,
+          botmuxPage,
           firstTabId,
           testInfo,
           `tab-switch-corrupt-immediate-cycle-${cycle}`
         )
       }
 
-      await orcaBotmuxPage.waitForTimeout(60)
-      const settled = await readTabTerminalGeometry(orcaBotmuxPage, firstTabId, runId)
+      await botmuxPage.waitForTimeout(60)
+      const settled = await readTabTerminalGeometry(botmuxPage, firstTabId, runId)
       const settledIssue = geometryLooksCorrupted(settled)
       if (settledIssue) {
         corruptionReports.push(`cycle ${cycle} settled: ${settledIssue}`)
         await captureTabScreenshot(
-          orcaBotmuxPage,
+          botmuxPage,
           firstTabId,
           testInfo,
           `tab-switch-corrupt-settled-cycle-${cycle}`
         )
       }
     }
-    const schedulerActivity = await waitForHiddenOutputSchedulerActivity(orcaBotmuxPage)
+    const schedulerActivity = await waitForHiddenOutputSchedulerActivity(botmuxPage)
     expect(schedulerActivity.scheduledDrainCount).toBeGreaterThan(0)
 
     if (corruptionReports.length > 0) {
@@ -602,20 +602,20 @@ test.describe('Terminal tab switch visual restore', () => {
   })
 
   test('keeps geometry after hidden alt-screen TUI redraws during tab switches', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(orcaBotmuxPage)
-    await forceWebglOnActiveTab(orcaBotmuxPage)
+    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(botmuxPage)
+    await forceWebglOnActiveTab(botmuxPage)
 
     const runId = `${Date.now()}`
     const finalMarker = `${TAB_SWITCH_MARKER_PREFIX}_${runId}_ALT_24`
 
-    await orcaBotmuxPage.evaluate(
+    await botmuxPage.evaluate(
       ({ tabId, finalMarker }) => {
         const manager = window.__paneManagers?.get(tabId)
         const pane = manager?.getActivePane?.() ?? manager?.getPanes?.()[0]
@@ -643,8 +643,8 @@ test.describe('Terminal tab switch visual restore', () => {
 
     const corruptionReports: string[] = []
     for (let cycle = 0; cycle < 6; cycle += 1) {
-      await activateTerminalTab(orcaBotmuxPage, secondTabId)
-      await orcaBotmuxPage.evaluate(
+      await activateTerminalTab(botmuxPage, secondTabId)
+      await botmuxPage.evaluate(
         ({ tabId, finalMarker, cycle }) => {
           const manager = window.__paneManagers?.get(tabId)
           const pane = manager?.getActivePane?.() ?? manager?.getPanes?.()[0]
@@ -668,16 +668,16 @@ test.describe('Terminal tab switch visual restore', () => {
         },
         { tabId: firstTabId, finalMarker, cycle }
       )
-      await activateTerminalTab(orcaBotmuxPage, firstTabId)
+      await activateTerminalTab(botmuxPage, firstTabId)
 
-      const geometry = await readTabTerminalGeometry(orcaBotmuxPage, firstTabId, `${runId}_ALT`)
+      const geometry = await readTabTerminalGeometry(botmuxPage, firstTabId, `${runId}_ALT`)
       const issue = geometryLooksCorrupted(geometry)
       if (issue || !geometry.markerPresent) {
         corruptionReports.push(
           `cycle ${cycle}: ${issue ?? 'marker missing after alt-screen redraw'}`
         )
         await captureTabScreenshot(
-          orcaBotmuxPage,
+          botmuxPage,
           firstTabId,
           testInfo,
           `alt-screen-corrupt-cycle-${cycle}`
@@ -693,20 +693,20 @@ test.describe('Terminal tab switch visual restore', () => {
     ).toEqual([])
   })
 
-  test('restores skipped hidden agent output on light tab resume', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  test('restores skipped hidden agent output on light tab resume', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const shellTabId = (await getActiveTabId(orcaBotmuxPage))!
-    const agentTabId = await createCodexMarkedTerminalTab(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPanePtyIdOnTab(orcaBotmuxPage, agentTabId)
-    const paneIdentity = await readPaneIdentityOnTab(orcaBotmuxPage, agentTabId)
+    const shellTabId = (await getActiveTabId(botmuxPage))!
+    const agentTabId = await createCodexMarkedTerminalTab(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPanePtyIdOnTab(botmuxPage, agentTabId)
+    const paneIdentity = await readPaneIdentityOnTab(botmuxPage, agentTabId)
     const paneKey = `${agentTabId}:${paneIdentity.leafId}`
 
-    await activateTerminalTab(orcaBotmuxPage, shellTabId)
+    await activateTerminalTab(botmuxPage, shellTabId)
     const runId = `${Date.now()}`
     const marker = `${TAB_SWITCH_MARKER_PREFIX}_SKIPPED_AGENT_${runId}`
     const hiddenFrame = [
@@ -715,49 +715,49 @@ test.describe('Terminal tab switch visual restore', () => {
       'status=streaming while tab-hidden',
       '\x1b[?2026l'
     ].join('\r\n')
-    await resetHiddenOutputDebug(orcaBotmuxPage)
-    await injectPaneData(orcaBotmuxPage, paneKey, hiddenFrame, {
+    await resetHiddenOutputDebug(botmuxPage)
+    await injectPaneData(botmuxPage, paneKey, hiddenFrame, {
       seq: hiddenFrame.length,
       rawLength: hiddenFrame.length
     })
 
     await expect
-      .poll(async () => (await readHiddenOutputDebug(orcaBotmuxPage))?.hiddenRendererSkipCount ?? 0, {
+      .poll(async () => (await readHiddenOutputDebug(botmuxPage))?.hiddenRendererSkipCount ?? 0, {
         timeout: 5_000,
         message: 'Codex-marked hidden output did not take the skipped renderer path'
       })
       .toBeGreaterThan(0)
-    await setHiddenSnapshotOverride(orcaBotmuxPage, paneIdentity.ptyId, {
+    await setHiddenSnapshotOverride(botmuxPage, paneIdentity.ptyId, {
       data: `${marker} restored from main snapshot\r\n`,
       cols: paneIdentity.cols,
       rows: paneIdentity.rows,
       seq: hiddenFrame.length
     })
 
-    await activateTerminalTab(orcaBotmuxPage, agentTabId)
+    await activateTerminalTab(botmuxPage, agentTabId)
 
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 8_000), {
+      .poll(() => getTerminalContent(botmuxPage, 8_000), {
         timeout: 10_000,
         message: 'light tab resume did not request skipped hidden-output recovery'
       })
       .toContain(marker)
   })
 
-  test('restores skipped hidden Grok output on light tab resume', async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+  test('restores skipped hidden Grok output on light tab resume', async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const shellTabId = (await getActiveTabId(orcaBotmuxPage))!
-    const grokTabId = await createGrokMarkedTerminalTab(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
-    await waitForPanePtyIdOnTab(orcaBotmuxPage, grokTabId)
-    const paneIdentity = await readPaneIdentityOnTab(orcaBotmuxPage, grokTabId)
+    const shellTabId = (await getActiveTabId(botmuxPage))!
+    const grokTabId = await createGrokMarkedTerminalTab(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
+    await waitForPanePtyIdOnTab(botmuxPage, grokTabId)
+    const paneIdentity = await readPaneIdentityOnTab(botmuxPage, grokTabId)
     const paneKey = `${grokTabId}:${paneIdentity.leafId}`
 
-    await activateTerminalTab(orcaBotmuxPage, shellTabId)
+    await activateTerminalTab(botmuxPage, shellTabId)
     const runId = `${Date.now()}`
     const marker = `${TAB_SWITCH_MARKER_PREFIX}_SKIPPED_GROK_${runId}`
     // Why: synchronized-output mode exercises the hidden renderer skip path
@@ -768,84 +768,84 @@ test.describe('Terminal tab switch visual restore', () => {
       'status=streaming while tab-hidden',
       '\x1b[?2026l'
     ].join('\r\n')
-    await resetHiddenOutputDebug(orcaBotmuxPage)
-    await injectPaneData(orcaBotmuxPage, paneKey, hiddenFrame, {
+    await resetHiddenOutputDebug(botmuxPage)
+    await injectPaneData(botmuxPage, paneKey, hiddenFrame, {
       seq: hiddenFrame.length,
       rawLength: hiddenFrame.length
     })
 
     await expect
-      .poll(async () => (await readHiddenOutputDebug(orcaBotmuxPage))?.hiddenRendererSkipCount ?? 0, {
+      .poll(async () => (await readHiddenOutputDebug(botmuxPage))?.hiddenRendererSkipCount ?? 0, {
         timeout: 5_000,
         message: 'Grok-marked hidden output did not take the skipped renderer path'
       })
       .toBeGreaterThan(0)
-    await setHiddenSnapshotOverride(orcaBotmuxPage, paneIdentity.ptyId, {
+    await setHiddenSnapshotOverride(botmuxPage, paneIdentity.ptyId, {
       data: `${marker} restored from main snapshot\r\n`,
       cols: paneIdentity.cols,
       rows: paneIdentity.rows,
       seq: hiddenFrame.length
     })
 
-    await activateTerminalTab(orcaBotmuxPage, grokTabId)
+    await activateTerminalTab(botmuxPage, grokTabId)
 
     await expect
-      .poll(() => getTerminalContent(orcaBotmuxPage, 8_000), {
+      .poll(() => getTerminalContent(botmuxPage, 8_000), {
         timeout: 10_000,
         message: 'light tab resume did not request skipped Grok hidden-output recovery'
       })
       .toContain(marker)
   })
 
-  test('keeps returned tab glyphs intact across tab switches', async ({ orcaBotmuxPage }, testInfo) => {
+  test('keeps returned tab glyphs intact across tab switches', async ({ botmuxPage }, testInfo) => {
     // Why: screenshot equality catches WebGL atlas corruption on the tab being
     // resumed, not just stale cols/rows geometry checks.
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
-    await waitForActiveTerminalManager(orcaBotmuxPage, 30_000)
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
+    await waitForActiveTerminalManager(botmuxPage, 30_000)
 
-    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(orcaBotmuxPage)
-    await forceWebglOnActiveTab(orcaBotmuxPage)
-    await activateTerminalTab(orcaBotmuxPage, firstTabId)
-    const firstWebgl = await waitForWebglOnTab(orcaBotmuxPage, firstTabId)
-    await activateTerminalTab(orcaBotmuxPage, secondTabId)
-    await orcaBotmuxPage.evaluate((id) => {
+    const { firstTabId, secondTabId } = await ensureTwoTerminalTabs(botmuxPage)
+    await forceWebglOnActiveTab(botmuxPage)
+    await activateTerminalTab(botmuxPage, firstTabId)
+    const firstWebgl = await waitForWebglOnTab(botmuxPage, firstTabId)
+    await activateTerminalTab(botmuxPage, secondTabId)
+    await botmuxPage.evaluate((id) => {
       window.__paneManagers?.get(id)?.setTerminalGpuAcceleration?.('on')
     }, secondTabId)
-    const secondWebgl = await waitForWebglOnTab(orcaBotmuxPage, secondTabId)
+    const secondWebgl = await waitForWebglOnTab(botmuxPage, secondTabId)
     if (!firstWebgl || !secondWebgl) {
       test.skip(true, 'WebGL never attached on both tabs')
       return
     }
 
-    const firstPtyId = await waitForPanePtyIdOnTab(orcaBotmuxPage, firstTabId)
-    const secondPtyId = await waitForPanePtyIdOnTab(orcaBotmuxPage, secondTabId)
-    await sendToTerminal(orcaBotmuxPage, firstPtyId, SILENT_FOREGROUND_COMMAND)
-    await sendToTerminal(orcaBotmuxPage, secondPtyId, SILENT_FOREGROUND_COMMAND)
-    await orcaBotmuxPage.waitForTimeout(1_000)
+    const firstPtyId = await waitForPanePtyIdOnTab(botmuxPage, firstTabId)
+    const secondPtyId = await waitForPanePtyIdOnTab(botmuxPage, secondTabId)
+    await sendToTerminal(botmuxPage, firstPtyId, SILENT_FOREGROUND_COMMAND)
+    await sendToTerminal(botmuxPage, secondPtyId, SILENT_FOREGROUND_COMMAND)
+    await botmuxPage.waitForTimeout(1_000)
 
     const runId = `${Date.now()}`
     const markerA = `${TAB_SWITCH_MARKER_PREFIX}_A_${runId}`
     const markerB = `${TAB_SWITCH_MARKER_PREFIX}_B_${runId}`
-    await writeStaticTabContent(orcaBotmuxPage, firstTabId, markerA, TAB_A_GLYPH_ROW)
-    await activateTerminalTab(orcaBotmuxPage, secondTabId)
-    await writeStaticTabContent(orcaBotmuxPage, secondTabId, markerB, TAB_B_GLYPH_ROW)
+    await writeStaticTabContent(botmuxPage, firstTabId, markerA, TAB_A_GLYPH_ROW)
+    await activateTerminalTab(botmuxPage, secondTabId)
+    await writeStaticTabContent(botmuxPage, secondTabId, markerB, TAB_B_GLYPH_ROW)
 
-    await activateTerminalTab(orcaBotmuxPage, firstTabId)
-    await resetAtlasOnTab(orcaBotmuxPage, firstTabId)
-    await orcaBotmuxPage.waitForTimeout(800)
-    const baseline = await captureStableTabScreenshot(orcaBotmuxPage, firstTabId)
+    await activateTerminalTab(botmuxPage, firstTabId)
+    await resetAtlasOnTab(botmuxPage, firstTabId)
+    await botmuxPage.waitForTimeout(800)
+    const baseline = await captureStableTabScreenshot(botmuxPage, firstTabId)
 
     const screenshotMismatches: string[] = []
     for (let cycle = 0; cycle < 8; cycle += 1) {
-      await activateTerminalTab(orcaBotmuxPage, secondTabId)
+      await activateTerminalTab(botmuxPage, secondTabId)
       // Why: do not write into the hidden tab here — new bytes would change the
       // screenshot even when rendering is healthy. This cycle only exercises the
       // suspend/resume + atlas reset path on unchanged content.
-      await activateTerminalTab(orcaBotmuxPage, firstTabId)
-      await orcaBotmuxPage.waitForTimeout(100)
-      const afterReturn = await captureStableTabScreenshot(orcaBotmuxPage, firstTabId)
+      await activateTerminalTab(botmuxPage, firstTabId)
+      await botmuxPage.waitForTimeout(100)
+      const afterReturn = await captureStableTabScreenshot(botmuxPage, firstTabId)
       const diff = compareTerminalScreenshots(baseline, afterReturn)
       if (!diff.matches) {
         screenshotMismatches.push(

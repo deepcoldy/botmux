@@ -4,12 +4,12 @@ import {
   botmuxSessionBelongsToWorktree,
   filterBotmuxSessionsForWorktree,
   normalizeBotmuxMatchPath,
-  orcaBotmuxHostIdForRepoConnection
+  botmuxHostIdForRepoConnection
 } from './botmux-session-worktree-match'
 
 describe('botmux-session-worktree-match', () => {
   const host = 'ssh:ssh-1'
-  const worktree = { path: '/root/workspace/botmux', orcaBotmuxHostId: host }
+  const worktree = { path: '/root/workspace/botmux', botmuxHostId: host }
 
   it('normalizes trailing slashes and backslashes', () => {
     expect(normalizeBotmuxMatchPath('/a/b/')).toBe('/a/b')
@@ -17,8 +17,8 @@ describe('botmux-session-worktree-match', () => {
   })
 
   it('maps repo connectionId to ssh host id', () => {
-    expect(orcaBotmuxHostIdForRepoConnection('ssh-1')).toBe('ssh:ssh-1')
-    expect(orcaBotmuxHostIdForRepoConnection(null)).toBe('local')
+    expect(botmuxHostIdForRepoConnection('ssh-1')).toBe('ssh:ssh-1')
+    expect(botmuxHostIdForRepoConnection(null)).toBe('local')
   })
 
   it('matches session cwd equal or under worktree path on same host', () => {
@@ -68,7 +68,7 @@ describe('botmux-session-worktree-match', () => {
     ]
     const out = applyBotmuxSessionWorktreeScope(sessions, {
       worktreePath: '/root/workspace/botmux',
-      orcaBotmuxHostId: host
+      botmuxHostId: host
     })
     expect(out.map((s) => s.sessionId)).toEqual(['keep'])
   })

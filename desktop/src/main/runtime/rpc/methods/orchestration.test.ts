@@ -4,7 +4,7 @@ import { ORCHESTRATION_METHODS } from './orchestration'
 import { RpcDispatcher } from '../dispatcher'
 import { buildRegistry, type RpcContext, type RpcRequest } from '../core'
 import { OrchestrationDb } from '../../orchestration/db'
-import { OrcaRuntimeService } from '../../orca-botmux-runtime'
+import { BotmuxRuntimeService } from '../../botmux-runtime'
 import type { RuntimeTerminalSummary } from '../../../../shared/runtime-types'
 
 function lifecycleGroupRecipientError(type: 'worker_done' | 'heartbeat'): string {
@@ -14,13 +14,13 @@ function lifecycleGroupRecipientError(type: 'worker_done' | 'heartbeat'): string
 describe('orchestration RPC methods', () => {
   let db: OrchestrationDb
   let dbOpen = false
-  let runtime: OrcaRuntimeService
+  let runtime: BotmuxRuntimeService
   let ctx: RpcContext
 
   function setup(): void {
     db = new OrchestrationDb(':memory:')
     dbOpen = true
-    runtime = new OrcaRuntimeService()
+    runtime = new BotmuxRuntimeService()
     runtime.setOrchestrationDb(db)
     ctx = { runtime }
   }
@@ -1365,14 +1365,14 @@ describe('orchestration RPC methods', () => {
 
       expect(send).toHaveBeenCalledWith(
         'term_a',
-        expect.stringContaining('orca-botmux-desktop-dev orchestration send')
+        expect.stringContaining('botmux-desktop-dev orchestration send')
       )
     })
 
     it('uses the target pane CLI command for the returned preamble', async () => {
       setup()
       const task = db.createTask({ spec: 'work' })
-      vi.spyOn(runtime, 'getTerminalOrchestrationCliCommand').mockReturnValue('orca-botmux-ide')
+      vi.spyOn(runtime, 'getTerminalOrchestrationCliCommand').mockReturnValue('botmux-ide')
 
       const result = (await call('orchestration.dispatch', {
         task: task.id,
@@ -1381,8 +1381,8 @@ describe('orchestration RPC methods', () => {
       })) as { preamble: string }
 
       expect(runtime.getTerminalOrchestrationCliCommand).toHaveBeenCalledWith('term_wsl')
-      expect(result.preamble).toContain('orca-botmux-ide orchestration send')
-      expect(result.preamble).not.toMatch(/(^|\s)orca_botmux orchestration/m)
+      expect(result.preamble).toContain('botmux-ide orchestration send')
+      expect(result.preamble).not.toMatch(/(^|\s)botmux orchestration/m)
     })
 
     it('injects preamble through the agent prompt path instead of raw terminal send', async () => {

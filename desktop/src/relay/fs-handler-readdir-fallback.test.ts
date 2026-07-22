@@ -12,7 +12,7 @@ afterEach(async () => {
 
 describe('relay readdir file-list fallback', () => {
   it('returns a bounded prefix instead of rejecting at the requested result limit', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'orca-botmux-relay-readdir-'))
+    const root = await mkdtemp(join(tmpdir(), 'botmux-relay-readdir-'))
     roots.push(root)
     await mkdir(join(root, 'src'))
     await writeFile(join(root, 'src', 'a.ts'), 'a')

@@ -97,7 +97,7 @@ function smokeLoadDaemonEntry(outputDir: string): void {
 
 export function createPlainNodeEntryGuardPlugin(): Plugin {
   return {
-    name: 'orca-botmux-plain-node-entry-guard',
+    name: 'botmux-plain-node-entry-guard',
     writeBundle(options: NormalizedOutputOptions, bundle: OutputBundle) {
       // Why: skip in `electron-vite dev` watch mode — the smoke would respawn on
       // every rebuild, and the guard only needs to gate produced builds.

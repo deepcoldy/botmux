@@ -26,10 +26,10 @@ function writeLegacyLinearFiles(token: string, viewer: Record<string, unknown>):
 }
 
 function writeLegacyLinearToken(token: string | Buffer, viewer: Record<string, unknown>): void {
-  const orcaDir = join(tempHome, '.orca_botmux')
-  mkdirSync(orcaDir, { recursive: true })
-  writeFileSync(join(orcaDir, 'linear-token.enc'), token)
-  writeFileSync(join(orcaDir, 'linear-viewer.json'), JSON.stringify(viewer), {
+  const botmuxDir = join(tempHome, '.botmux')
+  mkdirSync(botmuxDir, { recursive: true })
+  writeFileSync(join(botmuxDir, 'linear-token.enc'), token)
+  writeFileSync(join(botmuxDir, 'linear-viewer.json'), JSON.stringify(viewer), {
     encoding: 'utf-8'
   })
 }
@@ -37,7 +37,7 @@ function writeLegacyLinearToken(token: string | Buffer, viewer: Record<string, u
 function workspaceTokenPath(workspaceId: string): string {
   return join(
     tempHome,
-    '.orca_botmux',
+    '.botmux',
     'linear-tokens',
     `${Buffer.from(workspaceId).toString('base64url')}.enc`
   )
@@ -47,10 +47,10 @@ function writeMultiWorkspaceFiles(
   workspaces: { id: string; token: string | Buffer }[],
   selectedWorkspaceId: string
 ): void {
-  const orcaDir = join(tempHome, '.orca_botmux')
-  mkdirSync(join(orcaDir, 'linear-tokens'), { recursive: true })
+  const botmuxDir = join(tempHome, '.botmux')
+  mkdirSync(join(botmuxDir, 'linear-tokens'), { recursive: true })
   writeFileSync(
-    join(orcaDir, 'linear-workspaces.json'),
+    join(botmuxDir, 'linear-workspaces.json'),
     JSON.stringify({
       version: 1,
       activeWorkspaceId: workspaces[0]?.id ?? null,
@@ -111,7 +111,7 @@ async function loadClientModule(options: SafeStorageMockOptions = {}) {
 }
 
 beforeEach(() => {
-  tempHome = mkdtempLike('orca-botmux-linear-client-')
+  tempHome = mkdtempLike('botmux-linear-client-')
   fixtures = new Map([
     [
       'token-alpha',
@@ -208,8 +208,8 @@ describe('Linear client workspace storage', () => {
       workspaces: [{ id: 'org-alpha', organizationName: 'Alpha' }]
     })
     expect(status.workspaces?.some((workspace) => workspace.id === 'legacy')).toBe(false)
-    expect(existsSync(join(tempHome, '.orca_botmux', 'linear-token.enc'))).toBe(false)
-    expect(readFileSync(join(tempHome, '.orca_botmux', 'linear-workspaces.json'), 'utf-8')).toContain(
+    expect(existsSync(join(tempHome, '.botmux', 'linear-token.enc'))).toBe(false)
+    expect(readFileSync(join(tempHome, '.botmux', 'linear-workspaces.json'), 'utf-8')).toContain(
       'org-alpha'
     )
   })
@@ -236,7 +236,7 @@ describe('Linear client workspace storage', () => {
   })
 
   it('does not pass encrypted safeStorage bytes to the Linear SDK when encryption is unavailable', async () => {
-    const tokenPath = join(tempHome, '.orca_botmux', 'linear-token.enc')
+    const tokenPath = join(tempHome, '.botmux', 'linear-token.enc')
     writeLegacyLinearToken(Buffer.from([0x76, 0x31, 0x30, 0xff, 0xfe]), {
       displayName: 'Ada',
       email: 'ada@example.com',
@@ -261,7 +261,7 @@ describe('Linear client workspace storage', () => {
   })
 
   it('does not clear the Linear token when safeStorage decryption fails', async () => {
-    const tokenPath = join(tempHome, '.orca_botmux', 'linear-token.enc')
+    const tokenPath = join(tempHome, '.botmux', 'linear-token.enc')
     writeLegacyLinearToken(Buffer.from([0x76, 0x31, 0x30, 0xff, 0xfe]), {
       displayName: 'Ada',
       email: 'ada@example.com',

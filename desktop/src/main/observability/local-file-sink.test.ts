@@ -17,7 +17,7 @@ import { createLocalFileSink, getRotatedFamilySize, listRotatedFiles } from './l
 let dir: string
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), 'orca-botmux-sink-'))
+  dir = mkdtempSync(join(tmpdir(), 'botmux-sink-'))
 })
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true })

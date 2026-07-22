@@ -26,7 +26,7 @@ const MEANINGFUL_CONTENT_SCAN_TAIL_LIMIT = 4096
 /**
  * Lightweight normalization to detect whether a PTY data chunk contains
  * meaningful (non-ANSI, non-OSC) output. Mirrors the regex passes in
- * orca-botmux-runtime.ts normalizeTerminalChunk but avoids importing the runtime.
+ * botmux-runtime.ts normalizeTerminalChunk but avoids importing the runtime.
  */
 function hasMeaningfulContent(chunk: string): boolean {
   for (let index = 0; index < chunk.length; index++) {
@@ -92,7 +92,7 @@ export class AgentDetector {
   }
 
   /**
-   * Called on every PTY data chunk (from orca-botmux-runtime.ts onPtyData).
+   * Called on every PTY data chunk (from botmux-runtime.ts onPtyData).
    * Receives raw data BEFORE normalization, since normalizeTerminalChunk
    * strips OSC sequences that we need for agent detection.
    */
@@ -176,7 +176,7 @@ export class AgentDetector {
   }
 
   /**
-   * Called when a PTY process exits (from orca-botmux-runtime.ts onPtyExit).
+   * Called when a PTY process exits (from botmux-runtime.ts onPtyExit).
    */
   onExit(ptyId: string): void {
     const record = this.ptys.get(ptyId)

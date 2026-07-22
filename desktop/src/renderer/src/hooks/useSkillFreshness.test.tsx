@@ -95,7 +95,7 @@ describe('useSkillFreshness', () => {
     await act(async () => window.dispatchEvent(new Event('focus')))
     expect(freshnessInventory).toHaveBeenCalledTimes(1)
 
-    await act(async () => window.dispatchEvent(new Event('orca_botmux:installed-agent-skills-changed')))
+    await act(async () => window.dispatchEvent(new Event('botmux:installed-agent-skills-changed')))
     await act(async () => second.resolve(inventory(2)))
     expect(freshnessInventory).toHaveBeenCalledTimes(2)
     expect(state?.inventory?.scannedAt).toBe(2)
@@ -107,12 +107,12 @@ describe('useSkillFreshness', () => {
     const second = deferred<SkillFreshnessInventory>()
     const freshnessInventory = vi
       .fn()
-      .mockResolvedValueOnce(inventory(1, ['orca-botmux-cli']))
+      .mockResolvedValueOnce(inventory(1, ['botmux-cli']))
       .mockReturnValueOnce(second.promise)
     window.api = { skills: { freshnessInventory } } as never
 
     await act(async () => root?.render(<Probe />))
-    expect(state?.inventory?.eligibleUpdateNames).toEqual(['orca-botmux-cli'])
+    expect(state?.inventory?.eligibleUpdateNames).toEqual(['botmux-cli'])
 
     await act(async () => window.dispatchEvent(new Event('focus')))
     expect(freshnessInventory).toHaveBeenCalledTimes(1)
@@ -145,7 +145,7 @@ describe('useSkillFreshness', () => {
     await act(async () => first.resolve(inventory(1)))
     expect(freshnessInventory).toHaveBeenCalledTimes(1)
 
-    await act(async () => window.dispatchEvent(new Event('orca_botmux:installed-agent-skills-changed')))
+    await act(async () => window.dispatchEvent(new Event('botmux:installed-agent-skills-changed')))
     await act(async () => second.resolve(inventory(2)))
     expect(freshnessInventory).toHaveBeenCalledTimes(2)
   })
@@ -195,7 +195,7 @@ describe('useSkillFreshness', () => {
     await act(async () => root?.render(<Probe />))
     expect(state?.inventory?.scannedAt).toBe(1)
 
-    await act(async () => window.dispatchEvent(new Event('orca_botmux:installed-agent-skills-changed')))
+    await act(async () => window.dispatchEvent(new Event('botmux:installed-agent-skills-changed')))
     expect(state?.inventory).toBeNull()
     expect(state?.loading).toBe(true)
 
@@ -223,7 +223,7 @@ describe('useSkillFreshness', () => {
 
     expect(addEventListener.mock.calls.filter(([name]) => name === 'focus')).toHaveLength(1)
     expect(
-      addEventListener.mock.calls.filter(([name]) => name === 'orca_botmux:installed-agent-skills-changed')
+      addEventListener.mock.calls.filter(([name]) => name === 'botmux:installed-agent-skills-changed')
     ).toHaveLength(1)
 
     await act(async () => root?.unmount())
@@ -231,7 +231,7 @@ describe('useSkillFreshness', () => {
     expect(removeEventListener.mock.calls.filter(([name]) => name === 'focus')).toHaveLength(1)
     expect(
       removeEventListener.mock.calls.filter(
-        ([name]) => name === 'orca_botmux:installed-agent-skills-changed'
+        ([name]) => name === 'botmux:installed-agent-skills-changed'
       )
     ).toHaveLength(1)
   })

@@ -35,7 +35,7 @@ function installModuleMocks(
   const sessionFromPartitionMock = vi.fn((partition: string) => ({
     partition,
     setUserAgent: vi.fn(),
-    getUserAgent: vi.fn(() => 'Mozilla/5.0 Electron/31 OrcaBotmux'),
+    getUserAgent: vi.fn(() => 'Mozilla/5.0 Electron/31 Botmux'),
     setPermissionRequestHandler: vi.fn(),
     setPermissionCheckHandler: vi.fn(),
     setDevicePermissionHandler: vi.fn(),
@@ -156,13 +156,13 @@ describe('BrowserSessionRegistry persistence', () => {
     const written = JSON.parse(fsState.files.get(META_PATH) ?? '{}')
     expect(written.pendingCookieDbPath).toBeNull()
     expect(written.pendingCookieImports).toEqual({})
-    expect(fsState.present.has('/user-data/Partitions/orca-botmux-browser/Cookies')).toBe(true)
+    expect(fsState.present.has('/user-data/Partitions/botmux-browser/Cookies')).toBe(true)
   })
 
   it('replays pending cookies into an existing Network database', async () => {
     const stagedPath = '/staged/network-import'
-    const networkPath = '/user-data/Partitions/orca-botmux-browser/Network/Cookies'
-    const legacyPath = '/user-data/Partitions/orca-botmux-browser/Cookies'
+    const networkPath = '/user-data/Partitions/botmux-browser/Network/Cookies'
+    const legacyPath = '/user-data/Partitions/botmux-browser/Cookies'
     const fsState = createFsState()
     seedMeta(fsState, {
       defaultSource: null,
@@ -184,15 +184,15 @@ describe('BrowserSessionRegistry persistence', () => {
     expect(fsState.present.has(legacyPath)).toBe(false)
   })
 
-  it('persists new browser session profiles under the active OrcaBotmux profile directory', async () => {
+  it('persists new browser session profiles under the active Botmux profile directory', async () => {
     const fsState = createFsState()
     const profileMetaPath = '/user-data/profiles/local-work/browser-session-meta.json'
 
     installModuleMocks(fsState)
     const { browserSessionRegistry } = await import('./browser-session-registry')
 
-    browserSessionRegistry.configureForOrcaProfile({
-      orcaProfileId: 'local-work',
+    browserSessionRegistry.configureForBotmuxProfile({
+      botmuxProfileId: 'local-work',
       profileDirectory: '/user-data/profiles/local-work'
     })
     const profile = browserSessionRegistry.createProfile('isolated', 'Work Browser')
@@ -221,22 +221,22 @@ describe('BrowserSessionRegistry persistence', () => {
     installModuleMocks(fsState)
     const { browserSessionRegistry } = await import('./browser-session-registry')
 
-    browserSessionRegistry.setPendingCookieImport('persist:orca-botmux-browser', '/staged/default')
+    browserSessionRegistry.setPendingCookieImport('persist:botmux-browser', '/staged/default')
     browserSessionRegistry.setPendingCookieImport(
-      'persist:orca-botmux-browser-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      'persist:botmux-browser-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
       '/staged/imported'
     )
 
     const written = JSON.parse(fsState.files.get(META_PATH) ?? '{}')
     expect(written.pendingCookieDbPath).toBe('/staged/default')
     expect(written.pendingCookieImports).toEqual({
-      'persist:orca-botmux-browser': '/staged/default',
-      'persist:orca-botmux-browser-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa': '/staged/imported'
+      'persist:botmux-browser': '/staged/default',
+      'persist:botmux-browser-session-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa': '/staged/imported'
     })
   })
 
   it('restores persisted UA for non-default partitions', async () => {
-    const importedPartition = 'persist:orca-botmux-browser-session-11111111-1111-4111-8111-111111111111'
+    const importedPartition = 'persist:botmux-browser-session-11111111-1111-4111-8111-111111111111'
     const importedUa = 'Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36'
     const defaultUa = 'Mozilla/5.0 Chrome/119.0.0.0 Safari/537.36'
     const fsState = createFsState()
@@ -244,7 +244,7 @@ describe('BrowserSessionRegistry persistence', () => {
       defaultSource: null,
       userAgent: defaultUa,
       userAgentByPartition: {
-        'persist:orca-botmux-browser': defaultUa,
+        'persist:botmux-browser': defaultUa,
         [importedPartition]: importedUa
       },
       pendingCookieDbPath: null,
@@ -304,7 +304,7 @@ describe('BrowserSessionRegistry persistence', () => {
     browserSessionRegistry.initializeBrowserSessionsFromPersistedState()
 
     const defaultSessions = sessionFromPartitionMock.mock.results
-      .filter((_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:orca-botmux-browser')
+      .filter((_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:botmux-browser')
       .map((r) => r.value)
     expect(defaultSessions.length).toBeGreaterThan(0)
     const defaultSession = defaultSessions[0]
@@ -436,7 +436,7 @@ describe('BrowserSessionRegistry persistence', () => {
     browserSessionRegistry.initializeBrowserSessionsFromPersistedState()
 
     const defaultSessions = sessionFromPartitionMock.mock.results
-      .filter((_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:orca-botmux-browser')
+      .filter((_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:botmux-browser')
       .map((r) => r.value)
     const policySessions = defaultSessions.filter(
       (s) => s.setPermissionRequestHandler.mock.calls.length > 0
@@ -481,7 +481,7 @@ describe('BrowserSessionRegistry persistence', () => {
     browserSessionRegistry.initializeBrowserSessionsFromPersistedState()
 
     const defaultSession = sessionFromPartitionMock.mock.results.find(
-      (_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:orca-botmux-browser'
+      (_, idx) => sessionFromPartitionMock.mock.calls[idx]?.[0] === 'persist:botmux-browser'
     )?.value
     const requestHandler = defaultSession.setPermissionRequestHandler.mock.calls[0][0]
     const guestWc = { id: 403, getURL: vi.fn(() => 'https://example.com/camera') }
@@ -498,7 +498,7 @@ describe('BrowserSessionRegistry persistence', () => {
   })
 
   it('keeps failed partition replay pending and removes unrelated missing entries', async () => {
-    const importedPartition = 'persist:orca-botmux-browser-session-22222222-2222-4222-8222-222222222222'
+    const importedPartition = 'persist:botmux-browser-session-22222222-2222-4222-8222-222222222222'
     const fsState = createFsState()
     seedMeta(fsState, {
       defaultSource: null,
@@ -507,7 +507,7 @@ describe('BrowserSessionRegistry persistence', () => {
       pendingCookieDbPath: null,
       pendingCookieImports: {
         [importedPartition]: '/staged/imported',
-        'persist:orca-botmux-browser': '/staged/missing'
+        'persist:botmux-browser': '/staged/missing'
       },
       profiles: [
         {

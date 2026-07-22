@@ -19,7 +19,7 @@ const OLD_FETCH = globalThis.fetch
 
 describe('Azure DevOps client', () => {
   beforeEach(() => {
-    process.env = { ...OLD_ENV, ORCA_AZURE_DEVOPS_TOKEN: 'pat-token' }
+    process.env = { ...OLD_ENV, BOTMUX_AZURE_DEVOPS_TOKEN: 'pat-token' }
     gitExecFileAsyncMock.mockReset()
     _resetAzureDevOpsRepoRefCache()
   })
@@ -37,7 +37,7 @@ describe('Azure DevOps client', () => {
   })
 
   it('marks token-only auth as configured but unverified because repository remotes supply the API base URL', async () => {
-    delete process.env.ORCA_AZURE_DEVOPS_API_BASE_URL
+    delete process.env.BOTMUX_AZURE_DEVOPS_API_BASE_URL
     await expect(getAzureDevOpsAuthStatus()).resolves.toEqual({
       configured: true,
       authenticated: false,

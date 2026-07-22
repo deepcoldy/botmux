@@ -1,6 +1,6 @@
 import { Menu, Tray, nativeImage, nativeTheme, type NativeImage } from 'electron'
-import menuBarIconPath from '../../../resources/tray/orca-botmux-menu-barTemplate.png?asset&asarUnpack'
-import menuBarIconRetinaPath from '../../../resources/tray/orca-botmux-menu-barTemplate@2x.png?asset&asarUnpack'
+import menuBarIconPath from '../../../resources/tray/botmux-menu-barTemplate.png?asset&asarUnpack'
+import menuBarIconRetinaPath from '../../../resources/tray/botmux-menu-barTemplate@2x.png?asset&asarUnpack'
 import { createAppIconImage } from '../app-icon'
 import { translateMain } from '../i18n/main-i18n'
 import { composeTrayAttentionIcon, tintTrayTemplateForAttention } from './tray-attention-icon'
@@ -19,7 +19,7 @@ export type SystemTrayOptions = {
   onOpenSettings: () => void
   /** Run the existing user-initiated update check. */
   onCheckForUpdates: () => void
-  /** Quit OrcaBotmux for real (caller must set the quitting latch before quitting). */
+  /** Quit Botmux for real (caller must set the quitting latch before quitting). */
   onQuit: () => void
 }
 
@@ -46,9 +46,9 @@ let nativeThemeUpdatedListener: (() => void) | null = null
 // tooltip carries the worktree/branch label so hovering tells them apart.
 function baseTooltip(): string {
   if (!devIndicator) {
-    return 'orca_botmux'
+    return 'botmux'
   }
-  return devIndicator.label ? `OrcaBotmux DEV (${devIndicator.label})` : 'OrcaBotmux DEV'
+  return devIndicator.label ? `Botmux DEV (${devIndicator.label})` : 'Botmux DEV'
 }
 
 // Why: on Windows the notification area expects a 16px icon; the app icon PNG
@@ -87,7 +87,7 @@ function applyTrayImage(): void {
         tray.setToolTip(
           devIndicator
             ? `${baseTooltip()} - ${translateMain('tray.activityWaitingSuffix', 'activity waiting')}`
-            : translateMain('tray.activityWaiting', 'OrcaBotmux - activity waiting')
+            : translateMain('tray.activityWaiting', 'Botmux - activity waiting')
         )
         return
       } catch (error) {
@@ -242,7 +242,7 @@ export function createSystemTray(opts: SystemTrayOptions): Tray | null {
         ] as Electron.MenuItemConstructorOptions[])
       : []),
     {
-      label: translateMain('tray.openOrca', 'Open orca_botmux'),
+      label: translateMain('tray.openBotmux', 'Open botmux'),
       click: safeMenuAction(() => opts.onOpen())
     },
     { type: 'separator' },

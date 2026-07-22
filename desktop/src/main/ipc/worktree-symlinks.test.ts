@@ -67,7 +67,7 @@ describe('createWorktreeSymlinks', () => {
   let error: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'orca-botmux-symlinks-'))
+    root = mkdtempSync(join(tmpdir(), 'botmux-symlinks-'))
     primary = join(root, 'primary')
     worktree = join(root, 'worktree')
     mkdirSync(primary, { recursive: true })
@@ -247,7 +247,7 @@ describe('createWorktreeSymlinks', () => {
     })
 
     expect(readFileSync(target, 'utf8')).toBe('RACE=1\n')
-    expect(existsSync(join(worktree, '.orca-botmux-apfs-clone-file-race'))).toBe(false)
+    expect(existsSync(join(worktree, '.botmux-apfs-clone-file-race'))).toBe(false)
     expect(warn).not.toHaveBeenCalled()
     expect(error).not.toHaveBeenCalled()
   })
@@ -396,7 +396,7 @@ describe('removeWorktreeSymlinks', () => {
   let error: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
-    root = mkdtempSync(join(tmpdir(), 'orca-botmux-unlink-'))
+    root = mkdtempSync(join(tmpdir(), 'botmux-unlink-'))
     primary = join(root, 'primary')
     worktree = join(root, 'worktree')
     mkdirSync(primary, { recursive: true })

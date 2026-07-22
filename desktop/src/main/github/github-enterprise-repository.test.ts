@@ -53,12 +53,12 @@ describe('getEnterpriseGitHubRepoSlug', () => {
   })
 
   it('resolves a GHES remote whose host the user is gh-authenticated to (#8312)', async () => {
-    mockOriginRemote('https://github.acme-corp.com/team/orca_botmux.git')
+    mockOriginRemote('https://github.acme-corp.com/team/botmux.git')
     mockHostAuthenticated()
 
     await expect(getEnterpriseGitHubRepoSlug('/repo')).resolves.toEqual({
       owner: 'team',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       host: 'github.acme-corp.com'
     })
     // The auth probe targets the remote's host, not a hardcoded github.com.
@@ -69,18 +69,18 @@ describe('getEnterpriseGitHubRepoSlug', () => {
   })
 
   it('resolves a GHES SCP-style SSH remote', async () => {
-    mockOriginRemote('git@github.acme-corp.com:team/orca_botmux.git')
+    mockOriginRemote('git@github.acme-corp.com:team/botmux.git')
     mockHostAuthenticated()
 
     await expect(getEnterpriseGitHubRepoSlug('/repo')).resolves.toEqual({
       owner: 'team',
-      repo: 'orca_botmux',
+      repo: 'botmux',
       host: 'github.acme-corp.com'
     })
   })
 
   it('probes gh in the repository WSL runtime, not the host/default distro', async () => {
-    mockOriginRemote('https://github.acme-corp.com/team/orca_botmux.git')
+    mockOriginRemote('https://github.acme-corp.com/team/botmux.git')
     mockHostAuthenticated()
 
     await getEnterpriseGitHubRepoSlug('/repo', null, {
@@ -94,14 +94,14 @@ describe('getEnterpriseGitHubRepoSlug', () => {
   })
 
   it('leaves github.com to getOwnerRepo without probing gh auth', async () => {
-    mockOriginRemote('https://github.com/team/orca_botmux.git')
+    mockOriginRemote('https://github.com/team/botmux.git')
 
     await expect(getEnterpriseGitHubRepoSlug('/repo')).resolves.toBeNull()
     expect(ghExecFileAsyncMock).not.toHaveBeenCalled()
   })
 
   it('declines a custom host the user is not gh-authenticated to (leaves it for Gitea)', async () => {
-    mockOriginRemote('https://gitea.example.com/team/orca_botmux.git')
+    mockOriginRemote('https://gitea.example.com/team/botmux.git')
     mockHostNotAuthenticated()
 
     await expect(getEnterpriseGitHubRepoSlug('/repo')).resolves.toBeNull()

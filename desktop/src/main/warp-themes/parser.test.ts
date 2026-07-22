@@ -34,7 +34,7 @@ describe('parseWarpThemeYaml', () => {
     vi.restoreAllMocks()
   })
 
-  it('maps Warp normal and bright palettes to OrcaBotmux terminal colors', () => {
+  it('maps Warp normal and bright palettes to Botmux terminal colors', () => {
     const result = parseWarpThemeYaml(VALID_THEME, 'tokyo_night.yaml', {
       importedAt: '2026-06-05T00:00:00.000Z',
       sourceLabel: 'themes'

@@ -125,7 +125,7 @@ describe('resolveWindowShortcutAction', () => {
     expect(
       resolveWindowShortcutAction(input, 'linux', overrides, {
         context: 'terminal',
-        terminalShortcutPolicy: 'orca-botmux-first'
+        terminalShortcutPolicy: 'botmux-first'
       })
     ).toEqual({ type: 'toggleQuickCommandsMenu' })
   })
@@ -208,7 +208,7 @@ describe('resolveWindowShortcutAction', () => {
     ).toBeNull()
   })
 
-  it('keeps OrcaBotmux-first active in terminal context but lets Terminal-first pass risky app chords', () => {
+  it('keeps Botmux-first active in terminal context but lets Terminal-first pass risky app chords', () => {
     const macWorktreePalette = {
       code: 'KeyJ',
       key: 'j',
@@ -220,7 +220,7 @@ describe('resolveWindowShortcutAction', () => {
     expect(
       resolveWindowShortcutAction(macWorktreePalette, 'darwin', undefined, {
         context: 'terminal',
-        terminalShortcutPolicy: 'orca-botmux-first'
+        terminalShortcutPolicy: 'botmux-first'
       })
     ).toEqual({ type: 'toggleWorktreePalette' })
     expect(
@@ -259,7 +259,7 @@ describe('resolveWindowShortcutAction', () => {
         { code: 'Digit3', key: '3', meta: false, control: true, alt: false, shift: false },
         'darwin',
         undefined,
-        { context: 'terminal', terminalShortcutPolicy: 'orca-botmux-first' }
+        { context: 'terminal', terminalShortcutPolicy: 'botmux-first' }
       )
     ).toEqual({ type: 'jumpToTabIndex', index: 2 })
   })

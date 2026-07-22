@@ -10,8 +10,8 @@ import { LOCAL_EXECUTION_HOST_ID } from '../../shared/execution-host'
 const AI_VAULT_CACHE_TTL_MS = 15_000
 
 // Why: codex-home + WSL home dirs must be sourced from a serve-mode-reachable
-// seam (the OrcaRuntimeService deps), NOT the window-only registerCoreHandlers
-// path — `orca-botmux-desktop serve` never runs that path, so sourcing it there would silently
+// seam (the BotmuxRuntimeService deps), NOT the window-only registerCoreHandlers
+// path — `botmux-desktop serve` never runs that path, so sourcing it there would silently
 // drop managed-Codex sessions from remote/SSH results.
 export type AiVaultSessionSources = {
   getAdditionalCodexHomePaths?: () => readonly string[]

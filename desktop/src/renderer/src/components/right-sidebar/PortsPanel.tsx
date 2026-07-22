@@ -17,7 +17,7 @@ import {
 import { toast } from 'sonner'
 import { useAppStore } from '@/store'
 import { useActiveWorktree, useRepoById } from '@/store/selectors'
-import { resolveOrcaBotmuxToolingContext } from '@/lib/orca-botmux-tooling-context'
+import { resolveBotmuxToolingContext } from '@/lib/botmux-tooling-context'
 import { cn } from '@/lib/utils'
 import { getActiveRuntimeTarget } from '@/runtime/runtime-rpc-client'
 import { getRuntimeEnvironmentIdForWorktree } from '@/lib/worktree-runtime-owner'
@@ -26,7 +26,7 @@ import {
   getPortOpenBrowserTooltipLabel,
   openWorkspacePortInBrowser,
   refreshWorkspacePortScanAfterStop,
-  resolvePortOpenInOrcaBrowser,
+  resolvePortOpenInBotmuxBrowser,
   scanWorkspacePortsForTarget,
   workspacePortRuntimeTargetKey
 } from '@/lib/workspace-port-actions'
@@ -151,12 +151,12 @@ export default function PortsPanel({ isVisible }: { isVisible: boolean }): React
   // Why: botmux session hosts may not have a repo on the synthetic worktree, but
   // still own a filesystem SSH target (or match a remote project worktree).
   const filesystemConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
   const activeWorktree = useActiveWorktree()
   const activeRepo = useRepoById(activeWorktree?.repoId ?? null)
   const toolingWorktree = useAppStore((s) => {
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const toolingRepo = useRepoById(toolingWorktree?.repoId ?? null)
@@ -301,7 +301,7 @@ function LocalWorkspacePortsPanel({ isVisible }: { isVisible: boolean }): React.
         runtimeTarget,
         createBrowserTab,
         setRemoteBrowserPageHandle,
-        openInOrcaBrowser: resolvePortOpenInOrcaBrowser({
+        openInBotmuxBrowser: resolvePortOpenInBotmuxBrowser({
           settings,
           event,
           isMac: navigator.userAgent.includes('Mac')
@@ -822,10 +822,10 @@ function SshPortsPanel(): React.JSX.Element {
   // Botmux session hosts use filesystemConnectionId when the synthetic
   // worktree has no repo binding.
   const toolingConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
   const toolingWorktree = useAppStore((s) => {
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const activeWorktree = useActiveWorktree()
@@ -886,7 +886,7 @@ function SshPortsPanel(): React.JSX.Element {
     (entry: PortForwardEntry, event?: React.MouseEvent<HTMLButtonElement>) => {
       const url = browserUrlForPortForwardEntry(entry)
       if (
-        !resolvePortOpenInOrcaBrowser({
+        !resolvePortOpenInBotmuxBrowser({
           settings,
           event,
           isMac: navigator.userAgent.includes('Mac')

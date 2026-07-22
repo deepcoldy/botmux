@@ -95,8 +95,8 @@ function createLocalRepoFixture(worktreeCount) {
   const repoPath = path.join(baseDir, 'repo')
   mkdirSync(repoPath, { recursive: true })
   git(repoPath, 'init', '--initial-branch=main')
-  git(repoPath, 'config', 'user.email', 'bench@orca_botmux.local')
-  git(repoPath, 'config', 'user.name', 'OrcaBotmux Bench')
+  git(repoPath, 'config', 'user.email', 'bench@botmux.local')
+  git(repoPath, 'config', 'user.name', 'Botmux Bench')
   writeFileSync(path.join(repoPath, 'README.md'), '# cold-park resource fixture\n')
   git(repoPath, 'add', '.')
   git(repoPath, 'commit', '-m', 'init', '--no-gpg-sign')
@@ -111,7 +111,7 @@ function createLocalRepoFixture(worktreeCount) {
 
 async function setupWorkspaces(page, fixture) {
   return await runWithTimeout(
-    'fixture registration in OrcaBotmux',
+    'fixture registration in Botmux',
     () =>
       page.evaluate(
         async ({ repoPath, importedWorktreePaths }) => {
@@ -351,7 +351,7 @@ async function main() {
     fixture = createLocalRepoFixture(args.worktrees)
     const cdpPort = await pickFreePort()
     userDataDir = createShortUserDataDirectory()
-    process.env.ORCA_E2E_TERMINAL_PARKING_DELAY_MS = String(PARK_DELAY_MS)
+    process.env.BOTMUX_E2E_TERMINAL_PARKING_DELAY_MS = String(PARK_DELAY_MS)
     console.log(
       `[cold-park-res] fixture=${fixture.baseDir} userData=${userDataDir} cdp=${cdpPort} worktrees=${args.worktrees}`
     )

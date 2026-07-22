@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useAppStore } from '@/store'
 import { useActiveWorktree, useRepoById } from '@/store/selectors'
-import { resolveOrcaBotmuxToolingContext } from '@/lib/orca-botmux-tooling-context'
+import { resolveBotmuxToolingContext } from '@/lib/botmux-tooling-context'
 import { basename, dirname } from '@/lib/path'
 import { useRuntimeFileListForWorktree } from '@/components/quick-open-file-list'
 import { folderRelativePathToIncludeGlob } from './file-search-include-pattern'
@@ -83,10 +83,10 @@ function FileExplorerFiles(): React.JSX.Element {
   // Why: botmux synthetic hosts rarely have a repoId; FS ops use the host's
   // filesystem SSH target (or the matched project worktree's repo).
   const filesystemConnectionId = useAppStore(
-    (s) => resolveOrcaBotmuxToolingContext(s).filesystemConnectionId
+    (s) => resolveBotmuxToolingContext(s).filesystemConnectionId
   )
   const toolingWorktree = useAppStore((s) => {
-    const id = resolveOrcaBotmuxToolingContext(s).toolingWorktreeId
+    const id = resolveBotmuxToolingContext(s).toolingWorktreeId
     return id ? (s.getKnownWorktreeById(id) ?? null) : null
   })
   const activeRepo = useRepoById(toolingWorktree?.repoId ?? activeWorktree?.repoId ?? null)
@@ -120,16 +120,16 @@ function FileExplorerFiles(): React.JSX.Element {
   )
   const toggleShowDotfilesForWorktree = useAppStore((s) => s.toggleShowDotfilesForWorktree)
 
-  // Why: orca_botmux agent/session hosts plant session cwd on Worktree.path and on
-  // orcaBotmuxSurfaceByHostId (Zustand-visible). Tab switch only mutates the
+  // Why: botmux agent/session hosts plant session cwd on Worktree.path and on
+  // botmuxSurfaceByHostId (Zustand-visible). Tab switch only mutates the
   // cached Worktree in place — without the surface map FileExplorer would keep
   // the first session's tree. Prefer surface.cwd, then Worktree.path.
-  const orcaBotmuxSurfaceCwd = useAppStore((s) => {
+  const botmuxSurfaceCwd = useAppStore((s) => {
     if (!activeWorktreeId) return null
-    const cwd = s.orcaBotmuxSurfaceByHostId[activeWorktreeId]?.cwd?.trim()
+    const cwd = s.botmuxSurfaceByHostId[activeWorktreeId]?.cwd?.trim()
     return cwd || null
   })
-  const worktreePath = orcaBotmuxSurfaceCwd || activeWorktree?.path?.trim() || null
+  const worktreePath = botmuxSurfaceCwd || activeWorktree?.path?.trim() || null
   const runtimeDownloadContext = useMemo(
     () =>
       activeRuntimeEnvironmentId && activeWorktreeId && worktreePath
@@ -286,7 +286,7 @@ function FileExplorerFiles(): React.JSX.Element {
   // Why: botmux host ids never own gitStatus rows — decorations come from the
   // project worktree matched to the session cwd (left-sidebar highlight).
   const gitStatusWorktreeId = useAppStore((s) => {
-    const ctx = resolveOrcaBotmuxToolingContext(s)
+    const ctx = resolveBotmuxToolingContext(s)
     return ctx.toolingWorktreeId ?? activeWorktreeId
   })
   const entries = useMemo(
@@ -661,7 +661,7 @@ function FileExplorerFiles(): React.JSX.Element {
     <>
       <div
         ref={setExplorerShellRef}
-        data-orca-botmux-explorer-shell
+        data-botmux-explorer-shell
         data-selected-folder-relative-path={
           selectedNode?.isDirectory ? selectedNode.relativePath : undefined
         }

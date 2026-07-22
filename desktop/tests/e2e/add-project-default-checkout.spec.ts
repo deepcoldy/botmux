@@ -3,7 +3,7 @@ import { mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { mkdtemp } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { waitForSessionReady } from './helpers/store'
 
 const tempRoots: string[] = []
@@ -16,7 +16,7 @@ async function createCloneFixture(): Promise<{
   // repo.path on macOS, where os.tmpdir() (/var/...) symlinks to /private/var/...
   // and the app canonicalizes repo.path via `git rev-parse --show-toplevel`.
   const rootPath = realpathSync(
-    await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-add-project-clone-'))
+    await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-add-project-clone-'))
   )
   tempRoots.push(rootPath)
 
@@ -47,7 +47,7 @@ async function createLinkedWorktreeFixture(): Promise<{
   // os.tmpdir() (/var/...) symlinks to /private/var/... and the app canonicalizes
   // repo.path via `git rev-parse --show-toplevel` on add.
   const rootPath = realpathSync(
-    await mkdtemp(path.join(os.tmpdir(), 'orca-botmux-e2e-add-project-linked-'))
+    await mkdtemp(path.join(os.tmpdir(), 'botmux-e2e-add-project-linked-'))
   )
   tempRoots.push(rootPath)
 
@@ -81,33 +81,33 @@ test.afterEach(() => {
 
 test.describe('Add project default checkout', () => {
   test('clones a repo and opens the default checkout without the setup-choice modal', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const fixture = await createCloneFixture()
 
-    await orcaBotmuxPage
+    await botmuxPage
       .getByRole('button', { name: /Add Project/i })
       .first()
       .click()
-    const addDialog = orcaBotmuxPage.getByRole('dialog', { name: /Add a project/i })
+    const addDialog = botmuxPage.getByRole('dialog', { name: /Add a project/i })
     await expect(addDialog).toBeVisible()
     await addDialog.getByRole('button', { name: /Clone from URL/i }).click()
 
-    const cloneDialog = orcaBotmuxPage.getByRole('dialog', { name: /Clone from URL/i })
+    const cloneDialog = botmuxPage.getByRole('dialog', { name: /Clone from URL/i })
     await expect(cloneDialog).toBeVisible()
     await cloneDialog.getByPlaceholder('https://github.com/user/repo.git').fill(fixture.sourcePath)
     await cloneDialog.getByPlaceholder('/path/to/destination').fill(fixture.destinationParent)
     await cloneDialog.getByRole('button', { name: /^Clone$/ }).click()
 
-    await expect(orcaBotmuxPage.getByRole('dialog', { name: /Repo added/i })).toBeHidden()
-    await expect(orcaBotmuxPage.getByText('Use existing worktrees')).toBeHidden()
-    await expect(orcaBotmuxPage.getByText('Create a new worktree')).toBeHidden()
+    await expect(botmuxPage.getByRole('dialog', { name: /Repo added/i })).toBeHidden()
+    await expect(botmuxPage.getByText('Use existing worktrees')).toBeHidden()
+    await expect(botmuxPage.getByText('Create a new worktree')).toBeHidden()
 
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((cloneName) => {
+          botmuxPage.evaluate((cloneName) => {
             const state = window.__store?.getState()
             if (!state) {
               return null
@@ -139,26 +139,26 @@ test.describe('Add project default checkout', () => {
   })
 
   test('reveals sibling git worktrees before opening the default checkout', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    await waitForSessionReady(orcaBotmuxPage)
+    await waitForSessionReady(botmuxPage)
     const fixture = await createLinkedWorktreeFixture()
 
-    await orcaBotmuxPage.evaluate((folderPath) => {
+    await botmuxPage.evaluate((folderPath) => {
       window.__store?.getState().openModal('confirm-add-project-from-folder', { folderPath })
     }, fixture.mainPath)
-    const addProjectDialog = orcaBotmuxPage.getByRole('dialog', { name: /^Add Project$/i })
+    const addProjectDialog = botmuxPage.getByRole('dialog', { name: /^Add Project$/i })
     await expect(addProjectDialog).toBeVisible()
     await addProjectDialog.getByRole('button', { name: /^Add Project$/ }).click()
 
     await expect(addProjectDialog).toBeHidden()
-    await expect(orcaBotmuxPage.getByRole('dialog', { name: /Repo added/i })).toBeHidden()
-    await expect(orcaBotmuxPage.getByText('Use existing worktrees')).toBeHidden()
+    await expect(botmuxPage.getByRole('dialog', { name: /Repo added/i })).toBeHidden()
+    await expect(botmuxPage.getByText('Use existing worktrees')).toBeHidden()
 
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((mainPath) => {
+          botmuxPage.evaluate((mainPath) => {
             const state = window.__store?.getState()
             if (!state) {
               return null

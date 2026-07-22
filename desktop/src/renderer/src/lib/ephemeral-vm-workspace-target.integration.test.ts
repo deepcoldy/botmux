@@ -6,7 +6,7 @@ import { createCompatibleRuntimeStatusResponse } from '@/runtime/runtime-compati
 function makeProvisionedRuntime(projectRoot: string) {
   return {
     ok: true as const,
-    connectionType: 'orca-botmux-server' as const,
+    connectionType: 'botmux-server' as const,
     stderr: 'creating sandbox',
     warnings: [],
     environment: {
@@ -30,7 +30,7 @@ function makeProvisionedRuntime(projectRoot: string) {
       updatedAt: 1,
       recipeResult: {
         schemaVersion: 1 as const,
-        pairingCode: 'orca_botmux://pair?code=test',
+        pairingCode: 'botmux://pair?code=test',
         projectRoot
       }
     }

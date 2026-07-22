@@ -26,9 +26,22 @@ import {
   Filter,
   Check,
   UserCircle,
-  PanelLeftClose
+  PanelLeftClose,
+  Radio
 } from 'lucide-react-native'
 import type { RpcClient } from '../../../src/transport/rpc-client'
+import {
+  botmuxBridgeListSessions,
+  type BotmuxBridgeSession
+} from '../../../src/botmux/botmux-bridge-rpc'
+import { openBotmuxSessionOnMobile } from '../../../src/botmux/open-botmux-session-on-mobile'
+import {
+  isBotmuxSessionClosed,
+  sortBotmuxSessionsByActivity
+} from '../../../src/botmux/botmux-session-presentation'
+import { BotmuxSessionRow } from '../../../src/components/botmux/BotmuxSessionRow'
+import { formatBotmuxOpenError, getBotmuxMobileCopy } from '../../../src/botmux/botmux-mobile-copy'
+import { triggerSuccess } from '../../../src/platform/haptics'
 import { loadHosts, updateLastConnected } from '../../../src/transport/host-store'
 import { removeHostAndCloseClient } from '../../../src/transport/host-removal-lifecycle'
 import {
@@ -66,6 +79,7 @@ import { WorkspaceDetailPlaceholder } from '../../../src/components/WorkspaceDet
 import { getCachedWorktrees, setCachedWorktrees } from '../../../src/cache/worktree-cache'
 import { setCachedRepos } from '../../../src/cache/repo-cache'
 import { colors, radii, spacing, typography } from '../../../src/theme/mobile-theme'
+import { appleSurfaces } from '../../../src/theme/apple-tokens'
 import { useResponsiveLayout } from '../../../src/layout/responsive-layout'
 import { leaveHostRoute } from '../../../src/host-route-exit'
 import { evaluateCompat, type CompatVerdict } from '../../../src/transport/protocol-compat'
@@ -100,6 +114,7 @@ import {
 import type { DesktopStatus, RepoSummary } from '../../../src/worktree/host-worktree-rpc-types'
 import type { WorkspaceStatusDefinition } from '../../../../src/shared/types'
 import { DEFAULT_MOBILE_WORKSPACE_STATUSES } from '../../../src/worktree/mobile-workspace-statuses'
+import { useMobileI18n } from '../../../src/i18n/mobile-i18n'
 
 function isErrorVerdict(v: ConnectionVerdict): boolean {
   return v.kind === 'warning' || v.kind === 'unreachable' || v.kind === 'auth-failed'
@@ -133,6 +148,7 @@ export function HostScreen({
   const router = useRouter()
   const pathname = usePathname()
   const insets = useSafeAreaInsets()
+  const { locale, t } = useMobileI18n()
   // Why: cap and center the worktree list on wide/tablet canvases; on phones
   // isWideLayout is false so the list stays edge-to-edge as before. When
   // embedded as the sidebar the list already lives in a narrow pane, so the
@@ -144,6 +160,12 @@ export function HostScreen({
   // Why: shared client per host owned by RpcClientProvider. See
   // docs/mobile-shared-client-per-host.md.
   const { client, state: connState } = useHostClient(hostId)
+  // Why: Botmux sessions sit at the SAME level as worktrees (desktop sidebar
+  // parity) — a peer section at the top of this list, not a separate route.
+  const [botmuxSessions, setBotmuxSessions] = useState<BotmuxBridgeSession[]>([])
+  const [botmuxCollapsed, setBotmuxCollapsed] = useState(false)
+  const [botmuxBusyId, setBotmuxBusyId] = useState<string | null>(null)
+  const botmuxCopy = useMemo(() => getBotmuxMobileCopy(locale), [locale])
   const reconnectAttempts = useReconnectAttempt(hostId)
   const lastConnectedAt = useLastConnectedAt(hostId)
   const clientRef = useRef<RpcClient | null>(null)
@@ -328,6 +350,52 @@ export function HostScreen({
     }
   }, [client, connState, hostId, applyViewState])
 
+  // Botmux bridge sessions for the peer section — non-blocking, closed
+  // sessions hidden, activity-sorted (same order as the desktop sidebar).
+  const fetchBotmuxSessions = useCallback(async () => {
+    if (!client || connState !== 'connected') return
+    try {
+      const list = await botmuxBridgeListSessions(client)
+      const open = (list.sessions ?? []).filter((s) => !isBotmuxSessionClosed(s.status))
+      setBotmuxSessions(sortBotmuxSessionsByActivity(open))
+    } catch {
+      // Bridge unavailable on this desktop — section simply hides.
+      setBotmuxSessions([])
+    }
+  }, [client, connState])
+
+  const openBotmuxSession = useCallback(
+    async (session: BotmuxBridgeSession) => {
+      if (!client || !hostId) return
+      setBotmuxBusyId(session.sessionId)
+      try {
+        const opened = await openBotmuxSessionOnMobile({
+          client,
+          mobileHostId: hostId,
+          session,
+          worktrees
+        })
+        if (!opened.ok) {
+          Alert.alert(
+            botmuxCopy.openFailedTitle,
+            formatBotmuxOpenError(opened.message, locale) || botmuxCopy.openFailedFallback
+          )
+          return
+        }
+        triggerSuccess()
+        router.push(opened.sessionPath as never)
+      } catch (e) {
+        Alert.alert(
+          botmuxCopy.openFailedTitle,
+          formatBotmuxOpenError(e instanceof Error ? e.message : String(e), locale)
+        )
+      } finally {
+        setBotmuxBusyId(null)
+      }
+    },
+    [client, botmuxCopy, hostId, locale, router, worktrees]
+  )
+
   // Why: keep clientRef in sync so existing imperative call sites work
   // unchanged. Also re-seed the cached worktree list on hostId change
   // since the useState initializer only runs on first mount.
@@ -365,7 +433,7 @@ export function HostScreen({
       }
       const host = hosts.find((h) => h.id === hostId)
       if (!host) {
-        setError('Host not found')
+        setError(t('Host not found'))
         return
       }
       setHostName(host.name)
@@ -595,6 +663,7 @@ export function HostScreen({
       }
       void fetchWorktrees()
       void fetchRepoMetadata()
+      void fetchBotmuxSessions()
       // Pull desktop's shared view settings on focus so desktop-side changes
       // show up here without a manual refresh.
       void syncViewSettingsFromDesktop()
@@ -604,8 +673,21 @@ export function HostScreen({
         void fetchWorktrees()
         void fetchRepoMetadata()
       }, 3000)
-      return () => clearInterval(interval)
-    }, [embedded, connState, fetchWorktrees, fetchRepoMetadata, syncViewSettingsFromDesktop])
+      const botmuxInterval = setInterval(() => {
+        void fetchBotmuxSessions()
+      }, 12_000)
+      return () => {
+        clearInterval(interval)
+        clearInterval(botmuxInterval)
+      }
+    }, [
+      embedded,
+      connState,
+      fetchWorktrees,
+      fetchRepoMetadata,
+      fetchBotmuxSessions,
+      syncViewSettingsFromDesktop
+    ])
   )
 
   // Why: as the persistent tablet sidebar this list is never the focused
@@ -723,9 +805,9 @@ export function HostScreen({
       // Why: metadata commit can fail while the host is still paired; keep the
       // screen mounted and re-open confirm (ConfirmModal closes on confirm).
       setConfirmRemoveHost(true)
-      Alert.alert('Could not remove host', 'Please try again.')
+      Alert.alert(t('Could not remove host'), t('Please try again.'))
     }
-  }, [hostId, leaveHost, closeHostClient])
+  }, [hostId, leaveHost, closeHostClient, t])
 
   const navigateFromHostList = useCallback(
     (target: string) => {
@@ -809,8 +891,19 @@ export function HostScreen({
     count += filters.filterRepoIds.size
     return count
   }, [filters])
-  const selectedSortLabel =
+  const selectedSortLabel = t(
     SORT_OPTIONS.find((option) => option.value === sortMode)?.label ?? 'Recent'
+  )
+  const localizedSortOptions = SORT_OPTIONS.map((option) => ({
+    ...option,
+    label: t(option.label),
+    subtitle: option.subtitle ? t(option.subtitle) : undefined
+  }))
+  const localizedGroupOptions = GROUP_OPTIONS.map((option) => ({
+    ...option,
+    label: t(option.label),
+    subtitle: option.subtitle ? t(option.subtitle) : undefined
+  }))
 
   const handleGroupChange = useCallback(
     (value: MobileGroupMode) => {
@@ -891,7 +984,7 @@ export function HostScreen({
             style={styles.backButton}
             onPress={leaveHost}
             accessibilityRole="button"
-            accessibilityLabel="Back to hosts"
+            accessibilityLabel={t('Back to hosts')}
             hitSlop={8}
           >
             <ChevronLeft size={22} color={colors.textPrimary} />
@@ -907,7 +1000,7 @@ export function HostScreen({
                 <View style={styles.hostIdentity}>
                   <StatusDot state={connState} verdict={headerVerdict} />
                   <Text style={styles.hostNameText} numberOfLines={1}>
-                    {hostName || 'Host'}
+                    {hostName || t('Host')}
                   </Text>
                 </View>
                 {connState !== 'connected' &&
@@ -930,7 +1023,7 @@ export function HostScreen({
                         onPress={() => void forceReconnectHost(hostId!)}
                         hitSlop={8}
                       >
-                        <Text style={styles.reconnectButtonText}>Reconnect</Text>
+                        <Text style={styles.reconnectButtonText}>{t('Reconnect')}</Text>
                       </Pressable>
                     )
                   })()}
@@ -942,7 +1035,7 @@ export function HostScreen({
               style={styles.sidebarCollapseButton}
               onPress={onHideSidebar}
               accessibilityRole="button"
-              accessibilityLabel="Hide sidebar"
+              accessibilityLabel={t('Hide sidebar')}
               hitSlop={8}
             >
               <PanelLeftClose size={14} color={colors.textSecondary} />
@@ -962,7 +1055,11 @@ export function HostScreen({
                 ]}
                 onPress={() => setShowFilterModal(true)}
                 accessibilityRole="button"
-                accessibilityLabel={`Filter workspaces${activeFilterCount > 0 ? `, ${activeFilterCount} active` : ''}`}
+                accessibilityLabel={`${t('Filter workspaces')}${
+                  activeFilterCount > 0
+                    ? `, ${t('{{count}} active', { count: activeFilterCount })}`
+                    : ''
+                }`}
               >
                 <Filter
                   size={12}
@@ -975,7 +1072,8 @@ export function HostScreen({
                   ]}
                   numberOfLines={1}
                 >
-                  Filter{activeFilterCount > 0 ? ` ${activeFilterCount}` : ''}
+                  {t('Filter')}
+                  {activeFilterCount > 0 ? ` ${activeFilterCount}` : ''}
                 </Text>
               </Pressable>
 
@@ -983,7 +1081,7 @@ export function HostScreen({
                 style={[styles.modeButton, styles.embeddedModeButton]}
                 onPress={() => setShowSortPicker(true)}
                 accessibilityRole="button"
-                accessibilityLabel={`Sort by ${selectedSortLabel}`}
+                accessibilityLabel={t('Sort by {{sort}}', { sort: selectedSortLabel })}
               >
                 <SlidersHorizontal size={14} color={colors.textSecondary} />
                 <Text style={styles.sortLabel} numberOfLines={1}>
@@ -995,17 +1093,17 @@ export function HostScreen({
                 style={[styles.modeButton, styles.embeddedModeButton]}
                 onPress={() => setShowGroupPicker(true)}
                 accessibilityRole="button"
-                accessibilityLabel="Group workspaces"
+                accessibilityLabel={t('Group workspaces')}
               >
                 <Layers size={14} color={colors.textSecondary} />
                 <Text style={styles.sortLabel} numberOfLines={1}>
                   {groupMode === 'none'
-                    ? 'Group'
+                    ? t('Group')
                     : groupMode === 'workspaceStatus'
-                      ? 'Status'
+                      ? t('Status')
                       : groupMode === 'repo'
-                        ? 'Repo'
-                        : 'PR'}
+                        ? t('Repo')
+                        : t('PR')}
                 </Text>
               </Pressable>
             </View>
@@ -1019,7 +1117,7 @@ export function HostScreen({
                 onPress={() => navigateFromHostList(`/h/${hostId}/accounts`)}
                 disabled={connState !== 'connected'}
                 accessibilityRole="button"
-                accessibilityLabel="Accounts"
+                accessibilityLabel={t('Accounts')}
               >
                 <UserCircle
                   size={16}
@@ -1035,7 +1133,7 @@ export function HostScreen({
                 onPress={() => navigateFromHostList(`/h/${hostId}/tasks`)}
                 disabled={connState !== 'connected'}
                 accessibilityRole="button"
-                accessibilityLabel="Tasks"
+                accessibilityLabel={t('Tasks')}
               >
                 <List
                   size={16}
@@ -1051,7 +1149,7 @@ export function HostScreen({
                 onPress={openNewWorktreeModal}
                 disabled={connState !== 'connected'}
                 accessibilityRole="button"
-                accessibilityLabel="New workspace"
+                accessibilityLabel={t('New Workspace')}
               >
                 <Plus
                   size={16}
@@ -1063,7 +1161,7 @@ export function HostScreen({
                 style={styles.embeddedToolbarIconButton}
                 onPress={() => setShowSearch((s) => !s)}
                 accessibilityRole="button"
-                accessibilityLabel={showSearch ? 'Close search' : 'Search workspaces'}
+                accessibilityLabel={t(showSearch ? 'Close search' : 'Search workspaces')}
               >
                 {showSearch ? (
                   <X size={16} color={colors.textSecondary} />
@@ -1089,7 +1187,8 @@ export function HostScreen({
                   activeFilterCount > 0 && styles.filterChipTextActive
                 ]}
               >
-                Filter{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+                {t('Filter')}
+                {activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
               </Text>
             </Pressable>
 
@@ -1104,12 +1203,12 @@ export function HostScreen({
               <Layers size={14} color={colors.textSecondary} />
               <Text style={styles.sortLabel} numberOfLines={1}>
                 {groupMode === 'none'
-                  ? 'Group'
+                  ? t('Group')
                   : groupMode === 'workspaceStatus'
-                    ? 'Status'
+                    ? t('Status')
                     : groupMode === 'repo'
-                      ? 'Repo'
-                      : 'PR'}
+                      ? t('Repo')
+                      : t('PR')}
               </Text>
             </Pressable>
 
@@ -1164,12 +1263,12 @@ export function HostScreen({
           <MobileSearchField
             value={search}
             onChangeText={setSearch}
-            placeholder="Search worktrees…"
+            placeholder={t('Search worktrees…')}
             autoFocus
             // Why: new key each open remounts focus effect if the field stays mounted
             // across rapid toggles; pairs with delayed focus so the keyboard appears.
             focusKey={showSearch}
-            accessibilityLabel="Search worktrees"
+            accessibilityLabel={t('Search workspaces')}
           />
         </View>
       )}
@@ -1188,10 +1287,10 @@ export function HostScreen({
         <View style={styles.centered}>
           <Text style={styles.emptyText}>
             {search
-              ? 'No matching worktrees'
+              ? t('No matching worktrees')
               : activeFilterCount > 0
-                ? 'No worktrees match filters'
-                : 'No worktrees'}
+                ? t('No worktrees match filters')
+                : t('No worktrees')}
           </Text>
         </View>
       )}
@@ -1217,6 +1316,52 @@ export function HostScreen({
             isWideLayout &&
               !embedded && { maxWidth: contentMaxWidth, width: '100%', alignSelf: 'center' }
           ]}
+          // Botmux sessions as a PEER section above worktree groups (desktop
+          // sidebar parity): collapsible, activity-sorted, first 5 + show-all.
+          ListHeaderComponent={
+            botmuxSessions.length > 0 ? (
+              <View>
+                <Pressable
+                  style={styles.sectionHeader}
+                  onPress={() => setBotmuxCollapsed((v) => !v)}
+                  accessibilityRole="button"
+                  accessibilityState={{ expanded: !botmuxCollapsed }}
+                >
+                  {botmuxCollapsed ? (
+                    <ChevronRight size={12} color={colors.textMuted} style={styles.sectionIcon} />
+                  ) : (
+                    <ChevronDown size={12} color={colors.textMuted} style={styles.sectionIcon} />
+                  )}
+                  <Radio size={12} color={colors.textMuted} style={styles.sectionIcon} />
+                  <Text style={styles.sectionTitle}>{botmuxCopy.title}</Text>
+                  <Text style={styles.sectionCount}>{botmuxSessions.length}</Text>
+                </Pressable>
+                {!botmuxCollapsed ? (
+                  <>
+                    {botmuxSessions.slice(0, 5).map((s) => (
+                      <BotmuxSessionRow
+                        key={`${s.hostId}::${s.sessionId}`}
+                        session={s}
+                        busy={botmuxBusyId === s.sessionId}
+                        onOpen={(sess) => void openBotmuxSession(sess)}
+                      />
+                    ))}
+                    {botmuxSessions.length > 5 ? (
+                      <Pressable
+                        style={styles.botmuxShowAll}
+                        onPress={() => router.push(`/h/${hostId}/botmux`)}
+                        accessibilityRole="button"
+                      >
+                        <Text style={styles.botmuxShowAllText}>
+                          {botmuxCopy.showAll} ({botmuxSessions.length})
+                        </Text>
+                      </Pressable>
+                    ) : null}
+                  </>
+                ) : null}
+              </View>
+            ) : null
+          }
           renderSectionHeader={({ section }) => {
             if (!section.title) {
               return null
@@ -1246,7 +1391,11 @@ export function HostScreen({
                     />
                   </View>
                 ) : null}
-                <Text style={styles.sectionTitle}>{section.title}</Text>
+                <Text style={styles.sectionTitle}>
+                  {groupMode === 'workspaceStatus' || section.icon === 'pin'
+                    ? t(section.title)
+                    : section.title}
+                </Text>
                 <Text style={styles.sectionCount}>{count}</Text>
               </Pressable>
             )
@@ -1288,8 +1437,8 @@ export function HostScreen({
 
       <PickerModal
         visible={showSortPicker}
-        title="Sort By"
-        options={SORT_OPTIONS}
+        title={t('Sort By')}
+        options={localizedSortOptions}
         selected={sortMode}
         onSelect={handleSortChange}
         onClose={() => setShowSortPicker(false)}
@@ -1297,8 +1446,8 @@ export function HostScreen({
 
       <PickerModal
         visible={showGroupPicker}
-        title="Group By"
-        options={GROUP_OPTIONS}
+        title={t('Group By')}
+        options={localizedGroupOptions}
         selected={groupMode}
         onSelect={handleGroupChange}
         onClose={() => setShowGroupPicker(false)}
@@ -1306,30 +1455,30 @@ export function HostScreen({
 
       <BottomDrawer visible={showFilterModal} onClose={() => setShowFilterModal(false)}>
         <View style={styles.filterModalHeader}>
-          <Text style={styles.filterModalTitle}>Filter</Text>
+          <Text style={styles.filterModalTitle}>{t('Filter')}</Text>
           {activeFilterCount > 0 && (
             <Pressable onPress={clearFilters}>
-              <Text style={styles.clearFiltersText}>Clear filters</Text>
+              <Text style={styles.clearFiltersText}>{t('Clear filters')}</Text>
             </Pressable>
           )}
         </View>
 
-        <Text style={styles.filterSectionLabel}>Workspaces</Text>
+        <Text style={styles.filterSectionLabel}>{t('Workspaces')}</Text>
         <View style={styles.filterGroup}>
           <Pressable style={styles.filterRow} onPress={toggleHideSleeping}>
-            <Text style={styles.filterRowText}>Hide sleeping</Text>
+            <Text style={styles.filterRowText}>{t('Hide sleeping')}</Text>
             {filters.hideSleeping && <Check size={14} color={colors.textPrimary} />}
           </Pressable>
           <View style={styles.filterSeparator} />
           <Pressable style={styles.filterRow} onPress={toggleHideDefaultBranch}>
-            <Text style={styles.filterRowText}>Hide default branch</Text>
+            <Text style={styles.filterRowText}>{t('Hide default branch')}</Text>
             {filters.hideDefaultBranch && <Check size={14} color={colors.textPrimary} />}
           </Pressable>
         </View>
 
         {uniqueRepos.length > 1 && (
           <>
-            <Text style={styles.filterSectionLabel}>Repositories</Text>
+            <Text style={styles.filterSectionLabel}>{t('Repositories')}</Text>
             <View style={styles.filterGroup}>
               {uniqueRepos.map((repo, i) => (
                 <View key={repo.id}>
@@ -1361,9 +1510,12 @@ export function HostScreen({
         {confirmDelete ? (
           <View>
             <View style={styles.confirmContent}>
-              <Text style={styles.confirmTitle}>Delete Worktree</Text>
+              <Text style={styles.confirmTitle}>{t('Delete Worktree')}</Text>
               <Text style={styles.confirmMessage}>
-                Delete "{confirmDelete.displayName || confirmDelete.repo}" ({confirmDelete.branch})?
+                {t('Delete "{{name}}" ({{branch}})?', {
+                  name: confirmDelete.displayName || confirmDelete.repo,
+                  branch: confirmDelete.branch
+                })}
               </Text>
             </View>
             <View style={styles.confirmButtons}>
@@ -1375,7 +1527,7 @@ export function HostScreen({
                 ]}
                 onPress={() => setConfirmDelete(null)}
               >
-                <Text style={styles.confirmBtnCancelText}>Cancel</Text>
+                <Text style={styles.confirmBtnCancelText}>{t('Cancel')}</Text>
               </Pressable>
               <Pressable
                 style={({ pressed }) => [
@@ -1391,7 +1543,7 @@ export function HostScreen({
                   setActionTarget(null)
                 }}
               >
-                <Text style={styles.confirmBtnDestructiveText}>Delete</Text>
+                <Text style={styles.confirmBtnDestructiveText}>{t('Delete')}</Text>
               </Pressable>
             </View>
           </View>
@@ -1411,9 +1563,9 @@ export function HostScreen({
                       hostCapabilities,
                       navigate: navigateFromHostList,
                       onDone: () => setActionTarget(null)
-                    }),
+                    }).map((action) => ({ ...action, label: t(action.label) })),
                     {
-                      label: 'Sleep',
+                      label: t('Sleep'),
                       icon: Moon,
                       onPress: () => {
                         if (client) {
@@ -1428,14 +1580,14 @@ export function HostScreen({
                       }
                     },
                     {
-                      label: isWorktreePinned(actionTarget, pinnedIds) ? 'Unpin' : 'Pin',
+                      label: t(isWorktreePinned(actionTarget, pinnedIds) ? 'Unpin' : 'Pin'),
                       onPress: () => {
                         togglePin(actionTarget.worktreeId)
                         setActionTarget(null)
                       }
                     },
                     {
-                      label: 'Delete',
+                      label: t('Delete'),
                       destructive: true,
                       onPress: () => setConfirmDelete(actionTarget)
                     }
@@ -1449,9 +1601,9 @@ export function HostScreen({
       {/* Host remove confirmation */}
       <ConfirmModal
         visible={confirmRemoveHost}
-        title="Remove Host"
-        message={`Remove "${hostName}"? You can re-pair later.`}
-        confirmLabel="Remove"
+        title={t('Remove Host')}
+        message={t('Remove "{{host}}"? You can re-pair later.', { host: hostName })}
+        confirmLabel={t('Remove')}
         destructive
         onConfirm={() => void handleRemoveHost()}
         onCancel={() => setConfirmRemoveHost(false)}
@@ -1688,20 +1840,27 @@ const styles = StyleSheet.create({
     marginRight: spacing.xs
   },
   sectionTitle: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: colors.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.5
+    fontSize: 13,
+    fontWeight: '400',
+    color: colors.textSecondary
   },
   sectionCount: {
     fontSize: 11,
     color: colors.textMuted,
     marginLeft: spacing.xs
   },
+  botmuxShowAll: {
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.lg
+  },
+  botmuxShowAllText: {
+    fontSize: typography.metaSize,
+    fontWeight: '600',
+    color: colors.accentBlue
+  },
   separator: {
-    height: 1,
-    backgroundColor: colors.borderSubtle,
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: appleSurfaces.separator,
     marginLeft: spacing.lg + 24,
     marginRight: spacing.lg
   },

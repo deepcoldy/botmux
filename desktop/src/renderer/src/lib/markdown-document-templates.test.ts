@@ -77,16 +77,16 @@ describe('markdown document templates', () => {
     ).toHaveLength(0)
   })
 
-  it('discovers markdown files under .orca_botmux/templates and skips unsafe entries', async () => {
+  it('discovers markdown files under .botmux/templates and skips unsafe entries', async () => {
     const readDir = stubReadDir({
-      '/repo/.orca_botmux/templates': [
+      '/repo/.botmux/templates': [
         entry('daily-note.md'),
         entry('scratch.txt'),
         entry('linked.md', false, true),
         entry('nested', true),
         entry('node_modules', true)
       ],
-      '/repo/.orca_botmux/templates/nested': [entry('meeting.markdown'), entry('brief.mdx')]
+      '/repo/.botmux/templates/nested': [entry('meeting.markdown'), entry('brief.mdx')]
     })
 
     await expect(
@@ -101,33 +101,33 @@ describe('markdown document templates', () => {
       )
     ).resolves.toEqual([
       {
-        id: '.orca_botmux/templates/nested/brief.mdx',
+        id: '.botmux/templates/nested/brief.mdx',
         name: 'Brief',
-        filePath: '/repo/.orca_botmux/templates/nested/brief.mdx',
-        relativePath: '.orca_botmux/templates/nested/brief.mdx',
+        filePath: '/repo/.botmux/templates/nested/brief.mdx',
+        relativePath: '.botmux/templates/nested/brief.mdx',
         templateRelativePath: 'nested/brief.mdx',
         basename: 'brief.mdx'
       },
       {
-        id: '.orca_botmux/templates/daily-note.md',
+        id: '.botmux/templates/daily-note.md',
         name: 'Daily note',
-        filePath: '/repo/.orca_botmux/templates/daily-note.md',
-        relativePath: '.orca_botmux/templates/daily-note.md',
+        filePath: '/repo/.botmux/templates/daily-note.md',
+        relativePath: '.botmux/templates/daily-note.md',
         templateRelativePath: 'daily-note.md',
         basename: 'daily-note.md'
       },
       {
-        id: '.orca_botmux/templates/nested/meeting.markdown',
+        id: '.botmux/templates/nested/meeting.markdown',
         name: 'Meeting',
-        filePath: '/repo/.orca_botmux/templates/nested/meeting.markdown',
-        relativePath: '.orca_botmux/templates/nested/meeting.markdown',
+        filePath: '/repo/.botmux/templates/nested/meeting.markdown',
+        relativePath: '.botmux/templates/nested/meeting.markdown',
         templateRelativePath: 'nested/meeting.markdown',
         basename: 'meeting.markdown'
       }
     ])
 
     expect(readDir).toHaveBeenCalledWith({
-      dirPath: '/repo/.orca_botmux/templates',
+      dirPath: '/repo/.botmux/templates',
       connectionId: 'conn-1'
     })
   })
@@ -145,7 +145,7 @@ describe('markdown document templates', () => {
 
   it('keeps Windows file paths native while exposing root-relative template paths', async () => {
     stubReadDir({
-      'C:\\repo\\.orca_botmux\\templates': [entry('daily.md')]
+      'C:\\repo\\.botmux\\templates': [entry('daily.md')]
     })
 
     await expect(
@@ -155,10 +155,10 @@ describe('markdown document templates', () => {
       )
     ).resolves.toEqual([
       {
-        id: '.orca_botmux/templates/daily.md',
+        id: '.botmux/templates/daily.md',
         name: 'Daily',
-        filePath: 'C:\\repo\\.orca_botmux\\templates\\daily.md',
-        relativePath: '.orca_botmux/templates/daily.md',
+        filePath: 'C:\\repo\\.botmux\\templates\\daily.md',
+        relativePath: '.botmux/templates/daily.md',
         templateRelativePath: 'daily.md',
         basename: 'daily.md'
       }

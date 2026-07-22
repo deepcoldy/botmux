@@ -5,14 +5,14 @@ import type {
 } from '../../../../shared/computer-use-permissions-types'
 import {
   COMPUTER_USE_SKILL_NAME,
-  ORCA_LINEAR_SKILL_NAME,
-  ORCA_CLI_SKILL_NAME,
+  BOTMUX_LINEAR_SKILL_NAME,
+  BOTMUX_CLI_SKILL_NAME,
   ORCHESTRATION_SKILL_NAME,
   buildAgentFeatureSkillInstallCommand
 } from '@/lib/agent-feature-install-commands'
 import { BROWSER_USE_ENABLED_STORAGE_KEY } from '@/lib/browser-use-setup-state'
 import { e2eConfig } from '@/lib/e2e-config'
-import { showOrcaCliRegistrationPromptToast } from '@/lib/agent-skill-cli-prerequisite'
+import { showBotmuxCliRegistrationPromptToast } from '@/lib/agent-skill-cli-prerequisite'
 import {
   ORCHESTRATION_ENABLED_STORAGE_KEY,
   ORCHESTRATION_SETUP_DISMISSED_STORAGE_KEY,
@@ -49,10 +49,10 @@ const ONBOARDING_PROGRESS_FEATURE_SETUP_IDS: readonly OnboardingFeatureSetupId[]
 ]
 
 const FEATURE_SKILL_NAMES: Record<OnboardingFeatureSetupId, string> = {
-  browserUse: ORCA_CLI_SKILL_NAME,
+  browserUse: BOTMUX_CLI_SKILL_NAME,
   computerUse: COMPUTER_USE_SKILL_NAME,
   orchestration: ORCHESTRATION_SKILL_NAME,
-  linearTickets: ORCA_LINEAR_SKILL_NAME
+  linearTickets: BOTMUX_LINEAR_SKILL_NAME
 }
 
 const FEATURE_TELEMETRY_IDS: Record<
@@ -168,7 +168,7 @@ export function createOnboardingFeatureSetupDeps(): OnboardingFeatureSetupDeps {
 
   return {
     getCliStatus: () => window.api.cli.getInstallStatus(),
-    showCliRegistrationPrompt: showOrcaCliRegistrationPromptToast,
+    showCliRegistrationPrompt: showBotmuxCliRegistrationPromptToast,
     installCli: () => window.api.cli.install(),
     writeClipboardText: (text) => window.api.ui.writeClipboardText(text),
     getComputerUsePermissionStatus: () => window.api.computerUsePermissions.getStatus(),
@@ -223,13 +223,13 @@ export async function runOnboardingFeatureSetup(
     if (!status.supported) {
       warnings.push({
         featureId: 'cli',
-        message: status.detail ?? 'OrcaBotmux CLI registration is not available on this platform.'
+        message: status.detail ?? 'Botmux CLI registration is not available on this platform.'
       })
     } else if (status.pathConfigured === null) {
       // Why: an unknown registry read cannot safely drive a PATH read-modify-write.
       warnings.push({
         featureId: 'cli',
-        message: status.detail ?? 'OrcaBotmux could not check your Windows user PATH.'
+        message: status.detail ?? 'Botmux could not check your Windows user PATH.'
       })
     } else if (status.state !== 'installed' || status.pathConfigured === false) {
       await deps.showCliRegistrationPrompt?.()
@@ -238,7 +238,7 @@ export async function runOnboardingFeatureSetup(
       if (next.state !== 'installed') {
         warnings.push({
           featureId: 'cli',
-          message: next.detail ?? 'OrcaBotmux CLI registration needs attention.'
+          message: next.detail ?? 'Botmux CLI registration needs attention.'
         })
       } else if (next.pathConfigured !== true && next.detail) {
         warnings.push({ featureId: 'cli', message: next.detail })

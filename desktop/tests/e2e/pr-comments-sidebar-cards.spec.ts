@@ -1,5 +1,5 @@
 import type { Locator } from '@stablyai/playwright-test'
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { openChecks } from './helpers/source-control-ai-generation'
 import { seedPRCommentsSidebarFixture } from './helpers/pr-comments-sidebar-fixture'
 import { waitForActiveWorktree, waitForSessionReady } from './helpers/store'
@@ -43,27 +43,27 @@ async function expectOpenTextNotShiftedLeft(
 }
 
 test.describe('PR comments sidebar cards view', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
   })
 
-  test('groups open, conversation, and resolved comments in cards layout', async ({ orcaBotmuxPage }) => {
-    const { worktreeId } = await seedPRCommentsSidebarFixture(orcaBotmuxPage)
-    await openChecks(orcaBotmuxPage, worktreeId)
+  test('groups open, conversation, and resolved comments in cards layout', async ({ botmuxPage }) => {
+    const { worktreeId } = await seedPRCommentsSidebarFixture(botmuxPage)
+    await openChecks(botmuxPage, worktreeId)
 
-    const commentsSection = orcaBotmuxPage.getByText('Comments', { exact: true })
+    const commentsSection = botmuxPage.getByText('Comments', { exact: true })
     await expect(commentsSection).toBeVisible({ timeout: 10_000 })
 
-    await expect(orcaBotmuxPage.getByText('Needs review · 1')).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Please update this handler before merge.')).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('alice')).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('LGTM on the overall approach.')).toBeVisible()
+    await expect(botmuxPage.getByText('Needs review · 1')).toBeVisible()
+    await expect(botmuxPage.getByText('Please update this handler before merge.')).toBeVisible()
+    await expect(botmuxPage.getByText('alice')).toBeVisible()
+    await expect(botmuxPage.getByText('LGTM on the overall approach.')).toBeVisible()
 
-    const openThreadCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    const openThreadCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'Please update this handler before merge.'
     })
-    const conversationCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    const conversationCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'LGTM on the overall approach.'
     })
     await expect(openThreadCard).toBeVisible()
@@ -77,38 +77,38 @@ test.describe('PR comments sidebar cards view', () => {
     )
     await expectOpenTextNotShiftedLeft(openThreadCard, conversationCard, 'alice', 'bob')
 
-    const resolvedTrigger = orcaBotmuxPage.getByRole('button', { name: 'Resolved · 1' })
+    const resolvedTrigger = botmuxPage.getByRole('button', { name: 'Resolved · 1' })
     await expect(resolvedTrigger).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Already fixed upstream.')).toBeHidden()
+    await expect(botmuxPage.getByText('Already fixed upstream.')).toBeHidden()
 
     await resolvedTrigger.click()
-    await expect(orcaBotmuxPage.getByText('Already fixed upstream.')).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Resolved', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Already fixed upstream.')).toBeVisible()
+    await expect(botmuxPage.getByText('Resolved', { exact: true })).toBeVisible()
     await expect(
-      orcaBotmuxPage
+      botmuxPage
         .getByTestId('pr-comment-group')
         .filter({ hasText: 'Already fixed upstream.' })
         .getByRole('button', { name: 'Unresolve', exact: true })
     ).toBeVisible()
 
-    await expect(orcaBotmuxPage.getByRole('button', { name: /^Add$/ })).toHaveCount(0)
+    await expect(botmuxPage.getByRole('button', { name: /^Add$/ })).toHaveCount(0)
   })
 
-  test('can switch from grouped to chronological timeline order', async ({ orcaBotmuxPage }) => {
-    const { worktreeId } = await seedPRCommentsSidebarFixture(orcaBotmuxPage)
-    await openChecks(orcaBotmuxPage, worktreeId)
+  test('can switch from grouped to chronological timeline order', async ({ botmuxPage }) => {
+    const { worktreeId } = await seedPRCommentsSidebarFixture(botmuxPage)
+    await openChecks(botmuxPage, worktreeId)
 
-    await expect(orcaBotmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
-    await orcaBotmuxPage.getByRole('button', { name: 'Comment display options' }).click()
-    await orcaBotmuxPage.getByRole('menuitemradio', { name: 'Timeline' }).click()
+    await expect(botmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
+    await botmuxPage.getByRole('button', { name: 'Comment display options' }).click()
+    await botmuxPage.getByRole('menuitemradio', { name: 'Timeline' }).click()
 
-    await expect(orcaBotmuxPage.getByText('Needs review · 1')).toHaveCount(0)
-    await expect(orcaBotmuxPage.getByText('Already fixed upstream.')).toBeVisible()
+    await expect(botmuxPage.getByText('Needs review · 1')).toHaveCount(0)
+    await expect(botmuxPage.getByText('Already fixed upstream.')).toBeVisible()
 
     const comments = [
-      orcaBotmuxPage.getByText('Already fixed upstream.'),
-      orcaBotmuxPage.getByText('Please update this handler before merge.'),
-      orcaBotmuxPage.getByText('LGTM on the overall approach.')
+      botmuxPage.getByText('Already fixed upstream.'),
+      botmuxPage.getByText('Please update this handler before merge.'),
+      botmuxPage.getByText('LGTM on the overall approach.')
     ]
     const positions = await Promise.all(
       comments.map(async (comment) => {
@@ -125,14 +125,14 @@ test.describe('PR comments sidebar cards view', () => {
   })
 
   test('queues an open thread for the agent from the visible row action and menu fallback', async ({
-    orcaBotmuxPage
+    botmuxPage
   }) => {
-    const { worktreeId } = await seedPRCommentsSidebarFixture(orcaBotmuxPage)
-    await openChecks(orcaBotmuxPage, worktreeId)
+    const { worktreeId } = await seedPRCommentsSidebarFixture(botmuxPage)
+    await openChecks(botmuxPage, worktreeId)
 
-    await expect(orcaBotmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
+    await expect(botmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
 
-    const openThreadCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    const openThreadCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'Please update this handler before merge.'
     })
     await openThreadCard.hover()
@@ -141,13 +141,13 @@ test.describe('PR comments sidebar cards view', () => {
     await visibleQueueButton.click()
     await expect(visibleQueueButton).toBeHidden()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
+      botmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
     ).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Queued', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Queued', { exact: true })).toBeVisible()
 
-    await orcaBotmuxPage.getByRole('button', { name: 'Clear queued comments' }).click()
+    await botmuxPage.getByRole('button', { name: 'Clear queued comments' }).click()
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
+      botmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
     ).toBeHidden()
     await openThreadCard.hover()
     await expect(visibleQueueButton).toBeVisible()
@@ -155,20 +155,20 @@ test.describe('PR comments sidebar cards view', () => {
     const actionsMenu = openThreadCard.getByRole('button', { name: 'More comment actions' })
     await actionsMenu.evaluate((element) => (element as HTMLElement).focus())
     await actionsMenu.press('Enter')
-    const queueMenuItem = orcaBotmuxPage.getByRole('menuitem', { name: 'Queue for agent' })
+    const queueMenuItem = botmuxPage.getByRole('menuitem', { name: 'Queue for agent' })
     await queueMenuItem.click({ force: true })
     await expect(queueMenuItem).toBeHidden()
 
     await expect(
-      orcaBotmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
+      botmuxPage.getByRole('button', { name: 'Send 1 queued comments to AI' })
     ).toBeVisible()
-    await expect(orcaBotmuxPage.getByText('Queued', { exact: true })).toBeVisible()
+    await expect(botmuxPage.getByText('Queued', { exact: true })).toBeVisible()
 
-    const queuedCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    const queuedCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'Please update this handler before merge.'
     })
     const queuedCardBox = await queuedCard.boundingBox()
-    const checkboxBox = await orcaBotmuxPage
+    const checkboxBox = await botmuxPage
       .getByRole('checkbox', { name: 'Select comment' })
       .first()
       .boundingBox()
@@ -178,15 +178,15 @@ test.describe('PR comments sidebar cards view', () => {
     expect(checkboxBox.x - queuedCardBox.x).toBeGreaterThanOrEqual(8)
   })
 
-  test('keeps open card content aligned while the row menu is open', async ({ orcaBotmuxPage }) => {
-    const { worktreeId } = await seedPRCommentsSidebarFixture(orcaBotmuxPage)
-    await openChecks(orcaBotmuxPage, worktreeId)
+  test('keeps open card content aligned while the row menu is open', async ({ botmuxPage }) => {
+    const { worktreeId } = await seedPRCommentsSidebarFixture(botmuxPage)
+    await openChecks(botmuxPage, worktreeId)
 
-    await expect(orcaBotmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
-    const openThreadCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    await expect(botmuxPage.getByText('Needs review · 1')).toBeVisible({ timeout: 10_000 })
+    const openThreadCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'Please update this handler before merge.'
     })
-    const conversationCard = orcaBotmuxPage.getByTestId('pr-comment-group').filter({
+    const conversationCard = botmuxPage.getByTestId('pr-comment-group').filter({
       hasText: 'LGTM on the overall approach.'
     })
 
@@ -194,7 +194,7 @@ test.describe('PR comments sidebar cards view', () => {
     const actionsMenu = openThreadCard.getByRole('button', { name: 'More comment actions' })
     await actionsMenu.evaluate((element) => (element as HTMLElement).focus())
     await actionsMenu.press('Enter')
-    await expect(orcaBotmuxPage.getByRole('menuitem', { name: 'Queue for agent' })).toBeVisible()
+    await expect(botmuxPage.getByRole('menuitem', { name: 'Queue for agent' })).toBeVisible()
 
     await expectOpenTextNotShiftedLeft(
       openThreadCard,

@@ -14,7 +14,7 @@ const { hasOpenAiSpeechApiKeyMock, netRequestMock, spawnMock } = vi.hoisted(() =
 
 vi.mock('electron', () => ({
   app: {
-    getPath: () => '/tmp/orca-botmux-speech-models-test'
+    getPath: () => '/tmp/botmux-speech-models-test'
   },
   net: {
     request: netRequestMock
@@ -66,7 +66,7 @@ describe('ModelManager', () => {
   })
 
   it('verifies downloaded archive hashes before extraction', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const archivePath = join(dir, 'model.tar.bz2')
       writeFileSync(archivePath, 'known archive bytes')
@@ -83,7 +83,7 @@ describe('ModelManager', () => {
   })
 
   it('rejects non-HTTPS model downloads', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const manager = new ModelManager(dir) as unknown as ModelManagerInternals
 
@@ -102,7 +102,7 @@ describe('ModelManager', () => {
   })
 
   it('marks OpenAI transcription models ready only when an API key is configured', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const manager = new ModelManager(dir)
 
@@ -123,7 +123,7 @@ describe('ModelManager', () => {
   })
 
   it('deletes a ready local model and reports it as not downloaded', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const manifest = SPEECH_MODEL_CATALOG.find((model) => model.provider === 'local')
       expect(manifest?.files).toBeDefined()
@@ -152,7 +152,7 @@ describe('ModelManager', () => {
   })
 
   it('aborts an in-flight model download request when cancelled', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const manifest = SPEECH_MODEL_CATALOG[0]
       const errorHandlers: ((err: Error) => void)[] = []
@@ -235,7 +235,7 @@ describe('ModelManager', () => {
 
   it('settles immediately when the abort signal fires before a response', async () => {
     vi.useFakeTimers()
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const errorHandlers: ((err: Error) => void)[] = []
       const responseHandlers: ((response: unknown) => void)[] = []
@@ -318,7 +318,7 @@ describe('ModelManager', () => {
 
   it('times out a model download request that never responds', async () => {
     vi.useFakeTimers()
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const errorHandlers: ((err: Error) => void)[] = []
       const responseHandlers: ((response: unknown) => void)[] = []
@@ -400,7 +400,7 @@ describe('ModelManager', () => {
 
   it('clears extraction abort polling when the child does not close', async () => {
     vi.useFakeTimers()
-    const dir = mkdtempSync(join(tmpdir(), 'orca-botmux-model-manager-'))
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-model-manager-'))
     try {
       const handlers: Record<string, ((arg?: unknown) => void)[]> = {
         close: [],

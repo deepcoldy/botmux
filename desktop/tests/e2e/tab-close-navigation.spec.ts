@@ -7,7 +7,7 @@
  *   fixed a regression where closing the active editor tab jumped to an
  *   arbitrary file. The existing `tabs.spec.ts` only covers terminal tab
  *   close; the editor/diff close path has no E2E guard today.
- * - PR #677 (`return to OrcaBotmux landing screen after closing last terminal`)
+ * - PR #677 (`return to Botmux landing screen after closing last terminal`)
  *   plus editor.ts's `shouldDeactivateWorktree` branch (also hardened in
  *   tabs.ts's `closeUnifiedTab`) require that when a worktree's last visible
  *   surface closes, the app clears `activeWorktreeId` instead of leaving a
@@ -19,7 +19,7 @@
  *   file is one that is still open.
  */
 
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import {
   waitForSessionReady,
   waitForActiveWorktree,
@@ -118,20 +118,20 @@ async function getActiveFileId(
 }
 
 test.describe('Tab Close Navigation', () => {
-  test.beforeEach(async ({ orcaBotmuxPage }) => {
-    await waitForSessionReady(orcaBotmuxPage)
-    await waitForActiveWorktree(orcaBotmuxPage)
-    await ensureTerminalVisible(orcaBotmuxPage)
+  test.beforeEach(async ({ botmuxPage }) => {
+    await waitForSessionReady(botmuxPage)
+    await waitForActiveWorktree(botmuxPage)
+    await ensureTerminalVisible(botmuxPage)
   })
 
   /**
    * Covers PR #693: closing the active editor tab should activate the visual
    * neighbor in the same worktree, not the first file in the list.
    */
-  test('closing the active editor tab activates its visual neighbor', async ({ orcaBotmuxPage }) => {
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+  test('closing the active editor tab activates its visual neighbor', async ({ botmuxPage }) => {
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
 
-    const fileIds = await openSeededEditorTabs(orcaBotmuxPage, worktreeId, [
+    const fileIds = await openSeededEditorTabs(botmuxPage, worktreeId, [
       'package.json',
       'README.md',
       'tsconfig.json'
@@ -141,12 +141,12 @@ test.describe('Tab Close Navigation', () => {
     // Activate the middle tab and close it. The neighbor-picking logic in
     // closeFile should pick the file that sat immediately after the closed
     // one in the worktree's openFiles slice.
-    await setActiveFile(orcaBotmuxPage, fileIds[1])
-    await expect.poll(async () => getActiveFileId(orcaBotmuxPage), { timeout: 3_000 }).toBe(fileIds[1])
+    await setActiveFile(botmuxPage, fileIds[1])
+    await expect.poll(async () => getActiveFileId(botmuxPage), { timeout: 3_000 }).toBe(fileIds[1])
 
-    await closeFile(orcaBotmuxPage, fileIds[1])
+    await closeFile(botmuxPage, fileIds[1])
 
-    const openFilesAfter = await getOpenFiles(orcaBotmuxPage, worktreeId)
+    const openFilesAfter = await getOpenFiles(botmuxPage, worktreeId)
     const remainingIds = new Set(openFilesAfter.map((f) => f.id))
     expect(remainingIds.has(fileIds[1])).toBe(false)
 
@@ -158,7 +158,7 @@ test.describe('Tab Close Navigation', () => {
     // laxer assertion like "some open file is active" would have missed that
     // specific regression, since any order-agnostic fallback would still pass.
     await expect
-      .poll(async () => getActiveFileId(orcaBotmuxPage), {
+      .poll(async () => getActiveFileId(botmuxPage), {
         timeout: 5_000,
         message: 'expected the visual neighbor (tsconfig.json) to become active after close'
       })
@@ -166,7 +166,7 @@ test.describe('Tab Close Navigation', () => {
 
     // And the workspace must still be showing an editor, not silently flipping
     // back to terminal while editors remain open.
-    await expect.poll(async () => getActiveTabType(orcaBotmuxPage), { timeout: 3_000 }).toBe('editor')
+    await expect.poll(async () => getActiveTabType(botmuxPage), { timeout: 3_000 }).toBe('editor')
   })
 
   /**
@@ -174,17 +174,17 @@ test.describe('Tab Close Navigation', () => {
    * openFiles list with editor tabs (contentType='diff') and route through
    * the same closeFile path, which is where #693 regressed.
    */
-  test('closing the active diff tab activates a still-open neighbor', async ({ orcaBotmuxPage }) => {
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+  test('closing the active diff tab activates a still-open neighbor', async ({ botmuxPage }) => {
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
 
     // Seed two editor tabs + one diff tab in the same worktree.
-    const editorIds = await openSeededEditorTabs(orcaBotmuxPage, worktreeId, [
+    const editorIds = await openSeededEditorTabs(botmuxPage, worktreeId, [
       'package.json',
       'README.md'
     ])
     expect(editorIds.length).toBe(2)
 
-    const diffId = await orcaBotmuxPage.evaluate((wId) => {
+    const diffId = await botmuxPage.evaluate((wId) => {
       const store = window.__store
       if (!store) {
         return null
@@ -210,11 +210,11 @@ test.describe('Tab Close Navigation', () => {
     }, worktreeId)
 
     expect(diffId).not.toBeNull()
-    await expect.poll(async () => getActiveFileId(orcaBotmuxPage), { timeout: 3_000 }).toBe(diffId)
+    await expect.poll(async () => getActiveFileId(botmuxPage), { timeout: 3_000 }).toBe(diffId)
 
-    await closeFile(orcaBotmuxPage, diffId!)
+    await closeFile(botmuxPage, diffId!)
 
-    const openFilesAfter = await getOpenFiles(orcaBotmuxPage, worktreeId)
+    const openFilesAfter = await getOpenFiles(botmuxPage, worktreeId)
     const remainingIds = new Set(openFilesAfter.map((f) => f.id))
     expect(remainingIds.has(diffId!)).toBe(false)
     expect(remainingIds.size).toBe(2)
@@ -226,7 +226,7 @@ test.describe('Tab Close Navigation', () => {
     // remaining file, README.md (editorIds[1]). Asserting the exact ID makes
     // this a real guard against #693 instead of a tautology.
     await expect
-      .poll(async () => getActiveFileId(orcaBotmuxPage), {
+      .poll(async () => getActiveFileId(botmuxPage), {
         timeout: 5_000,
         message: 'expected README.md (last remaining) to become active after closing the diff tab'
       })
@@ -238,8 +238,8 @@ test.describe('Tab Close Navigation', () => {
    * when the last editor closes and no terminal/browser surface remains for
    * the worktree, the app must return to Landing (activeWorktreeId === null).
    */
-  test('closing the last visible surface returns the app to Landing', async ({ orcaBotmuxPage }) => {
-    const worktreeId = await waitForActiveWorktree(orcaBotmuxPage)
+  test('closing the last visible surface returns the app to Landing', async ({ botmuxPage }) => {
+    const worktreeId = await waitForActiveWorktree(botmuxPage)
 
     // Prepare the worktree so only a single editor tab is present as a
     // visible surface: no browser tabs and no terminal tabs.
@@ -252,7 +252,7 @@ test.describe('Tab Close Navigation', () => {
     // it here keeps the helpers below self-contained and the test's setup
     // order-independent instead of depending on whichever surface-close
     // happens to leave activeWorktreeId untouched.
-    await orcaBotmuxPage.evaluate((wId) => {
+    await botmuxPage.evaluate((wId) => {
       const store = window.__store
       if (!store) {
         return
@@ -277,11 +277,11 @@ test.describe('Tab Close Navigation', () => {
       }
     }, worktreeId)
 
-    const editorIds = await openSeededEditorTabs(orcaBotmuxPage, worktreeId, ['package.json'])
+    const editorIds = await openSeededEditorTabs(botmuxPage, worktreeId, ['package.json'])
     expect(editorIds.length).toBe(1)
 
-    await setActiveFile(orcaBotmuxPage, editorIds[0])
-    await expect.poll(async () => getActiveFileId(orcaBotmuxPage), { timeout: 3_000 }).toBe(editorIds[0])
+    await setActiveFile(botmuxPage, editorIds[0])
+    await expect.poll(async () => getActiveFileId(botmuxPage), { timeout: 3_000 }).toBe(editorIds[0])
 
     // Sanity: confirm the worktree has no backing terminal/browser surfaces
     // before we close the last editor. Otherwise the deactivate branch would
@@ -294,7 +294,7 @@ test.describe('Tab Close Navigation', () => {
     await expect
       .poll(
         () =>
-          orcaBotmuxPage.evaluate((wId) => {
+          botmuxPage.evaluate((wId) => {
             const store = window.__store
             if (!store) {
               throw new Error('window.__store is not available')
@@ -319,12 +319,12 @@ test.describe('Tab Close Navigation', () => {
       )
       .toEqual({ terminals: 0, browserTabs: 0 })
 
-    await closeFile(orcaBotmuxPage, editorIds[0])
+    await closeFile(botmuxPage, editorIds[0])
 
     // The worktree should be deselected. Landing renders when
     // activeWorktreeId === null.
     await expect
-      .poll(async () => getActiveWorktreeId(orcaBotmuxPage), {
+      .poll(async () => getActiveWorktreeId(botmuxPage), {
         timeout: 5_000,
         message: 'activeWorktreeId was not cleared after closing the last visible surface'
       })

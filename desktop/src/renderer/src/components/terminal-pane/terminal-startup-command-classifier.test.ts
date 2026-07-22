@@ -28,9 +28,9 @@ describe('terminal startup command classifier', () => {
   })
 
   it('recognizes quoted Windows Codex executables', () => {
-    const command = '"C:\\Program Files\\OrcaBotmux\\codex.cmd" --resume'
+    const command = '"C:\\Program Files\\Botmux\\codex.cmd" --resume'
 
-    expect(getTerminalStartupCommandToken(command)).toBe('C:\\Program Files\\OrcaBotmux\\codex.cmd')
+    expect(getTerminalStartupCommandToken(command)).toBe('C:\\Program Files\\Botmux\\codex.cmd')
     expect(isCodexTerminalStartupCommand(command)).toBe(true)
     expect(isKnownTuiAgentTerminalStartupCommand(command)).toBe(true)
   })
@@ -40,7 +40,7 @@ describe('terminal startup command classifier', () => {
     expect(isCodexTerminalStartupCommand('/usr/local/bin/not-codex --continue')).toBe(false)
   })
 
-  it('recognizes non-Codex OrcaBotmux agent startup commands', () => {
+  it('recognizes non-Codex Botmux agent startup commands', () => {
     expect(isKnownTuiAgentTerminalStartupCommand('grok --permission-mode bypassPermissions')).toBe(
       true
     )

@@ -4,7 +4,7 @@ import type { CodexUsagePersistedState } from './types'
 import { CodexUsageStore } from './store'
 
 const { getPathMock } = vi.hoisted(() => ({
-  getPathMock: vi.fn(() => '/tmp/orca-botmux-test-userdata')
+  getPathMock: vi.fn(() => '/tmp/botmux-test-userdata')
 }))
 
 vi.mock('electron', () => ({
@@ -127,7 +127,7 @@ describe('CodexUsageStore snapshot benchmark', () => {
     const store = createStoreWithState(createLargeState())
     const startedAt = performance.now()
 
-    const snapshot = store.getSnapshot('orca_botmux', '30d', 10)
+    const snapshot = store.getSnapshot('botmux', '30d', 10)
 
     const snapshotMs = performance.now() - startedAt
     expect(snapshot.summary.totalTokens).toBe(18_000_000)

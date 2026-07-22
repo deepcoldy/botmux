@@ -99,9 +99,9 @@ describe('registerEphemeralVmHandlers', () => {
     disconnectRuntimeOwnedSshTargetMock.mockReset()
     removeRuntimeOwnedSshTargetMock.mockReset()
     connectRuntimeOwnedSshTargetMock.mockResolvedValue({
-      targetId: 'runtime-ssh-orca-botmux-instance-1',
+      targetId: 'runtime-ssh-botmux-instance-1',
       target: {
-        id: 'runtime-ssh-orca-botmux-instance-1',
+        id: 'runtime-ssh-botmux-instance-1',
         label: 'Sandbox',
         host: 'sandbox.example.com',
         port: 22,
@@ -121,10 +121,10 @@ describe('registerEphemeralVmHandlers', () => {
     }
   })
 
-  it('lists recipes from local repo orca_botmux.yaml', async () => {
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+  it('lists recipes from local repo botmux.yaml', async () => {
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -157,9 +157,9 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('lists the recipe catalog across local git repos', async () => {
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -192,8 +192,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('provisions a recipe and persists the ephemeral runtime', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start.js')
@@ -204,12 +204,12 @@ describe('registerEphemeralVmHandlers', () => {
         '  schemaVersion: 1,',
         `  pairingCode: ${JSON.stringify(makePairingCode())},`,
         "  projectRoot: '/workspace/repo',",
-        '  userData: { providerResourceId: process.env.ORCA_VM_INSTANCE_ID }',
+        '  userData: { providerResourceId: process.env.BOTMUX_VM_INSTANCE_ID }',
         '}))'
       ].join('\n')
     )
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -275,8 +275,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('provisions an ssh recipe without creating a runtime environment', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start-ssh.js')
@@ -300,7 +300,7 @@ describe('registerEphemeralVmHandlers', () => {
       ].join('\n')
     )
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -332,12 +332,12 @@ describe('registerEphemeralVmHandlers', () => {
     expect(result).toMatchObject({
       ok: true,
       connectionType: 'ssh',
-      sshTargetId: 'runtime-ssh-orca-botmux-instance-1',
+      sshTargetId: 'runtime-ssh-botmux-instance-1',
       runtime: {
         repoId: 'repo-1',
         status: 'running',
         connectionMode: 'ssh',
-        sshTargetId: 'runtime-ssh-orca-botmux-instance-1'
+        sshTargetId: 'runtime-ssh-botmux-instance-1'
       }
     })
     expect(result.environment).toBeUndefined()
@@ -358,8 +358,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('removes the runtime-owned SSH target on cleanup even when destroy fails', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start-ssh.js')
@@ -386,7 +386,7 @@ describe('registerEphemeralVmHandlers', () => {
     // SSH target must still be torn down so it never orphans (see Fix D).
     writeFileSync(destroyPath, 'process.exit(1)')
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -407,14 +407,14 @@ describe('registerEphemeralVmHandlers', () => {
     } as never)) as { status?: string; connectionMode?: string; sshTargetId?: string }
 
     expect(cleaned).toEqual(expect.objectContaining({ status: 'cleanup_failed' }))
-    expect(removeRuntimeOwnedSshTargetMock).toHaveBeenCalledWith('runtime-ssh-orca-botmux-instance-1')
+    expect(removeRuntimeOwnedSshTargetMock).toHaveBeenCalledWith('runtime-ssh-botmux-instance-1')
     expect(cleaned.connectionMode).toBeUndefined()
     expect(cleaned.sshTargetId).toBeUndefined()
   })
 
   it('runs suspend and resume for an attached ephemeral VM workspace', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start.js')
@@ -459,7 +459,7 @@ describe('registerEphemeralVmHandlers', () => {
       ].join('\n')
     )
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -510,8 +510,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('returns a copyable cleanup command for a persisted runtime', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start.js')
@@ -528,7 +528,7 @@ describe('registerEphemeralVmHandlers', () => {
     )
     writeFileSync(cleanupPath, 'process.stdin.resume()\n')
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -557,8 +557,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('streams provision logs and cancels an active provision', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start.js')
@@ -576,7 +576,7 @@ describe('registerEphemeralVmHandlers', () => {
       ].join('\n')
     )
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',
@@ -612,8 +612,8 @@ describe('registerEphemeralVmHandlers', () => {
   })
 
   it('redacts recipe stdout when provisioning fails', async () => {
-    const userDataPath = makeDir('orca-botmux-ephemeral-vm-ipc-user-data-')
-    const repoPath = makeDir('orca-botmux-ephemeral-vm-ipc-repo-')
+    const userDataPath = makeDir('botmux-ephemeral-vm-ipc-user-data-')
+    const repoPath = makeDir('botmux-ephemeral-vm-ipc-repo-')
     getPathMock.mockReturnValue(userDataPath)
     mkdirSync(join(repoPath, 'scripts'), { recursive: true })
     const startPath = join(repoPath, 'scripts', 'start.js')
@@ -627,7 +627,7 @@ describe('registerEphemeralVmHandlers', () => {
       ].join('\n')
     )
     writeFileSync(
-      join(repoPath, 'orca_botmux.yaml'),
+      join(repoPath, 'botmux.yaml'),
       [
         'environmentRecipes:',
         '  - id: cloud-sandbox',

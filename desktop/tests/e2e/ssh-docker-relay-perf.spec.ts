@@ -1,4 +1,4 @@
-import { test, expect } from './helpers/orca-botmux-app'
+import { test, expect } from './helpers/botmux-app'
 import { ensureTerminalVisible, waitForActiveWorktree, waitForSessionReady } from './helpers/store'
 import {
   execInTerminal,
@@ -19,7 +19,7 @@ import {
   reconnectDockerSshRelayTarget
 } from './helpers/docker-ssh-relay-connection'
 
-const RUN_DOCKER_SSH = process.env.ORCA_E2E_SSH_DOCKER === '1'
+const RUN_DOCKER_SSH = process.env.BOTMUX_E2E_SSH_DOCKER === '1'
 const KEY_LATENCY_SAMPLES = 'abcdefghij'
 const MAX_MEDIAN_KEY_LATENCY_MS = 500
 const MAX_WORST_KEY_LATENCY_MS = 2_000
@@ -139,27 +139,27 @@ async function stopRemoteLoad(page: Page, ptyId: string): Promise<void> {
 }
 
 test.describe('Docker SSH relay perf', () => {
-  test.skip(!RUN_DOCKER_SSH, 'Set ORCA_E2E_SSH_DOCKER=1 to run Docker-backed SSH relay perf.')
+  test.skip(!RUN_DOCKER_SSH, 'Set BOTMUX_E2E_SSH_DOCKER=1 to run Docker-backed SSH relay perf.')
   test.skip(process.platform === 'win32', 'Docker SSH relay perf uses POSIX ssh tooling.')
 
   test('keeps remote typing responsive while the Linux relay streams TUI output', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const ptyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      await connectDockerSshRelayTarget(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const ptyId = await waitForActivePanePtyId(botmuxPage, 60_000)
 
       const runId = String(Date.now())
-      await execInTerminal(orcaBotmuxPage, ptyId, `node -e ${shellQuote(remoteTypingLoadScript(runId))}`)
-      await waitForTerminalOutput(orcaBotmuxPage, `REMOTE_TUI_READY_${runId}`, 30_000, 80_000)
-      const measurement = await measureRemoteTyping(orcaBotmuxPage, ptyId, runId)
+      await execInTerminal(botmuxPage, ptyId, `node -e ${shellQuote(remoteTypingLoadScript(runId))}`)
+      await waitForTerminalOutput(botmuxPage, `REMOTE_TUI_READY_${runId}`, 30_000, 80_000)
+      const measurement = await measureRemoteTyping(botmuxPage, ptyId, runId)
       const summary = `median=${measurement.medianLatencyMs.toFixed(
         1
       )}ms worst=${measurement.worstLatencyMs.toFixed(1)}ms samples=${measurement.latencies
@@ -172,14 +172,14 @@ test.describe('Docker SSH relay perf', () => {
       })
       expect(measurement.medianLatencyMs).toBeLessThan(MAX_MEDIAN_KEY_LATENCY_MS)
       expect(measurement.worstLatencyMs).toBeLessThan(MAX_WORST_KEY_LATENCY_MS)
-      await stopRemoteLoad(orcaBotmuxPage, ptyId)
+      await stopRemoteLoad(botmuxPage, ptyId)
     } finally {
       cleanupDockerSshRelayTarget(target)
     }
   })
 
   test('keeps active remote typing responsive while a background SSH PTY stream is ACK-stalled', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
@@ -187,44 +187,44 @@ test.describe('Docker SSH relay perf', () => {
     let activePtyId: string | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      backgroundPtyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      await connectDockerSshRelayTarget(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      backgroundPtyId = await waitForActivePanePtyId(botmuxPage, 60_000)
 
       const runId = String(Date.now())
       await execInTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         backgroundPtyId,
         `node -e ${shellQuote(remoteBackgroundFloodScript(runId))}`
       )
-      await waitForTerminalOutput(orcaBotmuxPage, `REMOTE_ACK_FLOOD_READY_${runId}`, 30_000, 80_000)
-      await holdSshPtyAckGate(orcaBotmuxPage, [backgroundPtyId])
-      await orcaBotmuxPage.evaluate((ptyId) => window.api.pty.write(ptyId, 'g'), backgroundPtyId)
+      await waitForTerminalOutput(botmuxPage, `REMOTE_ACK_FLOOD_READY_${runId}`, 30_000, 80_000)
+      await holdSshPtyAckGate(botmuxPage, [backgroundPtyId])
+      await botmuxPage.evaluate((ptyId) => window.api.pty.write(ptyId, 'g'), backgroundPtyId)
 
-      await splitActiveTerminalPane(orcaBotmuxPage, 'vertical')
-      await focusLastTerminalPane(orcaBotmuxPage)
-      activePtyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await splitActiveTerminalPane(botmuxPage, 'vertical')
+      await focusLastTerminalPane(botmuxPage)
+      activePtyId = await waitForActivePanePtyId(botmuxPage, 60_000)
       expect(activePtyId).not.toBe(backgroundPtyId)
 
       const activeRunId = `${runId}_active`
       await execInTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         activePtyId,
         `node -e ${shellQuote(remoteTypingLoadScript(activeRunId))}`
       )
-      await waitForTerminalOutput(orcaBotmuxPage, `REMOTE_TUI_READY_${activeRunId}`, 30_000, 80_000)
+      await waitForTerminalOutput(botmuxPage, `REMOTE_TUI_READY_${activeRunId}`, 30_000, 80_000)
       await expect
-        .poll(async () => (await readSshPtyAckGate(orcaBotmuxPage))?.heldAckChars ?? 0, {
+        .poll(async () => (await readSshPtyAckGate(botmuxPage))?.heldAckChars ?? 0, {
           timeout: 30_000,
           message: 'remote background SSH PTY stream did not build held ACK pressure'
         })
         .toBeGreaterThan(MIN_HELD_SSH_ACK_CHARS)
 
-      const measurement = await measureRemoteTyping(orcaBotmuxPage, activePtyId, activeRunId)
-      const ackGate = await readSshPtyAckGate(orcaBotmuxPage)
+      const measurement = await measureRemoteTyping(botmuxPage, activePtyId, activeRunId)
+      const ackGate = await readSshPtyAckGate(botmuxPage)
       const summary = `median=${measurement.medianLatencyMs.toFixed(
         1
       )}ms worst=${measurement.worstLatencyMs.toFixed(1)}ms heldAckChars=${
@@ -241,34 +241,34 @@ test.describe('Docker SSH relay perf', () => {
       expect(measurement.medianLatencyMs).toBeLessThan(MAX_MEDIAN_KEY_LATENCY_MS)
       expect(measurement.worstLatencyMs).toBeLessThan(MAX_WORST_KEY_LATENCY_MS)
 
-      await releaseSshPtyAckGate(orcaBotmuxPage)
-      const releasedAckGate = await readSshPtyAckGate(orcaBotmuxPage)
+      await releaseSshPtyAckGate(botmuxPage)
+      const releasedAckGate = await readSshPtyAckGate(botmuxPage)
       expect(releasedAckGate?.heldAckChars ?? 0).toBe(0)
     } finally {
-      await releaseSshPtyAckGate(orcaBotmuxPage).catch(() => undefined)
+      await releaseSshPtyAckGate(botmuxPage).catch(() => undefined)
       if (activePtyId) {
-        await stopRemoteLoad(orcaBotmuxPage, activePtyId).catch(() => undefined)
+        await stopRemoteLoad(botmuxPage, activePtyId).catch(() => undefined)
       }
       if (backgroundPtyId) {
-        await stopRemoteLoad(orcaBotmuxPage, backgroundPtyId).catch(() => undefined)
+        await stopRemoteLoad(botmuxPage, backgroundPtyId).catch(() => undefined)
       }
       cleanupDockerSshRelayTarget(target)
     }
   })
 
   test('keeps remote typing responsive while relay file streams and git churn are active', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const ptyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerSshRelayTarget(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const ptyId = await waitForActivePanePtyId(botmuxPage, 60_000)
 
       const runId = String(Date.now())
       // Large remote binaries: each read streams ~8MB of fs.streamChunk frames
@@ -278,20 +278,20 @@ test.describe('Docker SSH relay perf', () => {
         `${DOCKER_SSH_RELAY_REMOTE_REPO_PATH}/stream-load-b.png`
       ]
       await execInTerminal(
-        orcaBotmuxPage,
+        botmuxPage,
         ptyId,
         `dd if=/dev/urandom of=${shellQuote(loadFiles[0])} bs=1M count=8 status=none && ` +
           `dd if=/dev/urandom of=${shellQuote(loadFiles[1])} bs=1M count=8 status=none && ` +
           `echo LOAD_FILES_READY_${runId}`
       )
-      await waitForTerminalOutput(orcaBotmuxPage, `LOAD_FILES_READY_${runId}`, 60_000, 80_000)
+      await waitForTerminalOutput(botmuxPage, `LOAD_FILES_READY_${runId}`, 60_000, 80_000)
 
-      await execInTerminal(orcaBotmuxPage, ptyId, `node -e ${shellQuote(remoteTypingLoadScript(runId))}`)
-      await waitForTerminalOutput(orcaBotmuxPage, `REMOTE_TUI_READY_${runId}`, 30_000, 80_000)
+      await execInTerminal(botmuxPage, ptyId, `node -e ${shellQuote(remoteTypingLoadScript(runId))}`)
+      await waitForTerminalOutput(botmuxPage, `REMOTE_TUI_READY_${runId}`, 30_000, 80_000)
 
       // Background relay pressure: continuous large file reads plus git status
       // refreshes, mirroring file preview + source-control churn while typing.
-      await orcaBotmuxPage.evaluate(
+      await botmuxPage.evaluate(
         ({ targetId, files, repoPath }) => {
           const state = { stopped: false, reads: 0, errors: [] as string[] }
           ;(window as unknown as { __sshRelayLoad: typeof state }).__sshRelayLoad = state
@@ -318,10 +318,10 @@ test.describe('Docker SSH relay perf', () => {
         }
       )
       // Let the bulk load ramp before measuring.
-      await orcaBotmuxPage.waitForTimeout(1_000)
+      await botmuxPage.waitForTimeout(1_000)
 
-      const measurement = await measureRemoteTyping(orcaBotmuxPage, ptyId, runId)
-      const load = await orcaBotmuxPage.evaluate(() => {
+      const measurement = await measureRemoteTyping(botmuxPage, ptyId, runId)
+      const load = await botmuxPage.evaluate(() => {
         const state = (
           window as unknown as {
             __sshRelayLoad: { stopped: boolean; reads: number; errors: string[] }
@@ -348,36 +348,36 @@ test.describe('Docker SSH relay perf', () => {
       expect(load.reads).toBeGreaterThan(0)
       expect(measurement.medianLatencyMs).toBeLessThan(MAX_MEDIAN_KEY_LATENCY_MS)
       expect(measurement.worstLatencyMs).toBeLessThan(MAX_WORST_KEY_LATENCY_MS)
-      await stopRemoteLoad(orcaBotmuxPage, ptyId)
+      await stopRemoteLoad(botmuxPage, ptyId)
     } finally {
       cleanupDockerSshRelayTarget(target)
     }
   })
 
   test('keeps an SSH workspace terminal usable after disconnect and reconnect', async ({
-    orcaBotmuxPage
+    botmuxPage
   }, testInfo) => {
     test.slow()
     let target: DockerSshRelayTarget | null = null
     try {
       target = startDockerSshRelayTarget(testInfo)
-      await waitForSessionReady(orcaBotmuxPage)
-      await waitForActiveWorktree(orcaBotmuxPage)
-      const remote = await connectDockerSshRelayTarget(orcaBotmuxPage, target)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const beforePtyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await waitForSessionReady(botmuxPage)
+      await waitForActiveWorktree(botmuxPage)
+      const remote = await connectDockerSshRelayTarget(botmuxPage, target)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const beforePtyId = await waitForActivePanePtyId(botmuxPage, 60_000)
       const beforeMarker = `SSH_RECONNECT_BEFORE_${Date.now()}`
-      await execInTerminal(orcaBotmuxPage, beforePtyId, `printf ${shellQuote(beforeMarker)}`)
-      await waitForTerminalOutput(orcaBotmuxPage, beforeMarker, 20_000, 60_000)
+      await execInTerminal(botmuxPage, beforePtyId, `printf ${shellQuote(beforeMarker)}`)
+      await waitForTerminalOutput(botmuxPage, beforeMarker, 20_000, 60_000)
 
-      await reconnectDockerSshRelayTarget(orcaBotmuxPage, remote.targetId)
-      await ensureTerminalVisible(orcaBotmuxPage, 45_000)
-      await waitForActiveTerminalManager(orcaBotmuxPage, 60_000)
-      const afterPtyId = await waitForActivePanePtyId(orcaBotmuxPage, 60_000)
+      await reconnectDockerSshRelayTarget(botmuxPage, remote.targetId)
+      await ensureTerminalVisible(botmuxPage, 45_000)
+      await waitForActiveTerminalManager(botmuxPage, 60_000)
+      const afterPtyId = await waitForActivePanePtyId(botmuxPage, 60_000)
       const afterMarker = `SSH_RECONNECT_AFTER_${Date.now()}`
-      await execInTerminal(orcaBotmuxPage, afterPtyId, `printf ${shellQuote(afterMarker)}`)
-      await waitForTerminalOutput(orcaBotmuxPage, afterMarker, 20_000, 60_000)
+      await execInTerminal(botmuxPage, afterPtyId, `printf ${shellQuote(afterMarker)}`)
+      await waitForTerminalOutput(botmuxPage, afterMarker, 20_000, 60_000)
 
       testInfo.annotations.push({
         type: 'docker-ssh-reconnect',

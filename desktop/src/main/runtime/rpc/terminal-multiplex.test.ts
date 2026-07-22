@@ -2,7 +2,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { RpcDispatcher } from './dispatcher'
 import type { RpcRequest } from './core'
-import type { OrcaRuntimeService } from '../orca-botmux-runtime'
+import type { BotmuxRuntimeService } from '../botmux-runtime'
 import { TERMINAL_METHODS } from './methods/terminal'
 import type { RuntimeTerminalWait } from '../../../shared/runtime-types'
 import {
@@ -15,7 +15,7 @@ import {
   encodeTerminalStreamText
 } from '../../../shared/terminal-stream-protocol'
 
-function stubRuntime(overrides: Partial<OrcaRuntimeService> = {}): OrcaRuntimeService {
+function stubRuntime(overrides: Partial<BotmuxRuntimeService> = {}): BotmuxRuntimeService {
   return {
     getRuntimeId: () => 'test-runtime',
     // Why: every multiplex stream registers as a remote view subscriber for
@@ -34,7 +34,7 @@ function stubRuntime(overrides: Partial<OrcaRuntimeService> = {}): OrcaRuntimeSe
     getRemoteDesktopFitHold: vi.fn().mockReturnValue({ mode: 'desktop-fit', cols: 120, rows: 40 }),
     isRemoteDesktopViewerOwner: vi.fn().mockReturnValue(false),
     ...overrides
-  } as OrcaRuntimeService
+  } as BotmuxRuntimeService
 }
 
 function makeRequest(method: string, params?: unknown): RpcRequest {
@@ -42,7 +42,7 @@ function makeRequest(method: string, params?: unknown): RpcRequest {
 }
 
 function startDesktopMultiplexSubscribe(
-  overrides: Partial<OrcaRuntimeService> = {},
+  overrides: Partial<BotmuxRuntimeService> = {},
   trace?: string[]
 ) {
   const messages: string[] = []
@@ -2914,7 +2914,7 @@ describe('terminal multiplex RPC', () => {
           fitListener?.({ mode: 'desktop-fit', cols: 100, rows: 30 })
           driverListener?.({ kind: 'transition-during-snapshot' })
           return { tail: [], truncated: false } as unknown as Awaited<
-            ReturnType<OrcaRuntimeService['readTerminal']>
+            ReturnType<BotmuxRuntimeService['readTerminal']>
           >
         }),
         subscribeToFitOverrideChanges: vi.fn((_ptyId, listener) => {

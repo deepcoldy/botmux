@@ -7,7 +7,7 @@ describe('WSL Codex commands', () => {
 
     expect(args.slice(0, 5)).toEqual(['-d', 'Ubuntu24-Dev', '--', 'sh', '-c'])
     expect(args.at(-1)).toContain('getent passwd')
-    expect(args.at(-1)).toContain('_orca_lookup_command=')
+    expect(args.at(-1)).toContain('_botmux_lookup_command=')
     expect(args.at(-1)).toContain('codex')
     expect(args.at(-1)).not.toContain('bash -ic')
   })

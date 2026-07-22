@@ -670,7 +670,7 @@ export function buildMobileRichMarkdownEditorHtml(): string {
         }
       });
 
-      window.__orcaRichMarkdown = { setMarkdown: setMarkdown, setEditable: setEditable, runCommand: runCommand, currentMarkdown: currentMarkdown };
+      window.__botmuxRichMarkdown = { setMarkdown: setMarkdown, setEditable: setEditable, runCommand: runCommand, currentMarkdown: currentMarkdown };
 ${MOBILE_RICH_MARKDOWN_KEYBOARD_INSET_SCRIPT}
       post({ type: 'ready' });
     })();

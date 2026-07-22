@@ -43,7 +43,7 @@ describe('SourceControlBranchContextRow', () => {
       <SourceControlBranchContextRow
         summary={readySummary}
         compareBaseRef={null}
-        manualReviewUrl="https://github.com/stablyai/orca_botmux/compare/main...feature?expand=1"
+        manualReviewUrl="https://github.com/stablyai/botmux/compare/main...feature?expand=1"
         onChangeBaseRef={vi.fn()}
         onRetry={vi.fn()}
       />

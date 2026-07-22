@@ -13,10 +13,10 @@ import {
 
 function makeWorktree(overrides: Partial<Worktree> = {}): Worktree {
   return {
-    id: 'repo-1::/repo/orca_botmux',
+    id: 'repo-1::/repo/botmux',
     repoId: 'repo-1',
-    displayName: 'orca_botmux',
-    path: '/repo/orca_botmux',
+    displayName: 'botmux',
+    path: '/repo/botmux',
     head: 'abc123',
     branch: 'main',
     isBare: false,
@@ -37,8 +37,8 @@ function makeWorktree(overrides: Partial<Worktree> = {}): Worktree {
 function makeRepo(overrides: Partial<Repo> = {}): Repo {
   return {
     id: 'repo-1',
-    path: '/repo/orca_botmux',
-    displayName: 'orca_botmux',
+    path: '/repo/botmux',
+    displayName: 'botmux',
     badgeColor: '#000000',
     addedAt: 1,
     ...overrides
@@ -101,15 +101,15 @@ function makeWorktreeInfo(
 ): AiVaultSessionWorktreeInfo {
   return {
     status,
-    label: 'orca_botmux',
-    path: '/repo/orca_botmux',
-    ...(status === 'unavailable' ? {} : { worktreeId: 'repo-1::/repo/orca_botmux' })
+    label: 'botmux',
+    path: '/repo/botmux',
+    ...(status === 'unavailable' ? {} : { worktreeId: 'repo-1::/repo/botmux' })
   }
 }
 
-const HOST_SESSION_FILE = '/Users/ada/.claude/projects/-repo-orca_botmux/session-1.jsonl'
+const HOST_SESSION_FILE = '/Users/ada/.claude/projects/-repo-botmux/session-1.jsonl'
 const WSL_SESSION_FILE =
-  '\\\\wsl$\\Ubuntu\\home\\ada\\.claude\\projects\\-repo-orca_botmux\\session-1.jsonl'
+  '\\\\wsl$\\Ubuntu\\home\\ada\\.claude\\projects\\-repo-botmux\\session-1.jsonl'
 
 describe('resolveAiVaultSessionResumeState', () => {
   it('prefers the session worktree over the active workspace', () => {
@@ -126,7 +126,7 @@ describe('resolveAiVaultSessionResumeState', () => {
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -136,13 +136,13 @@ describe('resolveAiVaultSessionResumeState', () => {
       resolveAiVaultSessionResumeState({
         sessionFilePath: HOST_SESSION_FILE,
         worktreeInfo: makeWorktreeInfo('archived'),
-        activeWorktreeId: 'repo-1::/repo/orca_botmux',
+        activeWorktreeId: 'repo-1::/repo/botmux',
         worktrees: [makeWorktree()],
         repos: [{ id: 'repo-1' } as Repo]
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: false
     })
   })
@@ -174,7 +174,7 @@ describe('resolveAiVaultSessionResumeState', () => {
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -190,7 +190,7 @@ describe('resolveAiVaultSessionResumeState', () => {
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -212,7 +212,7 @@ describe('resolveAiVaultSessionResumeState', () => {
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -251,7 +251,7 @@ describe('resolveAiVaultSessionResumeState', () => {
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -261,20 +261,20 @@ describe('resolveAiVaultSessionResumeState', () => {
       resolveAiVaultSessionResumeState({
         sessionFilePath: HOST_SESSION_FILE,
         worktreeInfo: makeWorktreeInfo('active'),
-        activeWorktreeId: 'repo-2::/remote/orca_botmux',
+        activeWorktreeId: 'repo-2::/remote/botmux',
         worktrees: [
           makeWorktree(),
           makeWorktree({
-            id: 'repo-2::/remote/orca_botmux',
+            id: 'repo-2::/remote/botmux',
             repoId: 'repo-2',
-            path: '/remote/orca_botmux'
+            path: '/remote/botmux'
           })
         ],
         repos: [{ id: 'repo-1' } as Repo, { id: 'repo-2', connectionId: 'ssh-1' } as Repo]
       })
     ).toEqual({
       blocked: false,
-      worktreeId: 'repo-1::/repo/orca_botmux',
+      worktreeId: 'repo-1::/repo/botmux',
       usesSessionWorktree: true
     })
   })
@@ -377,7 +377,7 @@ describe('resolveAiVaultSessionResumeActions', () => {
         repos: [{ id: 'repo-1' } as Repo]
       })
     ).toEqual({
-      worktree: { worktreeId: 'repo-1::/repo/orca_botmux', disabled: false },
+      worktree: { worktreeId: 'repo-1::/repo/botmux', disabled: false },
       newTab: { worktreeId: 'repo-1::/repo/other', disabled: false }
     })
   })
@@ -387,20 +387,20 @@ describe('resolveAiVaultSessionResumeActions', () => {
       resolveAiVaultSessionResumeActions({
         sessionFilePath: WSL_SESSION_FILE,
         worktreeInfo: makeWorktreeInfo('active'),
-        activeWorktreeId: 'repo-2::/remote/orca_botmux',
+        activeWorktreeId: 'repo-2::/remote/botmux',
         worktrees: [
           makeWorktree(),
           makeWorktree({
-            id: 'repo-2::/remote/orca_botmux',
+            id: 'repo-2::/remote/botmux',
             repoId: 'repo-2',
-            path: '/remote/orca_botmux'
+            path: '/remote/botmux'
           })
         ],
         repos: [{ id: 'repo-1' } as Repo, { id: 'repo-2', connectionId: 'ssh-1' } as Repo]
       })
     ).toEqual({
-      worktree: { worktreeId: 'repo-1::/repo/orca_botmux', disabled: false },
-      newTab: { worktreeId: 'repo-2::/remote/orca_botmux', disabled: false }
+      worktree: { worktreeId: 'repo-1::/repo/botmux', disabled: false },
+      newTab: { worktreeId: 'repo-2::/remote/botmux', disabled: false }
     })
   })
 
@@ -409,20 +409,20 @@ describe('resolveAiVaultSessionResumeActions', () => {
       resolveAiVaultSessionResumeActions({
         sessionFilePath: HOST_SESSION_FILE,
         worktreeInfo: makeWorktreeInfo('active'),
-        activeWorktreeId: 'repo-2::/remote/orca_botmux',
+        activeWorktreeId: 'repo-2::/remote/botmux',
         worktrees: [
           makeWorktree(),
           makeWorktree({
-            id: 'repo-2::/remote/orca_botmux',
+            id: 'repo-2::/remote/botmux',
             repoId: 'repo-2',
-            path: '/remote/orca_botmux'
+            path: '/remote/botmux'
           })
         ],
         repos: [{ id: 'repo-1' } as Repo, { id: 'repo-2', connectionId: 'ssh-1' } as Repo]
       })
     ).toEqual({
-      worktree: { worktreeId: 'repo-1::/repo/orca_botmux', disabled: false },
-      newTab: { worktreeId: 'repo-2::/remote/orca_botmux', disabled: true }
+      worktree: { worktreeId: 'repo-1::/repo/botmux', disabled: false },
+      newTab: { worktreeId: 'repo-2::/remote/botmux', disabled: true }
     })
   })
 
@@ -451,7 +451,7 @@ describe('resolveAiVaultSessionResumeActions', () => {
         ]
       })
     ).toEqual({
-      worktree: { worktreeId: 'repo-1::/repo/orca_botmux', disabled: true },
+      worktree: { worktreeId: 'repo-1::/repo/botmux', disabled: true },
       newTab: { worktreeId: 'repo-2::/repo/other', disabled: false }
     })
   })
@@ -461,12 +461,12 @@ describe('resolveAiVaultSessionResumeActions', () => {
       resolveAiVaultSessionResumeActions({
         sessionFilePath: HOST_SESSION_FILE,
         worktreeInfo: makeWorktreeInfo('current'),
-        activeWorktreeId: 'repo-1::/repo/orca_botmux',
+        activeWorktreeId: 'repo-1::/repo/botmux',
         worktrees: [makeWorktree()],
         repos: [{ id: 'repo-1' } as Repo]
       })
     ).toEqual({
-      worktree: { worktreeId: 'repo-1::/repo/orca_botmux', disabled: false },
+      worktree: { worktreeId: 'repo-1::/repo/botmux', disabled: false },
       newTab: { worktreeId: null, disabled: true }
     })
   })

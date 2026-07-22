@@ -36,7 +36,7 @@ describe('WSL skill discovery', () => {
         'S',
         '0',
         '/home/alice/.codex/skills/.system/review/SKILL.md',
-        '/opt/orca_botmux/review/SKILL.md',
+        '/opt/botmux/review/SKILL.md',
         '1700000000',
         '7',
         markdown
@@ -45,7 +45,7 @@ describe('WSL skill discovery', () => {
         'S',
         '1',
         '/work/project/.agents/skills/review/SKILL.md',
-        '/opt/orca_botmux/review/SKILL.md',
+        '/opt/botmux/review/SKILL.md',
         '1700000001',
         '9',
         markdown

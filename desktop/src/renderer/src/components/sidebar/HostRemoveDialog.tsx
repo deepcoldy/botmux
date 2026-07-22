@@ -85,7 +85,7 @@ export function HostRemoveDialog({
   }
 
   // Why: runtime-environment removal needs active-environment switching and
-  // error context owned by the OrcaBotmux servers settings pane, so we deep-link
+  // error context owned by the Botmux servers settings pane, so we deep-link
   // there with the host pre-selected instead of duplicating that flow.
   const handleRemoveRuntime = (environmentId: string): void => {
     const state = useAppStore.getState()
@@ -164,12 +164,12 @@ export function HostRemoveDialog({
     target.kind === 'runtime'
       ? translate(
           'auto.components.sidebar.HostRemoveDialog.4d5e6f7a8b',
-          'This opens the OrcaBotmux servers settings where you can remove this server.'
+          'This opens the Botmux servers settings where you can remove this server.'
         )
       : hasWorkspaces
         ? translate(
             'auto.components.sidebar.HostRemoveDialog.hostHasWorkspacesDefault',
-            'Removes {{value0}} and its credentials from this computer. Its {{value1}} stay in OrcaBotmux — remote files are not touched.',
+            'Removes {{value0}} and its credentials from this computer. Its {{value1}} stay in Botmux — remote files are not touched.',
             { value0: label, value1: workspaceCountLabel }
           )
         : translate(
@@ -178,7 +178,7 @@ export function HostRemoveDialog({
           )
 
   // The destructive opt-in wording depends on whether we delete remote files or
-  // only forget OrcaBotmux's records (offline/ghost host).
+  // only forget Botmux's records (offline/ghost host).
   const deleteOptionLabel = isConnected
     ? translate(
         'auto.components.sidebar.HostRemoveDialog.alsoDeleteRemote',
@@ -187,7 +187,7 @@ export function HostRemoveDialog({
       )
     : translate(
         'auto.components.sidebar.HostRemoveDialog.alsoForgetLocal',
-        'Also remove these {{value0}} from OrcaBotmux',
+        'Also remove these {{value0}} from Botmux',
         { value0: workspaceCountLabel }
       )
 
@@ -266,7 +266,7 @@ export function HostRemoveDialog({
                           )
                         : translate(
                             'auto.components.sidebar.HostRemoveDialog.alsoForgetLocalHint',
-                            'Clears them from OrcaBotmux only. Remote files, worktrees, and branches are left untouched.'
+                            'Clears them from Botmux only. Remote files, worktrees, and branches are left untouched.'
                           )}
                     </span>
                   </span>

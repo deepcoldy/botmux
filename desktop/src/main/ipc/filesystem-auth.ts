@@ -66,7 +66,7 @@ export function invalidateAuthorizedRootsCache(): void {
 function getLocalRepos(store: Store) {
   // Why: SSH repo paths are meaningful on the remote host. Treating them as
   // local roots can both authorize unrelated local folders and probe paths
-  // that OrcaBotmux should only touch through the SSH provider.
+  // that Botmux should only touch through the SSH provider.
   return store.getRepos().filter((repo) => !repo.connectionId)
 }
 

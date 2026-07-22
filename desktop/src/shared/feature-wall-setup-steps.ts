@@ -32,10 +32,10 @@ export const FEATURE_WALL_SETUP_STEPS: readonly FeatureWallSetupStep[] = [
   },
   {
     id: 'browser',
-    name: "Use OrcaBotmux's browser",
-    subtitle: "Use OrcaBotmux's browser",
+    name: "Use Botmux's browser",
+    subtitle: "Use Botmux's browser",
     description:
-      'Browse your web app without leaving OrcaBotmux. Grab any element and send its exact source and styles to an agent with one click.'
+      'Browse your web app without leaving Botmux. Grab any element and send its exact source and styles to an agent with one click.'
   },
   {
     id: 'notifications',
@@ -51,10 +51,10 @@ export const FEATURE_WALL_SETUP_STEPS: readonly FeatureWallSetupStep[] = [
   },
   {
     id: 'agent-capabilities',
-    name: 'Enable OrcaBotmux CLI',
-    subtitle: 'Enable OrcaBotmux CLI',
+    name: 'Enable Botmux CLI',
+    subtitle: 'Enable Botmux CLI',
     description:
-      'Register the OrcaBotmux shell command and install agent skills for browser, computer, and orchestration workflows.'
+      'Register the Botmux shell command and install agent skills for browser, computer, and orchestration workflows.'
   },
   {
     id: 'task-sources',
@@ -74,7 +74,7 @@ export const FEATURE_WALL_SETUP_STEPS: readonly FeatureWallSetupStep[] = [
     name: 'Start work in multiple repos',
     subtitle: 'Start work in multiple repos',
     description:
-      'Bring your key repos into OrcaBotmux so you can start agent work without hunting for folders.'
+      'Bring your key repos into Botmux so you can start agent work without hunting for folders.'
   }
 ] as const
 

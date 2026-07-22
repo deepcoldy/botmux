@@ -297,7 +297,7 @@ const markdownPreviewSanitizeSchema = {
   protocols: {
     ...defaultSchema.protocols,
     // Why: markdown preview owns file:// click routing and authorizes the
-    // user-selected path before opening it in OrcaBotmux. Sanitization must preserve
+    // user-selected path before opening it in Botmux. Sanitization must preserve
     // the target so the click handler can make that security decision.
     href: [...(defaultSchema.protocols?.href ?? []), 'file'],
     src: [...(defaultSchema.protocols?.src ?? []), 'file']
@@ -314,8 +314,8 @@ const markdownPreviewSanitizeSchema = {
     details: [
       ...(defaultSchema.attributes?.details ?? []),
       'open',
-      ['className', 'orca-botmux-details'],
-      ['dataOrcaToggle', 'heading-1', 'heading-2', 'heading-3', 'heading-4', 'heading-5']
+      ['className', 'botmux-details'],
+      ['dataBotmuxToggle', 'heading-1', 'heading-2', 'heading-3', 'heading-4', 'heading-5']
     ],
     h1: [...(defaultSchema.attributes?.h1 ?? []), 'id'],
     h2: [...(defaultSchema.attributes?.h2 ?? []), 'id'],
@@ -1206,7 +1206,7 @@ export default function MarkdownPreview({
                     <>
                       <button
                         type="button"
-                        className="orca-botmux-diff-comment-pill-btn"
+                        className="botmux-diff-comment-pill-btn"
                         title={
                           copiedReviewNoteId === comment.id
                             ? translate(
@@ -1442,7 +1442,7 @@ export default function MarkdownPreview({
 
           if (target.protocol === 'http:' || target.protocol === 'https:') {
             // Why: route through openHttpLink (not raw shell.openUrl) so a plain
-            // click honors the "open links in OrcaBotmux" setting; openHttpLink keeps
+            // click honors the "open links in Botmux" setting; openHttpLink keeps
             // remote runtimes on the system browser. (Cmd/Ctrl+Shift-click is
             // handled above; this path only sees non-escape-hatch clicks.)
             openHttpLink(
@@ -1495,7 +1495,7 @@ export default function MarkdownPreview({
           if (!targetWorktree) {
             if (sourceRoutingWorktreeId && worktreeRoot) {
               // Why: floating markdown files are owned by a synthetic workspace,
-              // so there may be no repo worktree even though OrcaBotmux can stat/open
+              // so there may be no repo worktree even though Botmux can stat/open
               // links relative to the source file root.
               void activateMarkdownLink(href, {
                 sourceFilePath: filePath,
@@ -2072,7 +2072,7 @@ function MarkdownSingleNoteSendMenu({
         }
       ]}
       targetModeLabel="This note"
-      triggerClassName="orca-botmux-diff-comment-pill-btn"
+      triggerClassName="botmux-diff-comment-pill-btn"
       disabledTooltip="Note already sent"
       onDelivered={onDelivered}
     />
@@ -2138,12 +2138,12 @@ function MarkdownAnnotationComposer({
       className="markdown-annotation-composer"
       onClick={(event) => event.stopPropagation()}
     >
-      <div className="orca-botmux-diff-comment-popover-label">
+      <div className="botmux-diff-comment-popover-label">
         {translate('auto.components.editor.MarkdownPreview.b1bfc04034', 'Selected text')}
       </div>
       <textarea
         ref={focusTextareaRef}
-        className="orca-botmux-diff-comment-popover-textarea"
+        className="botmux-diff-comment-popover-textarea"
         placeholder={translate(
           'auto.components.editor.MarkdownPreview.d737791433',
           'Add note for the AI'
@@ -2168,7 +2168,7 @@ function MarkdownAnnotationComposer({
         }}
         rows={3}
       />
-      <div className="orca-botmux-diff-comment-popover-footer">
+      <div className="botmux-diff-comment-popover-footer">
         <Button variant="ghost" size="sm" onClick={onCancel} disabled={submitting}>
           {translate('auto.components.editor.MarkdownPreview.e4683f70c4', 'Cancel')}
         </Button>

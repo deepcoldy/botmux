@@ -33,16 +33,17 @@ function ids(
 
 describe('settings navigation metadata', () => {
   it('puts AI capability panes at the top on desktop', () => {
+    // Why: computer-use is hidden from product chrome; voice remains under capabilities.
     expect(ids().slice(0, 10)).toEqual([
       'agents',
       'accounts',
       'orchestration',
-      'computer-use',
       'voice',
       'setup-guide',
       'general',
       'integrations',
       'mobile',
+      'botmux-bridge',
       'git'
     ])
   })
@@ -100,8 +101,15 @@ describe('settings navigation metadata', () => {
     expect(webIds).not.toContain('computer-use')
     expect(webIds).not.toContain('voice')
     expect(webIds).not.toContain('advanced')
-    expect(webIds).toContain('servers')
+    // Why: Remote Botmux Servers is hidden from product chrome for now.
+    expect(webIds).not.toContain('servers')
     expect(webIds).toContain('repo-repo-1')
+  })
+
+  it('hides Computer Use and Remote Servers from desktop settings chrome', () => {
+    const desktopIds = ids({ isWebClient: false })
+    expect(desktopIds).not.toContain('computer-use')
+    expect(desktopIds).not.toContain('servers')
   })
 
   it('does not mark installable AI capabilities as beta in the sidebar metadata', () => {
@@ -112,7 +120,8 @@ describe('settings navigation metadata', () => {
       repos: [repo]
     })
 
-    expect(sections.find((section) => section.id === 'computer-use')?.badge).toBeUndefined()
+    // computer-use is hidden; voice remains and is not beta.
+    expect(sections.find((section) => section.id === 'computer-use')).toBeUndefined()
     expect(sections.find((section) => section.id === 'voice')?.badge).toBeUndefined()
   })
 

@@ -36,7 +36,7 @@ function hasDetectedHiddenLinkedExternalWorktrees(
       !worktree.isMainWorktree &&
       !worktree.selectedCheckout &&
       !worktree.visible &&
-      worktree.ownership !== 'orca-botmux-managed'
+      worktree.ownership !== 'botmux-managed'
   )
 }
 

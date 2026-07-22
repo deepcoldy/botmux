@@ -7,8 +7,8 @@
  * possibly blocked) wait state and mis-stamp waitBlockedAt on its first chunk.
  */
 import { describe, expect, it } from 'vitest'
-import { OrcaRuntimeService } from './orca-botmux-runtime'
-import type { TerminalTailWaitState } from './orca-botmux-runtime'
+import { BotmuxRuntimeService } from './botmux-runtime'
+import type { TerminalTailWaitState } from './botmux-runtime'
 
 type PtyRecord = {
   connected: boolean
@@ -22,7 +22,7 @@ type RuntimeInternals = {
 
 describe('pruneDisconnectedPtyTranscript clears the wait-scan cache', () => {
   it('empties the tail and drops tailWaitState so resume recomputes', () => {
-    const runtime = new OrcaRuntimeService()
+    const runtime = new BotmuxRuntimeService()
     const internals = runtime as unknown as RuntimeInternals
     const pty = internals.recordPtyWorktree('pty-1', 'wt-1', { connected: true })
 

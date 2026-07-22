@@ -216,7 +216,7 @@ export function createPtyOutputProcessor({
     if (sideEffectDrainTimer !== null) {
       return
     }
-    // Why: xterm.write() buffers parsing onto its own timer. Defer OrcaBotmux's
+    // Why: xterm.write() buffers parsing onto its own timer. Defer Botmux's
     // title/status/BEL store work so live terminal rendering gets the next turn.
     sideEffectDrainTimer = setTimeout(drainPtySideEffects, 0)
   }
@@ -439,7 +439,7 @@ export function createPtyOutputProcessor({
   ): void {
     const rawLength = meta?.rawLength ?? data.length
     const suppressAttentionEvents = options.suppressAttentionEvents === true
-    // Why: OSC 9999 is an OrcaBotmux control protocol. Parse it before xterm sees
+    // Why: OSC 9999 is an Botmux control protocol. Parse it before xterm sees
     // the bytes, and keep parser state across chunks so partial PTY reads do
     // not drop valid status updates or print escape garbage.
     const processed = processAgentStatusChunk(data)
@@ -527,7 +527,7 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
   // Why: eager PTY buffers contain output produced before the pane attached —
   // often from the previous app session. We still replay that data so titles
   // and scrollback restore correctly, but it must not produce fresh bells,
-  // unread marks, or notifications for unrelated worktrees just because OrcaBotmux
+  // unread marks, or notifications for unrelated worktrees just because Botmux
   // is reconnecting background terminals on launch.
   let suppressAttentionEvents = false
   const inputWriteQueue = createPtyInputWriteQueue({

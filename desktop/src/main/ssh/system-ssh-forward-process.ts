@@ -28,7 +28,7 @@ export function spawnSystemSshPortForward(
     )
   }
 
-  const args = buildSshArgs(target, { ...options, suppressOrcaControlMaster: true })
+  const args = buildSshArgs(target, { ...options, suppressBotmuxControlMaster: true })
   const destinationIndex = args.lastIndexOf('--')
   const forwardArgs = [
     '-N',
@@ -45,7 +45,7 @@ export function spawnSystemSshPortForward(
     args.splice(destinationIndex, 0, ...forwardArgs)
   }
 
-  // Why: port-forward ssh processes are not wired to OrcaBotmux credential prompts;
+  // Why: port-forward ssh processes are not wired to Botmux credential prompts;
   // system SSH forwards must authenticate via OpenSSH config, agent, or control socket.
   return spawn(sshPath, args, {
     stdio: ['ignore', 'ignore', 'pipe'],

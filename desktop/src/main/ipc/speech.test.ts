@@ -15,7 +15,7 @@ const {
 }))
 
 vi.mock('electron', () => ({
-  app: { getPath: vi.fn(() => '/tmp/orca-botmux-speech-test') },
+  app: { getPath: vi.fn(() => '/tmp/botmux-speech-test') },
   BrowserWindow: { fromWebContents: fromWebContentsMock },
   ipcMain: { handle: handleMock },
   safeStorage: {
