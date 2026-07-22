@@ -38,6 +38,11 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+    resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
+      openId
+        ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
+        : undefined
+    )),
     sessions,
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => {
       const session = {
@@ -110,11 +115,6 @@ vi.mock('../src/services/project-scanner.js', async () => {
 vi.mock('../src/im/lark/identity-cache.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
-});
-
-vi.mock('../src/core/worker-pool.js', async () => {
-  const actual = await vi.importActual<any>('../src/core/worker-pool.js');
-  return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
 import { registerBot } from '../src/bot-registry.js';

@@ -385,7 +385,7 @@ describe('repo select card — plain switch', () => {
       content: 'mock-prompt',
       codexAppInput,
     });
-    expect(vi.mocked(forkWorker).mock.calls[0]).toHaveLength(2);
+    expect(vi.mocked(forkWorker).mock.calls[0]![2]).toBe(false);
     expect(vi.mocked(buildNewTopicCliInput).mock.calls[0]![11]).toEqual(expect.objectContaining({
       substituteTrigger,
     }));
@@ -536,8 +536,9 @@ describe('repo select card — plain switch', () => {
     const sessionAfterFirst = ds.session.sessionId;
 
     const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
-    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
-    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(late?.toast?.content).toMatch(/失效|最新卡片|仓库已选定|ignore the old card/i);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(closeWorkerPoolSession).toHaveBeenCalledTimes(1);
     expect(createSession).toHaveBeenCalledTimes(1);
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.session.sessionId).toBe(sessionAfterFirst);
@@ -545,7 +546,8 @@ describe('repo select card — plain switch', () => {
 
     releaseReply!();
     await first;
-    expect(killWorker).toHaveBeenCalledTimes(1);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(closeWorkerPoolSession).toHaveBeenCalledTimes(1);
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.session.sessionId).toBe(sessionAfterFirst);
   });
@@ -558,7 +560,7 @@ describe('repo select card — plain switch', () => {
     const { deps } = makeDeps(ds);
 
     const late = await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
-    expect(late?.toast?.content).toMatch(/仓库已选定|ignore the old card/i);
+    expect(late?.toast?.content).toMatch(/失效|最新卡片|仓库已选定|ignore the old card/i);
     expect(killWorker).not.toHaveBeenCalled();
     expect(createSession).not.toHaveBeenCalled();
     expect(forkWorker).not.toHaveBeenCalled();
@@ -1168,7 +1170,7 @@ describe('repo select card — worktree open', () => {
     // persisted the flipped mode (config undefined → true)
     expect(vi.mocked(applyConfigField)).toHaveBeenCalledWith('app_test', expect.objectContaining({ configKey: 'worktreeMultiPicker' }), true);
     // withdrew the old card and posted a fresh interactive repo card
-    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_card');
+    expect(vi.mocked(deleteMessage)).toHaveBeenCalledWith('app_test', 'om_old_card');
     const interactiveCall = sessionReply.mock.calls.find(c => c[2] === 'interactive');
     expect(interactiveCall).toBeDefined();
     expect(ds.repoCardMessageId).toBe('om_reply');

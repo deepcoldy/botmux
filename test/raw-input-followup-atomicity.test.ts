@@ -83,7 +83,7 @@ describe('worker raw_input delivery', () => {
   });
 
   it('routes the follow-up through sendToPty (normal busy-queue semantics)', () => {
-    expect(region).toContain('sendToPty(msg.followUpContent!, undefined, {');
+    expect(region).toContain('sendToPty(msg.followUpContent!, msg.followUpTurnId, {');
     expect(region).toContain('codexAppInput: msg.followUpCodexAppInput');
   });
 
@@ -226,7 +226,7 @@ describe('raw command backend acceptance', () => {
 });
 
 describe('daemon prompt_ready dispatch', () => {
-  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2000);
+  const region = caseRegion(poolSrc, "case 'prompt_ready':", 5000);
 
   it('bundles the follow-up onto the raw_input IPC instead of a second message IPC', () => {
     expect(region).toContain('followUpContent: followUp?.cliInput');

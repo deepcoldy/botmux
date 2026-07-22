@@ -926,6 +926,11 @@ describe('codex-app-runner app-server protocol integration', () => {
     expect(result.final.content).not.toContain('unrelated autonomous output');
     expect(result.requests.filter(request => request.method === 'thread/turns/list')).toHaveLength(0);
     expect(result.markers.some(marker => marker.kind === 'diagnostic')).toBe(false);
+    expect(result.activities.map(activity => activity.phase)).toEqual([
+      'submitted',
+      'progress',
+      'completed',
+    ]);
   });
 
   it('does not let response-last A overwrite a newer Goal B native lifecycle', async () => {

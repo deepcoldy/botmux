@@ -454,7 +454,7 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.managedTurnOrigin).toBeUndefined();
   });
 
-  it('mints a durable identity while freezing previous-turn reply routing for a no-id prompt', () => {
+  it('mints a durable identity without borrowing previous-turn routing for a no-id fork', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const ds = makeDs({
       currentReplyTarget: {
@@ -482,11 +482,11 @@ describe('Codex App clean-input feature gate', () => {
         clientUserMessageId: expect.stringMatching(/^codex-app-dispatch-/),
       },
       turnId: expect.stringMatching(/^codex-app-dispatch-/),
-      replyTurnId: 'om_current_vc',
       codexAppDispatchId: expect.any(String),
-      vcMeetingImTurnOrigin: origin,
     }));
     expect(init.promptCodexAppInput.clientUserMessageId).toBe(init.turnId);
+    expect(init.replyTurnId).toBeUndefined();
+    expect(init.vcMeetingImTurnOrigin).toBeUndefined();
   });
 
   it('mints distinct persisted identities for consecutive live no-id inputs without losing reply routing', () => {

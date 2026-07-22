@@ -1649,6 +1649,7 @@ export async function handleCommand(
               !pendingRawInput && pendingTurnId ? { turnId: pendingTurnId } : false,
             );
             current.pendingRepo = false;
+            current.pendingRepoCommitInFlight = true;
             // Queued activation ownership lasts through adapter submission.
             // These source buffers were folded into opening N; clear them but
             // keep the gate so later inbounds enter the exact post-ACK FIFO.
@@ -1676,13 +1677,17 @@ export async function handleCommand(
           });
           if (!started) return false;
           try {
-            await sessionReply(rootId, replyText);
-          } catch (e) {
-            logger.warn(`[${logTag}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
-          }
-          if (started.cardToWithdraw) {
-            try { await deleteMessage(started.current.larkAppId, started.cardToWithdraw); }
-            catch { /* best-effort */ }
+            try {
+              await sessionReply(rootId, replyText);
+            } catch (e) {
+              logger.warn(`[${logTag}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
+            }
+            if (started.cardToWithdraw) {
+              try { await deleteMessage(started.current.larkAppId, started.cardToWithdraw); }
+              catch { /* best-effort */ }
+            }
+          } finally {
+            started.current.pendingRepoCommitInFlight = false;
           }
           return true;
         };

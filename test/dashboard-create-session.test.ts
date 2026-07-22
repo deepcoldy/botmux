@@ -34,6 +34,7 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
 
 const sendMessageMock = vi.fn(async () => 'om_banner_123');
+const uploadImageMock = vi.fn(async () => 'img_dashboard_123');
 const replyMessageMock = vi.fn(async () => 'om_reply_123');
 const deleteMessageMock = vi.fn(async () => {});
 vi.mock('../src/im/lark/client.js', () => ({
@@ -139,6 +140,7 @@ beforeEach(() => {
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   sendMessageMock.mockClear();
+  uploadImageMock.mockClear();
   replyMessageMock.mockClear();
   deleteMessageMock.mockClear();
   scanMultipleProjectsMock.mockReset();
@@ -1111,7 +1113,10 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     await executeScheduledTask(task(), active, vi.fn());
 
     expect(active.get(sessionKey(ROOT, APP))).toBe(ds);
-    expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), true);
+    expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), expect.objectContaining({
+      resume: true,
+      turnId: expect.stringMatching(/^schedule:schedule-owner-test:/),
+    }));
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
   });
 
@@ -1122,7 +1127,10 @@ describe('executeScheduledTask — workerless owner semantics', () => {
     await executeScheduledTask(task(), active, vi.fn());
 
     expect(active.get(sessionKey(ROOT, APP))).toBe(ds);
-    expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), true);
+    expect(forkWorkerMock).toHaveBeenCalledWith(ds, expect.anything(), expect.objectContaining({
+      resume: true,
+      turnId: expect.stringMatching(/^schedule:schedule-owner-test:/),
+    }));
     expect(closeWorkerSessionMock).not.toHaveBeenCalled();
   });
 

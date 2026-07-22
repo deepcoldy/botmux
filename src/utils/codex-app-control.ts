@@ -65,6 +65,7 @@ const POSIX_OWNER_RECORD_RE = /^owner-[a-f0-9]{64}\.json$/;
 const POSIX_OWNER_PENDING_RE = /^owner-[a-f0-9]{64}\.pending$/;
 const POSIX_REAPER_RECORD_RE = /^reap-[a-f0-9]{64}\.json$/;
 const POSIX_REAPER_PENDING_RE = /^reap-[a-f0-9]{64}\.pending$/;
+const POSIX_DIRECTORY_GENERATION_RE = /^generation-([a-f0-9]{64})\.json$/;
 const POSIX_LEASE_RECORD_MAX_BYTES = 4_096;
 const windowsHardenedDirectories = new Set<string>();
 
@@ -639,6 +640,10 @@ interface CodexAppPosixFileIdentity {
   ino: string;
 }
 
+interface CodexAppPosixDirectoryIdentity extends CodexAppPosixFileIdentity {
+  generation?: string;
+}
+
 interface CodexAppPosixOwnerTarget {
   nonce: string;
   recordIdentity: CodexAppPosixFileIdentity;
@@ -647,14 +652,14 @@ interface CodexAppPosixOwnerTarget {
 }
 
 interface CodexAppPosixOwnerRecord {
-  version: 2;
+  version: 2 | 3;
   role: 'owner' | 'reaper';
   sessionId: string;
   nonce: string;
   pid: number;
   processStartToken: string;
   createdAtMs: number;
-  directoryIdentity: CodexAppPosixFileIdentity;
+  directoryIdentity: CodexAppPosixDirectoryIdentity;
   targetOwner?: CodexAppPosixOwnerTarget;
 }
 
@@ -758,6 +763,17 @@ function validPosixFileIdentity(value: unknown): value is CodexAppPosixFileIdent
     && typeof identity.ino === 'string' && /^(?:0|[1-9]\d*)$/.test(identity.ino);
 }
 
+function validPosixDirectoryIdentity(
+  value: unknown,
+  requireGeneration: boolean,
+): value is CodexAppPosixDirectoryIdentity {
+  if (!validPosixFileIdentity(value)) return false;
+  const generation = (value as unknown as Record<string, unknown>).generation;
+  return requireGeneration
+    ? typeof generation === 'string' && /^[a-f0-9]{64}$/.test(generation)
+    : generation === undefined;
+}
+
 function validPosixOwnerTarget(value: unknown): value is CodexAppPosixOwnerTarget {
   if (!value || typeof value !== 'object') return false;
   const target = value as Record<string, unknown>;
@@ -781,7 +797,10 @@ function validPosixOwnerRecord(
   const targetValid = record.role === 'owner'
     ? record.targetOwner === undefined
     : validPosixOwnerTarget(record.targetOwner);
-  return record.version === 2
+  const versionValid = record.version === 2
+    ? validPosixDirectoryIdentity(record.directoryIdentity, false)
+    : record.version === 3 && validPosixDirectoryIdentity(record.directoryIdentity, true);
+  return versionValid
     && roleValid
     && (expectedRole === undefined || record.role === expectedRole)
     && record.sessionId === sessionId
@@ -790,7 +809,6 @@ function validPosixOwnerRecord(
     && typeof record.processStartToken === 'string'
     && record.processStartToken.length > 0 && record.processStartToken.length <= 256
     && typeof record.createdAtMs === 'number' && Number.isFinite(record.createdAtMs)
-    && validPosixFileIdentity(record.directoryIdentity)
     && targetValid;
 }
 
@@ -825,8 +843,10 @@ interface ObservedPosixLeaseRecord {
 
 interface ObservedPosixLeaseDirectory {
   stat: BigIntStats;
-  identity: CodexAppPosixFileIdentity;
+  identity: CodexAppPosixDirectoryIdentity;
   names: string[];
+  generationName?: string;
+  generationStat?: BigIntStats;
 }
 
 function errnoCode(err: unknown): string | undefined {
@@ -984,7 +1004,51 @@ function observePosixLeaseDirectory(
   }
   if (!samePosixStatIdentity(before, after)) return undefined;
   assertPosixLeaseDirectoryStat(after, platform);
-  return { stat: after, identity: posixFileIdentity(after), names };
+  const generationNames = names.filter(name => POSIX_DIRECTORY_GENERATION_RE.test(name));
+  if (generationNames.length > 1) {
+    throw new Error('Codex App POSIX owner lease contains multiple directory generations');
+  }
+  const generationName = generationNames[0];
+  if (!generationName) return { stat: after, identity: posixFileIdentity(after), names };
+  const generation = generationName.match(POSIX_DIRECTORY_GENERATION_RE)?.[1];
+  const generationPath = join(directory, generationName);
+  try {
+    const generationStat = lstatSync(generationPath, { bigint: true });
+    assertPrivatePosixLeaseRecord(
+      generationStat,
+      'Codex App POSIX directory generation',
+      platform,
+    );
+    const persistedGeneration = readOwnedRegularFile(
+      generationPath,
+      128,
+      'Codex App POSIX directory generation',
+      platform,
+    );
+    const verifiedGenerationStat = lstatSync(generationPath, { bigint: true });
+    assertPrivatePosixLeaseRecord(
+      verifiedGenerationStat,
+      'Codex App POSIX directory generation',
+      platform,
+    );
+    if (!generation || persistedGeneration !== generation
+        || !samePosixStatIdentity(generationStat, verifiedGenerationStat)) {
+      throw new Error('Codex App POSIX directory generation verification failed');
+    }
+    return {
+      stat: after,
+      identity: { ...posixFileIdentity(after), generation },
+      names,
+      generationName,
+      generationStat: verifiedGenerationStat,
+    };
+  } catch (err) {
+    // The exact marker can disappear after readdir when the owner releases or
+    // a contender completes cleanup. Treat that as a changed snapshot so the
+    // caller retries against the next directory generation.
+    if (errnoCode(err) === 'ENOENT') return undefined;
+    throw err;
+  }
 }
 
 function createStagedPosixLeaseRecord(input: {
@@ -1063,6 +1127,50 @@ function retireObservedPosixLeaseRecord(
   return true;
 }
 
+/** Remove the exact generation marker only while it is the directory's sole
+ * remaining entry. The marker gives each mkdir generation an unforgeable
+ * identity even when the filesystem immediately reuses the same dev+ino. */
+function retirePosixDirectoryGeneration(
+  directory: string,
+  observed: ObservedPosixLeaseDirectory,
+  leasesRoot: string,
+  sessionId: string,
+  platform: NodeJS.Platform,
+): boolean {
+  if (!observed.generationName || !observed.generationStat) return false;
+  const current = observePosixLeaseDirectory(directory, platform);
+  if (!current || current.names.length !== 1
+      || current.generationName !== observed.generationName
+      || current.identity.generation !== observed.identity.generation
+      || !samePosixFileIdentity(current.identity, observed.identity)
+      || !current.generationStat
+      || !samePosixStatIdentity(current.generationStat, observed.generationStat)) return false;
+  const markerPath = join(directory, observed.generationName);
+  const retired = join(
+    leasesRoot,
+    `.retired-generation-${sessionKey(sessionId).slice(0, 16)}-${observed.identity.generation}`,
+  );
+  try {
+    renameSync(markerPath, retired);
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return false;
+    throw err;
+  }
+  try {
+    const moved = lstatSync(retired, { bigint: true });
+    assertPrivatePosixLeaseRecord(moved, 'Retired Codex App POSIX directory generation', platform);
+    if (!samePosixStatIdentity(observed.generationStat, moved)) {
+      throw new Error('Codex App POSIX directory generation changed during retirement');
+    }
+  } finally {
+    try { unlinkSync(retired); } catch { /* crash residue is outside authority */ }
+  }
+  try { rmdirSync(directory); } catch (err) {
+    if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
+  }
+  return true;
+}
+
 function assertPosixLeaseDirectoryStat(stat: BigIntStats, platform: NodeJS.Platform): void {
   if (!stat.isDirectory() || stat.isSymbolicLink() || exactBigIntMode(stat.mode) !== PRIVATE_DIRECTORY_MODE) {
     throw new Error('Codex App POSIX owner lease must be a real 0700 directory');
@@ -1072,11 +1180,14 @@ function assertPosixLeaseDirectoryStat(stat: BigIntStats, platform: NodeJS.Platf
 
 function posixLeaseRecordMatchesDirectory(
   observed: ObservedPosixLeaseRecord,
-  directory: ObservedPosixLeaseDirectory | CodexAppPosixFileIdentity,
+  directory: ObservedPosixLeaseDirectory | CodexAppPosixDirectoryIdentity,
 ): boolean {
   if (!observed.record) return false;
   const identity = 'identity' in directory ? directory.identity : directory;
-  return samePosixFileIdentity(observed.record.directoryIdentity, identity);
+  if (!samePosixFileIdentity(observed.record.directoryIdentity, identity)) return false;
+  return observed.record.version === 2
+    ? observed.record.directoryIdentity.generation === undefined
+    : observed.record.directoryIdentity.generation === identity.generation;
 }
 
 function posixOwnerTarget(observed: ObservedPosixLeaseRecord): CodexAppPosixOwnerTarget {
@@ -1144,6 +1255,9 @@ export async function acquireCodexAppPosixOwnerLease(
 
   acquireLoop: while (true) {
     const nonce = randomBytes(32).toString('hex');
+    const directoryGeneration = randomBytes(32).toString('hex');
+    const generationName = `generation-${directoryGeneration}.json`;
+    const generationPath = join(directory, generationName);
     const ownerRecordPath = join(directory, `owner-${nonce}.json`);
     const ownerPendingPath = join(directory, `owner-${nonce}.pending`);
     let createdDirectory = false;
@@ -1152,12 +1266,22 @@ export async function acquireCodexAppPosixOwnerLease(
       createdDirectory = true;
       const ownedDirectoryStat = lstatSync(directory, { bigint: true });
       assertPosixLeaseDirectoryStat(ownedDirectoryStat, platform);
-      const ownedDirectoryIdentity = posixFileIdentity(ownedDirectoryStat);
+      createExclusiveFile(
+        generationPath,
+        directoryGeneration,
+        'Codex App POSIX directory generation',
+        platform,
+      );
+      fsyncDirectory(directory, platform);
+      const ownedDirectoryIdentity: CodexAppPosixDirectoryIdentity = {
+        ...posixFileIdentity(ownedDirectoryStat),
+        generation: directoryGeneration,
+      };
       if (options.onOwnerDirectoryCreated) {
         await options.onOwnerDirectoryCreated(directory);
       }
       const record: CodexAppPosixOwnerRecord = {
-        version: 2,
+        version: 3,
         role: 'owner',
         sessionId: options.sessionId,
         nonce,
@@ -1185,7 +1309,10 @@ export async function acquireCodexAppPosixOwnerLease(
         }
         const installed = observePosixLeaseDirectory(directory, platform);
         if (!installed || !samePosixStatIdentity(installed.stat, ownedDirectoryStat)
-            || installed.names.length !== 1 || installed.names[0] !== basename(ownerRecordPath)) {
+            || installed.identity.generation !== directoryGeneration
+            || installed.names.length !== 2
+            || !installed.names.includes(generationName)
+            || !installed.names.includes(basename(ownerRecordPath))) {
           throw posixLeaseRaceError(
             'Codex App POSIX owner directory changed during record publication',
           );
@@ -1193,6 +1320,7 @@ export async function acquireCodexAppPosixOwnerLease(
       } catch (err) {
         try { unlinkSync(ownerPendingPath); } catch { /* not installed */ }
         try { unlinkSync(ownerRecordPath); } catch { /* not installed */ }
+        try { unlinkSync(generationPath); } catch { /* replacement directory owns a different generation */ }
         try { rmdirSync(directory); } catch { /* competing reaper or residue */ }
         throw err;
       }
@@ -1250,7 +1378,21 @@ export async function acquireCodexAppPosixOwnerLease(
             try { unlinkSync(ownerRecordPath); } catch { /* already reaped */ }
           }
           try { unlinkSync(ownerPendingPath); } catch { /* never published or already retired */ }
-          try { rmdirSync(directory); } catch { /* another contender owns cleanup */ }
+          try {
+            const currentDirectory = observePosixLeaseDirectory(directory, platform);
+            if (currentDirectory
+                && currentDirectory.identity.generation === directoryGeneration
+                && currentDirectory.names.length === 1
+                && currentDirectory.names[0] === generationName) {
+              retirePosixDirectoryGeneration(
+                directory,
+                currentDirectory,
+                leasesRoot,
+                options.sessionId,
+                platform,
+              );
+            }
+          } catch { /* another contender owns cleanup */ }
         },
       };
     } catch (err) {
@@ -1273,6 +1415,7 @@ export async function acquireCodexAppPosixOwnerLease(
       || POSIX_OWNER_PENDING_RE.test(name)
       || POSIX_REAPER_RECORD_RE.test(name)
       || POSIX_REAPER_PENDING_RE.test(name)
+      || POSIX_DIRECTORY_GENERATION_RE.test(name)
     ));
     if (knownNames.length !== snapshot.names.length) {
       throw new Error('Codex App POSIX owner lease contains an unknown record');
@@ -1404,11 +1547,21 @@ export async function acquireCodexAppPosixOwnerLease(
         await retry();
         continue;
       }
-      try {
-        rmdirSync(directory);
-      } catch (err) {
-        if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
-        await retry();
+      if (snapshot.generationName) {
+        if (!retirePosixDirectoryGeneration(
+          directory,
+          snapshot,
+          leasesRoot,
+          options.sessionId,
+          platform,
+        )) await retry();
+      } else {
+        try {
+          rmdirSync(directory);
+        } catch (err) {
+          if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
+          await retry();
+        }
       }
       continue;
     }
@@ -1432,7 +1585,7 @@ export async function acquireCodexAppPosixOwnerLease(
     const reaperPath = join(directory, `reap-${reaperNonce}.json`);
     const reaperPendingPath = join(directory, `reap-${reaperNonce}.pending`);
     const reaperRecord: CodexAppPosixOwnerRecord = {
-      version: 2,
+      version: snapshot.identity.generation ? 3 : 2,
       role: 'reaper',
       sessionId: options.sessionId,
       nonce: reaperNonce,
@@ -1556,8 +1709,19 @@ export async function acquireCodexAppPosixOwnerLease(
       try { unlinkSync(reaperPendingPath); } catch { /* renamed or already retired */ }
       try { unlinkSync(reaperPath); } catch { /* another cleaner retired it */ }
     }
-    try { rmdirSync(directory); } catch (err) {
-      if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
+    const emptied = observePosixLeaseDirectory(directory, platform);
+    if (emptied?.generationName && emptied.names.length === 1) {
+      retirePosixDirectoryGeneration(
+        directory,
+        emptied,
+        leasesRoot,
+        options.sessionId,
+        platform,
+      );
+    } else {
+      try { rmdirSync(directory); } catch (err) {
+        if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
+      }
     }
   }
 }

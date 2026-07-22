@@ -768,14 +768,16 @@ async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: s
   await turn.reconciliation;
 }
 
-function handleNotification(msg: JsonObject): void {
+function handleNotification(msg: JsonObject, replayedAfterResponse = false): void {
   const params = msg.params ?? {};
   if (params.threadId !== threadId) return;
   const notificationTurnId = params.turnId ?? params.turn?.id;
 
   if (msg.method === 'turn/started') {
     const startedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
-    if (startedId) nativeActiveTurnId = startedId;
+    if (startedId && (!replayedAfterResponse
+        || nativeActiveTurnId === undefined
+        || nativeActiveTurnId === startedId)) nativeActiveTurnId = startedId;
     const turn = activeTurn;
     if (turn && startedId) {
       const exact = turn.clientUserMessageId
@@ -785,6 +787,17 @@ function handleNotification(msg: JsonObject): void {
       if (turn.nativeTurnId === startedId) {
         turn.serverStarted = true;
         emitTurnActivity(turn, 'progress', true);
+        return;
+      }
+      // app-server is allowed to publish turn/started before replying to
+      // turn/start. Without the response we do not yet know whether this is
+      // our native turn, but dropping it also loses the first (and sometimes
+      // only) progress edge. Replay it after the RPC binds nativeTurnId.
+      if (!turn.requestAccepted && turn.requestKind === 'start') {
+        const alreadyBufferedStart = turn.pendingNotifications.some(
+          notification => notification.method === 'turn/started',
+        );
+        if (!alreadyBufferedStart) turn.pendingNotifications.push(msg);
         return;
       }
     }
@@ -1080,7 +1093,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
   const pendingNotifications = turn.pendingNotifications.splice(0);
   for (const notification of pendingNotifications) {
     const notificationTurnId = notification.params?.turnId ?? notification.params?.turn?.id;
-    if (notificationTurnId === turn.nativeTurnId) handleNotification(notification);
+    if (notificationTurnId === turn.nativeTurnId) handleNotification(notification, true);
   }
   const pendingCompletions = turn.pendingCompletions.splice(0);
   if (pendingCompletions.length > 0 && !turn.completed) {

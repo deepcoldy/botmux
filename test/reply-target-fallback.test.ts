@@ -17,6 +17,8 @@ import {
   beginReplyTargetTurn,
   fallbackTurnId,
   frozenReplyContextForTurn,
+  isSubstituteTurn,
+  pickTurnReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';

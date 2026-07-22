@@ -8,6 +8,7 @@ import {
   CLI_FILTER_OPTIONS,
   SESSION_STATUS_OPTIONS,
   deriveSessionBoardColumn,
+  groupSessionsByTopic,
   isUnknownChatSession,
   restartConfirmMessage,
   historySenderKey,

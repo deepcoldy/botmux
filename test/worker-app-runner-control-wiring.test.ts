@@ -118,7 +118,9 @@ describe('worker app-runner control-channel wiring', () => {
       workerSource.indexOf('const releaseFirstPromptTimeout'),
       workerSource.indexOf('// Riff (and other remote HTTP backends)'),
     );
-    expect(firstPromptTimeout).toContain('if (cliAdapter?.supportsTypeAhead) flushPending();');
+    expect(firstPromptTimeout).toContain(
+      "if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')",
+    );
     expect(firstPromptTimeout).not.toContain('codexAppRuntimeTypeAheadReady()');
   });
 

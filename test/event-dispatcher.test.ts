@@ -131,7 +131,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,

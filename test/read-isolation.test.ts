@@ -535,7 +535,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(() => assertSafeAppId('...')).toThrow();
     expect(() => buildV2CarveOuts(v2({ currentAppId: '..' }))).toThrow();
     expect(buildV2CarveOuts(v2({ currentSessionId: '../other' })).allowPaths).toContain(
-      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other'),
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other', G1),
     );
     // botHomePath must also reject an unsafe id (used for own + other BOT_HOMEs)
     expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();

@@ -9630,11 +9630,14 @@ async function spawnCli(
   }
 }
 
+// Invalidate an in-flight async spawn before any other teardown hook runs. The
+// remaining cleanup is synchronous today, but generation ownership must not
+// depend on that implementation detail.
 function killCli(opts: { preservePending?: boolean } = {}): void {
+  cliSpawnGeneration++;
   currentCliCredentialIsolated = false;
   stopSessionMcpGatewayHost();
   stopCodexRpcEngine();
-  cliSpawnGeneration++;
   cleanupCodexAppControlBootstrap();
   stopCodexAppControlChannel();
   codexAppControlStateValue = undefined;

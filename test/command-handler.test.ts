@@ -466,7 +466,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, suspendWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -2353,7 +2353,7 @@ describe('handleCommand', () => {
 
       // No buffered message → spawn idle with an empty prompt so the user's NEXT
       // message becomes the first prompt (not an empty/boilerplate user_message).
-      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', { turnId: 'om_repo_command_only' });
       expect(buildNewTopicPrompt).not.toHaveBeenCalled();
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.createSession).not.toHaveBeenCalled();
@@ -2451,7 +2451,11 @@ describe('handleCommand', () => {
       expect(ensureSessionWhiteboard).toHaveBeenCalledWith(ds);
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('帮我看看这个 bug');
       expect((buildNewTopicCliInput as ReturnType<typeof vi.fn>).mock.calls[0][11]).toMatchObject({ whiteboardId: 'wb_test' });
-      expect(forkWorker).toHaveBeenCalledWith(ds, { content: 'WRAPPED:帮我看看这个 bug' }, false);
+      expect(forkWorker).toHaveBeenCalledWith(
+        ds,
+        { content: 'WRAPPED:帮我看看这个 bug' },
+        { turnId: 'om_buffered_first' },
+      );
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
     });

@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
-import { buildRestartReportText, sendRestartReportIfPending } from '../src/core/restart-report.js';
+import { buildRestartReportText, fetchChangelog, sendRestartReportIfPending } from '../src/core/restart-report.js';
 import {
   commitRestartIntentAttemptTo,
   restartIntentPathIn,

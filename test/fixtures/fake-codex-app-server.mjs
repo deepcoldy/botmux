@@ -55,6 +55,9 @@ function completeTurn(request) {
     || behavior === 'start-response-last-goal';
   if (!responseLast) respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
+  // Exercise duplicate pre-response lifecycle notifications: the runner must
+  // buffer one edge and must not misclassify a duplicate as autonomous work.
+  if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
   const finish = () => {
     if (responseLast) {
       notify('item/completed', {

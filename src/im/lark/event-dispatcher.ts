@@ -2083,7 +2083,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       return ownsSession
         ? handlers.handleThreadReply(payload.data, payload.ctx)
         : handlers.handleNewTopic(payload.data, payload.ctx);
-    });
+    }, 0);
   };
   const dispatchPersistedForwardFollowup = async (
     seedMessageId: string,
@@ -2859,7 +2859,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // processed in arrival order — never concurrently. Without this a fast
       // second message interleaves with the first's async session-spawn and is
       // dropped (worker-not-ready → re-fork branch). See anchor-serializer.ts.
-      await dispatchHumanMessage(payload)
+      // The chat-wide ingress lane protects only asynchronous routing. Once
+      // canonical work has been synchronously appended to its own anchor FIFO,
+      // release the raw lane so independent topics in the same chat can run
+      // concurrently. Same-anchor handlers remain strictly serialized by
+      // dispatchHumanMessage's canonical queue.
+      void dispatchHumanMessage(payload)
         .catch(err => logger.error(`Error handling message event: ${err}`));
     } catch (err) {
       logger.error(`Error handling message event: ${err}`);
