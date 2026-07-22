@@ -3007,6 +3007,18 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        // The worker/CLI generation ended. Disable an outstanding stuck-warning
+        // card before any replacement worker can be attached; otherwise a late
+        // click could inject its keys into the replacement CLI.
+        if (ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on CLI exit: ${err}`),
+          );
+          ds.stuckWarningCardId = undefined;
+          ds.stuckWarningTurnId = undefined;
+        }
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {

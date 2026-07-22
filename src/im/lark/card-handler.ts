@@ -1792,6 +1792,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
 
       if (optionType === 'toggle') {
+        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
+        // card must never read or mutate the other card's global selections.
+        if (!isActiveTuiCard) {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -1819,10 +1825,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return;
       }
 
-      // For confirm: batch all toggled options' keys first, then confirm keys
+      // For a normal TUI confirm: batch all toggled options' keys first.
+      // For a stuck-warning card: use ONLY the button's own keys — never mix
+      // in another concurrently active TUI card's toggle state/options.
       if (ds.worker) {
         let allKeys: string[] = [];
-        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -1849,7 +1857,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
 
         if (isFinal) {
-          const resolveText = ds.tuiToggledIndices?.length
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
           const finalText = resolveText || selectedText;
