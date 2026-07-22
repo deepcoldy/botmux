@@ -663,10 +663,10 @@ export async function automateOpenPlatformSetup(
       data = null;
     }
     if (!response.ok) {
-      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data);
+      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data, response.status);
     }
     if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
-      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data);
+      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data, response.status);
     }
     return data;
   };
@@ -1005,10 +1005,10 @@ export async function createOpenPlatformApiClient(
       data = null;
     }
     if (!response.ok) {
-      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data);
+      throw new OpenPlatformApiError(`HTTP ${response.status} ${path}: ${summarizeOpenPlatformPayload(data)}`, data, response.status);
     }
     if (data && typeof data === 'object' && typeof data.code === 'number' && data.code !== 0) {
-      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data);
+      throw new OpenPlatformApiError(`code=${data.code} msg=${data.msg ?? data.message ?? ''}`, data, response.status);
     }
     return data;
   };
@@ -1583,7 +1583,7 @@ class MutableCookieJar {
 }
 
 export class OpenPlatformApiError extends Error {
-  constructor(message: string, readonly payload: unknown) {
+  constructor(message: string, readonly payload: unknown, readonly status: number) {
     super(message);
   }
 }
@@ -1591,7 +1591,7 @@ export class OpenPlatformApiError extends Error {
 function openPlatformOwnerAccessDenied(error: unknown): boolean {
   if (!(error instanceof OpenPlatformApiError)) return false;
   const payload = asRecord(error.payload);
-  return payload.code === 10003;
+  return error.status === 403 && payload.code === 10003;
 }
 
 class FeishuWebSessionError extends Error {

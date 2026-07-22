@@ -31,6 +31,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
+  readCriticalScopesFromApplicationInfo,
   checkRequiredScopes,
   applyScopesUnverified,
   buildScopeDeepLink,
@@ -144,6 +145,35 @@ describe('validateCredentials', () => {
       expect.stringContaining('open.larksuite.com'),
       expect.any(Object),
     );
+  });
+});
+
+describe('readCriticalScopesFromApplicationInfo', () => {
+  it('uses the effective application-info scopes and reports missing critical names', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({
+        json: async () => ({ code: 0, data: { app: { scopes: [{ scope: 'im:message' }] } } }),
+      });
+    const result = await readCriticalScopesFromApplicationInfo('cli_x', 'secret');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.granted).toEqual(['im:message']);
+      expect(result.missingCritical.map(scope => scope.name)).toContain('contact:user.base:readonly');
+      expect(result.missingCritical.map(scope => scope.name)).not.toContain('im:message');
+    }
+    expect(fetchMock.mock.calls[1][0]).toContain('/open-apis/application/v6/applications/cli_x');
+  });
+
+  it('fails closed when application self-inspection is unavailable', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 99991672, msg: 'forbidden' }) });
+    expect(await readCriticalScopesFromApplicationInfo('cli_x', 'secret')).toEqual({
+      ok: false,
+      error: 'need_self_manage',
+      message: 'missing application:application:self_manage',
+    });
   });
 });
 

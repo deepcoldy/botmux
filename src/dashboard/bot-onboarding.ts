@@ -6,7 +6,14 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
-import { validateCredentials, buildRemainingSteps, type CredentialValidation, type RemainingStep } from '../setup/verify-permissions.js';
+import {
+  validateCredentials,
+  readCriticalScopesFromApplicationInfo,
+  buildRemainingSteps,
+  type CredentialValidation,
+  type CriticalScopeReadbackResult,
+  type RemainingStep,
+} from '../setup/verify-permissions.js';
 import { resolveSetupAppName } from '../setup/app-name.js';
 import {
   automateOpenPlatformSetup,
@@ -75,6 +82,10 @@ export interface BotOnboardingSnapshot {
   registrationMode?: 'web' | 'compat';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
+  /** Monotonic permission-recovery attempt within the same immutable target lineage. */
+  recoveryAttempt?: number;
+  /** Exact terminal/interrupted recovery attempt that authorized this fresh QR. */
+  previousRecoveryJobId?: string;
   brand?: 'feishu' | 'lark';
   // 实际写入的 CLI / 工作目录, 供前端完成页回显
   cliId?: string;
@@ -134,6 +145,7 @@ type ValidateCredentialsFn = (
   brand?: 'feishu' | 'lark',
 ) => Promise<CredentialValidation | { ok: true }>;
 type AutomateOpenPlatformFn = (opts: OpenPlatformAutomationOptions) => Promise<OpenPlatformAutomationResult>;
+type VerifyCriticalScopesFn = (appId: string, appSecret: string, brand: 'feishu' | 'lark') => Promise<CriticalScopeReadbackResult>;
 
 export interface BotOnboardingManagerOptions {
   botsJsonPath: string;
@@ -142,6 +154,8 @@ export interface BotOnboardingManagerOptions {
    * Dashboard 进程重启后继续完成已经创建、但尚未写入 bots.json 的应用。
    */
   pendingStorePath?: string;
+  /** Private, secret-free recovery lineage used to turn restart into a fresh owner QR. */
+  permissionRecoveryStorePath?: string;
   /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
   createApp?: CreateAppFn;
   inspectSession?: InspectSessionFn;
@@ -149,6 +163,7 @@ export interface BotOnboardingManagerOptions {
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
   automateOpenPlatform?: AutomateOpenPlatformFn;
+  verifyCriticalScopes?: VerifyCriticalScopesFn;
   renderQrDataUrl?: (url: string) => string;
   now?: () => number;
   /**
@@ -185,7 +200,8 @@ export type StartPermissionRecoveryResult =
       error:
         | 'permission_recovery_target_missing'
         | 'permission_recovery_target_ambiguous'
-        | 'permission_recovery_target_invalid';
+        | 'permission_recovery_target_invalid'
+        | 'permission_recovery_state_unavailable';
     };
 
 export type BotOnboardingSessionStatus =
@@ -233,10 +249,13 @@ export class BotOnboardingManager {
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
+  private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
   private readonly renderQrDataUrl: (url: string) => string;
   private readonly now: () => number;
   private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
   private readonly pendingStorePath: string;
+  private readonly permissionRecoveryStorePath: string;
+  private permissionRecoveryStateError?: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
     // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
@@ -246,11 +265,14 @@ export class BotOnboardingManager {
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
+    this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
     this.renderQrDataUrl = opts.renderQrDataUrl ?? renderQrSvgDataUrl;
     this.now = opts.now ?? (() => Date.now());
     this.startBotLive = opts.startBotLive;
     this.pendingStorePath = opts.pendingStorePath ?? `${opts.botsJsonPath}.onboarding-pending.json`;
+    this.permissionRecoveryStorePath = opts.permissionRecoveryStorePath ?? `${opts.botsJsonPath}.permission-recoveries.json`;
     this.restorePendingJobs();
+    this.restorePermissionRecoveryJobs();
   }
 
   /**
@@ -313,6 +335,141 @@ export class BotOnboardingManager {
     }
   }
 
+  private restorePermissionRecoveryJobs(): void {
+    if (!existsSync(this.permissionRecoveryStorePath)) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.permissionRecoveryStorePath, 'utf8'));
+    } catch (err) {
+      this.permissionRecoveryStateError = `permission recovery ledger is unreadable: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+    if ((parsed as any)?.version !== 1 || !Array.isArray((parsed as any).jobs) || (parsed as any).jobs.length > 128) {
+      this.permissionRecoveryStateError = 'permission recovery ledger schema is invalid';
+      return;
+    }
+    const records = (parsed as any).jobs;
+    const restored: BotOnboardingSnapshot[] = [];
+    const ids = new Set<string>();
+    for (const raw of records) {
+      if (
+        !raw || typeof raw !== 'object'
+        || typeof raw.id !== 'string' || !/^botperm_[A-Za-z0-9_-]{1,160}$/.test(raw.id)
+        || ids.has(raw.id)
+        || typeof raw.appId !== 'string' || !raw.appId
+        || typeof raw.workingDir !== 'string' || !raw.workingDir
+        || typeof raw.recoveryOfJobId !== 'string' || !raw.recoveryOfJobId
+        || !Number.isFinite(raw.createdAt) || !Number.isFinite(raw.updatedAt)
+        || !Number.isInteger(raw.recoveryAttempt)
+        || raw.recoveryAttempt < 1
+        || !['starting', 'configuring_permissions', 'waiting_for_platform_scan', 'completed', 'failed'].includes(raw.status)
+        || !['feishu', 'lark'].includes(raw.brand)
+        || (raw.previousRecoveryJobId !== undefined && typeof raw.previousRecoveryJobId !== 'string')
+      ) {
+        this.permissionRecoveryStateError = 'permission recovery ledger contains an invalid record';
+        return;
+      }
+      ids.add(raw.id);
+      const status: BotOnboardingStatus = ['completed', 'failed'].includes(raw.status)
+        ? raw.status
+        : 'failed';
+      const snapshot: BotOnboardingSnapshot = {
+        id: raw.id,
+        status,
+        createdAt: raw.createdAt,
+        updatedAt: this.now(),
+        appId: raw.appId,
+        brand: raw.brand === 'lark' ? 'lark' : 'feishu',
+        cliId: 'traex',
+        workingDir: raw.workingDir,
+        registrationMode: 'compat',
+        recoveryOfJobId: raw.recoveryOfJobId,
+        recoveryAttempt: raw.recoveryAttempt,
+        ...(typeof raw.previousRecoveryJobId === 'string' ? { previousRecoveryJobId: raw.previousRecoveryJobId } : {}),
+        ...(status === 'failed'
+          ? {
+              error: raw.status === 'failed' && typeof raw.error === 'string'
+                ? raw.error
+                : 'permission_recovery_interrupted',
+              message: raw.status === 'failed' && typeof raw.message === 'string'
+                ? raw.message
+                : 'Dashboard restarted before permission recovery reached a terminal result',
+            }
+          : {}),
+      };
+      restored.push(snapshot);
+    }
+    const groups = new Map<string, BotOnboardingSnapshot[]>();
+    for (const snapshot of restored) {
+      const key = JSON.stringify([snapshot.recoveryOfJobId, snapshot.workingDir, snapshot.appId]);
+      const group = groups.get(key) ?? [];
+      group.push(snapshot);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      group.sort((a, b) => (a.recoveryAttempt ?? 0) - (b.recoveryAttempt ?? 0));
+      for (let index = 0; index < group.length; index += 1) {
+        if (
+          group[index].recoveryAttempt !== index + 1
+          || (index === 0 && group[index].previousRecoveryJobId !== undefined)
+          || (index > 0 && group[index].previousRecoveryJobId !== group[index - 1].id)
+        ) {
+          this.permissionRecoveryStateError = 'permission recovery ledger lineage is ambiguous';
+          return;
+        }
+      }
+    }
+    try {
+      for (const snapshot of restored) {
+        if (snapshot.error === 'permission_recovery_interrupted') {
+          rmSync(join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${snapshot.id}.json`), { force: true });
+        }
+      }
+    } catch (err) {
+      this.permissionRecoveryStateError = `interrupted owner session could not be cleaned: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+    for (const snapshot of restored) {
+      this.jobs.set(snapshot.id, snapshot);
+    }
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch (err) {
+      this.permissionRecoveryStateError = `permission recovery ledger cannot be updated: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  private persistPermissionRecoveryJobs(): void {
+    const jobs = [...this.jobs.values()]
+      .filter(job => job.recoveryOfJobId && job.appId && job.workingDir && job.recoveryAttempt)
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(-128)
+      .map(job => ({
+        id: job.id,
+        status: job.status,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        appId: job.appId,
+        brand: job.brand,
+        workingDir: job.workingDir,
+        recoveryOfJobId: job.recoveryOfJobId,
+        recoveryAttempt: job.recoveryAttempt,
+        previousRecoveryJobId: job.previousRecoveryJobId,
+        error: job.error,
+        message: job.message,
+      }));
+    if (jobs.length === 0) return;
+    atomicWriteFileSync(this.permissionRecoveryStorePath, `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  private savePermissionRecoveryJobsBestEffort(): void {
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch (err: any) {
+      logger.warn(`[bot-onboarding] 无法更新权限恢复 lineage: ${err?.message ?? String(err)}`);
+    }
+  }
+
   /**
    * Best-effort auto-start of the just-persisted bot's daemon (no fleet restart).
    * Records the outcome on the job snapshot so the frontend shows "已自动上线"
@@ -351,7 +508,12 @@ export class BotOnboardingManager {
   startPermissionRecovery(input: {
     workingDir: string;
     predecessorJobId: string;
+    expectedAppId: string;
+    priorRecoveryJobId?: string;
   }): StartPermissionRecoveryResult {
+    if (this.permissionRecoveryStateError) {
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
     const candidates = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
       if (
         !bot
@@ -362,21 +524,31 @@ export class BotOnboardingManager {
         return [];
       }
       const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
-      if (!appId || !Array.isArray(bot.allowedUsers) || !hasOwnerEntry(bot.allowedUsers)) return [];
-      return [{ appId, brand: bot.brand === 'lark' ? 'lark' as const : 'feishu' as const, index }];
+      const appSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret : '';
+      if (!appId || !appSecret || !Array.isArray(bot.allowedUsers) || !hasOwnerEntry(bot.allowedUsers)) return [];
+      return [{ appId, appSecret, brand: bot.brand === 'lark' ? 'lark' as const : 'feishu' as const, index }];
     });
     if (candidates.length === 0) return { ok: false, error: 'permission_recovery_target_missing' };
     if (candidates.length !== 1) return { ok: false, error: 'permission_recovery_target_ambiguous' };
-    if (!input.predecessorJobId || !input.workingDir) {
+    if (!input.predecessorJobId || !input.workingDir || !input.expectedAppId || candidates[0].appId !== input.expectedAppId) {
       return { ok: false, error: 'permission_recovery_target_invalid' };
     }
 
-    const existing = [...this.jobs.values()].find(job =>
+    const lineage = [...this.jobs.values()].filter(job =>
       job.recoveryOfJobId === input.predecessorJobId
-      && job.workingDir === input.workingDir,
-    );
-    if (existing) {
-      return { ok: true, job: { id: existing.id, done: Promise.resolve() } };
+      && job.workingDir === input.workingDir
+      && job.appId === input.expectedAppId,
+    ).sort((a, b) => (a.recoveryAttempt ?? 0) - (b.recoveryAttempt ?? 0));
+    const latest = lineage.at(-1);
+    if (!input.priorRecoveryJobId) {
+      if (latest) return { ok: true, job: { id: latest.id, done: Promise.resolve() } };
+    } else {
+      if (!latest || latest.id !== input.priorRecoveryJobId) {
+        return { ok: false, error: 'permission_recovery_target_invalid' };
+      }
+      if (!['completed', 'failed'].includes(latest.status)) {
+        return { ok: true, job: { id: latest.id, done: Promise.resolve() } };
+      }
     }
 
     const target = candidates[0];
@@ -393,8 +565,17 @@ export class BotOnboardingManager {
       workingDir: input.workingDir,
       registrationMode: 'compat',
       recoveryOfJobId: input.predecessorJobId,
+      recoveryAttempt: (latest?.recoveryAttempt ?? 0) + 1,
+      ...(latest ? { previousRecoveryJobId: latest.id } : {}),
     });
-    const done = this.runPermissionRecovery(id, target.appId, target.brand, target.index).catch(err => {
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch {
+      this.jobs.delete(id);
+      this.permissionRecoveryStateError = 'permission recovery intent could not be persisted';
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const done = this.runPermissionRecovery(id, target.appId, target.appSecret, target.brand, target.index).catch(err => {
       this.patch(id, {
         status: 'failed',
         error: 'permission_recovery_failed',
@@ -424,6 +605,7 @@ export class BotOnboardingManager {
     const current = this.jobs.get(id);
     if (!current) return;
     this.jobs.set(id, { ...current, ...patch, updatedAt: this.now() });
+    if (current.recoveryOfJobId) this.savePermissionRecoveryJobsBestEffort();
   }
 
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
@@ -674,6 +856,14 @@ export class BotOnboardingManager {
     };
 
     try {
+      if (meta.registrationMode === 'compat') {
+        const sessionFilePath = join(
+          dirname(this.opts.botsJsonPath),
+          'onboarding-sessions',
+          `${id}.json`,
+        );
+        return await this.runOwnerPermissionAutomation(id, appId, brand, callbacks, sessionFilePath);
+      }
       const first = await this.automateOpenPlatform({
         appId,
         brand,
@@ -684,23 +874,7 @@ export class BotOnboardingManager {
         disableBytedcliFallback: meta.registrationMode === 'web',
         ...callbacks,
       });
-      if (
-        first.ok
-        || meta.registrationMode !== 'compat'
-        || first.reason !== 'owner_session_mismatch'
-      ) {
-        return first;
-      }
-
-      // The SDK scanner owns the new App, while the shared Open Platform cookie
-      // may belong to another operator. Re-authenticate the exact owner without
-      // creating another App or overwriting the global cookie jar.
-      const sessionFilePath = join(
-        dirname(this.opts.botsJsonPath),
-        'onboarding-sessions',
-        `${id}.json`,
-      );
-      return await this.runOwnerPermissionAutomation(id, appId, brand, callbacks, sessionFilePath);
+      return first;
     } catch (err) {
       // automation 不应抛 (内部已结构化返回), 兜底当作失败 → 手动步骤.
       return {
@@ -714,6 +888,7 @@ export class BotOnboardingManager {
   private async runPermissionRecovery(
     id: string,
     appId: string,
+    appSecret: string,
     brand: 'feishu' | 'lark',
     addedBotIndex: number,
   ): Promise<void> {
@@ -729,8 +904,24 @@ export class BotOnboardingManager {
       onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
     }, sessionFilePath);
     if (!auto.ok) {
-      this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
-      this.patch(id, { status: 'failed', error: 'permission_recovery_failed' });
+      this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'failed', 'permission_recovery_failed');
+      return;
+    }
+    let scopeReadback: CriticalScopeReadbackResult;
+    try {
+      scopeReadback = await this.verifyCriticalScopes(appId, appSecret, brand);
+    } catch (err) {
+      scopeReadback = { ok: false, error: 'network', message: err instanceof Error ? err.message : String(err) };
+    }
+    if (!scopeReadback.ok || scopeReadback.missingCritical.length > 0) {
+      const failed: OpenPlatformAutomationResult = {
+        ok: false,
+        reason: scopeReadback.ok ? 'scope_mapping_failed' : 'api_error',
+        message: scopeReadback.ok
+          ? `关键权限回读仍缺失: ${scopeReadback.missingCritical.map(scope => scope.name).join(', ')}`
+          : `关键权限回读失败: ${scopeReadback.message}`,
+      };
+      this.finalizePermissions(id, appId, brand, addedBotIndex, failed, 'failed', 'permission_recovery_failed');
       return;
     }
     this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
@@ -768,7 +959,8 @@ export class BotOnboardingManager {
     brand: 'feishu' | 'lark',
     addedBotIndex: number | undefined,
     auto: OpenPlatformAutomationResult,
-    status: 'completed' | 'needs_owner',
+    status: 'completed' | 'needs_owner' | 'failed',
+    error?: string,
   ): void {
     const permission: BotOnboardingPermission = auto.ok
       ? {
@@ -784,6 +976,7 @@ export class BotOnboardingManager {
       ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
       platformQrDataUrl: undefined,
       permission,
+      ...(error ? { error } : {}),
       ...(auto.ok ? {} : { remainingSteps: buildRemainingSteps(appId, brand) }),
     });
   }

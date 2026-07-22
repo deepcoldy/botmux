@@ -3203,7 +3203,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
     }
     if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/recover-permissions') {
-      let parsed: { workingDir?: unknown; predecessorJobId?: unknown };
+      let parsed: { workingDir?: unknown; predecessorJobId?: unknown; expectedAppId?: unknown; priorRecoveryJobId?: unknown };
       try {
         const chunks: Buffer[] = [];
         for await (const c of req) chunks.push(c as Buffer);
@@ -3214,13 +3214,16 @@ const server = createServer(async (req, res) => {
       }
       const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
       const predecessorJobId = typeof parsed.predecessorJobId === 'string' ? parsed.predecessorJobId.trim() : '';
-      if (!workingDir || !predecessorJobId || invalidWorkingDirs({ workingDir }).length > 0) {
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      const priorRecoveryJobId = typeof parsed.priorRecoveryJobId === 'string' ? parsed.priorRecoveryJobId.trim() : undefined;
+      if (!workingDir || !predecessorJobId || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
         return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
       }
-      const recovered = botOnboarding.startPermissionRecovery({ workingDir, predecessorJobId });
+      const recovered = botOnboarding.startPermissionRecovery({ workingDir, predecessorJobId, expectedAppId, priorRecoveryJobId });
       if (!recovered.ok) {
         const status = recovered.error === 'permission_recovery_target_missing' ? 404
           : recovered.error === 'permission_recovery_target_ambiguous' ? 409
+            : recovered.error === 'permission_recovery_state_unavailable' ? 503
             : 400;
         return jsonRes(res, status, recovered);
       }

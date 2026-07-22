@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
@@ -676,7 +676,7 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('forces a command-scoped owner QR when the shared session cannot access the compat app', async () => {
+  it('always forces a command-scoped owner QR for a compat-created App', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-owner-session-'));
     const gate = deferred<void>();
     const calls: Array<Parameters<NonNullable<ConstructorParameters<typeof BotOnboardingManager>[0]['automateOpenPlatform']>>[0]> = [];
@@ -692,13 +692,6 @@ describe('BotOnboardingManager', () => {
       validateCredentials: async () => ({ ok: true }),
       automateOpenPlatform: async (opts) => {
         calls.push(opts);
-        if (calls.length === 1) {
-          return {
-            ok: false,
-            reason: 'owner_session_mismatch',
-            message: 'the cached account cannot manage this exact app',
-          };
-        }
         await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"owner"}}' });
         await gate.promise;
         return { ...autoOk(), sessionSource: 'qr_login' };
@@ -709,15 +702,13 @@ describe('BotOnboardingManager', () => {
     const job = manager.start({ registrationMode: 'compat', cliId: 'traex', workingDir: dir });
     await new Promise(resolve => setTimeout(resolve, 0));
 
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toMatchObject({ disableQrLogin: false, disableBytedcliFallback: false });
-    expect(calls[0].forceQrLogin).toBeUndefined();
-    expect(calls[1]).toMatchObject({
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
       forceQrLogin: true,
       disableQrLogin: false,
       disableBytedcliFallback: true,
     });
-    expect(calls[1].sessionFilePath).toMatch(/onboarding-sessions\/[^/]+\.json$/);
+    expect(calls[0].sessionFilePath).toMatch(/onboarding-sessions\/[^/]+\.json$/);
     expect(manager.get(job.id)).toMatchObject({
       status: 'waiting_for_platform_scan',
       platformQrDataUrl: expect.stringContaining('data:image/svg+xml;base64,'),
@@ -748,6 +739,12 @@ describe('BotOnboardingManager', () => {
       botsJsonPath,
       createApp,
       registerApp,
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
       automateOpenPlatform: async (opts) => {
         calls.push(opts);
         await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"recover"}}' });
@@ -760,6 +757,7 @@ describe('BotOnboardingManager', () => {
     const started = manager.startPermissionRecovery({
       workingDir,
       predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
     });
     expect(started.ok).toBe(true);
     if (!started.ok) throw new Error(started.error);
@@ -800,8 +798,8 @@ describe('BotOnboardingManager', () => {
     const botsJsonPath = join(dir, 'bots.json');
     const workingDir = join(dir, 'space-agent');
     writeFileSync(botsJsonPath, JSON.stringify([
-      { larkAppId: 'cli_one', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
-      { larkAppId: 'cli_two', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
+      { larkAppId: 'cli_one', larkAppSecret: 'secret-one', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
+      { larkAppId: 'cli_two', larkAppSecret: 'secret-two', cliId: 'traex', defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'] },
     ]));
     const automateOpenPlatform = vi.fn();
     const manager = new BotOnboardingManager({ botsJsonPath, automateOpenPlatform });
@@ -809,8 +807,259 @@ describe('BotOnboardingManager', () => {
     expect(manager.startPermissionRecovery({
       workingDir,
       predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_one',
     })).toEqual({ ok: false, error: 'permission_recovery_target_ambiguous' });
     expect(automateOpenPlatform).not.toHaveBeenCalled();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('issues a fresh owner QR only after the caller advances the exact failed recovery lineage', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-retry-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const calls: string[] = [];
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async (opts) => {
+        calls.push(opts.appId);
+        await opts.onQrCode?.({ qrText: 'ascii', qrPayload: `{"qrlogin":{"token":"${calls.length}"}}` });
+        return { ok: false, reason: 'qr_expired', message: 'expired' };
+      },
+      verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+    });
+
+    const first = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.error);
+    await first.job.done;
+    expect(manager.get(first.job.id)?.status).toBe('failed');
+
+    const duplicate = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    });
+    expect(duplicate.ok && duplicate.job.id).toBe(first.job.id);
+    expect(calls).toHaveLength(1);
+
+    const retried = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+      priorRecoveryJobId: first.job.id,
+    });
+    expect(retried.ok).toBe(true);
+    if (!retried.ok) throw new Error(retried.error);
+    expect(retried.job.id).not.toBe(first.job.id);
+    await retried.job.done;
+    expect(calls).toHaveLength(2);
+    expect(manager.get(retried.job.id)).toMatchObject({
+      status: 'failed',
+      recoveryAttempt: 2,
+      previousRecoveryJobId: first.job.id,
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores an interrupted recovery as failed and continues with a fresh durable attempt', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const firstGate = deferred<void>();
+    const firstManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      automateOpenPlatform: async (opts) => {
+        await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"first"}}' });
+        await firstGate.promise;
+        return { ok: false, reason: 'qr_expired', message: 'expired' };
+      },
+      verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+    });
+    const first = firstManager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.error);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(firstManager.get(first.job.id)?.status).toBe('waiting_for_platform_scan');
+    const interruptedSessionDir = join(dir, 'onboarding-sessions');
+    const interruptedSessionPath = join(interruptedSessionDir, `${first.job.id}.json`);
+    mkdirSync(interruptedSessionDir, { recursive: true, mode: 0o700 });
+    writeFileSync(interruptedSessionPath, '{"cookie":"private"}', { mode: 0o600 });
+    const persistedRecovery = readFileSync(permissionRecoveryStorePath, 'utf8');
+    expect(persistedRecovery).not.toContain('existing-secret');
+    expect(persistedRecovery).not.toContain('qrlogin');
+    if (process.platform !== 'win32') {
+      expect(statSync(permissionRecoveryStorePath).mode & 0o777).toBe(0o600);
+    }
+
+    const secondManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+    });
+    expect(secondManager.get(first.job.id)).toMatchObject({
+      status: 'failed',
+      error: 'permission_recovery_interrupted',
+    });
+    expect(existsSync(interruptedSessionPath)).toBe(false);
+    const second = secondManager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+      priorRecoveryJobId: first.job.id,
+    });
+    expect(second.ok).toBe(true);
+    if (!second.ok) throw new Error(second.error);
+    await second.job.done;
+    expect(secondManager.get(second.job.id)).toMatchObject({ status: 'completed', recoveryAttempt: 2 });
+
+    firstGate.resolve();
+    await first.job.done;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails before QR automation when the recovery intent cannot be persisted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-store-fail-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const automateOpenPlatform = vi.fn();
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath: join(dir, 'missing-parent', 'ledger.json'),
+      automateOpenPlatform,
+    });
+    expect(manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    })).toEqual({ ok: false, error: 'permission_recovery_state_unavailable' });
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed on a malformed durable recovery ledger', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-store-corrupt-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    writeFileSync(permissionRecoveryStorePath, '{not-json', { mode: 0o600 });
+    const automateOpenPlatform = vi.fn();
+    const manager = new BotOnboardingManager({ botsJsonPath, permissionRecoveryStorePath, automateOpenPlatform });
+    expect(manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    })).toEqual({ ok: false, error: 'permission_recovery_state_unavailable' });
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed on an ambiguous durable recovery lineage', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-lineage-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner', larkAppSecret: 'existing-secret', cliId: 'traex',
+      defaultWorkingDir: workingDir, allowedUsers: ['owner@example.com'],
+    }]));
+    const base = {
+      status: 'failed', createdAt: 1, updatedAt: 1, appId: 'cli_existing_owner', brand: 'feishu',
+      workingDir, recoveryOfJobId: 'bot_original', error: 'permission_recovery_failed',
+    };
+    writeFileSync(permissionRecoveryStorePath, JSON.stringify({ version: 1, jobs: [
+      { ...base, id: 'botperm_first', recoveryAttempt: 1 },
+      { ...base, id: 'botperm_second', recoveryAttempt: 2, previousRecoveryJobId: 'botperm_wrong' },
+    ] }), { mode: 0o600 });
+    const automateOpenPlatform = vi.fn();
+    const manager = new BotOnboardingManager({ botsJsonPath, permissionRecoveryStorePath, automateOpenPlatform });
+    expect(manager.startPermissionRecovery({
+      workingDir, predecessorJobId: 'bot_original', expectedAppId: 'cli_existing_owner',
+    })).toEqual({ ok: false, error: 'permission_recovery_state_unavailable' });
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed on expected App drift and on a missing critical scope readback', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-permission-recovery-scope-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_existing_owner',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const automateOpenPlatform = vi.fn(async () => autoOk());
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform,
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [{ name: 'im:message', desc: '收发消息', critical: true }],
+        missingOptional: [],
+      }),
+    });
+    expect(manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_replaced',
+    })).toEqual({ ok: false, error: 'permission_recovery_target_invalid' });
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_existing_owner',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      error: 'permission_recovery_failed',
+      permission: { ok: false, reason: 'scope_mapping_failed' },
+    });
     rmSync(dir, { recursive: true, force: true });
   });
 

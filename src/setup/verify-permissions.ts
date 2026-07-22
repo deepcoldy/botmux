@@ -35,6 +35,10 @@ export interface RequiredScope {
   critical: boolean;
 }
 
+export type CriticalScopeReadbackResult =
+  | { ok: true; granted: string[]; missingCritical: RequiredScope[] }
+  | { ok: false; error: 'invalid_credentials' | 'need_self_manage' | 'network' | 'unknown'; message: string };
+
 /**
  * botmux 运行所需的 scope. 这里**只用于检测/提示**, 不用于自动申请——飞书
  * `scope.apply` 只能提交"已声明但未授权"的, 没法给应用 manifest 加新声明.
@@ -226,6 +230,75 @@ export async function validateCredentials(
   }
 
   return { ok: false, error: 'unknown', message: `code=${body?.code ?? '?'} msg=${body?.msg ?? ''}` };
+}
+
+/**
+ * Runtime-proven scope readback used by Dashboard VC validation and daemon
+ * startup checks: tenant token followed by Get application info. Unlike the
+ * legacy grant_status helper below, this endpoint returns the effective scope
+ * names directly in data.app.scopes.
+ */
+export async function readCriticalScopesFromApplicationInfo(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  opts: { budgetMs?: number } = {},
+): Promise<CriticalScopeReadbackResult> {
+  const openApi = larkHosts(brand).openApi;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), opts.budgetMs ?? 10_000);
+  try {
+    const tokenRes = await fetch(`${openApi}/open-apis/auth/v3/tenant_access_token/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      signal: ac.signal,
+    });
+    const tokenData = await tokenRes.json() as any;
+    if (tokenData?.code !== 0 || typeof tokenData?.tenant_access_token !== 'string') {
+      return {
+        ok: false,
+        error: 'invalid_credentials',
+        message: `tenant_access_token failed: code=${tokenData?.code ?? '?'} msg=${tokenData?.msg ?? ''}`,
+      };
+    }
+    const infoRes = await fetch(
+      `${openApi}/open-apis/application/v6/applications/${appId}?lang=zh_cn`,
+      { headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` }, signal: ac.signal },
+    );
+    const infoData = await infoRes.json() as any;
+    if (infoData?.code === 99991672) {
+      return { ok: false, error: 'need_self_manage', message: 'missing application:application:self_manage' };
+    }
+    if (infoData?.code !== 0) {
+      return {
+        ok: false,
+        error: 'unknown',
+        message: `application info failed: code=${infoData?.code ?? '?'} msg=${infoData?.msg ?? ''}`,
+      };
+    }
+    const scopesRaw: any[] = infoData.data?.app?.scopes
+      ?? infoData.data?.application?.scopes
+      ?? infoData.data?.scopes
+      ?? [];
+    const granted = [...new Set(
+      scopesRaw.map(scope => typeof scope === 'string' ? scope : scope?.scope).filter(Boolean) as string[],
+    )];
+    const grantedSet = new Set(granted);
+    return {
+      ok: true,
+      granted,
+      missingCritical: BOTMUX_REQUIRED_SCOPES.filter(scope => scope.critical && !grantedSet.has(scope.name)),
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: 'network',
+      message: ac.signal.aborted ? 'scope readback timeout' : `scope readback failed: ${err?.message ?? String(err)}`,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ─── Scope check (helper, not in main path) ──────────────────────────────
