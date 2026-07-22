@@ -210,6 +210,9 @@ describe('validateAdoptTarget (herdr branch)', () => {
     installHerdrFixture({
       sessions: [{ name: 'work', running: true }],
       agentsBySession: { work: [{ pane_id: '1-1', agent: 'claude' }] },
+      processByPane: {
+        'work:1-1': { pid: 1234, name: 'claude', argv: ['claude'], cwd: '/x' },
+      },
     });
     const target = {
       source: 'herdr' as const,
