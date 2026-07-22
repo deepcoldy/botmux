@@ -1,4 +1,7 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
 import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
@@ -42,6 +45,12 @@ const SERVER_BOOT_DEADLINE_MS = 5000;
 // agent still re-arms the watcher and we never accumulate an
 // indefinitely-orphaned subprocess on process teardown.
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
+// Herdr 0.7.5 replaced the free-form `agent start --cwd -- <argv...>` command
+// with a managed-agent facade that targets an existing shell pane and launches
+// one of Herdr's known coding-agent kinds. The command itself waits for the TUI
+// to become interactive, so let it use its 30s default plus a small IPC margin.
+const PANE_AGENT_START_TIMEOUT_MS = 30_000;
+const PANE_AGENT_EXEC_TIMEOUT_MS = PANE_AGENT_START_TIMEOUT_MS + 5_000;
 // Watch the full useful lifecycle, not just settled statuses. Herdr's
 // `wait agent-status --status X` is level-triggered: when the pane is already
 // in X it succeeds immediately. After one status wins we therefore exclude it
@@ -52,6 +61,22 @@ const WATCHED_STATUSES = ['working', 'done', 'blocked', 'idle'] as const;
 type WatchedStatus = typeof WATCHED_STATUSES[number];
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
+
+const PANE_AGENT_KIND_BY_EXECUTABLE: Readonly<Record<string, string>> = {
+  pi: 'pi',
+  claude: 'claude',
+  codex: 'codex',
+  gemini: 'gemini',
+  'cursor-agent': 'cursor',
+  agy: 'agy',
+  omp: 'omp',
+  opencode: 'opencode',
+  copilot: 'copilot',
+  kimi: 'kimi',
+  'kiro-cli': 'kiro',
+  grok: 'grok',
+  hermes: 'hermes',
+};
 
 export interface HerdrWebTerminalSize {
   cols: number;
@@ -82,6 +107,125 @@ function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: strin
 function jsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): any | undefined {
   const result = tryJsonCommand(args, opts);
   return result.ok ? result.value : undefined;
+}
+
+/** Required command variant used by multi-step Herdr protocols.
+ *
+ * `jsonCommand()` intentionally collapses command failures to undefined for
+ * best-effort probes. Spawn is different: swallowing stderr turned Herdr
+ * 0.7.5's actionable `unknown option: --cwd` into the generic
+ * "failed to start agent" message. Keep command arguments (which may contain
+ * credentials in --env values) out of the exception while preserving the
+ * upstream error code/message.
+ */
+function requiredJsonCommand(
+  operation: string,
+  args: string[],
+  opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv },
+): any {
+  let raw = '';
+  try {
+    raw = execFileSync('herdr', args, {
+      encoding: 'utf-8',
+      input: opts?.input,
+      stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
+      timeout: opts?.timeout ?? 5000,
+      maxBuffer: 16 * 1024 * 1024,
+      env: opts?.env,
+    }).trim();
+  } catch (err: any) {
+    const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : err?.stderr?.toString?.().trim();
+    const stdout = typeof err?.stdout === 'string' ? err.stdout.trim() : err?.stdout?.toString?.().trim();
+    const detail = stderr || stdout;
+    throw new Error(`${operation} failed${detail ? `: ${detail.slice(0, 1000)}` : ''}`);
+  }
+  if (!raw) throw new Error(`${operation} failed: empty response`);
+  let value: any;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error(`${operation} failed: invalid JSON response`);
+  }
+  if (value?.error) {
+    const code = typeof value.error.code === 'string' ? value.error.code : 'unknown_error';
+    const message = typeof value.error.message === 'string' ? value.error.message : 'unknown error';
+    throw new Error(`${operation} failed: ${code}: ${message}`);
+  }
+  return value;
+}
+
+function herdrUsesPaneAgentStart(): boolean {
+  try {
+    const out = execFileSync('herdr', ['--version'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    }).trim();
+    const match = /(?:^|\s)(\d+)\.(\d+)\.(\d+)(?:\D|$)/.exec(out);
+    if (!match) return false;
+    const [, majorRaw, minorRaw, patchRaw] = match;
+    const major = Number(majorRaw);
+    const minor = Number(minorRaw);
+    const patch = Number(patchRaw);
+    return major > 0 || minor > 7 || (minor === 7 && patch >= 5);
+  } catch {
+    return false;
+  }
+}
+
+function paneAgentKindForExecutable(bin: string): string | undefined {
+  return PANE_AGENT_KIND_BY_EXECUTABLE[basename(bin)];
+}
+
+function environmentForPaneAgent(bin: string, childEnv: Record<string, string> | undefined): Record<string, string> {
+  const env = { ...(childEnv ?? {}) };
+  if (!isAbsolute(bin)) return env;
+  const binDir = dirname(bin);
+  const currentPath = env.PATH ?? process.env.PATH ?? '';
+  const pathParts = currentPath.split(delimiter).filter(Boolean);
+  env.PATH = [binDir, ...pathParts.filter(part => part !== binDir)].join(delimiter);
+  return env;
+}
+
+function shellSingleQuote(value: string): string {
+  if (value.includes('\0')) throw new Error('Herdr launch argument contains NUL');
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+/** Build a short-lived canonical launcher for Herdr's managed-agent facade.
+ *
+ * Herdr 0.7.5 rejects control characters in `agent start` arguments, while
+ * Botmux intentionally passes multiline system/initial prompts to several
+ * CLIs. Put the exact executable + argv in a mode-0700 script and give Herdr
+ * no agent arguments. The shell immediately execs the real CLI, so Herdr still
+ * observes and validates the actual supported coding-agent process. The script
+ * is removed as soon as Herdr reports the TUI interactive.
+ */
+function createPaneAgentLauncher(
+  canonicalExecutable: string,
+  bin: string,
+  args: string[],
+  originalPath: string,
+): { dir: string; path: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-herdr-launch-'));
+  const path = join(dir, canonicalExecutable);
+  const command = [bin, ...args].map(shellSingleQuote).join(' ');
+  writeFileSync(path, [
+    '#!/bin/sh',
+    // Minimise the lifetime of the mode-0700 file containing the exact argv.
+    // The backend's finally block is the fallback if Herdr never executes it.
+    '/bin/rm -f -- "$0"',
+    '/bin/rmdir -- "${0%/*}" 2>/dev/null || true',
+    `PATH=${shellSingleQuote(originalPath)}`,
+    'export PATH',
+    `exec ${command}`,
+    '',
+  ].join('\n'), { mode: 0o700 });
+  return { dir, path };
+}
+
+function envCommandArgs(env: Record<string, string>): string[] {
+  return Object.entries(env).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
 }
 
 function runHerdr(args: string[], opts?: { timeout?: number; input?: string }): boolean {
@@ -313,16 +457,22 @@ export class HerdrBackend implements SessionBackend {
       const existing = this.isReattach ? this.getAgent() : undefined;
       if (existing) {
         this.paneId = existing.pane_id;
+      } else if (herdrUsesPaneAgentStart()) {
+        this.paneId = this.startPaneAgent(bin, args, opts);
       } else {
         const envArgs = this.opts.ownsSession === false
-          ? Object.entries(this.childEnv ?? {}).flatMap(([key, value]) => ['--env', `${key}=${value}`])
+          ? envCommandArgs(this.childEnv ?? {})
           : [];
-        const started = jsonCommand(herdrSessionArgs(this.sessionName, [
+        const started = requiredJsonCommand(
+          `herdr agent start ${this.agentName} in ${this.sessionName}`,
+          herdrSessionArgs(this.sessionName, [
           'agent', 'start', this.agentName,
           '--cwd', opts.cwd,
           ...envArgs,
           '--', bin, ...args,
-        ]), { timeout: 10_000, env: this.childEnv });
+          ]),
+          { timeout: 10_000, env: this.childEnv },
+        );
         const agent = extractAgent(started);
         if (!agent) throw new Error(`failed to start herdr agent ${this.agentName} in ${this.sessionName}`);
         this.paneId = agent.pane_id;
@@ -499,6 +649,78 @@ export class HerdrBackend implements SessionBackend {
       sleepSync(SERVER_BOOT_POLL_MS);
     }
     throw new Error(`failed to start herdr session ${this.sessionName}`);
+  }
+
+  /** Herdr >=0.7.5 managed-agent launch protocol.
+   *
+   * The new facade no longer accepts an arbitrary executable or cwd directly:
+   * create a shell workspace with the requested cwd/env, then ask Herdr to
+   * launch a supported coding-agent kind in that exact root pane. Prepending
+   * an absolute binary's directory to PATH preserves cliPathOverride installs
+   * whose basename is still the canonical Herdr executable (for example a Pi
+   * installed under ~/.local/bin/node/bin/pi).
+   */
+  private startPaneAgent(bin: string, args: string[], opts: SpawnOpts): string {
+    const kind = paneAgentKindForExecutable(bin);
+    if (!kind) {
+      throw new Error(
+        `Herdr >=0.7.5 cannot launch executable "${basename(bin)}" as a managed coding agent; ` +
+        'use a Herdr-supported CLI executable or select the tmux backend',
+      );
+    }
+
+    const workspaceEnv = environmentForPaneAgent(bin, this.childEnv);
+    const originalPath = workspaceEnv.PATH ?? process.env.PATH ?? '';
+    const launcher = createPaneAgentLauncher(basename(bin), bin, args, originalPath);
+    workspaceEnv.PATH = [launcher.dir, originalPath].filter(Boolean).join(delimiter);
+    let workspaceId: string | undefined;
+    try {
+      const created = requiredJsonCommand(
+        `herdr workspace create for ${this.agentName} in ${this.sessionName}`,
+        herdrSessionArgs(this.sessionName, [
+          'workspace', 'create',
+          '--cwd', opts.cwd,
+          '--label', this.agentName,
+          '--no-focus',
+          ...envCommandArgs(workspaceEnv),
+        ]),
+        { timeout: 10_000, env: this.childEnv },
+      );
+      const paneId = created?.result?.root_pane?.pane_id;
+      workspaceId = created?.result?.workspace?.workspace_id;
+      if (typeof paneId !== 'string' || !paneId) {
+        throw new Error(`herdr workspace create for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
+      }
+
+      const started = requiredJsonCommand(
+        `herdr agent start ${this.agentName} in ${this.sessionName}`,
+        herdrSessionArgs(this.sessionName, [
+          'agent', 'start', this.agentName,
+          '--kind', kind,
+          '--pane', paneId,
+          '--timeout', String(PANE_AGENT_START_TIMEOUT_MS),
+        ]),
+        { timeout: PANE_AGENT_EXEC_TIMEOUT_MS, env: this.childEnv },
+      );
+      const agent = extractAgent(started);
+      if (!agent?.pane_id) {
+        throw new Error(`herdr agent start ${this.agentName} in ${this.sessionName} failed: missing agent pane`);
+      }
+      return agent.pane_id;
+    } catch (err) {
+      // Workspace creation succeeded but the CLI did not. Remove only the
+      // workspace created by this attempt so a shared user session is never
+      // left with an empty Botmux tab after a failed spawn.
+      if (typeof workspaceId === 'string' && workspaceId) {
+        runHerdr(
+          herdrSessionArgs(this.sessionName, ['workspace', 'close', workspaceId]),
+          { timeout: 5000 },
+        );
+      }
+      throw err;
+    } finally {
+      rmSync(launcher.dir, { recursive: true, force: true });
+    }
   }
 
   private startWebAttach(size: HerdrWebTerminalSize): boolean {

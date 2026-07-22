@@ -16,6 +16,7 @@
  * Run:  pnpm vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('node:child_process', () => ({
@@ -108,6 +109,12 @@ const EMPTY_SESSIONS_REPLY = JSON.stringify({ sessions: [] });
 const AGENT_GET_REPLY = (paneId: string) => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: paneId } } });
 const AGENT_LIST_REPLY = (paneId: string) => JSON.stringify({ result: { agents: [{ name: 'botmux', pane_id: paneId }] } });
 const PANE_READ_REPLY = (text: string) => JSON.stringify({ result: { read: { text } } });
+const WORKSPACE_CREATED_REPLY = (workspaceId: string, paneId: string) => JSON.stringify({
+  result: {
+    workspace: { workspace_id: workspaceId },
+    root_pane: { pane_id: paneId },
+  },
+});
 
 beforeEach(() => {
   mockedExecFileSync.mockReset();
@@ -281,6 +288,84 @@ describe('HerdrBackend connection surface', () => {
 // ─── spawn(): fresh / existing / external ──────────────────────────────────
 
 describe('HerdrBackend.spawn', () => {
+  it('Herdr 0.7.5: creates a workspace and starts the real Pi coding agent in its root pane', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', 'line one\nline two'], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-1' },
+    });
+
+    const workspaceCall = herdrCall('workspace', 'create', '--cwd', '/work', '--label', 'botmux', '--no-focus');
+    expect(workspaceCall).toBeDefined();
+    const pathArg = workspaceCall!.find(arg => arg.startsWith('PATH='));
+    expect(pathArg).toMatch(/^PATH=.*botmux-herdr-launch-/);
+    expect(pathArg).toContain('/Users/test/.local/bin/node/bin:/usr/bin:/bin');
+    const launcherDir = pathArg!.slice('PATH='.length).split(':')[0]!;
+    expect(workspaceCall).toContain('BOTMUX_SESSION_ID=sid-1');
+
+    const startCall = herdrCall(
+      'agent', 'start', 'botmux',
+      '--kind', 'pi',
+      '--pane', 'w_pi-1',
+      '--timeout', '30000',
+    );
+    expect(startCall).toBeDefined();
+    expect(startCall).not.toContain('--cwd');
+    // Exact CLI args (including the multiline initial prompt) live in the
+    // short-lived launcher script. Herdr receives no control-character args.
+    expect(startCall).not.toContain('--session-id');
+    expect(startCall).not.toContain('line one\nline two');
+    expect(existsSync(launcherDir)).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+    ]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('/usr/local/bin/custom-pi-wrapper', [], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    })).toThrow(/cannot launch executable "custom-pi-wrapper".*tmux backend/);
+    expect(herdrCall('workspace', 'create')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: closes the new workspace and surfaces upstream diagnostics when agent startup fails', () => {
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd !== 'herdr') return '' as any;
+      const argv = args as string[];
+      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_failed', 'w_failed-1') as any;
+      if (argv.includes('agent') && argv.includes('start')) {
+        const err: any = new Error('exit 1');
+        err.stdout = JSON.stringify({ error: { code: 'agent_start_failed', message: 'pi exited before interactive' } });
+        err.stderr = '';
+        throw err;
+      }
+      return '' as any;
+    }) as any);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], {
+      cwd: '/work', cols: 120, rows: 30, env: {},
+    })).toThrow(/agent_start_failed.*pi exited before interactive/);
+    expect(herdrCall('workspace', 'close', 'w_failed')).toBeDefined();
+    be.kill();
+  });
+
   it('fresh session: calls `agent start botmux --cwd <cwd> -- bin args...` and records pane_id', () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
