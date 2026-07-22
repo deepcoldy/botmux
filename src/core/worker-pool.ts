@@ -2968,6 +2968,9 @@ function setupWorkerHandlers(
             publishAttentionPatch(ds);
           } catch (err: any) {
             logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+            // Card send failed — clear markers so a retry can post a fresh card.
+            ds.stuckWarningCardId = undefined;
+            ds.stuckWarningTurnId = undefined;
           }
         } else {
           // Unknown stall — warn but do NOT leak the terminal snapshot and do

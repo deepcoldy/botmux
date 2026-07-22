@@ -1824,8 +1824,13 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         allKeys.push(...keys);
 
         if (allKeys.length > 0) {
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal } as DaemonToWorker);
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
+          // Only the stuck-warning card's Enter (confirm) action re-arms the
+          // detector — t/Esc and all ScreenAnalyzer cards never set this flag.
+          const isStuckWarningEnter = optionType === 'confirm'
+            && !!ds.stuckWarningCardId
+            && cardMessageId === ds.stuckWarningCardId;
+          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal, rearmStuckDetector: isStuckWarningEnter } as DaemonToWorker);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} rearmStuck=${isStuckWarningEnter} — "${selectedText}"`);
         }
 
         if (isFinal) {
@@ -1846,9 +1851,12 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           ds.tuiPromptOptions = undefined;
           ds.tuiPromptMultiSelect = undefined;
           ds.tuiToggledIndices = undefined;
-          // If this click resolved a stuck-warning card, clear its marker too
+          // If this click resolved a stuck-warning card, clear both the card
+          // marker AND the turn dedup marker so the next review layer can
+          // re-trigger a fresh warning.
           if (ds.stuckWarningCardId && cardMessageId === ds.stuckWarningCardId) {
             ds.stuckWarningCardId = undefined;
+            ds.stuckWarningTurnId = undefined;
           }
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }

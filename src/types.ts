@@ -570,7 +570,7 @@ export type DaemonToWorker =
   // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
-  | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean; rearmStuckDetector?: boolean }
   // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
   // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
   // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
