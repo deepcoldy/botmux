@@ -218,6 +218,52 @@ describe('v3 run envelope — strict schema + builders', () => {
   });
 });
 describe('v3 run envelope — exact-byte hashing + strict load', () => {
+  it('pins the exact goal-run request beside a manual CLI authorization', () => {
+    const { base, runDir, runId } = freshRun();
+    try {
+      writeJson(join(runDir, 'dag.json'), dag(runId));
+      writeJson(join(runDir, 'bots.snapshot.json'), {
+        '': { larkAppId: 'cli_test', cliId: 'codex', workingDir: '/work' },
+      });
+      writeJson(join(runDir, 'goal.request.json'), {
+        schemaVersion: 'botmux.goal-run-request/v1',
+        goal: 'ship it',
+        botSelector: null,
+        workingDir: null,
+        timeoutMs: null,
+      }, 0);
+      const envelope = makeManualCliRunEnvelope({
+        runId,
+        createdAt: CREATED_AT,
+        authorizedAt: AUTHORIZED_AT,
+        artifacts: {
+          dag: artifactRef(runDir, 'dag.json'),
+          botSnapshots: artifactRef(runDir, 'bots.snapshot.json'),
+          goalRequest: artifactRef(runDir, 'goal.request.json'),
+        },
+      });
+      expect(envelope.authorization).toMatchObject({
+        kind: 'local_cli',
+        goalRequestSha256: envelope.artifacts.goalRequest!.sha256,
+      });
+      expect(() => validateRunEnvelope({
+        ...envelope,
+        authorization: { ...envelope.authorization, goalRequestSha256: sha256Bytes('different') },
+      })).toThrow(/must match artifacts\.goalRequest\.sha256/);
+
+      publishRunEnvelopeOnce(runDir, envelope);
+      const loaded = loadAuthorizedV3Run(runDir, { allowedSources: ['manual_cli'] });
+      expect(loaded.goalRequest).toMatchObject({ goal: 'ship it' });
+      writeFileSync(join(runDir, 'goal.request.json'), '{"goal":"changed"}\n');
+      expect(() => loadAuthorizedV3Run(runDir)).toThrowError(expect.objectContaining({
+        code: 'artifact_digest_mismatch',
+        artifact: 'goal.request.json',
+      }));
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   it('hashes exact bytes, then validates and returns the very bytes it parsed', () => {
     const { base, runDir, runId } = freshRun();
     try {
