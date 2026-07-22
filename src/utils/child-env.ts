@@ -22,6 +22,49 @@ export const REDACTED_CHILD_ENV_KEYS = [
 ] as const;
 
 /**
+ * Session-level CLI data-root pointers: claude-family → CLAUDE_CONFIG_DIR,
+ * codex → CODEX_HOME. Botmux computes these PER SESSION (read isolation pins
+ * `<BOT_HOME>/claude|codex`; Seed/Relay pin their fork dirs via adapter
+ * spawnEnv), so a value INHERITED from the surrounding environment is always
+ * stale. The poisoning path: pm2 persists the env of whichever process ran
+ * `botmux start/restart` into every managed app (and into dump.pm2 for
+ * resurrect), so one self-upgrade issued from a bot session bakes that
+ * session's injected CLAUDE_CONFIG_DIR into ALL daemons and workers — and
+ * every non-isolated sibling bot then reads/writes that bot's home. Scrubbed
+ * at each process boundary botmux owns: the pm2 invocation env (cli.ts
+ * pm2Env), daemon boot (index-daemon.ts) and worker boot (worker.ts) — the
+ * boot scrubs cover envs pm2 resurrects from a stale dump. Scrubbing
+ * process.env (not just the spawned child's env) keeps worker-side resolvers
+ * that consult it dynamically — codex submit confirmation / resume fallback /
+ * transcript bridge (services/codex-paths.ts), slash-command discovery
+ * (core/command-discovery.ts) — consistent with the CLI child.
+ *
+ * Do NOT pin a "default" instead of deleting: CLAUDE_CONFIG_DIR=~/.claude is
+ * not a no-op — once the var is set, Claude Code reads its state file from
+ * $CLAUDE_CONFIG_DIR/.claude.json instead of ~/.claude.json, which lacks
+ * hasCompletedOnboarding → every non-isolated session reruns first-run
+ * onboarding (theme picker + login).
+ *
+ * GROK_HOME is deliberately ABSENT: botmux never injects it per session (grok
+ * has no per-bot isolation, and per-bot env rejects the key — see
+ * core/per-bot-env.ts), so it can never carry a sibling bot's home. Its
+ * contract is the opposite of per-session: process-level only, where worker
+ * and CLI child must resolve the SAME value (the worker installs ready-gate
+ * hooks and drains transcripts under it — see services/grok-paths.ts), so
+ * scrubbing it on any single side would split-brain that documented
+ * configuration channel.
+ */
+export const SESSION_CLI_HOME_ENV_KEYS = ['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const;
+
+/** Delete inherited session-level CLI data-root pointers from `env` in place
+ *  (see SESSION_CLI_HOME_ENV_KEYS). Values a session actually needs are
+ *  computed and re-set AFTER this scrub (worker isolation pins / adapter
+ *  spawnEnv). */
+export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of SESSION_CLI_HOME_ENV_KEYS) delete env[key];
+}
+
+/**
  * Botmux-managed, session/bot-scoped env keys that reach the CLI pane via the
  * `/usr/bin/env KEY=VAL` wrapper injection (buildBotmuxEnvAssignments), NOT via
  * the tmux client env. They MUST be stripped from the env handed to the `tmux`

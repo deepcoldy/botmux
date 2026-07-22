@@ -113,8 +113,16 @@ export interface CliAdapter {
   }): string[];
 
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
-   *  The worker skips queuing the prompt for stdin write. */
+   *  The worker skips queuing the prompt for stdin write unless another
+   *  defer condition routes it through the post-start input queue. */
   readonly passesInitialPromptViaArgs?: boolean;
+
+  /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
+   *  UTF-8 byte length is GREATER than this adapter-specific limit are not
+   *  baked into launch args; the worker defers them to the normal post-start
+   *  input queue. This guards backend launchers (notably tmux) whose command
+   *  string limit can be much lower than OS ARG_MAX. */
+  readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
    *  silently drops its initial-prompt launch flag on a RESUME spawn (e.g.

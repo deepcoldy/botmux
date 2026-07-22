@@ -27,6 +27,10 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux reports "command too long" around ~12KB total launch argv on some
+    // deployments, well below OS ARG_MAX. Keep short Pi prompts on argv (legacy
+    // behavior) but route long first messages/cards through writeInput instead.
+    maxInitialPromptArgBytes: 4096,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.pasteText && pty.sendSpecialKeys) {

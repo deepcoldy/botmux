@@ -4,6 +4,7 @@ import {
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
   shouldDeferArgsBakedDurablePrompt,
+  shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
   terminalReleasesDurableTurn,
 } from '../src/utils/pending-input-queue.js';
@@ -57,6 +58,37 @@ describe('mergeQueuedCliInput', () => {
       content: 'human B',
       turnId: 'im-2',
       vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
+    })).toBe(true);
+  });
+});
+
+describe('initial prompt args deferral', () => {
+  it('does not defer queue-input CLIs even when the prompt exceeds the limit', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: false,
+      prompt: 'x'.repeat(10_000),
+      maxInitialPromptArgBytes: 4096,
+    })).toBe(false);
+  });
+
+  it('keeps args-baked prompts at or below the adapter byte limit on argv', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: 'abcd',
+      maxInitialPromptArgBytes: 4,
+    })).toBe(false);
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: '你', // 3 UTF-8 bytes, not 1 JS code unit.
+      maxInitialPromptArgBytes: 3,
+    })).toBe(false);
+  });
+
+  it('defers args-baked prompts whose UTF-8 byte length exceeds the adapter limit', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: '你', // 3 UTF-8 bytes.
+      maxInitialPromptArgBytes: 2,
     })).toBe(true);
   });
 });

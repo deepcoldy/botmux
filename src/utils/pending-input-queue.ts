@@ -56,6 +56,23 @@ export function shouldDeferArgsBakedDurablePrompt(opts: {
     && opts.dispatchAttempt !== undefined;
 }
 
+/** Some backends (tmux in particular) reject long launch command strings before
+ *  the spawned CLI ever sees argv. For adapters that normally bake the first
+ *  prompt into args, route over-limit prompts through the regular input queue
+ *  instead. The comparison is strictly `>` so a prompt exactly at the adapter's
+ *  declared budget keeps legacy args-baked behavior. */
+export function shouldDeferInitialPromptForArgLimit(opts: {
+  passesInitialPromptViaArgs: boolean;
+  prompt?: string;
+  maxInitialPromptArgBytes?: number;
+}): boolean {
+  if (!opts.passesInitialPromptViaArgs) return false;
+  if (!opts.prompt) return false;
+  const limit = opts.maxInitialPromptArgBytes;
+  if (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0) return false;
+  return Buffer.byteLength(opts.prompt, 'utf8') > limit;
+}
+
 /** Once either side of a queue boundary is durable, stop this batch and wait
  *  for the next reliable idle edge before writing the following turn. */
 export function shouldStopPendingBatch(

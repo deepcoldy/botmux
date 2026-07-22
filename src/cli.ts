@@ -75,6 +75,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
+import { scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
@@ -219,7 +220,18 @@ function pm2Bin(): string {
 
 /** Env for pm2 invocations with an isolated PM2_HOME. */
 function pm2Env(home: string = PM2_HOME): NodeJS.ProcessEnv {
-  return { ...process.env, PM2_HOME: home };
+  const env: NodeJS.ProcessEnv = { ...process.env, PM2_HOME: home };
+  // pm2 persists the caller's env into every managed app (and into dump.pm2
+  // for resurrect), so a `botmux start/restart` invoked from ANY process that
+  // carries a session-level CLI home pointer — most commonly a bot's own
+  // session during self-upgrade, whose env holds its injected
+  // CLAUDE_CONFIG_DIR — would poison ALL workers, making every non-isolated
+  // bot read/write a sibling bot's home. Strip at this boundary so the daemon
+  // stays session-agnostic; daemon/worker boot scrub the same keys against
+  // stale dumps (see SESSION_CLI_HOME_ENV_KEYS for the full story, including
+  // why GROK_HOME is exempt and why deleting beats pinning a default).
+  scrubSessionCliHomeEnv(env);
+  return env;
 }
 
 function listPm2GodDaemonPids(home: string = PM2_HOME): number[] {

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
+import { scrubSessionCliHomeEnv } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -24,6 +25,13 @@ dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'BOTMUX_CHAT_TYPE', 'BOTMUX_ROOT_MESSAGE_ID']) {
   delete process.env[k];
 }
+// Same vector, session-level CLI data-root pointers (CLAUDE_CONFIG_DIR /
+// CODEX_HOME): a value baked into pm2's saved app env — or resurrected from a
+// stale dump.pm2, which bypasses the pm2Env() strip in cli.ts — would make
+// every worker (forked with this process's env) and every non-isolated CLI
+// child read/write the leaking bot's home. Per-session values are recomputed
+// downstream (worker isolation pins / adapter spawnEnv).
+scrubSessionCliHomeEnv(process.env);
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { redactChildEnv } from '../src/utils/child-env.js';
+import { readFileSync } from 'node:fs';
+import { redactChildEnv, scrubSessionCliHomeEnv, SESSION_CLI_HOME_ENV_KEYS } from '../src/utils/child-env.js';
 
 describe('redactChildEnv()', () => {
   it('truly removes leaked keys — absent, not present-with-"undefined"', () => {
@@ -67,5 +68,58 @@ describe('redactChildEnv()', () => {
       if (prev === undefined) delete process.env.LARK_APP_ID;
       else process.env.LARK_APP_ID = prev;
     }
+  });
+});
+
+describe('scrubSessionCliHomeEnv()', () => {
+  it('deletes inherited session-level CLI home pointers in place, keys absent not undefined', () => {
+    const env: NodeJS.ProcessEnv = {
+      CLAUDE_CONFIG_DIR: '/root/.botmux/bots/sibling-bot/claude',
+      CODEX_HOME: '/root/.botmux/bots/sibling-bot/codex',
+      KEEP: 'v',
+      PATH: '/usr/bin',
+    };
+    scrubSessionCliHomeEnv(env);
+    // Same node-pty trap as redactChildEnv: the key must be ABSENT, or the
+    // child sees the literal string "undefined" and still relocates its home.
+    expect('CLAUDE_CONFIG_DIR' in env).toBe(false);
+    expect('CODEX_HOME' in env).toBe(false);
+    expect(env.KEEP).toBe('v');
+    expect(env.PATH).toBe('/usr/bin');
+  });
+
+  it('leaves GROK_HOME alone — process-level by contract, never session-injected', () => {
+    // grok-paths.ts: the worker installs ready-gate hooks and drains
+    // transcripts under the process-level GROK_HOME; botmux never injects a
+    // per-session value, so scrubbing it would only split-brain the worker
+    // from the CLI child. Guards against GROK_HOME creeping into the list.
+    const env: NodeJS.ProcessEnv = { GROK_HOME: '/custom/grok' };
+    scrubSessionCliHomeEnv(env);
+    expect(env.GROK_HOME).toBe('/custom/grok');
+    expect(SESSION_CLI_HOME_ENV_KEYS).not.toContain('GROK_HOME');
+  });
+});
+
+describe('session CLI home scrub call sites', () => {
+  // The scrub only works if every process boundary actually invokes it. These
+  // source-level pins keep a refactor from silently dropping a boundary:
+  // pm2Env (bakes the caller env into pm2 apps + dump.pm2), daemon boot
+  // (resurrected from a stale dump, workers fork from it), worker boot
+  // (worker-side dynamic resolvers + childEnv seeding).
+  const read = (rel: string) =>
+    readFileSync(new URL(`../src/${rel}`, import.meta.url), 'utf-8');
+
+  it('cli.ts pm2Env scrubs the env handed to pm2', () => {
+    const src = read('cli.ts');
+    const fn = src.slice(src.indexOf('function pm2Env('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubSessionCliHomeEnv(');
+  });
+
+  it('index-daemon.ts scrubs process.env at boot', () => {
+    expect(read('index-daemon.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
+  });
+
+  it('worker.ts scrubs process.env at boot', () => {
+    expect(read('worker.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
   });
 });

@@ -248,7 +248,7 @@ describe('shouldQueueInitialPrompt — the worker queuing wiring (exactly-once, 
   it('args-baked prompt (not deferred) → not queued even in paste', () => {
     expect(shouldQueueInitialPrompt({ ...base, passesInitialPromptViaArgs: true })).toBe(false);
   });
-  it('args-baked prompt deferred for startupCommands → queued', () => {
+  it('args-baked prompt deferred (startup commands / arg limit / resume ignore) → queued', () => {
     expect(shouldQueueInitialPrompt({ ...base, passesInitialPromptViaArgs: true, deferInitialPrompt: true })).toBe(true);
   });
 });

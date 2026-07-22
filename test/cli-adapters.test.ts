@@ -773,6 +773,7 @@ describe('pi buildArgs', () => {
     expect(args).not.toContain('--tools');
     expect(args.at(-1)).toBe('hello pi');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
     expect(adapter.altScreen).toBe(true);
   });
 });
