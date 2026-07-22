@@ -6,6 +6,9 @@
  *
  * Three independent toggles:
  *   • disableStreamingCard      — suppress the live streaming session card
+ *   • persistentStreamCard      — post the streaming card once per session and
+ *                                  PATCH the same card on every subsequent turn
+ *                                  (no per-turn post + recall)
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
  *                                  message (only meaningful while the card is off)
@@ -24,6 +27,9 @@ import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
   disableStreamingCard: boolean;
+  /** Post the streaming card once per session; PATCH the same card on every
+   *  subsequent turn instead of post-fresh + recall-previous. Default false. */
+  persistentStreamCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
    * legacy full-prompt UserMessage; true moves Botmux metadata to hidden
@@ -55,6 +61,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
     const c = getBot(larkAppId).config;
     return {
       disableStreamingCard: c.disableStreamingCard === true,
+      persistentStreamCard: c.persistentStreamCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
@@ -71,6 +78,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   } catch {
     return {
       disableStreamingCard: false,
+      persistentStreamCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
       writableTerminalLinkInCard: false,
@@ -140,6 +148,7 @@ export async function updateBotCardPrefs(
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
+    apply(entry, 'persistentStreamCard', patch.persistentStreamCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
@@ -155,6 +164,7 @@ export async function updateBotCardPrefs(
       write: true,
       result: {
         disableStreamingCard: entry.disableStreamingCard === true,
+        persistentStreamCard: entry.persistentStreamCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
@@ -178,6 +188,9 @@ export async function updateBotCardPrefs(
   // Sync in-memory config so live card builders / routing react without a restart.
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
+  }
+  if (patch.persistentStreamCard !== undefined) {
+    bot.config.persistentStreamCard = patch.persistentStreamCard || undefined;
   }
   if (patch.silentTurnReactions !== undefined) {
     bot.config.silentTurnReactions = patch.silentTurnReactions || undefined;
@@ -219,6 +232,7 @@ export async function updateBotCardPrefs(
   }
   logger.info(
     `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `persistentStreamCard=${r.result.persistentStreamCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +

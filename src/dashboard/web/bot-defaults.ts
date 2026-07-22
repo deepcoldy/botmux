@@ -57,6 +57,7 @@ export type BotDefaultsRow = {
   readIsolationSupported?: boolean;
   backendType?: string | null;
   disableStreamingCard?: boolean;
+  persistentStreamCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   writableTerminalLinkInCard?: boolean;
