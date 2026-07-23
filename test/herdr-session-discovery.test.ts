@@ -53,7 +53,7 @@ interface HerdrFixture {
   sessions: Array<{ name: string; running: boolean }>;
   agentsBySession: Record<string, Array<{ name?: string; agent?: string; pane_id?: string; terminal_id?: string; cwd?: string }>>;
   panesBySession?: Record<string, Array<{ name?: string; pane_id?: string; terminal_id?: string; cwd?: string; foreground_cwd?: string }>>;
-  processByPane?: Record<string, { pid: number; name: string; argv: string[]; cwd: string }>;
+  processByPane?: Record<string, { pid: number; name: string; argv?: string[]; argv0?: string; cwd: string }>;
   /** Throw on certain probes to simulate `unknown` validation result. */
   failOn?: (args: string[]) => boolean;
 }
@@ -119,6 +119,9 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'botmux', agent: 'claude', pane_id: '5-5', cwd: '/projects/own' },
         ],
       },
+      processByPane: {
+        'botmux:w1:p1': { pid: 75275, name: 'node', argv0: 'pi', cwd: '/projects/pi' },
+      },
     });
 
     const sessions = discoverAdoptableSessions();
@@ -156,6 +159,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrSessionName: 'botmux',
       herdrPaneId: 'w1:p1',
       herdrTerminalId: 't-pi',
+      cliPid: 75275,
       cwd: '/projects/pi',
     });
   });

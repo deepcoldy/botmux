@@ -663,7 +663,23 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const terminalId = typeof agent?.terminal_id === 'string' ? agent.terminal_id : undefined;
       const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
-      const claudeMeta = cliId === 'claude-code' ? findUniqueClaudeSessionByCwd(cwd) : undefined;
+      // `agent list` identifies the CLI kind but does not expose its pid. Probe
+      // the pane as well: structured adopt bridges (Pi/Codex/TraeX/...) need the
+      // real pid to bind the exact transcript. Without it the terminal can show
+      // `working`, yet no final reply is emitted because the worker has no
+      // session id or pid from which to resolve the JSONL.
+      const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
+      const process = herdrPaneCliProcess(rawInfo, cliId);
+      const cliPid = process?.pid;
+      let sessionId: string | undefined;
+      if (cliPid) {
+        if (cliId === 'traex') sessionId = findTraexRolloutByPid(cliPid)?.cliSessionId;
+        else if (cliId === 'codex') sessionId = findCodexRolloutByPid(cliPid)?.cliSessionId;
+        else if (cliId === 'coco') sessionId = findCocoSessionByPid(cliPid)?.sessionId;
+      }
+      const claudeMeta = cliId === 'claude-code'
+        ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
+        : undefined;
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -672,10 +688,11 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
         herdrPaneId: paneId,
         herdrAgentName: agentName,
         herdrTerminalId: terminalId,
+        cliPid,
         cliId,
-        sessionId: claudeMeta?.sessionId,
+        sessionId: sessionId ?? claudeMeta?.sessionId,
         cwd,
-        startedAt: claudeMeta?.startedAt,
+        startedAt: claudeMeta?.startedAt ?? (cliPid ? readProcessStartTime(cliPid) : undefined),
         paneCols: 200,
         paneRows: 50,
       });
