@@ -193,10 +193,14 @@ describe('buildRestartLauncher', () => {
 });
 
 describe('detachedRestartEnv', () => {
-  it('drops runtime host snapshots before launching a managed restart', () => {
+  it('drops runtime env snapshots before launching a managed restart', () => {
     const inherited = {
       WEB_EXTERNAL_HOST: '10.255.64.131',
       BOTMUX_DASHBOARD_EXTERNAL_HOST: '10.255.64.131',
+      BOTMUX_DASHBOARD_HOST: '127.0.0.1',
+      BOTMUX_DASHBOARD_PORT: '7991',
+      BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
+      BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       PATH: '/usr/bin',
     };
 

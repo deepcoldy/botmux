@@ -83,7 +83,7 @@ import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
-import { resolveDaemonExternalHostEnv } from './cli/daemon-lifecycle-env.js';
+import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
@@ -399,7 +399,7 @@ function ecosystemConfig(): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
   ensureUniqueBotProcessNames(bots);
-  const externalHostEnv = resolveDaemonExternalHostEnv(
+  const daemonEnv = resolveDaemonEnv(
     process.env,
     existsSync(ENV_FILE) ? readFileSync(ENV_FILE, 'utf-8') : undefined,
   );
@@ -444,7 +444,7 @@ function ecosystemConfig(): string {
     error_file: join(LOG_DIR, `daemon-${i}-error.log`),
     out_file: join(LOG_DIR, `daemon-${i}-out.log`),
     env: {
-      ...externalHostEnv,
+      ...daemonEnv,
       SESSION_DATA_DIR: DATA_DIR,
       BOTMUX_BOT_INDEX: String(i),
       // Native-memory diagnostics. Default off; operator can flip it on
@@ -470,15 +470,13 @@ function ecosystemConfig(): string {
     out_file: join(LOG_DIR, 'dashboard-out.log'),
     merge_logs: true,
     env: {
-      ...externalHostEnv,
+      ...daemonEnv,
       // MUST match the bot daemons' SESSION_DATA_DIR: the dashboard shares
       // pairings/federations/memberships with them via {dataDir}/*.json. Without
       // it the dashboard falls back to an install-relative ../data and reads a
       // DIFFERENT store → /pair「配对码无效」, auto-bind hubsSynced:0,
       // remote-group not_a_member (cross-deployment 拉群 silently broken).
       SESSION_DATA_DIR: DATA_DIR,
-      BOTMUX_DASHBOARD_HOST: process.env.BOTMUX_DASHBOARD_HOST ?? '0.0.0.0',
-      BOTMUX_DASHBOARD_PORT: process.env.BOTMUX_DASHBOARD_PORT ?? '7891',
     },
   });
 
