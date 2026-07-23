@@ -296,6 +296,7 @@ import {
   CodexAppControlFinalAssembler,
   CodexAppControlLineDecoder,
   CodexAppControlProofDeadline,
+  CodexAppControlRecordApplicationGate,
   CodexAppControlReplayWindow,
   CodexAppControlSequenceFence,
   activateCodexAppControlIdentity,
@@ -323,6 +324,7 @@ import {
   hardenWindowsCodexAppControlFile,
   mergeCodexAppControlCandidate,
   parseCodexAppControlWireRecord,
+  projectCodexAppControlReadinessStatus,
   readCodexAppControlState,
   shouldColdStartCodexAppReattach,
   shouldFailCodexAppControlChannel,
@@ -1672,6 +1674,7 @@ interface CodexAppControlConnection {
 }
 const codexAppControlConnections = new Map<Socket, CodexAppControlConnection>();
 const codexAppControlReplayWindow = new CodexAppControlReplayWindow();
+const codexAppControlRecordApplicationGate = new CodexAppControlRecordApplicationGate();
 
 function cleanupCodexAppControlBootstrap(): void {
   if (codexAppBootstrapCleanupTimer) {
@@ -1962,34 +1965,55 @@ async function handleCodexAppControlLine(
     connection.socket.destroy();
     return;
   }
-  let applied = true;
-  if (finalResult.status === 'not-final') {
-    applied = await handleTrustedCodexAppMarker(
-      record.kind,
-      record.payload,
-      { generation: identity.generation, seq: record.seq },
+  // start/chunk records intentionally remain uncommitted so a replacement
+  // connection can rebuild the complete final. Every record that does apply
+  // worker effects is single-flight by signed generation/sequence until the
+  // replay window below is committed.
+  if (finalResult.status === 'accepted') return;
+  const application = codexAppControlRecordApplicationGate.run(
+    identity.generation,
+    record.seq,
+    () => finalResult.status === 'not-final'
+      ? handleTrustedCodexAppMarker(
+          record.kind,
+          record.payload,
+          { generation: identity.generation, seq: record.seq },
+        )
+      : handleTrustedCodexAppMarker(
+          'final',
+          finalResult.payload,
+          { generation: identity.generation, seq: record.seq },
+        ),
+  );
+  let applied: boolean;
+  try {
+    applied = await application;
+  } catch (err) {
+    codexAppControlRecordApplicationGate.release(
+      identity.generation,
+      record.seq,
+      application,
     );
-  } else if (finalResult.status === 'complete') {
-    applied = await handleTrustedCodexAppMarker(
-      'final',
-      finalResult.payload,
-      { generation: identity.generation, seq: record.seq },
-    );
+    throw err;
   }
   if (!applied) {
+    codexAppControlRecordApplicationGate.release(
+      identity.generation,
+      record.seq,
+      application,
+    );
     // Do not commit or cumulatively ACK a semantically rejected signed marker.
     // In particular, a final for the wrong FIFO head must remain replayable
     // rather than becoming a permanently lost answer.
     connection.socket.destroy();
     return;
   }
-  // Treat chunked final output as one ACK transaction. If the endpoint dies
-  // after ACKing only a prefix, a replacement worker has no partial assembly
-  // and the runner could otherwise discard the bytes needed to rebuild it.
-  // Keeping start/chunk uncommitted makes every reconnect replay the complete
-  // final; final-end advances the cumulative sequence only after assembly.
-  if (finalResult.status === 'accepted') return;
   codexAppControlReplayWindow.commit(identity.generation, record.seq);
+  codexAppControlRecordApplicationGate.release(
+    identity.generation,
+    record.seq,
+    application,
+  );
   if (!connection.socket.destroyed) {
     connection.socket.write(`${encodeCodexAppControlAck(
       cfg.sessionId,
@@ -2530,7 +2554,11 @@ type RuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
  */
 function codexAppLivenessStatus(base: RuntimeScreenStatus, nowMs = Date.now()): RuntimeScreenStatus {
   if (lastInitConfig?.cliId !== 'codex-app') return base;
-  if (!codexAppControlProven && base === 'idle') return 'working';
+  base = projectCodexAppControlReadinessStatus(base, {
+    controlProven: codexAppControlProven,
+    signedStateObserved: codexAppSignedStateObserved,
+    inputReady: codexAppInputReady,
+  });
   const liveness = codexAppTurnLiveness.poll(nowMs);
   if (liveness.shouldNotify) {
     send({

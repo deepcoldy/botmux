@@ -32,6 +32,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, win32 } from 'node:path';
 import type { BackendType } from '../adapters/backend/types.js';
+import type { ScreenStatus } from '../types.js';
 
 /**
  * The launch boundary carries only a path to an owner-only, read-once file.
@@ -122,6 +123,64 @@ export class CodexAppControlProofDeadline {
   get armed(): boolean {
     return this.timer !== undefined;
   }
+}
+
+/**
+ * Coalesce one signed control record while its worker-side effects are still
+ * awaiting a durable daemon ACK. Endpoint replacement can replay the same
+ * generation/sequence before the replay window is committed; every replay
+ * must observe the first application result instead of running queue or
+ * liveness effects again.
+ *
+ * The caller releases the entry only after committing the replay window (or
+ * after a rejected application). Keeping release outside the promise closes
+ * the resolution -> replay-commit gap.
+ */
+export class CodexAppControlRecordApplicationGate {
+  private readonly inFlight = new Map<string, Promise<boolean>>();
+
+  run(
+    generation: string,
+    seq: number,
+    apply: () => boolean | Promise<boolean>,
+  ): Promise<boolean> {
+    const key = this.key(generation, seq);
+    const existing = this.inFlight.get(key);
+    if (existing) return existing;
+    const application = Promise.resolve().then(apply);
+    this.inFlight.set(key, application);
+    return application;
+  }
+
+  release(generation: string, seq: number, application: Promise<boolean>): void {
+    const key = this.key(generation, seq);
+    if (this.inFlight.get(key) === application) this.inFlight.delete(key);
+  }
+
+  private key(generation: string, seq: number): string {
+    return `${generation}\0${seq}`;
+  }
+}
+
+export type CodexAppRuntimeScreenStatus = Exclude<ScreenStatus, 'limited'>;
+
+/** Authentication alone is not readiness. Until the active generation has
+ * published a signed accepting-input state, an idle screen is fail-closed to
+ * working so reconnect replay cannot expose a false-idle interval. */
+export function projectCodexAppControlReadinessStatus(
+  base: CodexAppRuntimeScreenStatus,
+  readiness: {
+    controlProven: boolean;
+    signedStateObserved: boolean;
+    inputReady: boolean;
+  },
+): CodexAppRuntimeScreenStatus {
+  if (base !== 'idle') return base;
+  return readiness.controlProven
+      && readiness.signedStateObserved
+      && readiness.inputReady
+    ? base
+    : 'working';
 }
 const STATE_MAX_BYTES = 16_384;
 const GENERATION_RE = /^[A-Za-z0-9_-]{43}$/;

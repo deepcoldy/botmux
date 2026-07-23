@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   applyTrustedCodexAppActivityMarker,
   applyTrustedCodexAppStateMarker,
@@ -7,6 +7,10 @@ import {
   CodexAppTurnLiveness,
   shouldBeginCodexAppReattachObservation,
 } from '../src/utils/codex-app-turn-liveness.js';
+import {
+  CodexAppControlRecordApplicationGate,
+  projectCodexAppControlReadinessStatus,
+} from '../src/utils/codex-app-control.js';
 
 describe('CodexAppReadyAuthority', () => {
   it('does not allocate a Botmux liveness slot for a native Goal continuation', () => {
@@ -181,6 +185,90 @@ describe('shouldBeginCodexAppReattachObservation', () => {
 });
 
 describe('CodexAppTurnLiveness', () => {
+  it('coalesces a replayed final while persistence is pending and keeps type-ahead working', async () => {
+    const tracker = new CodexAppTurnLiveness(1_000);
+    const gate = new CodexAppControlRecordApplicationGate();
+    tracker.begin('turn-n', 10_000);
+    tracker.begin('turn-n-plus-1', 10_010);
+
+    let completionAwaitingFinal = false;
+    const completed = applyTrustedCodexAppActivityMarker(tracker, {
+      phase: 'completed',
+      atMs: 10_100,
+    }, 10_100);
+    expect(completed).toMatchObject({ accepted: true, phase: 'completed' });
+    completionAwaitingFinal = true;
+
+    let releasePersistence!: () => void;
+    const persistence = new Promise<void>(resolve => {
+      releasePersistence = resolve;
+    });
+    let applicationCount = 0;
+    const applyFinal = async (): Promise<boolean> => {
+      applicationCount++;
+      if (!completionAwaitingFinal) tracker.completeCurrent(10_110);
+      completionAwaitingFinal = false;
+      await persistence;
+      return true;
+    };
+
+    const first = gate.run('generation-a', 42, applyFinal);
+    await Promise.resolve();
+    const replayEffect = vi.fn(async () => true);
+    const replay = gate.run('generation-a', 42, replayEffect);
+
+    expect(applicationCount).toBe(1);
+    expect(replayEffect).not.toHaveBeenCalled();
+    expect(tracker.poll(10_110)).toMatchObject({
+      active: true,
+      turnId: 'turn-n-plus-1',
+    });
+    expect(projectCodexAppControlReadinessStatus('idle', {
+      controlProven: true,
+      signedStateObserved: false,
+      inputReady: false,
+    })).toBe('working');
+
+    releasePersistence();
+    await expect(first).resolves.toBe(true);
+    await expect(replay).resolves.toBe(true);
+    gate.release('generation-a', 42, first);
+
+    expect(applicationCount).toBe(1);
+    expect(tracker.poll(10_120)).toMatchObject({
+      active: true,
+      turnId: 'turn-n-plus-1',
+    });
+  });
+
+  it('projects idle only after authenticated signed input readiness', () => {
+    expect(projectCodexAppControlReadinessStatus('idle', {
+      controlProven: false,
+      signedStateObserved: false,
+      inputReady: false,
+    })).toBe('working');
+    expect(projectCodexAppControlReadinessStatus('idle', {
+      controlProven: true,
+      signedStateObserved: false,
+      inputReady: false,
+    })).toBe('working');
+    expect(projectCodexAppControlReadinessStatus('idle', {
+      controlProven: true,
+      signedStateObserved: true,
+      inputReady: false,
+    })).toBe('working');
+    expect(projectCodexAppControlReadinessStatus('idle', {
+      controlProven: true,
+      signedStateObserved: true,
+      inputReady: true,
+    })).toBe('idle');
+    expect(projectCodexAppControlReadinessStatus('stalled', {
+      controlProven: false,
+      signedStateObserved: false,
+      inputReady: false,
+    })).toBe('stalled');
+  });
+
   it('stays working before the no-progress threshold, then stalls and notifies once', () => {
     const tracker = new CodexAppTurnLiveness(1_000);
     tracker.begin('turn-1', 10_000);

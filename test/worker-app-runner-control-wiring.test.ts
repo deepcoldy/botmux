@@ -44,6 +44,10 @@ describe('worker app-runner control-channel wiring', () => {
     const marker = workerSource.slice(markerStart, markerEnd);
     expect(marker).toContain('const settlement = codexAppTurnDispatchQueue.settleFinal(payload, false);');
     expect(marker).toContain('codexAppTurnDispatchQueue.commitExactHead(codexAppDispatchHandle)');
+    expect(workerSource).toContain('codexAppControlRecordApplicationGate.run(');
+    expect(workerSource).toContain('codexAppControlReplayWindow.commit(identity.generation, record.seq);');
+    expect(workerSource.indexOf('codexAppControlRecordApplicationGate.run('))
+      .toBeLessThan(workerSource.indexOf('codexAppControlReplayWindow.commit(identity.generation, record.seq);'));
     const codexSettlementStart = marker.indexOf('const settlement = codexAppTurnDispatchQueue.settleFinal(payload, false);');
     const miraFallbackStart = marker.indexOf('} else {\n      // Mira/Mir', codexSettlementStart);
     expect(marker.slice(codexSettlementStart, miraFallbackStart)).not.toContain('currentBotmuxTurnId');
@@ -114,6 +118,7 @@ describe('worker app-runner control-channel wiring', () => {
     expect(runtimeGate).toContain('codexAppControlProven');
     expect(runtimeGate).toContain('codexAppSignedStateObserved');
     expect(runtimeGate).toContain('codexAppInputReady');
+    expect(workerSource).toContain('projectCodexAppControlReadinessStatus(base, {');
     const firstPromptTimeout = workerSource.slice(
       workerSource.indexOf('const releaseFirstPromptTimeout'),
       workerSource.indexOf('// Riff (and other remote HTTP backends)'),
@@ -196,7 +201,7 @@ describe('worker app-runner control-channel wiring', () => {
     const assembleIdx = handler.indexOf('const finalResult = connection.finalAssembler.accept(');
     const rejectIdx = handler.indexOf("if (finalResult.status === 'reject')", assembleIdx);
     const destroyIdx = handler.indexOf('connection.socket.destroy();', rejectIdx);
-    const persistedIdx = handler.indexOf('await handleTrustedCodexAppMarker(', assembleIdx);
+    const applicationIdx = handler.indexOf('codexAppControlRecordApplicationGate.run(', assembleIdx);
     const commitIdx = handler.indexOf('codexAppControlReplayWindow.commit(', assembleIdx);
     const ackIdx = handler.indexOf('encodeCodexAppControlAck(', commitIdx);
     const semanticRejectIdx = handler.indexOf('if (!applied)', assembleIdx);
@@ -205,7 +210,7 @@ describe('worker app-runner control-channel wiring', () => {
     expect(rejectIdx).toBeGreaterThan(assembleIdx);
     expect(destroyIdx).toBeGreaterThan(rejectIdx);
     expect(semanticRejectIdx).toBeGreaterThan(destroyIdx);
-    expect(persistedIdx).toBeGreaterThan(assembleIdx);
+    expect(applicationIdx).toBeGreaterThan(assembleIdx);
     expect(commitIdx).toBeGreaterThan(semanticRejectIdx);
     expect(commitIdx).toBeGreaterThan(destroyIdx);
     expect(ackIdx).toBeGreaterThan(commitIdx);
