@@ -36,16 +36,16 @@ function preview(renderer: TestRenderer.ReactTestRenderer): string {
 }
 
 describe('GroupNamePrefixRow (dashboard settings)', () => {
-  it('edits, previews, trims, and explicitly saves a prefix', () => {
+  it('edits, previews, and explicitly saves separator whitespace', () => {
     const onSave = vi.fn();
     const { renderer } = render({ onSave });
 
-    act(() => input(renderer).props.onChange({ currentTarget: { value: '  AI讨论·  ' } }));
+    act(() => input(renderer).props.onChange({ currentTarget: { value: '[AI] ' } }));
 
-    expect(preview(renderer)).toContain('AI讨论·');
+    expect(preview(renderer)).toContain('[AI] ');
     expect(saveButton(renderer).props.disabled).toBe(false);
     act(() => saveButton(renderer).props.onClick());
-    expect(onSave).toHaveBeenCalledWith('AI讨论·');
+    expect(onSave).toHaveBeenCalledWith('[AI] ');
   });
 
   it('clears an existing prefix and saves an empty string', () => {
@@ -65,6 +65,17 @@ describe('GroupNamePrefixRow (dashboard settings)', () => {
     const readOnly = render({ disabled: true });
     expect(input(readOnly.renderer).props.disabled).toBe(true);
     expect(saveButton(readOnly.renderer).props.disabled).toBe(true);
+  });
+
+  it('rejects a non-empty whitespace-only prefix', () => {
+    const onSave = vi.fn();
+    const { renderer } = render({ onSave });
+
+    act(() => input(renderer).props.onChange({ currentTarget: { value: '   ' } }));
+
+    expect(saveButton(renderer).props.disabled).toBe(true);
+    act(() => saveButton(renderer).props.onClick());
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   it('syncs the draft when the confirmed server value changes', () => {
