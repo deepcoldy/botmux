@@ -49,9 +49,11 @@ function run(command, args) {
 }
 
 const appVersion = resolveAppVersion();
+process.env.BOTMUX_DESKTOP_VERSION = appVersion;
 
 run('pnpm', ['build']);
 run('pnpm', ['desktop:bundle']);
+run('pnpm', ['desktop:runtime']);
 run('pnpm', [
   'exec',
   'electron-builder',

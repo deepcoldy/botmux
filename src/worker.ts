@@ -13,13 +13,18 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
   evaluateReadIsolationGate,
+  evaluateCredentialOnlyIsolationGate,
+  credentialIsolationRequired,
+  deviceCredentialIsolationMarkerPath,
+  isCredentialIsolationReservedBasename,
+  buildCredentialIsolationRules,
   buildSeatbeltProfile,
   isolatedPaneReattachSafe,
   sendCredFilePath,
@@ -32,6 +37,7 @@ import {
   buildWriteSandboxRules,
   buildLinuxReadIsolationMasks,
   isolationPaneMarkerContent,
+  type IsolationCapability,
   type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
@@ -171,7 +177,21 @@ import {
   isValidRiffBaseUrl,
   isValidRiffSandboxCluster,
 } from './adapters/backend/riff-backend.js';
-import { prepareSandbox, attachSandboxOutbox, startOutboxWatcher, sandboxEnabled, sandboxedClaudeDataDir, localSandboxApplies } from './adapters/backend/sandbox.js';
+import {
+  prepareSandbox,
+  prepareCredentialOnlySandbox,
+  credentialOnlySandboxAvailable,
+  probeHostCredentialIsolationMechanism,
+  attachSandboxOutbox,
+  startOutboxWatcher,
+  sandboxEnabled,
+  sandboxedClaudeDataDir,
+  localSandboxApplies,
+} from './adapters/backend/sandbox.js';
+import {
+  DEVICE_AUTHORITY_DIRECTORY,
+  DEVICE_CREDENTIAL_FILE,
+} from './platform/device-paths.js';
 import type { BackendType, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
@@ -753,6 +773,10 @@ let lastCliExitSignal: string | null = null;
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
 let isPipeMode = false;
 let effectiveBackendType: BackendType = 'pty';
+/** Worker-owned statement about the confinement attached to the CURRENT CLI
+ * generation. The daemon receives this over private IPC; child-writable PID
+ * marker files remain diagnostics only. */
+let currentCliCredentialIsolated = false;
 /** pty-under-zellij backend (BACKEND_TYPE=zellij). Behaves like the non-tmux
  *  pty path for the worker (renderer screenshots, relay web terminal) but owns
  *  a persistent zellij session that survives daemon restart. */
@@ -5551,6 +5575,38 @@ async function spawnCli(
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
   clearSessionRenameInFlight();
+  currentCliCredentialIsolated = false;
+  // Enrollment writes the fixed marker before any device credential appears.
+  // From that instant onward every NEW local CLI must carry a credential
+  // boundary, regardless of adapter capability or optional sandbox toggles.
+  // lstat (not existsSync) deliberately treats a hostile/broken symlink as a
+  // present authority signal and therefore fails closed.
+  const hostHomeDir = homedir();
+  const defaultBotmuxHome = join(hostHomeDir, '.botmux');
+  const configuredBotmuxHome = process.env.SESSION_DATA_DIR
+    ? dirname(process.env.SESSION_DATA_DIR)
+    : defaultBotmuxHome;
+  const hostEntryExistsNoFollow = (path: string): boolean => {
+    try { lstatSync(path); return true; } catch { return false; }
+  };
+  const deviceIsolationMarkerExists = hostEntryExistsNoFollow(
+    deviceCredentialIsolationMarkerPath(hostHomeDir),
+  );
+  const deviceCredentialExists = [...new Set([defaultBotmuxHome, configuredBotmuxHome])]
+    .some(root => hostEntryExistsNoFollow(join(root, DEVICE_AUTHORITY_DIRECTORY, DEVICE_CREDENTIAL_FILE))
+      // Upgrade fail-safe: a pre-dedicated-directory credential still activates
+      // mandatory confinement until the host explicitly removes/migrates it.
+      || hostEntryExistsNoFollow(join(root, DEVICE_CREDENTIAL_FILE)));
+  const mandatoryCredentialIsolation = credentialIsolationRequired({
+    markerExists: deviceIsolationMarkerExists,
+    deviceCredentialExists,
+  });
+  if (mandatoryCredentialIsolation && cfg.adoptMode) {
+    throw new Error(
+      `[device-credential-isolation] refusing adopt session ${cfg.sessionId}: `
+      + 'an already-running external CLI cannot be retrofitted with the mandatory credential boundary',
+    );
+  }
   // (startupCommands one-shot is re-armed below, AFTER the reattach-vs-fresh
   // prediction — only a genuinely fresh CLI process replays them; see
   // willReattachPersistent.)
@@ -5910,6 +5966,59 @@ async function spawnCli(
   // established (unsandboxable backend, no SESSION_DATA_DIR) is a hard error at the
   // spawn site below, never a silent unconfined run.
   const willWriteSandbox = process.platform === 'darwin' && wantsFileSandbox;
+  if (willWriteSandbox && !process.env.SESSION_DATA_DIR) {
+    throw new Error(
+      `[file-sandbox] refusing to start session ${cfg.sessionId}: missing SESSION_DATA_DIR`,
+    );
+  }
+  const fullIsolationCoversCredentials = !riffRemoteBackend && (
+    (process.platform === 'darwin' && (willReadIsolate || willWriteSandbox))
+    || (process.platform === 'linux' && wantsFileSandbox)
+  );
+  let credentialMechanismAvailable = true;
+  let credentialMechanismExecutable: string | undefined;
+  if (mandatoryCredentialIsolation && !riffRemoteBackend && !fullIsolationCoversCredentials) {
+    if (process.platform === 'darwin') {
+      const probe = probeHostCredentialIsolationMechanism();
+      credentialMechanismAvailable = probe.supported;
+      if (probe.supported) credentialMechanismExecutable = probe.executable;
+    } else {
+      credentialMechanismAvailable = process.platform === 'linux'
+        ? credentialOnlySandboxAvailable()
+        : false;
+    }
+  }
+  const credentialIsolationGate = evaluateCredentialOnlyIsolationGate({
+    markerExists: deviceIsolationMarkerExists,
+    deviceCredentialExists,
+    remoteBackend: riffRemoteBackend,
+    platform: process.platform,
+    mechanismAvailable: credentialMechanismAvailable,
+    fullIsolationCoversCredentials,
+  });
+  if (credentialIsolationGate.mode === 'blocked') {
+    throw new Error(
+      `[device-credential-isolation] refusing to start session ${cfg.sessionId}: `
+      + credentialIsolationGate.failClosedReason,
+    );
+  }
+  const credentialBoundaryActive = credentialIsolationGate.required
+    && credentialIsolationGate.mode !== 'remote-bypass';
+  const credentialOnlySeatbelt = credentialIsolationGate.mode === 'seatbelt';
+  const credentialOnlyBwrap = credentialIsolationGate.mode === 'bwrap';
+  const appliedIsolationCapabilities: IsolationCapability[] = [];
+  if (credentialBoundaryActive
+    || willReadIsolate
+    || (process.platform === 'linux' && wantsFileSandbox)) {
+    appliedIsolationCapabilities.push('credential');
+  }
+  if (willReadIsolate) appliedIsolationCapabilities.push('read');
+  if (willWriteSandbox || (process.platform === 'linux' && wantsFileSandbox)) {
+    appliedIsolationCapabilities.push('write');
+  }
+  currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
+  const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
+    ?? join(defaultBotmuxHome, 'data');
 
   let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
     cfg.sessionId,
@@ -5933,7 +6042,6 @@ async function spawnCli(
   isPipeMode = selectedBackend.isPipeMode;
   isZellijMode = selectedBackend.isZellijMode;
   backend = selectedBackend.backend;
-
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -6006,7 +6114,7 @@ async function spawnCli(
   // so the probe below sees no pane and we cold-spawn fresh isolated. A current-
   // policy pane survives daemon restarts and suspend→resume safely because the
   // confinement remains attached to the live process.
-  if ((willReadIsolate || willWriteSandbox) && persistentSessionName && effectiveBackendType !== 'pty') {
+  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
     const paneLive = effectiveBackendType === 'tmux'
       ? TmuxBackend.hasSession(persistentSessionName)
       : effectiveBackendType === 'zellij'
@@ -6015,9 +6123,9 @@ async function spawnCli(
     if (paneLive) {
       let marker: string | null = null;
       marker = readRegularHostFileNoFollow(
-        join(process.env.SESSION_DATA_DIR ?? '', 'read-isolation', `${cfg.sessionId}.boot`),
+        join(isolationRuntimeDataDir, 'read-isolation', `${cfg.sessionId}.boot`),
       );
-      if (isolatedPaneReattachSafe(marker)) {
+      if (isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)) {
         // Pane was spawned under the current isolation policy → still confined
         // on the running process across daemon restarts; warm reattach preserves
         // resume/context + tmux idle-suspend.
@@ -6266,16 +6374,21 @@ async function spawnCli(
     allowWritePaths: string[];
     allowWriteRegexes: string[];
     denyWritePaths: string[];
+    denyWriteRegexes: string[];
   } | undefined;
   if (willWriteSandbox && process.env.SESSION_DATA_DIR) {
     const sessionDataDir = process.env.SESSION_DATA_DIR;
     // Regex rules cannot be realpath'd after construction, so build their home
     // prefix from the canonical path up front (Seatbelt matches canonical paths).
-    const sandboxHome = (() => { try { return realpathSync(homedir()); } catch { return homedir(); } })();
+    const canonicalSandboxPath = (path: string) => {
+      try { return realpathSync(path); } catch { return path; }
+    };
+    const sandboxHome = canonicalSandboxPath(homedir());
     writeSandboxRules = buildWriteSandboxRules({
       homeDir: sandboxHome,
-      botmuxHome: dirname(sessionDataDir),
-      sessionDataDir,
+      botmuxHome: canonicalSandboxPath(dirname(sessionDataDir)),
+      defaultBotmuxHome: canonicalSandboxPath(join(homedir(), '.botmux')),
+      sessionDataDir: canonicalSandboxPath(sessionDataDir),
       workingDir: cfg.workingDir,
       currentAppId: cfg.larkAppId,
       // TMPDIR on macOS resolves under /private/var/folders (already allowed), but
@@ -6537,6 +6650,31 @@ async function spawnCli(
         sessionDataDirs: [readIsolationCtx.sessionDataDir],
       });
     }
+    if (credentialBoundaryActive) {
+      const credentialRules = buildCredentialIsolationRules({
+        homeDir: canonical(hostHomeDir),
+        botmuxHome: canonical(configuredBotmuxHome),
+        defaultBotmuxHome: canonical(defaultBotmuxHome),
+      });
+      denyPaths = [...new Set([...denyPaths, ...credentialRules.denyPaths.map(canonical)])];
+      denyRegexes = [...new Set([...denyRegexes, ...credentialRules.denyRegexes])];
+      protectedWrites = {
+        denyWritePaths: [...new Set([
+          ...(protectedWrites?.denyWritePaths ?? []),
+          ...credentialRules.denyWritePaths.map(canonical),
+        ])],
+        denyWriteRegexes: [...new Set([
+          ...(protectedWrites?.denyWriteRegexes ?? []),
+          ...credentialRules.denyWriteRegexes,
+        ])],
+        denyWriteLiterals: [...new Set([
+          ...(protectedWrites?.denyWriteLiterals ?? []),
+          ...credentialRules.denyWriteLiterals.map(canonical),
+          defaultBotmuxHome,
+          configuredBotmuxHome,
+        ])],
+      };
+    }
     if (mcpRuntimeManifest) {
       finalDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
         mcpRuntimeManifest,
@@ -6566,12 +6704,13 @@ async function spawnCli(
           allowWritePaths: writeSandboxRules.allowWritePaths.map(canonical),
           allowWriteRegexes: writeSandboxRules.allowWriteRegexes,
           denyWritePaths: writeSandboxRules.denyWritePaths.map(canonical),
+          denyWriteRegexes: writeSandboxRules.denyWriteRegexes,
         }
       : undefined;
     if (!locateOnPath('sandbox-exec')) {
       throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
     }
-    const profileDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
+    const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
     replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
@@ -6585,20 +6724,20 @@ async function spawnCli(
     ));
     seatbeltProfilePath = profilePath;
     spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
-    spawnBin = 'sandbox-exec';
+    spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
     log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (read-isolation=${!!readIsolationCtx}, write-sandbox=${!!writeRules}): sandbox-exec -f ${profilePath}`);
   }
   // Fresh sandboxed spawn on a persistent backend: stamp the pane with this daemon's
   // policy version + boot id so a later suspend→resume reattach can be trusted (see the stale-pane
   // guard above). Applies to read-isolation AND write-sandbox panes (both carry the
   // Seatbelt confinement on the live process). pty needs no marker (never reattached).
-  if ((readIsolationCtx || writeSandboxRules) && persistentSessionName && !willReattachPersistent) {
+  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
     try {
-      const markerDir = join(process.env.SESSION_DATA_DIR!, 'read-isolation');
+      const markerDir = join(isolationRuntimeDataDir, 'read-isolation');
       mkdirSync(markerDir, { recursive: true });
       replaceManagedOriginCapabilityFile(
         join(markerDir, `${cfg.sessionId}.boot`),
-        isolationPaneMarkerContent(cfg.daemonBootId ?? ''),
+        isolationPaneMarkerContent(cfg.daemonBootId ?? '', appliedIsolationCapabilities),
       );
     } catch { /* non-fatal: worst case a same-lifetime reattach cold-spawns instead */ }
   }
@@ -6830,6 +6969,140 @@ async function spawnCli(
     target: selectedBackend.persistentBackendTarget,
   });
 
+  // Mandatory credential-only confinement is the OUTERMOST launch wrapper so
+  // wrapperCli and every descendant it starts inherit the boundary. Full
+  // Seatbelt/bwrap sessions were already wrapped above and never enter these
+  // branches (gate mode `covered`), avoiding nested/double sandboxes.
+  if (!willReattachPersistent && credentialOnlySeatbelt) {
+    const canonical = (path: string) => {
+      try { return realpathSync(path); } catch { return path; }
+    };
+    const rules = buildCredentialIsolationRules({
+      homeDir: canonical(hostHomeDir),
+      botmuxHome: canonical(configuredBotmuxHome),
+      defaultBotmuxHome: canonical(defaultBotmuxHome),
+    });
+    const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
+    mkdirSync(profileDir, { recursive: true });
+    const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
+    replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
+      rules.denyPaths.map(canonical),
+      [],
+      [],
+      [],
+      rules.denyRegexes,
+      undefined,
+      {
+        denyWritePaths: [...new Set([
+          ...rules.denyWritePaths.map(canonical),
+          canonical(profileDir),
+        ])],
+        denyWriteRegexes: rules.denyWriteRegexes,
+        denyWriteLiterals: [...new Set([
+          ...rules.denyWriteLiterals.map(canonical),
+          canonical(profileDir),
+          defaultBotmuxHome,
+          configuredBotmuxHome,
+        ])],
+      },
+    ));
+    seatbeltProfilePath = profilePath;
+    spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+    // Absolute path only: a pre-activation unconfined CLI could plant a fake
+    // sandbox-exec earlier on PATH. Prefer the probe result; fall back to the
+    // well-known system location used by full Seatbelt wrapping above.
+    spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
+    log(`[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only Seatbelt: ${spawnBin} -f ${profilePath}`);
+  }
+  if (!willReattachPersistent && credentialOnlyBwrap) {
+    const panePolicyDir = join(isolationRuntimeDataDir, 'read-isolation');
+    mkdirSync(panePolicyDir, { recursive: true });
+    const hideDirectories = new Set<string>();
+    const hideFiles = new Set<string>();
+    const processedRoots = new Set<string>();
+    const isDashboardAuthorityBasename = (name: string): boolean =>
+      name === '.dashboard-secret'
+      || name.startsWith('.dashboard-secret.')
+      || name === '.dashboard-token'
+      || name.startsWith('.dashboard-token.');
+    for (const rawRoot of [defaultBotmuxHome, configuredBotmuxHome]) {
+      let root = rawRoot;
+      try { root = realpathSync(rawRoot); } catch { /* gate authority root is checked below */ }
+      if (processedRoots.has(root)) continue;
+      let rootStat: ReturnType<typeof lstatSync>;
+      try { rootStat = lstatSync(root); } catch {
+        // An unrelated/default root can be absent when the activation signal
+        // came from a custom BOTMUX_HOME. At least one signalled root must
+        // survive; the builder below rejects an empty root set.
+        continue;
+      }
+      if (!rootStat.isDirectory()) {
+        throw new Error(`[device-credential-isolation] authority root is not a directory: ${rawRoot}`);
+      }
+      processedRoots.add(root);
+      const authorityDirectory = join(root, DEVICE_AUTHORITY_DIRECTORY);
+      try {
+        const authorityStat = lstatSync(authorityDirectory);
+        if (!authorityStat.isDirectory()) {
+          throw new Error(
+            `[device-credential-isolation] device authority path is not a directory: ${authorityDirectory}`,
+          );
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        // A fixed empty mount target lets the child mask the entire authority
+        // namespace while leaving BOTMUX_HOME itself live and writable.
+        mkdirSync(authorityDirectory, { mode: 0o700 });
+      }
+      hideDirectories.add(realpathSync(authorityDirectory));
+      for (const name of readdirSync(root)) {
+        if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
+        if (!isCredentialIsolationReservedBasename(name)
+          && !isDashboardAuthorityBasename(name)) continue;
+        const entry = join(root, name);
+        try {
+          const stat = lstatSync(entry);
+          if (!stat.isFile()) {
+            // Never follow a host-authority symlink or special file. Exact mask
+            // destinations must be stable regular files or the launch fails
+            // closed before an untrusted CLI starts.
+            throw new Error(
+              `[device-credential-isolation] authority entry is not a regular file: ${entry}`,
+            );
+          }
+          hideFiles.add(entry);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          // A racing removal needs no mask; a later exact credential rotation
+          // is host-only and the long-lived device secret namespace itself is
+          // protected wholesale above.
+        }
+      }
+    }
+    let credentialCliBin = spawnBin;
+    try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    const credentialSandbox = prepareCredentialOnlySandbox({
+      hideDirectories: [...hideDirectories],
+      hideFiles: [...hideFiles],
+      readonlyPaths: [realpathSync(panePolicyDir)],
+      workingDir: spawnCwd,
+      cliBin: credentialCliBin,
+      cliArgs: spawnArgs,
+    });
+    if (!credentialSandbox) {
+      throw new Error(
+        `[device-credential-isolation] refusing to start session ${cfg.sessionId}: `
+        + 'credential-only bubblewrap could not be established',
+      );
+    }
+    spawnBin = credentialSandbox.bin;
+    spawnArgs = credentialSandbox.args;
+    log(
+      `[device-credential-isolation] wrapping ${cliAdapter.id} in credential-only bwrap `
+      + `(${hideDirectories.size} authority dir(s), ${hideFiles.size} exact file(s))`,
+    );
+  }
+
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -6851,6 +7124,7 @@ async function spawnCli(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  publishLocalProcessAttestation(cliPid ?? undefined);
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
     try {
@@ -6892,6 +7166,7 @@ async function spawnCli(
         // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
         // module-level bridgeCliPid and re-points to the real CLI's jsonl.
         bridgeCliPid = realPid;
+        publishLocalProcessAttestation(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -6925,6 +7200,7 @@ async function spawnCli(
       if (!backend) return;
       const pid = backend.getChildPid?.();
       if (pid) {
+        publishLocalProcessAttestation(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
           try {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -7314,6 +7590,7 @@ async function spawnCli(
 }
 
 function killCli(opts: { preservePending?: boolean } = {}): void {
+  currentCliCredentialIsolated = false;
   stopSessionMcpGatewayHost();
   stopCodexRpcEngine();
   destroyCrashDiagnosticTerminal('killCli');
@@ -8605,6 +8882,17 @@ function send(msg: WorkerToDaemon): void {
     workflowFinalOutputSent = true;
   }
   process.send?.(payload);
+}
+
+function publishLocalProcessAttestation(cliPid?: number): void {
+  const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  send({
+    type: 'local_process_attestation',
+    backendType: effectiveBackendType,
+    credentialIsolated: currentCliCredentialIsolated,
+    ...(cliPid ? { cliPid } : {}),
+    ...(cliProcStart ? { cliProcStart } : {}),
+  });
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`

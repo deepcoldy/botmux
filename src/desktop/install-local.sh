@@ -125,8 +125,14 @@ fi
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   APP_VERSION="$(resolve_app_version)"
 
+  log "Build bundled botmux runtime"
+  pnpm build
+
   log "Build Desktop bundle"
   pnpm desktop:bundle
+
+  log "Prepare bundled botmux and Node runtimes"
+  BOTMUX_DESKTOP_VERSION="$APP_VERSION" pnpm desktop:runtime
 
   log "Package Botmux.app locally (version $APP_VERSION)"
   pnpm exec electron-builder --mac dir --config electron-builder.yml -c.extraMetadata.version="$APP_VERSION"

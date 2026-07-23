@@ -13,32 +13,35 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 /** Simple in-memory file store keyed by absolute path. */
 let files: Record<string, string>;
 
-vi.mock('node:fs', () => ({
-  existsSync: (p: string) => p in files,
-  mkdirSync: (_p: string, _opts?: any) => {
-    /* no-op: directory creation is a side effect we don't need to track */
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    existsSync: (p: string) => p in files,
+    mkdirSync: (_p: string, _opts?: any) => {
+      /* no-op: directory creation is a side effect we don't need to track */
+    },
+    writeFileSync: (p: string, data: string, _enc?: string) => {
+      files[p] = data;
+    },
+    appendFileSync: (p: string, data: string, _enc?: string) => {
+      files[p] = (files[p] ?? '') + data;
+    },
+    readFileSync: (p: string, _enc?: string) => {
+      if (!(p in files)) throw new Error(`ENOENT: ${p}`);
+      return files[p];
+    },
+  };
+});
+
+// This suite owns the queue semantics, not atomic-write's fd/fsync machinery.
+// Keep persistence in the same in-memory store while atomic-write has its own
+// dedicated tests. This avoids duplicating every current/future node:fs syscall
+// in a fragile full-module mock.
+vi.mock('../src/utils/atomic-write.js', () => ({
+  atomicWriteFileSync: (path: string, data: string | Buffer) => {
+    files[path] = Buffer.isBuffer(data) ? data.toString('utf8') : data;
   },
-  writeFileSync: (p: string, data: string, _enc?: string) => {
-    files[p] = data;
-  },
-  appendFileSync: (p: string, data: string, _enc?: string) => {
-    files[p] = (files[p] ?? '') + data;
-  },
-  readFileSync: (p: string, _enc?: string) => {
-    if (!(p in files)) throw new Error(`ENOENT: ${p}`);
-    return files[p];
-  },
-  // atomic-write（tmp+rename）会经过这两个调用
-  renameSync: (from: string, to: string) => {
-    if (!(from in files)) throw new Error(`ENOENT: ${from}`);
-    files[to] = files[from];
-    delete files[from];
-  },
-  unlinkSync: (p: string) => {
-    if (!(p in files)) throw new Error(`ENOENT: ${p}`);
-    delete files[p];
-  },
-  promises: {},
 }));
 
 vi.mock('../src/config.js', () => ({

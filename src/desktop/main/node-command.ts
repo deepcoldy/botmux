@@ -22,6 +22,16 @@ export interface BuildExternalBotmuxCommandInput {
   pathEnv?: string;
 }
 
+export interface BuildBundledBotmuxCommandInput {
+  nodePath: string;
+  cliPath: string;
+  botmuxHome: string;
+  args: string[];
+  baseEnv: NodeJS.ProcessEnv;
+  /** Probed user shell PATH (zsh/bash, profile+rc) — see probeShellPathEnv. */
+  pathEnv?: string;
+}
+
 export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxCommand {
   return {
     command: input.electronExecPath,
@@ -34,6 +44,28 @@ export function buildBotmuxCommand(input: BuildBotmuxCommandInput): BotmuxComman
       PM2_HOME: join(input.botmuxHome, 'pm2'),
       SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
     },
+  };
+}
+
+export function buildBundledBotmuxCommand(input: BuildBundledBotmuxCommandInput): BotmuxCommand {
+  const env: NodeJS.ProcessEnv = {
+    ...input.baseEnv,
+    // Finder-launched apps only carry launchd's minimal PATH. The daemon this
+    // command starts must still find per-bot CLIs (claude/codex/traex/... via
+    // nvm/fnm/homebrew) and a `node` for their `#!/usr/bin/env node` shebangs,
+    // so repair PATH: user's shell PATH first (their nvm node keeps winning,
+    // matching terminal behavior), bundled node as fallback, then well-known
+    // install dirs.
+    PATH: buildBundledPath(input.baseEnv.PATH, input.nodePath, input.pathEnv),
+    PM2_HOME: join(input.botmuxHome, 'pm2'),
+    SESSION_DATA_DIR: join(input.botmuxHome, 'data'),
+  };
+  delete env.ELECTRON_RUN_AS_NODE;
+
+  return {
+    command: input.nodePath,
+    args: [input.cliPath, ...input.args],
+    env,
   };
 }
 
@@ -53,6 +85,28 @@ export function buildExternalBotmuxCommand(input: BuildExternalBotmuxCommandInpu
     args: input.args,
     env,
   };
+}
+
+/**
+ * PATH for anything spawned on behalf of the bundled runtime (daemon start and
+ * pm2 contact alike — pm2's daemon env sticks and propagates into resurrected
+ * apps, so BOTH chains must agree on ordering or which `node` a per-bot CLI
+ * gets would depend on pm2 startup order). User shell PATH first: their
+ * nvm/fnm node keeps winning like in a terminal; the bundled node dir is only
+ * the fallback for `#!/usr/bin/env node` when the user has no node at all.
+ * Callers never rely on this PATH to locate node/pm2 themselves — both are
+ * invoked via absolute paths.
+ */
+export function buildBundledPath(current: string | undefined, nodePath: string, pathEnv: string | undefined): string {
+  return joinPathEntries([
+    pathEnv,
+    dirname(nodePath),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    current,
+  ]);
 }
 
 function buildExternalPath(current: string | undefined, binPath: string, pathEnv: string | undefined): string {

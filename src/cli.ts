@@ -12,6 +12,7 @@
  *   botmux logs [--lines] — view daemon logs
  *   botmux status         — show daemon status
  *   botmux upgrade|update — upgrade to latest version
+ *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to tmux
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux delete <id>    — close a session by ID prefix
@@ -405,6 +406,10 @@ function ecosystemConfig(): string {
 
   const baseApp = {
     script: daemonScript,
+    // Pin every managed core process to the Node that invoked this CLI. This
+    // keeps GUI/launchd starts independent from PATH and lets Desktop replace
+    // an external fleet without also killing unrelated plugin services.
+    interpreter: process.execPath,
     cwd: CONFIG_DIR,
     autorestart: true,
     max_restarts: 10,
@@ -452,6 +457,7 @@ function ecosystemConfig(): string {
   apps.push({
     name: 'botmux-dashboard',
     script: join(PKG_ROOT, 'dist', 'dashboard.js'),
+    interpreter: process.execPath,
     cwd: PKG_ROOT,
     autorestart: true,
     max_restarts: 10,
@@ -4443,6 +4449,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
   dashboard   打印新的 Web Dashboard 一次性登录 URL（旧 token 同时失效）
+  device enroll|status|logout
+              在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -7339,6 +7347,7 @@ botmux create-group — 用一组机器人新建飞书群
 用法:
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
                       [--working-dir <path>]
+                      [--kickoff-bot <open_id> --kickoff-prompt "文本"]
 
 参数:
   --bot <ref>     至少一个，可多次。ref 推荐用 bot 显示名（同 botmux send 的 @<name>）或完整 larkAppId；
@@ -7349,6 +7358,10 @@ botmux create-group — 用一组机器人新建飞书群
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
+  --kickoff-bot <open_id>  可选；建群成功后由 creator @ 该 bot 并发送 --kickoff-prompt，
+                 触发该 bot 自动开始工作（如 PR review）。需配合 --kickoff-prompt 使用。
+                 该 bot 必须已在 --bot 列表中（即已是群成员）。
+  --kickoff-prompt "文本"  可选；与 --kickoff-bot 配合使用，@ bot 后发送的 prompt 文本。
 
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
@@ -7356,6 +7369,8 @@ botmux create-group — 用一组机器人新建飞书群
     转不出来或为空则跳过对应步骤，stderr warning）。
   - 不依赖 botmux 会话，任何环境都能跑。
   - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
+  - --kickoff-bot/--kickoff-prompt：creator 建群后 @ 指定 bot 并发 prompt；该 bot 收到 @ 会自动起会话。
+    注意：creator 不能 @ 自己（自消息被忽略），故 --kickoff-bot 应选 creator 之外的 bot。
 
 输出协议（skill 友好）:
   - 成功（即使 transfer/notify 部分失败）：stdout 单行 chatId，exit 0；stderr 打人类提示 + applink。
@@ -7369,6 +7384,8 @@ botmux create-group — 用一组机器人新建飞书群
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
   const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
+  const kickoffBot = argValue(rest, '--kickoff-bot');
+  const kickoffPrompt = argValue(rest, '--kickoff-prompt');
 
   let bindWorkingDir: string | undefined;
   let bindWorkingDirResolved: string | undefined;
@@ -7410,7 +7427,7 @@ botmux create-group — 用一组机器人新建飞书群
   let botInfoEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
-  const { resolveBotRefs } = await import('./cli/create-group-resolver.js');
+  const { resolveBotRefs, resolveKickoff } = await import('./cli/create-group-resolver.js');
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
@@ -7433,6 +7450,16 @@ botmux create-group — 用一组机器人新建飞书群
   }
 
   const creatorLarkAppId = resolved.larkAppIds[0];
+  const kickoff = resolveKickoff(
+    kickoffBot,
+    kickoffPrompt,
+    resolved.larkAppIds,
+    botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botOpenId: b.botOpenId })),
+  );
+  if (!kickoff.ok) {
+    console.error(kickoff.error);
+    process.exit(1);
+  }
 
   // Register bots so getBotClient works inside service
   const fullConfigs = loadBotConfigs();
@@ -7471,6 +7498,8 @@ botmux create-group — 用一组机器人新建飞书群
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,
       bindWorkingDir,
+      kickoffBotLarkAppId: kickoff.targetLarkAppId,
+      kickoffPrompt: kickoff.prompt,
     });
   } catch (err: any) {
     console.error(`建群失败: ${err?.message ?? err}`);
@@ -7499,6 +7528,11 @@ botmux create-group — 用一组机器人新建飞书群
     console.error(`⚠️  @通知发送失败: ${result.notifyError}`);
   } else if (result.notifyMessageId) {
     console.error(`✅ @通知已发送 (msg ${result.notifyMessageId})`);
+  }
+  if (result.kickoffError) {
+    console.error(`⚠️  kickoff 消息发送失败: ${result.kickoffError}`);
+  } else if (result.kickoffMessageId) {
+    console.error(`✅ kickoff 消息已发送 (msg ${result.kickoffMessageId})`);
   }
   if (bindWorkingDir) {
     const ok = result.oncallBindings.filter(b => b.ok).length;
@@ -9022,6 +9056,11 @@ switch (command) {
     // `botmux bind <code>` — 把本机绑定到中心化平台
     const { cmdBind } = await import('./platform/bind.js');
     await cmdBind(process.argv.slice(3));
+    break;
+  }
+  case 'device': {
+    const { runDeviceCommand } = await import('./platform/device-command.js');
+    process.exitCode = await runDeviceCommand(process.argv.slice(3));
     break;
   }
   case 'list':

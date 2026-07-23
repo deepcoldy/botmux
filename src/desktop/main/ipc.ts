@@ -24,6 +24,7 @@ export function registerDesktopIpc(args: {
   // Keep the renderer's surface area narrow: every filesystem/process action
   // must go through an explicit handler here.
   ipcMain.handle('desktop:get-state', () => args.runtime.getState());
+  ipcMain.handle('desktop:get-device-status', () => args.runtime.getDeviceStatus());
   ipcMain.handle('desktop:start', () => runRuntimeAction(args.runtime.start, args.monitor));
   ipcMain.handle('desktop:stop', () => runRuntimeAction(args.runtime.stop, args.monitor));
   ipcMain.handle('desktop:restart', () => runRuntimeAction(args.runtime.restart, args.monitor));

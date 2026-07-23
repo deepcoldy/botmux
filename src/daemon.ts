@@ -105,6 +105,7 @@ import {
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
@@ -16594,6 +16595,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // SessionRow.botName.
   setBotName(cfg.displayName ?? cfg.larkAppId);
   setLarkAppId(cfg.larkAppId);
+  setDeviceIsolationDaemonIdentity({
+    larkAppId: cfg.larkAppId,
+    bootInstanceId: desc.bootInstanceId,
+  });
   selfV3LarkAppId = cfg.larkAppId; // scope v3 humanGate cold-attach / start to this bot
   selfV3BootInstanceId = desc.bootInstanceId;
 

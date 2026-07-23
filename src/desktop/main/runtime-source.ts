@@ -4,6 +4,7 @@ export interface Pm2AppSummary {
   name: string;
   script?: string;
   status?: string;
+  version?: string;
 }
 
 export interface RuntimeSourceInput {
@@ -14,13 +15,14 @@ export interface RuntimeSourceInput {
 export interface RuntimeSource {
   running: boolean;
   sourcePath: string | null;
+  sourceVersion: string | null;
 }
 
 export function classifyRuntimeSource(input: RuntimeSourceInput): RuntimeSource {
-  // CLI-first Desktop only needs to know whether a botmux PM2 process exists;
-  // ownership comes from the selected global CLI, not from a bundled path.
+  // The source path decides whether Desktop already owns the fleet or must
+  // replace an older/global installation with its bundled runtime.
   const botmuxApps = activeBotmuxApps(input.pm2Apps);
-  if (botmuxApps.length === 0) return { running: false, sourcePath: null };
+  if (botmuxApps.length === 0) return { running: false, sourcePath: null, sourceVersion: null };
 
   const sourcePaths = botmuxApps
     .map(app => app.script ? normalizeRuntimePath(app.script, input.normalizePath) : null)
@@ -28,6 +30,7 @@ export function classifyRuntimeSource(input: RuntimeSourceInput): RuntimeSource 
   return {
     running: true,
     sourcePath: sourcePaths[0] ?? null,
+    sourceVersion: botmuxApps.find(app => app.version)?.version ?? null,
   };
 }
 
@@ -41,7 +44,7 @@ export function parsePm2Apps(stdout: string): Pm2AppSummary[] {
     if (!Array.isArray(parsed)) return [];
     return parsed.flatMap(app => {
       if (!app || typeof app !== 'object') return [];
-      const record = app as { name?: unknown; script?: unknown; pm2_env?: { pm_exec_path?: unknown; status?: unknown } };
+      const record = app as { name?: unknown; script?: unknown; pm2_env?: { pm_exec_path?: unknown; status?: unknown; version?: unknown } };
       if (typeof record.name !== 'string') return [];
       const script = typeof record.script === 'string'
         ? record.script
@@ -49,7 +52,8 @@ export function parsePm2Apps(stdout: string): Pm2AppSummary[] {
           ? record.pm2_env.pm_exec_path
           : undefined;
       const status = typeof record.pm2_env?.status === 'string' ? record.pm2_env.status : undefined;
-      return [{ name: record.name, script, status }];
+      const version = typeof record.pm2_env?.version === 'string' ? record.pm2_env.version : undefined;
+      return [{ name: record.name, script, status, version }];
     });
   } catch {
     return [];
@@ -61,11 +65,15 @@ function activeBotmuxApps(pm2Apps: Pm2AppSummary[]): Pm2AppSummary[] {
 }
 
 function isBotmuxApp(app: Pm2AppSummary): boolean {
-  return app.name === 'botmux-dashboard' || app.name === 'botmux' || app.name.startsWith('botmux-');
+  return app.name === 'botmux-dashboard'
+    || app.name === 'botmux'
+    || (app.name.startsWith('botmux-') && !app.name.startsWith('botmux-plugin-'));
 }
 
 function isBotmuxDaemonApp(app: Pm2AppSummary): boolean {
-  return app.name !== 'botmux-dashboard' && (app.name === 'botmux' || app.name.startsWith('botmux-'));
+  return app.name !== 'botmux-dashboard'
+    && !app.name.startsWith('botmux-plugin-')
+    && (app.name === 'botmux' || app.name.startsWith('botmux-'));
 }
 
 function isActivePm2App(app: Pm2AppSummary): boolean {

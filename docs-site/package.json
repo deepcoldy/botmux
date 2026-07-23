@@ -3,7 +3,9 @@
   "private": true,
   "version": "0.0.0",
   "scripts": {
+    "predev": "node scripts/prepare-assets.mjs",
     "dev": "rspress dev",
+    "prebuild": "node scripts/prepare-assets.mjs",
     "build": "rspress build",
     "preview": "rspress preview"
   },

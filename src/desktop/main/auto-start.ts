@@ -6,6 +6,7 @@ export type AutoStartLaunchResult = 'started' | 'skipped' | 'failed';
 export interface AutoStartRuntime {
   getState(): Promise<DesktopRuntimeState>;
   start(): Promise<RunResult>;
+  takeover(): Promise<RunResult>;
 }
 
 export interface AutoStartMonitor {
@@ -13,10 +14,14 @@ export interface AutoStartMonitor {
 }
 
 export function shouldAutoStartCliRuntime(state: DesktopRuntimeState): boolean {
-  // Only a stopped, selected CLI runtime is safe to start automatically.
-  // Setup, degraded, and handoff states need user-visible recovery instead.
-  const cliSource = state.runtimeSource === 'global-cli';
-  return state.status === 'stopped' && state.runtimeManaged && cliSource;
+  return state.status === 'stopped' && state.runtimeManaged && state.runtimeSource !== 'none';
+}
+
+export function shouldTakeOverExternalRuntime(state: DesktopRuntimeState): boolean {
+  return state.status === 'degraded'
+    && !state.runtimeManaged
+    && state.runtimeSource === 'global-cli'
+    && Boolean(state.runtimePath);
 }
 
 export async function autoStartCliRuntimeOnLaunch(args: {
@@ -26,9 +31,10 @@ export async function autoStartCliRuntimeOnLaunch(args: {
 }): Promise<AutoStartLaunchResult> {
   try {
     const state = await args.runtime.getState();
-    if (!shouldAutoStartCliRuntime(state)) return 'skipped';
+    const takeover = shouldTakeOverExternalRuntime(state);
+    if (!shouldAutoStartCliRuntime(state) && !takeover) return 'skipped';
 
-    const result = await args.runtime.start();
+    const result = takeover ? await args.runtime.takeover() : await args.runtime.start();
     await refreshAfterLaunchAction(args.monitor, args.warn);
     if (result.code !== 0) {
       args.warn?.(`CLI auto-start failed: ${formatRunResult(result)}`);

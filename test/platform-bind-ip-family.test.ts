@@ -1,7 +1,7 @@
 // test/platform-bind-ip-family.test.ts
 // botmux bind 的协议族兜底链：默认路径不通 → 依次 IPv6 / IPv4 重试，
 // 但不再把 ipFamily 写进绑定文件（隧道始终用 happy-eyeballs 自动选路）。
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const postJson = vi.fn();
 vi.mock('../src/platform/platform-http.js', () => ({
@@ -26,19 +26,25 @@ import { cmdBind } from '../src/platform/bind.js';
 const blob = Buffer.from(JSON.stringify({ u: 'http://platform.test', t: 'code-1' })).toString('base64url');
 const okRes = { status: 200, json: { machineId: 'm-1', machineToken: 'tok-1' } };
 const netErr = () => Object.assign(new Error('connect ENETUNREACH'), { code: 'ENETUNREACH' });
+const hostOnly = { isAgentContext: () => false };
 
 describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
   beforeEach(() => {
     postJson.mockReset();
     readPlatformBinding.mockReset().mockReturnValue(null);
     writePlatformBinding.mockReset();
+    process.exitCode = undefined;
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
   });
 
+  afterEach(() => {
+    process.exitCode = undefined;
+  });
+
   it('默认路径成功：不写 ipFamily', async () => {
     postJson.mockResolvedValueOnce(okRes);
-    await cmdBind([blob]);
+    await cmdBind([blob], hostOnly);
     expect(postJson).toHaveBeenCalledTimes(1);
     expect((postJson.mock.calls[0][2] as { family?: number }).family).toBeUndefined();
     expect(writePlatformBinding).toHaveBeenCalledTimes(1);
@@ -47,7 +53,7 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
 
   it('默认不通、IPv6 兜底成功：不写 ipFamily', async () => {
     postJson.mockRejectedValueOnce(netErr()).mockResolvedValueOnce(okRes);
-    await cmdBind([blob]);
+    await cmdBind([blob], hostOnly);
     expect(postJson).toHaveBeenCalledTimes(2);
     expect((postJson.mock.calls[1][2] as { family?: number }).family).toBe(6);
     expect(writePlatformBinding.mock.calls[0][0]).not.toHaveProperty('ipFamily');
@@ -56,7 +62,7 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
 
   it('默认与 IPv6 都不通、IPv4 兜底成功：不写 ipFamily', async () => {
     postJson.mockRejectedValueOnce(netErr()).mockRejectedValueOnce(netErr()).mockResolvedValueOnce(okRes);
-    await cmdBind([blob]);
+    await cmdBind([blob], hostOnly);
     expect(postJson).toHaveBeenCalledTimes(3);
     expect((postJson.mock.calls[2][2] as { family?: number }).family).toBe(4);
     expect(writePlatformBinding.mock.calls[0][0]).not.toHaveProperty('ipFamily');
@@ -67,10 +73,20 @@ describe('cmdBind 协议族兜底（不落盘 ipFamily）', () => {
     const exit = vi.spyOn(process, 'exit').mockImplementation(() => {
       throw new Error('exit');
     });
-    await expect(cmdBind([blob])).rejects.toThrow('exit');
+    await expect(cmdBind([blob], hostOnly)).rejects.toThrow('exit');
     expect(exit).toHaveBeenCalledWith(1);
     expect(postJson).toHaveBeenCalledTimes(3);
     expect(writePlatformBinding).not.toHaveBeenCalled();
     exit.mockRestore();
+  });
+
+  it('managed agent context is rejected before consuming the blob or touching network/storage', async () => {
+    await cmdBind([blob], { isAgentContext: () => true });
+
+    expect(process.exitCode).toBe(2);
+    expect(postJson).not.toHaveBeenCalled();
+    expect(readPlatformBinding).not.toHaveBeenCalled();
+    expect(writePlatformBinding).not.toHaveBeenCalled();
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining('宿主终端'));
   });
 });

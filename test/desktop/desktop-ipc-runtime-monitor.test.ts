@@ -121,6 +121,32 @@ describe('desktop IPC runtime monitor', () => {
       openAsHidden: true,
     });
   });
+
+  it('registers a narrow device-status IPC that returns only the runtime DTO', async () => {
+    const { registerDesktopIpc } = await import('../../src/desktop/main/ipc.js');
+    const getDeviceStatus = vi.fn().mockResolvedValue({
+      ok: true,
+      status: { schemaVersion: 1, enrolled: false },
+    });
+    registerDesktopIpc({
+      paths: desktopPaths,
+      runtime: {
+        getState: vi.fn(),
+        getDeviceStatus,
+        start: vi.fn(),
+        stop: vi.fn(),
+        restart: vi.fn(),
+        takeover: vi.fn(),
+        dashboard: vi.fn(),
+      } as any,
+    });
+
+    await expect(handlers.get('desktop:get-device-status')?.({} as any)).resolves.toEqual({
+      ok: true,
+      status: { schemaVersion: 1, enrolled: false },
+    });
+    expect(getDeviceStatus).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('desktop dashboard locate IPC', () => {
@@ -185,7 +211,7 @@ describe('desktop dashboard locate IPC', () => {
     });
     vi.stubGlobal('fetch', fetch);
     const output = [
-      'https://m-test.botmux.bytedance.net/?t=platform-token',
+      'https://m-test.botmux.example.test/?t=platform-token',
       '本地直连(平台异常时可用): http://10.92.89.226:7891/?t=local-token',
     ].join('\n');
     const runtime = {

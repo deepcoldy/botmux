@@ -93,6 +93,7 @@ import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
+import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1293,6 +1294,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
+  ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
@@ -1397,6 +1399,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   armWorkerKillBackstop(w, tag(ds));
 
   ds.worker = null;
+  ds.localProcessAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
@@ -1877,6 +1880,19 @@ export function forkWorker(
     dispatchAttempt?: number;
   } = false,
 ): void {
+  // Device enrollment briefly freezes every daemon before the one-way host
+  // marker is installed and legacy local CLIs are torn down. Do this before
+  // ANY session mutation or child fork. One deferred spawn per logical session
+  // is replayed after the exact freeze lease is released; a session closed by
+  // the activation transaction is deliberately not revived.
+  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
+    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      forkWorker(ds, promptInput, resumeOrTurnId);
+    }
+  })) {
+    logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    return;
+  }
   const cb = requireCallbacks();
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
@@ -1895,6 +1911,7 @@ export function forkWorker(
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
+  ds.localProcessAttestation = undefined;
 
   let resume = false;
   let initTurnId: string | undefined;
@@ -2348,6 +2365,23 @@ function setupWorkerHandlers(
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
+        break;
+      }
+      case 'local_process_attestation': {
+        // This message arrives over the private parent<->worker IPC channel;
+        // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
+        // Bind it to the daemon's current worker generation so a late message
+        // from a replaced worker never attests the replacement process.
+        if (ds.worker !== worker) break;
+        ds.localProcessAttestation = {
+          backendType: msg.backendType,
+          credentialIsolated: msg.credentialIsolated,
+          ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
+          ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(ds.workerGeneration !== undefined
+            ? { workerGeneration: ds.workerGeneration }
+            : {}),
+        };
         break;
       }
       case 'ready': {

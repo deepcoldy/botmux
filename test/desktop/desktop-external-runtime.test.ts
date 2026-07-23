@@ -10,15 +10,16 @@ const paths = {
   pm2Home: '/home/.botmux/pm2',
 };
 
-describe('desktop external CLI runtime wiring', () => {
-  it('wires external CLI discovery into the runtime service', () => {
+describe('desktop external CLI runtime discovery', () => {
+  it('wires the bundled runtime into the production Desktop service', () => {
     const mainSource = readFileSync(
       fileURLToPath(new URL('../../src/desktop/main.ts', import.meta.url)),
       'utf-8',
     );
 
-    expect(mainSource).toContain('discoverExternalRuntimeCandidate');
-    expect(mainSource).toContain('discoverExternalRuntime: () => discoverExternalRuntimeCandidate(paths)');
+    expect(mainSource).toContain('resolveBundledRuntimeCandidate');
+    expect(mainSource).toContain('bundledRuntime,');
+    expect(mainSource).not.toContain('discoverExternalRuntime:');
   });
 
   it('selects an npm-installed botmux runtime outside the bundled app', () => {
@@ -189,6 +190,104 @@ describe('desktop external CLI runtime wiring', () => {
       binPath: '/home/.botmux/bin/botmux',
       root: '/Users/me/src/botmux',
       pathEnv: shellPath,
+    });
+  });
+
+  it('discovers an rc-only (nvm-in-.zshrc) install through the interactive zsh probe', () => {
+    const nvmBin = '/Users/me/.nvm/versions/node/v22.22.2/bin';
+    const files = new Map([
+      [`/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/package.json`, JSON.stringify({ name: 'botmux', version: '2.32.0' })],
+      [`/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/dist/cli.js`, ''],
+    ]);
+
+    const candidate = discoverExternalRuntimeCandidate(paths, {
+      platform: 'darwin',
+      env: {},
+      execFileSync: (file, args) => {
+        if (file !== '/bin/zsh') return '';
+        // Login shell (.zprofile) has no nvm dir and no botmux; only the
+        // interactive rc (.zshrc) probe surfaces both.
+        if (args[0] === '-lc') return '__BOTMUX_PATH__/usr/bin:/bin\n';
+        return `Welcome banner from .zshrc\n__BOTMUX_PATH__${nvmBin}:/usr/bin:/bin\n${nvmBin}/botmux\n`;
+      },
+      existsSync: path => files.has(path),
+      readFileSync: path => files.get(path) ?? '',
+      realpathSync: path => path === `${nvmBin}/botmux`
+        ? '/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/dist/cli.js'
+        : path,
+      statSync: path => ({ size: files.get(path)?.length ?? 100_000 }),
+    });
+
+    expect(candidate).toMatchObject({
+      binPath: `${nvmBin}/botmux`,
+      version: '2.32.0',
+      // Interactive PATH is probed first, so nvm's prepend stays in front.
+      pathEnv: `${nvmBin}:/usr/bin:/bin`,
+    });
+  });
+
+  it('probes the bash login shell for bash users', () => {
+    const nvmBin = '/Users/me/.nvm/versions/node/v22.22.2/bin';
+    const files = new Map([
+      [`/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/package.json`, JSON.stringify({ name: 'botmux', version: '2.32.0' })],
+      [`/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/dist/cli.js`, ''],
+    ]);
+
+    const candidate = discoverExternalRuntimeCandidate(paths, {
+      platform: 'darwin',
+      env: { SHELL: '/bin/bash' },
+      execFileSync: (file, args) => {
+        // Only the user's bash rc file knows about the nvm install.
+        if (file === '/bin/bash' && args[0] === '-ic') {
+          return `__BOTMUX_PATH__${nvmBin}:/usr/bin:/bin\n${nvmBin}/botmux\n`;
+        }
+        return '';
+      },
+      existsSync: path => files.has(path),
+      readFileSync: path => files.get(path) ?? '',
+      realpathSync: path => path === `${nvmBin}/botmux`
+        ? '/Users/me/.nvm/versions/node/v22.22.2/lib/node_modules/botmux/dist/cli.js'
+        : path,
+      statSync: path => ({ size: files.get(path)?.length ?? 100_000 }),
+    });
+
+    expect(candidate).toMatchObject({
+      binPath: `${nvmBin}/botmux`,
+      version: '2.32.0',
+      pathEnv: `${nvmBin}:/usr/bin:/bin`,
+    });
+  });
+
+  it('attaches the probed shell PATH to bins found outside the shell probe', () => {
+    const files = new Map([
+      ['/usr/local/lib/node_modules/botmux/package.json', JSON.stringify({ name: 'botmux', version: '2.9.0' })],
+      ['/usr/local/lib/node_modules/botmux/dist/cli.js', ''],
+    ]);
+
+    const candidate = discoverExternalRuntimeCandidate(paths, {
+      platform: 'darwin',
+      env: {},
+      execFileSync: (file, args) => {
+        // `which` (GUI PATH) finds the bin; the shell probes only know the PATH.
+        if (file === 'which') return '/usr/local/bin/botmux\n';
+        if (file === '/bin/zsh' && args[0] === '-ic') {
+          return '__BOTMUX_PATH__/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin\n';
+        }
+        return '';
+      },
+      existsSync: path => files.has(path),
+      readFileSync: path => files.get(path) ?? '',
+      realpathSync: path => path === '/usr/local/bin/botmux'
+        ? '/usr/local/lib/node_modules/botmux/dist/cli.js'
+        : path,
+      statSync: path => ({ size: files.get(path)?.length ?? 100_000 }),
+    });
+
+    // The daemon started from this bin still needs the shell PATH to find
+    // nvm-managed `node` and per-bot CLIs.
+    expect(candidate).toMatchObject({
+      binPath: '/usr/local/bin/botmux',
+      pathEnv: '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/local/bin:/usr/bin:/bin',
     });
   });
 

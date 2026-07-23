@@ -3,6 +3,11 @@ import { readFileSync } from 'node:fs';
 import {
   buildSeatbeltProfile,
   evaluateReadIsolationGate,
+  evaluateCredentialOnlyIsolationGate,
+  credentialIsolationRequired,
+  deviceCredentialIsolationMarkerPath,
+  isCredentialIsolationReservedBasename,
+  buildCredentialIsolationRules,
   isolatedPaneReattachSafe,
   botHomePath,
   buildV2DenyPaths,
@@ -48,6 +53,110 @@ describe('normalizeIsolationPath (path hardening)', () => {
 
   it('strips trailing slashes', () => {
     expect(normalizeIsolationPath('/a/b/')).toBe('/a/b');
+  });
+});
+
+describe('mandatory device credential isolation gate', () => {
+  it('uses a fixed home marker and recognizes every credential journal sidecar', () => {
+    expect(deviceCredentialIsolationMarkerPath('/Users/bot/'))
+      .toBe('/Users/bot/.botmux/.device-credential-isolation');
+    for (const name of [
+      '.device-credential-isolation',
+      '.device-credential-isolation.1.tmp',
+      'device-auth',
+      'device.json',
+      'device.json.1.tmp',
+      'platform.json.backup',
+      'device-enroll-pending.json',
+      'device-enroll-pending.json.42.random.tmp',
+    ]) expect(isCredentialIsolationReservedBasename(name)).toBe(true);
+    expect(isCredentialIsolationReservedBasename('device.jsonx')).toBe(false);
+    expect(isCredentialIsolationReservedBasename('ordinary.json')).toBe(false);
+  });
+
+  it('activates on marker OR device credential and bypasses only the remote backend', () => {
+    expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: false })).toBe(false);
+    expect(credentialIsolationRequired({ markerExists: true, deviceCredentialExists: false })).toBe(true);
+    expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: true })).toBe(true);
+    expect(evaluateCredentialOnlyIsolationGate({
+      markerExists: true,
+      deviceCredentialExists: false,
+      remoteBackend: true,
+      platform: 'win32',
+      mechanismAvailable: false,
+      fullIsolationCoversCredentials: false,
+    })).toEqual({ required: true, mode: 'remote-bypass' });
+  });
+
+  it('is independent of adapter support/default sandbox config and chooses the minimal local wrapper', () => {
+    // No adapterSupports/sandbox input exists by design: this is the regression
+    // guard for unsupported adapters and the default sandbox=false path.
+    expect(evaluateCredentialOnlyIsolationGate({
+      markerExists: true,
+      deviceCredentialExists: false,
+      remoteBackend: false,
+      platform: 'darwin',
+      mechanismAvailable: true,
+      fullIsolationCoversCredentials: false,
+    })).toEqual({ required: true, mode: 'seatbelt' });
+    expect(evaluateCredentialOnlyIsolationGate({
+      markerExists: false,
+      deviceCredentialExists: true,
+      remoteBackend: false,
+      platform: 'linux',
+      mechanismAvailable: true,
+      fullIsolationCoversCredentials: false,
+    })).toEqual({ required: true, mode: 'bwrap' });
+    expect(evaluateCredentialOnlyIsolationGate({
+      markerExists: true,
+      deviceCredentialExists: false,
+      remoteBackend: false,
+      platform: 'linux',
+      mechanismAvailable: false,
+      fullIsolationCoversCredentials: true,
+    })).toEqual({ required: true, mode: 'covered' });
+  });
+
+  it('fails closed without a local execution mechanism or on unsupported platforms', () => {
+    const linux = evaluateCredentialOnlyIsolationGate({
+      markerExists: true,
+      deviceCredentialExists: false,
+      remoteBackend: false,
+      platform: 'linux',
+      mechanismAvailable: false,
+      fullIsolationCoversCredentials: false,
+    });
+    expect(linux.mode).toBe('blocked');
+    const windows = evaluateCredentialOnlyIsolationGate({
+      markerExists: true,
+      deviceCredentialExists: false,
+      remoteBackend: false,
+      platform: 'win32',
+      mechanismAvailable: true,
+      fullIsolationCoversCredentials: false,
+    });
+    expect(windows.mode).toBe('blocked');
+  });
+
+  it('builds exact + sidecar read/write rules for fixed and custom roots', () => {
+    const rules = buildCredentialIsolationRules({
+      homeDir: '/Users/bot',
+      defaultBotmuxHome: '/private/default-botmux',
+      botmuxHome: '/srv/botmux',
+    });
+    for (const root of ['/private/default-botmux', '/srv/botmux']) {
+      expect(rules.denyPaths).toContain(`${root}/device-auth`);
+      expect(rules.denyWritePaths).toContain(`${root}/device-auth`);
+      for (const file of ['device.json', 'platform.json', 'device-enroll-pending.json']) {
+        expect(rules.denyPaths).toContain(`${root}/${file}`);
+        expect(rules.denyWritePaths).toContain(`${root}/${file}`);
+        const sidecar = `${root}/${file}.12.random.tmp`;
+        expect(rules.denyRegexes.some(pattern => new RegExp(pattern).test(sidecar))).toBe(true);
+        expect(rules.denyWriteRegexes.some(pattern => new RegExp(pattern).test(sidecar))).toBe(true);
+      }
+    }
+    expect(rules.denyPaths).toContain('/private/default-botmux/.device-credential-isolation');
+    expect(rules.denyWriteLiterals).toEqual(['/private/default-botmux', '/srv/botmux']);
   });
 });
 
@@ -151,6 +260,49 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/srv/botmux/.dashboard-secret.repair-seed',
     ]) expect(regexes.some(regex => regex.test(path))).toBe(true);
     expect(regexes.some(regex => regex.test('/Users/bot/.botmux/.dashboard-secretx'))).toBe(false);
+  });
+
+  it('denies device and machine credentials at fixed/custom roots, including atomic sidecars', () => {
+    const ctx = v2({
+      botmuxHome: '/srv/botmux',
+      sessionDataDir: '/srv/botmux/data',
+    });
+    const credentialPaths = [
+      '/Users/bot/.botmux/device-auth',
+      '/Users/bot/.botmux/device.json',
+      '/Users/bot/.botmux/platform.json',
+      '/Users/bot/.botmux/device-enroll-pending.json',
+      '/srv/botmux/device-auth',
+      '/srv/botmux/device.json',
+      '/srv/botmux/platform.json',
+      '/srv/botmux/device-enroll-pending.json',
+    ];
+    const rootCredentialFiles = credentialPaths.filter(path => !path.endsWith('/device-auth'));
+    const deny = buildV2DenyPaths(ctx);
+    for (const path of credentialPaths) expect(deny).toContain(path);
+
+    const readRegexes = buildV2DenyRegexes(ctx).map(pattern => new RegExp(pattern));
+    for (const path of [
+      ...rootCredentialFiles,
+      '/Users/bot/.botmux/device.json.42.a1b2c3d4.tmp',
+      '/Users/bot/.botmux/platform.json.42.a1b2c3d4.tmp',
+      '/Users/bot/.botmux/device-enroll-pending.json.42.a1b2c3d4.tmp',
+      '/srv/botmux/device.json.backup',
+      '/srv/botmux/platform.json.42.a1b2c3d4.tmp',
+      '/srv/botmux/device-enroll-pending.json.recovery',
+    ]) expect(readRegexes.some(regex => regex.test(path))).toBe(true);
+    expect(readRegexes.some(regex => regex.test('/srv/botmux/device.jsonx'))).toBe(false);
+
+    const protectedWrites = buildReadIsolationProtectedWriteRules(ctx);
+    for (const path of credentialPaths) expect(protectedWrites.denyWritePaths).toContain(path);
+    const writeRegexes = protectedWrites.denyWriteRegexes.map(pattern => new RegExp(pattern));
+    expect(writeRegexes.some(regex => regex.test(
+      '/srv/botmux/device.json.42.a1b2c3d4.tmp',
+    ))).toBe(true);
+
+    // Host credentials never receive an own-bot carve-out.
+    const carve = buildV2CarveOuts(ctx);
+    for (const path of credentialPaths) expect(carve.allowPaths).not.toContain(path);
   });
 
   it('uses the canonical fixed dashboard root for exact and sidecar rules', () => {
@@ -378,6 +530,9 @@ describe('buildSeatbeltProfile (verified format)', () => {
     expect(prof).toContain('(allow default)');
     expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.botmux/bots.json"))');
     expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.botmux/bots"))');
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.botmux/device-auth"))');
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.botmux/device.json"))');
+    expect(prof).toContain('(deny file-read* (subpath "/Users/bot/.botmux/platform.json"))');
   });
 
   it('emits carve-out allows AFTER the denies (last-match wins) so own slices re-open', () => {
@@ -533,6 +688,30 @@ describe('macOS write-sandbox (buildWriteSandboxRules)', () => {
     expect(r.denyWritePaths).toContain('/Users/bot/.aws');
     expect(r.denyWritePaths).toContain('/Users/bot/.botmux/bots.json'); // can't tamper other bots' creds
     expect(r.denyWritePaths).toContain('/Users/bot/.botmux/.dashboard-secret');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/device-auth');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/device.json');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/platform.json');
+    expect(r.denyWritePaths).toContain('/Users/bot/.botmux/device-enroll-pending.json');
+    const denyRegexes = r.denyWriteRegexes.map(pattern => new RegExp(pattern));
+    expect(denyRegexes.some(regex => regex.test(
+      '/Users/bot/.botmux/device.json.42.a1b2c3d4.tmp',
+    ))).toBe(true);
+
+    const custom = buildWriteSandboxRules(ws({
+      botmuxHome: '/private/state/custom-botmux',
+      defaultBotmuxHome: '/private/state/default-botmux',
+      sessionDataDir: '/private/state/custom-botmux/data',
+    }));
+    for (const path of [
+      '/private/state/default-botmux/device-auth',
+      '/private/state/default-botmux/device.json',
+      '/private/state/default-botmux/platform.json',
+      '/private/state/default-botmux/device-enroll-pending.json',
+      '/private/state/custom-botmux/device-auth',
+      '/private/state/custom-botmux/device.json',
+      '/private/state/custom-botmux/platform.json',
+      '/private/state/custom-botmux/device-enroll-pending.json',
+    ]) expect(custom.denyWritePaths).toContain(path);
   });
 
   it('folds extraWritePaths (custom TMPDIR / worktrees) and drops unsafe ones', () => {
@@ -547,11 +726,13 @@ describe('macOS write-sandbox (buildWriteSandboxRules)', () => {
       allowWritePaths: ['/Users/bot/projects/app'],
       allowWriteRegexes: ['^/Users/bot/\\.claude\\.json\\.tmp\\.[^/]+$'],
       denyWritePaths: ['/Users/bot/.ssh'],
+      denyWriteRegexes: ['^/Users/bot/\\.botmux/device\\.json(?:\\.|$)'],
     });
     expect(prof).toContain('(deny file-write* (subpath "/"))');
     expect(prof).toContain('(allow file-write* (subpath "/Users/bot/projects/app"))');
     expect(prof).toContain('(allow file-write* (regex #"^/Users/bot/\\.claude\\.json\\.tmp\\.[^/]+$"))');
     expect(prof).toContain('(deny file-write* (subpath "/Users/bot/.ssh"))');
+    expect(prof).toContain('(deny file-write* (regex #"^/Users/bot/\\.botmux/device\\.json(?:\\.|$)"))');
     // ORDER matters (Seatbelt last-match wins): deny-all < allow project < final deny ssh
     const iDenyAll = prof.indexOf('(deny file-write* (subpath "/"))');
     const iAllow = prof.indexOf('(allow file-write* (subpath "/Users/bot/projects/app"))');
@@ -621,6 +802,15 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
       '/Users/bot/.botmux/.dashboard-token',
       '/srv/botmux/.dashboard-secret',
       '/srv/botmux/.dashboard-token',
+      '/Users/bot/.botmux/device-auth',
+      '/Users/bot/.botmux/device.json',
+      '/Users/bot/.botmux/platform.json',
+      '/Users/bot/.botmux/device-enroll-pending.json',
+      '/Users/bot/.botmux/.device-credential-isolation',
+      '/srv/botmux/device-auth',
+      '/srv/botmux/device.json',
+      '/srv/botmux/platform.json',
+      '/srv/botmux/device-enroll-pending.json',
       '/srv/botmux/data/.botmux-cli-pids',
     ]) expect(masks).toContain(path);
   });
@@ -639,13 +829,26 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
 });
 
 describe('isolatedPaneReattachSafe', () => {
-  it('trusts only panes stamped with the current isolation policy version', () => {
-    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent('boot-abc'))).toBe(true);
+  it('trusts only panes stamped with the current isolation policy version and required capabilities', () => {
+    expect(isolatedPaneReattachSafe(
+      isolationPaneMarkerContent('boot-abc', ['credential', 'read', 'write']),
+    )).toBe(true);
+    const credentialOnly = isolationPaneMarkerContent('boot-abc', ['credential']);
+    expect(isolatedPaneReattachSafe(credentialOnly, ['credential'])).toBe(true);
+    expect(isolatedPaneReattachSafe(credentialOnly, ['credential', 'read'])).toBe(false);
+    const full = isolationPaneMarkerContent('boot-abc', ['write', 'credential', 'read', 'write']);
+    expect(JSON.parse(full).capabilities).toEqual(['credential', 'read', 'write']);
+    expect(isolatedPaneReattachSafe(full, ['write', 'credential'])).toBe(true);
     // Legacy unversioned or older-policy panes keep their old Seatbelt rules in
     // memory and must be killed + cold-spawned after a security upgrade.
     expect(isolatedPaneReattachSafe('boot-abc')).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 1, bootId: 'old' }))).toBe(false);
     expect(isolatedPaneReattachSafe(JSON.stringify({ version: 2, bootId: 'old-mcp-policy' }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 5, bootId: 'pre-device-policy' }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ version: 7, bootId: 'missing-capabilities' }))).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 7, bootId: 'unknown-capability', capabilities: ['credential', 'network'],
+    }))).toBe(false);
     // No / blank marker → pane was NOT spawned isolated → unsafe (kill + cold-spawn).
     expect(isolatedPaneReattachSafe(null)).toBe(false);
     expect(isolatedPaneReattachSafe(undefined)).toBe(false);
@@ -683,6 +886,21 @@ describe('worker capability carve-out ordering', () => {
     expect(allowAt).toBeGreaterThan(denyAt);
     expect(writeDenyAt).toBeGreaterThan(allowAt);
     expect(profileAt).toBeGreaterThan(writeDenyAt);
+  });
+
+  it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {
+    const gateAt = source.indexOf('if (mandatoryCredentialIsolation && cfg.adoptMode)');
+    const adoptAt = source.indexOf("if (cfg.adoptMode && cfg.adoptSource === 'herdr'");
+    const wrapperAt = source.indexOf('if (cfg.wrapperCli && cfg.wrapperCli.trim())');
+    const credentialWrapperAt = source.indexOf('if (!willReattachPersistent && credentialOnlySeatbelt)');
+    const spawnAt = source.indexOf('backend.spawn(spawnBin, spawnArgs, {');
+    expect(gateAt).toBeGreaterThanOrEqual(0);
+    expect(gateAt).toBeLessThan(adoptAt);
+    expect(credentialWrapperAt).toBeGreaterThan(wrapperAt);
+    expect(credentialWrapperAt).toBeLessThan(spawnAt);
+    expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
+    expect(source).toContain('isCredentialIsolationReservedBasename(name)');
+    expect(source).toContain('isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)');
   });
 });
 

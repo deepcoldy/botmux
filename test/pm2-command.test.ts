@@ -51,10 +51,10 @@ describe('buildPm2SpawnCommand', () => {
     });
   });
 
-  it('keeps direct script execution on Unix platforms', () => {
+  it('runs package-local PM2 through the current Node on Unix platforms', () => {
     expect(buildPm2SpawnCommand('/app/node_modules/pm2/bin/pm2', ['status'], 'linux', '/usr/bin/node')).toEqual({
-      command: '/app/node_modules/pm2/bin/pm2',
-      args: ['status'],
+      command: '/usr/bin/node',
+      args: ['/app/node_modules/pm2/bin/pm2', 'status'],
     });
   });
 });

@@ -1,7 +1,8 @@
 import { execFileSync as defaultExecFileSync } from 'node:child_process';
 import { existsSync as defaultExistsSync, readFileSync as defaultReadFileSync, realpathSync as defaultRealpathSync, statSync as defaultStatSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import type { DesktopPaths } from '../shared/types.js';
+import { shellPathProbes } from '../shared/shell-path-probes.js';
 import type { ExternalRuntimeCandidate } from './runtime-service.js';
 import { resolveEffectiveBotmuxVersion } from '../../utils/version-info.js';
 
@@ -34,6 +35,7 @@ interface InstallProbeDeps {
 export interface ExternalRuntimeDiscoveryDeps {
   binPaths?: string[];
   platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
   execFileSync?: ExecFile;
   existsSync?: (path: string) => boolean;
   readFileSync?: ReadTextFile;
@@ -157,15 +159,23 @@ function resolveBotmuxBin(binPath: string, deps: InstallProbeDeps): { root: stri
 function listBotmuxBins(paths: DesktopPaths, deps: ExternalRuntimeDiscoveryDeps): DiscoveredBin[] {
   const execFile = deps.execFileSync ?? (defaultExecFileSync as unknown as ExecFile);
   const platform = deps.platform ?? process.platform;
+  // macOS GUI apps miss the user's shell PATH, so ask the user's shell (zsh or
+  // bash, profile and rc flavors) — see shellPathProbes for the ladder.
+  const shellProbe = platform === 'darwin'
+    ? cachedShellPathWhich(execFile, deps)
+    : { bins: [], pathEnv: undefined };
+  // The merged shell PATH is attached to every candidate (not only shell-found
+  // ones): whichever bin wins, the daemon it starts needs that PATH to find
+  // `node` and the per-bot CLIs when they live in nvm/fnm-managed directories.
+  const pathEnv = shellProbe.pathEnv;
   const bins: DiscoveredBin[] = [
-    ...runWhich(execFile, platform).map(binPath => ({ binPath })),
-    // macOS GUI apps often miss the user's login shell PATH, so ask zsh too.
-    ...(platform === 'darwin' ? runLoginShellWhich(execFile) : []),
+    ...runWhich(execFile, platform).map(binPath => ({ binPath, pathEnv })),
+    ...shellProbe.bins.map(binPath => ({ binPath, pathEnv })),
     // User-owned wrappers are useful fallbacks, but should not override the CLI
     // that the user's shell actually resolves for `botmux`.
-    { binPath: join(paths.botmuxHome, 'bin', 'botmux') },
-    { binPath: '/opt/homebrew/bin/botmux' },
-    { binPath: '/usr/local/bin/botmux' },
+    { binPath: join(paths.botmuxHome, 'bin', 'botmux'), pathEnv },
+    { binPath: '/opt/homebrew/bin/botmux', pathEnv },
+    { binPath: '/usr/local/bin/botmux', pathEnv },
   ];
 
   const byBin = new Map<string, DiscoveredBin>();
@@ -196,17 +206,79 @@ function runWhich(execFile: ExecFile, platform: NodeJS.Platform): string[] {
   }
 }
 
-function runLoginShellWhich(execFile: ExecFile): DiscoveredBin[] {
-  try {
-    const out = execFile('/bin/zsh', ['-lc', `printf '${LOGIN_SHELL_PATH_MARKER}%s\\n' "$PATH"; which -a botmux`], {
-      encoding: 'utf-8',
-      timeout: 3_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return splitLoginShellWhichOutput(out);
-  } catch {
-    return [];
+// Runtime state is polled every ~5s (createRuntimeStateMonitor) and each poll
+// re-runs discovery. Spawning up to 4 rc-sourcing shells per poll is far too
+// heavy, so the probe result is cached: shell PATH essentially never changes
+// mid-run. A miss (no bins) expires within one poll period so a user who
+// installs botmux while the app shows "install CLI" (or hits an explicit
+// retry) never sees a stale miss for more than ~one refresh.
+const SHELL_PROBE_HIT_TTL_MS = 5 * 60_000;
+const SHELL_PROBE_MISS_TTL_MS = 5_000;
+let shellProbeCache: { at: number; value: { bins: string[]; pathEnv?: string } } | null = null;
+
+/**
+ * Merged login+interactive shell PATH for GUI-launched processes (darwin only;
+ * undefined elsewhere or when probing fails). The bundled-runtime daemon spawn
+ * uses this so per-bot CLIs installed via nvm/fnm/homebrew stay findable —
+ * PtyBackend spawns CLIs without any rc-sourcing shell wrapper, so whatever
+ * PATH the daemon starts with is what `#!/usr/bin/env node` resolves against.
+ */
+export function probeShellPathEnv(): string | undefined {
+  if (process.platform !== 'darwin') return undefined;
+  const execFile = defaultExecFileSync as unknown as ExecFile;
+  return cachedShellPathWhich(execFile, {}).pathEnv;
+}
+
+function cachedShellPathWhich(
+  execFile: ExecFile,
+  deps: ExternalRuntimeDiscoveryDeps,
+): { bins: string[]; pathEnv?: string } {
+  // Tests inject execFileSync/env; caching across injected deps would leak
+  // state between tests, so the cache only serves the production defaults.
+  const cacheable = !deps.execFileSync && !deps.env;
+  if (cacheable && shellProbeCache) {
+    const ttl = shellProbeCache.value.bins.length ? SHELL_PROBE_HIT_TTL_MS : SHELL_PROBE_MISS_TTL_MS;
+    if (Date.now() - shellProbeCache.at < ttl) return shellProbeCache.value;
   }
+  const value = runShellPathWhich(execFile, deps.env ?? process.env);
+  if (cacheable) shellProbeCache = { at: Date.now(), value };
+  return value;
+}
+
+function runShellPathWhich(execFile: ExecFile, env: NodeJS.ProcessEnv): { bins: string[]; pathEnv?: string } {
+  const bins: string[] = [];
+  const pathParts: string[] = [];
+  const seenBins = new Set<string>();
+  const seenParts = new Set<string>();
+
+  for (const probe of shellPathProbes(env)) {
+    let out: string;
+    try {
+      // `|| true` keeps the probe's $PATH usable even when this particular
+      // shell flavor cannot see botmux — the PATH is still needed downstream.
+      out = execFile(probe.shell, [probe.flags, `printf '${LOGIN_SHELL_PATH_MARKER}%s\\n' "$PATH"; which -a botmux || true`], {
+        encoding: 'utf-8',
+        timeout: 3_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      continue;
+    }
+    const parsed = splitLoginShellWhichOutput(out);
+    for (const bin of parsed.bins) {
+      if (seenBins.has(bin)) continue;
+      seenBins.add(bin);
+      bins.push(bin);
+    }
+    for (const part of parsed.pathEnv?.split(delimiter) ?? []) {
+      const trimmed = part.trim();
+      if (!trimmed || seenParts.has(trimmed)) continue;
+      seenParts.add(trimmed);
+      pathParts.push(trimmed);
+    }
+  }
+
+  return { bins, ...(pathParts.length ? { pathEnv: pathParts.join(delimiter) } : {}) };
 }
 
 function readPackageVersion(
@@ -234,14 +306,16 @@ function splitCommandOutput(out: string): string[] {
   return out.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
 }
 
-function splitLoginShellWhichOutput(out: string): DiscoveredBin[] {
+function splitLoginShellWhichOutput(out: string): { bins: string[]; pathEnv?: string } {
   const lines = splitCommandOutput(out);
   const markerIndex = lines.findIndex(line => line.startsWith(LOGIN_SHELL_PATH_MARKER));
   const pathEnv = markerIndex >= 0
     ? lines[markerIndex]!.slice(LOGIN_SHELL_PATH_MARKER.length).trim() || undefined
     : undefined;
   const binLines = markerIndex >= 0 ? lines.slice(markerIndex + 1) : lines;
-  return binLines.map(binPath => ({ binPath, ...(pathEnv ? { pathEnv } : {}) }));
+  // Interactive rc files can echo arbitrary text and zsh's `which` prints
+  // "botmux not found" to stdout — keep only absolute paths.
+  return { bins: binLines.filter(line => line.startsWith('/')), ...(pathEnv ? { pathEnv } : {}) };
 }
 
 function isSemverVersion(version: string): boolean {

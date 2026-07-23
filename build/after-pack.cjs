@@ -1,5 +1,5 @@
 const { execFileSync } = require('node:child_process');
-const { existsSync } = require('node:fs');
+const { existsSync, unlinkSync } = require('node:fs');
 const { join } = require('node:path');
 
 const unusedPrivacyUsageKeys = [
@@ -15,6 +15,13 @@ async function afterPack(context) {
   if (context.electronPlatformName !== 'darwin') return;
 
   const productFilename = context.packager?.appInfo?.productFilename ?? 'Botmux';
+  const resourcesPath = join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Resources');
+  const stagedModules = join(resourcesPath, 'runtime', 'node_modules.tar.gz');
+  const runtimeModules = join(resourcesPath, 'runtime', 'node_modules');
+  if (existsSync(stagedModules) && !existsSync(runtimeModules)) {
+    execFileSync('tar', ['-xzf', stagedModules, '-C', join(resourcesPath, 'runtime')]);
+    unlinkSync(stagedModules);
+  }
   const plistPath = join(context.appOutDir, `${productFilename}.app`, 'Contents', 'Info.plist');
   if (!existsSync(plistPath)) return;
 

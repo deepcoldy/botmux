@@ -10,7 +10,7 @@
  *  - unresolvable refs → reported in `invalid`
  */
 import { describe, it, expect } from 'vitest';
-import { resolveBotRefs } from '../src/cli/create-group-resolver.js';
+import { resolveBotRefs, resolveKickoff } from '../src/cli/create-group-resolver.js';
 
 const CFG_CLAUDE = { larkAppId: 'cli_claude_1', cliId: 'claude-code' };
 const CFG_COCO_1 = { larkAppId: 'cli_coco_1', cliId: 'claude-code' };
@@ -112,5 +112,49 @@ describe('resolveBotRefs', () => {
     const r = resolveBotRefs(['cli_claude_1'], [CFG_CLAUDE], [INFO_CLAUDE]);
     expect(r.larkAppIds).toEqual(['cli_claude_1']);
     expect(r.ambiguousWarnings).toEqual([]);
+  });
+});
+
+describe('resolveKickoff', () => {
+  const selected = ['cli_creator', 'cli_reviewer'];
+  const botInfo = [
+    { larkAppId: 'cli_creator', botOpenId: 'ou_creator_self' },
+    { larkAppId: 'cli_reviewer', botOpenId: 'ou_reviewer_self' },
+    { larkAppId: 'cli_unselected', botOpenId: 'ou_unselected_self' },
+  ];
+
+  it('accepts an omitted kickoff pair', () => {
+    expect(resolveKickoff(undefined, undefined, selected, botInfo)).toEqual({ ok: true });
+  });
+
+  it('requires both kickoff arguments and rejects whitespace-only values', () => {
+    expect(resolveKickoff('ou_reviewer_self', undefined, selected, botInfo)).toEqual({
+      ok: false,
+      error: '--kickoff-bot 与 --kickoff-prompt 必须同时提供且不能为空。',
+    });
+    expect(resolveKickoff('   ', 'review this', selected, botInfo).ok).toBe(false);
+  });
+
+  it('resolves a selected non-creator bot and trims the prompt', () => {
+    expect(resolveKickoff(' ou_reviewer_self ', ' review this ', selected, botInfo)).toEqual({
+      ok: true,
+      targetLarkAppId: 'cli_reviewer',
+      prompt: 'review this',
+    });
+  });
+
+  it('rejects an unknown or unselected bot open_id', () => {
+    expect(resolveKickoff('ou_unknown', 'review', selected, botInfo).ok).toBe(false);
+    expect(resolveKickoff('ou_unselected_self', 'review', selected, botInfo)).toEqual({
+      ok: false,
+      error: '--kickoff-bot 必须属于本次 --bot 列表。',
+    });
+  });
+
+  it('rejects the creator bot', () => {
+    expect(resolveKickoff('ou_creator_self', 'review', selected, botInfo)).toEqual({
+      ok: false,
+      error: '--kickoff-bot 不能是 creator（第一个 --bot）。',
+    });
   });
 });

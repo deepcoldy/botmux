@@ -8,8 +8,18 @@ asar: true
 files:
   - dist/desktop/**
   - '!node_modules/**'
+extraResources:
+  - from: build/desktop-runtime
+    to: runtime
+  - from: build/desktop-node
+    to: node
 afterPack: build/after-pack.cjs
 mac:
+  icon: build/icon.png
+  # Both per-arch builds intentionally carry both bundled Node/runtime trees.
+  # Keep those already architecture-qualified Mach-O files instead of asking
+  # @electron/universal to lipo identical copies a second time.
+  x64ArchFiles: 'Contents/Resources/{node/**,runtime/node_modules/.pnpm/**}'
   category: public.app-category.developer-tools
   hardenedRuntime: true
   gatekeeperAssess: false

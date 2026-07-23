@@ -20,7 +20,17 @@
  * 是穿透链接写真实目标的。目标不存在时退而解析父目录（覆盖「软链目录里建新
  * 文件」），悬空 symlink 这种病态形态不特判。
  */
-import { writeFileSync, renameSync, unlinkSync, realpathSync, chmodSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fchmodSync,
+  fsyncSync,
+  openSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, basename, join } from 'node:path';
@@ -35,11 +45,48 @@ export interface AtomicWriteOptions {
   mode?: number;
   /** 文本编码，默认 utf-8（data 为 Buffer 时忽略）。 */
   encoding?: BufferEncoding;
+  /**
+   * Crash-durable write: fsync the completed temp file before rename, then
+   * fsync the containing directory so the new directory entry survives a
+   * power loss. This costs extra I/O and is therefore opt-in for credentials
+   * and other recovery journals whose acknowledgement depends on persistence.
+   */
+  durable?: boolean;
+  /**
+   * Preserve the historical dotfiles behavior of following an existing target
+   * symlink. Credential/authority files must set this to false: the containing
+   * directory is canonicalized, but the leaf is replaced rather than followed.
+   */
+  followTargetSymlink?: boolean;
+}
+
+function fsyncDirectorySync(filePath: string): void {
+  // Windows does not support opening directories through Node's fs API. The
+  // file itself is still flushed before rename; POSIX additionally flushes the
+  // directory entry to make the rename crash-durable.
+  if (process.platform === 'win32') return;
+  const fd = openSync(dirname(filePath), 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+async function fsyncDirectory(filePath: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  const handle = await fsp.open(dirname(filePath), 'r');
+  try { await handle.sync(); } finally { await handle.close(); }
 }
 
 /** 生成与目标同目录的唯一 tmp 路径。 */
 function tmpPathFor(filePath: string): string {
   return `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+}
+
+function exclusiveCreateFlags(): number {
+  // O_NOFOLLOW is a POSIX hardening flag. The random O_EXCL leaf is still
+  // race-safe on Windows, where O_NOFOLLOW is not consistently supported.
+  return constants.O_WRONLY
+    | constants.O_CREAT
+    | constants.O_EXCL
+    | (process.platform === 'win32' ? 0 : constants.O_NOFOLLOW);
 }
 
 /** 解析 symlink 到真实路径；目标不存在时解析父目录，保持 in-place 写的穿透语义。 */
@@ -48,8 +95,17 @@ function resolveRealPathSync(filePath: string): string {
   try { return join(realpathSync(dirname(filePath)), basename(filePath)); } catch { return filePath; }
 }
 
+/** Resolve only the containing directory, never the final path component. */
+function resolveParentPathSync(filePath: string): string {
+  try { return join(realpathSync(dirname(filePath)), basename(filePath)); } catch { return filePath; }
+}
+
 async function resolveRealPath(filePath: string): Promise<string> {
   try { return await fsp.realpath(filePath); } catch { /* 目标尚不存在 */ }
+  try { return join(await fsp.realpath(dirname(filePath)), basename(filePath)); } catch { return filePath; }
+}
+
+async function resolveParentPath(filePath: string): Promise<string> {
   try { return join(await fsp.realpath(dirname(filePath)), basename(filePath)); } catch { return filePath; }
 }
 
@@ -62,16 +118,30 @@ export function atomicWriteFileSync(
   data: string | Buffer,
   options: AtomicWriteOptions = {},
 ): void {
-  filePath = resolveRealPathSync(filePath);
+  filePath = options.followTargetSymlink === false
+    ? resolveParentPathSync(filePath)
+    : resolveRealPathSync(filePath);
   const tmp = tmpPathFor(filePath);
+  let fd: number | undefined;
   try {
-    writeFileSync(tmp, data, {
+    fd = openSync(
+      tmp,
+      exclusiveCreateFlags(),
+      options.mode ?? 0o666,
+    );
+    writeFileSync(fd, data, {
       encoding: typeof data === 'string' ? (options.encoding ?? 'utf-8') : undefined,
-      ...(options.mode !== undefined ? { mode: options.mode } : {}),
     });
-    if (options.mode !== undefined) chmodSync(tmp, options.mode);
+    if (options.mode !== undefined) fchmodSync(fd, options.mode);
+    if (options.durable) fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
     renameSync(tmp, filePath);
+    if (options.durable) fsyncDirectorySync(filePath);
   } catch (err) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
     try { unlinkSync(tmp); } catch { /* tmp 可能根本没写出来 */ }
     throw err;
   }
@@ -85,16 +155,30 @@ export async function atomicWriteFile(
   data: string | Buffer,
   options: AtomicWriteOptions = {},
 ): Promise<void> {
-  filePath = await resolveRealPath(filePath);
+  filePath = options.followTargetSymlink === false
+    ? await resolveParentPath(filePath)
+    : await resolveRealPath(filePath);
   const tmp = tmpPathFor(filePath);
+  let handle: import('node:fs/promises').FileHandle | undefined;
   try {
-    await fsp.writeFile(tmp, data, {
+    handle = await fsp.open(
+      tmp,
+      exclusiveCreateFlags(),
+      options.mode ?? 0o666,
+    );
+    await handle.writeFile(data, {
       encoding: typeof data === 'string' ? (options.encoding ?? 'utf-8') : undefined,
-      ...(options.mode !== undefined ? { mode: options.mode } : {}),
     });
-    if (options.mode !== undefined) await fsp.chmod(tmp, options.mode);
+    if (options.mode !== undefined) await handle.chmod(options.mode);
+    if (options.durable) await handle.sync();
+    await handle.close();
+    handle = undefined;
     await fsp.rename(tmp, filePath);
+    if (options.durable) await fsyncDirectory(filePath);
   } catch (err) {
+    if (handle) {
+      try { await handle.close(); } catch { /* best effort */ }
+    }
     try { await fsp.unlink(tmp); } catch { /* tmp 可能根本没写出来 */ }
     throw err;
   }

@@ -40,14 +40,17 @@ bash src/desktop/install-local.sh
 脚本会执行这些步骤：
 
 1. 安装依赖（如 `node_modules` 缺失）。
-2. 构建 Desktop bundle。
-3. 解析源码版本号，并使用 electron-builder 生成本机 `Botmux.app`。
-4. 退出正在运行的 Botmux App。
-5. 安装到 `/Applications/Botmux.app`。
-6. 使用本机 ad-hoc 签名并移除 quarantine。
-7. 默认打开 App。
+2. 构建 botmux runtime 与 Desktop bundle。
+3. 下载并校验用于 Universal App 的官方 Node arm64/x64 runtime（后续构建复用本机缓存）。
+4. 解析源码版本号，并使用 electron-builder 生成本机 `Botmux.app`。
+5. 退出正在运行的 Botmux App。
+6. 安装到 `/Applications/Botmux.app`。
+7. 使用本机 ad-hoc 签名并移除 quarantine。
+8. 默认打开 App。
 
-脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 启动后会连接用户已经安装好的全局 CLI；如果未安装 CLI，App 会进入可解释的 setup/degraded 状态。
+脚本只安装 App，不会安装、升级、link 或修改用户机器上的全局 `botmux` CLI。App 自带版本匹配的 Node、botmux 和 PM2，不依赖用户的 PATH、fnm、nvm 或 Homebrew Node。
+
+App 与命令行继续共用 `~/.botmux` 中的机器人配置、会话、日志和专用 PM2_HOME。启动时若检测到全局 CLI 留下的 botmux fleet，会先优雅停止旧 core 进程，再使用内置 runtime 重建；不会删除用户配置，也不会操作默认 `~/.pm2` 中的无关应用。
 
 常用参数：
 
@@ -75,7 +78,7 @@ git pull
 bash src/desktop/install-local.sh
 ```
 
-这个脚本只更新 App 本体，不会变更全局 CLI。如果用户需要升级 CLI，应按 CLI 自己的安装/升级方式单独处理。
+这个脚本只更新 App 本体和 App 内置 runtime，不会变更全局 CLI。Desktop 运行期间由内置 runtime 管理 daemon；终端里单独安装的 CLI 不作为 App 的运行依赖。
 
 ## 验证
 

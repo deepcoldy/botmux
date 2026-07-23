@@ -92,6 +92,22 @@ describe('atomicWriteFileSync', () => {
     expect(readFileSync(link, 'utf-8')).toBe('{"new":true}');
   });
 
+  it('authority 模式只解析父目录并替换 leaf symlink，不穿透写目标', () => {
+    const real = join(dir, 'outside-secret.json');
+    writeFileSync(real, 'keep-me');
+    const link = join(dir, 'device.json');
+    symlinkSync(real, link);
+
+    atomicWriteFileSync(link, 'new-credential', {
+      mode: 0o600,
+      followTargetSymlink: false,
+    });
+
+    expect(lstatSync(link).isSymbolicLink()).toBe(false);
+    expect(readFileSync(link, 'utf8')).toBe('new-credential');
+    expect(readFileSync(real, 'utf8')).toBe('keep-me');
+  });
+
   it('父目录是 symlink、目标尚不存在时，新文件落在真实目录', () => {
     const realDir = join(dir, 'real-dir');
     mkdirSync(realDir);
