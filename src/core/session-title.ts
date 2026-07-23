@@ -25,9 +25,9 @@ function stripLeadingKnownMentions(
   while (matched) {
     matched = false;
     for (const name of mentionNames) {
-      const tag = `@${name}`;
-      if (content.startsWith(tag)) {
-        content = content.slice(tag.length).trimStart();
+      const atPrefix = content.match(/^@+/)?.[0];
+      if (atPrefix && content.slice(atPrefix.length).startsWith(name)) {
+        content = content.slice(atPrefix.length + name.length).trimStart();
         matched = true;
         break;
       }
@@ -83,6 +83,7 @@ export function updateSessionTitle(session: Session, rawTitle: unknown): Session
   session.title = title;
   session.nativeSessionTitle = title;
   session.nativeSessionTitleUserDefined = true;
+  session.nativeSessionTitleAwaitingContent = undefined;
   sessionStore.updateSession(session);
   dashboardEventBus.publish({
     type: 'session.update',

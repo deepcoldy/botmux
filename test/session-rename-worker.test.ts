@@ -81,11 +81,22 @@ describe('worker native session rename queue', () => {
     const end = workerSource.indexOf('/** 在 resume 首条输入前记录', start);
     const region = workerSource.slice(start, end);
 
-    expect(region).toContain("const sourceText = resumeGeneration ? ''");
+    expect(region).toContain('const sourceText = cfg.nativeSessionTitlePrompt?.trim()');
     expect(region).toContain('cfg.nativeSessionTitlePrompt = undefined');
     expect(region).toContain('generateCodexAppThreadTitle({');
     expect(region).toContain('buildBotmuxLarkNativeSessionTitle(semanticCore)');
     expect(region).toContain("send({ type: 'native_session_title_generated', title: semanticTitle })");
+  });
+
+  it('restarts title generation when the first meaningful follow-up arrives', () => {
+    const region = caseRegion('message');
+
+    expect(region).toContain('msg.nativeSessionTitlePrompt');
+    expect(region).toContain('nativeSessionTitleRevision += 1');
+    expect(region).toContain('lastInitConfig.nativeSessionTitle = msg.nativeSessionTitle');
+    expect(region).toContain('lastInitConfig.nativeSessionTitlePrompt = msg.nativeSessionTitlePrompt');
+    expect(region).toContain('stopNativeSessionTitleSync()');
+    expect(region).toContain('void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
   });
 
   it('queues rename IPC without opening a renderer or usage turn', () => {

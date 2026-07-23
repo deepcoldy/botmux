@@ -432,7 +432,7 @@ async function syncFreshCodexNativeSessionTitle(
     nativeSessionTitleAppliedThreadId = threadId;
     log(`Applied native Codex session title: ${fallbackTitle}`);
 
-    const sourceText = resumeGeneration ? '' : cfg.nativeSessionTitlePrompt?.trim() ?? '';
+    const sourceText = cfg.nativeSessionTitlePrompt?.trim() ?? '';
     cfg.nativeSessionTitlePrompt = undefined;
     if (!sourceText) return;
 
@@ -9327,6 +9327,22 @@ process.on('message', async (raw: unknown) => {
       // Mark new turn baseline so the streaming card only shows this turn's content
       renderer?.markNewTurn();
       const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+      if (
+        msg.nativeSessionTitlePrompt
+        && msg.nativeSessionTitle
+        && lastInitConfig?.cliId === 'codex'
+        && !lastInitConfig.adoptMode
+      ) {
+        nativeSessionTitleRevision += 1;
+        nativeSessionTitleAppliedThreadId = undefined;
+        lastInitConfig.nativeSessionTitle = msg.nativeSessionTitle;
+        lastInitConfig.nativeSessionTitlePrompt = msg.nativeSessionTitlePrompt;
+        stopNativeSessionTitleSync();
+        const threadId = codexRpcEngine?.activeThreadId
+          ?? lastSpawnEffectiveCliSessionId
+          ?? lastInitConfig.cliSessionId;
+        if (threadId) void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine);
+      }
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
       let content = msg.content;

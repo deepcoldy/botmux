@@ -563,6 +563,109 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
+  it('waits when a fresh Codex topic only contains the bot mention', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        title: '@@TestBot',
+        nativeSessionTitle: '[BotMux·Lark] @@TestBot',
+      },
+    });
+    forkWorker(ds, `
+<user_message>
+@@TestBot
+</user_message>
+`, false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      nativeSessionTitle: '[BotMux·Lark] 新话题',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+  });
+
+  it('consumes only the first meaningful follow-up for a pending Codex title', () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      session: {
+        ...makeDs().session,
+        cliId: 'codex',
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>@@TestBot</user_message>', 'om_mention')).toBe(true);
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>@@TestBot</user_message>',
+      turnId: 'om_mention',
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>@TestBot 帮我查下当前会话标题</user_message>', 'om_topic')).toBe(true);
+    expect(ds.session.nativeSessionTitle).toBe('[BotMux·Lark] 帮我查下当前会话标题');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>@TestBot 帮我查下当前会话标题</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] 帮我查下当前会话标题',
+      nativeSessionTitlePrompt: '帮我查下当前会话标题',
+      turnId: 'om_topic',
+    });
+
+    expect(sendWorkerInput(ds, '<user_message>第二条有效内容</user_message>', 'om_later')).toBe(true);
+    expect(worker.send).toHaveBeenLastCalledWith({
+      type: 'message',
+      content: '<user_message>第二条有效内容</user_message>',
+      turnId: 'om_later',
+    });
+  });
+
+  it('consumes a pending Codex title when a stopped worker resumes', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        cliSessionId: 'codex-native-pending',
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+    forkWorker(ds, '<user_message>@TestBot 分析图片安全拦截</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] 分析图片安全拦截',
+      nativeSessionTitlePrompt: '分析图片安全拦截',
+    }));
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+  });
+
+  it('passes the pending fallback when a stopped Codex worker has no native session id yet', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] 新话题',
+        nativeSessionTitleAwaitingContent: true,
+      },
+    });
+    forkWorker(ds, '<user_message>@TestBot 分析 worker 启动失败</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] 分析 worker 启动失败',
+      nativeSessionTitlePrompt: '分析 worker 启动失败',
+    }));
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
+  });
+
   it('keeps a persisted user-defined title when a fresh Codex worker starts', () => {
     const ds = makeDs({
       session: {
@@ -634,6 +737,7 @@ describe('session.start lifecycle integration', () => {
     });
 
     expect(ds.session.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBeUndefined();
     expect(ds.initConfig?.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
     expect(ds.initConfig?.nativeSessionTitlePrompt).toBeUndefined();
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);

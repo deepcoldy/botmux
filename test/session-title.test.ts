@@ -44,6 +44,7 @@ describe('buildBotmuxLarkNativeSessionTitle', () => {
 
   it('falls back for empty topic content', () => {
     expect(buildBotmuxLarkNativeSessionTitle('@Botmux', [{ name: 'Botmux' }])).toBe('[BotMux·Lark] 新话题');
+    expect(buildBotmuxLarkNativeSessionTitle('@@Botmux', [{ name: 'Botmux' }])).toBe('[BotMux·Lark] 新话题');
     expect(buildBotmuxLarkNativeSessionTitle(undefined)).toBe('[BotMux·Lark] 新话题');
   });
 
@@ -67,6 +68,13 @@ describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
 `, [{ name: 'TestBot' }])).toBe('调查图片生成返回 12008 的原因');
   });
 
+  it('strips duplicated and consecutive known mentions before extracting the topic', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@@TestBot @CoCo 帮我查下当前会话标题</user_message>',
+      [{ name: 'TestBot' }, { name: 'CoCo' }],
+    )).toBe('帮我查下当前会话标题');
+  });
+
   it('removes transport hints and bounds the untrusted model input', () => {
     const prompt = extractBotmuxLarkNativeSessionTitlePrompt(
       `[用户引用了消息 用 botmux quoted om_xxx 查看]\n${'话'.repeat(2_100)}`,
@@ -80,6 +88,10 @@ describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
       '<user_message>@TestBot</user_message>',
       [{ name: 'TestBot' }],
     )).toBeUndefined();
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@@TestBot</user_message>',
+      [{ name: 'TestBot' }],
+    )).toBeUndefined();
   });
 });
 
@@ -88,6 +100,7 @@ describe('updateSessionTitle', () => {
 
   it('normalizes, persists, and publishes one dashboard patch', () => {
     const session = makeSession();
+    session.nativeSessionTitleAwaitingContent = true;
     const events: DashboardEvent[] = [];
     const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
 
@@ -103,6 +116,7 @@ describe('updateSessionTitle', () => {
     expect(session.title).toBe('First line Second line');
     expect(session.nativeSessionTitle).toBe('First line Second line');
     expect(session.nativeSessionTitleUserDefined).toBe(true);
+    expect(session.nativeSessionTitleAwaitingContent).toBeUndefined();
     expect(sessionStore.updateSession).toHaveBeenCalledWith(session);
     expect(events).toEqual([{
       type: 'session.update',

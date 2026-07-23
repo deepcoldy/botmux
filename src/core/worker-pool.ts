@@ -1861,11 +1861,35 @@ export function sendWorkerInput(
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  let nativeSessionTitlePrompt: string | undefined;
+  let nativeSessionTitle: string | undefined;
+  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
+    const bot = getBot(ds.larkAppId);
+    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
+    if (effectiveCliId === 'codex') {
+      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+        normalized.codexAppInput?.text ?? normalized.content,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
+      if (nativeSessionTitlePrompt) {
+        nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(nativeSessionTitlePrompt);
+        ds.session.nativeSessionTitle = nativeSessionTitle;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = nativeSessionTitle;
+          ds.initConfig.nativeSessionTitlePrompt = nativeSessionTitlePrompt;
+        }
+        sessionStore.updateSession(ds.session);
+      }
+    }
+  }
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
   ds.worker.send({
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(vcMeetingImTurnOrigin
@@ -2025,23 +2049,37 @@ export function forkWorker(
   let nativeSessionTitlePrompt: string | undefined;
   if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
-    if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
-      ds.session.nativeSessionTitle = ds.session.nativeSessionTitleUserDefined
-        ? ds.session.title
-        : buildBotmuxLarkNativeSessionTitle(ds.session.title);
+    const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      promptPayload.codexAppInput?.text ?? prompt,
+      bot.botName ? [{ name: bot.botName }] : undefined,
+    );
+    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+        titlePrompt ? ds.session.title : undefined,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
+      ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (
+      ds.session.nativeSessionTitleAwaitingContent
+      && !ds.session.nativeSessionTitleUserDefined
+      && titlePrompt
+    ) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(titlePrompt);
+      ds.session.nativeSessionTitleAwaitingContent = undefined;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
+      ds.session.nativeSessionTitle = ds.session.title;
       sessionStore.updateSession(ds.session);
     }
     if (
       isFreshNativeSession
       || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+      || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
     ) {
       nativeSessionTitle = ds.session.nativeSessionTitle;
-    }
-    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
-      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
-        promptPayload.codexAppInput?.text ?? prompt,
-        bot.botName ? [{ name: bot.botName }] : undefined,
-      );
     }
   }
   // Claude Code blocks on the interactive folder-trust dialog the first time
@@ -2716,6 +2754,7 @@ function setupWorkerHandlers(
         const title = msg.title.trim();
         if (!title) break;
         ds.session.nativeSessionTitle = title;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
         if (ds.initConfig) {
           ds.initConfig.nativeSessionTitle = title;
           ds.initConfig.nativeSessionTitlePrompt = undefined;
