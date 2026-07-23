@@ -48,7 +48,7 @@ describe('worker structured-turn status wiring', () => {
   it('records authoritative submit confirmation in fresh and adopt write paths', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
     const verification = flush.indexOf('codexBridgeQueue.beginSubmitVerification(bridgeTurnId, undefined, item.dispatchAttempt)');
-    const write = flush.indexOf('targetAdapter.writeInput(', verification);
+    const write = flush.indexOf('writeAdapter.writeInput(', verification);
     expect(verification).toBeGreaterThanOrEqual(0);
     expect(write).toBeGreaterThan(verification);
     expect(flush).toContain('result?.submitted === true && bridgeTurnId');
@@ -68,7 +68,7 @@ describe('worker structured-turn status wiring', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
     const loop = flush.indexOf('while (pendingMessages.length > 0 && backend && cliAdapter)');
     const perItemCycle = flush.indexOf('beginCliWriteCycle()', loop);
-    const itemWrite = flush.indexOf('targetAdapter.writeInput(', loop);
+    const itemWrite = flush.indexOf('writeAdapter.writeInput(', loop);
     expect(perItemCycle).toBeGreaterThan(loop);
     expect(itemWrite).toBeGreaterThan(perItemCycle);
 
@@ -91,6 +91,10 @@ describe('worker structured-turn status wiring', () => {
 
   it('limits the strong ready gate to drivers with a complete terminal contract', () => {
     const gate = functionSlice('hasStructuredLifecycleBlock', 'structuredBridgeIsCodex');
+    const rpcGate = gate.indexOf('turn.rpcActive === true');
+    const transcriptAllowlist = gate.indexOf('isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)');
+    expect(rpcGate).toBeGreaterThanOrEqual(0);
+    expect(transcriptAllowlist).toBeGreaterThan(rpcGate);
     expect(gate).toContain('isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)');
     expect(gate).toContain('codexBridgeQueue.hasBlockingTurn()');
 
@@ -140,7 +144,7 @@ describe('worker structured-turn status wiring', () => {
   it('generation-fences the normal flush continuation immediately after writeInput settles', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
     const capture = flush.indexOf('const writeGeneration = cliSpawnGeneration');
-    const write = flush.indexOf('targetAdapter.writeInput(', capture);
+    const write = flush.indexOf('writeAdapter.writeInput(', capture);
     const resolvedGuard = flush.indexOf('if (!writeContinuationIsCurrent())', write);
     const busyProbe = flush.indexOf('scheduleBusyPatternIdleProbe(', write);
     const catchStart = flush.indexOf('} catch (err: any) {', resolvedGuard);
@@ -167,6 +171,84 @@ describe('worker structured-turn status wiring', () => {
     expect(staleSettlement).toContain("emitTurnTerminal(turnId, 'ambiguous', code, dispatchAttempt)");
     expect(staleSettlement).not.toContain('dropPendingTurn(');
     expect(staleSettlement).not.toContain('send({');
+  });
+
+  it('generation-fences an RPC ack before creating or activating bridge state', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const rpcBranch = flush.slice(flush.indexOf('if (writeRpcEngine) {'));
+    const sendAck = rpcBranch.indexOf('await writeRpcEngine.sendTurn(msg, rpcTurnIdentity!)');
+    const generationFence = rpcBranch.indexOf('if (!writeContinuationIsCurrent())', sendAck);
+    const assignBridge = rpcBranch.indexOf('bridgeTurnId = rpcTurnIdentity.turnId', generationFence);
+    const activate = rpcBranch.indexOf('activateRpcTurnLifecycle(', assignBridge);
+    expect(sendAck).toBeGreaterThanOrEqual(0);
+    expect(generationFence).toBeGreaterThan(sendAck);
+    expect(assignBridge).toBeGreaterThan(generationFence);
+    expect(activate).toBeGreaterThan(assignBridge);
+    expect(flush).toContain('codexBridgeActive && !writeRpcEngine');
+    expect(rpcBranch.slice(0, sendAck)).not.toContain('codexBridgeMarkPendingTurn(');
+
+    const ingest = functionSlice('codexBridgeIngest', 'codexBridgeMarkPendingTurn');
+    expect(ingest).toContain('if (rpcTurnsAwaitingActivation.size > 0) return;');
+  });
+
+  it('registers fresh accepted RPC turns by exact id+attempt and fails closed on lifecycle registration loss', () => {
+    const engage = source.slice(
+      source.indexOf('async function engageCodexRpc'),
+      source.indexOf('function armRpcStartupDialogDismiss'),
+    );
+    expect(engage).toContain('turnId: cfg.turnId ??');
+    expect(engage).toContain('dispatchAttempt: cfg.dispatchAttempt');
+    expect(engage).toContain('rpcTurnsAwaitingActivation.set(');
+    expect(engage).toContain('if (!first.nativeTurnId)');
+    expect(engage).toContain('rpcLifecycleFailClosedOwners.set(ownerKey, firstGeneration)');
+    expect(engage).toContain('activateRpcTurnLifecycle(');
+    expect(engage).toContain('firstGeneration,');
+    expect(engage).toContain('deferredFreshRpcTurn = {');
+    expect(engage).toContain('A dispatched-but-unconfirmed first turn is never re-sent');
+    expect(engage).toContain('rpcLifecycleFailClosedOwners.set(');
+    expect(engage).toContain('codexBridgeMarkPendingTurn(');
+  });
+
+  it('buffers a fast native terminal until exact activation and hydrates output before terminal retirement', () => {
+    const handle = functionSlice('handleRpcTurnTerminal', 'activateRpcTurnLifecycle');
+    expect(handle).toContain('rpcTurnsAwaitingActivation.get(ownerKey)');
+    expect(handle).toContain('pendingRpcTurnTerminals.set(ownerKey, { terminal, generation })');
+    expect(handle).toContain('sameRpcGeneration(awaiting, generation)');
+
+    const activate = functionSlice('activateRpcTurnLifecycle', 'releaseRpcTurnTerminalDeferral');
+    expect(activate).toContain('codexBridgeQueue.markRpcActive(identity.turnId, identity.dispatchAttempt)');
+    expect(activate).toContain('settleRpcTurnTerminal(pendingTerminal.terminal, generation)');
+
+    const hydrate = functionSlice('hydrateCompletedRpcTurn', 'settleRpcTurnTerminal');
+    const drain = hydrate.indexOf('codexBridgeDrainAndMaybeEmit({ signalIdle: false })');
+    const finalize = hydrate.indexOf('finalizeRpcTurnTerminal(', drain);
+    expect(drain).toBeGreaterThanOrEqual(0);
+    expect(finalize).toBeGreaterThan(drain);
+    expect(hydrate).toContain('CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS');
+
+    const init = source.slice(source.indexOf('await spawnCli(msg'), source.indexOf('// Queue the initial prompt'));
+    expect(init.indexOf('await spawnCli(msg')).toBeLessThan(init.indexOf('releaseRpcTurnTerminalDeferral('));
+  });
+
+  it('makes native terminal settlement idempotent and generation-owned across abort/death/stop cleanup', () => {
+    const settle = functionSlice('settleRpcTurnTerminal', 'handleRpcTurnTerminal');
+    expect(settle).toContain('const existingSettlement = settlingRpcTerminalOwners.get(ownerKey)');
+    expect(settle).toContain('sameRpcGeneration(existingSettlement, generation)');
+    expect(settle).toContain('codexBridgeQueue.stopRpcActive(');
+
+    const finalize = functionSlice('finalizeRpcTurnTerminal', 'hydrateCompletedRpcTurn');
+    expect(finalize).toContain('settlingRpcTerminalOwners.get(ownerKey)');
+    expect(finalize).toContain('codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true)');
+    expect(finalize).toContain("terminal.status === 'failed' || terminal.status === 'aborted'");
+    expect(finalize).toContain("terminal.status === 'engine-dead'");
+    expect(finalize).toContain("terminal.status === 'stopped'");
+
+    const stop = functionSlice('stopCodexRpcEngine', 'persistentPaneInfo');
+    expect(stop.indexOf('engine?.stop()')).toBeLessThan(stop.indexOf('codexRpcEngine = undefined'));
+    expect(stop).toContain('turn.finalText === undefined');
+    expect(stop).toContain('turn.rpcActive');
+    expect(stop).toContain('ownedRpcTurns.has(rpcTurnOwnerKey({');
+    expect(stop).toContain('codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true)');
   });
 
   it('does not synthesize prompt-ready after a conclusively failed unstarted submit', () => {

@@ -1005,6 +1005,20 @@ describe('CodexBridgeQueue', () => {
     expect(q.stopRpcActive('rpc-stop')).toBe(false);
   });
 
+  it('stopRpcActive releases only the exact dispatch attempt', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('same-rpc-turn', 'attempt one', 100, 1);
+    q.mark('same-rpc-turn', 'attempt two', 200, 2);
+    expect(q.markRpcActive('same-rpc-turn', 1)).toBe(true);
+    expect(q.markRpcActive('same-rpc-turn', 2)).toBe(true);
+
+    expect(q.stopRpcActive('same-rpc-turn', 1)).toBe(true);
+    expect(q.peek().find(turn => turn.dispatchAttempt === 1)?.rpcActive).toBeUndefined();
+    expect(q.peek().find(turn => turn.dispatchAttempt === 2)?.rpcActive).toBe(true);
+    expect(q.stopRpcActive('same-rpc-turn', 1)).toBe(false);
+    expect(q.stopRpcActive('same-rpc-turn', 2)).toBe(true);
+  });
+
   it('rpcActive does not block a normal started turn from draining', () => {
     let now = 1_000;
     const q = new CodexBridgeQueue(() => now);
