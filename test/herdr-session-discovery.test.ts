@@ -247,6 +247,26 @@ describe('validateAdoptTarget (herdr branch)', () => {
     expect(validateAdoptTarget(target)).toBe(true);
   });
 
+  it("returns 'alive' for Herdr 0.7.5 Pi process-info that reports node + argv0 only", () => {
+    installHerdrFixture({
+      sessions: [{ name: 'collie', running: true }],
+      agentsBySession: { collie: [{ pane_id: 'w3:p1', agent: 'pi', cwd: '/x' }] },
+      processByPane: {
+        'collie:w3:p1': { pid: 75275, name: 'node', argv0: 'pi', cwd: '/x' },
+      },
+    });
+    const target = {
+      source: 'herdr' as const,
+      herdrSessionName: 'collie',
+      herdrPaneId: 'w3:p1',
+      cliId: 'pi' as const,
+      cwd: '/x',
+      paneCols: 200,
+      paneRows: 50,
+    };
+    expect(validateAdoptTargetState(target)).toBe('alive');
+  });
+
   it("returns 'alive' for a hook-less TraeX pane whose foreground process still matches", () => {
     installHerdrFixture({
       sessions: [{ name: 'work', running: true }],

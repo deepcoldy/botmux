@@ -623,7 +623,13 @@ function herdrPaneCliProcess(
   const processes = Array.isArray(info?.foreground_processes) ? info.foreground_processes : [];
   for (const proc of processes) {
     const argv = Array.isArray(proc?.argv) ? proc.argv.filter((v: unknown): v is string => typeof v === 'string') : [];
-    const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, argv, filterCliId);
+    // Herdr 0.7.5 process-info may expose only `argv0` for a foreground
+    // launcher (`name:"node", argv0:"pi"`). Treat it as argv evidence so
+    // adopt revalidation agrees with agent-list discovery instead of falsely
+    // reporting a live Pi pane as exited.
+    const argv0 = typeof proc?.argv0 === 'string' ? proc.argv0 : undefined;
+    const effectiveArgv = argv.length > 0 ? argv : argv0 ? [argv0] : [];
+    const cliId = cliIdFromCommArgv(typeof proc?.name === 'string' ? proc.name : undefined, effectiveArgv, filterCliId);
     const pid = Number(proc?.pid);
     if (cliId && Number.isInteger(pid) && pid > 0 && (!expectedPid || pid === expectedPid)) {
       return { pid, cliId, cwd: typeof proc?.cwd === 'string' ? proc.cwd : undefined };
