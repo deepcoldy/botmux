@@ -329,6 +329,14 @@ export class CodexBridgeQueue {
       && candidate.finalText === undefined);
   }
 
+  /** True when buffered transcript replay has already closed this exact turn
+   *  before its RPC turn/start continuation installs rpcActive. */
+  hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean {
+    return this.queue.some(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt
+      && candidate.finalText !== undefined);
+  }
+
   /** True while the transcript proves a turn is running, or while a verified
    *  submit is in the bounded pre-start hand-off window. A bare worker mark is
    *  never authoritative, preventing a dropped Enter from causing permanent

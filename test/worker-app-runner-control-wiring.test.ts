@@ -64,12 +64,12 @@ describe('worker app-runner control-channel wiring', () => {
     const engageEnd = workerSource.indexOf('/** RPC panes have NO terminal input path', engageStart);
     const engage = workerSource.slice(engageStart, engageEnd);
     const firstTurn = engage.indexOf('await engine.sendFirstTurn(');
-    const accepted = engage.indexOf("if (first === 'accepted' && cfg.queuedActivationToken)", firstTurn);
+    const accepted = engage.indexOf("if (first.outcome === 'accepted' && cfg.queuedActivationToken)", firstTurn);
     const ack = engage.indexOf("type: 'queued_activation_submitted'", accepted);
     expect(firstTurn).toBeGreaterThan(-1);
     expect(accepted).toBeGreaterThan(firstTurn);
     expect(ack).toBeGreaterThan(accepted);
-    expect(engage.slice(firstTurn, accepted)).toContain("if (first === 'not-sent')");
+    expect(engage.slice(firstTurn, accepted)).toContain("if (first.outcome === 'not-sent')");
   });
 
   it('restores the durable FIFO but never treats warm signed idle as proof that prepared input was unwritten', () => {

@@ -28,6 +28,27 @@ export const CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS = [
   3_000,
 ] as const;
 
+/** Ordinary transcript ingest must not advance past a turn/start ACK that has
+ *  not installed its exact bridge mark yet. Native-terminal hydration for an
+ *  older owner is different: it must keep draining that owner's final output
+ *  even while a successor waits for ACK. Any successor events reached by that
+ *  drain stay in CodexBridgeQueue's unmatched replay buffer until activation.
+ *
+ *  A matching awaiting owner still blocks hydration, because consuming its
+ *  transcript before the exact mark exists would retire the same logical
+ *  delivery against incomplete local ownership. */
+export function rpcTranscriptIngestBlockedByAwaitingActivation(
+  awaitingOwnerKeys: Iterable<string>,
+  hydrationOwnerKey?: string,
+): boolean {
+  for (const ownerKey of awaitingOwnerKeys) {
+    if (hydrationOwnerKey === undefined || ownerKey === hydrationOwnerKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Monotonic fence for async app-server engagement. Worker IPC handlers are not
  *  serialized, so restart/close can invalidate an engage while it is awaiting
  *  /readyz, thread creation, or first-turn rollout evidence. Only the lease

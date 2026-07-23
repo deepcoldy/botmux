@@ -174,7 +174,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -4418,6 +4418,7 @@ function codexBridgeFallbackActive(): boolean {
 /** Only drivers with a complete normal-final + interrupted-terminal contract
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
+  if (rpcTurnsAwaitingActivation.size > 0) return true;
   if (rpcLifecycleFailClosedOwners.size > 0) return true;
   if (rpcTerminalHydrationOwners.size > 0) return true;
   // rpcActive is an explicit native app-server ownership proof and is valid for
@@ -4956,12 +4957,19 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   codexBridgeNotifyCliSessionId(observed.cliSessionId);
 }
 
-function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
+function codexBridgeIngest(opts: {
+  signalIdle?: boolean;
+  hydrationOwnerKey?: string;
+} = {}): void {
   // Follow-up RPC turns install their exact bridge mark only after the
-  // turn/start ACK passes the generation fence. Do not advance the rollout
-  // cursor while such an activation is pending; after activation, the same
-  // unread bytes are replayed into the newly marked exact attempt.
-  if (rpcTurnsAwaitingActivation.size > 0) return;
+  // turn/start ACK passes the generation fence. Ordinary ingest must not
+  // advance the rollout cursor in that window. Terminal hydration for an
+  // older owner may continue: successor events reached by the same drain stay
+  // buffered until the exact successor mark is installed.
+  if (rpcTranscriptIngestBlockedByAwaitingActivation(
+    rpcTurnsAwaitingActivation.keys(),
+    opts.hydrationOwnerKey,
+  )) return;
   if (structuredBridgeIsHermes()) {
     hermesBridgeIngest();
     return;
@@ -5071,7 +5079,12 @@ function hydrateCompletedRpcTurn(
   // old generation when teardown reaches the engine.
   if (cliSpawnGeneration !== generation.cliGeneration
     || codexRpcEngine !== generation.engine) return;
-  try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch { /* retry */ }
+  try {
+    codexBridgeDrainAndMaybeEmit({
+      signalIdle: false,
+      hydrationOwnerKey: ownerKey,
+    });
+  } catch { /* retry */ }
   if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
     // Structured ingest already emitted final_output + terminal in the canonical
     // order. The explicit native terminal below is idempotently suppressed.
@@ -5183,7 +5196,8 @@ function activateRpcTurnLifecycle(
     return false;
   }
   let marked = alreadyMarked
-    && codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt);
+    && (codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)
+      || codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt));
   if (!alreadyMarked) {
     const bridgeTurnId = codexBridgeMarkPendingTurn(
       messageText,
@@ -5192,9 +5206,22 @@ function activateRpcTurnLifecycle(
     );
     marked = bridgeTurnId === identity.turnId;
   }
-  const activated = marked
-    && codexBridgeQueue.markRpcActive(identity.turnId, identity.dispatchAttempt);
-  if (activated) rpcActiveOwners.set(ownerKey, generation);
+  // An older turn's terminal hydration may have drained and buffered this
+  // successor's complete user/final pair while turn/start ACK was still
+  // pending. mark() replays that pair synchronously. Treat the exact transcript
+  // terminal as an already-retired activation instead of failing closed merely
+  // because markRpcActive correctly refuses a completed queue entry.
+  const transcriptTerminalObserved = marked
+    && codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt);
+  const activated = transcriptTerminalObserved
+    || (marked && codexBridgeQueue.markRpcActive(
+      identity.turnId,
+      identity.dispatchAttempt,
+    ));
+  if (activated && !transcriptTerminalObserved) {
+    rpcActiveOwners.set(ownerKey, generation);
+  }
+  if (transcriptTerminalObserved) emitReadyCodexTurns();
   if (!deferTerminal
     && sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
     rpcTurnsAwaitingActivation.delete(ownerKey);
@@ -5336,7 +5363,10 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   return true;
 }
 
-function codexBridgeDrainAndMaybeEmit(opts: { signalIdle?: boolean } = {}): void {
+function codexBridgeDrainAndMaybeEmit(opts: {
+  signalIdle?: boolean;
+  hydrationOwnerKey?: string;
+} = {}): void {
   if (!codexBridgeFallbackActive()) return;
   if (structuredBridgeIsHermes() || structuredBridgeIsMtr() || (codexBridgeRolloutPath && codexBridgeBaselineDone)) {
     try { codexBridgeIngest(opts); } catch (err: any) { log(`Codex bridge ingest error: ${err.message}`); }
