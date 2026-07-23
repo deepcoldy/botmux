@@ -23,6 +23,23 @@ import { normalizePluginIdList } from './core/plugins/ids.js';
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
 
+/** Keep the configurable prefix short enough to leave useful room for the
+ *  caller-provided group name. Count UTF-16 code units to match HTML
+ *  `maxLength` and the rest of the dashboard's string validation. */
+export const GROUP_NAME_PREFIX_MAX_LENGTH = 32;
+
+/** Normalize the machine-wide prefix used by the `/group` slash command.
+ *  Missing/blank/invalid values are treated as disabled on the forgiving read
+ *  path; the Dashboard write path rejects invalid non-blank values. */
+export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  if (!value) return undefined;
+  if (value.length > GROUP_NAME_PREFIX_MAX_LENGTH) return undefined;
+  if (/[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+  return value;
+}
+
 export interface WhiteboardConfig {
   /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
   enabled?: boolean;
@@ -40,6 +57,9 @@ export interface VcMeetingAgentGlobalConfig {
 
 export interface GlobalConfig {
   lang?: Locale;
+  /** Machine-wide default prefix for groups created via `/group` or `/g`.
+   *  Other creation paths intentionally ignore it. Missing means disabled. */
+  groupNamePrefix?: string;
   /** Machine-wide repo picker display mode. Missing / 'all' preserves legacy
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
@@ -379,6 +399,8 @@ export function readGlobalConfig(): GlobalConfig {
   const raw = readRawConfig();
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
+  if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
   const dashboard = readDashboard(raw.dashboard);

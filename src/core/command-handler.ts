@@ -7,7 +7,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
-import { repoPickerScanOptions } from '../global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
@@ -113,6 +113,19 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * that pollutes the dashboard's session list. Handle them without a session.
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
+
+const SLASH_GROUP_NAME_MAX_LENGTH = 50;
+
+/** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
+ *  existing Lark headroom. `Array.from` avoids slicing through an emoji's
+ *  surrogate pair when a long name is truncated. */
+export function formatSlashGroupName(name: string, prefix = ''): string {
+  const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
+  const characters = Array.from(prefixed);
+  return characters.length > SLASH_GROUP_NAME_MAX_LENGTH
+    ? `${characters.slice(0, SLASH_GROUP_NAME_MAX_LENGTH).join('')}…`
+    : prefixed;
+}
 
 /**
  * Daemon commands that operate on an ALREADY-EXISTING session and must never
@@ -2620,15 +2633,15 @@ export async function handleCommand(
           rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
         }
         const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
-        const MAX_NAME = 50; // Lark group names cap around 60; leave headroom for '…'
-        let groupName: string;
+        let baseGroupName: string;
         if (firstLine) {
-          groupName = firstLine.length > MAX_NAME ? firstLine.slice(0, MAX_NAME) + '…' : firstLine;
+          baseGroupName = firstLine;
         } else {
           const now = new Date();
           const ts = `${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
-          groupName = t('cmd.group.empty_fallback', { ts }, loc);
+          baseGroupName = t('cmd.group.empty_fallback', { ts }, loc);
         }
+        const groupName = formatSlashGroupName(baseGroupName, readGlobalConfig().groupNamePrefix);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).

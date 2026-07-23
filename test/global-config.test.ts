@@ -3,9 +3,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
+  invalidateGlobalConfigCache,
   mergeDashboardConfig,
   mergeGlobalConfig,
   readGlobalConfig,
@@ -104,6 +106,37 @@ describe('global dashboard config', () => {
     }));
 
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('reads a trimmed groupNamePrefix as a top-level global setting', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  AI讨论·  ' }));
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+  });
+
+  it('ignores invalid groupNamePrefix values on the forgiving read path', () => {
+    for (const groupNamePrefix of [
+      42,
+      '   ',
+      'AI\n讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    }
+  });
+
+  it('round-trips and clears groupNamePrefix without losing unknown keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ futureSetting: 'keep-me' }));
+    mergeGlobalConfig({ groupNamePrefix: 'AI讨论·' });
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+    expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).futureSetting).toBe('keep-me');
+
+    mergeGlobalConfig({ groupNamePrefix: null });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    expect(raw).not.toHaveProperty('groupNamePrefix');
+    expect(raw.futureSetting).toBe('keep-me');
   });
 
   it('drops invalid repoPickerMode values', () => {

@@ -5,6 +5,7 @@ import type {
   GlobalConfig,
   MaintenanceConfig,
 } from '../src/global-config.js';
+import { GROUP_NAME_PREFIX_MAX_LENGTH } from '../src/global-config.js';
 import {
   applySettingsWrite,
   type ResolvedDashboardSettingsView,
@@ -16,6 +17,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const storedMaintenance: MaintenanceConfig = {};
   const storedGlobal: GlobalConfig = {};
   const settingsView: ResolvedDashboardSettingsView = {
+    groupNamePrefix: '',
     publicReadOnly: false,
     openTerminalInFeishu: false,
     enableLocalCliOpen: false,
@@ -55,6 +57,20 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
 }
 
 describe('applySettingsWrite happy paths', () => {
+  it('writes a trimmed groupNamePrefix through the top-level global config', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '  AI讨论·  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: 'AI讨论·' });
+  });
+
+  it('clears groupNamePrefix when the dashboard saves a blank value', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '   ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: null });
+  });
+
   it('writes publicReadOnly toggle and echoes the resolved snapshot', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: true }, deps);
@@ -168,6 +184,28 @@ describe('applySettingsWrite happy paths', () => {
 });
 
 describe('applySettingsWrite — validation errors', () => {
+  it('rejects invalid groupNamePrefix payloads without writing', async () => {
+    for (const groupNamePrefix of [
+      42,
+      'AI\n讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ groupNamePrefix }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('expected failure');
+      expect(r.error).toBe('invalid_groupNamePrefix');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does not persist a valid prefix when another dashboard field is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: 'AI讨论·', publicReadOnly: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
   it('rejects non-boolean publicReadOnly → invalid_publicReadOnly', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: 'yes' }, deps);

@@ -484,7 +484,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
 import { scanMultipleProjects } from '../src/services/project-scanner.js';
-import { repoPickerScanOptions } from '../src/global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
 import { listCodexAppThreads } from '../src/services/codex-app-threads.js';
@@ -1034,6 +1034,7 @@ describe('handleCommand', () => {
     // tests (verified on vitest 4; resetAllMocks is what restores factory
     // impls). Every mock that tests override must therefore be restored to
     // its default here, or the last override leaks into subsequent tests.
+    vi.mocked(readGlobalConfig).mockReturnValue({});
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
     vi.mocked(findOncallChat).mockReturnValue(undefined);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
@@ -3232,6 +3233,56 @@ describe('handleCommand', () => {
       expect(reply).toContain('oc_new_group');
     });
 
+    it('applies the configured global prefix to /group and reports the final name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group My Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·My Project');
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('AI讨论·My Project');
+    });
+
+    it('applies the configured global prefix through the /g alias', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·Project');
+    });
+
+    it('does not duplicate a prefix already present in the requested name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group AI讨论·Project'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·Project');
+    });
+
+    it('prefixes the existing timestamp fallback when /group has no name', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage('/group'), deps, LARK_APP_ID);
+
+      expect(mockedCreate.mock.calls[0][0].name).toMatch(/^AI讨论·新会话 \d{2}\/\d{2} \d{2}:\d{2}$/);
+    });
+
+    it('truncates the final prefixed name by Unicode characters without splitting emoji', async () => {
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/group', ROOT_ID, makeLarkMessage(`/group ${'😀'.repeat(60)}`), deps, LARK_APP_ID);
+
+      const name = mockedCreate.mock.calls[0][0].name!;
+      expect(Array.from(name)).toHaveLength(51);
+      expect(name).toBe(`AI讨论·${'😀'.repeat(45)}…`);
+      expect(name).not.toContain('\uFFFD');
+    });
+
     it('passes /group --role-profile through and strips it from the group name', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
@@ -3813,6 +3864,9 @@ describe('handleCommand', () => {
     // bot itself is the sole participant. New group = user + this bot; the DM
     // session migrates over with no peer coordination.
     it('p2p --create: solo relay without mentions — group is user + this bot, session migrates', async () => {
+      // The global prefix is deliberately scoped to /group; relay names must
+      // remain untouched even when the setting is enabled.
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
         chatType: 'p2p',
@@ -3825,6 +3879,7 @@ describe('handleCommand', () => {
       expect(mockedCreate).toHaveBeenCalledTimes(1);
       const opts = mockedCreate.mock.calls[0][0];
       expect(opts.larkAppIds).toEqual([LARK_APP_ID]);
+      expect(opts.name).toBe('搬去群里');
       expect(opts.userOpenIds).toEqual(['ou_sender']);
       expect(opts.transferOwnerTo).toBe('ou_sender');
 
