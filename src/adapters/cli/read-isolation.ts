@@ -451,6 +451,7 @@ export function isolatedPaneReattachSafe(
   markerContent: string | null | undefined,
   expected: readonly IsolationCapability[] | {
     requiredCapabilities: readonly IsolationCapability[];
+    exactCapabilities?: boolean;
     readIsolation?: boolean;
     writeSandbox?: boolean;
     requireOriginChannel?: boolean;
@@ -480,6 +481,7 @@ export function isolatedPaneReattachSafe(
       ? undefined
       : expected as {
           requiredCapabilities: readonly IsolationCapability[];
+          exactCapabilities?: boolean;
           readIsolation?: boolean;
           writeSandbox?: boolean;
           requireOriginChannel?: boolean;
@@ -490,6 +492,8 @@ export function isolatedPaneReattachSafe(
       : expected as readonly IsolationCapability[];
     const actual = new Set(parsed.capabilities as IsolationCapability[]);
     if (!requiredCapabilities.every(capability => actual.has(capability))) return false;
+    if (expectedPolicy?.exactCapabilities
+      && actual.size !== new Set(requiredCapabilities).size) return false;
     if (!expectedPolicy) return true;
     if (expectedPolicy.readIsolation !== undefined
       && parsed.readIsolation !== expectedPolicy.readIsolation) return false;
