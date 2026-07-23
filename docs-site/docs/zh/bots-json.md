@@ -186,6 +186,42 @@
 |------|------|
 | `voice` | 该 bot 的语音引擎覆盖，按字段合并到 `~/.botmux/config.json` 的全局 `voice` 块之上（per-bot 优先）。有可用语音凭据时，回复卡片会出现「🔊 语音总结」按钮。见 [语音总结](/voice) |
 
+## 会议监听角色与群内输出形式
+
+`vcMeetingAgent.meetingConsumer.consumerProfiles` 可以定义通用的会议监听角色。`responseMode` 与 `listenerDelivery.placement` 是两个独立维度：
+
+Dashboard 的“会议角色预设”提供本地内置模板库，当前包含“会议重要信息同步”“会议纪要与行动项”“会议主持”“方案评审与风险挑战”“访谈与需求洞察”。点击“使用此模板”会复制出一个普通、可完整编辑的 profile；之后修改模板不会改写用户配置。模板目录带稳定的 `templateId`、版本和来源，未来可以在同一模型上接入社区源。本期不联网、不上传模板使用情况，因此不提供热度或使用量排行。
+
+- `responseMode: "silent"`：自动模型输出不可见；适合只做内部处理或通过受管会议能力执行动作。
+- `responseMode: "listener_thread"`：允许把自动模型输出发到会议监听群，需要 `listener.output.request` capability。
+- `listenerDelivery.placement: "auto"`：兼容旧行为，沿用当前会话的群/话题路由；省略该字段等同于 `auto`。
+- `listenerDelivery.placement: "chat"`：每次同步都作为群顶层消息发送。
+- `listenerDelivery.placement: "topic"`：首条有效同步作为固定话题根消息，后续同步都回复到同一话题；移除并重新启用该 profile 后会开启新话题。
+
+`listener_thread` 的自动输出使用 botmux 内部的 `skip | publish` 控制协议：Agent 判断当前是否值得发布，botmux 只在 `publish` 时把消息正文发到飞书，控制 JSON 本身不会出现在群里。该协议不做语义指纹去重，也不提供 debounce/interval 配置；是否为新信息、是否继续观察以及何时发布，都由 Agent 根据 profile prompt 和完整会议上下文判断。格式异常会 fail closed，不会把模型原始控制文本发到群里。显式人工消息仍按原引用关系回复，不走此协议。
+
+下面是一个“会议重要信息同步”预设。它不包含事故专用结构，只通过 prompt 定义“什么值得同步”，因此也适用于项目评审、发布协调等会议：
+
+```json
+{
+  "id": "important-sync",
+  "agentAppId": "cli_your_agent_app_id",
+  "label": "会议重要信息同步",
+  "role": "important-information-sync",
+  "instructions": "持续监听会议，只发布对群内协作者有实际价值的新信息：已确认的结论或决定、状态变化、明确阻塞或风险、需要群内人员知晓或行动的事项。讨论尚未形成明确变化时先不发布；是否继续观察以及何时发布，由你根据会议语义自行判断。忽略讨论过程、重复表述、寒暄和未经确认的猜测。每次只发布相对上次的新内容，使用简洁中文；有负责人、截止时间或影响范围时一并写明。此前信息的时间、负责人、范围、状态或结论发生修正时，必须作为新信息发布，不能因为其他内容大部分一致而忽略。字幕发生修订时重新判断，但不要重复发布未发生变化的事项。",
+  "filter": {
+    "activityTypes": ["transcript_received", "chat_received"]
+  },
+  "responseMode": "listener_thread",
+  "listenerDelivery": {
+    "placement": "topic"
+  },
+  "capabilities": ["listener.output.request", "meeting.read"]
+}
+```
+
+`agentAppId` 是实际执行该角色的 bot App ID。把 profile id 加入 `defaultConsumerIds`，并将 `defaultMode` 设为 `agents`，可让它在监听开始时默认启用；否则可在会中消费者选择卡片里手动启用。
+
 ## 运行时状态（自动维护，勿手改）
 
 下列字段由 botmux 自身写入并随授权 / 开关一起持久化进 `bots.json`，列出仅为说明，**不要手动编辑**：

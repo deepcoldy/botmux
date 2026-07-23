@@ -2,7 +2,12 @@ import {
   findVcMeetingDeliveryByKey,
   listVcMeetingActiveProjectionsForReceiverSession,
 } from './vc-meeting-delivery-store.js';
-import type { Session, VcMeetingImTurnOrigin } from '../types.js';
+import type {
+  Session,
+  VcMeetingImTurnOrigin,
+  VcMeetingListenerOutputPlacement,
+} from '../types.js';
+import type { VcMeetingListenerOutputProtocol } from './vc-meeting-listener-output-protocol.js';
 
 /** Resolve explicit-IM authority by the worker's live turn id. The latest
  * quote target is presentation state only: message B may already be queued
@@ -39,7 +44,16 @@ export type VcMeetingManagedSendDecision =
       ok: true;
       kind: 'listener_thread';
       /** Durable ownership used to index the successful primary Lark output. */
-      meetingOwner: { listenerAppId: string; meetingId: string };
+      meetingOwner: {
+        listenerAppId: string;
+        meetingId: string;
+        memberId: string;
+        memberEpoch: number;
+      };
+      /** Automatic delivery placement. Explicit human IM turns remain routed
+       * to their quote/thread context and therefore use `auto`. */
+      outputPlacement: VcMeetingListenerOutputPlacement;
+      listenerOutputProtocol: VcMeetingListenerOutputProtocol;
     }
   | { ok: false; errorCode: 'origin_unproven' | 'receipt_not_found' | 'origin_mismatch' | 'silent_delivery'; error: string };
 
@@ -174,9 +188,13 @@ export function evaluateVcMeetingManagedSend(
         return {
           ok: true,
           kind: 'listener_thread',
+          outputPlacement: 'auto',
+          listenerOutputProtocol: 'plain',
           meetingOwner: {
             listenerAppId: imOrigin.listenerAppId,
             meetingId: imOrigin.meetingId,
+            memberId: imOrigin.memberId,
+            memberEpoch: imOrigin.memberEpoch,
           },
         };
       }
@@ -229,9 +247,13 @@ export function evaluateVcMeetingManagedSend(
   return {
     ok: true,
     kind: 'listener_thread',
+    outputPlacement: lookup.receipt.outputPlacement ?? 'auto',
+    listenerOutputProtocol: lookup.receipt.listenerOutputProtocol ?? 'plain',
     meetingOwner: {
       listenerAppId: lookup.memberKey.listenerAppId,
       meetingId: lookup.memberKey.meetingId,
+      memberId: lookup.memberKey.memberId,
+      memberEpoch: lookup.memberKey.memberEpoch,
     },
   };
 }

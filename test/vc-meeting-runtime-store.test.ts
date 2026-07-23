@@ -35,6 +35,7 @@ function legacySelectedAgent(
     role: VC_MEETING_RUNTIME_LEGACY_ROLE,
     status,
     responseMode: 'listener_thread',
+    listenerPlacement: 'auto',
     capabilities: ['meeting.read', 'meeting.output.request'],
     ownedSinks: ['meeting_text', 'meeting_voice'],
     deliveryProfileHash: VC_MEETING_RUNTIME_LEGACY_PROFILE_HASH,
@@ -285,6 +286,7 @@ describe('vc meeting runtime store', () => {
       status: 'active',
       filter: { activityTypes: ['chat_received', 'transcript_received'] },
       responseMode: 'silent',
+      listenerPlacement: 'auto',
       capabilities: ['meeting.read'],
       ownedSinks: [],
     }, {
@@ -294,6 +296,7 @@ describe('vc meeting runtime store', () => {
       role: 'action_writer',
       status: 'activating',
       responseMode: 'listener_thread',
+      listenerPlacement: 'auto',
       capabilities: ['meeting.read', 'meeting.output.request', 'listener.output.request'],
       ownedSinks: ['meeting_text'],
       deliveryProfileHash: `sha256:${'a'.repeat(64)}`,

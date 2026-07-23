@@ -9,6 +9,14 @@ export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
 
 export type VcMeetingConsumerResponseMode = 'silent' | 'listener_thread';
 
+/** How an automatic listener-visible consumer reply is placed inside the
+ * listener chat. `auto` preserves the historical session routing behavior. */
+export type VcMeetingListenerOutputPlacement = 'auto' | 'chat' | 'topic';
+
+export interface VcMeetingListenerDeliveryConfig {
+  placement: VcMeetingListenerOutputPlacement;
+}
+
 /** Host-derived authority for one explicit Lark message routed into a
  * dedicated meeting receiver. Entries are keyed by `larkMessageId` on the
  * persisted session so queued human turns cannot overwrite each other's
@@ -46,6 +54,10 @@ export interface VcMeetingConsumerProfileConfig {
   instructions?: string;
   filter?: VcMeetingConsumerProfileFilter;
   responseMode: VcMeetingConsumerResponseMode;
+  /** Presentation policy for automatic listener-visible output. This is
+   * orthogonal to responseMode: silent consumers never auto-post regardless
+   * of placement. Omitted means the backward-compatible `auto` behavior. */
+  listenerDelivery?: VcMeetingListenerDeliveryConfig;
   /** Capability names are snapshotted onto runtime membership. */
   capabilities: string[];
   /** Only managed meeting text/voice sinks are accepted in MA-P1 slice 1A. */

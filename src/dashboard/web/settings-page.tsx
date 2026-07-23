@@ -554,6 +554,10 @@ function SettingsBody(props: {
           <p className="hint-warn">{tr('settings.readOnlyVisitor')}</p>
         </article>
       )}
+      <SettingsModule
+        title={tr('settings.moduleGeneral')}
+        description={tr('settings.moduleGeneralHelp')}
+      >
       <SettingsGroup className="settings-group-main">
         <SettingsBlock title={tr('settings.sectionAccess')}>
           <ToggleRow
@@ -675,6 +679,14 @@ function SettingsBody(props: {
             }}
           />
         </SettingsBlock>
+      </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        className="settings-module-meeting"
+        title={tr('settings.moduleMeeting')}
+        description={tr('settings.moduleMeetingHelp')}
+      >
+      <SettingsGroup className="settings-group-meeting">
         <SettingsBlock className="settings-vc-block" title={tr('settings.sectionVcMeetingAgent')}>
           <ToggleRow
             title={tr('settings.vcMeetingAgent')}
@@ -730,6 +742,11 @@ function SettingsBody(props: {
           ) : null}
         </SettingsBlock>
       </SettingsGroup>
+      </SettingsModule>
+      <SettingsModule
+        title={tr('settings.moduleSystem')}
+        description={tr('settings.moduleSystemHelp')}
+      >
       <SettingsGroup className="settings-group-ops">
         <SettingsBlock
           title={tr('settings.sectionMaintenance')}
@@ -791,10 +808,29 @@ function SettingsBody(props: {
         </SettingsBlock>
         {props.updateBlock}
       </SettingsGroup>
+      </SettingsModule>
       <div className="settings-status-row">
         <span className={`oncall-status ${props.message?.cls ?? ''}`} data-settings-status>{props.message?.text ?? ''}</span>
       </div>
     </div>
+  );
+}
+
+function SettingsModule(props: {
+  className?: string;
+  title: string;
+  description: string;
+  children: ReactNode;
+}): JSX.Element {
+  const cls = ['settings-module', props.className].filter(Boolean).join(' ');
+  return (
+    <section className={cls}>
+      <header className="settings-module-heading">
+        <h2>{props.title}</h2>
+        <p>{props.description}</p>
+      </header>
+      {props.children}
+    </section>
   );
 }
 

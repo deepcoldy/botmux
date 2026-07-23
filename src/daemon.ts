@@ -317,7 +317,10 @@ import {
   type VcMeetingRuntimeSelectedAgent,
   type VcMeetingRuntimeSessionRecord,
 } from './services/vc-meeting-runtime-store.js';
-import { computeVcMeetingConsumerProfileHash } from './services/vc-meeting-profile-instructions.js';
+import {
+  computeVcMeetingConsumerProfileHash,
+  normalizeVcMeetingProfileInstructions,
+} from './services/vc-meeting-profile-instructions.js';
 import { bootstrapVcMeetingDefaultConsumerProfile } from './services/vc-meeting-consumer-profile-bootstrap.js';
 import {
   getVcMeetingPreparation,
@@ -391,6 +394,9 @@ import {
   resolveVcMeetingImTurnOrigin,
   verifyVcMeetingManagedOriginClaim,
 } from './services/vc-meeting-send-policy.js';
+import {
+  ensureVcMeetingListenerTopicRoot,
+} from './services/vc-meeting-listener-topic-store.js';
 import {
   finishVcMeetingManagedActionProvider,
   finishVcMeetingManagedApprovalCard,
@@ -1156,6 +1162,10 @@ type VcMeetingDaemonSession = {
   // 避免 daemon 重启把半选状态变成真状态）。
   consumerPendingChoice?: { mode: 'agent'; agentAppId: string } | { mode: 'listenOnly' };
   consumerPendingIntervalMs?: number;
+  /** Authenticated operator context submitted with the current profile form.
+   * Staged only: activation freezes it into each newly joined member's trusted
+   * instruction snapshot, so it never mutates the reusable preset. */
+  consumerPendingActivationContext?: string;
   consumerInjectTimer?: ReturnType<typeof setInterval>;
   consumerInjectPromise?: Promise<VcMeetingConsumerInjectResult>;
   actorNamesByOpenId: Record<string, string>;
@@ -1373,6 +1383,8 @@ const VC_MEETING_SYNC_INTERVAL_OPTIONS_MS = [15_000, 30_000, 60_000, 90_000] as 
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MIN_SECONDS = 10;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_MAX_SECONDS = 3_600;
 const VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD = 'vc_meeting_custom_interval_seconds';
+const VC_MEETING_ACTIVATION_CONTEXT_FIELD = 'vc_meeting_activation_context';
+const VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS = 2_000;
 const vcMeetingEndedTombstones = new BoundedMap<string, number>(2_000);
 const vcMeetingPendingInvites = new BoundedMap<string, VcMeetingPendingInvite>(2_000);
 
@@ -1476,6 +1488,32 @@ function normalizeVcMeetingCustomSyncIntervalMs(value: unknown): { ok: true; int
 
 function vcMeetingCustomSyncIntervalFromCard(data: CardActionData): { ok: true; intervalMs?: number } | { ok: false; error: string } {
   return normalizeVcMeetingCustomSyncIntervalMs(data.action?.form_value?.[VC_MEETING_CUSTOM_SYNC_INTERVAL_FIELD]);
+}
+
+type VcMeetingActivationContextResult =
+  | { ok: true; context?: string }
+  | { ok: false; error: string };
+
+function normalizeVcMeetingActivationContext(value: unknown): VcMeetingActivationContextResult {
+  if (value === undefined || value === null) return { ok: true };
+  const text = (Array.isArray(value) ? String(value[0] ?? '') : String(value))
+    .replace(/\r\n?/g, '\n')
+    .trim();
+  if (!text) return { ok: true };
+  if (text.length > VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS) {
+    return { ok: false, error: `本次会议补充说明不能超过 ${VC_MEETING_ACTIVATION_CONTEXT_MAX_CHARS} 个字符` };
+  }
+  const normalized = normalizeVcMeetingProfileInstructions(text);
+  if (!normalized.ok) {
+    return { ok: false, error: `本次会议补充说明无效：${normalized.error}` };
+  }
+  return { ok: true, context: normalized.instructions };
+}
+
+function vcMeetingActivationContextFromCard(data: CardActionData): VcMeetingActivationContextResult {
+  return normalizeVcMeetingActivationContext(
+    data.action?.form_value?.[VC_MEETING_ACTIVATION_CONTEXT_FIELD],
+  );
 }
 
 function vcMeetingSessionFlushIntervalMs(session: VcMeetingDaemonSession, cfg: VcMeetingAgentConfig): number {
@@ -2592,6 +2630,24 @@ async function sessionReply(
         );
         return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
       }
+    }
+    if (opts?.placement === 'chat') {
+      return sendWithHookPolicy(chatId, content, msgType, opts.uuid);
+    }
+    if (opts?.placement === 'topic') {
+      const topicKey = opts.meetingTopicKey;
+      if (!topicKey || topicKey.targetChatId !== chatId) {
+        throw new Error('meeting topic placement is missing a matching durable topic key');
+      }
+      const root = await ensureVcMeetingListenerTopicRoot(
+        config.session.dataDir,
+        topicKey,
+        () => sendWithHookPolicy(chatId, content, msgType, opts.uuid),
+      );
+      if (root.created) {
+        return root.rootMessageId;
+      }
+      return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
     }
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);
@@ -6121,6 +6177,8 @@ type VcMeetingConsumerSelectionApplyOptions = {
   /** Only the authenticated recovery-card path may resume the same legacy
    * member after `meeting_ended`; ordinary ended selections stay fenced. */
   allowClosingRecovery?: boolean;
+  /** Per-meeting context for profiles newly activated by this selection. */
+  activationContext?: string;
 };
 
 /** Publish a membership mutation before its first await. Meeting close uses
@@ -8842,10 +8900,33 @@ function vcMeetingRuntimeAgentForProfile(
     ...(opts.activationError ? { activationError: opts.activationError.slice(0, 500) } : {}),
     ...(filter ? { filter } : {}),
     responseMode: profile.responseMode,
+    listenerPlacement: profile.listenerDelivery?.placement ?? 'auto',
     capabilities: vcMeetingCanonicalProfileCapabilities(profile),
     ownedSinks: vcMeetingCanonicalProfileOwnedSinks(profile),
     deliveryProfileHash: opts.deliveryProfileHash ?? vcMeetingConsumerProfileHash(profile),
   };
+}
+
+function vcMeetingProfileWithActivationContext(
+  profile: VcMeetingConsumerProfileConfig,
+  activationContext: string | undefined,
+): VcMeetingConsumerProfileConfig {
+  if (!activationContext) return profile;
+  const contextSection = [
+    '本次会议补充说明（仅适用于本次会议，不修改角色预设）：',
+    activationContext,
+  ].join('\n');
+  const combined = profile.instructions
+    ? `${profile.instructions}\n\n${contextSection}`
+    : contextSection;
+  const normalized = normalizeVcMeetingProfileInstructions(combined);
+  if (!normalized.ok || !normalized.instructions) {
+    throw new Error(
+      `profile ${profile.id} 的预设职责与本次会议补充说明无法合并：`
+      + `${normalized.ok ? '内容为空' : normalized.error}`,
+    );
+  }
+  return { ...profile, instructions: normalized.instructions };
 }
 
 /** Rehydrate the exact immutable profile snapshot selected for this member
@@ -8862,6 +8943,9 @@ function vcMeetingProfileFromRuntimeAgent(
     ...(selected.instructions ? { instructions: selected.instructions } : {}),
     ...(selected.filter ? { filter: selected.filter } : {}),
     responseMode: selected.responseMode,
+    ...(selected.listenerPlacement !== 'auto'
+      ? { listenerDelivery: { placement: selected.listenerPlacement } }
+      : {}),
     capabilities: [...selected.capabilities],
     ...(selected.ownedSinks.length > 0 ? { ownedSinks: [...selected.ownedSinks] } : {}),
   };
@@ -8946,6 +9030,7 @@ async function ensureVcMeetingProfileMember(
     && JSON.stringify(prior.ownedSinks) === JSON.stringify(canonicalOwnedSinks);
   const samePolicy = sameStreamSemantics
     && prior.responseMode === profile.responseMode
+    && prior.outputPlacement === (profile.listenerDelivery?.placement ?? 'auto')
     && JSON.stringify(prior.capabilities) === JSON.stringify(canonicalCapabilities)
     && sameOwnedSinks;
   // Receiver registration commits before the hub projection. A crash in that
@@ -8962,6 +9047,7 @@ async function ensureVcMeetingProfileMember(
     && receiverPrior.instructions === instructions
     && receiverPrior.outputChatId === listenerChatId
     && receiverPrior.responseMode === profile.responseMode
+    && receiverPrior.outputPlacement === (profile.listenerDelivery?.placement ?? 'auto')
     && JSON.stringify(receiverPrior.filter ?? {}) === JSON.stringify(canonicalFilter ?? {})
     && JSON.stringify(receiverPrior.capabilities) === JSON.stringify(canonicalCapabilities)
     && JSON.stringify(receiverPrior.ownedSinks) === JSON.stringify(canonicalOwnedSinks)
@@ -9029,7 +9115,10 @@ async function ensureVcMeetingProfileMember(
       responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
       ...policy,
     },
-    outputRoute: { chatId: orphanedReceiver?.outputChatId ?? listenerChatId },
+    outputRoute: {
+      chatId: orphanedReceiver?.outputChatId ?? listenerChatId,
+      placement: orphanedReceiver?.outputPlacement ?? profile.listenerDelivery?.placement ?? 'auto',
+    },
   };
   const receiver = await postVcMeetingMemberProjection(profile.agentAppId, projection);
   const body = vcMeetingResponseRecord(receiver.body);
@@ -9061,6 +9150,7 @@ async function ensureVcMeetingProfileMember(
     membershipGeneration,
     status: 'active',
     responseMode: orphanedReceiver?.responseMode ?? profile.responseMode,
+    outputPlacement: orphanedReceiver?.outputPlacement ?? profile.listenerDelivery?.placement ?? 'auto',
     ...policy,
     joinedAtIngestSeq,
     receiverSessionId,
@@ -9179,6 +9269,7 @@ async function pauseVcMeetingSingleConsumerMembership(
     membershipGeneration,
     status: 'paused',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     joinedAtIngestSeq: prior.joinedAtIngestSeq,
     receiverSessionId: prior.receiverSessionId,
     outputChatId: prior.outputChatId,
@@ -9203,7 +9294,7 @@ async function pauseVcMeetingSingleConsumerMembership(
       joinedAtIngestSeq: prior.joinedAtIngestSeq,
       responseMode: prior.responseMode,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   });
   const body = vcMeetingResponseRecord(receiver.body);
   if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
@@ -9255,6 +9346,7 @@ async function pauseVcMeetingProfileMembership(
     membershipGeneration,
     status: 'paused',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: prior.joinedAtIngestSeq,
     receiverSessionId: prior.receiverSessionId,
@@ -9281,7 +9373,7 @@ async function pauseVcMeetingProfileMembership(
       responseMode: prior.responseMode,
       ...policy,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   });
   const body = vcMeetingResponseRecord(receiver.body);
   if (receiver.status < 200 || receiver.status >= 300 || body?.ok !== true) {
@@ -9318,6 +9410,7 @@ function retireVcMeetingSingleConsumerForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
     outputChatId: member.outputChatId,
@@ -9339,6 +9432,7 @@ function retireVcMeetingSingleConsumerForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
     outputChatId: member.outputChatId,
@@ -9390,6 +9484,7 @@ function retireVcMeetingProfileMemberForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
@@ -9413,6 +9508,7 @@ function retireVcMeetingProfileMemberForRecovery(
     membershipGeneration,
     status: 'removed',
     responseMode: member.responseMode,
+    outputPlacement: member.outputPlacement ?? 'auto',
     ...policy,
     joinedAtIngestSeq: member.joinedAtIngestSeq,
     receiverSessionId: member.receiverSessionId,
@@ -9607,6 +9703,7 @@ function vcMeetingProfileMemberSemanticsMatchRuntime(
     && member.outputChatId === listenerChatId
     && member.deliveryProfileHash === selected.deliveryProfileHash
     && member.responseMode === selected.responseMode
+    && (member.outputPlacement ?? 'auto') === selected.listenerPlacement
     && JSON.stringify(member.filter ?? {}) === JSON.stringify(selected.filter ?? {})
     && JSON.stringify(member.capabilities) === JSON.stringify(selected.capabilities)
     && JSON.stringify(member.ownedSinks) === JSON.stringify(selected.ownedSinks);
@@ -9649,6 +9746,7 @@ function refreshVcMeetingProfileOwnerBoot(session: VcMeetingDaemonSession): bool
         joinedAtIngestSeq: member.joinedAtIngestSeq,
         receiverSessionId: member.receiverSessionId,
         outputChatId: member.outputChatId,
+        outputPlacement: member.outputPlacement ?? 'auto',
       });
       if (!applied.ok) throw new Error(`receiver ${member.memberId}: ${applied.reason}`);
     }
@@ -9673,6 +9771,7 @@ function refreshVcMeetingProfileOwnerBoot(session: VcMeetingDaemonSession): bool
         membershipGeneration: member.membershipGeneration,
         status: member.status,
         responseMode: member.responseMode,
+        outputPlacement: member.outputPlacement ?? 'auto',
         ...policy,
         joinedAtIngestSeq: member.joinedAtIngestSeq,
         receiverSessionId: member.receiverSessionId,
@@ -10982,7 +11081,7 @@ async function removeVcMeetingProfileMember(
       ownedSinks: prior.ownedSinks,
       sinkOwnerGeneration: prior.sinkOwnerGeneration,
     },
-    outputRoute: { chatId: prior.outputChatId },
+    outputRoute: { chatId: prior.outputChatId, placement: prior.outputPlacement ?? 'auto' },
   };
   const receiver = await postVcMeetingMemberProjection(prior.agentAppId, projection);
   const body = vcMeetingResponseRecord(receiver.body);
@@ -11003,6 +11102,7 @@ async function removeVcMeetingProfileMember(
     membershipGeneration,
     status: 'removed',
     responseMode: prior.responseMode,
+    outputPlacement: prior.outputPlacement ?? 'auto',
     ...(prior.filter ? { filter: prior.filter } : {}),
     capabilities: prior.capabilities,
     ownedSinks: prior.ownedSinks,
@@ -11236,7 +11336,9 @@ async function applyVcMeetingConsumerProfileSelection(
     );
     const requestedProfiles = resolution.selectedProfiles.map((profile) => {
       const existing = existingByProfileId.get(profile.id);
-      return existing ? vcMeetingProfileFromRuntimeAgent(existing) : profile;
+      return existing
+        ? vcMeetingProfileFromRuntimeAgent(existing)
+        : vcMeetingProfileWithActivationContext(profile, opts.activationContext);
     });
     const retainedAfterRemovalFailure: VcMeetingRuntimeSelectedAgent[] = [];
     const removalErrors: string[] = [];
@@ -11329,6 +11431,7 @@ async function applyVcMeetingConsumerProfileSelection(
     session.consumerSelectionApplying = false;
     session.consumerPendingProfileIds = undefined;
     session.consumerPendingIntervalMs = undefined;
+    session.consumerPendingActivationContext = undefined;
   }
 }
 
@@ -11496,13 +11599,14 @@ async function applyVcMeetingConsumerProfileStagedState(
   const selectedProfileIds = session.consumerPendingProfileIds
     ?? (fallbackProfileIds ? [...fallbackProfileIds] : undefined);
   const stagedIntervalMs = session.consumerPendingIntervalMs;
+  const activationContext = session.consumerPendingActivationContext;
   if (stagedIntervalMs) session.syncIntervalMs = stagedIntervalMs;
   let result = await applyVcMeetingConsumerProfileSelection(
     key,
     session,
     cfg,
     selectedProfileIds,
-    opts,
+    { ...opts, ...(activationContext ? { activationContext } : {}) },
   );
   if (!result.ok && selectedProfileIds === undefined && session.consumerMode === 'pending') {
     // A conflicting/invalid hand-edited default must never leave a pending
@@ -13383,6 +13487,11 @@ async function handleVcMeetingCardAction(data: CardActionData, larkAppId: string
           session.consumerSelectionApplying = false;
         }
       }
+      const activationContext = vcMeetingActivationContextFromCard(data);
+      if (!activationContext.ok) {
+        return { toast: { type: 'error', content: activationContext.error } };
+      }
+      session.consumerPendingActivationContext = activationContext.context;
       return applyVcMeetingConsumerSelectionInBackground(
         key,
         session,

@@ -115,6 +115,23 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
     expect(mapped.profiles[1].capabilities).toEqual([OUTPUT, READ]);
   });
 
+  it('round-trips listener placement independently from response mode', () => {
+    const mapped = vcMeetingConsumerProfilesFromDtos([
+      dto({ responseMode: 'listener_thread', listenerPlacement: 'topic' }),
+    ], []);
+    expect(mapped.ok).toBe(true);
+    if (!mapped.ok) return;
+    expect(mapped.profiles[0].listenerDelivery).toEqual({ placement: 'topic' });
+    expect(vcMeetingConsumerProfileToDto(mapped.profiles[0]).listenerPlacement).toBe('topic');
+
+    const legacy = vcMeetingConsumerProfilesFromDtos([dto()], []);
+    expect(legacy.ok).toBe(true);
+    if (legacy.ok) {
+      expect(legacy.profiles[0]).not.toHaveProperty('listenerDelivery');
+      expect(vcMeetingConsumerProfileToDto(legacy.profiles[0]).listenerPlacement).toBe('auto');
+    }
+  });
+
   // codex 指定用例：silent policy 合法携带 listener.output.request 时，
   // custom 的 no-op GET→PUT 往返不得丢字段（mode 未变 → 逐字复制）。
   it('no-op custom round-trip preserves capabilities verbatim (incl. listener cap on silent)', () => {
@@ -227,6 +244,7 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
       dto({ id: 'd', permissionPreset: 'root' as never }),
       dto({ id: 'e', activityTypes: ['transcript_received', 'nope'] }),
       dto({ id: 'f', instructions: 42 as never }),
+      dto({ id: 'g', listenerPlacement: 'broadcast' as never }),
     ], []);
     expect(mapped.ok).toBe(false);
     if (mapped.ok) return;
@@ -237,6 +255,7 @@ describe('vcMeetingConsumerProfilesFromDtos ↔ vcMeetingConsumerProfileToDto', 
       'profiles[3].permissionPreset',
       'profiles[4].activityTypes',
       'profiles[5].instructions',
+      'profiles[6].listenerPlacement',
     ]);
   });
 
@@ -477,8 +496,18 @@ describe('handleVcMeetingConsumerProfilesGet', () => {
     if (out.status !== 200) return;
     expect(out.body.revision).toBe('sha256:rev1');
     expect(out.body.catalogState).toBe('profiles');
-    expect(out.body.profiles).toEqual([dto()]);
+    expect(out.body.profiles).toEqual([dto({ listenerPlacement: 'auto' })]);
     expect(out.body.agentOptions[0]?.appId).toBe('app_agent');
+    expect(out.body.templateCatalog).toMatchObject({
+      schemaVersion: 1,
+      templates: [
+        { templateId: 'important-information-sync', version: 1, source: 'builtin' },
+        { templateId: 'meeting-minutes', version: 2, source: 'builtin' },
+        { templateId: 'meeting-facilitator', version: 1, source: 'builtin' },
+        { templateId: 'solution-review-risk-challenge', version: 1, source: 'builtin' },
+        { templateId: 'interview-requirement-insights', version: 1, source: 'builtin' },
+      ],
+    });
   });
 
   it('GET exposes an explicit legacy-seed migration offer without mutating config', async () => {

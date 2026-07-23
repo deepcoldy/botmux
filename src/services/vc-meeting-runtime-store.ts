@@ -8,6 +8,7 @@ import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
   VcMeetingConsumerResponseMode,
+  VcMeetingListenerOutputPlacement,
 } from '../types.js';
 import type { VcMeetingActivityType } from '../vc-agent/types.js';
 import type { VcMeetingPreparationQaMode } from './vc-meeting-preparations-store.js';
@@ -33,6 +34,7 @@ export interface VcMeetingRuntimeSelectedAgent {
   activationError?: string;
   filter?: VcMeetingConsumerProfileFilter;
   responseMode: VcMeetingConsumerResponseMode;
+  listenerPlacement: VcMeetingListenerOutputPlacement;
   capabilities: string[];
   ownedSinks: VcMeetingConsumerManagedSink[];
   /** Immutable P0/P1 delivery semantics snapshot; optional for new records until hub activation. */
@@ -331,6 +333,7 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
     'activationError',
     'filter',
     'responseMode',
+    'listenerPlacement',
     'capabilities',
     'ownedSinks',
     'deliveryProfileHash',
@@ -348,6 +351,10 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
     agent.status as VcMeetingRuntimeSelectedAgentStatus,
   )) return { ok: false };
   if (agent.responseMode !== 'silent' && agent.responseMode !== 'listener_thread') return { ok: false };
+  if (agent.listenerPlacement !== undefined
+    && agent.listenerPlacement !== 'auto'
+    && agent.listenerPlacement !== 'chat'
+    && agent.listenerPlacement !== 'topic') return { ok: false };
   const capabilities = normalizeUniqueStringList(agent.capabilities);
   const ownedSinks = normalizeUniqueStringList(agent.ownedSinks);
   if (!capabilities || !ownedSinks) return { ok: false };
@@ -375,6 +382,7 @@ function normalizeSelectedAgent(value: unknown): NormalizeSelectedAgentResult {
         : {}),
       ...(filter.filter ? { filter: filter.filter } : {}),
       responseMode: agent.responseMode,
+      listenerPlacement: (agent.listenerPlacement ?? 'auto') as VcMeetingListenerOutputPlacement,
       capabilities,
       ownedSinks: ownedSinks as VcMeetingConsumerManagedSink[],
       ...(typeof agent.deliveryProfileHash === 'string'
@@ -441,6 +449,7 @@ function legacySelectedAgent(value: Record<string, unknown>): VcMeetingRuntimeSe
     role: VC_MEETING_RUNTIME_LEGACY_ROLE,
     status: value.consumerPaused === true ? 'paused' : 'active',
     responseMode: 'listener_thread',
+    listenerPlacement: 'auto',
     capabilities: ['meeting.read', 'meeting.output.request'],
     ownedSinks: ['meeting_text', 'meeting_voice'],
     deliveryProfileHash: VC_MEETING_RUNTIME_LEGACY_PROFILE_HASH,

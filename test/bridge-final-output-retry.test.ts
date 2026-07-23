@@ -149,6 +149,15 @@ function finalOutputMsg(): Extract<WorkerToDaemon, { type: 'final_output' }> {
   return { type: 'final_output', content: 'final answer', lastUuid: 'uuid-1', turnId: 'turn-1' };
 }
 
+function listenerFinalOutputMsg(
+  content = 'final answer',
+): Extract<WorkerToDaemon, { type: 'final_output' }> {
+  return {
+    ...finalOutputMsg(),
+    content: JSON.stringify({ decision: 'publish', content }),
+  };
+}
+
 function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
   const memberKey = {
     listenerAppId: 'listener-app', meetingId: 'meeting-1', memberId: 'member-1', memberEpoch: 1,
@@ -164,7 +173,9 @@ function seedReceiverReceipt(responseMode: 'silent' | 'listener_thread'): void {
     ...memberKey,
     ownerBootId: 'owner-boot', ownerEpoch: 1, membershipGeneration: 1,
     deliveryKey: 'delivery-stable-key', inputHash: 'input-hash', fromSeq: 1, toSeq: 1,
-    responseMode, receiverBootId: 'receiver-boot',
+    responseMode,
+    listenerOutputProtocol: responseMode === 'listener_thread' ? 'decision_v1' : 'plain',
+    receiverBootId: 'receiver-boot',
   })).toMatchObject({ kind: 'accepted' });
   expect(markVcMeetingDeliveryDispatched('/tmp/test-sessions', {
     ...memberKey, deliveryKey: 'delivery-stable-key',
@@ -988,7 +999,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     seedReceiverReceipt('listener_thread');
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, {
-      ...finalOutputMsg(),
+      ...listenerFinalOutputMsg(),
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
     }, 'tag', 0);
@@ -996,6 +1007,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0][1]).toContain('final answer');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('decision');
     expect(sessionReply.mock.calls[0][5]).toMatchObject({
       uuid: expect.stringMatching(/^vcp_[0-9a-f]+$/),
       sourceSessionId: ds.session.sessionId,
@@ -1006,6 +1019,71 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       meetingId: 'meeting-1',
       targetChatId: ds.chatId,
     })).toEqual(['om_meeting_fallback']);
+  });
+
+  it('treats a valid skip decision as a successful no-message outcome', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...listenerFinalOutputMsg(),
+      content: '{"decision":"skip"}',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(listVcMeetingActions('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+    })).toEqual([]);
+  });
+
+  it('fails closed on a malformed automatic listener control envelope', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.vcMeetingReceiver = {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1',
+      memberId: 'member-1', memberEpoch: 1,
+    };
+    seedReceiverReceipt('listener_thread');
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, {
+      ...finalOutputMsg(),
+      content: '暂无重要更新',
+      turnId: 'delivery-stable-key',
+      dispatchAttempt: 1,
+    }, 'tag', 0);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
+      listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
+    })).toEqual([]);
   });
 
   it('reuses one provider UUID when a listener reply is accepted before crash reconciliation', async () => {
@@ -1038,7 +1116,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     seedReceiverReceipt('listener_thread');
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     const first = {
-      ...finalOutputMsg(),
+      ...listenerFinalOutputMsg(),
       turnId: 'delivery-stable-key',
       dispatchAttempt: 1,
       lastUuid: 'bridge-attempt-1',
@@ -1063,7 +1141,10 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
     __testOnly_deliverFinalOutput(ds, {
       ...first,
-      content: 'changed replay answer must not create another effect',
+      content: JSON.stringify({
+        decision: 'publish',
+        content: 'changed replay answer must not create another effect',
+      }),
       dispatchAttempt: 2,
       lastUuid: 'bridge-attempt-2',
     }, 'tag', 0);
