@@ -377,16 +377,6 @@ export class HerdrBackend implements SessionBackend {
       .filter((name: string) => name.startsWith('bmx-'));
   }
 
-  /** Pick a user-owned running session without creating anything. */
-  static preferredRunningSession(): string | undefined {
-    const raw = jsonCommand(['session', 'list', '--json']);
-    const sessions = extractSessions(raw).filter((s: any) =>
-      typeof s?.name === 'string' && s.running === true && !s.name.startsWith('bmx-'));
-    const envSession = process.env.HERDR_SESSION;
-    if (envSession && sessions.some((s: any) => s.name === envSession)) return envSession;
-    return sessions.find((s: any) => s.default === true)?.name ?? sessions[0]?.name;
-  }
-
   static hasAgent(sessionName: string, agentName: string): boolean {
     return HerdrBackend.probeAgent(sessionName, agentName) === 'exists';
   }

@@ -67,7 +67,7 @@ export interface SelectedSessionBackend {
   /** Exact resource owned by this Botmux session; persisted by the daemon. */
   persistentBackendTarget?: PersistentBackendTarget;
   isReattach?: boolean;
-  /** Set only when this spawn must create a herdr session because none exists. */
+  /** Set when this spawn creates its deterministic Botmux-owned Herdr session. */
   createdHerdrSessionName?: string;
 }
 
@@ -75,7 +75,8 @@ export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
   backendConfig?: RiffBackendConfig;
-  reuseExistingHerdrSession?: boolean;
+  /** Migration compatibility for sessions previously placed in a shared user host. */
+  reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
 }): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
@@ -116,12 +117,12 @@ export function selectSessionBackend(opts: {
   if (opts.backendType === 'herdr') {
     const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
     // A restarted worker must reattach to the SAME shared host selected by the
-    // prior generation. Re-running preferredRunningSession() here can pick a
-    // newly-current/default workspace, start a duplicate CLI there, and orphan
+    // prior generation. Re-selecting from UI current/default state could pick a
+    // different workspace, start a duplicate CLI there, and orphan
     // the still-live managed agent in the recorded host. Isolation/MCP callers
     // explicitly disable shared reuse, so they intentionally ignore this stamp
     // and converge back to a bot-owned bmx-* session.
-    const recorded = opts.reuseExistingHerdrSession === false
+    const recorded = opts.reuseRecordedHerdrTarget === false
       ? undefined
       : opts.persistentBackendTarget?.backendType === 'herdr'
         && opts.persistentBackendTarget.agentName
@@ -167,32 +168,11 @@ export function selectSessionBackend(opts: {
       };
     }
 
-    // Reuse the user's current/default running herdr session. Creating one
-    // session per botmux conversation is surprising and hides the agent from
-    // the user's normal workspace. The deterministic agent name also lets a
-    // restarted worker find the same pane again.
-    const hostSessionName = opts.reuseExistingHerdrSession === false
-      ? undefined
-      : HerdrBackend.preferredRunningSession();
-    if (hostSessionName) {
-      const agentName = `botmux-${opts.sessionId.slice(0, 8)}`;
-      const reattach = HerdrBackend.hasAgent(hostSessionName, agentName);
-      return {
-        backend: new HerdrBackend(hostSessionName, {
-          agentName,
-          isReattach: reattach,
-          ownsSession: false,
-          ownsAgent: true,
-        }),
-        isTmuxMode: false,
-        isPipeMode: true,
-        isZellijMode: false,
-        persistentSessionName: hostSessionName,
-        persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
-        isReattach: reattach,
-      };
-    }
-
+    // Fresh Botmux topics never guess among the user's running Herdr sessions.
+    // Their ordering/default/focus is UI state, not durable routing intent.
+    // Keep the same ownership boundary as tmux and zellij: one deterministic
+    // bmx-<sid8> mux session per Botmux conversation. /adopt is the only path
+    // that intentionally binds a new Botmux conversation to a user session.
     return {
       backend: new HerdrBackend(ownedSessionName, { createSession: true }),
       isTmuxMode: false,

@@ -23,7 +23,6 @@ vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
     static hasSession = vi.fn(() => false);
     static probeSession = vi.fn(() => 'missing');
-    static preferredRunningSession = vi.fn(() => undefined);
     static hasAgent = vi.fn(() => false);
     static probeAgent = vi.fn(() => 'missing');
     constructor(public sessionName: string, public opts?: unknown) {}
@@ -50,7 +49,6 @@ describe('selectSessionBackend', () => {
     vi.mocked(TmuxBackend.sessionName).mockClear();
     vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
     vi.mocked(HerdrBackend.probeSession).mockReturnValue('missing');
-    vi.mocked(HerdrBackend.preferredRunningSession).mockReturnValue(undefined);
     vi.mocked(HerdrBackend.hasAgent).mockReturnValue(false);
     vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
   });
@@ -92,33 +90,24 @@ describe('selectSessionBackend', () => {
     expect('tmuxBackend' in selected).toBe(false);
   });
 
-  it('puts a managed agent in an existing user herdr session', () => {
-    vi.mocked(HerdrBackend.preferredRunningSession).mockReturnValue('work');
-
+  it('creates an owned Herdr session for a fresh topic instead of guessing a user host', () => {
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'herdr' });
 
-    expect((selected.backend as any).sessionName).toBe('work');
-    expect((selected.backend as any).opts).toEqual({
-      agentName: 'botmux-9cfa0024',
-      isReattach: false,
-      ownsSession: false,
-      ownsAgent: true,
-    });
+    expect((selected.backend as any).sessionName).toBe('bmx-9cfa0024');
+    expect((selected.backend as any).opts).toEqual({ createSession: true });
     expect(selected.persistentBackendTarget).toEqual({
       backendType: 'herdr',
-      sessionName: 'work',
-      agentName: 'botmux-9cfa0024',
+      sessionName: 'bmx-9cfa0024',
     });
-    expect(selected.createdHerdrSessionName).toBeUndefined();
+    expect(selected.createdHerdrSessionName).toBe('bmx-9cfa0024');
   });
 
   it('reattaches the recorded shared Herdr agent even when current/default changed', () => {
     vi.mocked(HerdrBackend.probeSession).mockReturnValue('exists');
     vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
-    // A stray deterministic session and a new default must not outrank the
-    // durable shared target selected by the prior worker generation.
+    // A stray deterministic session must not outrank the durable shared target
+    // selected by the prior worker generation.
     vi.mocked(HerdrBackend.hasSession).mockReturnValue(true);
-    vi.mocked(HerdrBackend.preferredRunningSession).mockReturnValue('new-default');
 
     const selected = selectSessionBackend({
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
@@ -142,7 +131,6 @@ describe('selectSessionBackend', () => {
       sessionName: 'original-work',
       agentName: 'botmux-9cfa0024',
     });
-    expect(HerdrBackend.preferredRunningSession).not.toHaveBeenCalled();
   });
 
   it('fails closed when the recorded shared Herdr target cannot be probed', () => {
@@ -157,13 +145,11 @@ describe('selectSessionBackend', () => {
         agentName: 'botmux-9cfa0024',
       },
     })).toThrow('recorded herdr session original-work probe inconclusive');
-    expect(HerdrBackend.preferredRunningSession).not.toHaveBeenCalled();
   });
 
   it('recreates a missing managed agent in its recorded shared Herdr host', () => {
     vi.mocked(HerdrBackend.probeSession).mockReturnValue('exists');
     vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
-    vi.mocked(HerdrBackend.preferredRunningSession).mockReturnValue('new-default');
 
     const selected = selectSessionBackend({
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
@@ -182,7 +168,6 @@ describe('selectSessionBackend', () => {
       ownsSession: false,
       ownsAgent: true,
     });
-    expect(HerdrBackend.preferredRunningSession).not.toHaveBeenCalled();
   });
 
   it('ignores a recorded shared Herdr target when shared reuse is disabled', () => {
@@ -191,7 +176,7 @@ describe('selectSessionBackend', () => {
     const selected = selectSessionBackend({
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
       backendType: 'herdr',
-      reuseExistingHerdrSession: false,
+      reuseRecordedHerdrTarget: false,
       persistentBackendTarget: {
         backendType: 'herdr',
         sessionName: 'original-work',
@@ -202,17 +187,6 @@ describe('selectSessionBackend', () => {
     expect((selected.backend as any).sessionName).toBe('bmx-9cfa0024');
     expect(HerdrBackend.probeSession).not.toHaveBeenCalled();
     expect(HerdrBackend.probeAgent).not.toHaveBeenCalled();
-  });
-
-  it('creates and reports a botmux herdr session only when none is running', () => {
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'herdr' });
-
-    expect((selected.backend as any).sessionName).toBe('bmx-9cfa0024');
-    expect(selected.persistentBackendTarget).toEqual({
-      backendType: 'herdr',
-      sessionName: 'bmx-9cfa0024',
-    });
-    expect(selected.createdHerdrSessionName).toBe('bmx-9cfa0024');
   });
 
   it('uses zellij backend when backend is zellij', () => {

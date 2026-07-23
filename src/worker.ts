@@ -6030,10 +6030,11 @@ async function spawnCli(
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
     persistentBackendTarget: cfg.persistentBackendTarget,
-    // Isolation markers and MCP gateway hosts are scoped to a bot-owned
-    // persistent session. Never risk their cold-resume path stopping a user's
-    // shared herdr session.
-    reuseExistingHerdrSession: !willReadIsolate
+    // Old builds could place managed agents in a user's shared Herdr session.
+    // Preserve that recorded target for compatibility unless this incarnation
+    // requires an isolation/MCP boundary that only a Botmux-owned session can
+    // safely provide. Fresh topics always create their own bmx-<sid8> session.
+    reuseRecordedHerdrTarget: !willReadIsolate
       && !willWriteSandbox
       && !hasMcpRuntimeEntries,
   });
@@ -7116,7 +7117,7 @@ async function spawnCli(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `本机没有正在运行的 Herdr 会话，已创建：\`${selectedBackend.createdHerdrSessionName}\``,
+      message: `已为当前话题创建独立 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
     });
   }
 

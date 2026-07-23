@@ -155,23 +155,6 @@ describe('HerdrBackend connection surface', () => {
     expect(HerdrBackend.hasSession('missing')).toBe(false);
   });
 
-  it('prefers the current herdr session, then the running default, and ignores botmux sessions', () => {
-    const previous = process.env.HERDR_SESSION;
-    process.env.HERDR_SESSION = 'current';
-    setHerdrResponses([{
-      match: a => a[0] === 'session' && a[1] === 'list',
-      reply: () => JSON.stringify({ sessions: [
-        { name: 'bmx-owned', running: true },
-        { name: 'default', running: true, default: true },
-        { name: 'current', running: true },
-      ] }),
-    }]);
-    expect(HerdrBackend.preferredRunningSession()).toBe('current');
-    if (previous === undefined) delete process.env.HERDR_SESSION;
-    else process.env.HERDR_SESSION = previous;
-    expect(HerdrBackend.preferredRunningSession()).toBe('default');
-  });
-
   // ── Tri-state probe (exists | missing | unknown) ────────────────────────────
   // The restore-time zombie-close decision MUST NOT collapse "list command
   // failed/timed out" into "session is gone" — a transient probe failure would
