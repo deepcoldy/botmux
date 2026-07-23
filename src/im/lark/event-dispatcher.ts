@@ -2879,9 +2879,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }, 'bot-added event');
     },
     // 文档评论入口（/watch-comment / /subscribe-lark-doc）。notice 事件主要覆盖 @Bot
-    // 通知；旧逐文件订阅还可能收到 file 事件。`/watch-comment --all` 的普通评论由
-    // daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。
-    'drive.file.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
+    // 通知；普通评论由 daemon 应用身份轮询补齐，不依赖逐文件 subscribe API。
     'drive.notice.comment_add_v1': (data: any) => handleCommentEventAckSafe(data, larkAppId, handlers),
     [VC_BOT_MEETING_INVITED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_invited', VC_BOT_MEETING_INVITED_EVENT),
