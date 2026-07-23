@@ -477,6 +477,8 @@ const subs = new Map<string, () => void>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
 interface ResolvedDashboardSettings {
+  /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -998,6 +1000,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,

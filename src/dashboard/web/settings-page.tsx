@@ -10,6 +10,7 @@ interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
 
 interface DashboardSettings {
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -124,6 +125,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 
 function parseSettings(s: any): DashboardSettings {
   return {
+    groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -647,6 +649,17 @@ function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionGroupCreation')}>
+          <GroupNamePrefixRow
+            value={settings.groupNamePrefix}
+            disabled={dis || savingKey === 'groupNamePrefix'}
+            onSave={value => props.onSave(
+              'groupNamePrefix',
+              { groupNamePrefix: value },
+              s => ({ ...s, groupNamePrefix: value.trim() }),
+            )}
+          />
+        </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionExperimental')}>
           <ToggleRow
             title={tr('settings.chatBotDiscovery')}
@@ -1105,6 +1118,58 @@ function ToggleRow(props: {
         <strong><FieldTitle className="settings-toggle-title" help={props.help}>{props.title}</FieldTitle></strong>
       </span>
     </label>
+  );
+}
+
+const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+export function GroupNamePrefixRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const normalized = draft.trim();
+  const dirty = normalized !== props.value.trim();
+  const submit = () => {
+    if (props.disabled || !dirty) return;
+    void props.onSave(normalized);
+  };
+
+  return (
+    <div className="settings-subfield settings-group-prefix-editor">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.groupNamePrefixHelp')}>{tr('settings.groupNamePrefix')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          maxLength={GROUP_NAME_PREFIX_INPUT_MAX_LENGTH}
+          placeholder={tr('settings.groupNamePrefixPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-group-name-prefix-preview>
+        {normalized
+          ? tr('settings.groupNamePrefixPreview', { name: `${normalized}${tr('settings.groupNamePrefixPreviewName')}` })
+          : tr('settings.groupNamePrefixDisabled')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty}
+          onClick={submit}
+        >
+          {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
   );
 }
 
