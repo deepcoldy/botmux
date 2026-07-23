@@ -94,6 +94,7 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import { acknowledgeSessionReady } from './session-ready-handshake.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -2365,6 +2366,14 @@ function setupWorkerHandlers(
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
+        break;
+      }
+      case 'session_ready_ack': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored session_ready_ack from stale worker generation`);
+          break;
+        }
+        acknowledgeSessionReady(msg.requestId);
         break;
       }
       case 'local_process_attestation': {

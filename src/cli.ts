@@ -7928,10 +7928,9 @@ async function cmdHook(cliId: string): Promise<void> {
 
 // ─── botmux session-ready ─────────────────────────────────────────────────────
 //
-// Claude 家族（claude/seed）的 SessionStart hook 客户端。Claude 在 TUI 输入框
-// 真正渲染就绪时（startup / resume / clear / compact）触发本命令；它通知 daemon
-// 「CLI 真就绪」，放行 worker 端被 ready-gate 门控的首条 prompt——绕开 cjadk 之类
-// 自定义 launcher 启动选择器的 ❯ 误命中 readyPattern、把首条消息整条吞掉的 bug。
+// Claude 家族（claude/seed）的 SessionStart hook 客户端。它通知 daemon 已越过
+// 外层 startup selector；worker 随即清除 selector 留下的旧 ❯ 证据，再等待所有
+// 并行 hook 完成后新渲染的输入框，避免 cjadk 选择器误吞首条消息。
 //
 // 会话归属只靠 hook 子进程继承的 env（worker spawn 时设的 BOTMUX_SESSION_ID /
 // BOTMUX_LARK_APP_ID）。任何失败（env 缺失=adopt/非 botmux 会话、daemon 不可达）
@@ -9118,7 +9117,7 @@ switch (command) {
   }
   case 'session-ready': {
     // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
-    // 「CLI 真就绪」，放行被门控的首条 prompt。
+    // 已越过外层 selector；worker 再等待 hook 后的新 prompt 证据。
     await cmdSessionReady();
     break;
   }

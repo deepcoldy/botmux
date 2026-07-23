@@ -593,10 +593,11 @@ export type DaemonToWorker =
   | { type: 'set_locale'; locale: 'zh' | 'en' }
   | { type: 'term_action'; key: TermActionKey }
   | { type: 'refresh_screen' }
-  // Claude-family「真就绪」信号：CLI 的 SessionStart hook 经 `botmux session-ready`
-  // 调到 daemon，daemon 转发给本会话 worker，放行被 ready-gate 门控的首条 prompt
-  // （绕开 cjadk 启动选择器吞首条消息）。source = SessionStart 的 startup/resume/… 。
-  | { type: 'session_ready'; source?: string };
+  // Claude-family SessionStart 信号：CLI hook 经 `botmux session-ready` 调到
+  // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt
+  // 证据再回复 hook，避免 Claude 在 worker 重置前继续渲染真正输入框。
+  // source = SessionStart 的 startup/resume/… 。
+  | { type: 'session_ready'; source?: string; requestId?: string };
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
@@ -614,6 +615,9 @@ export type WorkerToDaemon =
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
+  /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
+   *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
+  | { type: 'session_ready_ack'; requestId: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }

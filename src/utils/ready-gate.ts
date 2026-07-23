@@ -1,6 +1,6 @@
 /**
  * Ready-gate state machine — holds the FIRST prompt for Claude-family CLIs until
- * a SessionStart hook fires a "真就绪" (true-ready) signal.
+ * a SessionStart hook proves the outer startup selector has been passed.
  *
  * Why this exists: a custom launcher (e.g. `cjadk claude`) shows an interactive
  * model/session selector at startup whose cursor is `❯` (U+276F). That glyph
@@ -10,11 +10,11 @@
  * trailing Enter mis-selects a menu item). The selector clears before Claude's
  * real input box renders, so the message is silently lost.
  *
- * Claude Code's `SessionStart` hook fires within ~3ms of the real input box
- * rendering, and crucially does NOT fire while the launcher is still on its
- * selector — so it's an unambiguous "the CLI is genuinely ready" signal. This
- * gate suspends the first flush until that signal (or a fallback timeout) so the
- * selector can never eat the first message.
+ * Claude Code's `SessionStart` hook crucially does NOT fire while the launcher
+ * is still on its selector. Claude can run multiple matching hooks in parallel,
+ * though, and renders the real prompt only after all finish. This gate therefore
+ * establishes the anti-selector boundary; the worker separately waits for fresh
+ * post-signal prompt evidence before it flushes Claude input.
  *
  * Lifecycle (recreated per CLI spawn in the worker):
  *   - `arm()`        — call at spawn when the adapter injects the SessionStart
