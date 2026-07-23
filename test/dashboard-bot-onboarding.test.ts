@@ -734,11 +734,15 @@ describe('BotOnboardingManager', () => {
     const gate = deferred<void>();
     const createApp = vi.fn();
     const registerApp = vi.fn();
+    const stopBotLive = vi.fn(async () => ({ ok: true, message: 'exact bot stopped' }));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'exact bot online' }));
     const calls: Array<Parameters<NonNullable<ConstructorParameters<typeof BotOnboardingManager>[0]['automateOpenPlatform']>>[0]> = [];
     const manager = new BotOnboardingManager({
       botsJsonPath,
       createApp,
       registerApp,
+      stopBotLive,
+      startBotLive,
       verifyCriticalScopes: async () => ({
         ok: true,
         granted: [],
@@ -758,6 +762,7 @@ describe('BotOnboardingManager', () => {
       workingDir,
       predecessorJobId: 'bot_original',
       expectedAppId: 'cli_existing_owner',
+      requireCriticalScopesBeforeActivation: true,
     });
     expect(started.ok).toBe(true);
     if (!started.ok) throw new Error(started.error);
@@ -765,6 +770,8 @@ describe('BotOnboardingManager', () => {
 
     expect(createApp).not.toHaveBeenCalled();
     expect(registerApp).not.toHaveBeenCalled();
+    expect(stopBotLive).toHaveBeenCalledOnce();
+    expect(stopBotLive).toHaveBeenCalledWith('cli_existing_owner');
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({
       appId: 'cli_existing_owner',
@@ -780,16 +787,28 @@ describe('BotOnboardingManager', () => {
       workingDir,
       registrationMode: 'compat',
       recoveryOfJobId: 'bot_original',
+      criticalScopeActivationRequired: true,
+      activationPending: true,
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_existing_owner',
+      activationPending: true,
     });
 
     gate.resolve();
     await started.job.done;
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(startBotLive).toHaveBeenCalledWith('cli_existing_owner');
     expect(manager.get(started.job.id)).toMatchObject({
       status: 'completed',
       addedBotIndex: 0,
       permission: { ok: true },
+      activationPending: false,
+      liveStarted: true,
     });
-    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toHaveLength(1);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.not.objectContaining({ activationPending: true }),
+    ]);
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -894,16 +913,22 @@ describe('BotOnboardingManager', () => {
         return { ok: false, reason: 'qr_expired', message: 'expired' };
       },
       verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped before restart' }),
     });
     const first = firstManager.startPermissionRecovery({
       workingDir,
       predecessorJobId: 'bot_original',
       expectedAppId: 'cli_existing_owner',
+      requireCriticalScopesBeforeActivation: true,
     });
     expect(first.ok).toBe(true);
     if (!first.ok) throw new Error(first.error);
     await new Promise(resolve => setTimeout(resolve, 0));
-    expect(firstManager.get(first.job.id)?.status).toBe('waiting_for_platform_scan');
+    expect(firstManager.get(first.job.id)).toMatchObject({
+      status: 'waiting_for_platform_scan',
+      criticalScopeActivationRequired: true,
+      activationPending: true,
+    });
     const interruptedSessionDir = join(dir, 'onboarding-sessions');
     const interruptedSessionPath = join(interruptedSessionDir, `${first.job.id}.json`);
     mkdirSync(interruptedSessionDir, { recursive: true, mode: 0o700 });
@@ -920,10 +945,14 @@ describe('BotOnboardingManager', () => {
       permissionRecoveryStorePath,
       automateOpenPlatform: async () => autoOk(),
       verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
+      stopBotLive: async () => ({ ok: true, message: 'already stopped' }),
+      startBotLive: async () => ({ ok: true, message: 'recovered after restart' }),
     });
     expect(secondManager.get(first.job.id)).toMatchObject({
       status: 'failed',
       error: 'permission_recovery_interrupted',
+      criticalScopeActivationRequired: true,
+      activationPending: true,
     });
     expect(existsSync(interruptedSessionPath)).toBe(false);
     const second = secondManager.startPermissionRecovery({
@@ -931,11 +960,18 @@ describe('BotOnboardingManager', () => {
       predecessorJobId: 'bot_original',
       expectedAppId: 'cli_existing_owner',
       priorRecoveryJobId: first.job.id,
+      requireCriticalScopesBeforeActivation: true,
     });
     expect(second.ok).toBe(true);
     if (!second.ok) throw new Error(second.error);
     await second.job.done;
-    expect(secondManager.get(second.job.id)).toMatchObject({ status: 'completed', recoveryAttempt: 2 });
+    expect(secondManager.get(second.job.id)).toMatchObject({
+      status: 'completed',
+      recoveryAttempt: 2,
+      criticalScopeActivationRequired: true,
+      activationPending: false,
+      liveStarted: true,
+    });
 
     firstGate.resolve();
     await first.job.done;
@@ -1094,6 +1130,266 @@ describe('BotOnboardingManager', () => {
     const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
     expect(bots[0]).toMatchObject({ larkAppId: 'cli_f', cliId: 'claude-code', allowedUsers: ['admin@corp.com'] });
 
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps a MOSA bot activation-pending until every critical scope is readable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-activation-'));
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
+    });
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_mosa_pending',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_scanner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [
+          { name: 'im:message', desc: '收发消息', critical: true },
+          { name: 'im:message.group_msg', desc: '群消息', critical: true },
+          { name: 'im:chat.members:read', desc: '群成员读取', critical: true },
+          { name: 'im:chat.members:write_only', desc: '群成员写入', critical: true },
+          { name: 'contact:user.base:readonly', desc: '用户基本信息', critical: true },
+        ],
+        missingOptional: [],
+      }),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+      startBotLive,
+    });
+
+    const job = manager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir: dir,
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await job.done;
+
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      criticalScopeActivationRequired: true,
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))).toEqual([
+      expect.objectContaining({
+        larkAppId: 'cli_mosa_pending',
+        activationPending: true,
+      }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('activates an exact pending MOSA bot only after permission recovery reads every critical scope', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-recovery-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_pending_recovery',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'bot online' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'not running yet' }),
+      startBotLive,
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_pending_recovery',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(startBotLive).toHaveBeenCalledWith('cli_pending_recovery');
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'completed',
+      criticalScopeActivationRequired: true,
+      liveStarted: true,
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.not.objectContaining({ activationPending: true }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps the exact MOSA bot activation-pending when the single-bot live start is not acknowledged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-start-failed-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_pending_start_failed',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive: async () => ({ ok: false, message: 'pm2 unavailable' }),
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_pending_start_failed',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      activationPending: true,
+      liveStarted: false,
+      error: 'permission_recovery_failed',
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.objectContaining({
+        larkAppId: 'cli_pending_start_failed',
+        activationPending: true,
+      }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed when the exact pending MOSA bot binding drifts during permission recovery', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-target-drift-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_pending_target_drift',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform: async () => {
+        writeFileSync(botsJsonPath, JSON.stringify([{
+          larkAppId: 'cli_replaced_target',
+          larkAppSecret: 'different-secret',
+          cliId: 'traex',
+          defaultWorkingDir: workingDir,
+          allowedUsers: ['owner@example.com'],
+          activationPending: true,
+        }]));
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive,
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_pending_target_drift',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      error: 'permission_recovery_failed',
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails before owner QR when the exact MOSA bot cannot be stopped for managed recovery', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-stop-failed-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_stop_failed',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const automateOpenPlatform = vi.fn(async () => autoOk());
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      automateOpenPlatform,
+      stopBotLive: async () => ({ ok: false, message: 'pm2 stop rejected' }),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      startBotLive: async () => ({ ok: true, message: 'must not start' }),
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_stop_failed',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      criticalScopeActivationRequired: true,
+      activationPending: true,
+      liveStopped: false,
+      error: 'permission_recovery_failed',
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_stop_failed',
+      activationPending: true,
+    });
     rmSync(dir, { recursive: true, force: true });
   });
 

@@ -1599,6 +1599,10 @@ export function getBotTuiSlashAllow(larkAppId: string): string[] | undefined {
  * 2. ~/.botmux/bots.json — default config path
  */
 export function loadBotConfigs(): BotConfig[] {
+  return parseBotConfigFile(resolveBotConfigPath());
+}
+
+function resolveBotConfigPath(): string {
   // 1. BOTS_CONFIG env var
   const botsConfigPath = process.env.BOTS_CONFIG;
   if (botsConfigPath) {
@@ -1607,19 +1611,53 @@ export function loadBotConfigs(): BotConfig[] {
       throw new Error(`BOTS_CONFIG file not found: ${resolved}`);
     }
     loadedConfigPath = resolved;
-    return parseBotConfigFile(resolved);
+    return resolved;
   }
 
   // 2. ~/.botmux/bots.json
   const defaultPath = resolve(homedir(), '.botmux', 'bots.json');
   if (existsSync(defaultPath)) {
     loadedConfigPath = defaultPath;
-    return parseBotConfigFile(defaultPath);
+    return defaultPath;
   }
 
   throw new Error(
     'No bot configuration found. Set BOTS_CONFIG or create ~/.botmux/bots.json.\nSee README for config format.'
   );
+}
+
+/**
+ * Resolve one daemon's exact raw bots.json slot without compacting earlier
+ * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
+ * array index; filtering the array first would make a later ready bot load a
+ * different App whenever concurrent onboarding left an earlier slot pending.
+ */
+export function loadBotConfigAtIndex(index: number): BotConfig {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new Error(`Invalid bot config index: ${index}`);
+  }
+  const filePath = resolveBotConfigPath();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch (err: any) {
+    throw new Error(`Invalid JSON in bot config file (file: ${filePath}): ${err?.message ?? String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
+  }
+  const entry = parsed[index];
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
+  }
+  if ((entry as Record<string, unknown>).activationPending === true) {
+    throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+  }
+  const exact = parseBotConfigsFromText(JSON.stringify([entry]));
+  if (exact.length !== 1) {
+    throw new Error(`Bot config [${index}] could not be resolved exactly (file: ${filePath})`);
+  }
+  return exact[0];
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
@@ -1653,6 +1691,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     }
     if (!entry.larkAppSecret || typeof entry.larkAppSecret !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppSecret is required and must be a string`);
+    }
+    // MOSA-managed onboarding persists the exact App/secret/owner binding so
+    // the same App can resume permission recovery, but a daemon must not load
+    // it before the recovery job has read back every critical scope.
+    if (entry.activationPending === true) {
+      continue;
     }
 
     // Parse workingDirs from comma-separated workingDir if workingDirs not explicitly set

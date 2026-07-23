@@ -2537,6 +2537,32 @@ export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
   | { ok: false; reason: 'not_found' | 'fleet_down' | 'pm2_error'; message: string };
 
+export type StopBotLiveResult =
+  | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
+  | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
+
+function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): StopBotLiveResult {
+  const bots = loadBotsJson();
+  const index = bots.findIndex(b => b?.larkAppId === appId);
+  if (index < 0) {
+    return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
+  }
+  const processName = botProcessName(bots[index], index, PM2_NAME);
+  const running = listBotmuxPm2Apps();
+  const exact = running.find(a => a.name === processName);
+  if (!exact) {
+    return { ok: true, state: 'already-stopped', processName };
+  }
+  try {
+    // Delete only this exact PM2 entry. The later start-bot command recreates
+    // it from the current ecosystem config after activation is acknowledged.
+    runPm2(['delete', processName], !opts.quiet);
+  } catch (e) {
+    return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
+  }
+  return { ok: true, state: 'stopped', processName };
+}
+
 /**
  * Bring a SINGLE bot's daemon online without touching any other bot's process.
  * The key to "add a bot without `botmux restart`": a new bot is always APPENDED
@@ -2615,6 +2641,33 @@ async function cmdStartBot(argv: string[]): Promise<void> {
   } else {
     console.error(`❌ 拉起失败 (${r.reason}): ${r.message}`);
   }
+  process.exit(1);
+}
+
+/** `botmux stop-bot <larkAppId>` — stop only one exact bot for managed recovery. */
+async function cmdStopBot(argv: string[]): Promise<void> {
+  const wantsJson = argv.includes('--json');
+  const appId = argv.find(a => !a.startsWith('-'));
+  if (!appId) {
+    const msg = '用法: botmux stop-bot <larkAppId> —— 停止单个机器人的 daemon（不影响其它 bot）';
+    if (wantsJson) console.log(JSON.stringify({ ok: false, reason: 'missing_app_id', message: msg }));
+    else console.error(`❌ ${msg}`);
+    process.exit(1);
+  }
+  ensureConfigDir();
+  const r = ensureBotDaemonStopped(appId, { quiet: wantsJson });
+  if (wantsJson) {
+    console.log(JSON.stringify(r, null, 2));
+    if (!r.ok) process.exitCode = 1;
+    return;
+  }
+  if (r.ok) {
+    console.log(r.state === 'already-stopped'
+      ? `✅ ${r.processName} 已停止`
+      : `✅ 已停止 ${r.processName}（其它机器人未受影响）`);
+    return;
+  }
+  console.error(`❌ 停止失败 (${r.reason}): ${r.message}`);
   process.exit(1);
 }
 
@@ -9044,6 +9097,7 @@ switch (command) {
   }
   case 'start':   await cmdStart(); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
+  case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
   case 'stop':    await cmdStop(); break;
   case 'restart': await cmdRestart(); break;
   case 'logs':    cmdLogs(); break;

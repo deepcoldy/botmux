@@ -99,6 +99,18 @@ export interface BotOnboardingSnapshot {
   liveStarted?: boolean;
   /** 自动上线的诊断信息（成功给进程名，失败给原因），供前端提示。 */
   liveStartMessage?: string;
+  /** Managed recovery stopped the exact existing daemon before issuing a fresh owner QR. */
+  liveStopped?: boolean;
+  /** Exact single-bot stop diagnostic. */
+  liveStopMessage?: string;
+  /**
+   * MOSA-managed onboarding only: the bot remains present in the private
+   * configuration for exact permission recovery but is excluded from daemon
+   * registration until every critical scope is observable.
+   */
+  activationPending?: boolean;
+  /** The caller explicitly requires the critical-scope activation gate. */
+  criticalScopeActivationRequired?: boolean;
   permission?: BotOnboardingPermission;
   /** 自动配置失败时的手动权限步骤 (深链) */
   remainingSteps?: RemainingStep[];
@@ -134,6 +146,13 @@ export interface BotOnboardingInput {
    */
   dirMode?: 'fixed' | 'card';
   model?: string;
+  /**
+   * MOSA-managed onboarding only. When true, a bot with incomplete critical
+   * scope readback is persisted as activation-pending and cannot be loaded by
+   * a daemon. The exact permission-recovery job clears the marker and starts
+   * the bot only after all critical scopes are readable.
+   */
+  requireCriticalScopesBeforeActivation?: boolean;
 }
 
 type RegisterAppFn = (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
@@ -176,6 +195,8 @@ export interface BotOnboardingManagerOptions {
    * `liveStarted` stays undefined).
    */
   startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  /** Stop only the exact existing bot before a managed permission recovery QR. */
+  stopBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
 }
 
 export interface BotOnboardingJob {
@@ -254,6 +275,7 @@ export class BotOnboardingManager {
   private readonly now: () => number;
   private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
   private readonly pendingStorePath: string;
+  private readonly stopBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
   private readonly permissionRecoveryStorePath: string;
   private permissionRecoveryStateError?: string;
 
@@ -270,6 +292,7 @@ export class BotOnboardingManager {
     this.now = opts.now ?? (() => Date.now());
     this.startBotLive = opts.startBotLive;
     this.pendingStorePath = opts.pendingStorePath ?? `${opts.botsJsonPath}.onboarding-pending.json`;
+    this.stopBotLive = opts.stopBotLive;
     this.permissionRecoveryStorePath = opts.permissionRecoveryStorePath ?? `${opts.botsJsonPath}.permission-recoveries.json`;
     this.restorePendingJobs();
     this.restorePermissionRecoveryJobs();
@@ -386,6 +409,10 @@ export class BotOnboardingManager {
         recoveryOfJobId: raw.recoveryOfJobId,
         recoveryAttempt: raw.recoveryAttempt,
         ...(typeof raw.previousRecoveryJobId === 'string' ? { previousRecoveryJobId: raw.previousRecoveryJobId } : {}),
+        ...(raw.criticalScopeActivationRequired === true
+          ? { criticalScopeActivationRequired: true }
+          : {}),
+        ...(raw.activationPending === true ? { activationPending: true } : {}),
         ...(status === 'failed'
           ? {
               error: raw.status === 'failed' && typeof raw.error === 'string'
@@ -455,6 +482,8 @@ export class BotOnboardingManager {
         recoveryOfJobId: job.recoveryOfJobId,
         recoveryAttempt: job.recoveryAttempt,
         previousRecoveryJobId: job.previousRecoveryJobId,
+        criticalScopeActivationRequired: job.criticalScopeActivationRequired,
+        activationPending: job.activationPending,
         error: job.error,
         message: job.message,
       }));
@@ -475,14 +504,119 @@ export class BotOnboardingManager {
    * Records the outcome on the job snapshot so the frontend shows "已自动上线"
    * instead of the restart hint. Never throws.
    */
-  private async runLiveStart(id: string, appId: string): Promise<void> {
-    if (!this.startBotLive) return;
+  private async runLiveStart(
+    id: string,
+    appId: string,
+  ): Promise<{ attempted: boolean; ok?: boolean; message?: string }> {
+    if (!this.startBotLive) return { attempted: false };
     try {
       const r = await this.startBotLive(appId);
       this.patch(id, { liveStarted: r.ok, liveStartMessage: r.message });
+      return { attempted: true, ok: r.ok, message: r.message };
     } catch (err) {
-      this.patch(id, { liveStarted: false, liveStartMessage: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      this.patch(id, { liveStarted: false, liveStartMessage: message });
+      return { attempted: true, ok: false, message };
     }
+  }
+
+  private async runLiveStop(
+    id: string,
+    appId: string,
+  ): Promise<{ attempted: boolean; ok?: boolean; message?: string }> {
+    if (!this.stopBotLive) return { attempted: false };
+    try {
+      const r = await this.stopBotLive(appId);
+      this.patch(id, { liveStopped: r.ok, liveStopMessage: r.message });
+      return { attempted: true, ok: r.ok, message: r.message };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.patch(id, { liveStopped: false, liveStopMessage: message });
+      return { attempted: true, ok: false, message };
+    }
+  }
+
+  private async criticalScopesReady(
+    appId: string,
+    appSecret: string,
+    brand: 'feishu' | 'lark',
+  ): Promise<boolean> {
+    try {
+      const readback = await this.verifyCriticalScopes(appId, appSecret, brand);
+      return readback.ok && readback.missingCritical.length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async activateRecoveredBot(
+    id: string,
+    appId: string,
+    addedBotIndex: number,
+  ): Promise<void> {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+    ) {
+      throw new Error('permission_recovery_activation_target_drift');
+    }
+    // Existing pre-gate bots were already daemon-visible. Their exact App may
+    // recover permissions without performing a second activation transition.
+    if (current.activationPending !== true) {
+      return;
+    }
+    const next = [...bots];
+    const ready = { ...current };
+    delete ready.activationPending;
+    next[addedBotIndex] = ready;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    this.patch(id, { activationPending: false });
+    const live = await this.runLiveStart(id, appId);
+    if (live.attempted && live.ok === true) {
+      return;
+    }
+
+    // Permission readback alone is not the activation ACK. If the exact
+    // single-bot start is unavailable or rejected, put the durable marker back
+    // so a fleet restart cannot silently make the bot runnable.
+    const afterStart = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const stillExact = afterStart[addedBotIndex];
+    if (
+      !stillExact
+      || typeof stillExact !== 'object'
+      || stillExact.larkAppId !== appId
+      || stillExact.activationPending === true
+    ) {
+      throw new Error('permission_recovery_activation_rollback_target_drift');
+    }
+    const rolledBack = [...afterStart];
+    rolledBack[addedBotIndex] = { ...stillExact, activationPending: true };
+    writeBotsJsonAtomic(this.opts.botsJsonPath, rolledBack);
+    this.patch(id, { activationPending: true });
+    throw new Error(
+      `permission_recovery_activation_not_acknowledged${live.message ? `: ${live.message}` : ''}`,
+    );
+  }
+
+  private holdRecoveryActivation(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+    ) {
+      throw new Error('permission_recovery_activation_target_drift');
+    }
+    if (current.activationPending !== true) {
+      const next = [...bots];
+      next[addedBotIndex] = { ...current, activationPending: true };
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    }
+    this.patch(id, { activationPending: true });
   }
 
   start(input: BotOnboardingInput = {}): BotOnboardingJob {
@@ -503,13 +637,15 @@ export class BotOnboardingManager {
    * Resume only Open Platform authorization for one already-persisted Space
    * Agent. The exact neutral working directory is the durable target anchor:
    * zero or multiple matching bots fail closed, and this path never creates an
-   * App, registers another Bot, or changes bots.json.
+   * App or registers another Bot. A managed caller may place the exact existing
+   * row behind the critical-scope activation marker before the fresh QR.
    */
   startPermissionRecovery(input: {
     workingDir: string;
     predecessorJobId: string;
     expectedAppId: string;
     priorRecoveryJobId?: string;
+    requireCriticalScopesBeforeActivation?: boolean;
   }): StartPermissionRecoveryResult {
     if (this.permissionRecoveryStateError) {
       return { ok: false, error: 'permission_recovery_state_unavailable' };
@@ -566,6 +702,9 @@ export class BotOnboardingManager {
       registrationMode: 'compat',
       recoveryOfJobId: input.predecessorJobId,
       recoveryAttempt: (latest?.recoveryAttempt ?? 0) + 1,
+      ...(input.requireCriticalScopesBeforeActivation === true
+        ? { criticalScopeActivationRequired: true }
+        : {}),
       ...(latest ? { previousRecoveryJobId: latest.id } : {}),
     });
     try {
@@ -575,7 +714,14 @@ export class BotOnboardingManager {
       this.permissionRecoveryStateError = 'permission recovery intent could not be persisted';
       return { ok: false, error: 'permission_recovery_state_unavailable' };
     }
-    const done = this.runPermissionRecovery(id, target.appId, target.appSecret, target.brand, target.index).catch(err => {
+    const done = this.runPermissionRecovery(
+      id,
+      target.appId,
+      target.appSecret,
+      target.brand,
+      target.index,
+      input.requireCriticalScopesBeforeActivation === true,
+    ).catch(err => {
       this.patch(id, {
         status: 'failed',
         error: 'permission_recovery_failed',
@@ -614,6 +760,9 @@ export class BotOnboardingManager {
     const appName = resolveSetupAppName(input.appName, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
     this.patch(id, {
       registrationMode: input.registrationMode ?? 'web',
+      ...(input.requireCriticalScopesBeforeActivation
+        ? { criticalScopeActivationRequired: true }
+        : {}),
       // SDK/Lark compatibility mode cannot apply a custom application name, so
       // do not claim that the resolved Feishu name was used.
       ...(input.registrationMode === 'compat' ? {} : { appName }),
@@ -716,6 +865,12 @@ export class BotOnboardingManager {
       workingDir,
       registrationMode: input.registrationMode ?? 'web',
     });
+    const activationPending = input.requireCriticalScopesBeforeActivation === true
+      && !(await this.criticalScopesReady(result.appId, result.appSecret, result.brand));
+    if (activationPending) {
+      bot.activationPending = true;
+      this.patch(id, { activationPending: true });
+    }
 
     // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
     // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
@@ -736,7 +891,9 @@ export class BotOnboardingManager {
 
     if (ownerEntry) {
       const addedBotIndex = this.persistBot({ ...bot, allowedUsers: [ownerEntry] });
-      await this.runLiveStart(id, result.appId);
+      if (!activationPending) {
+        await this.runLiveStart(id, result.appId);
+      }
       this.finalizePermissions(id, result.appId, result.brand, addedBotIndex, auto, 'completed');
     } else {
       // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
@@ -818,7 +975,11 @@ export class BotOnboardingManager {
     // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
     const addedBotIndex = this.persistBot({ ...pending, allowedUsers: entries });
     this.pendingBots.delete(id);
-    await this.runLiveStart(id, appId);
+    if (pending.activationPending === true) {
+      this.patch(id, { activationPending: true });
+    } else {
+      await this.runLiveStart(id, appId);
+    }
     this.patch(id, { status: 'completed', addedBotIndex });
     this.savePendingJobs();
     return { ok: true };
@@ -891,7 +1052,17 @@ export class BotOnboardingManager {
     appSecret: string,
     brand: 'feishu' | 'lark',
     addedBotIndex: number,
+    requireCriticalScopesBeforeActivation: boolean,
   ): Promise<void> {
+    if (requireCriticalScopesBeforeActivation) {
+      this.holdRecoveryActivation(id, appId, addedBotIndex);
+      const stopped = await this.runLiveStop(id, appId);
+      if (!stopped.attempted || stopped.ok !== true) {
+        throw new Error(
+          `permission_recovery_deactivation_not_acknowledged${stopped.message ? `: ${stopped.message}` : ''}`,
+        );
+      }
+    }
     this.patch(id, { status: 'configuring_permissions' });
     const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
     const auto = await this.runOwnerPermissionAutomation(id, appId, brand, {
@@ -924,6 +1095,7 @@ export class BotOnboardingManager {
       this.finalizePermissions(id, appId, brand, addedBotIndex, failed, 'failed', 'permission_recovery_failed');
       return;
     }
+    await this.activateRecoveredBot(id, appId, addedBotIndex);
     this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
   }
 

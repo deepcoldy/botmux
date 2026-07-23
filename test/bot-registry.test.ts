@@ -904,6 +904,44 @@ describe('loadBotConfigs', () => {
     expect(configs[0].cliId).toBe('claude-code'); // default
   });
 
+  it('does not register activation-pending bots before their critical scopes are ready', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    const configs = mod.loadBotConfigs();
+    expect(configs.map(config => config.larkAppId)).toEqual(['ready_app']);
+  });
+
+  it('keeps daemon slot indexes stable when an earlier bot is activation-pending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([
+      {
+        larkAppId: 'pending_app',
+        larkAppSecret: 'pending_secret',
+        activationPending: true,
+      },
+      {
+        larkAppId: 'ready_app',
+        larkAppSecret: 'ready_secret',
+      },
+    ]));
+
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    expect(mod.loadBotConfigAtIndex(1).larkAppId).toBe('ready_app');
+  });
+
   it('should fall back to ~/.botmux/bots.json when BOTS_CONFIG is not set', () => {
     // No BOTS_CONFIG env var
     // existsSync: first call (for BOTS_CONFIG) won't happen since env isn't set,
