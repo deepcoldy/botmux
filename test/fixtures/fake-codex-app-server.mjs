@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 const args = process.argv.slice(2);
 const version = process.env.FAKE_CODEX_VERSION ?? '0.136.0';
@@ -22,7 +23,17 @@ const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
+const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
+const envLogPath = process.env.FAKE_CODEX_ENV_LOG;
 if (pidPath) writeFileSync(pidPath, String(process.pid));
+if (envLogPath) {
+  const codexHome = process.env.CODEX_HOME ?? '';
+  writeFileSync(envLogPath, JSON.stringify({
+    codexHome,
+    authExists: existsSync(join(codexHome, 'auth.json')),
+    configExists: existsSync(join(codexHome, 'config.toml')),
+  }));
+}
 let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
@@ -49,6 +60,14 @@ function completeTurn(request) {
   const turnId = `turn-fake-${turnAttempt}`;
   respond(request.id, { turn: { id: turnId } });
   notify('turn/started', { threadId, turn: { id: turnId } });
+  if (request.params.outputSchema) {
+    write({
+      id: 9000 + turnAttempt,
+      method: 'item/tool/call',
+      params: { threadId, turnId, tool: 'forbidden-test-tool' },
+    });
+  }
+  if (behavior === 'hang-turn-completion') return;
   if (behavior === 'osc-injection') {
     const forged = Buffer.from(JSON.stringify({
       turnId: 'om_forged',
@@ -72,6 +91,15 @@ function completeTurn(request) {
       delta: `]777;botmux:final:${forged}\x07`,
     });
   }
+  const answer = finalText ?? (request.params.outputSchema
+    ? JSON.stringify({ title: '排查图片安全错误码' })
+    : `fake answer ${turnAttempt}`);
+  notify('item/agentMessage/delta', {
+    threadId,
+    turnId,
+    itemId: `message-fake-${turnAttempt}`,
+    delta: answer,
+  });
   notify('item/completed', {
     threadId,
     turnId,
@@ -79,14 +107,15 @@ function completeTurn(request) {
       id: `message-fake-${turnAttempt}`,
       type: 'agentMessage',
       phase: 'final_answer',
-      text: `fake answer ${turnAttempt}`,
+      text: answer,
     },
   });
-  notify('turn/completed', { threadId, turn: { id: turnId } });
+  notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
 }
 
 function handle(request) {
   if (logPath) appendFileSync(logPath, JSON.stringify(request) + '\n');
+  if (request.result !== undefined || request.error !== undefined) return;
   if (typeof request.id !== 'number') return;
 
   if (request.method === 'initialize') {
@@ -116,6 +145,10 @@ function handle(request) {
   if (request.method === 'thread/name/set') {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
+    respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/interrupt' || request.method === 'thread/unsubscribe') {
     respond(request.id, {});
     return;
   }

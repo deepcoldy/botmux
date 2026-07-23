@@ -547,14 +547,19 @@ describe('session.start lifecycle integration', () => {
         nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
       },
     });
-    forkWorker(ds, 'hello', false);
+    forkWorker(ds, `
+<botmux_routing>routing instructions</botmux_routing>
+<user_message>
+@TestBot 排查这个 TTP logid 的失败原因
+</user_message>
+`, false);
     const worker = forkMock.mock.results.at(-1)!.value;
     const init = vi.mocked(worker.send).mock.calls[0][0];
 
     expect(init).toEqual(expect.objectContaining({
       type: 'init',
       nativeSessionTitle: '[BotMux·Lark] 排查这个 TTP logid',
-      prompt: 'hello',
+      nativeSessionTitlePrompt: '排查这个 TTP logid 的失败原因',
     }));
   });
 
@@ -574,6 +579,7 @@ describe('session.start lifecycle integration', () => {
     expect(init).toEqual(expect.objectContaining({
       nativeSessionTitle: '我的手动标题',
     }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
   });
 
   it('does not invent a title while resuming a legacy Codex session', () => {
@@ -588,6 +594,7 @@ describe('session.start lifecycle integration', () => {
     const init = vi.mocked(worker.send).mock.calls[0][0];
 
     expect(init).not.toHaveProperty('nativeSessionTitle');
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
   });
 
   it('reapplies a managed Lark title after its Codex session resumes', () => {
@@ -607,6 +614,50 @@ describe('session.start lifecycle integration', () => {
       cliSessionId: 'codex-native-manual',
       nativeSessionTitle: '[BotMux·Lark] 我的持久化标题',
     }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+  });
+
+  it('persists a generated native title from the current worker', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] 原始内容',
+      },
+    });
+    forkWorker(ds, '<user_message>原始内容</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', {
+      type: 'native_session_title_generated',
+      title: '[BotMux·Lark] 排查图片安全拦截',
+    });
+
+    expect(ds.session.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
+    expect(ds.initConfig?.nativeSessionTitle).toBe('[BotMux·Lark] 排查图片安全拦截');
+    expect(ds.initConfig?.nativeSessionTitlePrompt).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('ignores a late generated title after the user explicitly renames the session', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '用户标题',
+        nativeSessionTitleUserDefined: true,
+      },
+    });
+    forkWorker(ds, '<user_message>原始内容</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', {
+      type: 'native_session_title_generated',
+      title: '[BotMux·Lark] 迟到的模型标题',
+    });
+
+    expect(ds.session.nativeSessionTitle).toBe('用户标题');
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
   });
 });
 

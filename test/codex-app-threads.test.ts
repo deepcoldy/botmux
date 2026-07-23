@@ -1,14 +1,199 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { setCodexAppThreadName } from '../src/services/codex-app-threads.js';
+import {
+  generateCodexAppThreadTitle,
+  setCodexAppThreadName,
+} from '../src/services/codex-app-threads.js';
 
 const FAKE_CODEX = resolve('test/fixtures/fake-codex-app-server.mjs');
 const tempDirs: string[] = [];
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function fakeCodexEnv(
+  dir: string,
+  extra: Record<string, string> = {},
+): NodeJS.ProcessEnv {
+  const sourceCodexHome = join(dir, 'source-codex-home');
+  mkdirSync(sourceCodexHome, { recursive: true });
+  writeFileSync(join(sourceCodexHome, 'auth.json'), '{}');
+  writeFileSync(join(sourceCodexHome, 'config.toml'), '[mcp_servers.dangerous]\ncommand = "false"\n');
+  return {
+    ...process.env,
+    CODEX_HOME: sourceCodexHome,
+    ...extra,
+  };
+}
+
+describe('generateCodexAppThreadTitle', () => {
+  it('generates a structured semantic title in an isolated ephemeral thread', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-generate-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+    const envLogPath = join(dir, 'env.json');
+
+    const title = await generateCodexAppThreadTitle({
+      sourceText: '请排查 image_safety 为什么没有返回错误码 12008',
+      codexBin: FAKE_CODEX,
+      env: fakeCodexEnv(dir, {
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_ENV_LOG: envLogPath,
+      }),
+      model: 'fake-low-cost-model',
+      timeoutMs: 5000,
+    });
+
+    expect(title).toBe('排查图片安全错误码');
+    const requests = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    const threadStart = requests.find(request => request.method === 'thread/start');
+    expect(threadStart.params).toMatchObject({
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      ephemeral: true,
+      threadSource: 'system',
+      runtimeWorkspaceRoots: [],
+      selectedCapabilityRoots: [],
+      environments: [],
+      dynamicTools: null,
+      developerInstructions: expect.stringContaining('不得调用工具'),
+      config: {
+        model: 'fake-low-cost-model',
+        model_reasoning_effort: 'low',
+        shell_environment_policy: { inherit: 'none' },
+        project_doc_max_bytes: 0,
+        project_doc_fallback_filenames: [],
+        tools: { web_search: false },
+        features: {
+          apps: false,
+          browser_use: false,
+          browser_use_external: false,
+          browser_use_full_cdp_access: false,
+          code_mode: false,
+          code_mode_host: false,
+          computer_use: false,
+          enable_mcp_apps: false,
+          hooks: false,
+          image_generation: false,
+          in_app_browser: false,
+          memories: false,
+          multi_agent: false,
+          multi_agent_v2: false,
+          plugin_sharing: false,
+          plugins: false,
+          remote_plugin: false,
+          skill_mcp_dependency_install: false,
+          shell_tool: false,
+          shell_snapshot: false,
+          standalone_web_search: false,
+          unified_exec: false,
+          workspace_dependencies: false,
+        },
+      },
+    });
+    expect(threadStart.params.cwd).toMatch(/botmux-codex-title-/);
+    expect(existsSync(threadStart.params.cwd)).toBe(false);
+
+    const turnStart = requests.find(request => request.method === 'turn/start');
+    expect(turnStart.params).toMatchObject({
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      effort: 'low',
+      environments: [],
+      runtimeWorkspaceRoots: [],
+      outputSchema: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', minLength: 1, maxLength: 36 },
+        },
+        required: ['title'],
+        additionalProperties: false,
+      },
+    });
+    expect(turnStart.params.input[0].text).toContain(
+      JSON.stringify({ source_text: '请排查 image_safety 为什么没有返回错误码 12008' }),
+    );
+    expect(requests).toContainEqual(expect.objectContaining({
+      id: 9001,
+      result: { contentItems: [], success: false },
+    }));
+    expect(requests.map(request => request.method)).toContain('thread/unsubscribe');
+    const isolatedEnv = JSON.parse(readFileSync(envLogPath, 'utf8'));
+    expect(isolatedEnv.codexHome).not.toBe(join(dir, 'source-codex-home'));
+    expect(isolatedEnv.authExists).toBe(true);
+    expect(isolatedEnv.configExists).toBe(false);
+  });
+
+  it('returns undefined for invalid structured output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-invalid-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    const title = await generateCodexAppThreadTitle({
+      sourceText: '排查登录失败',
+      codexBin: FAKE_CODEX,
+      env: fakeCodexEnv(dir, {
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_FINAL_TEXT: JSON.stringify({ title: 'x'.repeat(37) }),
+      }),
+      timeoutMs: 5000,
+    });
+
+    expect(title).toBeUndefined();
+    const methods = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).method);
+    expect(methods).toContain('thread/unsubscribe');
+  });
+
+  it('times out, interrupts the temporary turn, and reaps the app-server', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-timeout-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+    const pidPath = join(dir, 'pid');
+
+    const title = await generateCodexAppThreadTitle({
+      sourceText: '这个标题生成永远不会完成',
+      codexBin: FAKE_CODEX,
+      env: fakeCodexEnv(dir, {
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_PID_PATH: pidPath,
+        FAKE_CODEX_BEHAVIOR: 'hang-turn-completion',
+      }),
+      timeoutMs: 100,
+      detached: true,
+    });
+
+    expect(title).toBeUndefined();
+    expect(existsSync(pidPath)).toBe(true);
+    const requests = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    expect(requests.map(request => request.method)).toEqual(expect.arrayContaining([
+      'turn/interrupt',
+      'thread/unsubscribe',
+    ]));
+
+    const pid = Number(readFileSync(pidPath, 'utf8'));
+    const reapDeadline = Date.now() + 2000;
+    while (Date.now() < reapDeadline) {
+      try {
+        process.kill(pid, 0);
+        await new Promise(resolvePromise => setTimeout(resolvePromise, 20));
+      } catch {
+        return;
+      }
+    }
+    throw new Error(`title generator fake Codex app-server ${pid} was not reaped`);
+  });
 });
 
 describe('setCodexAppThreadName', () => {

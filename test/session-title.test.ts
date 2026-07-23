@@ -7,7 +7,11 @@ vi.mock('../src/services/session-store.js', () => ({
 
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
-import { buildBotmuxLarkNativeSessionTitle, updateSessionTitle } from '../src/core/session-title.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+  updateSessionTitle,
+} from '../src/core/session-title.js';
 
 function makeSession(): Session {
   return {
@@ -49,6 +53,33 @@ describe('buildBotmuxLarkNativeSessionTitle', () => {
     expect(Array.from(title)).toHaveLength(100);
     expect(title.startsWith('[BotMux·Lark] ')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
+  });
+});
+
+describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
+  it('extracts only the first user message from the Botmux routing envelope', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(`
+<botmux_routing>不要把这段路由说明当成标题</botmux_routing>
+<user_message>
+@TestBot 调查图片生成返回 12008 的原因
+</user_message>
+<sender type="user" name="Alice" />
+`, [{ name: 'TestBot' }])).toBe('调查图片生成返回 12008 的原因');
+  });
+
+  it('removes transport hints and bounds the untrusted model input', () => {
+    const prompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      `[用户引用了消息 用 botmux quoted om_xxx 查看]\n${'话'.repeat(2_100)}`,
+    );
+
+    expect(prompt).toBe('话'.repeat(2_000));
+  });
+
+  it('returns undefined when no user topic remains', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@TestBot</user_message>',
+      [{ name: 'TestBot' }],
+    )).toBeUndefined();
   });
 });
 

@@ -94,7 +94,10 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
-import { buildBotmuxLarkNativeSessionTitle } from './session-title.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './session-title.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -2019,6 +2022,7 @@ export function forkWorker(
   const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
+  let nativeSessionTitlePrompt: string | undefined;
   if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
     const isFreshNativeSession = !resume && !ds.session.cliSessionId;
     if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
@@ -2032,6 +2036,12 @@ export function forkWorker(
       || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
     ) {
       nativeSessionTitle = ds.session.nativeSessionTitle;
+    }
+    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
+      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+        promptPayload.codexAppInput?.text ?? prompt,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
     }
   }
   // Claude Code blocks on the interactive folder-trust dialog the first time
@@ -2178,6 +2188,7 @@ export function forkWorker(
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
@@ -2697,6 +2708,19 @@ function setupWorkerHandlers(
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
+        break;
+      }
+
+      case 'native_session_title_generated': {
+        if (ds.worker !== worker || ds.session.nativeSessionTitleUserDefined) break;
+        const title = msg.title.trim();
+        if (!title) break;
+        ds.session.nativeSessionTitle = title;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = title;
+          ds.initConfig.nativeSessionTitlePrompt = undefined;
+        }
+        sessionStore.updateSession(ds.session);
         break;
       }
 

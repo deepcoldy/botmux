@@ -104,7 +104,12 @@ import {
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue } from './services/codex-bridge-queue.js';
-import { readCodexAppThreadMetadata, setCodexAppThreadName } from './services/codex-app-threads.js';
+import {
+  generateCodexAppThreadTitle,
+  readCodexAppThreadMetadata,
+  setCodexAppThreadName,
+} from './services/codex-app-threads.js';
+import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -335,14 +340,76 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
   return false;
 }
 
-/** 首条 UserMessage 预览落盘后设置标题，避免标题先于线程元数据写入。 */
+function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...redactChildEnv(process.env),
+    ...sanitizePerBotEnv(cfg.env),
+  };
+  env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
+  return env;
+}
+
+function registerNativeTitleForceClose(forceClose: () => void): () => void {
+  nativeSessionTitleSyncForceClosers.add(forceClose);
+  return () => nativeSessionTitleSyncForceClosers.delete(forceClose);
+}
+
+async function applyCodexNativeSessionTitle(
+  threadId: string,
+  title: string,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  engine: CodexRpcEngine | undefined,
+  wait: 'preview' | 'resume' | 'none',
+  expectedRevision: number,
+): Promise<boolean> {
+  if (expectedRevision !== nativeSessionTitleRevision) return false;
+  if (engine?.activeThreadId === threadId) {
+    if (wait === 'resume') {
+      await engine.waitForThreadUpdatedAfter(
+        nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
+        10_000,
+      );
+    } else if (wait === 'preview') {
+      await engine.waitForThreadPreview(10_000);
+    }
+    if (expectedRevision !== nativeSessionTitleRevision) return false;
+    await engine.setThreadName(title);
+    return true;
+  }
+
+  const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+  const abortController = new AbortController();
+  nativeSessionTitleSyncAbortControllers.add(abortController);
+  try {
+    await setCodexAppThreadName({
+      threadId,
+      name: title,
+      codexBin: adapter.resolvedBin,
+      cwd: cfg.workingDir,
+      env: codexNativeTitleEnv(cfg),
+      timeoutMs: 10_000,
+      signal: abortController.signal,
+      detached: true,
+      waitForExistingPreview: wait === 'preview',
+      ...(wait === 'resume' ? {
+        waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
+      } : {}),
+      registerForceClose: registerNativeTitleForceClose,
+    });
+    return expectedRevision === nativeSessionTitleRevision;
+  } finally {
+    nativeSessionTitleSyncAbortControllers.delete(abortController);
+  }
+}
+
+/** 首条 UserMessage 落盘后先写 fallback，再用隔离的临时 turn 生成语义标题。 */
 async function syncFreshCodexNativeSessionTitle(
   threadId: string,
   engine?: CodexRpcEngine,
 ): Promise<void> {
   const cfg = lastInitConfig;
-  const title = cfg?.nativeSessionTitle?.trim();
-  if (!cfg || cfg.cliId !== 'codex' || cfg.adoptMode || !title || !threadId) return;
+  const fallbackTitle = cfg?.nativeSessionTitle?.trim();
+  if (!cfg || cfg.cliId !== 'codex' || cfg.adoptMode || !fallbackTitle || !threadId) return;
   if (nativeSessionTitleAppliedThreadId === threadId || nativeSessionTitleSyncInFlight === threadId) return;
 
   const revision = nativeSessionTitleRevision;
@@ -350,59 +417,74 @@ async function syncFreshCodexNativeSessionTitle(
   let syncLatestTitle = false;
   nativeSessionTitleSyncInFlight = threadId;
   try {
-    if (engine?.activeThreadId === threadId) {
-      if (resumeGeneration) {
-        await engine.waitForThreadUpdatedAfter(
-          nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
-          10_000,
-        );
-      } else {
-        await engine.waitForThreadPreview(10_000);
-      }
-      if (revision !== nativeSessionTitleRevision) {
-        syncLatestTitle = true;
-        return;
-      }
-      await engine.setThreadName(title);
-    } else {
-      const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
-      const env: NodeJS.ProcessEnv = {
-        ...redactChildEnv(process.env),
-        ...sanitizePerBotEnv(cfg.env),
-      };
-      env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
-      const abortController = new AbortController();
-      nativeSessionTitleSyncAbortController = abortController;
-      await setCodexAppThreadName({
-        threadId,
-        name: title,
+    const fallbackApplied = await applyCodexNativeSessionTitle(
+      threadId,
+      fallbackTitle,
+      cfg,
+      engine,
+      resumeGeneration ? 'resume' : 'preview',
+      revision,
+    );
+    if (!fallbackApplied || revision !== nativeSessionTitleRevision) {
+      syncLatestTitle = true;
+      return;
+    }
+    nativeSessionTitleAppliedThreadId = threadId;
+    log(`Applied native Codex session title: ${fallbackTitle}`);
+
+    const sourceText = resumeGeneration ? '' : cfg.nativeSessionTitlePrompt?.trim() ?? '';
+    cfg.nativeSessionTitlePrompt = undefined;
+    if (!sourceText) return;
+
+    const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+    const abortController = new AbortController();
+    nativeSessionTitleSyncAbortControllers.add(abortController);
+    let semanticCore: string | undefined;
+    try {
+      semanticCore = await generateCodexAppThreadTitle({
+        sourceText,
         codexBin: adapter.resolvedBin,
-        cwd: cfg.workingDir,
-        env,
-        timeoutMs: 10_000,
+        env: codexNativeTitleEnv(cfg),
+        model: cfg.model,
+        timeoutMs: 30_000,
         signal: abortController.signal,
         detached: true,
-        waitForExistingPreview: !resumeGeneration,
-        ...(resumeGeneration ? {
-          waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
-        } : {}),
-        registerForceClose: forceClose => {
-          nativeSessionTitleSyncForceClosers.add(forceClose);
-          return () => nativeSessionTitleSyncForceClosers.delete(forceClose);
-        },
+        registerForceClose: registerNativeTitleForceClose,
       });
+    } finally {
+      nativeSessionTitleSyncAbortControllers.delete(abortController);
     }
     if (revision !== nativeSessionTitleRevision) {
       syncLatestTitle = true;
       return;
     }
+    if (!semanticCore) {
+      log('Native Codex semantic title generation unavailable; keeping fallback title');
+      return;
+    }
+
+    const semanticTitle = buildBotmuxLarkNativeSessionTitle(semanticCore);
+    if (semanticTitle === fallbackTitle) return;
+    const semanticApplied = await applyCodexNativeSessionTitle(
+      threadId,
+      semanticTitle,
+      cfg,
+      engine,
+      'none',
+      revision,
+    );
+    if (!semanticApplied || revision !== nativeSessionTitleRevision) {
+      syncLatestTitle = true;
+      return;
+    }
+    cfg.nativeSessionTitle = semanticTitle;
     nativeSessionTitleAppliedThreadId = threadId;
-    log(`Applied native Codex session title: ${title}`);
+    send({ type: 'native_session_title_generated', title: semanticTitle });
+    log(`Applied generated native Codex session title: ${semanticTitle}`);
   } catch (err: any) {
     if (revision !== nativeSessionTitleRevision) syncLatestTitle = true;
     else log(`Native Codex session title sync failed: ${err?.message ?? err}`);
   } finally {
-    nativeSessionTitleSyncAbortController = undefined;
     if (nativeSessionTitleSyncInFlight === threadId) nativeSessionTitleSyncInFlight = undefined;
     if (syncLatestTitle) {
       void syncFreshCodexNativeSessionTitle(threadId, engine);
@@ -428,25 +510,24 @@ async function captureCodexResumeTitleBaseline(threadId: string, engine?: CodexR
     };
     env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
     const abortController = new AbortController();
-    nativeSessionTitleSyncAbortController = abortController;
-    const metadata = await readCodexAppThreadMetadata({
-      threadId,
-      codexBin: adapter.resolvedBin,
-      cwd: cfg.workingDir,
-      env,
-      timeoutMs: 7000,
-      signal: abortController.signal,
-      detached: true,
-      registerForceClose: forceClose => {
-        nativeSessionTitleSyncForceClosers.add(forceClose);
-        return () => nativeSessionTitleSyncForceClosers.delete(forceClose);
-      },
-    });
-    if (metadata.updatedAt !== undefined) nativeSessionTitleResumeUpdatedAt = metadata.updatedAt;
+    nativeSessionTitleSyncAbortControllers.add(abortController);
+    try {
+      const metadata = await readCodexAppThreadMetadata({
+        threadId,
+        codexBin: adapter.resolvedBin,
+        cwd: cfg.workingDir,
+        env,
+        timeoutMs: 7000,
+        signal: abortController.signal,
+        detached: true,
+        registerForceClose: registerNativeTitleForceClose,
+      });
+      if (metadata.updatedAt !== undefined) nativeSessionTitleResumeUpdatedAt = metadata.updatedAt;
+    } finally {
+      nativeSessionTitleSyncAbortControllers.delete(abortController);
+    }
   } catch (err: any) {
     log(`Could not capture Codex resume title baseline: ${err?.message ?? err}`);
-  } finally {
-    nativeSessionTitleSyncAbortController = undefined;
   }
 }
 
@@ -1238,14 +1319,16 @@ let pendingSessionRename: string | null = null;
 let nativeSessionTitleSyncInFlight: string | undefined;
 let nativeSessionTitleAppliedThreadId: string | undefined;
 let nativeSessionTitleRevision = 0;
-let nativeSessionTitleSyncAbortController: AbortController | undefined;
 let nativeSessionTitleResumeUpdatedAt: number | undefined;
 let nativeSessionTitleCurrentGenerationResume = false;
+const nativeSessionTitleSyncAbortControllers = new Set<AbortController>();
 const nativeSessionTitleSyncForceClosers = new Set<() => void>();
 
 function stopNativeSessionTitleSync(): void {
-  nativeSessionTitleSyncAbortController?.abort();
+  for (const abortController of nativeSessionTitleSyncAbortControllers) abortController.abort();
+  nativeSessionTitleSyncAbortControllers.clear();
   for (const forceClose of nativeSessionTitleSyncForceClosers) forceClose();
+  nativeSessionTitleSyncForceClosers.clear();
 }
 /** True after the rename command's Enter lands and until the TUI returns to its
  * prompt. Blocks type-ahead user messages from racing into the command UI. */
@@ -9404,7 +9487,10 @@ process.on('message', async (raw: unknown) => {
       // capability-check and deliver the latest title once a real prompt is idle.
       nativeSessionTitleRevision += 1;
       nativeSessionTitleAppliedThreadId = undefined;
-      if (lastInitConfig) lastInitConfig.nativeSessionTitle = msg.title;
+      if (lastInitConfig) {
+        lastInitConfig.nativeSessionTitle = msg.title;
+        lastInitConfig.nativeSessionTitlePrompt = undefined;
+      }
       stopNativeSessionTitleSync();
       pendingSessionRename = msg.title;
       log(`Queued native session rename: ${msg.title}`);
