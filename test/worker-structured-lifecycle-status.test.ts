@@ -196,6 +196,30 @@ describe('worker structured-turn status wiring', () => {
     expect(ingest).toContain('opts.hydrationOwnerKey');
   });
 
+  it('anchors delayed RPC replay to the exact owner send-start time instead of ACK time', () => {
+    const install = functionSlice('installAwaitingRpcActivation', 'clearRpcLifecycleFailClosedOwner');
+    expect(install).toContain('rpcTurnsAwaitingActivationReplayAnchors.set(ownerKey, Date.now())');
+    expect(install).toContain('awaitingRpcActivationReplayAnchorMs(');
+    expect(install).toContain('sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)');
+
+    const activate = functionSlice('activateRpcTurnLifecycle', 'releaseRpcTurnTerminalDeferral');
+    const readAnchor = activate.indexOf('const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(');
+    const mark = activate.indexOf('codexBridgeMarkPendingTurn(', readAnchor);
+    expect(readAnchor).toBeGreaterThanOrEqual(0);
+    expect(mark).toBeGreaterThan(readAnchor);
+    expect(activate.slice(mark, activate.indexOf(');', mark) + 2)).toContain('replayAnchorMs');
+
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const rpcCatch = flush.indexOf('if (rpcTurnIdentity && rpcTurnGeneration && writeRpcEngine)');
+    const catchAnchor = flush.indexOf('const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(', rpcCatch);
+    const clear = flush.indexOf('clearAwaitingRpcActivation(', catchAnchor);
+    const catchMark = flush.indexOf('codexBridgeMarkPendingTurn(', clear);
+    expect(catchAnchor).toBeGreaterThan(rpcCatch);
+    expect(clear).toBeGreaterThan(catchAnchor);
+    expect(catchMark).toBeGreaterThan(clear);
+    expect(flush.slice(catchMark, flush.indexOf(');', catchMark) + 2)).toContain('replayAnchorMs');
+  });
+
   it('fails closed on an ambiguous follow-up RPC response before generic submit-failure cleanup', () => {
     const flush = source.slice(
       source.indexOf('async function flushPending'),
@@ -230,6 +254,8 @@ describe('worker structured-turn status wiring', () => {
     expect(durableClaim).toBeGreaterThan(notSent);
     expect(engage.slice(notSent, durableClaim)).toContain("return 'not-engaged'");
     expect(engage.match(/installRpcLifecycleFailClosedOwner\(firstIdentity, firstGeneration\)/g))
+      .toHaveLength(2);
+    expect(engage.match(/awaitingRpcActivationReplayAnchorMs\(firstIdentity, firstGeneration\)/g))
       .toHaveLength(2);
     expect(engage).toContain('codexBridgeMarkPendingTurn(');
   });

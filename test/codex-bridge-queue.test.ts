@@ -1043,8 +1043,9 @@ describe('CodexBridgeQueue', () => {
     expect(q.hasBlockingTurn(now)).toBe(false);
   });
 
-  it('replays successor events drained during predecessor terminal hydration after the exact mark arrives', () => {
-    const q = new CodexBridgeQueue();
+  it('replays successor events drained during predecessor hydration when its ACK is delayed beyond 5s', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
     q.mark('turn-n', 'first prompt', 100, 1);
     q.markRpcActive('turn-n', 1);
     q.ingest([userEv('first prompt', 'u-n', 200)]);
@@ -1064,6 +1065,11 @@ describe('CodexBridgeQueue', () => {
       }),
     ]);
 
+    // turn/start for N+1 was sent at t=350, but its ACK continuation does not
+    // install the mark until t=8,000. The worker preserves t=350 for this exact
+    // awaiting owner, so the pair buffered at t=400/500 is still replayable.
+    // Using the ACK time here would put both events outside the 5s window.
+    now = 8_000;
     q.mark('turn-n-plus-1', 'second prompt', 350, 2);
     expect(q.hasTerminalTurn('turn-n-plus-1', 2)).toBe(true);
     expect(q.markRpcActive('turn-n-plus-1', 2)).toBe(false);
