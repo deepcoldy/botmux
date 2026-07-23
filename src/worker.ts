@@ -4016,6 +4016,34 @@ function exitTmuxScrollMode(): void {
   tmuxScrolledHalfPages = 0;
 }
 
+/**
+ * Server-side synthesis of a restricted mouse-wheel sequence for the READ-ONLY
+ * web terminal (see CliAdapter.readonlyWheelScroll). The read-only client sends
+ * only {dir, lines}; EVERYTHING that could encode a click, drag, release, key,
+ * or arbitrary coordinate is decided HERE, server-side:
+ *   • button is hard-coded to 64 (wheel-up) / 65 (wheel-down) — never a click
+ *   • the coordinate is the server-owned grid CENTRE (never client-supplied,
+ *     never (1,1)) so zone-routed TUIs still accept it
+ *   • line count is clamped to a small positive bound
+ * A view capability therefore cannot forge any event other than a bounded
+ * scroll. Returns '' if the request is malformed so callers forward nothing.
+ */
+function buildReadonlyWheelSequence(dir: unknown, lines: unknown): string {
+  if (dir !== 'up' && dir !== 'down') return '';
+  const n = typeof lines === 'number' && Number.isFinite(lines)
+    ? Math.max(1, Math.min(6, Math.floor(lines)))
+    : 1;
+  const cols = renderCols || PTY_COLS;
+  const rows = renderRows || PTY_ROWS;
+  const col = (cols >> 1) + 1; // grid centre, 1-based; never (1,1)
+  const row = (rows >> 1) + 1;
+  const button = dir === 'up' ? 64 : 65;
+  const coord = `${col};${row}`;
+  let seq = '';
+  for (let i = 0; i < n; i++) seq += `\x1b[<${button};${coord}M`;
+  return seq;
+}
+
 function handleTermAction(key: TermActionKey): void {
   // riff：没有远端终端可驱动——把控制字符 write 进 RiffBackend 会变成一个内容为
   // ANSI 序列的 follow-up 任务（^C 也不会 cancel 任务），必须整体拒绝。
@@ -7929,8 +7957,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
+      // Read-only wheel scrolling: opt-in per adapter (Claude family). Lets a
+      // viewToken client scroll the CLI's alt-screen transcript WITHOUT gaining
+      // byte-forwarding — the client sends a restricted {type:'scroll'} intent
+      // and the server synthesizes a pure wheel sequence. Off for every other
+      // CLI, so their read-only views still forward zero input. Gated to the
+      // shared relay (PtyBackend / tmux-pipe) path Claude actually runs on;
+      // tmux/zellij attach own their own copy-mode scrolling.
+      const readonlyWheelScroll = cliAdapter?.readonlyWheelScroll === true
+        && !(isTmuxMode && !isPipeMode);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, readonlyWheelScroll));
     });
 
     wss = new WebSocketServer({
@@ -8181,6 +8218,19 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
               backend?.write(msg.data);
+            } else if (msg.type === 'scroll') {
+              // RESTRICTED read-only scroll intent (see readonlyWheelScroll). Unlike
+              // 'input', this is allowed WITHOUT write capability — but the client
+              // supplied only {dir, lines}; the server synthesizes the actual bytes,
+              // so no click/drag/coordinate can be forged. Gated to adapters that
+              // opted in; ignored entirely otherwise.
+              if (cliAdapter?.readonlyWheelScroll !== true) return;
+              const seq = buildReadonlyWheelSequence(msg.dir, msg.lines);
+              if (!seq) return;
+              if (usesHerdrSnapshotWebHistory()) {
+                herdrWebScrollDirection = msg.dir === 'up' ? 'up' : 'down';
+              }
+              backend?.write(seq);
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -8212,6 +8262,7 @@ function getTerminalHtml(
   loginUrl = '',
   forceRemoteScroll = false,
   localTerminalBackend = false,
+  readonlyWheelScroll = false,
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -8350,6 +8401,7 @@ var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
+var readonlyWheelScroll=${readonlyWheelScroll};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -8634,7 +8686,17 @@ if(!${isTmuxMode && !isPipeMode}){
       return;
     }
     if(!hasToken){
-      e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);return;
+      e.preventDefault();e.stopPropagation();
+      // Alt-screen read-only: no local scrollback to move. If the CLI opted into
+      // read-only wheel scrolling, send a RESTRICTED intent (direction + a small
+      // line count only). We never send raw mouse bytes here — the server owns
+      // button/coordinate synthesis, so a view capability can't forge a click.
+      if(readonlyWheelScroll&&ws_&&ws_.readyState===1&&px){
+        var _lines=Math.max(1,Math.min(6,Math.round(Math.abs(px)/33)));
+        ws_.send(JSON.stringify({type:'scroll',dir:px<0?'up':'down',lines:_lines}));
+        return;
+      }
+      term.scrollLines(e.deltaY>0?3:-3);return;
     }
     e.preventDefault();e.stopPropagation();
     _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer

@@ -349,6 +349,19 @@ export interface CliAdapter {
   /** Whether CLI uses alternate screen buffer */
   readonly altScreen: boolean;
 
+  /** Opt-in: allow the READ-ONLY web terminal (viewToken, no write capability)
+   *  to scroll this CLI's alternate-screen transcript. Alt-screen CLIs keep no
+   *  xterm/tmux scrollback, so the only way to scroll is forwarding SGR
+   *  mouse-wheel events to the CLI — normally forbidden for a view capability,
+   *  since mouse-protocol bytes can also encode clicks/drags an app may bind to
+   *  approvals. When true, the read-only client sends only a restricted
+   *  {type:'scroll',dir,lines} intent and the SERVER synthesizes a pure wheel
+   *  sequence (fixed button 64/65, server-clamped lines, server-owned centre
+   *  coordinate) — the client can never supply raw bytes, a click, or a
+   *  coordinate. Enable ONLY for CLIs where the wheel is purely a scroll and
+   *  never bound to a state-changing action (Claude family). Default: off. */
+  readonly readonlyWheelScroll?: boolean;
+
   /** Curated model candidates surfaced in `botmux setup`. When undefined the
    *  setup flow skips the model prompt for this CLI entirely (e.g. CLIs whose
    *  model is fixed or set via a config file we don't manage). The order is

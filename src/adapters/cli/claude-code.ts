@@ -933,6 +933,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       : undefined,
     systemHints: [],
     altScreen: false,
+    // Claude & Seed render their transcript in the alternate screen at runtime
+    // (declared altScreen:false only because the FIRST frame is normal-buffer).
+    // Their mouse wheel is a pure transcript scroll, never bound to an action —
+    // safe to let the read-only web terminal scroll via the server-synthesized
+    // restricted wheel path. See CliAdapter.readonlyWheelScroll.
+    readonlyWheelScroll: true,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.
