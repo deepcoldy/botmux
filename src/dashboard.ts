@@ -3307,6 +3307,46 @@ const server = createServer(async (req, res) => {
       }
       return jsonRes(res, 202, { job: botOnboarding.get(recovered.job.id) });
     }
+    let mScopePropagation: RegExpMatchArray | null;
+    if (
+      req.method === 'POST'
+      && (mScopePropagation = url.pathname.match(
+        /^\/api\/bot-onboarding\/([^/]+)\/complete-scope-propagation$/,
+      ))
+    ) {
+      const onboardingId = decodeURIComponent(mScopePropagation[1]);
+      let parsed: { workingDir?: unknown; expectedAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      if (!workingDir || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const completed = await botOnboarding.completeScopePropagation({
+        jobId: onboardingId,
+        workingDir,
+        expectedAppId,
+      });
+      if (!completed.ok) {
+        const status = completed.error === 'permission_recovery_target_missing' ? 404
+          : completed.error === 'permission_recovery_target_ambiguous' ? 409
+            : completed.error === 'permission_recovery_scopes_pending' ? 425
+              : (
+                  completed.error === 'permission_recovery_state_unavailable'
+                  || completed.error === 'permission_recovery_activation_failed'
+                ) ? 503
+                : 400;
+        return jsonRes(res, status, completed);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
+    }
     let mOwner: RegExpMatchArray | null;
     if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {
       // needs_owner 状态下用户手动提交 owner：扫码人身份验证不了时的兜底入口。

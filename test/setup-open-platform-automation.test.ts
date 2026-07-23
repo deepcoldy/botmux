@@ -9,6 +9,8 @@ import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   automateOpenPlatformSetup,
+  BOT_BASELINE_APP_EVENTS,
+  BOT_BASELINE_CALLBACKS,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
   buildSafeSettingPayload,
@@ -985,7 +987,11 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/scope/update/'))).toBe(false);
   });
 
-  function subscriptionFetchImpl(sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+  function subscriptionFetchImpl(
+    sub: ReturnType<typeof openPlatformSubscriptionMock>,
+    calls: string[],
+    versionId: string | null = 'v1',
+  ) {
     return (async (url: string | URL | Request, init?: RequestInit) => {
       const href = String(url);
       calls.push(href);
@@ -994,22 +1000,74 @@ describe('automateOpenPlatformSetup', () => {
       if (href.includes('/scope/all/')) {
         return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
       }
-      if (href.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v1' } });
+      if (href.includes('/app_version/create/')) {
+        return Response.json({ code: 0, data: versionId ? { versionId } : {} });
+      }
       return sub.handle(href, init) ?? Response.json({ code: 0 });
     }) as typeof fetch;
   }
 
-  async function runSetupWithMock(sessionDirPrefix: string, sub: ReturnType<typeof openPlatformSubscriptionMock>, calls: string[]) {
+  async function runSetupWithMock(
+    sessionDirPrefix: string,
+    sub: ReturnType<typeof openPlatformSubscriptionMock>,
+    calls: string[],
+    options: { requireVerifiedEvents?: boolean; versionId?: string | null } = {},
+  ) {
     const dir = mkdtempSync(join(tmpdir(), sessionDirPrefix));
     const sessionFile = join(dir, 'feishu-session.json');
     writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
     return automateOpenPlatformSetup({
       appId: 'cli_x',
       sessionFilePath: sessionFile,
-      fetchImpl: subscriptionFetchImpl(sub, calls),
+      fetchImpl: subscriptionFetchImpl(sub, calls, options.versionId === undefined ? 'v1' : options.versionId),
       scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      requireVerifiedEvents: options.requireVerifiedEvents,
     });
   }
+
+  it('returns an exact event and version ack from the same managed session', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-', sub, calls, {
+      requireVerifiedEvents: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      eventMode: 4,
+      verifiedEventCount: BOT_BASELINE_APP_EVENTS.length + BOT_BASELINE_CALLBACKS.length,
+      versionId: 'v1',
+    });
+  });
+
+  it('fails managed activation when one baseline event is still missing after same-session readback', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x', {
+      rejectEventNames: ['im.chat.member.bot.added_v1'],
+    });
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-missing-', sub, calls, {
+      requireVerifiedEvents: true,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'event_verification_failed',
+    });
+  });
+
+  it('fails managed activation when the published version cannot be proven', async () => {
+    const sub = openPlatformSubscriptionMock('cli_x');
+    const calls: string[] = [];
+    const result = await runSetupWithMock('botmux-sub-managed-version-', sub, calls, {
+      requireVerifiedEvents: true,
+      versionId: null,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'version_verification_failed',
+    });
+  });
 
   it('subscribes baseline app events incrementally and the card callback via /callback endpoints', async () => {
     const sub = openPlatformSubscriptionMock('cli_x');

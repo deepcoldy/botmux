@@ -38,6 +38,12 @@ const autoOk = (): OpenPlatformAutomationResult => ({
   cookieCount: 3,
   scopeCount: 9,
   skippedScopeCount: 0,
+  subscribedEventCount: 7,
+  missingVcEvents: [],
+  eventModeReady: true,
+  eventMode: 4,
+  verifiedEventCount: 7,
+  versionId: 'v1',
 });
 
 const immediateCriticalScopePolling = {
@@ -1151,7 +1157,8 @@ describe('BotOnboardingManager', () => {
       code: 0,
       data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
     });
-    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'exact bot online' }));
+    let scopesReady = false;
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
       ...immediateCriticalScopePolling,
@@ -1164,21 +1171,24 @@ describe('BotOnboardingManager', () => {
       }),
       validateCredentials: async () => ({ ok: true }),
       automateOpenPlatform: async opts => {
+        expect(opts.requireVerifiedEvents).toBe(true);
         await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
         return autoOk();
       },
-      verifyCriticalScopes: async () => ({
-        ok: true,
-        granted: [],
-        missingCritical: [
-          { name: 'im:message', desc: '收发消息', critical: true },
-          { name: 'im:message.group_msg', desc: '群消息', critical: true },
-          { name: 'im:chat.members:read', desc: '群成员读取', critical: true },
-          { name: 'im:chat.members:write_only', desc: '群成员写入', critical: true },
-          { name: 'contact:user.base:readonly', desc: '用户基本信息', critical: true },
-        ],
-        missingOptional: [],
-      }),
+      verifyCriticalScopes: async () => scopesReady
+        ? { ok: true, granted: [], missingCritical: [], missingOptional: [] }
+        : {
+            ok: true,
+            granted: [],
+            missingCritical: [
+              { name: 'im:message', desc: '收发消息', critical: true },
+              { name: 'im:message.group_msg', desc: '群消息', critical: true },
+              { name: 'im:chat.members:read', desc: '群成员读取', critical: true },
+              { name: 'im:chat.members:write_only', desc: '群成员写入', critical: true },
+              { name: 'contact:user.base:readonly', desc: '用户基本信息', critical: true },
+            ],
+            missingOptional: [],
+          },
       renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
       startBotLive,
     });
@@ -1187,6 +1197,7 @@ describe('BotOnboardingManager', () => {
       registrationMode: 'compat',
       cliId: 'traex',
       workingDir: dir,
+      dirMode: 'fixed',
       requireCriticalScopesBeforeActivation: true,
     });
     await job.done;
@@ -1202,6 +1213,21 @@ describe('BotOnboardingManager', () => {
         larkAppId: 'cli_mosa_pending',
         activationPending: true,
       }),
+    ]);
+    scopesReady = true;
+    await expect(manager.completeScopePropagation({
+      jobId: job.id,
+      workingDir: dir,
+      expectedAppId: 'cli_mosa_pending',
+    })).resolves.toEqual({ ok: true });
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: false,
+      liveStarted: true,
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))).toEqual([
+      expect.not.objectContaining({ activationPending: true }),
     ]);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -1238,6 +1264,7 @@ describe('BotOnboardingManager', () => {
       registrationMode: 'compat',
       cliId: 'traex',
       workingDir: dir,
+      dirMode: 'fixed',
       requireCriticalScopesBeforeActivation: true,
     });
     await job.done;
@@ -1285,7 +1312,7 @@ describe('BotOnboardingManager', () => {
       criticalScopeMaxAttempts: 5,
       registerApp: async () => ({
         ok: true,
-        appId: 'cli_mosa_stable',
+      appId: 'cli_mosa_stable',
         appSecret: 's',
         brand: 'feishu',
         userOpenId: 'ou_scanner',
@@ -1303,20 +1330,103 @@ describe('BotOnboardingManager', () => {
       registrationMode: 'compat',
       cliId: 'traex',
       workingDir: dir,
+      dirMode: 'fixed',
       requireCriticalScopesBeforeActivation: true,
     });
     await job.done;
 
+    expect(verifyCriticalScopes).not.toHaveBeenCalled();
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      criticalScopeActivationRequired: true,
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+      },
+    });
+    await expect(manager.completeScopePropagation({
+      jobId: job.id,
+      workingDir: dir,
+      expectedAppId: 'cli_mosa_stable',
+    })).resolves.toEqual({ ok: true });
     expect(verifyCriticalScopes).toHaveBeenCalledTimes(5);
     expect(startBotLive).toHaveBeenCalledOnce();
     expect(manager.get(job.id)).toMatchObject({
       status: 'completed',
       criticalScopeActivationRequired: true,
       liveStarted: true,
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+      },
     });
     expect(manager.get(job.id)).not.toMatchObject({ activationPending: true });
     expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))).toEqual([
       expect.not.objectContaining({ activationPending: true }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps a fresh MOSA bot activation-pending when managed automation lacks the exact event/version ack', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-managed-ack-missing-'));
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
+    });
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'bot online' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      ...immediateCriticalScopePolling,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_mosa_ack_missing',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_scanner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        expect(opts.requireVerifiedEvents).toBe(true);
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return {
+          ...autoOk(),
+          eventMode: undefined,
+          verifiedEventCount: undefined,
+          versionId: undefined,
+        };
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [{ name: 'im:message', type: 'tenant' }],
+        missingOptional: [],
+      }),
+      startBotLive,
+    });
+
+    const job = manager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir: dir,
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await job.done;
+
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      criticalScopeActivationRequired: true,
+      permission: {
+        ok: true,
+      },
+    });
+    expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))).toEqual([
+      expect.objectContaining({ activationPending: true }),
     ]);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -1373,6 +1483,428 @@ describe('BotOnboardingManager', () => {
     expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
       expect.not.objectContaining({ activationPending: true }),
     ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('lets botmux finish exact scope propagation and live-start without another owner QR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-propagation-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_pending_propagation',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    let scopesReady = false;
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'exact bot online' }));
+    const automateOpenPlatform = vi.fn(async opts => {
+      await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+      return autoOk();
+    });
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      ...immediateCriticalScopePolling,
+      criticalScopeMaxAttempts: 3,
+      automateOpenPlatform,
+      verifyCriticalScopes: async () => scopesReady
+        ? { ok: true, granted: [], missingCritical: [], missingOptional: [] }
+        : {
+            ok: true,
+            granted: [],
+            missingCritical: [{ name: 'im:message', type: 'tenant' }],
+            missingOptional: [],
+          },
+      stopBotLive: async () => ({ ok: true, message: 'exact bot stopped' }),
+      startBotLive,
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_pending_propagation',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      error: 'permission_recovery_failed',
+      activationPending: true,
+      permission: {
+        ok: false,
+        reason: 'scope_mapping_failed',
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+    expect(startBotLive).not.toHaveBeenCalled();
+
+    scopesReady = true;
+    const completed = await manager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_pending_propagation',
+    });
+
+    expect(completed).toEqual({ ok: true });
+    expect(automateOpenPlatform).toHaveBeenCalledOnce();
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(startBotLive).toHaveBeenCalledWith('cli_pending_propagation');
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: false,
+      liveStarted: true,
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.not.objectContaining({ activationPending: true }),
+    ]);
+
+    await expect(manager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_other',
+    })).resolves.toEqual({
+      ok: false,
+      error: 'permission_recovery_target_invalid',
+    });
+    expect(startBotLive).toHaveBeenCalledOnce();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores the exact managed ACK and completes propagation after a dashboard restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-propagation-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_propagation_restart',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    const firstManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      ...immediateCriticalScopePolling,
+      criticalScopeMaxAttempts: 3,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [{ name: 'im:message', type: 'tenant' }],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+    });
+    const started = firstManager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_propagation_restart',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'online after restart' }));
+    const secondManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      ...immediateCriticalScopePolling,
+      automateOpenPlatform: vi.fn(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      startBotLive,
+    });
+    expect(secondManager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      activationPending: true,
+      permission: {
+        ok: false,
+        reason: 'scope_mapping_failed',
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+
+    await expect(secondManager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_propagation_restart',
+    })).resolves.toEqual({ ok: true });
+    expect(startBotLive).toHaveBeenCalledOnce();
+
+    const thirdManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      startBotLive: vi.fn(async () => ({ ok: false, message: 'must not restart' })),
+    });
+    await expect(thirdManager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_propagation_restart',
+    })).resolves.toEqual({ ok: true });
+    expect(thirdManager.get(started.job.id)).toMatchObject({
+      status: 'completed',
+      liveStarted: true,
+      activationPending: false,
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('restores an initial managed activation tail after restart without another App or QR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-initial-propagation-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_initial_owner', name: 'Initial owner' } },
+    });
+    const firstManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      ...immediateCriticalScopePolling,
+      criticalScopeMaxAttempts: 1,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_initial_propagation_restart',
+        appSecret: 'initial-secret',
+        brand: 'feishu',
+        userOpenId: 'ou_initial_owner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+    });
+    const initial = firstManager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir,
+      dirMode: 'fixed',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await initial.done;
+    expect(firstManager.get(initial.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      platformQrScanConfirmedAt: expect.any(Number),
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+
+    const createApp = vi.fn();
+    const automateOpenPlatform = vi.fn();
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'initial bot online' }));
+    const restartedManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      ...immediateCriticalScopePolling,
+      createApp,
+      automateOpenPlatform,
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      startBotLive,
+    });
+    expect(restartedManager.get(initial.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      appId: 'cli_initial_propagation_restart',
+      workingDir,
+      platformQrScanConfirmedAt: expect.any(Number),
+      permission: {
+        ok: true,
+        eventMode: 4,
+        verifiedEventCount: 7,
+        versionId: 'v1',
+      },
+    });
+    await expect(restartedManager.completeScopePropagation({
+      jobId: initial.id,
+      workingDir,
+      expectedAppId: 'cli_initial_propagation_restart',
+    })).resolves.toEqual({ ok: true });
+    expect(createApp).not.toHaveBeenCalled();
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    expect(startBotLive).toHaveBeenCalledOnce();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('refuses initial activation when its managed ACK ledger cannot be persisted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-initial-ledger-failure-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_ledger_owner', name: 'Ledger owner' } },
+    });
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath: join(dir, 'missing-parent', 'managed-ledger.json'),
+      criticalScopeStableReads: 1,
+      criticalScopeMaxAttempts: 1,
+      criticalScopePollIntervalMs: 0,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_initial_ledger_failure',
+        appSecret: 'initial-secret',
+        brand: 'feishu',
+        userOpenId: 'ou_ledger_owner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      startBotLive,
+    });
+    const initial = manager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir,
+      dirMode: 'fixed',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await initial.done;
+
+    await expect(manager.completeScopePropagation({
+      jobId: initial.id,
+      workingDir,
+      expectedAppId: 'cli_initial_ledger_failure',
+    })).resolves.toEqual({
+      ok: false,
+      error: 'permission_recovery_state_unavailable',
+    });
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_initial_ledger_failure',
+      activationPending: true,
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('singleflights overlapping scope completion retries and starts the exact bot once', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-propagation-singleflight-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_propagation_singleflight',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    let scopesReady = false;
+    const readbackStarted = deferred<void>();
+    const releaseReadback = deferred<void>();
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'single exact start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      criticalScopeStableReads: 1,
+      criticalScopeMaxAttempts: 1,
+      criticalScopePollIntervalMs: 0,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes: async () => {
+        if (scopesReady) {
+          readbackStarted.resolve();
+          await releaseReadback.promise;
+          return { ok: true, granted: [], missingCritical: [], missingOptional: [] };
+        }
+        return {
+          ok: true,
+          granted: [],
+          missingCritical: [{ name: 'im:message', type: 'tenant' }],
+          missingOptional: [],
+        };
+      },
+      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      startBotLive,
+    });
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_propagation_singleflight',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    scopesReady = true;
+    const first = manager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_propagation_singleflight',
+    });
+    await readbackStarted.promise;
+    const second = manager.completeScopePropagation({
+      jobId: started.job.id,
+      workingDir,
+      expectedAppId: 'cli_propagation_singleflight',
+    });
+    releaseReadback.resolve();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { ok: true },
+      { ok: true },
+    ]);
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationPending');
     rmSync(dir, { recursive: true, force: true });
   });
 

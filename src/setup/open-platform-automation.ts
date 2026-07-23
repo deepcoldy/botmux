@@ -120,6 +120,10 @@ export type OpenPlatformAutomationResult =
       missingVcEvents: string[];
       /** 回读确认事件接收方式已是长连接(ok:true 时恒为 true,显式带回供门函数统一判定)。 */
       eventModeReady: boolean;
+      /** Managed onboarding only: exact same-session event mode readback. */
+      eventMode?: number;
+      /** Managed onboarding only: exact baseline event + callback count read back before session cleanup. */
+      verifiedEventCount?: number;
       versionId?: string;
     }
   | {
@@ -134,6 +138,8 @@ export type OpenPlatformAutomationResult =
         | 'missing_csrf'
         | 'owner_session_mismatch'
         | 'scope_mapping_failed'
+        | 'event_verification_failed'
+        | 'version_verification_failed'
         | 'network'
         | 'api_error';
       message: string;
@@ -146,6 +152,12 @@ export type OpenPlatformAutomationResult =
       missingVcEvents?: string[];
       /** 事件接收方式是否回读确认为长连接(走到订阅阶段才有;早期失败为 undefined)。 */
       eventModeReady?: boolean;
+      /** Managed onboarding exact event-mode ACK, preserved across later scope propagation failure. */
+      eventMode?: number;
+      /** Managed onboarding exact baseline count ACK, preserved across later scope propagation failure. */
+      verifiedEventCount?: number;
+      /** Exact published version ACK, preserved across later scope propagation failure. */
+      versionId?: string;
     };
 
 export interface OpenPlatformAutomationOptions {
@@ -158,6 +170,8 @@ export interface OpenPlatformAutomationOptions {
   forceQrLogin?: boolean;
   /** Reuse a valid cache or fail instead of presenting another QR. */
   disableQrLogin?: boolean;
+  /** Require all baseline events/callbacks and a published version to be proven before managed activation. */
+  requireVerifiedEvents?: boolean;
   fetchImpl?: typeof fetch;
   scopeManifest?: ScopeManifest;
   pollIntervalMs?: number;
@@ -837,7 +851,7 @@ export async function automateOpenPlatformSetup(
     + BOT_BASELINE_CALLBACKS.filter(name => callbackState?.callbacks.includes(name)).length;
   const eventWarning = eventWarnings.length > 0 ? eventWarnings.join('; ') : undefined;
   const criticalIssues: string[] = [
-    ...BOT_CRITICAL_APP_EVENTS.filter(name => !hasEvent(name)),
+    ...(options.requireVerifiedEvents ? missingBaselineEvents : BOT_CRITICAL_APP_EVENTS.filter(name => !hasEvent(name))),
     ...missingCallbacks,
   ];
   // 长连接模式必须以回读为准:switch 接口返回成功≠生效,mode 不是 4 时
@@ -853,7 +867,7 @@ export async function automateOpenPlatformSetup(
   if (criticalIssues.length > 0) {
     return {
       ok: false,
-      reason: 'api_error',
+      reason: options.requireVerifiedEvents ? 'event_verification_failed' : 'api_error',
       message: `核心事件/回调订阅未生效(${criticalIssues.join('; ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
       sessionFile,
       subscribedEventCount,
@@ -876,6 +890,18 @@ export async function automateOpenPlatformSetup(
     const appVersion = nextAppVersion(versionList);
     const created = await postJson(`/developers/v1/app_version/create/${options.appId}`, buildAppVersionCreatePayload(appVersion, visibleMemberIds));
     const versionId = extractVersionId(created);
+    if (options.requireVerifiedEvents && !versionId) {
+      return {
+        ok: false,
+        reason: 'version_verification_failed',
+        message: '开放平台未返回可发布的精确版本 ID，受管机器人保持未激活',
+        sessionFile,
+        subscribedEventCount,
+        eventWarning,
+        missingVcEvents,
+        eventModeReady,
+      };
+    }
     if (versionId) {
       await postJson(`/developers/v1/publish/commit/${options.appId}/${versionId}`, { clientId: options.appId });
     }
@@ -891,6 +917,12 @@ export async function automateOpenPlatformSetup(
       eventWarning,
       missingVcEvents,
       eventModeReady,
+      ...(options.requireVerifiedEvents
+        ? {
+            eventMode: eventState?.eventMode,
+            verifiedEventCount: BOT_BASELINE_APP_EVENTS.length + BOT_BASELINE_CALLBACKS.length,
+          }
+        : {}),
       versionId,
     };
   } catch (err: any) {

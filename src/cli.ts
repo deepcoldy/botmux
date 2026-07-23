@@ -154,6 +154,12 @@ import {
 } from './core/plugins/dependencies.js';
 import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-authority.js';
 import { resolveDaemonIpcPort } from './utils/daemon-discovery.js';
+import {
+  inspectBotmuxPm2Apps,
+  parsePm2JlistOutputStrict as parsePm2JlistOutput,
+  stopExactPm2Process,
+  type BotmuxPm2Inspection,
+} from './core/bot-live-control.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -323,21 +329,6 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
     throw new Error(`pm2 ${args.join(' ')} failed: ${detail}`);
   }
   return typeof r.stdout === 'string' ? r.stdout : '';
-}
-
-function parsePm2JlistOutput(output: string): any[] {
-  try {
-    const parsed = JSON.parse(output);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    for (let start = output.lastIndexOf('['); start >= 0; start = output.lastIndexOf('[', start - 1)) {
-      try {
-        const parsed = JSON.parse(output.slice(start).trim());
-        if (Array.isArray(parsed)) return parsed;
-      } catch { /* try an earlier '['; pm2 may prefix stdout with [PM2] logs */ }
-    }
-    throw new Error('pm2_jlist_json_not_found');
-  }
 }
 
 function loadBotsJson(): any[] {
@@ -2518,19 +2509,9 @@ async function cmdRestart(): Promise<void> {
   await printDashboardHintWithRetry();
 }
 
-/**
- * pm2 process list filtered to botmux entries (bot daemons + dashboard). Returns
- * `[]` when pm2 isn't running or has no botmux apps at all.
- */
-function listBotmuxPm2Apps(): Array<{ name: string; online: boolean }> {
-  try {
-    const apps = parsePm2JlistOutput(pm2Capture(['jlist']));
-    return (Array.isArray(apps) ? apps : [])
-      .filter(a => a && (a.name === PM2_NAME || String(a.name).startsWith(`${PM2_NAME}-`)))
-      .map(a => ({ name: String(a.name), online: a?.pm2_env?.status === 'online' }));
-  } catch {
-    return [];
-  }
+/** Observe botmux PM2 rows. Unknown state is never represented as absence. */
+function listBotmuxPm2Apps(): BotmuxPm2Inspection {
+  return inspectBotmuxPm2Apps(() => parsePm2JlistOutput(pm2Capture(['jlist'])));
 }
 
 export type StartBotLiveResult =
@@ -2548,19 +2529,15 @@ function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): 
     return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
   }
   const processName = botProcessName(bots[index], index, PM2_NAME);
-  const running = listBotmuxPm2Apps();
-  const exact = running.find(a => a.name === processName);
-  if (!exact) {
-    return { ok: true, state: 'already-stopped', processName };
-  }
-  try {
-    // Delete only this exact PM2 entry. The later start-bot command recreates
-    // it from the current ecosystem config after activation is acknowledged.
-    runPm2(['delete', processName], !opts.quiet);
-  } catch (e) {
-    return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
-  }
-  return { ok: true, state: 'stopped', processName };
+  return stopExactPm2Process(
+    processName,
+    listBotmuxPm2Apps,
+    exactName => {
+      // Delete only this exact PM2 entry. The later start-bot command recreates
+      // it from the current ecosystem config after activation is acknowledged.
+      runPm2(['delete', exactName], !opts.quiet);
+    },
+  );
 }
 
 /**
@@ -2591,10 +2568,13 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
   const processName = botProcessName(bots[index], index, PM2_NAME);
 
   const running = listBotmuxPm2Apps();
-  if (running.length === 0) {
+  if (!running.ok) {
+    return { ok: false, reason: 'pm2_error', message: running.message };
+  }
+  if (running.apps.length === 0) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
   }
-  if (running.some(a => a.name === processName && a.online)) {
+  if (running.apps.some(a => a.name === processName && a.online)) {
     return { ok: true, state: 'already-online', processName };
   }
 
