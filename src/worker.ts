@@ -40,7 +40,7 @@ import {
   type IsolationCapability,
   type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
-import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
+import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -6029,11 +6029,12 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrOwnerId: cfg.larkAppId,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
     // Preserve that recorded target for compatibility unless this incarnation
     // requires an isolation/MCP boundary that only a Botmux-owned session can
-    // safely provide. Fresh topics always create their own bmx-<sid8> session.
+    // safely provide. Fresh topics use distinct agents in one bot-owned host.
     reuseRecordedHerdrTarget: !willReadIsolate
       && !willWriteSandbox
       && !hasMcpRuntimeEntries,
@@ -6116,11 +6117,10 @@ async function spawnCli(
   // policy pane survives daemon restarts and suspend→resume safely because the
   // confinement remains attached to the live process.
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
+    const persistentTarget = selectedBackend.persistentBackendTarget;
+    const paneLive = persistentTarget
+      ? probePersistentBackendTarget(persistentTarget) === 'exists'
+      : false;
     if (paneLive) {
       let marker: string | null = null;
       marker = readRegularHostFileNoFollow(
@@ -6136,7 +6136,9 @@ async function spawnCli(
         // obsolete permissions. Kill it before publishing any new capability.
         log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
         try {
-          killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+          const persistentTarget = selectedBackend.persistentBackendTarget;
+          if (persistentTarget) killPersistentBackendTarget(persistentTarget);
+          else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
           selectedBackend = selectBackend();
           isTmuxMode = selectedBackend.isTmuxMode;
           isPipeMode = selectedBackend.isPipeMode;
@@ -6151,17 +6153,18 @@ async function spawnCli(
   }
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
+    const persistentTarget = selectedBackend.persistentBackendTarget;
+    const paneLive = persistentTarget
+      ? probePersistentBackendTarget(persistentTarget) === 'exists'
+      : false;
     if (paneLive) {
       // The trusted Gateway host belongs to the worker and cannot survive a
       // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
       // fresh relay socket instead of reattaching to a dead connection.
       log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
-      killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      const persistentTarget = selectedBackend.persistentBackendTarget;
+      if (persistentTarget) killPersistentBackendTarget(persistentTarget);
+      else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
       isPipeMode = selectedBackend.isPipeMode;
@@ -7117,7 +7120,7 @@ async function spawnCli(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `已为当前话题创建独立 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
+      message: `已为当前机器人创建专属 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
     });
   }
 

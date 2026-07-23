@@ -75,6 +75,8 @@ export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
   backendConfig?: RiffBackendConfig;
+  /** Stable bot identity used to choose the Botmux-owned Herdr host session. */
+  herdrOwnerId?: string;
   /** Migration compatibility for sessions previously placed in a shared user host. */
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
@@ -168,20 +170,32 @@ export function selectSessionBackend(opts: {
       };
     }
 
-    // Fresh Botmux topics never guess among the user's running Herdr sessions.
-    // Their ordering/default/focus is UI state, not durable routing intent.
-    // Keep the same ownership boundary as tmux and zellij: one deterministic
-    // bmx-<sid8> mux session per Botmux conversation. /adopt is the only path
-    // that intentionally binds a new Botmux conversation to a user session.
+    // Fresh topics share one Botmux-owned Herdr host per bot, but each gets a
+    // distinct managed agent/pane. This avoids both ambiguous reuse of a user's
+    // sessions and a proliferation of one Herdr server per Lark topic. /adopt
+    // remains the only path that intentionally binds to a user-owned session.
+    if (!opts.herdrOwnerId?.trim()) {
+      throw new Error('herdr backend requires herdrOwnerId');
+    }
+    const hostSessionName = HerdrBackend.botSessionName(opts.herdrOwnerId);
+    const agentName = `botmux-${opts.sessionId.slice(0, 8)}`;
+    const hostExists = HerdrBackend.hasSession(hostSessionName);
+    const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);
     return {
-      backend: new HerdrBackend(ownedSessionName, { createSession: true }),
+      backend: new HerdrBackend(hostSessionName, {
+        createSession: !hostExists,
+        agentName,
+        isReattach: reattach,
+        ownsSession: false,
+        ownsAgent: true,
+      }),
       isTmuxMode: false,
       isPipeMode: true,
       isZellijMode: false,
-      persistentSessionName: ownedSessionName,
-      persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
-      isReattach: false,
-      createdHerdrSessionName: ownedSessionName,
+      persistentSessionName: hostSessionName,
+      persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
+      isReattach: reattach,
+      createdHerdrSessionName: hostExists ? undefined : hostSessionName,
     };
   }
 

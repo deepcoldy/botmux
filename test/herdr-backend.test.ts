@@ -145,6 +145,11 @@ describe('HerdrBackend connection surface', () => {
     expect(HerdrBackend.isAvailable()).toBe(false);
   });
 
+  it('derives one stable Herdr host name per bot identity', () => {
+    expect(HerdrBackend.botSessionName('cli_aac603fe35f91be8')).toBe('bmx-bot-3fb565c0');
+    expect(HerdrBackend.botSessionName('cli_other')).toBe('bmx-bot-5a3fa7eb');
+  });
+
   it('hasSession() parses `session list --json` and matches running sessions', () => {
     setHerdrResponses([{
       match: a => a[0] === 'session' && a[1] === 'list',

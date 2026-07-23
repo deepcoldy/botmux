@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -337,6 +338,12 @@ export class HerdrBackend implements SessionBackend {
 
   static sessionName(sessionId: string): string {
     return `bmx-${sessionId.slice(0, 8)}`;
+  }
+
+  /** One Botmux-owned Herdr host per bot; topics are separate managed agents. */
+  static botSessionName(botId: string): string {
+    const suffix = createHash('sha256').update(botId).digest('hex').slice(0, 8);
+    return `bmx-bot-${suffix}`;
   }
 
   static hasSession(name: string): boolean {

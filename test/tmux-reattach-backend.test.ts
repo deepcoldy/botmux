@@ -21,6 +21,7 @@ vi.mock('../src/adapters/backend/tmux-pipe-backend.js', () => ({
 vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: class MockHerdrBackend {
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static botSessionName = vi.fn((id: string) => `bmx-bot-${id.slice(-8)}`);
     static hasSession = vi.fn(() => false);
     static probeSession = vi.fn(() => 'missing');
     static hasAgent = vi.fn(() => false);
@@ -90,16 +91,47 @@ describe('selectSessionBackend', () => {
     expect('tmuxBackend' in selected).toBe(false);
   });
 
-  it('creates an owned Herdr session for a fresh topic instead of guessing a user host', () => {
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'herdr' });
+  it('creates one bot-owned Herdr host and a topic-specific agent', () => {
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      herdrOwnerId: 'cli_aac603fe35f91be8',
+    });
 
-    expect((selected.backend as any).sessionName).toBe('bmx-9cfa0024');
-    expect((selected.backend as any).opts).toEqual({ createSession: true });
+    expect((selected.backend as any).sessionName).toBe('bmx-bot-35f91be8');
+    expect((selected.backend as any).opts).toEqual({
+      createSession: true,
+      agentName: 'botmux-9cfa0024',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+    });
     expect(selected.persistentBackendTarget).toEqual({
       backendType: 'herdr',
-      sessionName: 'bmx-9cfa0024',
+      sessionName: 'bmx-bot-35f91be8',
+      agentName: 'botmux-9cfa0024',
     });
-    expect(selected.createdHerdrSessionName).toBe('bmx-9cfa0024');
+    expect(selected.createdHerdrSessionName).toBe('bmx-bot-35f91be8');
+  });
+
+  it('puts a second topic agent in the same existing bot-owned Herdr host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'bmx-bot-35f91be8');
+
+    const selected = selectSessionBackend({
+      sessionId: 'fedcba98-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      herdrOwnerId: 'cli_aac603fe35f91be8',
+    });
+
+    expect((selected.backend as any).sessionName).toBe('bmx-bot-35f91be8');
+    expect((selected.backend as any).opts).toEqual({
+      createSession: false,
+      agentName: 'botmux-fedcba98',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    expect(selected.createdHerdrSessionName).toBeUndefined();
   });
 
   it('reattaches the recorded shared Herdr agent even when current/default changed', () => {

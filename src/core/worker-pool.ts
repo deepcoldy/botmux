@@ -35,7 +35,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -4216,9 +4216,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
       let botCliId: CliId | undefined;
       try { botCliId = getBot(session.larkAppId).config.cliId; } catch { continue; }
       if (botCliId && sessionCliId !== botCliId) {
-        const name = backend.sessionName(session.sessionId);
-        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${name}`);
-        backend.killSession(name);
+        const target = resolvePersistentBackendTarget(
+          backendType,
+          session.sessionId,
+          session.persistentBackendTarget,
+        );
+        const label = target.backendType === 'herdr' && target.agentName
+          ? `${target.sessionName}/${target.agentName}`
+          : target.sessionName;
+        logger.info(`CLI mismatch for ${session.sessionId.substring(0, 8)} (session=${sessionCliId}, bot=${botCliId}), killing ${backendType} ${label}`);
+        killPersistentBackendTarget(target);
       }
     }
   }
