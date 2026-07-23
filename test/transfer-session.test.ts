@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
   getSession: vi.fn(),
+  listSessions: vi.fn(() => []),
   closeSession: vi.fn(),
 }));
 
@@ -53,6 +54,10 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
+import {
+  __testOnly_resetBotTurnMutationGates,
+  withBotTurnAdmission,
+} from '../src/core/bot-turn-mutation-gate.js';
 
 function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   const session: Session = {
@@ -94,6 +99,13 @@ function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   } as DaemonSession;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 describe('transferSession', () => {
   let registry: Map<string, DaemonSession>;
 
@@ -112,6 +124,8 @@ describe('transferSession', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    __testOnly_resetBotTurnMutationGates();
+    vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     registry = new Map();
     setActiveSessionsRegistry(registry);
   });
@@ -175,6 +189,105 @@ describe('transferSession', () => {
     expect(forkWorkerSpy).not.toHaveBeenCalled();
     // Adopt session must remain in source chat untouched.
     expect(adoptDs.chatId).toBe('oc_source');
+  });
+
+  it('refuses a Riff transfer before worker, store, registry, or reply-route mutation', async () => {
+    const worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    const riffDs = makeDs({
+      worker,
+      initConfig: { backendType: 'riff' } as any,
+    });
+    riffDs.session.cliId = 'riff';
+    riffDs.session.backendType = 'riff';
+    riffDs.session.riffParentTaskId = 'task-riff-route';
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), riffDs);
+
+    const result = await callTransfer(riffDs.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result).toEqual({ ok: false, error: 'riff_not_relayable' });
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(riffDs.worker).toBe(worker);
+    expect(riffDs.session).toMatchObject({
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      riffParentTaskId: 'task-riff-route',
+    });
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(riffDs);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+  });
+
+  it('refuses transfer while the durable Codex App dispatch ledger is non-empty', async () => {
+    const ds = makeDs();
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+    ];
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+
+    expect(result).toEqual({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('drains a pre-accept turn and rechecks durable ownership before transfer', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const paused = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    const inbound = withBotTurnAdmission(ds.larkAppId, async () => {
+      markStarted();
+      await paused;
+      ds.session.codexAppDispatchLedger = [{
+        dispatchId: 'd-raced',
+        turnId: 't-raced',
+        state: 'accepted',
+        content: 'accepted before transfer',
+      }];
+    });
+    await started;
+
+    const transfer = callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+    await Promise.resolve();
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    release();
+    await inbound;
+
+    expect(await transfer).toEqual({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(registry.get(sessionKey('om_source_root', ds.larkAppId))).toBe(ds);
+  });
+
+  it('does not kill or overwrite a source successor discovered after cleanup awaits', async () => {
+    const ds = makeDs();
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+    const successor = makeDs({
+      session: { ...ds.session, sessionId: 'source-successor' },
+    });
+    vi.mocked(sessionStore.listSessions).mockImplementationOnce(() => {
+      ds.session.status = 'closed';
+      registry.set(sourceKey, successor);
+      return [];
+    });
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+
+    expect(result).toEqual({ ok: false, error: 'session_not_active' });
+    expect(registry.get(sourceKey)).toBe(successor);
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
   });
 
   it('returns same_anchor when a chat-scope source targets its own chat (chat→chat)', async () => {
@@ -407,6 +520,72 @@ describe('transferSession', () => {
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(existingDs);
   });
 
+  it('refuses a disk-only legacy target owner with an unsettled Codex App dispatch', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+    const legacyConflict: Session = {
+      ...movingDs.session,
+      sessionId: 'legacy-disk-only-owner',
+      chatId: 'oc_target',
+      rootMessageId: 'om_legacy_target',
+      scope: 'chat',
+      larkAppId: undefined,
+      codexAppDispatchLedger: [{
+        dispatchId: 'legacy-dispatch',
+        turnId: 'legacy-turn',
+        state: 'prepared',
+        content: 'owned output',
+        deliverySink: 'lark',
+      }],
+    };
+    vi.mocked(sessionStore.listSessions).mockReturnValue([legacyConflict]);
+
+    const result = await callTransfer(
+      movingDs.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+    );
+
+    expect(result).toEqual({ ok: false, error: 'target_chat_has_session' });
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(movingDs.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(movingDs);
+  });
+
+  it('retires a disk-only legacy scratch before claiming the target anchor', async () => {
+    const movingDs = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), movingDs);
+    const legacyScratch: Session = {
+      ...movingDs.session,
+      sessionId: 'legacy-disk-only-scratch',
+      chatId: 'oc_target',
+      rootMessageId: 'om_legacy_scratch',
+      scope: 'chat',
+      larkAppId: undefined,
+      cliId: undefined,
+      lastCliInput: undefined,
+      queued: false,
+      codexAppDispatchLedger: [],
+    };
+    vi.mocked(sessionStore.listSessions).mockReturnValue([legacyScratch]);
+    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+      sid === legacyScratch.sessionId ? legacyScratch : undefined,
+    );
+
+    const result = await callTransfer(
+      movingDs.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(legacyScratch.sessionId);
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(movingDs);
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('closes the daemon-command scratch session occupying the target chat slot', async () => {
     // Regression: a /relay command in the target chat creates a placeholder
     // session record with `worker: null`. Previously the pre-flight scan
@@ -427,6 +606,8 @@ describe('transferSession', () => {
         rootMessageId: 'om_relay_cmd_msg',
         scope: 'chat',
         title: '/relay',
+        cliId: undefined,
+        lastCliInput: undefined,
       },
       worker: null, // command-time placeholder, no real worker
       chatId: 'oc_target',
@@ -498,6 +679,28 @@ describe('transferSession', () => {
     // embed an img element referencing it (preferred over the text fallback).
     expect(body).toMatch(/"tag":\s*"img"/);
     expect(body).toMatch(/"img_key":\s*"old_image_key"/);
+  });
+
+  it('reattaches at the routing commit before awaiting the source-card patch', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const patch = deferred<void>();
+    updateMessageMock.mockImplementationOnce(() => patch.promise);
+
+    const transferring = callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledTimes(1));
+
+    // The target owner is already runnable before the best-effort Lark PATCH.
+    // A close that wins during that await must not be followed by a stale fork.
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(ds);
+    registry.delete(sessionKey('oc_target', 'cli_app_test'));
+    ds.session.status = 'closed';
+
+    patch.resolve();
+    await expect(transferring).resolves.toEqual({ ok: true });
+    expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
   });
 
   it('frozen card renders no extra element when no currentImageKey is set (hidden mode)', async () => {
@@ -638,6 +841,66 @@ describe('setActiveSessionSafe', () => {
     await setActiveSessionSafe(registry, key, ds);
 
     expect(registry.get(key)).toBe(ds);
+    expect(sessionStore.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unsettled incumbent and closes a ledger-empty incoming collision', async () => {
+    const incumbent = makeSimpleDs('pending-incumbent');
+    incumbent.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incumbent',
+      turnId: 'turn-incumbent',
+      state: 'prepared',
+      content: 'owned',
+      deliverySink: 'lark',
+    }];
+    const incoming = makeSimpleDs('ledger-empty-incoming');
+    vi.mocked(sessionStore.getSession).mockImplementation((sid: string) =>
+      sid === incoming.session.sessionId ? incoming.session : undefined,
+    );
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, incumbent);
+
+    const result = await setActiveSessionSafe(registry, key, incoming);
+
+    expect(result).toEqual({
+      accepted: false,
+      reason: 'kept_pending_owner',
+      keptSessionId: incumbent.session.sessionId,
+      closedIncomingSessionId: incoming.session.sessionId,
+    });
+    expect(registry.get(key)).toBe(incumbent);
+    expect(sessionStore.closeSession).toHaveBeenCalledWith(incoming.session.sessionId);
+  });
+
+  it('fails closed and preserves both rows when both colliding owners are unsettled', async () => {
+    const incumbent = makeSimpleDs('pending-incumbent');
+    incumbent.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incumbent',
+      turnId: 'turn-incumbent',
+      state: 'prepared',
+      content: 'owned incumbent',
+      deliverySink: 'lark',
+    }];
+    const incoming = makeSimpleDs('pending-incoming');
+    incoming.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-incoming',
+      turnId: 'turn-incoming',
+      state: 'prepared',
+      content: 'owned incoming',
+      deliverySink: 'lark',
+    }];
+    const key = sessionKey('oc_c', 'cli_app_test');
+    registry.set(key, incumbent);
+
+    const result = await setActiveSessionSafe(registry, key, incoming);
+
+    expect(result).toEqual({
+      accepted: false,
+      reason: 'both_pending',
+      keptSessionId: incumbent.session.sessionId,
+      preservedIncomingSessionId: incoming.session.sessionId,
+    });
+    expect(registry.get(key)).toBe(incumbent);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
   });
 });

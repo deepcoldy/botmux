@@ -3,8 +3,13 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { countActiveSessionsOnDisk } from '../src/services/session-store.js';
-import { buildRestartReportText, sendRestartReportIfPending, fetchChangelog } from '../src/core/restart-report.js';
-import { writeRestartIntentTo, restartIntentPathIn } from '../src/services/restart-intent-store.js';
+import { buildRestartReportText, fetchChangelog, sendRestartReportIfPending } from '../src/core/restart-report.js';
+import {
+  commitRestartIntentAttemptTo,
+  restartIntentPathIn,
+  writeRestartAttemptIntentTo,
+  writeRestartIntentTo,
+} from '../src/services/restart-intent-store.js';
 
 function writeSessions(dir: string, name: string, sessions: Record<string, { status: string }>) {
   writeFileSync(join(dir, name), JSON.stringify(sessions));
@@ -176,6 +181,30 @@ describe('sendRestartReportIfPending', () => {
     await sendRestartReportIfPending(w);
     await sendRestartReportIfPending(w);
     expect(sent).toHaveLength(1);
+  });
+
+  it('atomically reclaims a commit that lands after the prepared observation', async () => {
+    writeRestartAttemptIntentTo(
+      dir,
+      { kind: 'manual', at: new Date(T0).toISOString() },
+      T0,
+      'attempt-full-fleet',
+    );
+    const wait = vi.fn(async () => {
+      // Commit occurs strictly between two report-claim operations. There is
+      // no separate hasPrepared read whose false result can lose this commit.
+      expect(commitRestartIntentAttemptTo(dir, 'attempt-full-fleet')).toBe(true);
+    });
+    const { w, sent } = fakeWiring({
+      wait,
+      preparedCommitWaitMs: 100,
+    });
+
+    await sendRestartReportIfPending(w);
+
+    expect(wait).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(1);
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false);
   });
 });
 

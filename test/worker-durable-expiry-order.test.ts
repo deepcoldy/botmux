@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest';
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
 describe('worker durable lease expiry ordering', () => {
-  it('removes exact queued attempt N behind an ordinary current turn before ACKing', () => {
+  it('durably retires exact queued attempt N behind an ordinary current turn before ACKing', () => {
     const start = workerSource.indexOf("case 'expire_durable_turn':");
     const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
     expect(start).toBeGreaterThanOrEqual(0);
@@ -16,20 +16,26 @@ describe('worker durable lease expiry ordering', () => {
     const branch = workerSource.slice(start, end);
 
     const currentExact = branch.indexOf('const currentExact = durableTurnInFlight');
-    const pendingLoop = branch.indexOf('for (let i = pendingMessages.length - 1; i >= 0; i--)');
-    const exactTurn = branch.indexOf('item.turnId === msg.turnId', pendingLoop);
-    const exactAttempt = branch.indexOf('item.dispatchAttempt === msg.dispatchAttempt', pendingLoop);
-    const remove = branch.indexOf('pendingMessages.splice(i, 1)', pendingLoop);
-    const pendingAck = branch.indexOf("acknowledge('queued_removed');", remove);
+    const pendingCount = branch.indexOf('const removedPending = pendingMessages.filter(');
+    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', pendingCount);
+    const pendingAck = branch.indexOf("acknowledge('queued_removed');", retire);
     const noProof = branch.indexOf('withholding ACK for daemon fencing', pendingAck);
 
     expect(currentExact).toBeGreaterThanOrEqual(0);
-    expect(pendingLoop).toBeGreaterThan(currentExact);
-    expect(exactTurn).toBeGreaterThan(pendingLoop);
-    expect(exactAttempt).toBeGreaterThan(exactTurn);
-    expect(remove).toBeGreaterThan(exactAttempt);
-    expect(pendingAck).toBeGreaterThan(remove);
+    expect(pendingCount).toBeGreaterThan(currentExact);
+    expect(retire).toBeGreaterThan(pendingCount);
+    expect(pendingAck).toBeGreaterThan(retire);
     expect(noProof).toBeGreaterThan(pendingAck);
+
+    const retireStart = workerSource.indexOf('async function retireCodexAppDispatchForDurableReplay(');
+    const retireEnd = workerSource.indexOf('\nfunction ', retireStart + 1);
+    const retireHelper = workerSource.slice(retireStart, retireEnd);
+    const persist = retireHelper.indexOf("requestCodexAppDispatchTransition('cancel'");
+    const localQueueCancel = retireHelper.indexOf('codexAppTurnDispatchQueue.cancelExact(', persist);
+    const localPendingRemove = retireHelper.indexOf('pendingMessages.splice(index, 1)', persist);
+    expect(persist).toBeGreaterThanOrEqual(0);
+    expect(localQueueCancel).toBeGreaterThan(persist);
+    expect(localPendingRemove).toBeGreaterThan(persist);
   });
 
   it('ACKs active exact expiry only after synchronous owned-CLI restart fencing', () => {
@@ -37,11 +43,13 @@ describe('worker durable lease expiry ordering', () => {
     const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
     const branch = workerSource.slice(start, end);
     const exactBranch = branch.indexOf('if (currentExact)');
-    const restart = branch.indexOf("restartCliProcess('durable lease expiry'", exactBranch);
+    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', exactBranch);
+    const restart = branch.indexOf("restartCliProcess('durable lease expiry'", retire);
     const ack = branch.indexOf("acknowledge('cli_fenced');", restart);
 
     expect(exactBranch).toBeGreaterThanOrEqual(0);
-    expect(restart).toBeGreaterThan(exactBranch);
+    expect(retire).toBeGreaterThan(exactBranch);
+    expect(restart).toBeGreaterThan(retire);
     expect(ack).toBeGreaterThan(restart);
   });
 

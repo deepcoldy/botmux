@@ -239,6 +239,7 @@ export function resolveSessionContext(
   dataDir: string,
   envSessionId: string | undefined,
   startPid: number = process.ppid,
+  originChannelId: string | undefined = process.env.BOTMUX_ORIGIN_CHANNEL_ID,
 ): AncestorSessionContext | null {
   const fromMarker = findAncestorSessionContext(dataDir, startPid);
   // A live process-tree marker is the primary source whenever it is visible.
@@ -252,7 +253,7 @@ export function resolveSessionContext(
   // as daemon authority. It is consulted only when no live marker is visible,
   // so fields from two generations are never mixed.
   const protectedClaim = envSessionId
-    ? readManagedOriginCapability(dataDir, envSessionId)
+    ? readManagedOriginCapability(dataDir, envSessionId, undefined, originChannelId)
     : null;
   if (protectedClaim) {
     return {

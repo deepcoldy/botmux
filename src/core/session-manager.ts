@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -39,10 +39,19 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
+import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, storedSessionAnchorId } from './types.js';
+import {
+  activeSessionKey,
+  sessionKey,
+  sessionAnchorId,
+  storedSessionAnchorId,
+  riffRetirementAdmissionPhase,
+} from './types.js';
 import type { DaemonSession } from './types.js';
+import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, markSessionActivity, announcePendingRepoSession } from './session-activity.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
 import { buildRepoSelectCard } from '../im/lark/card-builder.js';
@@ -67,6 +76,114 @@ function sessionCreatedAtMs(session: { createdAt?: string }): number {
 
 function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: string }): number {
   return session.lastMessageAt ? (Date.parse(session.lastMessageAt) || sessionCreatedAtMs(session)) : sessionCreatedAtMs(session);
+}
+
+async function resumeRestoredPendingRepoSetup(
+  ds: DaemonSession,
+  activeSessions: Map<string, DaemonSession>,
+): Promise<void> {
+  const setup = ds.session.pendingRepoSetup;
+  if (!setup || ds.session.queuedActivationPending || !ds.pendingRepo) return;
+  const anchor = sessionAnchorId(ds);
+  const notify = async (content: string): Promise<unknown> => {
+    const { sendMessage, replyMessage } = await import('../im/lark/client.js');
+    return ds.scope === 'thread'
+      ? replyMessage(ds.larkAppId, anchor, content, 'text', true)
+      : sendMessage(ds.larkAppId, ds.chatId, content, 'text');
+  };
+
+  if (setup.mode === 'auto_worktree' && setup.baseDir) {
+    const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
+    void runAutoWorktreeCommit({
+      ds,
+      anchor,
+      larkAppId: ds.larkAppId,
+      baseDir: setup.baseDir,
+      title: ds.session.title,
+      prompt: setup.prompt,
+      operatorOpenId: ds.session.ownerOpenId,
+      activeSessions,
+      notify,
+    }).catch((err) => {
+      // Git/worktree recovery is deliberately detached. A failed publish or
+      // build may not reject daemon startup or erase this durable setup owner.
+      restorePendingRepoRuntime(ds);
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Pending auto-worktree recovery failed; `
+        + `durable setup retained for retry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] Restarted durable pending auto-worktree setup`);
+    return;
+  }
+
+  // Always publish a fresh picker after restart: a persisted message id proves
+  // identity, not that the Lark message still exists. Persist the replacement
+  // before best-effort withdrawal so exactly one card remains authoritative.
+  const oldCardMessageId = setup.repoCardMessageId;
+  const scanDirs = getProjectScanDirs(ds).filter(dir => existsSync(dir));
+  const projects = scanDirs.length > 0
+    ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+    : [];
+  if (projects.length > 0) {
+    const bot = getBot(ds.larkAppId);
+    const card = buildRepoSelectCard(
+      projects,
+      getSessionWorkingDir(ds),
+      anchor,
+      localeForBot(ds.larkAppId),
+      bot.config.worktreeMultiPicker,
+    );
+    const { sendMessage, replyMessage, deleteMessage } = await import('../im/lark/client.js');
+    const messageId = ds.scope === 'thread'
+      ? await replyMessage(ds.larkAppId, anchor, card, 'interactive', true)
+      : await sendMessage(ds.larkAppId, ds.chatId, card, 'interactive');
+    ds.repoCardMessageId = messageId;
+    persistPendingRepoCardMessageId(ds, messageId);
+    if (oldCardMessageId && oldCardMessageId !== messageId) {
+      void deleteMessage(ds.larkAppId, oldCardMessageId).catch(() => {});
+    }
+    announcePendingRepoSession(ds);
+    logger.info(`[${ds.session.sessionId.substring(0, 8)}] Re-posted durable pending repo picker`);
+    return;
+  }
+
+  // The original pre-card scan may have crashed before learning there was no
+  // selectable repo. Resume the same no-project fallback without replacing N.
+  ds.pendingRepo = false;
+  ensureSessionWhiteboard(ds);
+  if (setup.rawInput) {
+    rememberLastCliInput(ds, setup.rawInput, setup.rawInput);
+    forkWorker(ds, '', { resume: false, turnId: setup.turnId });
+  } else {
+    const bot = getBot(ds.larkAppId);
+    const availableBots = await getAvailableBots(ds.larkAppId, ds.chatId);
+    const input = buildNewTopicCliInput(
+      setup.prompt,
+      ds.session.sessionId,
+      ds.session.cliId ?? bot.config.cliId,
+      ds.session.cliPathOverride ?? bot.config.cliPathOverride,
+      ds.pendingAttachments,
+      ds.pendingMentions,
+      availableBots,
+      undefined,
+      { name: bot.botName, openId: bot.botOpenId },
+      localeForBot(ds.larkAppId),
+      ds.pendingSender,
+      {
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        whiteboardId: ds.session.whiteboardId,
+        substituteTrigger: ds.pendingSubstituteTrigger,
+        codexAppText: ds.pendingCodexAppText,
+        codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
+        codexAppMessageContext: ds.pendingCodexAppMessageContext,
+      },
+    );
+    rememberLastCliInput(ds, setup.prompt, input);
+    forkWorker(ds, input, { resume: false, turnId: setup.turnId });
+  }
+  logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
 }
 
 function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
@@ -101,6 +218,23 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boole
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return false;
 
+  // A config mismatch is not an explicit user close. In particular, bots.json
+  // may be edited while the daemon is down, leaving a persisted backend-neutral
+  // activation owner (or Codex App final) that only the frozen generation can
+  // reconcile on restart. Preserve it until its durable ownership settles.
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch retained until `
+      + 'durable activation ownership is reconciled',
+    );
+    return false;
+  }
+
+  // queuedActivationPending is the backend-neutral write-ahead owner for an
+  // opening/successor that has not crossed its adapter submission boundary.
+  // Its durable tail is ordered behind that owner. A bot config edit is not an
+  // explicit abandon operation, so it must not close either non-Codex/Riff
+  // work or a tail-only restore before recovery promotes its first entry.
   const tag = ds.session.sessionId.substring(0, 8);
   const backendType = getSessionPersistentBackendType(ds);
   // 仅在没有活 worker 时预杀 backing pane：restore 守卫处 ds 尚未进 registry，
@@ -137,6 +271,10 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    // Defense in depth: the dashboard toggle preflights the whole bot before
+    // changing config. Never let a refused suspend fall through into
+    // closeSession: close is explicit abandon, and a settings toggle is not.
+    if (hasProtectedSessionMutationOwnership(ds)) continue;
     if (await closeActiveSessionIfCliMismatch(ds)) closed++;
   }
   return closed;
@@ -160,6 +298,10 @@ export async function suspendActiveSessionsForBot(larkAppId: string): Promise<nu
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    // A settings helper is never an explicit abandon boundary. In particular,
+    // suspendWorker intentionally refuses pending Codex App ownership; do not
+    // reinterpret that refusal as permission to close and erase the FIFO.
+    if (hasProtectedSessionMutationOwnership(ds)) continue;
     // Prefer suspend (keeps the session; --resume continues context on the next
     // message). But suspendWorker no-ops for a NON-suspendable backend (explicit
     // PTY) — leaving the old unisolated process running would silently defeat the
@@ -1160,21 +1302,35 @@ const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
  * staggered to avoid a thundering-herd CPU/IO spike when many sessions survive a
  * restart: spawn `batchSize` workers, wait `delayMs`, repeat.
  *
- * Sessions whose worker is already live are skipped — a real message can arrive
- * (the Lark dispatcher is up before restore finishes) and lazily fork the worker
- * during one of our `delayMs` pauses; re-forking it here would kill that live
- * worker mid-turn via `forkWorker`'s double-fork guard.
+ * Sessions whose worker is already live are skipped. Startup admissions are
+ * held behind restore, but lifecycle callbacks or a future recovery path can
+ * still close/replace/wake an entry during one of the batch delays; re-forking
+ * that stale object would kill the current worker via the double-fork guard.
  */
 export async function staggeredRecoveryFork(
   sessions: readonly DaemonSession[],
   fork: (ds: DaemonSession) => void,
   batchSize: number = RECOVERY_FORK_BATCH_SIZE,
   delayMs: number = RECOVERY_FORK_DELAY_MS,
+  stillOwned: (ds: DaemonSession) => boolean = ds => ds.session.status === 'active',
 ): Promise<void> {
   let spawnedInBatch = 0;
   for (const ds of sessions) {
-    if (ds.worker) continue; // already woken by a real message — don't clobber it
-    fork(ds);
+    // The batch delay is a lifecycle boundary: close/replace can remove this
+    // exact object while we sleep. Never resurrect a closed or orphaned ds.
+    if (ds.worker || ds.session.status !== 'active' || !stillOwned(ds)) continue;
+    try {
+      fork(ds);
+    } catch (err) {
+      // One malformed/stale pane or synchronous init-IPC failure must not
+      // abort recovery for every later durable owner. forkWorker compensates
+      // its own pre-init journal mutations; isolate this row and continue.
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Recovery fork failed; retained for later retry: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
     if (++spawnedInBatch >= batchSize) {
       spawnedInBatch = 0;
       if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
@@ -1197,6 +1353,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
 
   for (const session of active) {
+    try {
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1261,7 +1418,20 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // resolving to the same chat-scope key — e.g. a leaked scratch +
       // relayed real session from a prior buggy run), close the loser
       // rather than silently overwriting it.
-      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      const registration = await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      if (!registration.accepted) {
+        if (registration.reason === 'both_pending' || registration.reason === 'cleanup_failed') {
+          logger.error(
+            `[${session.sessionId.substring(0, 8)}] Isolated adopt restore collision; `
+            + `durable row/pane retained without aborting daemon startup: ${registration.reason === 'both_pending'
+              ? `two protected owners at ${activeSessionKey(ds)}`
+              : `cleanup failed for ${registration.cleanupSessionId}: ${registration.error}`}`,
+          );
+          continue;
+        }
+        logger.warn(`[${session.sessionId.substring(0, 8)}] restore collision lost to unsettled session ${registration.keptSessionId.substring(0, 8)}`);
+        continue;
+      }
       announceSessionRow(ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
@@ -1275,10 +1445,52 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       continue;
     }
 
+    if (session.queuedActivationPending) {
+      const unsettledCodex = hasUnsettledCodexAppDispatch(session.codexAppDispatchLedger);
+      if (session.cliId === 'codex-app') {
+        if (!unsettledCodex && !session.pendingRepoSetup?.rawInput) {
+          // An activation FIFO can become empty only after its exact prepared
+          // head settled. A lost submission-ACK persistence must not re-accept
+          // the old prompt after that terminal proof.
+          const priorTerminalActivation = {
+            queuedActivationPending: session.queuedActivationPending,
+            queuedActivationToken: session.queuedActivationToken,
+            queuedActivationInput: session.queuedActivationInput,
+            queuedActivationTurnId: session.queuedActivationTurnId,
+            queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
+            queuedActivationResume: session.queuedActivationResume,
+            queuedPrompt: session.queuedPrompt,
+            queuedCodexAppText: session.queuedCodexAppText,
+            queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
+            pendingRepoSetup: session.pendingRepoSetup,
+          };
+          session.queuedActivationPending = undefined;
+          session.queuedActivationToken = undefined;
+          session.queuedActivationInput = undefined;
+          session.queuedActivationTurnId = undefined;
+          session.queuedActivationDispatchAttempt = undefined;
+          session.queuedActivationResume = undefined;
+          session.queuedPrompt = undefined;
+          session.queuedCodexAppText = undefined;
+          session.queuedCodexAppMessageContext = undefined;
+          session.pendingRepoSetup = undefined;
+          try {
+            sessionStore.updateSession(session);
+          } catch (err) {
+            Object.assign(session, priorTerminalActivation);
+            throw err;
+          }
+        }
+      }
+    }
+
     // Queued（待办池）会话：CLI 从没起过，restore 必须保持 parked（hasHistory:false +
     // queued），绝不能走下面 hasHistory:true 的通用分支——否则下一条消息会 --resume 一个
     // 不存在的 CLI 会话。pendingPrompt 从持久化的 queuedPrompt 恢复，供激活时发首轮。
     if (session.queued) {
+      if (hasUnsettledCodexAppDispatch(session.codexAppDispatchLedger)) {
+        throw new Error(`queued session ${session.sessionId} carries an unsettled Codex App dispatch`);
+      }
       const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
       const ds: DaemonSession = {
         session,
@@ -1301,13 +1513,44 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         pendingAttachments: session.queuedAttachments,
         currentTurnTitle: session.currentTurnTitle ?? session.title,
       };
+      const restoredPendingRepo = restorePendingRepoRuntime(ds);
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
-      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      const registration = await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      if (!registration.accepted) {
+        if (registration.reason === 'both_pending' || registration.reason === 'cleanup_failed') {
+          logger.error(
+            `[${session.sessionId.substring(0, 8)}] Isolated queued restore collision; `
+            + `exact setup journal retained without aborting daemon startup: ${registration.reason === 'both_pending'
+              ? `two protected owners at ${activeSessionKey(ds)}`
+              : `cleanup failed for ${registration.cleanupSessionId}: ${registration.error}`}`,
+          );
+          continue;
+        }
+        logger.warn(`[${session.sessionId.substring(0, 8)}] queued restore collision lost to unsettled session ${registration.keptSessionId.substring(0, 8)}`);
+        continue;
+      }
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
       announceSessionRow(ds);
-      logger.info(`[${session.sessionId.substring(0, 8)}] Restored queued (待办池) session (scope: ${scope})`);
+      if (restoredPendingRepo) {
+        try {
+          await resumeRestoredPendingRepoSetup(ds, activeSessions);
+        } catch (err) {
+          // One unavailable scan/Lark send/worktree import must not abort the
+          // entire daemon restore. Rebuild volatile buffers from the retained
+          // setup journal so a later retry/card action remains lossless.
+          restorePendingRepoRuntime(ds);
+          logger.error(
+            `[${session.sessionId.substring(0, 8)}] Pending-repo restore failed; `
+            + `durable setup retained for retry: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+      logger.info(
+        `[${session.sessionId.substring(0, 8)}] Restored queued `
+        + `${restoredPendingRepo ? 'pending-repo' : '(待办池)'} session (scope: ${scope})`,
+      );
       continue;
     }
 
@@ -1324,7 +1567,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
-      hasHistory: true,  // restored sessions have prior CLI history
+      hasHistory: session.queuedActivationPending
+        ? (session.queuedActivationResume ?? false)
+        : true,  // restored ordinary sessions have prior CLI history
+      initialStartPending: session.queuedActivationPending === true
+        || (session.queuedActivationTail?.length ?? 0) > 0,
       workingDir: session.workingDir,
       ownerOpenId: session.ownerOpenId,
       // Restore persisted streaming-card state — next screen_update will PATCH
@@ -1374,15 +1621,50 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       ds.replyThreadAliases = aliases;
       sessionStore.updateSession(session);
     }
+    // Literal pending-repo passthroughs have an empty init prompt and therefore
+    // no Codex ledger entry. Their setup journal is the exact replay owner; the
+    // recovered worker sends it at prompt_ready with the retained token.
+    if (session.queuedActivationPending && session.pendingRepoSetup?.rawInput) {
+      ds.pendingRawInput = session.pendingRepoSetup.rawInput;
+    }
     if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    if (!ds.session.queuedActivationPending
+      && (ds.session.queuedActivationTail?.length ?? 0) > 0
+      && !promoteQueuedActivationTail(ds, { send: false })) {
+      throw new Error(`failed to promote durable activation tail for ${session.sessionId}`);
+    }
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
-    await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+    const registration = await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+    if (!registration.accepted) {
+      if (registration.reason === 'both_pending' || registration.reason === 'cleanup_failed') {
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Isolated active restore collision; `
+          + `durable row/pane retained without aborting daemon startup: ${registration.reason === 'both_pending'
+            ? `two protected owners at ${activeSessionKey(ds)}`
+            : `cleanup failed for ${registration.cleanupSessionId}: ${registration.error}`}`,
+        );
+        continue;
+      }
+      logger.warn(`[${session.sessionId.substring(0, 8)}] restore collision lost to unsettled session ${registration.keptSessionId.substring(0, 8)}`);
+      continue;
+    }
     announceSessionRow(ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
+    } catch (err) {
+      // Restore is a per-row reconciliation job. A malformed legacy hybrid or
+      // one transient persistence failure must retain that row for inspection
+      // and retry without preventing every later healthy session from loading.
+      logger.error(
+        `[${session.sessionId.substring(0, 8)}] Isolated session restore failure; `
+        + `durable row retained and daemon startup continuing: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -1410,13 +1692,32 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // would immediately zombie-close the session we just restored.
     if (ds.adoptedFrom) continue;
     const backendType = getSessionPersistentBackendType(ds);
-    if (!backendType) continue;
+    if (!backendType) {
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        logger.warn(`[${ds.session.sessionId.substring(0, 8)}] non-persistent backend has durable activation ownership — scheduling eager recovery`);
+        toReattach.push(ds);
+      }
+      continue;
+    }
     if (!shouldAutoForkOnRestore(backendType)) continue;
 
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     const probe = probePersistentSession(backendType, backendName);
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
+      if (ds.session.queuedActivationPending) {
+        logger.warn(`[${tag}] ${backendType} backing is missing with a tokened activation — scheduling fresh exact recovery`);
+        toReattach.push(ds);
+        continue;
+      }
+      // A missing pane is normally a zombie, but any backend-neutral durable
+      // activation owner is not disposable session metadata. Start a fresh
+      // resume worker so its exact head/tail can reconcile rather than strand.
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        logger.warn(`[${tag}] ${backendType} backing is missing with durable activation ownership — scheduling fresh resume recovery`);
+        toReattach.push(ds);
+        continue;
+      }
       // Intentionally cold-resume-suspended (idle-worker sweeper killed the
       // backing session + CLI to reclaim memory over the per-bot live cap). The
       // 'missing' backing is EXPECTED here, not a zombie — keep the worker-less
@@ -1452,6 +1753,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // store closed → no lazy recovery). Keep the worker-less active record and
       // let it re-attach on the next message, exactly like the old behaviour.
       const tag = ds.session.sessionId.substring(0, 8);
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        logger.warn(`[${tag}] ${backendType} probe inconclusive with unsettled Codex App ownership — scheduling bounded eager recovery`);
+        toReattach.push(ds);
+        continue;
+      }
       logger.warn(`[${tag}] ${backendType} backing session "${backendName}" probe inconclusive — keeping active session for lazy recovery`);
       continue;
     }
@@ -1470,7 +1776,28 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
 
   // Staggered re-fork (see staggeredRecoveryFork): empty prompt = re-attach
   // only, no new turn — same as the old per-session eager fork.
-  await staggeredRecoveryFork(toReattach, (ds) => forkWorker(ds, '', true));
+  await staggeredRecoveryFork(
+    toReattach,
+    (ds) => {
+      const recoverExactNonCodex = ds.session.queuedActivationPending
+        && ds.session.cliId !== 'codex-app'
+        && ds.session.queuedActivationInput;
+      forkWorker(
+        ds,
+        recoverExactNonCodex || '',
+        recoverExactNonCodex
+          ? {
+              resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+              turnId: ds.session.queuedActivationTurnId,
+              dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+            }
+          : true,
+      );
+    },
+    RECOVERY_FORK_BATCH_SIZE,
+    RECOVERY_FORK_DELAY_MS,
+    ds => activeSessions.get(activeSessionKey(ds)) === ds,
+  );
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
@@ -1553,7 +1880,7 @@ export async function resumeSession(
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
 | { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized'; activeSessionId?: string }> {
-  const session = sessionStore.getSession(sessionId);
+  let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
 
@@ -1590,6 +1917,22 @@ export async function resumeSession(
   const anchor = storedSessionAnchorId(session);
   const key = sessionKey(anchor, larkAppId);
 
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+  // The resume request may have waited behind a fresh creator. Re-read the
+  // durable row and keep the already-active creator as first owner.
+  const latest = sessionStore.getSession(sessionId);
+  if (!latest) return { ok: false as const, error: 'not_found' as const };
+  if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
+  if (latest.vcMeetingReceiver) return { ok: false as const, error: 'vc_receiver_managed' as const };
+  if (latest.deferredScheduleRun
+    && !readDeferredTopicBinding(config.session.dataDir, latest.sessionId)) {
+    return { ok: false as const, error: 'deferred_unmaterialized' as const };
+  }
+  if (latest.title?.startsWith('Adopt:') || latest.adoptedFrom) {
+    return { ok: false as const, error: 'adopt_unsupported' as const };
+  }
+  session = latest;
+
   // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
   // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
   // anchor; daemon.ts creates one for ANY DAEMON_COMMAND in a session-less
@@ -1605,7 +1948,12 @@ export async function resumeSession(
   // throwaway command container, so clobbering it would lose real intent.
   const existing = activeSessions.get(key);
   if (existing) {
-    if (isRelayableRealSession(existing) || existing.pendingRepo) {
+    if (hasProtectedSessionMutationOwnership(existing)
+      || isRelayableRealSession(existing)
+      || !!existing.session.riffParentTaskId
+      || existing.pendingRepo
+      || existing.initialStartPending
+      || existing.session.queued) {
       return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
     }
     await closeSession(existing.session.sessionId);
@@ -1621,9 +1969,10 @@ export async function resumeSession(
   // store-level conflict invisible to the Map check above.
   //
   // Same scratch carve-out applies on disk: a persisted scratch has neither
-  // `cliId` nor `lastCliInput` (those are only written once a real CLI ran).
-  // A real conflict (either marker present) still blocks; scratch-only
-  // conflicts get closed so they stop occupying the anchor on disk.
+  // `cliId` / `lastCliInput` nor a live Riff task id (those are only written
+  // once a real backend ran). A real conflict (any marker present) still
+  // blocks; scratch-only conflicts get closed so they stop occupying the
+  // anchor on disk.
   //
   // CAVEAT — this path canNOT honor the pendingRepo carve-out the in-memory
   // branch above applies: `pendingRepo` is a runtime DaemonSession flag that
@@ -1639,11 +1988,19 @@ export async function resumeSession(
   const conflicts = sessionStore.listSessions().filter(s =>
     s.sessionId !== sessionId
     && s.status === 'active'
-    && (s.larkAppId ?? '') === larkAppId
+    // Legacy active rows predate per-bot stamping. Conservatively attribute an
+    // unscoped row to this daemon, matching transfer/restore collision rules;
+    // otherwise a disk-only legacy anchor can be ghosted by the resumed row.
+    && (!s.larkAppId || s.larkAppId === larkAppId)
     && (s.scope === 'chat' ? 'chat' : 'thread') === scope
     && storedSessionAnchorId(s) === anchor,
   );
-  const realConflict = conflicts.find(s => !!s.cliId || !!s.lastCliInput);
+  const realConflict = conflicts.find(s =>
+    hasProtectedSessionMutationOwnership(s)
+    || !!s.cliId
+    || !!s.lastCliInput
+    || !!s.riffParentTaskId,
+  );
   if (realConflict) {
     return { ok: false, error: 'anchor_occupied', activeSessionId: realConflict.sessionId };
   }
@@ -1651,12 +2008,25 @@ export async function resumeSession(
     await closeSession(scratch.sessionId);
   }
 
-  // Reactivate in store — clear closedAt so dashboard rows don't keep showing
-  // the stale close timestamp on the now-active session.
-  session.status = 'active';
-  session.closedAt = undefined;
-  session.lastMessageAt = new Date().toISOString();
-  sessionStore.updateSession(session);
+  // Scratch cleanup and disk scans can await. A creator that does not yet use
+  // the shared key lock still wins if it published meanwhile; never reactivate
+  // the closed row and then replace that fresh owner.
+  const lateExisting = activeSessions.get(key);
+  if (lateExisting) {
+    return {
+      ok: false,
+      error: 'anchor_occupied',
+      activeSessionId: lateExisting.session.sessionId,
+    };
+  }
+
+  // Reactivate and abandon any queued/setup ownership in one durable replace.
+  // Closed rows created by older releases may still contain a prepared head,
+  // tail, or repo picker; generic resume starts a new lifecycle and must never
+  // replay those abandoned inputs.
+  const reactivated = sessionStore.reactivateClosedSession(sessionId);
+  if (!reactivated.ok) return reactivated;
+  session = reactivated.session;
 
   const now = Date.now();
   const ds: DaemonSession = {
@@ -1688,12 +2058,13 @@ export async function resumeSession(
   };
 
   messageQueue.ensureQueue(anchor);
-  // setActiveSessionSafe over a bare Map.set: the scratch-eviction above
-  // should already have freed `key`, but if any occupant remains it closes
-  // it rather than silently orphaning it (consistent with restore/transfer).
-  await setActiveSessionSafe(activeSessions, key, ds);
+  // Live creation is first-owner-wins.  Restore-time setActiveSessionSafe may
+  // replace disposable historical collisions, but a user resume must never
+  // close a newly-created worker/reservation at this anchor.
+  activeSessions.set(key, ds);
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
   return { ok: true, ds };
+  });
 }
 
 // ─── Scheduled task execution ────────────────────────────────────────────────
@@ -1944,102 +2315,169 @@ export async function executeScheduledTask(
 
   refreshCliVersion(bot.config.cliId, bot.config.cliPathOverride);
 
-  // Silent fires flip the model's default from "post progress via botmux send"
-  // to "say nothing unless the alert condition is met".
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
     : task.prompt;
-  // Inject into a live session if one already exists at this anchor.
-  const existing = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (isContinuation && existing?.worker && !existing.worker.killed) {
-    markSessionActivity(existing);
-    try {
-      ensureSessionWhiteboard(existing);
-      if (sharedTopicRootId) {
-        beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
-        sessionStore.updateSession(existing.session);
+  const key = sessionKey(anchor, larkAppId);
+  return withActiveSessionKeyLock(activeSessions, key, async () => {
+    // Reuse the canonical owner only when it is an actual conversation.  A
+    // worker:null entry is also used for three deliberately non-runnable
+    // states: first-turn setup, repo selection, and dashboard backlog.  Waking
+    // any of those here would let the scheduled prompt overtake (or replace)
+    // the opening prompt that owns the reservation.
+    const existing = activeSessions.get(key);
+    if (existing) {
+      const reservedState = existing.pendingRepo
+        ? 'pending_repo'
+        : existing.initialStartPending
+          ? 'initial_start_pending'
+          : existing.worktreeCreating
+            ? 'worktree_creating'
+            : existing.session.queued
+              ? 'queued_backlog'
+              : undefined;
+      if (reservedState) {
+        throw new Error(
+          `Scheduled task ${task.id} found owner ${existing.session.sessionId} `
+          + `in ${reservedState}; preserving its opening prompt`,
+        );
       }
-      const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
-        isAdoptMode: false,
-        cliId: existing.session.cliId ?? bot.config.cliId,
-        cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
-        locale: localeForBot(larkAppId),
-        larkAppId,
-        chatId: task.chatId,
-        whiteboardId: existing.session.whiteboardId,
-      });
-      rememberLastCliInput(existing, task.prompt, input);
-      if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
-      if (!sendWorkerInput(existing, input, scheduledTurnId)) {
-        if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-        throw new Error('worker unavailable');
+      const retirementPhase = riffRetirementAdmissionPhase(existing);
+      if (retirementPhase) {
+        throw new Error(
+          `Scheduled task ${task.id} found owner ${existing.session.sessionId} `
+          + `in ${retirementPhase}; input was not accepted`,
+        );
       }
-      logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-      return;
-    } catch (err: any) {
-      if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-      logger.warn(`[scheduler] Failed to inject into live session (${err.message}); spawning fresh worker`);
+      if (hasProtectedSessionMutationOwnership(existing)) {
+        throw new Error(
+          `Scheduled task ${task.id} found durable activation owner `
+          + `${existing.session.sessionId}; preserving it for recovery`,
+        );
+      }
+
+      if (isRelayableRealSession(existing) || !!existing.session.riffParentTaskId) {
+        markSessionActivity(existing);
+        ensureSessionWhiteboard(existing);
+        if (sharedTopicRootId) {
+          beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
+          sessionStore.updateSession(existing.session);
+        }
+        const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
+          isAdoptMode: false,
+          cliId: existing.session.cliId ?? bot.config.cliId,
+          cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+          locale: localeForBot(larkAppId),
+          larkAppId,
+          chatId: task.chatId,
+          whiteboardId: existing.session.whiteboardId,
+        });
+        if (existing.worker && !existing.worker.killed) {
+          if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
+          if (!sendWorkerInput(existing, input, scheduledTurnId)) {
+            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+            throw new Error(
+              `Scheduled task ${task.id} worker refused input before acceptance`,
+            );
+          }
+          rememberLastCliInput(existing, task.prompt, input);
+        } else {
+          rememberLastCliInput(existing, task.prompt, input);
+          if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
+          try {
+            forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
+          } catch (err) {
+            if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+            throw err;
+          }
+        }
+        logger.info(`[scheduler] Task "${task.name}" routed to existing session ${existing.session.sessionId}`);
+        return;
+      }
+
+      // Daemon-command scratches have no CLI history and no pending user
+      // intent.  Retire the exact scratch before creating the scheduled
+      // conversation; never fork the scratch as if it were resumable.
+      const closeResult = await closeSession(existing.session.sessionId);
+      if (!closeResult.ok) {
+        throw new Error(
+          `Scheduled task ${task.id} could not retire owner ${existing.session.sessionId}: `
+          + `${closeResult.error}; preserving its route for retry`,
+        );
+      }
+      if (activeSessions.get(key) === existing) activeSessions.delete(key);
+      const successor = activeSessions.get(key);
+      if (successor) {
+        throw new Error(
+          `Scheduled task ${task.id} lost anchor ${key} to ${successor.session.sessionId} `
+          + 'while retiring a scratch owner',
+        );
+      }
     }
-  }
 
-  // Spawn a fresh session bound to the chosen anchor.
+    // Spawn a fresh session bound to the chosen anchor.
   // Thread-scope: rootMessageId = anchor. Chat-scope: rootMessageId stores the
-  // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
-  // formerly chat-scope task was redirected into a converted topic chat, promote
-  // the runtime session to thread-scope so follow-up replies stay in-thread.
-  const deferredFreshTopic = executionPosition === 'new-topic' && silent;
-  const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
-    ? 'chat'
-    : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
-  const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
-  const now = Date.now();
-  session.larkAppId = larkAppId;
-  session.scope = runtimeScope;
-  if (deferredFreshTopic) {
-    session.deferredScheduleRun = {
-      taskId: task.id,
-      turnId: scheduledTurnId,
-      routingAnchor: anchor,
-      ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
-      createdAt: new Date(now).toISOString(),
+    // chatId-as-seed for audit (sessionAnchorId() returns chatId via scope). If a
+    // formerly chat-scope task was redirected into a converted topic chat, promote
+    // the runtime session to thread-scope so follow-up replies stay in-thread.
+    const deferredFreshTopic = executionPosition === 'new-topic' && silent;
+    const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
+      ? 'chat'
+      : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+    const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = runtimeScope;
+    if (deferredFreshTopic) {
+      session.deferredScheduleRun = {
+        taskId: task.id,
+        turnId: scheduledTurnId,
+        routingAnchor: anchor,
+        ...(task.topicTitle?.trim() ? { topicTitle: task.topicTitle.trim() } : {}),
+        createdAt: new Date(now).toISOString(),
+      };
+    }
+    session.lastMessageAt = new Date(now).toISOString();
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId: task.chatId,
+      chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
+      scope: runtimeScope,
+      spawnedAt: sessionCreatedAtMs(session),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: isContinuation,
+      workingDir: task.workingDir,
+      initialStartPending: true,
+      pendingPrompt: firePrompt,
     };
-  }
-  session.lastMessageAt = new Date(now).toISOString();
-  sessionStore.updateSession(session);
-  messageQueue.ensureQueue(anchor);
+    if (sharedTopicRootId) {
+      beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
+      sessionStore.updateSession(ds.session);
+    }
+    ensureSessionWhiteboard(ds);
+    const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+    activeSessions.set(key, ds);
+    rememberLastCliInput(ds, task.prompt, prompt);
+    if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
+    try {
+      forkWorker(ds, prompt, scheduledTurnId);
+    } catch (err) {
+      if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
+      throw err;
+    }
+    ds.initialStartPending = false;
+    ds.pendingPrompt = undefined;
 
-  const ds: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId,
-    chatId: task.chatId,
-    chatType: task.chatType === 'p2p' ? 'p2p' : 'group',
-    scope: runtimeScope,
-    spawnedAt: sessionCreatedAtMs(session),
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: isContinuation,
-    workingDir: task.workingDir,
-  };
-  if (sharedTopicRootId) {
-    beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
-    sessionStore.updateSession(ds.session);
-  }
-  ensureSessionWhiteboard(ds);
-  const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
-  rememberLastCliInput(ds, task.prompt, prompt);
-  if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
-  try {
-    forkWorker(ds, prompt, scheduledTurnId);
-  } catch (err) {
-    if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
-    throw err;
-  }
-
-  logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+    logger.info(`[scheduler] Task "${task.name}" spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
+  });
 }
 
 // ─── Dashboard「创建会话」spawn / activate ───────────────────────────────────
@@ -2067,7 +2505,10 @@ function resolveDashboardSpawnWorkingDir(larkAppId: string, chatId: string): str
  *    buildRepoSelectCard（含 worktree）。用户点卡片由 card-handler 的 pendingRepo 分支起 CLI。
  *  - 没钉也没项目 → 回退用 bot 默认 cwd 直接起。
  *  userContent 是已按角色包装好的首轮内容（lead 前言等），不论哪条路都原样带过去。 */
-async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promise<void> {
+async function forkOrShowRepoCard(
+  ds: DaemonSession,
+  userContent: string,
+): Promise<'forked' | 'pending_repo'> {
   const larkAppId = ds.larkAppId;
   const bot = getBot(larkAppId);
   const locale = localeForBot(larkAppId);
@@ -2085,6 +2526,14 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       const baseDir = ds.workingDir;
       ds.pendingRepo = true;         // router buffers concurrent msgs; commit clears it
       ds.pendingPrompt = userContent; // folded into the first turn by commitRepoSelection
+      stagePendingRepoSetup(ds, {
+        mode: 'auto_worktree',
+        baseDir,
+        turnId: ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId,
+      });
+      // Route visibility moves atomically from initial-start reservation to
+      // pendingRepo before the dynamic import can yield.
+      ds.initialStartPending = false;
       // (The pending dashboard row is announced inside runAutoWorktreeCommit so all
       // three spawn callers get it from one place — no publish needed here.)
       const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
@@ -2096,14 +2545,14 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
         notify: (m) => sendMessage(larkAppId, ds.chatId, m),
       });
       logger.info(`[createSession] session ${ds.session.sessionId.substring(0, 8)} → pending, building worktree off ${baseDir}`);
-      return;
+      return 'pending_repo';
     }
   }
 
   const buildPrompt = () => buildNewTopicCliInput(
     userContent, ds.session.sessionId, bot.config.cliId, bot.config.cliPathOverride,
-    ds.pendingAttachments, undefined, undefined, undefined,
-    { name: bot.botName, openId: bot.botOpenId }, locale, undefined,
+    ds.pendingAttachments, ds.pendingMentions, undefined, ds.pendingFollowUps,
+    { name: bot.botName, openId: bot.botOpenId }, locale, ds.pendingSender,
     {
       larkAppId,
       chatId: ds.chatId,
@@ -2111,6 +2560,8 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
+      codexAppFollowUps: ds.pendingCodexAppFollowUps,
+      codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
     },
   );
 
@@ -2119,24 +2570,56 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
+      const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), ds.chatId, locale, bot.config.worktreeMultiPicker);
+      const { sendMessage } = await import('../im/lark/client.js');
+      ds.pendingRepo = true;
+      ds.pendingPrompt = userContent;
       try {
-        const card = buildRepoSelectCard(projects, getSessionWorkingDir(ds), ds.chatId, locale, bot.config.worktreeMultiPicker);
-        const { sendMessage } = await import('../im/lark/client.js');
-        ds.pendingRepo = true;
-        ds.pendingPrompt = userContent;
-        ds.repoCardMessageId = await sendMessage(larkAppId, ds.chatId, card, 'interactive');
-        announcePendingRepoSession(ds);
-        // 弹卡片这条路不经 forkWorker，session.spawned 不会自动发——手动 upsert 一条，
-        // 让 dashboard 显示这条「待选仓库」会话（in_progress 首次 spawn 走这里才会出现）。
-        dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
-        logger.info(`[createSession] repo select card posted for session ${ds.session.sessionId.substring(0, 8)} (${projects.length} projects)`);
-        return;
+        stagePendingRepoSetup(ds, {
+          mode: 'picker',
+          turnId: ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId,
+        });
       } catch (err) {
-        // 发卡失败：退回直接起，别把会话卡死在 pendingRepo。
+        // Nothing external was published. The journal helper rolled its own
+        // mutation back, so direct fork remains a safe fallback.
         ds.pendingRepo = false;
         ds.pendingPrompt = undefined;
         ds.repoCardMessageId = undefined;
-        logger.warn(`[createSession] repo card failed (${(err as Error)?.message ?? err}); forking with default cwd`);
+        logger.warn(`[createSession] repo setup stage failed (${(err as Error)?.message ?? err}); forking with default cwd`);
+      }
+      if (ds.pendingRepo) {
+        let publishedCardId: string | undefined;
+        try {
+          publishedCardId = await sendMessage(larkAppId, ds.chatId, card, 'interactive');
+        } catch (err) {
+          // No picker exists, so the already-durable opening may safely move
+          // into forkWorker's tokened activation journal.
+          ds.pendingRepo = false;
+          ds.repoCardMessageId = undefined;
+          logger.warn(`[createSession] repo card publish failed (${(err as Error)?.message ?? err}); forking with default cwd`);
+        }
+        if (publishedCardId) {
+          ds.repoCardMessageId = publishedCardId;
+          try {
+            persistPendingRepoCardMessageId(ds, publishedCardId);
+          } catch (err) {
+            // The card is already visible. Keep its runtime identity and the
+            // durable setup owner fail-closed; restart will publish and persist
+            // a fresh picker instead of starting the CLI behind this card.
+            logger.error(
+              `[createSession] repo card id persistence failed for ${ds.session.sessionId.substring(0, 8)}; `
+              + `retaining pending picker ${publishedCardId}: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          ds.initialStartPending = false;
+          announcePendingRepoSession(ds);
+          // 弹卡片这条路不经 forkWorker，session.spawned 不会自动发——手动 upsert 一条，
+          // 让 dashboard 显示这条「待选仓库」会话（in_progress 首次 spawn 走这里才会出现）。
+          dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+          logger.info(`[createSession] repo select card posted for session ${ds.session.sessionId.substring(0, 8)} (${projects.length} projects)`);
+          return 'pending_repo';
+        }
       }
     }
   }
@@ -2145,10 +2628,24 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
   const prompt = buildPrompt();
   rememberLastCliInput(ds, userContent, prompt);
   forkWorker(ds, prompt);
-  ds.pendingCodexAppText = undefined;
-  ds.pendingCodexAppApplicationContext = undefined;
-  ds.pendingCodexAppMessageContext = undefined;
-  ds.pendingAttachments = undefined;
+  // forkWorker pre-accept is synchronous. Keep the reservation and all input
+  // buffers intact if it throws; only expose the normal worker state after it
+  // has accepted the first turn.
+  if (!ds.session.queuedActivationPending) {
+    ds.initialStartPending = false;
+    ds.pendingPrompt = undefined;
+    ds.pendingCodexAppText = undefined;
+    ds.pendingCodexAppApplicationContext = undefined;
+    ds.pendingCodexAppMessageContext = undefined;
+    ds.pendingAttachments = undefined;
+    ds.pendingMentions = undefined;
+    ds.pendingSender = undefined;
+    ds.pendingFollowUps = undefined;
+    ds.pendingFollowUpTurnIds = undefined;
+    ds.pendingCodexAppFollowUps = undefined;
+    ds.pendingCodexAppFollowUpContexts = undefined;
+  }
+  return 'forked';
 }
 
 export interface SpawnDashboardSessionArgs {
@@ -2193,8 +2690,12 @@ export async function spawnDashboardSession(
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
   const anchor = chatId;
-  const existing = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (existing && (existing.worker || existing.session.queued || isRelayableRealSession(existing))) {
+  const key = sessionKey(anchor, larkAppId);
+  const existing = activeSessions.get(key);
+  if (existing && (existing.worker || existing.session.queued || existing.pendingRepo
+    || existing.initialStartPending || existing.worktreeCreating || isRelayableRealSession(existing)
+    || !!existing.session.riffParentTaskId
+    || hasProtectedSessionMutationOwnership(existing))) {
     return { ok: false, error: 'session_exists' };
   }
 
@@ -2230,65 +2731,133 @@ export async function spawnDashboardSession(
   const userContent = composeSpawnUserContent({ content, role, coworkers: args.coworkers, locale });
   const codexAppMessageContext = composeSpawnCodexAppContext({ role, coworkers: args.coworkers, locale });
 
-  const resolvedTitle = args.title || deriveSessionTitleFromContent(content);
-  const session = sessionStore.createSession(chatId, bannerMessageId ?? chatId, resolvedTitle, 'group');
-  const now = Date.now();
-  session.larkAppId = larkAppId;
-  session.scope = 'chat';
-  session.ownerOpenId = args.ownerOpenId ?? getOwnerOpenId(larkAppId);
-  session.creatorOpenId = session.ownerOpenId;
-  if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
-  session.lastMessageAt = new Date(now).toISOString();
-  if (args.attachments?.length) session.dashboardAttachments = args.attachments;
-  if (column === 'backlog') {
-    session.queued = true;
-    session.queuedPrompt = userContent;
-    session.queuedCodexAppText = content;
-    session.queuedCodexAppMessageContext = codexAppMessageContext;
-    session.queuedAttachments = args.attachments;
-    session.kanbanColumn = 'backlog';
+  const registered = await withActiveSessionKeyLock(activeSessions, key, async () => {
+    const current = activeSessions.get(key);
+    if (current) {
+      const protectedOwner = current.worker || current.session.queued || current.pendingRepo
+        || current.initialStartPending || current.worktreeCreating
+        || isRelayableRealSession(current)
+        || !!current.session.riffParentTaskId
+        || hasProtectedSessionMutationOwnership(current);
+      if (protectedOwner) return undefined;
+      await closeSession(current.session.sessionId);
+    }
+
+    const resolvedTitle = args.title || deriveSessionTitleFromContent(content);
+    const session = sessionStore.createSession(chatId, bannerMessageId ?? chatId, resolvedTitle, 'group');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = 'chat';
+    session.ownerOpenId = args.ownerOpenId ?? getOwnerOpenId(larkAppId);
+    session.creatorOpenId = session.ownerOpenId;
+    if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
+    session.lastMessageAt = new Date(now).toISOString();
+    if (args.attachments?.length) session.dashboardAttachments = args.attachments;
+    if (column === 'backlog') {
+      session.queued = true;
+      session.queuedPrompt = userContent;
+      session.queuedCodexAppText = content;
+      session.queuedCodexAppMessageContext = codexAppMessageContext;
+      if (args.attachments?.length) session.queuedAttachments = args.attachments;
+      session.kanbanColumn = 'backlog';
+    }
+
+    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    if (workingDir) session.workingDir = workingDir;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+
+    const ds: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: sessionCreatedAtMs(session),
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir,
+      ownerOpenId: session.ownerOpenId,
+      currentTurnTitle: resolvedTitle,
+      pendingCodexAppText: content,
+      pendingCodexAppMessageContext: codexAppMessageContext,
+      pendingAttachments: args.attachments,
+    };
+    if (column !== 'backlog') {
+      ds.initialStartPending = true;
+      ds.pendingPrompt = userContent;
+    }
+    activeSessions.set(key, ds);
+    if (column === 'backlog') {
+      ds.pendingPrompt = userContent;
+      dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
+    } else {
+      // Keep the key reservation through initial worker/repo-picker
+      // installation. Otherwise a concurrent creator can classify this brief
+      // worker:null interval as disposable scratch, replace it, and let this
+      // caller resume by forking an orphan.
+      try {
+        await forkOrShowRepoCard(ds, userContent);
+      } catch (err) {
+        const durableOwner = hasProtectedSessionMutationOwnership(ds.session);
+        const liveWorkerOwner = !!ds.worker && !ds.worker.killed;
+        if (durableOwner || liveWorkerOwner) {
+          // `forkOrShowRepoCard` can fail after the repo/setup journal was
+          // durably staged (for example picker publish fallback followed by a
+          // fork rejection). That journal is now the exact opening owner; never
+          // erase it in the generic spawn rollback. Rebuild volatile picker
+          // buffers where possible and leave this exact map row active/retryable.
+          if (!ds.session.queuedActivationPending && ds.session.pendingRepoSetup) {
+            restorePendingRepoRuntime(ds);
+          }
+          ds.initialStartPending = ds.session.queuedActivationPending === true
+            || (ds.session.queuedActivationTail?.length ?? 0) > 0;
+          // The create IPC reports failure, but this durable row is still the
+          // authoritative retry owner. Upsert it so dashboard clients do not
+          // see an invisible occupied chat until the next full hydrate.
+          announceSessionRow(ds);
+          logger.error(
+            `[createSession] opening failed after durable ownership transfer for ${session.sessionId}; `
+            + `retaining exact active owner: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return { error: err instanceof Error ? err.message : String(err) };
+        }
+        // No durable or live owner accepted the opening. Roll back only our
+        // exact runtime claim and close only our row; a concurrently published
+        // successor must survive.
+        if (activeSessions.get(key) === ds) activeSessions.delete(key);
+        try { sessionStore.closeSession(session.sessionId); }
+        catch (closeErr) {
+          logger.error(
+            `[createSession] failed to close unaccepted session ${session.sessionId}: `
+            + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+          );
+        }
+        return {
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    return { ds, session };
+  });
+  if (!registered) return { ok: false, error: 'session_exists' };
+  if ('error' in registered && typeof registered.error === 'string') {
+    return { ok: false, error: registered.error };
   }
-
-  // 钉 workingDir：oncall 绑定（弹框填了目录）/ bot 默认。都没有 → undefined，激活/开跑时
-  // 会弹 /repo 卡片让用户在群里选仓库（复用普通新话题逻辑）。
-  const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
-  if (workingDir) session.workingDir = workingDir;
-  sessionStore.updateSession(session);
-  messageQueue.ensureQueue(anchor);
-
-  const ds: DaemonSession = {
-    session,
-    worker: null,
-    workerPort: null,
-    workerToken: null,
-    larkAppId,
-    chatId,
-    chatType: 'group',
-    scope: 'chat',
-    spawnedAt: sessionCreatedAtMs(session),
-    cliVersion: getCurrentCliVersion(),
-    lastMessageAt: now,
-    hasHistory: false,
-    workingDir,
-    ownerOpenId: session.ownerOpenId,
-    currentTurnTitle: resolvedTitle,
-    pendingCodexAppText: content,
-    pendingCodexAppMessageContext: codexAppMessageContext,
-    pendingAttachments: args.attachments,
-  };
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  const { ds, session } = registered;
 
   if (column === 'backlog') {
     // Parked：不起 CLI。手动广播 session.spawned，让 dashboard 立刻显示待办池卡片
     // （forkWorker 才会自动发这个事件，parked 路径要自己发）。
-    ds.pendingPrompt = userContent;
-    dashboardEventBus.publish({ type: 'session.spawned', body: { session: composeRowFromActive(ds) } });
     logger.info(`[createSession] queued session ${session.sessionId.substring(0, 8)} (bot=${larkAppId}, chat=${chatId}, role=${role})`);
     return { ok: true, sessionId: session.sessionId };
   }
 
   // in_progress：立即开跑或弹 /repo 卡片（没钉目录时）。userContent 已按角色包装好。
-  await forkOrShowRepoCard(ds, userContent);
   logger.info(`[createSession] spawned session ${session.sessionId.substring(0, 8)} (bot=${larkAppId}, chat=${chatId}, role=${role}, pendingRepo=${!!ds.pendingRepo})`);
   return { ok: true, sessionId: session.sessionId };
 }
@@ -2301,33 +2870,103 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
   }
   if (ds.worker && !ds.worker.killed) {
+    if (ds.session.queuedActivationPending
+      || (ds.session.queuedActivationTail?.length ?? 0) > 0
+      || ds.session.pendingRepoSetup) {
+      // A contradictory live+queued snapshot can occur around recovery or a
+      // stale dashboard action. Never reinterpret the live child as proof that
+      // its durable activation/setup owner crossed the adapter ACK boundary.
+      logger.warn(
+        `[${ds.session.sessionId.substring(0, 8)}] Ignored queued activation cleanup while durable ownership remains`,
+      );
+      return { ok: true };
+    }
     // 不该发生（queued 一定 worker:null），但保险：清标记即可。
     ds.session.queued = false;
     ds.session.queuedPrompt = undefined;
     ds.session.queuedCodexAppText = undefined;
     ds.session.queuedCodexAppMessageContext = undefined;
     ds.session.queuedAttachments = undefined;
+    ds.session.queuedActivationPending = undefined;
+    ds.session.queuedActivationToken = undefined;
+    ds.session.queuedActivationInput = undefined;
+    ds.session.queuedActivationTurnId = undefined;
+    ds.session.queuedActivationDispatchAttempt = undefined;
+    ds.session.queuedActivationResume = undefined;
+    ds.session.pendingRepoSetup = undefined;
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
-  const content = ds.session.queuedPrompt ?? ds.pendingPrompt ?? '';
-  // A parked dashboard task may have crossed a daemon restart. Restore the
-  // persisted clean-input sidecar before clearing the durable backlog fields;
-  // forkOrShowRepoCard will carry it through either immediate fork or /repo.
-  ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
-  ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
-  ds.pendingAttachments ??= ds.session.queuedAttachments;
-  ds.session.queued = false;
-  ds.session.queuedPrompt = undefined;
-  ds.session.queuedCodexAppText = undefined;
-  ds.session.queuedCodexAppMessageContext = undefined;
-  ds.session.queuedAttachments = undefined;
-  ds.pendingPrompt = undefined;
-  // 激活即视为开始：从待办池挪到进行中，让卡片归位。
-  if (ds.session.kanbanColumn === 'backlog') ds.session.kanbanColumn = 'in_progress';
-  sessionStore.updateSession(ds.session);
-  // 起会话或弹 /repo 卡片（没钉目录时）。content 已是包装好的首轮内容。
-  await forkOrShowRepoCard(ds, content);
-  logger.info(`[createSession] activated queued session ${ds.session.sessionId.substring(0, 8)} (bot=${ds.larkAppId}, pendingRepo=${!!ds.pendingRepo})`);
-  return { ok: true };
+  // Repo selection / auto-worktree already owns this activation attempt. Keep
+  // the durable queued payload as its crash-recovery journal and make repeated
+  // dashboard starts idempotent instead of posting a second picker/build.
+  if (ds.pendingRepo) return { ok: true };
+  const activate = async (): Promise<{ ok: boolean; error?: string }> => {
+    if (!ds.session.queued) {
+      return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
+    }
+    const content = ds.session.queuedPrompt ?? ds.pendingPrompt ?? '';
+    // Preserve the durable queued payload until fork or pendingRepo setup has
+    // succeeded.  Ordinary inbound routing does not take the key lock, so the
+    // runtime reservation must also be visible throughout every await.
+    ds.initialStartPending = true;
+    ds.pendingPrompt = content;
+    ds.pendingCodexAppText ??= ds.session.queuedCodexAppText;
+    ds.pendingCodexAppMessageContext ??= ds.session.queuedCodexAppMessageContext;
+    ds.pendingAttachments ??= ds.session.queuedAttachments;
+    let outcome: 'forked' | 'pending_repo';
+    try {
+      const exactRetry = ds.session.queuedActivationInput;
+      if (exactRetry) {
+        forkWorker(ds, exactRetry, {
+          resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+          turnId: ds.session.queuedActivationTurnId,
+          dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+        });
+        outcome = 'forked';
+      } else {
+        outcome = await forkOrShowRepoCard(ds, content);
+      }
+    } catch (err) {
+      // queued remains authoritative and retryable. Undo only transient route
+      // state installed by this failed attempt; never discard the opening
+      // prompt/sidecar before a worker or repo picker accepted it.
+      ds.initialStartPending = false;
+      ds.pendingRepo = false;
+      ds.repoCardMessageId = undefined;
+      ds.pendingPrompt = content;
+      return { ok: false, error: (err as Error)?.message ?? 'start_failed' };
+    }
+
+    // Ownership has transferred to a worker or pending-repo flow. Nothing
+    // below this point may advertise a retryable activation failure.
+    if (outcome === 'forked') {
+      ds.session.queued = false;
+      ds.session.queuedAttachments = undefined;
+    }
+    // pending_repo deliberately retains queued + queuedPrompt: pendingPrompt
+    // is runtime-only, so clearing the durable copy here would lose the first
+    // turn if the daemon dies before repo selection/worktree commit forks.
+    if (ds.session.kanbanColumn === 'backlog') ds.session.kanbanColumn = 'in_progress';
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      logger.error(
+        `[createSession] queued activation metadata persistence failed after ownership transfer: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    logger.info(`[createSession] activated queued session ${ds.session.sessionId.substring(0, 8)} (bot=${ds.larkAppId}, pendingRepo=${!!ds.pendingRepo})`);
+    return { ok: true };
+  };
+
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return activate();
+  const key = activeSessionKey(ds);
+  return withActiveSessionKeyLock(registry, key, async () => {
+    if (registry.get(key) !== ds || ds.session.status !== 'active') {
+      return { ok: false, error: 'session_not_active' };
+    }
+    return activate();
+  });
 }

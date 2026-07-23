@@ -16,7 +16,7 @@ describe('plugin service restart lifecycle', () => {
   it('preserves auto services by default and always ensures them after core starts', () => {
     const source = restartFunctionSource();
     const stop = 'if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });';
-    const coreStart = "runPm2(['start', cfg]);";
+    const coreStart = "runPm2(['start', cfg], true, PM2_HOME, timeoutMs);";
     const ensure = 'await reconcilePluginServicesForCli(undefined, { autoOnly: true });';
 
     expect(source).toContain(stop);

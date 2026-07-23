@@ -73,12 +73,46 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getActiveSessionsRegistry: vi.fn(() => wp.registry ?? undefined),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
     if (prev && prev !== ds) {
-      for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
+      const prevPending = (prev.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      const incomingPending = (ds.session?.codexAppDispatchLedger?.length ?? 0) > 0;
+      if (prevPending && incomingPending) {
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      const closeUnregistered = async (loser: any) => {
+        for (const [k, v] of map) {
+          if (v === loser) { map.delete(k); break; }
+        }
+        const store = await import('../src/services/session-store.js');
+        const persisted = store.getSession(loser.session.sessionId);
+        if (persisted && persisted.status !== 'closed') {
+          store.closeSession(loser.session.sessionId);
+        }
+      };
+      if (prevPending) {
+        await closeUnregistered(ds);
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      await closeUnregistered(prev);
     }
     map.set(key, ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
   }),
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
@@ -151,7 +185,7 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
+import { restoreActiveSessions, closeCliMismatchedSessionsForBot, resumeSession } from '../src/core/session-manager.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
@@ -252,6 +286,34 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
+    probe.result = 'exists';
+    server.state = 'running';
+    const s = makeActivePersistentSession('om_cli_mismatch_pending');
+    s.cliId = 'codex-app';
+    s.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-pending',
+      state: 'prepared',
+      content: 'prompt',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({
+      status: 'active',
+      codexAppDispatchLedger: [{ dispatchId: 'dispatch-pending' }],
+    });
+    const restored = map.get(sessionKey('om_cli_mismatch_pending', 'app_test'));
+    expect(restored).toBeDefined();
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
   });
 
   it('wrapper mismatch on restore (same cliId) → closes the active record', async () => {
@@ -403,6 +465,27 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_exists', 'app_test'))).toBeDefined();
   });
 
+  it('eagerly resumes an unsettled pty session so durable FIFO recovery is not stranded', async () => {
+    const s = makeActivePersistentSession('om_pty_pending');
+    s.backendType = 'pty';
+    s.codexAppDispatchLedger = [{
+      dispatchId: 'd-pty',
+      turnId: 't-pty',
+      state: 'accepted',
+      content: 'recover me',
+    }];
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    const restored = [...map.values()].find(current => current.session.sessionId === s.sessionId);
+    expect(restored).toBeDefined();
+    expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('restores only the latest clean Codex App sidecar after a disk reload and re-attaches it', async () => {
     probe.result = 'exists';
     bot.cliId = 'codex-app';
@@ -439,6 +522,85 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(restored.lastCliInput).toContain('第 20 轮用户原文');
     expect(forkWorker).toHaveBeenCalledWith(restored, '', true);
     expect(sessionStore.getSession(s.sessionId)?.lastCodexAppInput).toEqual(expected);
+  });
+
+  it('isolates a same-anchor pending collision without aborting startup and preserves both rows', async () => {
+    probe.result = 'exists';
+    bot.cliId = 'codex-app';
+    const first = makeActivePersistentSession('om_pending_collision');
+    first.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-first',
+      turnId: 'turn-first',
+      state: 'prepared',
+      content: 'first owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(first);
+    const second = makeActivePersistentSession('om_pending_collision');
+    second.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-second',
+      turnId: 'turn-second',
+      state: 'prepared',
+      content: 'second owned output',
+      deliverySink: 'lark',
+    }];
+    sessionStore.updateSession(second);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+
+    expect(sessionStore.getSession(first.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(second.sessionId)?.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+    const canonical = map.get(sessionKey('om_pending_collision', 'app_test'))!;
+    expect(canonical.session.sessionId).toBe(first.sessionId);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(canonical, '', true);
+  });
+});
+
+describe('resumeSession — disk-only legacy anchor collision', () => {
+  it('refuses a legacy unscoped real owner instead of ghosting it', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_conflict');
+    sessionStore.closeSession(target.sessionId);
+    const legacyOwner = makeActivePersistentSession('om_resume_legacy_conflict');
+    legacyOwner.larkAppId = undefined;
+    legacyOwner.lastCliInput = 'existing conversation';
+    sessionStore.updateSession(legacyOwner);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result).toEqual({
+      ok: false,
+      error: 'anchor_occupied',
+      activeSessionId: legacyOwner.sessionId,
+    });
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(legacyOwner.sessionId)?.status).toBe('active');
+    expect(map.size).toBe(0);
+  });
+
+  it('closes a disk-only legacy scratch before reactivating the requested session', async () => {
+    const target = makeActivePersistentSession('om_resume_legacy_scratch');
+    sessionStore.closeSession(target.sessionId);
+    const legacyScratch = makeActivePersistentSession('om_resume_legacy_scratch');
+    legacyScratch.larkAppId = undefined;
+    legacyScratch.cliId = undefined;
+    legacyScratch.lastCliInput = undefined;
+    sessionStore.updateSession(legacyScratch);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const result = await resumeSession(target.sessionId, map);
+
+    expect(result.ok).toBe(true);
+    expect(sessionStore.getSession(legacyScratch.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(target.sessionId)?.status).toBe('active');
+    expect(map.get(sessionKey('om_resume_legacy_scratch', 'app_test'))?.session.sessionId)
+      .toBe(target.sessionId);
   });
 });
 

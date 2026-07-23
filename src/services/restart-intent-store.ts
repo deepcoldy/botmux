@@ -14,10 +14,11 @@ import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { readProcessStartIdentity } from '../core/session-marker.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export type RestartKind = 'manual' | 'update' | 'rollback';
 
-export interface RestartIntent {
+export interface RestartIntentPayload {
   kind: RestartKind;
   /** Present for an update or rollback: the version delta to report. */
   oldVersion?: string;
@@ -25,6 +26,22 @@ export interface RestartIntent {
   /** ISO 8601 timestamp the breadcrumb was written. */
   at: string;
 }
+
+export interface RestartIntent extends RestartIntentPayload {
+  /** Unique CLI start attempt that may remove only its own failed breadcrumb. */
+  attemptId?: string;
+  /** A prepared attempt is deliberately invisible to daemons until the CLI
+   * verifies the complete configured fleet and atomically commits it. */
+  attemptState?: 'prepared' | 'committed' | 'aborted';
+  /** A newer maintenance writer is held behind the active prepared attempt so
+   * a partially-started primary daemon cannot consume it either. */
+  deferredIntent?: RestartIntentPayload;
+}
+
+export type RestartIntentReportClaim =
+  | { state: 'claimed'; intent: RestartIntent }
+  | { state: 'prepared' }
+  | { state: 'absent' };
 
 const FILE = 'restart-intent.json';
 const LEASE_FILE = 'restart-lease.json';
@@ -39,7 +56,7 @@ export function restartIntentPathIn(dir: string): string {
   return join(dir, FILE);
 }
 
-export function writeRestartIntentTo(dir: string, intent: RestartIntent): void {
+function writeRestartIntentUnlocked(dir: string, intent: RestartIntent): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const path = restartIntentPathIn(dir);
   const tmp = `${path}.${process.pid}.tmp`;
@@ -48,7 +65,37 @@ export function writeRestartIntentTo(dir: string, intent: RestartIntent): void {
 }
 
 export function clearRestartIntentTo(dir: string): void {
-  try { rmSync(restartIntentPathIn(dir)); } catch { /* absent / best-effort */ }
+  if (!existsSync(dir)) return;
+  withFileLockSync(restartIntentPathIn(dir), () => {
+    try { rmSync(restartIntentPathIn(dir)); } catch { /* absent / best-effort */ }
+  });
+}
+
+function payloadOf(intent: RestartIntent): RestartIntentPayload {
+  return {
+    kind: intent.kind,
+    at: intent.at,
+    ...(intent.oldVersion !== undefined ? { oldVersion: intent.oldVersion } : {}),
+    ...(intent.newVersion !== undefined ? { newVersion: intent.newVersion } : {}),
+  };
+}
+
+export function writeRestartIntentTo(dir: string, intent: RestartIntent): void {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  withFileLockSync(restartIntentPathIn(dir), () => {
+    const current = readRaw(dir);
+    const intentAt = Date.parse(intent.at);
+    const writerNow = Number.isFinite(intentAt) ? intentAt : Date.now();
+    if ((current?.attemptState === 'prepared' || current?.attemptState === 'aborted')
+        && isFresh(current, writerNow)) {
+      writeRestartIntentUnlocked(dir, {
+        ...current,
+        deferredIntent: payloadOf(intent),
+      });
+      return;
+    }
+    writeRestartIntentUnlocked(dir, payloadOf(intent));
+  });
 }
 
 function readRaw(dir: string): RestartIntent | null {
@@ -152,22 +199,134 @@ export function clearRestartLeaseTo(dir: string, id: string): void {
  *  it fires at most once and never lingers into a later restart. Returns the
  *  intent only when it is fresh. */
 export function consumeRestartIntentTo(dir: string, nowMs: number): RestartIntent | null {
-  const intent = readRaw(dir);
-  const path = restartIntentPathIn(dir);
-  if (existsSync(path)) {
-    try { rmSync(path); } catch { /* best-effort */ }
-  }
-  if (!intent) return null;
-  return isFresh(intent, nowMs) ? intent : null;
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const intent = readRaw(dir);
+    const path = restartIntentPathIn(dir);
+    if ((intent?.attemptState === 'prepared' || intent?.attemptState === 'aborted')
+        && isFresh(intent, nowMs)) {
+      return null;
+    }
+    if (existsSync(path)) {
+      try { rmSync(path); } catch { /* best-effort */ }
+    }
+    if (!intent) return null;
+    return isFresh(intent, nowMs) ? intent : null;
+  });
+}
+
+/** Atomically observe the restart-attempt state and, only for a visible fresh
+ * intent, claim it by deleting the breadcrumb in the same lock acquisition.
+ * Report polling must use this single state transition instead of composing
+ * `consume()` and a later read-only prepared check: prepared can commit between
+ * those two reads. */
+export function claimRestartIntentForReportTo(
+  dir: string,
+  nowMs: number,
+): RestartIntentReportClaim {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const intent = readRaw(dir);
+    const path = restartIntentPathIn(dir);
+    if (!intent || !isFresh(intent, nowMs)) {
+      if (existsSync(path)) {
+        try { rmSync(path); } catch { /* best-effort stale/corrupt cleanup */ }
+      }
+      return { state: 'absent' };
+    }
+    if (intent.attemptState === 'prepared') return { state: 'prepared' };
+    if (intent.attemptState === 'aborted') return { state: 'absent' };
+    if (existsSync(path)) {
+      try { rmSync(path); }
+      catch { return { state: 'absent' }; }
+    }
+    return { state: 'claimed', intent };
+  });
+}
+
+/** Read-only admission used by the primary daemon to distinguish a prepared
+ * restart (wait for commit/abort) from a crash with no breadcrumb. */
+export function hasPreparedRestartIntentTo(dir: string, nowMs: number): boolean {
+  if (!existsSync(dir)) return false;
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const intent = readRaw(dir);
+    if (intent?.attemptState !== 'prepared') return false;
+    if (isFresh(intent, nowMs)) return true;
+    try { rmSync(restartIntentPathIn(dir)); } catch { /* best-effort stale cleanup */ }
+    return false;
+  });
 }
 
 /** Write a `manual` breadcrumb only when no *fresh* breadcrumb already exists —
  *  so a maintenance-written `update` breadcrumb is not clobbered
  *  by the `botmux restart` it spawns. */
 export function writeManualIntentIfAbsentTo(dir: string, nowMs: number, atIso: string): void {
-  const existing = readRaw(dir);
-  if (existing && isFresh(existing, nowMs)) return;
-  writeRestartIntentTo(dir, { kind: 'manual', at: atIso });
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  withFileLockSync(restartIntentPathIn(dir), () => {
+    const existing = readRaw(dir);
+    if (existing && isFresh(existing, nowMs)) return;
+    writeRestartIntentUnlocked(dir, { kind: 'manual', at: atIso });
+  });
+}
+
+/** Atomically preserve any newer/richer fresh intent while tagging the exact
+ * CLI start attempt that owns rollback responsibility. */
+export function writeRestartAttemptIntentTo(
+  dir: string,
+  preferred: RestartIntent,
+  nowMs: number,
+  attemptId: string,
+): RestartIntent {
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const existing = readRaw(dir);
+    const selected = existing && isFresh(existing, nowMs)
+      ? ((existing.attemptState === 'prepared' || existing.attemptState === 'aborted')
+          && existing.deferredIntent
+          ? existing.deferredIntent
+          : payloadOf(existing))
+      : payloadOf(preferred);
+    const written: RestartIntent = { ...selected, attemptId, attemptState: 'prepared' };
+    writeRestartIntentUnlocked(dir, written);
+    return written;
+  });
+}
+
+/** Make exactly one successfully verified start attempt visible to the primary
+ * daemon. A newer ordinary writer is folded into the same commit, but can
+ * never bypass the prepared fence while the fleet is partial. */
+export function commitRestartIntentAttemptTo(dir: string, attemptId: string): boolean {
+  if (!existsSync(dir)) return false;
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const current = readRaw(dir);
+    if (current?.attemptId !== attemptId || current.attemptState !== 'prepared') return false;
+    const selected = current.deferredIntent ?? payloadOf(current);
+    writeRestartIntentUnlocked(dir, {
+      ...selected,
+      attemptId,
+      attemptState: 'committed',
+    });
+    return true;
+  });
+}
+
+/** Abort only the breadcrumb still owned by this failed start attempt. The
+ * restart-intent lock prevents a read/unlink race with a newer update writer.
+ * The result remains an aborted/non-consumable fence: a stranded partial
+ * primary must stay silent and even a later maintenance writer is deferred,
+ * while a later verified restart can adopt the newest payload. */
+export function removeRestartIntentAttemptTo(dir: string, attemptId: string): boolean {
+  if (!existsSync(dir)) return false;
+  return withFileLockSync(restartIntentPathIn(dir), () => {
+    const current = readRaw(dir);
+    if (current?.attemptId !== attemptId) return false;
+    writeRestartIntentUnlocked(dir, {
+      ...(current.deferredIntent ?? payloadOf(current)),
+      attemptId: `aborted:${attemptId}`,
+      attemptState: 'aborted',
+    });
+    return true;
+  });
 }
 
 // ---- default-dir wrappers (production wiring) ----
@@ -194,6 +353,16 @@ export function claimRestartLease(nowMs: number = Date.now()): string | null {
 
 export function clearRestartLease(id: string): void {
   clearRestartLeaseTo(config.session.dataDir, id);
+}
+
+export function claimRestartIntentForReport(
+  nowMs: number = Date.now(),
+): RestartIntentReportClaim {
+  return claimRestartIntentForReportTo(config.session.dataDir, nowMs);
+}
+
+export function hasPreparedRestartIntent(nowMs: number = Date.now()): boolean {
+  return hasPreparedRestartIntentTo(config.session.dataDir, nowMs);
 }
 
 export function writeManualIntentIfAbsent(nowMs: number = Date.now()): void {

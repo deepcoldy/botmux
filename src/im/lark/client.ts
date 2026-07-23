@@ -2,10 +2,16 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
+import {
+  configureLarkClientHttpTimeout,
+  getBotClient,
+  getAllBots,
+  getBot,
+  formatLarkError,
+} from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
-import { emitHookEvent } from '../../services/hook-runner.js';
+import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
@@ -67,11 +73,16 @@ function getAllBotClients() {
       // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
       cfgs = getAllBots().map((b) => b.config);
     }
-    allBotClients = cfgs.map((cfg) => ({
-      appId: cfg.larkAppId,
-      cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
-    }));
+    allBotClients = cfgs.map((cfg) => {
+      const client = new Client({
+        appId: cfg.larkAppId,
+        appSecret: cfg.larkAppSecret,
+        domain: sdkDomain(normalizeBrand(cfg.brand as any)),
+        logger: probeLarkLogger,
+      });
+      configureLarkClientHttpTimeout(client);
+      return { appId: cfg.larkAppId, cliId: cfg.cliId, client };
+    });
   }
   return allBotClients;
 }
@@ -128,6 +139,31 @@ export interface OutboundMessageOptions {
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
   suppressHook?: boolean;
+  /** Fence the distinct post-provider hook effect. A failure drops only the
+   * hook because the Lark message has already been accepted and must not be
+   * reported as failed (which would invite a duplicate retry). */
+  beforeHook?: () => void | Promise<void>;
+  /** Frozen protected origin used by read-isolated hook forwarding. */
+  hookOrigin?: ManagedHookOrigin;
+}
+
+async function emitOutboundHookIfAllowed(
+  options: OutboundMessageOptions | undefined,
+  event: 'outbound.send' | 'outbound.reply',
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (options?.suppressHook) return;
+  try {
+    await options?.beforeHook?.();
+  } catch (err) {
+    logger.warn(`Dropped ${event} hook after authority changed: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  if (options?.hookOrigin) {
+    emitHookEvent(event, payload, { managedOrigin: options.hookOrigin });
+  } else {
+    emitHookEvent(event, payload);
+  }
 }
 
 export async function sendMessage(
@@ -168,8 +204,7 @@ export async function sendMessage(
   const messageId = res.data?.message_id;
   if (!messageId) throw new Error('No message_id in response');
   logger.info(`Sent message ${messageId} to chat ${chatId}`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.send', {
+  await emitOutboundHookIfAllowed(options, 'outbound.send', {
       ...hookContext,
       larkAppId,
       chatId,
@@ -178,7 +213,6 @@ export async function sendMessage(
       uuid,
       content,
     });
-  }
   return messageId;
 }
 
@@ -228,8 +262,7 @@ export async function replyMessage(
   const replyId = res.data?.message_id;
   if (!replyId) throw new Error('No message_id in reply response');
   logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
-  if (!options?.suppressHook) {
-    emitHookEvent('outbound.reply', {
+  await emitOutboundHookIfAllowed(options, 'outbound.reply', {
       ...hookContext,
       larkAppId,
       messageId,
@@ -239,7 +272,6 @@ export async function replyMessage(
       uuid,
       content,
     });
-  }
   return replyId;
 }
 

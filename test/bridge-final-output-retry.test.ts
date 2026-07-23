@@ -238,6 +238,223 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
+  it('routes synthetic Codex App identities through their frozen reply turn and uses dispatch-stable Lark UUIDs', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+
+    __testOnly_deliverFinalOutput(ds, {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'scheduled answer one',
+      lastUuid: 'synthetic-1',
+      turnId: 'codex-app-dispatch-synthetic-1',
+      replyTurnId: 'om_shared_route',
+      codexAppSettlement: {
+        requestId: 'request-1', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-1',
+      },
+    }, 'tag', 0);
+    __testOnly_deliverFinalOutput(ds, {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'scheduled answer two',
+      lastUuid: 'synthetic-2',
+      turnId: 'codex-app-dispatch-synthetic-2',
+      replyTurnId: 'om_shared_route',
+      codexAppSettlement: {
+        requestId: 'request-2', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-2',
+      },
+    }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls.map(call => call[4])).toEqual([
+      'om_shared_route',
+      'om_shared_route',
+    ]);
+    expect(sessionReply.mock.calls.map(call => call[5]?.uuid)).toEqual([
+      'ca_dispatch-1',
+      'ca_dispatch-2',
+    ]);
+    expect(sessionReply.mock.calls[0][5]).not.toHaveProperty('suppressHook');
+  });
+
+  it('routes sequential Codex App settlements through each ledger-frozen shared-chat root', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.cliId = 'codex-app';
+    ds.currentReplyTarget = {
+      rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: new Date().toISOString(),
+    };
+    ds.session.currentReplyTarget = ds.currentReplyTarget;
+    ds.session.codexAppDispatchLedger = [
+      {
+        dispatchId: 'dispatch-a', turnId: 'turn-a', state: 'prepared', content: 'A',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' },
+      },
+      {
+        dispatchId: 'dispatch-b', turnId: 'turn-b', state: 'accepted', content: 'B',
+        replyTarget: { mode: 'thread', rootMessageId: 'om_topic_b' },
+      },
+    ];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'answer A', lastUuid: 'uuid-a', turnId: 'turn-a',
+      codexAppSettlement: {
+        requestId: 'settle-a', generation: 'generation-1', seq: 1, dispatchId: 'dispatch-a',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    expect(sessionReply.mock.calls[0][5]?.replyTarget)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_topic_a' });
+
+    (ds.worker as any).emit('message', {
+      type: 'codex_app_dispatch_transition',
+      sessionId: ds.session.sessionId,
+      requestId: 'prepare-b',
+      operation: 'submit',
+      entries: [{ dispatchId: 'dispatch-b', turnId: 'turn-b' }],
+    } satisfies Extract<WorkerToDaemon, { type: 'codex_app_dispatch_transition' }>);
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger?.[0]?.state).toBe('prepared'));
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'answer B', lastUuid: 'uuid-b', turnId: 'turn-b',
+      codexAppSettlement: {
+        requestId: 'settle-b', generation: 'generation-1', seq: 2, dispatchId: 'dispatch-b',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls[1][5]?.replyTarget)
+      .toEqual({ mode: 'thread', rootMessageId: 'om_topic_b' });
+  });
+
+  it.each(['doc_comment', 'http_wait', 'http_async', 'suppressed'] as const)(
+    'fails closed instead of leaking a recovered %s settlement into Lark',
+    async deliverySink => {
+      const sessionReply = vi.fn(async () => 'om_forbidden');
+      initWorkerPool({
+        sessionReply,
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.scope = 'chat';
+      ds.session.scope = 'chat';
+      ds.session.cliId = 'codex-app';
+      ds.session.codexAppDispatchLedger = [{
+        dispatchId: `dispatch-${deliverySink}`,
+        turnId: `turn-${deliverySink}`,
+        state: 'prepared',
+        content: 'recovered payload',
+        deliverySink,
+      }];
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', {
+        type: 'final_output',
+        sessionId: ds.session.sessionId,
+        content: 'must not cross channels',
+        lastUuid: `uuid-${deliverySink}`,
+        turnId: `turn-${deliverySink}`,
+        codexAppSettlement: {
+          requestId: `settle-${deliverySink}`,
+          generation: 'generation-recovered',
+          seq: 1,
+          dispatchId: `dispatch-${deliverySink}`,
+        },
+      } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+      await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+      expect(sessionReply).not.toHaveBeenCalled();
+      await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'codex_app_dispatch_persisted',
+          requestId: `settle-${deliverySink}`,
+          ok: true,
+        }),
+      ));
+    },
+  );
+
+  it('still resolves a live HTTP wait sink without posting to Lark', async () => {
+    const sessionReply = vi.fn(async () => 'om_forbidden');
+    const resolveWait = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'codex-app';
+    ds.pendingWaitPromises = new Map([['turn-wait-live', { resolve: resolveWait }]]);
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-wait-live',
+      turnId: 'turn-wait-live',
+      state: 'prepared',
+      content: 'live payload',
+      deliverySink: 'http_wait',
+    }];
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'HTTP answer', lastUuid: 'uuid-wait-live', turnId: 'turn-wait-live',
+      codexAppSettlement: {
+        requestId: 'settle-wait-live', generation: 'generation-live', seq: 1,
+        dispatchId: 'dispatch-wait-live',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.waitFor(() => expect(resolveWait).toHaveBeenCalledWith('HTTP answer'));
+    await vi.waitFor(() => expect(ds.session.codexAppDispatchLedger).toEqual([]));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('abandons a delayed final before external delivery when worker/session ownership changes', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    let owned = true;
+    const complete = vi.fn();
+
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete, () => owned);
+    owned = false;
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith(false);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
   it('drops final_output whose worker sessionId does not match the daemon session', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -1197,6 +1414,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
 
     const ds = makeDs();
+    const worker = ds.worker as any;
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
 
@@ -1206,6 +1424,72 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     expect(closeSession).toHaveBeenCalledWith(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
+    expect(worker.kill).not.toHaveBeenCalled();
+  });
+
+  it('does not commit dedup or completion when withdrawn-root Riff close is retryable', async () => {
+    const sessionReply = vi.fn().mockRejectedValue(new MessageWithdrawnError('om_root'));
+    // Production returns false when closeSessionHelper reports a failed Riff
+    // prepare/cancel; the active row, worker, and task id remain authoritative.
+    const closeSession = vi.fn(async () => false);
+    const complete = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    });
+
+    const ds = makeDs();
+    ds.session.backendType = 'riff';
+    ds.session.cliId = 'riff';
+    ds.session.riffParentTaskId = 'task-riff-withdraw-retry';
+    ds.initConfig = { backendType: 'riff' } as any;
+    const worker = ds.worker;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(closeSession).toHaveBeenCalledWith(ds);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledWith(false);
+    expect(ds.worker).toBe(worker);
+    expect(ds.session).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'task-riff-withdraw-retry',
+    });
+  });
+
+  it('preserves an unsettled Codex FIFO owner when the root is withdrawn', async () => {
+    const sessionReply = vi.fn().mockRejectedValue(new MessageWithdrawnError('om_root'));
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    });
+    const ds = makeDs();
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-1',
+      state: 'prepared',
+      content: 'pending answer',
+    }];
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect((ds.worker as any).kill).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledWith(false);
   });
 
   it('aborts pending retry if the session was closed in the meantime', async () => {

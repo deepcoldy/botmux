@@ -8,6 +8,8 @@ import {
   replaceManagedOriginCapabilityFile,
 } from '../src/core/managed-origin-capability.js';
 
+const ORIGIN_CHANNEL = 'a'.repeat(64);
+
 // resolveSessionContext is the layer that powers session-id inference for
 // `botmux send` / history / bots. Regression guard: a detached/backgrounded
 // invocation breaks the process-tree marker walk, and before the env fallback
@@ -24,10 +26,14 @@ describe('resolveSessionContext()', () => {
     writeFileSync(join(markersDir, String(pid)), body);
   }
 
-  function writeCapability(sessionId: string, body: Record<string, unknown>): void {
+  function writeCapability(
+    sessionId: string,
+    body: Record<string, unknown>,
+    channelId = ORIGIN_CHANNEL,
+  ): void {
     replaceManagedOriginCapabilityFile(
-      managedOriginCapabilityPath(dir, sessionId),
-      JSON.stringify({ sessionId, ...body }),
+      managedOriginCapabilityPath(dir, sessionId, channelId),
+      JSON.stringify({ sessionId, channelId, ...body }),
     );
   }
 
@@ -69,7 +75,7 @@ describe('resolveSessionContext()', () => {
       turnId: 'turn-protected',
       dispatchAttempt: 3,
     });
-    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+    expect(resolveSessionContext(dir, 'env-sid', process.pid, ORIGIN_CHANNEL)).toEqual({
       sessionId: 'env-sid',
       turnId: 'turn-protected',
       dispatchAttempt: 3,
@@ -87,7 +93,7 @@ describe('resolveSessionContext()', () => {
       turnId: 'turn-residual',
       dispatchAttempt: 4,
     });
-    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+    expect(resolveSessionContext(dir, 'env-sid', process.pid, ORIGIN_CHANNEL)).toEqual({
       sessionId: 'env-sid',
       turnId: 'turn-live',
       dispatchAttempt: 1,
@@ -105,11 +111,26 @@ describe('resolveSessionContext()', () => {
       turnId: 'turn-protected',
       dispatchAttempt: 2,
     });
-    expect(resolveSessionContext(dir, 'env-sid', process.pid)).toEqual({
+    expect(resolveSessionContext(dir, 'env-sid', process.pid, ORIGIN_CHANNEL)).toEqual({
       sessionId: 'marker-sid',
       turnId: 'turn-marker',
       dispatchAttempt: 1,
     });
+  });
+
+  it('does not read a capability snapshot from another pane channel', () => {
+    writeCapability('env-sid', {
+      capability: 'de'.repeat(32),
+      turnId: 'turn-other-pane',
+      dispatchAttempt: 5,
+    });
+
+    expect(resolveSessionContext(
+      dir,
+      'env-sid',
+      process.pid,
+      'b'.repeat(64),
+    )).toEqual({ sessionId: 'env-sid' });
   });
 
   it('falls back to env when the matched marker is empty/legacy (no usable sessionId)', () => {

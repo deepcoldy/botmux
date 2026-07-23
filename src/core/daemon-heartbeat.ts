@@ -24,6 +24,15 @@ export interface Heartbeat {
  *  Daemons should write well within this window (≈ every 15s). */
 export const HEARTBEAT_FRESH_MS = 60_000;
 
+/**
+ * A stalled turn is still potentially executing model/tool side effects. Keep
+ * it inside the fleet-wide maintenance gate just like working; changing the
+ * user-facing projection must not make a global restart newly eligible.
+ */
+export function isMaintenanceBusyStatus(status: string | undefined): boolean {
+  return status === 'working' || status === 'stalled';
+}
+
 export function heartbeatDirIn(dir: string): string {
   return join(dir, 'heartbeats');
 }

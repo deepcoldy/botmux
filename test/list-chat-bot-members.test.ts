@@ -66,6 +66,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  configureLarkClientHttpTimeout: vi.fn(),
   loadBotConfigs: vi.fn(() => [
     { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
     { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },

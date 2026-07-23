@@ -56,11 +56,16 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 
 // Import the module under test after mocks are set up
 import {
+  __testOnly_setAfterRiffBatchRename,
   init,
   createSession,
   getSession,
+  getActiveRiffShutdownSnapshotsBatch,
   listSessions,
   closeSession,
+  persistActiveRiffLineagesExactBatch,
+  reactivateClosedSession,
+  RiffLineageBatchError,
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
@@ -84,6 +89,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  __testOnly_setAfterRiffBatchRename(undefined);
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
@@ -361,6 +367,111 @@ describe('closeSession()', () => {
     expect(reloaded!.closedAt).toBeDefined();
   });
 
+  it('clears the non-generational worker pid atomically on close', () => {
+    const session = createSession('chat1', 'root1', 'Close PID');
+    session.pid = process.pid;
+    updateSession(session);
+    closeSession(session.sessionId);
+    init();
+    expect(getSession(session.sessionId)?.pid).toBeUndefined();
+  });
+
+  it('durably abandons Codex App dispatch recovery state on explicit close', () => {
+    const session = createSession('chat1', 'root1', 'Close Pending Codex');
+    session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-1',
+      turnId: 'turn-1',
+      state: 'prepared',
+      content: 'pending input',
+    }];
+    session.codexAppGenerationCommits = [{ generation: 'generation-1', committedThrough: 3 }];
+    updateSession(session);
+
+    closeSession(session.sessionId);
+    init();
+
+    const reloaded = getSession(session.sessionId);
+    expect(reloaded?.status).toBe('closed');
+    expect(reloaded?.codexAppDispatchLedger).toBeUndefined();
+    expect(reloaded?.codexAppGenerationCommits).toBeUndefined();
+  });
+
+  it('atomically abandons backend-neutral setup, activation head, and tail on explicit close', () => {
+    const session = createSession('chat1', 'root1', 'Close Generic Queue');
+    session.queued = true;
+    session.queuedPrompt = 'backlog prompt';
+    session.queuedCodexAppText = 'visible prompt';
+    session.queuedCodexAppMessageContext = '<sender />';
+    session.pendingRepoSetup = { mode: 'picker', prompt: 'choose repo', repoCardMessageId: 'om_picker' };
+    session.queuedActivationPending = true;
+    session.queuedActivationToken = 'activation-token';
+    session.queuedActivationInput = { content: 'prepared head' };
+    session.queuedActivationTurnId = 'turn-head';
+    session.queuedActivationDispatchAttempt = 2;
+    session.queuedActivationResume = true;
+    session.queuedActivationTail = [{
+      id: 'tail-1', order: 1, userPrompt: 'tail', cliInput: { content: 'prepared tail' }, turnId: 'turn-tail',
+    }];
+    session.queuedActivationTailNextOrder = 2;
+    updateSession(session);
+
+    closeSession(session.sessionId);
+    init();
+
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('closed');
+    expect(reloaded.queued).toBeUndefined();
+    expect(reloaded.queuedPrompt).toBeUndefined();
+    expect(reloaded.pendingRepoSetup).toBeUndefined();
+    expect(reloaded.queuedActivationPending).toBeUndefined();
+    expect(reloaded.queuedActivationToken).toBeUndefined();
+    expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationTail).toBeUndefined();
+    expect(reloaded.queuedActivationTailNextOrder).toBeUndefined();
+  });
+
+  it('rolls back explicit-close state in memory when the atomic save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Save Failure');
+    session.queuedActivationPending = true;
+    session.queuedActivationToken = 'keep-token';
+    session.queuedActivationInput = { content: 'keep-head' };
+    session.pendingRepoSetup = { mode: 'picker', prompt: 'keep setup' };
+    updateSession(session);
+    const durableDir = tempDir;
+    const nonDirectory = join(durableDir, 'not-a-directory');
+    writeFileSync(nonDirectory, 'block writes below this path');
+    tempDir = nonDirectory;
+
+    expect(() => closeSession(session.sessionId)).toThrow();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      queuedActivationPending: true,
+      queuedActivationToken: 'keep-token',
+      queuedActivationInput: { content: 'keep-head' },
+      pendingRepoSetup: { mode: 'picker', prompt: 'keep setup' },
+    });
+
+    tempDir = durableDir;
+    init();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      queuedActivationToken: 'keep-token',
+    });
+  });
+
+  it('clears Riff lineage atomically with the durable closed row', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-prepared';
+    updateSession(session);
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init();
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
   it('should call deleteFrozenCards with the sessionId', () => {
     const session = createSession('chat1', 'root1', 'Frozen');
     closeSession(session.sessionId);
@@ -385,6 +496,39 @@ describe('closeSession()', () => {
     // closedAt gets updated on second close
     expect(secondClosedAt).toBeDefined();
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+});
+
+describe('reactivateClosedSession()', () => {
+  it('sanitizes queued/setup state left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Queue');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.queued = true;
+    legacy.queuedPrompt = 'legacy backlog';
+    legacy.pendingRepoSetup = { mode: 'picker', prompt: 'legacy picker' };
+    legacy.queuedActivationPending = true;
+    legacy.queuedActivationToken = 'legacy-token';
+    legacy.queuedActivationInput = { content: 'legacy head' };
+    legacy.queuedActivationTail = [{
+      id: 'legacy-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'legacy tail' }, turnId: 'tail-turn',
+    }];
+    legacy.queuedActivationTailNextOrder = 2;
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init();
+
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.queued).toBeUndefined();
+    expect(reloaded.pendingRepoSetup).toBeUndefined();
+    expect(reloaded.queuedActivationPending).toBeUndefined();
+    expect(reloaded.queuedActivationToken).toBeUndefined();
+    expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationTail).toBeUndefined();
   });
 });
 
@@ -476,6 +620,182 @@ describe('updateSessionPid()', () => {
   it('should be a no-op for a non-existent sessionId', () => {
     // Should not throw
     updateSessionPid('nonexistent-id', 123);
+  });
+});
+
+// ─── Riff fleet shutdown transactions ───────────────────────────────────
+
+describe('Riff fleet shutdown transactions', () => {
+  function createRiffSession(label: string, pid: number, taskId: string) {
+    const session = createSession(`chat-${label}`, `root-${label}`, `Riff ${label}`);
+    session.backendType = 'riff';
+    session.larkAppId = 'riff-app';
+    session.pid = pid;
+    session.riffParentTaskId = taskId;
+    updateSession(session);
+    return session;
+  }
+
+  it('samples every owner and task from one fresh active projection', () => {
+    const first = createRiffSession('first', 101, 'task-first');
+    const second = createRiffSession('second', 202, 'task-second');
+
+    expect(getActiveRiffShutdownSnapshotsBatch([
+      first.sessionId,
+      second.sessionId,
+    ])).toEqual([
+      {
+        sessionId: first.sessionId,
+        taskId: 'task-first',
+        owner: { pid: 101, larkAppId: 'riff-app', backendType: 'riff' },
+      },
+      {
+        sessionId: second.sessionId,
+        taskId: 'task-second',
+        owner: { pid: 202, larkAppId: 'riff-app', backendType: 'riff' },
+      },
+    ]);
+  });
+
+  it('bounds initial snapshot lock contention and reports a prewrite I/O failure', () => {
+    const session = createRiffSession('locked', 101, 'task-locked');
+    const fp = join(tempDir, 'sessions.json');
+    writeFileSync(`${fp}.lock`, String(process.pid));
+
+    const startedAt = Date.now();
+    let failure: unknown;
+    try {
+      getActiveRiffShutdownSnapshotsBatch([session.sessionId], { maxWaitMs: 10 });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(RiffLineageBatchError);
+    expect((failure as RiffLineageBatchError).stage).toBe('prewrite_io');
+    expect((failure as RiffLineageBatchError).sessionIds).toEqual([session.sessionId]);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  it('bounds phase-2 lock contention without publishing any lineage', () => {
+    const session = createRiffSession('locked-phase-two', 101, 'task-before');
+    const [snapshot] = getActiveRiffShutdownSnapshotsBatch([session.sessionId]);
+    const fp = join(tempDir, 'sessions.json');
+    const beforeRaw = readFileSync(fp, 'utf-8');
+    const beforeInode = statSync(fp).ino;
+    writeFileSync(`${fp}.lock`, String(process.pid));
+
+    const startedAt = Date.now();
+    let failure: unknown;
+    try {
+      persistActiveRiffLineagesExactBatch([{
+        ...snapshot,
+        expectedCurrentTaskIds: [snapshot.taskId],
+        targetTaskId: 'task-after',
+      }], { maxWaitMs: 10 });
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(RiffLineageBatchError);
+    expect((failure as RiffLineageBatchError).stage).toBe('prewrite_io');
+    expect(readFileSync(fp, 'utf-8')).toBe(beforeRaw);
+    expect(statSync(fp).ino).toBe(beforeInode);
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  it('rejects a last-row CAS conflict without writing any earlier row', () => {
+    const first = createRiffSession('first', 101, 'task-first');
+    const second = createRiffSession('second', 202, 'task-second');
+    const snapshots = getActiveRiffShutdownSnapshotsBatch([
+      first.sessionId,
+      second.sessionId,
+    ]);
+
+    second.riffParentTaskId = 'task-second-new-owner';
+    updateSession(second);
+    const fp = join(tempDir, 'sessions.json');
+    const beforeRaw = readFileSync(fp, 'utf-8');
+    const beforeInode = statSync(fp).ino;
+
+    let failure: unknown;
+    try {
+      persistActiveRiffLineagesExactBatch(snapshots.map((snapshot, index) => ({
+        ...snapshot,
+        expectedCurrentTaskIds: [snapshot.taskId],
+        targetTaskId: `detached-${index}`,
+      })));
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(RiffLineageBatchError);
+    expect((failure as RiffLineageBatchError).stage).toBe('prewrite_ownership');
+    expect((failure as RiffLineageBatchError).sessionIds).toEqual([second.sessionId]);
+    expect(readFileSync(fp, 'utf-8')).toBe(beforeRaw);
+    expect(statSync(fp).ino).toBe(beforeInode);
+    const durable = JSON.parse(beforeRaw);
+    expect(durable[first.sessionId].riffParentTaskId).toBe('task-first');
+    expect(durable[second.sessionId].riffParentTaskId).toBe('task-second-new-owner');
+  });
+
+  it('publishes and verifies all target lineages with one batch rename', () => {
+    const first = createRiffSession('first', 101, 'task-first');
+    const second = createRiffSession('second', 202, 'task-second');
+    const snapshots = getActiveRiffShutdownSnapshotsBatch([
+      first.sessionId,
+      second.sessionId,
+    ]);
+    const fp = join(tempDir, 'sessions.json');
+    const beforeInode = statSync(fp).ino;
+
+    const verified = persistActiveRiffLineagesExactBatch(snapshots.map((snapshot, index) => ({
+      ...snapshot,
+      expectedCurrentTaskIds: [snapshot.taskId],
+      targetTaskId: `detached-${index}`,
+    })));
+
+    expect(verified.map(row => row.taskId)).toEqual(['detached-0', 'detached-1']);
+    expect(verified.map(row => row.owner)).toEqual(snapshots.map(row => row.owner));
+    expect(statSync(fp).ino).not.toBe(beforeInode);
+    const durable = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(durable[first.sessionId].riffParentTaskId).toBe('detached-0');
+    expect(durable[second.sessionId].riffParentTaskId).toBe('detached-1');
+    expect(getSession(first.sessionId)?.riffParentTaskId).toBe('detached-0');
+    expect(getSession(second.sessionId)?.riffParentTaskId).toBe('detached-1');
+  });
+
+  it('classifies an exact-owner readback mismatch after rename as ambiguous', () => {
+    const first = createRiffSession('first', 101, 'task-first');
+    const second = createRiffSession('second', 202, 'task-second');
+    const snapshots = getActiveRiffShutdownSnapshotsBatch([
+      first.sessionId,
+      second.sessionId,
+    ]);
+    const fp = join(tempDir, 'sessions.json');
+    __testOnly_setAfterRiffBatchRename(() => {
+      const projection = JSON.parse(readFileSync(fp, 'utf-8'));
+      projection[second.sessionId].pid = 303;
+      writeFileSync(fp, JSON.stringify(projection, null, 2), 'utf-8');
+    });
+
+    let failure: unknown;
+    try {
+      persistActiveRiffLineagesExactBatch(snapshots.map((snapshot, index) => ({
+        ...snapshot,
+        expectedCurrentTaskIds: [snapshot.taskId],
+        targetTaskId: `detached-${index}`,
+      })));
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(RiffLineageBatchError);
+    expect((failure as RiffLineageBatchError).stage).toBe('postrename_ambiguity');
+    expect((failure as RiffLineageBatchError).sessionIds).toEqual([second.sessionId]);
+    const durable = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(durable[first.sessionId].riffParentTaskId).toBe('detached-0');
+    expect(durable[second.sessionId].riffParentTaskId).toBe('detached-1');
+    expect(durable[second.sessionId].pid).toBe(303);
   });
 });
 

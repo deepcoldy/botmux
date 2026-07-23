@@ -1395,6 +1395,7 @@ export function buildRelayHostEnv(
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
+  delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
   if (preparedContentFile) {
     env.BOTMUX_CARD_LOCAL_LINK_MODE = 'disabled';
     env.BOTMUX_CARD_PREPARED_CONTENT_FILE = preparedContentFile;
@@ -1416,7 +1417,19 @@ export function startOutboxWatcher(
      *  absent the relay still runs, but carries NO durable origin — a missing
      *  hook must never let the sandbox promote its own origin fields. */
     authorize?: (claim: { capability?: string }) =>
-      | { ok: true; origin: { turnId?: string; dispatchAttempt?: number } }
+      | {
+          ok: true;
+          origin: {
+            turnId?: string;
+            dispatchAttempt?: number;
+            /** The worker matched an unsettled Codex App ledger entry. The
+             * host child must still find that exact entry before any provider
+             * side effect; terminal settlement/revocation between authorize
+             * and re-exec therefore fails closed instead of degrading to an
+             * ordinary mutable-session send. */
+            requiresCodexAppLedger?: boolean;
+          };
+        }
       | { ok: false; error: string };
     cliPath?: string;
   } = {},
@@ -1539,6 +1552,11 @@ export function startOutboxWatcher(
       if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
       if (trustedOrigin?.dispatchAttempt !== undefined) {
         requestEnv.BOTMUX_DISPATCH_ATTEMPT = String(trustedOrigin.dispatchAttempt);
+      }
+      if (trustedOrigin?.requiresCodexAppLedger) {
+        requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER = '1';
+      } else {
+        delete requestEnv.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
       }
       const child = spawn(process.execPath, [cli, 'send', ...hostArgs], { env: requestEnv });
       let out = '', err = '';

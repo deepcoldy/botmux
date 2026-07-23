@@ -53,6 +53,7 @@ describe('runtime monitor helpers', () => {
     expect(sessionRuntimeBucket(session({ sessionId: 's7', status: 'analyzing' }))).toBe('working');
     expect(sessionRuntimeBucket(session({ sessionId: 's8', status: 'active' }))).toBe('working');
     expect(sessionRuntimeBucket(session({ sessionId: 's9', status: 'dormant' }))).toBe('idle');
+    expect(sessionRuntimeBucket(session({ sessionId: 's10', status: 'stalled' }))).toBe('working');
   });
 
   it('builds fresh runtime summary with daemon and session pressure', () => {

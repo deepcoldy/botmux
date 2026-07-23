@@ -114,10 +114,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Fail-closed classification hint for macOS read isolation. This is never
+  // authority; cmdSend also checks the host-owned marker + live challenge.
+  'BOTMUX_READ_ISOLATED',
+  // Unguessable pane/profile authority channel. It selects an exact read carve
+  // but is not sufficient without the daemon-rotated capability inside it.
+  'BOTMUX_ORIGIN_CHANNEL_ID',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   'BOTMUX_READY_COMMAND',
+  // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
+  // the pane; the runner consumes+unlinks the file before app-server starts.
+  'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',

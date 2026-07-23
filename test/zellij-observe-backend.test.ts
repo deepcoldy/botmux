@@ -6,9 +6,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // transiently disappears and comes back.
 const calls: string[][] = [];
 let listPanesResult: () => string = () => JSON.stringify([{ id: 2, is_plugin: false }]);
+let failActions = false;
 vi.mock('node:child_process', () => ({
   execFileSync: (bin: string, args: string[]) => {
     calls.push([bin, ...args]);
+    if (failActions && args.includes('action')) throw new Error('pane unavailable');
     if (args.includes('dump-screen')) return 'line one\nline two\nline three\n';
     if (args.includes('list-panes')) return listPanesResult();
     return '';
@@ -26,6 +28,7 @@ describe('ZellijObserveBackend input encoding', () => {
   let be: ZellijObserveBackend;
   beforeEach(() => {
     calls.length = 0;
+    failActions = false;
     be = new ZellijObserveBackend(S, P, { cliPid: 999 });
   });
 
@@ -42,6 +45,12 @@ describe('ZellijObserveBackend input encoding', () => {
   it('sendSpecialKeys(C-c) → action write with ETX byte (3)', () => {
     be.sendSpecialKeys('C-c');
     expect(actionArgs('write')).toEqual(['write', '--pane-id', P, '3']);
+  });
+
+  it('returns false when the targeted pane action is unavailable', () => {
+    failActions = true;
+    expect(be.sendText('/goal x')).toBe(false);
+    expect(be.sendSpecialKeys('Enter')).toBe(false);
   });
 
   it('pasteText wraps text in bracketed-paste markers', () => {

@@ -2,7 +2,12 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import type { SessionBackend, SpawnOpts } from './types.js';
+import type {
+  SessionBackend,
+  SessionDestroyResult,
+  SessionShutdownDetachResult,
+  SpawnOpts,
+} from './types.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -339,6 +344,24 @@ export class RiffBackend implements SessionBackend {
   private cancelTimeoutMs = 4_000;
   private createTimeoutMs = 10_000;
   private destroyDeadlineMs = 20_000;
+  /** Exact late/current task whose close cancellation failed. Retained across
+   * the prepare-close handshake so the daemon can persist a retry handle. */
+  private closeFailureTaskId: string | null = null;
+  private closeFailureError: string | null = null;
+  private closeLateTaskHandled = false;
+  private closePrepared = false;
+  private closeAttempt: symbol | null = null;
+  private destroyInFlight: Promise<SessionDestroyResult> | null = null;
+  private cancelInFlight: Promise<boolean> | null = null;
+  private abortInFlight: Promise<void> | null = null;
+  /** Graceful daemon shutdown is a non-cancelling two-phase detach. It fences
+   * only writes arriving after prepare; writes already appended to writeChain
+   * still drain so a late child id can be durably handed to the daemon. */
+  private shutdownDetaching = false;
+  private shutdownDetachPrepared = false;
+  private shutdownDetachAttempt: symbol | null = null;
+  private shutdownDetachInFlight: Promise<SessionShutdownDetachResult> | null = null;
+  private shutdownDetachAbortInFlight: Promise<SessionShutdownDetachResult> | null = null;
   /** Serializes write() → createTask/followUp. Without this, a second message
    *  arriving before the first task-execute HTTP returns would see
    *  currentTaskId === null and create a duplicate task. */
@@ -417,8 +440,16 @@ export class RiffBackend implements SessionBackend {
     // No actual process to spawn. Task creation happens on first write().
   }
 
-  write(data: string): void {
-    if (this.killed || this.closing) return;
+  write(data: string): boolean {
+    if (this.killed) return false;
+    if (this.shutdownDetaching) {
+      logger.warn('[riff] write rejected while graceful shutdown detach is preparing/prepared');
+      return false;
+    }
+    if (this.closing) {
+      logger.warn('[riff] write rejected while explicit close is preparing/prepared');
+      return false;
+    }
 
     const { text, attachments } = this.extractAttachments(data);
 
@@ -440,6 +471,7 @@ export class RiffBackend implements SessionBackend {
       .catch((err) => {
         logger.warn(`[riff] queued write failed: ${err}`);
       });
+    return true;
   }
 
   resize(_cols: number, _rows: number): void {
@@ -467,8 +499,8 @@ export class RiffBackend implements SessionBackend {
     this.exitCb?.(0, null);
   }
 
-  async destroySession(): Promise<void> {
-    // /close（及 /restart 的替换路径）必须把远端任务真正取消掉——fire-and-forget
+  async destroySession(): Promise<SessionDestroyResult> {
+    // /close 必须把远端任务真正取消掉——fire-and-forget
     // 在 worker 紧接 process.exit 时大概率发不出去，已关闭话题的远端 agent 会
     // 继续拿着注入的凭证发消息。有界 await + 一次重试，失败也明确留痕。
     //
@@ -476,36 +508,249 @@ export class RiffBackend implements SessionBackend {
     // currentTaskId 还是 null/旧值，直接 cancel 会漏掉 late task。先立 closing
     // 门（拒新写 + 令 in-flight 完成后自取消），再有界等 writeChain 沉降，最后
     // cancel 沉降后的 current task。
+    if (this.shutdownDetaching) {
+      return {
+        ok: false,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+        error: 'shutdown_detach_in_progress',
+      };
+    }
+    if (this.destroyInFlight) return this.destroyInFlight;
+    if (this.closePrepared) {
+      return {
+        ok: true,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+      };
+    }
+    const attempt = Symbol('riff-close-prepare');
+    this.closeAttempt = attempt;
     this.closing = true;
+    this.closeFailureTaskId = null;
+    this.closeFailureError = null;
+    this.closeLateTaskHandled = false;
     // 预算层级（单调覆盖，无内层 race——writeChain 本身有界）：
     //   create/follow-up fetch 10s + late cancel 4s×2 = chain 最坏 18s
     //   own cancel 4s×2 = 8s（与 late 情形互斥：closing 分支不登记 current）
-    //   → destroySession 总 deadline 20s → worker close/restart race 22s
+    //   → destroySession 总 deadline 20s → worker close handshake 22s
     //   → daemon SIGTERM backstop 24s / SIGKILL 29s。
     // 对 writeChain 只整体 await：单独给它小窗口会在窗口边缘掐掉链内的
     // late cancel（create 于 t≈窗口末返回 → cancel 尚 pending → teardown 提前
     // resolve → process.exit 掐断取消）。
-    const teardown = (async () => {
+    const teardown = (async (): Promise<SessionDestroyResult> => {
       try {
         await this.writeChain;
       } catch { /* writeChain never rejects (caught internally) */ }
-      if (this.currentTaskId && !this.taskDone) {
+      if (this.closeAttempt !== attempt) {
+        return {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      if (this.closeFailureTaskId) {
+        return {
+          ok: false,
+          taskId: this.closeFailureTaskId,
+          error: this.closeFailureError ?? 'late_task_cancel_failed',
+        };
+      }
+      // A task materialized while closing was already cancelled inside the
+      // writeChain. Do not then cancel its stale parent lineage as if it were
+      // still the active execution.
+      if (!this.closeLateTaskHandled && this.currentTaskId && !this.taskDone) {
         const id = this.currentTaskId;
-        try {
-          await this.cancelTask(id);
+        const cancelled = await this.cancelTaskWithRetry(id, 'close');
+        // abortDestroySession invalidates the exact attempt before waiting for
+        // an already-issued cancellation. A late successful HTTP response must
+        // not resurrect that aborted generation as a prepared close.
+        if (this.closeAttempt !== attempt || !this.closing) {
+          return {
+            ok: false,
+            ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+            error: 'close_aborted',
+          };
+        }
+        if (cancelled) {
           logger.info(`[riff] task ${id} cancelled on close`);
-        } catch (err) {
-          try {
-            await this.cancelTask(id);
-            logger.info(`[riff] task ${id} cancelled on close (retry)`);
-          } catch (err2) {
-            logger.warn(`[riff] task-cancel failed on close (task ${id} may keep running remotely): ${err2}`);
-          }
+        } else {
+          return {
+            ok: false,
+            taskId: id,
+            error: this.closeFailureError ?? 'task_cancel_failed',
+          };
         }
       }
+      if (this.closeAttempt !== attempt || !this.closing) {
+        return {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      return {
+        ok: true,
+        ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+      };
     })();
-    await Promise.race([teardown, new Promise((r) => setTimeout(r, this.destroyDeadlineMs))]);
-    this.kill();
+    this.destroyInFlight = Promise.race([
+      teardown,
+      new Promise<SessionDestroyResult>(resolve => setTimeout(() => resolve({
+        ok: false,
+        ...(this.closeFailureTaskId || this.currentTaskId
+          ? { taskId: this.closeFailureTaskId ?? this.currentTaskId! }
+          : {}),
+        error: 'close_timeout',
+      }), this.destroyDeadlineMs)),
+    ]).then(async (result) => {
+      // Promise.race and the teardown continuation each add a microtask
+      // boundary. Revalidate the generation immediately before publishing the
+      // prepared bit so a concurrent abort can never be overwritten.
+      if (result.ok && (this.closeAttempt !== attempt || !this.closing)) {
+        result = {
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        };
+      }
+      if (result.ok) {
+        this.closePrepared = true;
+      } else {
+        // A failed prepare is not a terminal close. Restore admission so the
+        // still-active durable owner can accept a follow-up or a close retry.
+        await this.abortDestroySession();
+      }
+      return result;
+    }).finally(() => {
+      this.destroyInFlight = null;
+    });
+    return this.destroyInFlight;
+  }
+
+  async abortDestroySession(): Promise<void> {
+    if (this.killed) return;
+    if (this.abortInFlight) return this.abortInFlight;
+    this.closeAttempt = null;
+    this.closePrepared = false;
+    const pendingCancel = this.cancelInFlight;
+    this.abortInFlight = (async () => {
+      // A close timeout can win Promise.race after task-cancel was already
+      // issued. Reopening admission before that request settles lets a new
+      // follow-up race a late successful cancellation of its parent. Keep the
+      // backend fenced until the exact cancellation attempt reaches terminal.
+      if (pendingCancel) {
+        try { await pendingCancel; } catch { /* cancel helper returns boolean */ }
+      }
+      if (this.killed || this.closeAttempt !== null || this.closePrepared) return;
+      this.closing = false;
+      this.closeFailureTaskId = null;
+      this.closeFailureError = null;
+      this.closeLateTaskHandled = false;
+      logger.info('[riff] explicit close aborted; write admission restored');
+    })().finally(() => {
+      this.abortInFlight = null;
+    });
+    return this.abortInFlight;
+  }
+
+  commitDestroySession(): void {
+    // The daemon has durably published the closed row. Keep admission fenced
+    // until the worker immediately detaches/exits.
+    this.closePrepared = false;
+    this.closeAttempt = null;
+    this.closing = true;
+  }
+
+  async prepareShutdownDetach(): Promise<SessionShutdownDetachResult> {
+    if (this.shutdownDetachInFlight) return this.shutdownDetachInFlight;
+    if (this.shutdownDetachPrepared) {
+      return { ok: true, taskId: this.currentTaskId };
+    }
+    if (this.killed) {
+      return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+    }
+    if (this.closing || this.destroyInFlight || this.closePrepared) {
+      return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
+    }
+
+    const attempt = Symbol('riff-shutdown-detach');
+    this.shutdownDetachAttempt = attempt;
+    this.shutdownDetaching = true;
+    // Existing SSE delivery is presentation-only. Stop it now, but do not
+    // cancel the remote task. Any create/follow-up already accepted before the
+    // fence remains in writeChain and is allowed to materialize below.
+    this.abortController?.abort();
+
+    const drain = (async (): Promise<SessionShutdownDetachResult> => {
+      try { await this.writeChain; }
+      catch { /* writeChain catches its own failures */ }
+      if (this.killed || this.shutdownDetachAttempt !== attempt || !this.shutdownDetaching) {
+        return { ok: false, taskId: this.currentTaskId, error: 'shutdown_detach_aborted' };
+      }
+      if (this.closing || this.closePrepared) {
+        return { ok: false, taskId: this.currentTaskId, error: 'explicit_close_in_progress' };
+      }
+      this.shutdownDetachPrepared = true;
+      logger.info(
+        `[riff] graceful shutdown detach prepared`
+        + `${this.currentTaskId ? ` (task ${this.currentTaskId})` : ' (no task lineage)'}`,
+      );
+      return { ok: true, taskId: this.currentTaskId };
+    })();
+    this.shutdownDetachInFlight = drain.finally(() => {
+      this.shutdownDetachInFlight = null;
+    });
+    return this.shutdownDetachInFlight;
+  }
+
+  async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
+    if (this.killed) {
+      return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+    }
+    if (this.shutdownDetachAbortInFlight) return this.shutdownDetachAbortInFlight;
+    const pending = this.shutdownDetachInFlight;
+    const pendingCancel = this.cancelInFlight;
+    this.shutdownDetachAttempt = null;
+    this.shutdownDetachPrepared = false;
+    this.shutdownDetachAbortInFlight = (async (): Promise<SessionShutdownDetachResult> => {
+      // Normally shutdown detach never cancels a remote task. Still wait for
+      // any exact cancellation already issued by an overlapping explicit close
+      // before reopening admission, otherwise its late result could invalidate
+      // a newly accepted follow-up.
+      await Promise.all([
+        pending ? pending.catch(() => undefined) : Promise.resolve(),
+        pendingCancel ? pendingCancel.catch(() => false) : Promise.resolve(),
+      ]);
+      if (this.killed) {
+        return { ok: false, taskId: this.currentTaskId, error: 'backend_killed' };
+      }
+      if (this.closing || this.shutdownDetachAttempt !== null) {
+        return {
+          ok: false,
+          taskId: this.currentTaskId,
+          error: this.closing ? 'explicit_close_in_progress' : 'new_shutdown_detach_in_progress',
+        };
+      }
+      this.shutdownDetaching = false;
+      // prepare stopped SSE before the persistence ACK. If shutdown is
+      // aborted, reconnect the exact current task so the still-live owner
+      // resumes normal output and completion tracking.
+      if (this.currentTaskId && !this.taskDone) {
+        this.reconnectAttempts = 0;
+        void this.streamTask(this.currentTaskId);
+      }
+      logger.info('[riff] graceful shutdown detach aborted; write admission restored');
+      return { ok: true, taskId: this.currentTaskId };
+    })().finally(() => {
+      this.shutdownDetachAbortInFlight = null;
+    });
+    return this.shutdownDetachAbortInFlight;
+  }
+
+  commitShutdownDetach(): void {
+    this.shutdownDetachPrepared = false;
+    this.shutdownDetachAttempt = null;
+    // Keep admission fenced until the worker exits immediately after commit.
+    this.shutdownDetaching = true;
   }
 
   getChildPid(): number | null {
@@ -760,8 +1005,8 @@ export class RiffBackend implements SessionBackend {
    * Post-await adoption gate for a freshly created/followed-up task id.
    * - closing（/close 竞态窗口）：这个 late task 已经没有会话可服务——立即取消
    *   （有界+一次重试），绝不 stream/登记，防远端 orphan；
-   * - killed（detach：重启/休眠）：登记 id 让 daemon 持久化血缘，但不 stream
-   *   （任务合法续跑，重启后 follow-up 接上）；
+   * - killed / shutdownDetaching（detach）：登记 id 让 daemon 持久化血缘，
+   *   但不 stream（任务合法续跑，重启后 follow-up 接上）；
    * - 正常：登记 + 由调用方启动 stream。
    */
   private async adoptLateTask(taskId: string): Promise<boolean> {
@@ -769,20 +1014,21 @@ export class RiffBackend implements SessionBackend {
       // 在 writeChain 内 await——destroySession 等 writeChain 沉降时就能把这次
       // 取消一起等到（void 触发会在 worker exit 时被掐断）。
       logger.info(`[riff] task ${taskId} created during close — cancelling late task`);
-      try {
-        await this.cancelTask(taskId);
-      } catch {
-        try {
-          await this.cancelTask(taskId);
-        } catch (err) {
-          logger.warn(`[riff] late-task cancel failed (task ${taskId} may keep running remotely): ${err}`);
-        }
-      }
+      this.closeLateTaskHandled = true;
+      // Preserve the exact newest lineage even when cancellation succeeds.
+      // If the daemon cannot durably commit the close and sends abort, the
+      // next follow-up must continue from this child rather than its stale
+      // parent. Publishing before the cancel also makes a failed cancel
+      // retryable by the daemon.
+      this.currentTaskId = taskId;
+      this.taskIdCb?.(taskId);
+      const cancelled = await this.cancelTaskWithRetry(taskId, 'late-task close');
+      if (!cancelled) this.taskDone = false;
       return false;
     }
     this.currentTaskId = taskId;
     this.taskIdCb?.(taskId);
-    if (this.killed) return false;
+    if (this.killed || this.shutdownDetaching) return false;
     return true;
   }
 
@@ -807,6 +1053,32 @@ export class RiffBackend implements SessionBackend {
       signal: AbortSignal.timeout(this.cancelTimeoutMs),
     });
     if (!resp.ok) throw new Error(`task-cancel HTTP ${resp.status}`);
+  }
+
+  private async cancelTaskWithRetry(taskId: string, context: string): Promise<boolean> {
+    const operation = (async (): Promise<boolean> => {
+      try {
+        await this.cancelTask(taskId);
+        return true;
+      } catch {
+        try {
+          await this.cancelTask(taskId);
+          logger.info(`[riff] task ${taskId} cancelled on ${context} (retry)`);
+          return true;
+        } catch (err) {
+          this.closeFailureTaskId = taskId;
+          this.closeFailureError = err instanceof Error ? err.message : String(err);
+          logger.warn(`[riff] ${context} cancel failed (task ${taskId} may keep running remotely): ${err}`);
+          return false;
+        }
+      }
+    })();
+    this.cancelInFlight = operation;
+    try {
+      return await operation;
+    } finally {
+      if (this.cancelInFlight === operation) this.cancelInFlight = null;
+    }
   }
 
   private async streamTask(taskId: string): Promise<void> {

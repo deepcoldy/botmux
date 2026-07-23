@@ -1,7 +1,8 @@
 // test/dashboard-ipc.test.ts
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { createHmac, randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -11,12 +12,16 @@ import * as groupsStore from '../src/services/groups-store.js';
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
+import * as sandboxStore from '../src/services/sandbox-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import * as persistentBackend from '../src/core/persistent-backend.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import { managedOriginAttestationProofPath } from '../src/core/managed-origin-capability.js';
+import { MANAGED_ORIGIN_PROOF_DOMAIN } from '../src/core/managed-origin-attestation.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -117,6 +122,40 @@ describe('dashboard IPC server', () => {
     expect(res.status).toBe(404);
   });
 
+  it('binds and serves health early but holds authenticated state routes behind readiness', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let releaseReady!: () => void;
+    const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+    let mutations = 0;
+    const path = '/api/test-startup-readiness-mutation';
+    ipcRoute('POST', path, (_req, res) => {
+      mutations += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    handle = await startIpcServer({
+      port: 0,
+      host: '127.0.0.1',
+      authRequired: true,
+      ready,
+    });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const health = await fetch(`${base}/__health`);
+    expect(health.status).toBe(200);
+    const pending = fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', path, handle.port),
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(mutations).toBe(0);
+
+    releaseReady();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(mutations).toBe(1);
+  });
+
   it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     let mutations = 0;
@@ -167,6 +206,349 @@ describe('dashboard IPC server', () => {
     });
     expect(currentSecret.status).toBe(200);
   });
+});
+
+describe('POST /api/session-origin/attest', () => {
+  const CHANNEL = '77'.repeat(32);
+  const CAPABILITY = 'ab'.repeat(32);
+  const TURN_ID = 'turn-managed-origin';
+  const DISPATCH_ATTEMPT = 3;
+
+  function installManagedOriginFixture(options: {
+    worker?: Record<string, unknown> | null;
+    origin?: Record<string, unknown> | null;
+    ledger?: unknown[];
+  } = {}) {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-origin-attest-'));
+    const previousDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const sessionId = `origin-attest-${randomBytes(8).toString('hex')}`;
+    const defaultWorker = {
+      pid: process.pid,
+      connected: true,
+      killed: false,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+    };
+    const defaultOrigin = {
+      capability: CAPABILITY,
+      originChannelId: CHANNEL,
+      turnId: TURN_ID,
+      dispatchAttempt: DISPATCH_ATTEMPT,
+    };
+    const worker = options.worker === null
+      ? null
+      : { ...defaultWorker, ...(options.worker ?? {}) };
+    const managedTurnOrigin = options.origin === null
+      ? undefined
+      : { ...defaultOrigin, ...(options.origin ?? {}) };
+    const session = {
+      sessionId,
+      cliId: 'codex-app',
+      codexAppDispatchLedger: options.ledger ?? [{
+        dispatchId: 'dispatch-managed-origin',
+        turnId: TURN_ID,
+        dispatchAttempt: DISPATCH_ATTEMPT,
+        state: 'prepared',
+        content: 'prompt',
+        deliverySink: 'lark',
+      }],
+    };
+    const active = {
+      session,
+      worker,
+      managedTurnOrigin,
+      initConfig: { cliId: 'codex-app' },
+      larkAppId: 'app-managed-origin',
+    } as any;
+    config.session.dataDir = dataDir;
+    workerPool.setActiveSessionsRegistry(new Map([[sessionId, active]]));
+
+    return {
+      active,
+      dataDir,
+      sessionId,
+      proofPath: (nonce: string, channelId = CHANNEL) =>
+        managedOriginAttestationProofPath(dataDir, sessionId, channelId, nonce),
+      cleanup: () => {
+        workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+        config.session.dataDir = previousDataDir;
+        rmSync(dataDir, { recursive: true, force: true });
+      },
+    };
+  }
+
+  async function postAttestation(
+    port: number,
+    body: Record<string, unknown>,
+  ): Promise<Response> {
+    return fetch(`http://127.0.0.1:${port}/api/session-origin/attest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it('writes an exact nonce/channel/turn/ledger proof only for the live worker capability', async () => {
+    const fixture = installManagedOriginFixture();
+    const nonce = 'cd'.repeat(32);
+    const issuedAfter = Date.now();
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const res = await postAttestation(handle.port, {
+        sessionId: fixture.sessionId,
+        channelId: CHANNEL,
+        originCapability: CAPABILITY,
+        nonce,
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+      const path = fixture.proofPath(nonce);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const proof = JSON.parse(readFileSync(path, 'utf8'));
+      expect(proof).toMatchObject({
+        domain: MANAGED_ORIGIN_PROOF_DOMAIN,
+        version: 1,
+        nonce,
+        channelId: CHANNEL,
+        sessionId: fixture.sessionId,
+        turnId: TURN_ID,
+        dispatchAttempt: DISPATCH_ATTEMPT,
+        requiresCodexAppLedger: true,
+      });
+      expect(proof.issuedAtMs).toBeGreaterThanOrEqual(issuedAfter);
+      expect(proof.issuedAtMs).toBeLessThanOrEqual(Date.now());
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects missing, disconnected, or dead exact workers without writing a proof', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const cases = [
+      { name: 'missing', worker: null },
+      { name: 'disconnected', worker: { connected: false } },
+      { name: 'dead', worker: { pid: undefined } },
+    ] as const;
+    for (const candidate of cases) {
+      const fixture = installManagedOriginFixture({ worker: candidate.worker });
+      const nonce = randomBytes(32).toString('hex');
+      try {
+        const res = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId,
+          channelId: CHANNEL,
+          originCapability: CAPABILITY,
+          nonce,
+        });
+        expect(res.status, candidate.name).toBe(403);
+        expect(await res.json(), candidate.name).toEqual({ ok: false, error: 'origin_unproven' });
+        expect(existsSync(fixture.proofPath(nonce)), candidate.name).toBe(false);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  it('rejects a wrong rotating capability without writing a proof', async () => {
+    const fixture = installManagedOriginFixture();
+    const nonce = 'de'.repeat(32);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const res = await postAttestation(handle.port, {
+        sessionId: fixture.sessionId,
+        channelId: CHANNEL,
+        originCapability: 'ef'.repeat(32),
+        nonce,
+      });
+
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ ok: false, error: 'origin_unproven' });
+      expect(existsSync(fixture.proofPath(nonce))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects a missing or malformed live authority channel without writing a proof', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const cases = [
+      { name: 'missing', originChannelId: undefined },
+      { name: 'malformed', originChannelId: 'not-a-channel' },
+    ] as const;
+    for (const candidate of cases) {
+      const fixture = installManagedOriginFixture({
+        origin: { originChannelId: candidate.originChannelId },
+      });
+      const nonce = randomBytes(32).toString('hex');
+      try {
+        const res = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId,
+          channelId: CHANNEL,
+          originCapability: CAPABILITY,
+          nonce,
+        });
+        expect(res.status, candidate.name).toBe(403);
+        expect(await res.json(), candidate.name).toEqual({
+          ok: false,
+          error: 'origin_channel_unproven',
+        });
+        expect(existsSync(fixture.proofPath(nonce)), candidate.name).toBe(false);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  it('rejects a missing, malformed, or non-matching claimed channel without writing a proof', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const cases = [
+      { name: 'missing', channelId: undefined, status: 400, error: 'bad_attestation_request' },
+      { name: 'malformed', channelId: 'not-a-channel', status: 400, error: 'bad_attestation_request' },
+      { name: 'non-matching', channelId: '88'.repeat(32), status: 403, error: 'origin_channel_unproven' },
+    ] as const;
+    for (const candidate of cases) {
+      const fixture = installManagedOriginFixture();
+      const nonce = randomBytes(32).toString('hex');
+      try {
+        const res = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId,
+          ...(candidate.channelId === undefined ? {} : { channelId: candidate.channelId }),
+          originCapability: CAPABILITY,
+          nonce,
+        });
+        expect(res.status, candidate.name).toBe(candidate.status);
+        expect(await res.json(), candidate.name).toEqual({
+          ok: false,
+          error: candidate.error,
+        });
+        expect(existsSync(fixture.proofPath(nonce)), candidate.name).toBe(false);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  it('rejects missing or non-exact Codex App ledger ownership without writing a proof', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const cases = [
+      { name: 'missing', ledger: [] },
+      {
+        name: 'wrong-turn',
+        ledger: [{
+          dispatchId: 'dispatch-wrong-turn',
+          turnId: 'turn-other',
+          dispatchAttempt: DISPATCH_ATTEMPT,
+          state: 'prepared',
+          content: 'prompt',
+          deliverySink: 'lark',
+        }],
+      },
+      {
+        name: 'wrong-attempt',
+        ledger: [{
+          dispatchId: 'dispatch-wrong-attempt',
+          turnId: TURN_ID,
+          dispatchAttempt: DISPATCH_ATTEMPT + 1,
+          state: 'prepared',
+          content: 'prompt',
+          deliverySink: 'lark',
+        }],
+      },
+    ];
+    for (const candidate of cases) {
+      const fixture = installManagedOriginFixture({ ledger: candidate.ledger });
+      const nonce = randomBytes(32).toString('hex');
+      try {
+        const res = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId,
+          channelId: CHANNEL,
+          originCapability: CAPABILITY,
+          nonce,
+        });
+        expect(res.status, candidate.name).toBe(409);
+        expect(await res.json(), candidate.name).toEqual({
+          ok: false,
+          error: 'origin_not_sendable',
+        });
+        expect(existsSync(fixture.proofPath(nonce)), candidate.name).toBe(false);
+      } finally {
+        fixture.cleanup();
+      }
+    }
+  });
+
+  it('rejects an oversized unauthenticated body before capability lookup and writes no proof', async () => {
+    const fixture = installManagedOriginFixture();
+    const nonce = 'f0'.repeat(32);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const res = await postAttestation(handle.port, {
+        sessionId: fixture.sessionId,
+        channelId: CHANNEL,
+        originCapability: CAPABILITY,
+        nonce,
+        padding: 'x'.repeat(3_000),
+      });
+
+      expect(res.status).toBe(413);
+      expect(res.headers.get('connection')).toBe('close');
+      expect(await res.json()).toEqual({ ok: false, error: 'body_too_large' });
+      expect(existsSync(fixture.proofPath(nonce))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  it('times out a slow partial unauthenticated body and writes no proof', async () => {
+    const fixture = installManagedOriginFixture();
+    const nonce = 'f1'.repeat(32);
+    try {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const result = await new Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: string }>((resolve, reject) => {
+        const req = httpRequest({
+          host: '127.0.0.1',
+          port: handle!.port,
+          path: '/api/session-origin/attest',
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+        }, res => {
+          const chunks: Buffer[] = [];
+          res.on('data', chunk => chunks.push(Buffer.from(chunk)));
+          res.on('end', () => resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          }));
+        });
+        req.once('error', reject);
+        // Send a complete JSON value but deliberately omit the terminating
+        // chunk, exercising the pre-auth slow-body deadline.
+        req.write(JSON.stringify({
+          sessionId: fixture.sessionId,
+          channelId: CHANNEL,
+          originCapability: CAPABILITY,
+          nonce,
+        }));
+      });
+
+      expect(result.status).toBe(408);
+      expect(result.headers.connection).toBe('close');
+      expect(JSON.parse(result.body)).toEqual({ ok: false, error: 'body_timeout' });
+      expect(existsSync(fixture.proofPath(nonce))).toBe(false);
+    } finally {
+      fixture.cleanup();
+    }
+  }, 5_000);
 });
 
 describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
@@ -361,6 +743,97 @@ describe('POST /api/sessions/:sessionId/lock', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/board queued activation', () => {
+  it('returns the activation failure without publishing a false in-progress success', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-board-activation-'));
+    const previousDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const appId = 'test-board-activation-app';
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
+    try {
+      config.session.dataDir = dataDir;
+      registerBot({
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        defaultWorkingDir: '/tmp',
+        workingDir: '/tmp',
+        workingDirs: ['/tmp'],
+      } as any);
+      setLarkAppId(appId);
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_board', 'om_board', 'queued board task', 'group');
+      Object.assign(session, {
+        larkAppId: appId,
+        scope: 'thread',
+        workingDir: '/tmp',
+        queued: true,
+        queuedPrompt: 'queued board payload',
+        kanbanColumn: 'backlog',
+      });
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        larkAppId: appId,
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: false,
+        workingDir: '/tmp',
+        pendingPrompt: session.queuedPrompt,
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[sessionKey(session.rootMessageId, appId), ds]]));
+      workerPool.initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => { throw new Error('forced pre-init failure'); },
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/board`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ column: 'in_progress', position: 7 }),
+        },
+      );
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ ok: false, error: 'forced pre-init failure' });
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        queued: true,
+        queuedPrompt: 'queued board payload',
+        kanbanColumn: 'backlog',
+      });
+      expect(events).not.toContainEqual(expect.objectContaining({
+        type: 'session.update',
+        body: expect.objectContaining({ sessionId: session.sessionId }),
+      }));
+    } finally {
+      off();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+      workerPool.initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 0,
+        closeSession: vi.fn(),
+      });
+      sessionStore.init();
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/restart', () => {
   it('sends a restart IPC message to the live worker', async () => {
     const send = vi.fn();
@@ -375,7 +848,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
-    expect(send).toHaveBeenCalledWith({ type: 'restart' });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
     findSpy.mockRestore();
   });
 
@@ -405,6 +878,31 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'adopt_restart_unsupported' });
     expect(send).not.toHaveBeenCalled();
+    expect(forkSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    forkSpy.mockRestore();
+  });
+
+  it.each([
+    ['live', { send: vi.fn(), killed: false }],
+    ['worker-less', null],
+  ])('rejects %s Riff sessions without restart or refork', async (_label, worker) => {
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-riff', cliId: 'riff', backendType: 'riff' },
+      initConfig: { backendType: 'riff' },
+      worker,
+      adoptedFrom: undefined,
+      hasHistory: true,
+      larkAppId: 'app',
+    } as any);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-riff/restart`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'riff_restart_unsupported' });
+    if (worker) expect(worker.send).not.toHaveBeenCalled();
     expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();
     forkSpy.mockRestore();
@@ -480,6 +978,31 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
     findSpy.mockRestore();
   });
 
+  it('409s before suspension while durable Codex App dispatch ownership is non-empty', async () => {
+    const ds = {
+      session: {
+        sessionId: 's-owned',
+        cliId: 'codex-app',
+        codexAppDispatchLedger: [
+          { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+        ],
+      },
+      worker: { send: vi.fn(), killed: false },
+      adoptedFrom: undefined,
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
+  });
+
   it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
@@ -531,6 +1054,347 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
     expect(await res.json()).toMatchObject({ ok: false, error: 'backend_not_suspendable' });
     findSpy.mockRestore();
     suspendSpy.mockRestore();
+  });
+});
+
+describe('PUT /api/bot-read-isolation', () => {
+  for (const enabled of [false, true]) {
+    it(`treats ${enabled}→${enabled} as a no-op even with active and persisted pending owners`, async () => {
+      const appId = `test-read-isolation-noop-${enabled}`;
+      registerBot({
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        workingDir: process.cwd(),
+        workingDirs: [process.cwd()],
+        readIsolation: enabled,
+      } as any);
+      setLarkAppId(appId);
+      const pendingLedger = [
+        { dispatchId: 'd-noop', turnId: 't-noop', state: 'accepted', content: 'owned' },
+      ];
+      const previousRegistry = workerPool.getActiveSessionsRegistry();
+      workerPool.setActiveSessionsRegistry(new Map([['active-noop', {
+        larkAppId: appId,
+        session: { sessionId: 's-active-noop', codexAppDispatchLedger: pendingLedger },
+        worker: { send: vi.fn(), killed: false },
+      } as any]]));
+      const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+        sessionId: 's-persisted-noop',
+        chatId: 'oc_noop',
+        rootMessageId: 'om_noop',
+        title: 'persisted pending no-op',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: appId,
+        backendType: 'tmux',
+        codexAppDispatchLedger: pendingLedger,
+      } as any]);
+      const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
+      const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+      const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+      try {
+        handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+        const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({
+          ok: true,
+          readIsolation: enabled,
+          suspendedSessions: 0,
+          changed: false,
+        });
+        expect(listSpy).not.toHaveBeenCalled();
+        expect(updateSpy).not.toHaveBeenCalled();
+        expect(probeSpy).not.toHaveBeenCalled();
+        expect(suspendSpy).not.toHaveBeenCalled();
+      } finally {
+        suspendSpy.mockRestore();
+        probeSpy.mockRestore();
+        updateSpy.mockRestore();
+        listSpy.mockRestore();
+        workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+      }
+    });
+  }
+
+  it('rejects before persisting or suspending when any bot session owns a Codex App dispatch', async () => {
+    const appId = 'test-read-isolation-owned';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const owned = {
+      larkAppId: appId,
+      session: {
+        sessionId: 's-read-isolation-owned',
+        codexAppDispatchLedger: [
+          { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+        ],
+      },
+      worker: { send: vi.fn(), killed: false },
+    } as any;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['owned', owned]]));
+    setLarkAppId(appId);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'codex_app_dispatch_pending' });
+      expect(suspendSpy).not.toHaveBeenCalled();
+    } finally {
+      suspendSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('refuses read-isolation disable before persistence while an old-policy active session can resume', async () => {
+    const appId = 'test-read-isolation-active-disable';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const workerless = {
+      larkAppId: appId,
+      session: { sessionId: 's-read-isolation-active-disable', backendType: 'tmux' },
+      initConfig: { backendType: 'tmux' },
+      // A quiet restart/crash can leave worker=null while its old read-isolated
+      // pane survives and remains attachable.
+      worker: null,
+    } as any;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['workerless', workerless]]));
+    setLarkAppId(appId);
+    const updateSpy = vi.spyOn(sandboxStore, 'persistBotReadIsolation');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_active_sessions' });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(sandboxStore.getBotReadIsolation(appId)).toBe(true);
+    } finally {
+      updateSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it.runIf(process.platform === 'darwin')('refuses read-isolation enable before persistence while a write-only pane can survive restart', async () => {
+    const appId = 'test-read-isolation-active-enable';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      sandbox: true,
+    } as any);
+    const workerless = {
+      larkAppId: appId,
+      session: { sessionId: 's-write-only-active', backendType: 'tmux', sandbox: true },
+      initConfig: { backendType: 'tmux', sandbox: true, readIsolation: false },
+      worker: null,
+    } as any;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['workerless-write-only', workerless]]));
+    setLarkAppId(appId);
+    const updateSpy = vi.spyOn(sandboxStore, 'persistBotReadIsolation');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_active_sessions' });
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(sandboxStore.getBotReadIsolation(appId)).toBe(false);
+    } finally {
+      updateSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('refuses before persistence for a durable active row omitted from the runtime registry', async () => {
+    const appId = 'test-read-isolation-persisted-active';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-persisted-not-restored',
+      chatId: 'oc_persisted',
+      rootMessageId: 'om_persisted',
+      title: 'persisted active',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      backendType: 'tmux',
+      // Deliberately points at this live Vitest process. A closed row must not
+      // treat a reused pid as teardown authority; the stamped pane probe is.
+      pid: process.pid,
+    } as any]);
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'read_isolation_active_sessions' });
+      expect(updateSpy).not.toHaveBeenCalled();
+    } finally {
+      updateSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('waits for a just-closed persistent backing to disappear before changing policy', async () => {
+    const appId = 'test-read-isolation-close-teardown';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-just-closed',
+      chatId: 'oc_closed',
+      rootMessageId: 'om_closed',
+      title: 'just closed',
+      status: 'closed',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      backendType: 'tmux',
+    } as any]);
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession')
+      .mockReturnValueOnce('exists')
+      .mockReturnValue('missing');
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const endpoint = `http://127.0.0.1:${handle.port}/api/bot-read-isolation`;
+      const request = () => fetch(endpoint, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      const first = await request();
+      expect(first.status).toBe(409);
+      expect(await first.json()).toMatchObject({
+        ok: false,
+        error: 'read_isolation_teardown_unverified',
+      });
+      expect(updateSpy).not.toHaveBeenCalled();
+
+      const second = await request();
+      expect(second.status).toBe(200);
+      expect(await second.json()).toMatchObject({
+        ok: true,
+        readIsolation: false,
+        suspendedSessions: 0,
+      });
+      expect(updateSpy).toHaveBeenCalledOnce();
+      expect(probeSpy).toHaveBeenCalledWith('tmux', 'bmx-s-just-c');
+    } finally {
+      updateSpy.mockRestore();
+      probeSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
+  });
+
+  it('does not synchronously fan out legacy closed rows across every persistent backend', async () => {
+    const appId = 'test-read-isolation-legacy-backing';
+    registerBot({
+      larkAppId: appId,
+      larkAppSecret: 'secret',
+      cliId: 'codex-app',
+      workingDir: process.cwd(),
+      workingDirs: [process.cwd()],
+      readIsolation: true,
+    } as any);
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    setLarkAppId(appId);
+    const listSpy = vi.spyOn(sessionStore, 'listSessions').mockReturnValue([{
+      sessionId: 's-legacy-no-backend',
+      chatId: 'oc_legacy',
+      rootMessageId: 'om_legacy',
+      title: 'legacy closed',
+      status: 'closed',
+      createdAt: new Date().toISOString(),
+      larkAppId: appId,
+      // Deliberately no backendType stamp.
+    } as any]);
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        readIsolation: false,
+      });
+      expect(updateSpy).toHaveBeenCalledOnce();
+      expect(probeSpy).not.toHaveBeenCalled();
+    } finally {
+      updateSpy.mockRestore();
+      probeSpy.mockRestore();
+      listSpy.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+    }
   });
 });
 
@@ -1111,6 +1975,196 @@ describe('PUT /api/bot-agent', () => {
         model: 'kimi-k2.5',
       });
     } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-pending-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        model: 'old-model',
+        readIsolation: true,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_pending', 'om_pending', 'Pending', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'codex-app';
+      session.codexAppDispatchLedger = [{
+        dispatchId: 'dispatch-pending', turnId: 'turn-pending',
+        state: 'prepared', content: 'prompt', deliverySink: 'lark',
+      }];
+      sessionStore.updateSession(session);
+      const send = vi.fn();
+      const registry = new Map([[sessionKey(session.rootMessageId, appId), {
+        session,
+        worker: { killed: false, send },
+        workerPort: 1,
+        workerToken: 'token',
+        larkAppId: appId,
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const beforeFile = readFileSync(configPath, 'utf8');
+      const beforeLive = structuredClone(getBot(appId).config);
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'new-model' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'codex_app_dispatch_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'codex-app',
+          reasons: ['codex_app_dispatch'],
+        }],
+      });
+      expect(readFileSync(configPath, 'utf8')).toBe(beforeFile);
+      expect(getBot(appId).config).toEqual(beforeLive);
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        status: 'active',
+        codexAppDispatchLedger: [{ dispatchId: 'dispatch-pending' }],
+      });
+      expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(true);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports non-Codex pending work with a backend-neutral error and actionable sessions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-generic-pending-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-generic-pending-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession(
+        'oc_generic_pending',
+        'om_generic_pending',
+        'Generic pending',
+        'group',
+      );
+      session.larkAppId = appId;
+      session.cliId = 'traex';
+      session.queued = true;
+      session.pendingRepoSetup = { mode: 'picker', prompt: 'OPENING_N' };
+      sessionStore.updateSession(session);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'session_mutation_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'traex',
+          reasons: ['queued_todo', 'repository_setup'],
+        }],
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the hot-switch mismatch close after a settled Codex App ledger', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-settled-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-settled-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex-app',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_settled', 'om_settled', 'Settled', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'codex-app';
+      session.codexAppDispatchLedger = [];
+      sessionStore.updateSession(session);
+      const registry = new Map([[sessionKey(session.rootMessageId, appId), {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, closedMismatchedSessions: 1 });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(false);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
