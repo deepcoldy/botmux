@@ -589,8 +589,9 @@ export function hasMatchingManagedOriginCapability(
   sessionId: string | undefined,
   expectedCapability: string | undefined,
   relayDir?: string,
+  channelId?: string,
 ): boolean {
   if (!expectedCapability) return false;
-  return readManagedOriginCapability(dataDir, sessionId, relayDir)?.capability
+  return readManagedOriginCapability(dataDir, sessionId, relayDir, channelId)?.capability
     === expectedCapability;
 }

@@ -47,4 +47,13 @@ describe('daemon Codex App workflow prompt lanes', () => {
       'const codexAppApplicationContext = initialCodexAppApplicationContext;',
     );
   });
+
+  it('does not buffer ordinary turns solely because repo commit UI cleanup is still in flight', () => {
+    const block = region(
+      'async function handleThreadReply',
+      'async function autoCreateDocSession',
+    );
+    expect(block).toContain('if (ds?.pendingRepo || initialStartPending) {');
+    expect(block).not.toContain('if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending)');
+  });
 });

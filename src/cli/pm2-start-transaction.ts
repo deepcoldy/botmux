@@ -98,7 +98,9 @@ export function assertDaemonPm2GracefulExitPolicy(
     throw new Error(
       `[${operation}] daemon PM2 policy does not prove signal-death autorestart `
       + `(expected autorestart=true and stop_exit_codes=[${DAEMON_GRACEFUL_EXIT_CODE}]; unsafe: `
-      + `${unsafe.map(entry => entry.name).join(', ')})`,
+      + `${unsafe.map(entry => entry.name).join(', ')}). `
+      + 'For a one-time pre-protocol upgrade, first independently confirm every Session/Riff '
+      + 'workload is idle, then run: botmux restart --bootstrap-shutdown-protocol --yes',
     );
   }
 }

@@ -538,6 +538,16 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // would permanently block every later turn's drain — the notify + Web
       // terminal are the authoritative recovery surface (Codex P1).
       if (shouldPreMarkFirstTurn(first)) codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
+      if (first === 'accepted' && cfg.queuedActivationToken) {
+        // Fresh RPC input bypasses pendingMessages/flushPending entirely. The
+        // app-server's accepted turn/start (or positive rollout proof) is the
+        // durable submission boundary for the daemon's queued-opening journal.
+        send({
+          type: 'queued_activation_submitted',
+          sessionId: cfg.sessionId,
+          activationToken: cfg.queuedActivationToken,
+        });
+      }
       outcome = first; // 'accepted' | 'ambiguous' — both stay engaged, prompt never re-queued
     }
     persistCliSessionId(threadId);
@@ -7974,6 +7984,7 @@ async function spawnCli(
       ? readSessionMcpRuntimeManifest(cfg.sessionId, config.session.dataDir)
       : await prepareCliPluginGenerationAndGateway(cfg, cliAdapter);
   }
+  if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
 
   // Re-arm the startup-commands one-shot ONLY for a genuinely fresh CLI process.
   // A reattach to a LIVE persistent pane (daemon-restart recovery) is the SAME
@@ -9047,6 +9058,7 @@ async function spawnCli(
   // the candidate and proves the new key. The worker trusts cryptographic
   // proof, not a backend's prediction flag.
   try {
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
     prepareFreshCodexAppControlBootstrap(cfg, !!persistentSessionName);
     if (codexAppControlBootstrapPathForSpawn) {
       childEnv[CODEX_APP_CONTROL_BOOTSTRAP_ENV] = codexAppControlBootstrapPathForSpawn;
@@ -9336,6 +9348,7 @@ async function spawnCli(
       cfg.sessionId,
       sandboxRelayCapability?.token,
       sandboxRelayOutbox ?? undefined,
+      readIsolationOriginChannelId ?? undefined,
     );
   const readySignalAvailable =
     readyHookAvailable && readyPortAvailable && readyCapabilityAvailable;

@@ -1263,6 +1263,9 @@ describe('PUT /api/bot-read-isolation', () => {
       createdAt: new Date().toISOString(),
       larkAppId: appId,
       backendType: 'tmux',
+      // Deliberately points at this live Vitest process. A closed row must not
+      // treat a reused pid as teardown authority; the stamped pane probe is.
+      pid: process.pid,
     } as any]);
     const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
     try {
@@ -1345,7 +1348,7 @@ describe('PUT /api/bot-read-isolation', () => {
     }
   });
 
-  it('fails closed when a legacy unstamped row may still own any persistent backing', async () => {
+  it('does not synchronously fan out legacy closed rows across every persistent backend', async () => {
     const appId = 'test-read-isolation-legacy-backing';
     registerBot({
       larkAppId: appId,
@@ -1368,9 +1371,9 @@ describe('PUT /api/bot-read-isolation', () => {
       larkAppId: appId,
       // Deliberately no backendType stamp.
     } as any]);
-    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession')
-      .mockImplementation((backendType) => backendType === 'herdr' ? 'exists' : 'missing');
-    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation');
+    const probeSpy = vi.spyOn(persistentBackend, 'probePersistentSession');
+    const updateSpy = vi.spyOn(sandboxStore, 'updateBotReadIsolation')
+      .mockResolvedValue({ ok: true, readIsolation: false });
     try {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-read-isolation`, {
@@ -1379,13 +1382,13 @@ describe('PUT /api/bot-read-isolation', () => {
         body: JSON.stringify({ enabled: false }),
       });
 
-      expect(res.status).toBe(409);
+      expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
-        ok: false,
-        error: 'read_isolation_teardown_unverified',
+        ok: true,
+        readIsolation: false,
       });
-      expect(updateSpy).not.toHaveBeenCalled();
-      expect(probeSpy.mock.calls.map(call => call[0])).toEqual(['tmux', 'herdr']);
+      expect(updateSpy).toHaveBeenCalledOnce();
+      expect(probeSpy).not.toHaveBeenCalled();
     } finally {
       updateSpy.mockRestore();
       probeSpy.mockRestore();
@@ -2033,7 +2036,15 @@ describe('PUT /api/bot-agent', () => {
       });
 
       expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ ok: false, error: 'codex_app_dispatch_pending' });
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'codex_app_dispatch_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'codex-app',
+          reasons: ['codex_app_dispatch'],
+        }],
+      });
       expect(readFileSync(configPath, 'utf8')).toBe(beforeFile);
       expect(getBot(appId).config).toEqual(beforeLive);
       expect(sessionStore.getSession(session.sessionId)).toMatchObject({
@@ -2042,6 +2053,64 @@ describe('PUT /api/bot-agent', () => {
       });
       expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(true);
       expect(send).not.toHaveBeenCalled();
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports non-Codex pending work with a backend-neutral error and actionable sessions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-generic-pending-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-generic-pending-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession(
+        'oc_generic_pending',
+        'om_generic_pending',
+        'Generic pending',
+        'group',
+      );
+      session.larkAppId = appId;
+      session.cliId = 'traex';
+      session.queued = true;
+      session.pendingRepoSetup = { mode: 'picker', prompt: 'OPENING_N' };
+      sessionStore.updateSession(session);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'session_mutation_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'traex',
+          reasons: ['queued_todo', 'repository_setup'],
+        }],
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
       sessionStore.init();

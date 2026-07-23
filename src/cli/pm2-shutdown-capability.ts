@@ -46,7 +46,8 @@ function failure(operation: string, detail: string): Error {
     `[${operation}] refusing to signal daemon generation(s): ${detail}. `
     + `The live daemon may predate shutdown protocol ${SUPERVISOR_SHUTDOWN_PROTOCOL}; `
     + 'normal stop/restart intentionally fails closed on this first-upgrade boundary. '
-    + 'Confirm every Session/Riff workload is idle before an operator-approved one-time manual bootstrap; '
+    + 'After confirming every Session/Riff workload is idle, run '
+    + '`botmux restart --bootstrap-shutdown-protocol --yes` for the operator-approved one-time bootstrap; '
     + 'automatic update must not be reported as applied until the new handler-ready fleet is verified',
   );
 }

@@ -256,4 +256,30 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(a.worker).not.toBe(null);
     expect(b.worker).toBe(null);
   });
+
+  it('skips a sweep after a bounded wait instead of freezing the bot mutation gate', async () => {
+    const appId = 'cli_wedged';
+    const activeSessions = new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 90 * 60_000)],
+      ['b', ds('b', 'tmux', now - 10 * 60_000)],
+    ]);
+    let releaseAdmission!: () => void;
+    let admissionStarted!: () => void;
+    const started = new Promise<void>(resolve => { admissionStarted = resolve; });
+    const admission = withBotTurnAdmission(appId, async () => {
+      admissionStarted();
+      await new Promise<void>(resolve => { releaseAdmission = resolve; });
+    });
+    await started;
+
+    await expect(sweepIdleWorkersAfterTurnDrain(appId, activeSessions, {
+      maxLiveWorkers: 1,
+      mutationAcquireTimeoutMs: 5,
+    })).resolves.toEqual([]);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+
+    releaseAdmission();
+    await admission;
+    await expect(withBotTurnAdmission(appId, async () => 'open')).resolves.toBe('open');
+  });
 });

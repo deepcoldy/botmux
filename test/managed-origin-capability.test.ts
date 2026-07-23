@@ -10,6 +10,7 @@ import {
   ensureManagedOriginAttestationDirectory,
   ensureManagedOriginDataRootProbe,
   ensureManagedOriginRootLocator,
+  hasMatchingManagedOriginCapability,
   hasManagedOriginIsolationMarker,
   managedOriginAttestationDirectory,
   managedOriginCapabilityPath,
@@ -64,6 +65,20 @@ describe('managed origin capability transport', () => {
     expect(readManagedOriginCapability(dir, 'another-session', undefined, G1)).toBeNull();
     expect(readManagedOriginCapability(dir, sessionId, undefined, G2)).toBeNull();
     expect(readManagedOriginCapability(dir, sessionId)).toBeNull();
+    expect(hasMatchingManagedOriginCapability(
+      dir,
+      sessionId,
+      'ab'.repeat(32),
+      undefined,
+      G1,
+    )).toBe(true);
+    expect(hasMatchingManagedOriginCapability(
+      dir,
+      sessionId,
+      'ab'.repeat(32),
+      undefined,
+      G2,
+    )).toBe(false);
   });
 
   it('replaces a planted destination symlink without overwriting its target', () => {

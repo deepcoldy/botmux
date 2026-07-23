@@ -40,7 +40,9 @@ describe('configured PM2 fleet start authority', () => {
       ...row('botmux-a', 0),
       autorestart: true,
       stopExitCodes: [0],
-    }])).toThrow(/does not prove signal-death autorestart.*stop_exit_codes=\[42\]/);
+    }])).toThrow(
+      /does not prove signal-death autorestart.*botmux restart --bootstrap-shutdown-protocol --yes/,
+    );
     expect(() => assertDaemonPm2GracefulExitPolicy('start-idempotent-ready', [{
       ...row('botmux-a', 0),
       autorestart: false,

@@ -137,15 +137,24 @@ export function signalAndAwaitFleet(
     purpose: string,
     capMs: number = Number.POSITIVE_INFINITY,
   ): FleetProcessEntry[] => {
-    const budgetMs = remainingMs();
-    if (budgetMs <= 0) {
-      throw new Error(`fleet deadline exhausted before ${purpose}`);
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const budgetMs = remainingMs();
+      if (budgetMs <= 0) {
+        throw new Error(`fleet deadline exhausted before ${purpose}`);
+      }
+      try {
+        const projection = runtime.list(Math.max(1, Math.min(budgetMs, Math.floor(capMs))));
+        if (remainingMs() <= 0) {
+          throw new Error(`fleet deadline exhausted during ${purpose}`);
+        }
+        return projection;
+      } catch (error) {
+        lastError = error;
+        if (remainingMs() <= 0 || attempt === 2) throw error;
+      }
     }
-    const projection = runtime.list(Math.max(1, Math.min(budgetMs, Math.floor(capMs))));
-    if (remainingMs() <= 0) {
-      throw new Error(`fleet deadline exhausted during ${purpose}`);
-    }
-    return projection;
+    throw lastError;
   };
 
   // Later PM2 stop/delete mutates every supplied registry name, including
@@ -205,11 +214,18 @@ export function signalAndAwaitFleet(
   // A live refuser is decided early enough to leave one explicitly partitioned
   // compensation tail. All-dead fleets may continue their normal successor
   // settle beyond this point; they need no compensation subprocesses.
-  const compensationReserveMs = Math.min(6_000, Math.max(5, Math.floor(timeoutMs / 5)));
+  const productionBudget = timeoutMs >= 10_000;
+  const compensationReserveMs = productionBudget
+    ? Math.min(25_000, Math.max(10_000, Math.floor(timeoutMs / 3)))
+    : Math.min(6_000, Math.max(5, Math.floor(timeoutMs / 5)));
   const liveRefusalDeadline = Math.max(runtime.now(), deadline - compensationReserveMs);
-  const preProjectionCapMs = Math.max(1, Math.floor(compensationReserveMs / 5));
-  const exactStartCapMs = Math.max(1, Math.floor(compensationReserveMs / 2));
-  const postProjectionCapMs = Math.max(1, Math.floor(compensationReserveMs / 5));
+  const preProjectionCapMs = productionBudget
+    ? Math.max(5_000, Math.floor(compensationReserveMs / 4))
+    : Math.max(1, Math.floor(compensationReserveMs / 5));
+  const exactStartCapMs = productionBudget
+    ? Math.max(10_000, Math.floor(compensationReserveMs / 2))
+    : Math.max(1, Math.floor(compensationReserveMs / 2));
+  const postProjectionCapMs = preProjectionCapMs;
   const successorProjectionCapMs = preProjectionCapMs;
   let quietSince: number | null = null;
   let verificationFailure: string | null = null;

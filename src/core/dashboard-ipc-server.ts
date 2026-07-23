@@ -103,7 +103,9 @@ import {
   validateCodexAppManagedSendOrigin,
 } from '../utils/codex-app-dispatch-ledger.js';
 import { withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
-import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import {
+  protectedSessionMutationReasons,
+} from './session-mutation-guard.js';
 import {
   SUPERVISOR_SHUTDOWN_ROUTE,
   isExactSupervisorShutdownRequest,
@@ -212,6 +214,44 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+function rejectProtectedSessionMutation(
+  res: ServerResponse,
+  values: readonly (DaemonSession | Session)[],
+): boolean {
+  const bySessionId = new Map<string, {
+    sessionId: string;
+    cliId?: string;
+    reasons: ReturnType<typeof protectedSessionMutationReasons>;
+  }>();
+  for (const value of values) {
+    const session = 'session' in value ? value.session : value;
+    const reasons = protectedSessionMutationReasons(value);
+    if (reasons.length === 0) continue;
+    const existing = bySessionId.get(session.sessionId);
+    if (existing) {
+      existing.reasons = [...new Set([...existing.reasons, ...reasons])];
+      continue;
+    }
+    bySessionId.set(session.sessionId, {
+      sessionId: session.sessionId,
+      ...(session.cliId ? { cliId: session.cliId } : {}),
+      reasons,
+    });
+  }
+  const blockingSessions = [...bySessionId.values()];
+  if (blockingSessions.length === 0) return false;
+  const codexDispatchOnly = blockingSessions.every(blocker =>
+    blocker.reasons.every(reason => reason === 'codex_app_dispatch'));
+  jsonRes(res, 409, {
+    ok: false,
+    error: codexDispatchOnly
+      ? 'codex_app_dispatch_pending'
+      : 'session_mutation_pending',
+    blockingSessions,
+  });
+  return true;
 }
 
 ipcRoute('POST', SUPERVISOR_SHUTDOWN_ROUTE, async (req, res) => {
@@ -696,9 +736,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => 
   return withBotTurnMutation(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (hasProtectedSessionMutationOwnership(current)) {
-      return jsonRes(res, 409, { ok: false, error: 'codex_app_dispatch_pending' });
-    }
+    if (rejectProtectedSessionMutation(res, [current])) return;
     const r = await closeSession(params.sessionId);
     jsonRes(res, r.ok ? 200 : 502, r);
   });
@@ -745,9 +783,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) =
       || ds.session.cliId === 'riff') {
     return jsonRes(res, 409, { ok: false, error: 'riff_restart_unsupported' });
   }
-  if (hasProtectedSessionMutationOwnership(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'codex_app_dispatch_pending' });
-  }
+  if (rejectProtectedSessionMutation(res, [ds])) return;
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
     // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
@@ -786,9 +822,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_suspend_unsupported' });
   }
-  if (hasProtectedSessionMutationOwnership(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'codex_app_dispatch_pending' });
-  }
+  if (rejectProtectedSessionMutation(res, [ds])) return;
   if (!ds.worker || ds.worker.killed) {
     // Worker already gone (idle-suspended / crash-stopped) — the goal state is
     // already reached, so report idempotent success without a live kill.
@@ -2760,10 +2794,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       session.status === 'active'
       && (session.larkAppId === larkAppId || !session.larkAppId),
     );
-    if (activeBotSessions.some(hasProtectedSessionMutationOwnership)
-      || persistedActiveBotSessions.some(hasProtectedSessionMutationOwnership)) {
-      return jsonRes(res, 409, { ok: false, error: 'codex_app_dispatch_pending' });
-    }
+    if (rejectProtectedSessionMutation(res, [
+      ...activeBotSessions,
+      ...persistedActiveBotSessions,
+    ])) return;
 
     // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
     // auto-clear the flag here so the next session doesn't fail-close on it. (The
@@ -3129,10 +3163,10 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
     const persistedActiveBotSessions = persistedBotSessions.filter(session =>
       session.status === 'active',
     );
-    if (activeBotSessions.some(hasProtectedSessionMutationOwnership)
-      || persistedActiveBotSessions.some(hasProtectedSessionMutationOwnership)) {
-      return jsonRes(res, 409, { ok: false, error: 'codex_app_dispatch_pending' });
-    }
+    if (rejectProtectedSessionMutation(res, [
+      ...activeBotSessions,
+      ...persistedActiveBotSessions,
+    ])) return;
     // Crash-transactional safety boundary: bots.json is the restart source of
     // truth, while a live tmux/herdr/zellij pane retains its old in-memory
     // Seatbelt profile. Persisting the new flag before tearing those panes down
@@ -3147,39 +3181,19 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
       });
     }
     // `/close` intentionally returns after sending worker close IPC and marking
-    // the row closed; exact child exit and persistent-pane destruction can lag.
-    // A closed row therefore is not teardown proof. Refuse until every owned
-    // worker pid is gone and every stamped persistent backing probes missing.
-    // The user can retry once close completes; unknown probes fail closed.
+    // the row closed; persistent-pane destruction can lag. A closed row's pid
+    // is deliberately not probed: PID alone has no birth identity and may have
+    // been reused by an unrelated process. closeSession clears it atomically.
+    // For current rows, the stamped persistent backend is the teardown proof.
+    // Pre-stamp closed rows are not synchronously probed across three CLIs here:
+    // that legacy shell fan-out blocks the daemon event loop, while any active
+    // legacy row has already failed the active-session guard above.
     for (const session of persistedBotSessions) {
       if (session.adoptedFrom || session.title?.startsWith('Adopt:')) continue;
-      if (session.pid) {
-        try {
-          process.kill(session.pid, 0);
-          return jsonRes(res, 409, {
-            ok: false,
-            error: 'read_isolation_teardown_unverified',
-          });
-        } catch (err: any) {
-          // ESRCH is the only authoritative "process gone" answer. EPERM or an
-          // unexpected platform error means the generation cannot be proven dead.
-          if (err?.code !== 'ESRCH') {
-            return jsonRes(res, 409, {
-              ok: false,
-              error: 'read_isolation_teardown_unverified',
-            });
-          }
-        }
-      }
       const backendTypes: persistentBackend.PersistentBackendType[] =
         persistentBackend.isSuspendableBackendType(session.backendType)
           ? [session.backendType]
-          // Pre-stamp sessions can still own a deterministic pane. There is no
-          // durable backend discriminator, so prove absence across every local
-          // persistent backend; unknown is not permission to change policy.
-          : session.backendType === undefined
-            ? ['tmux', 'herdr', 'zellij']
-            : [];
+          : [];
       for (const backendType of backendTypes) {
         const backingName = persistentBackend.persistentSessionName(
           backendType,

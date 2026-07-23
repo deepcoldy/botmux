@@ -92,10 +92,17 @@ function writePosixLeaseActorRecord(input: {
   createdAtMs?: number;
   intendedDirectory?: string;
   targetOwnerPath?: string;
+  version?: 2 | 3;
 }): void {
   const role = basename(input.path).startsWith('reap-') ? 'reaper' : 'owner';
   const intendedDirectory = input.intendedDirectory ?? dirname(input.path);
   const directoryStat = statSync(intendedDirectory, { bigint: true });
+  const generationNames = readdirSync(intendedDirectory)
+    .filter(name => /^generation-[a-f0-9]{64}\.json$/.test(name));
+  const directoryGeneration = generationNames.length === 1
+    ? generationNames[0]!.slice('generation-'.length, -'.json'.length)
+    : undefined;
+  const version = input.version ?? (directoryGeneration ? 3 : 2);
   let targetOwner: Record<string, unknown> | undefined;
   if (role === 'reaper') {
     const targetPath = input.targetOwnerPath ?? readdirSync(dirname(input.path))
@@ -126,7 +133,7 @@ function writePosixLeaseActorRecord(input: {
     }
   }
   writeFileSync(input.path, JSON.stringify({
-    version: 2,
+    version,
     role,
     sessionId: input.sessionId,
     nonce: input.nonce,
@@ -136,6 +143,7 @@ function writePosixLeaseActorRecord(input: {
     directoryIdentity: {
       dev: directoryStat.dev.toString(10),
       ino: directoryStat.ino.toString(10),
+      ...(version === 3 ? { generation: directoryGeneration } : {}),
     },
     ...(targetOwner ? { targetOwner } : {}),
   }), { mode: 0o600 });
@@ -908,6 +916,99 @@ describe('POSIX Codex App locator replacement', () => {
       wait: async delayMs => { waits++; nowMs += delayMs; },
     });
     expect(waits).toBeGreaterThanOrEqual(3);
+    expect(lease.isOwned()).toBe(true);
+    lease.release();
+  });
+
+  it('does not let a v2 actor claim authority over a v3 generation directory', async () => {
+    const root = tempDir();
+    const sessionId = 'session-posix-v2-v3-boundary';
+    const directory = codexAppPosixOwnerLeaseDirectory(root, sessionId);
+    mkdirSync(join(root, 'leases'), { recursive: true, mode: 0o700 });
+    mkdirSync(directory, { mode: 0o700 });
+    const generation = '1'.repeat(64);
+    writeFileSync(join(directory, `generation-${generation}.json`), generation, { mode: 0o600 });
+    writePosixLeaseActorRecord({
+      path: join(directory, `owner-${'2'.repeat(64)}.json`),
+      sessionId,
+      nonce: '2'.repeat(64),
+      pid: 401,
+      processStartToken: 'legacy-live',
+      version: 2,
+    });
+
+    const lease = await acquireCodexAppPosixOwnerLease({
+      controlRoot: root,
+      sessionId,
+      pid: 402,
+      processStartToken: 'v3-successor',
+      inspectOwner: pid => pid === 401 ? 'alive' : 'unknown',
+      initializationGraceMs: 0,
+    });
+    expect(lease.isOwned()).toBe(true);
+    lease.release();
+  });
+
+  it('recovers multiple valid generation markers after the crash residue is actor-free', async () => {
+    const root = tempDir();
+    const sessionId = 'session-posix-multiple-generations';
+    const directory = codexAppPosixOwnerLeaseDirectory(root, sessionId);
+    mkdirSync(join(root, 'leases'), { recursive: true, mode: 0o700 });
+    mkdirSync(directory, { mode: 0o700 });
+    for (const generation of ['3'.repeat(64), '4'.repeat(64)]) {
+      writeFileSync(join(directory, `generation-${generation}.json`), generation, { mode: 0o600 });
+    }
+
+    const lease = await acquireCodexAppPosixOwnerLease({
+      controlRoot: root,
+      sessionId,
+      pid: 403,
+      processStartToken: 'multiple-generation-successor',
+      inspectOwner: () => 'unknown',
+      initializationGraceMs: 0,
+    });
+    expect(lease.isOwned()).toBe(true);
+    lease.release();
+  });
+
+  it('keeps an ambiguous multi-generation directory fail-closed while an actor is live', async () => {
+    const root = tempDir();
+    const sessionId = 'session-posix-multiple-generations-live';
+    const directory = codexAppPosixOwnerLeaseDirectory(root, sessionId);
+    mkdirSync(join(root, 'leases'), { recursive: true, mode: 0o700 });
+    mkdirSync(directory, { mode: 0o700 });
+    for (const generation of ['5'.repeat(64), '6'.repeat(64)]) {
+      writeFileSync(join(directory, `generation-${generation}.json`), generation, { mode: 0o600 });
+    }
+    writePosixLeaseActorRecord({
+      path: join(directory, `owner-${'7'.repeat(64)}.json`),
+      sessionId,
+      nonce: '7'.repeat(64),
+      pid: 404,
+      processStartToken: 'ambiguous-live',
+    });
+    let nowMs = Date.now();
+    await expect(acquireCodexAppPosixOwnerLease({
+      controlRoot: root,
+      sessionId,
+      pid: 405,
+      processStartToken: 'blocked-successor',
+      inspectOwner: pid => pid === 404 ? 'alive' : 'unknown',
+      initializationGraceMs: 0,
+      timeoutMs: 20,
+      retryDelayMs: 10,
+      now: () => nowMs,
+      wait: async delayMs => { nowMs += delayMs; },
+    })).rejects.toThrow(/timed out/);
+
+    const lease = await acquireCodexAppPosixOwnerLease({
+      controlRoot: root,
+      sessionId,
+      pid: 405,
+      processStartToken: 'recovered-successor',
+      inspectOwner: pid => pid === 404 ? 'dead' : 'unknown',
+      initializationGraceMs: 0,
+    });
     expect(lease.isOwned()).toBe(true);
     lease.release();
   });

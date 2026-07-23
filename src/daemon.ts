@@ -16370,7 +16370,7 @@ async function handleThreadReplyAdmitted(data: any, ctx: RoutingContext): Promis
     );
     return;
   }
-  if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending) {
+  if (ds?.pendingRepo || initialStartPending) {
     const durableTailReservation = ds.pendingRepo
       ? reserveAsyncQueuedActivationTailAdmission(ds)
       : undefined;
@@ -16479,8 +16479,10 @@ async function handleThreadReplyAdmitted(data: any, ctx: RoutingContext): Promis
       return;
     }
 
-    // Compatibility path for an older in-memory repo commit that has already
-    // crossed out of pendingRepo but still owns the first-fork boundary.
+    // Initial-start compatibility path after repo selection: only the durable
+    // queued-activation gate belongs here. pendingRepoCommitInFlight protects a
+    // second repo selection, but must not divert ordinary turns away from the
+    // already-forked worker into source buffers that will never be consumed.
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
     if (ds.pendingRawInput) {

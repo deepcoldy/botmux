@@ -2077,14 +2077,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const sessionsReady = new Promise<void>(resolve => { resolveSessionsReady = resolve; });
   if (sessionsReadyApps.has(larkAppId)) resolveSessionsReady();
   sessionsReadyBarriers.set(larkAppId, { promise: sessionsReady, resolve: resolveSessionsReady });
-  const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
-    await serializeByAnchor(payload.ctx.anchor, () => {
+  const dispatchHumanMessage = (payload: PendingForwardTopicPayload): Promise<void> =>
+    serializeByAnchor(payload.ctx.anchor, () => {
       const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
       return ownsSession
         ? handlers.handleThreadReply(payload.data, payload.ctx)
         : handlers.handleNewTopic(payload.data, payload.ctx);
     }, 0);
-  };
   const dispatchPersistedForwardFollowup = async (
     seedMessageId: string,
     payload: PendingForwardTopicPayload,
@@ -2124,6 +2123,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     }
   }
   const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
+  const waitForSeedRoutingGate = async (messageId: string): Promise<void> => {
+    const gate = seedRoutingGates.get(messageId);
+    if (!gate) return;
+    const timeoutMs = Math.max(1, config.daemon.forwardFollowupWaitMs);
+    let timer: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      gate.ready.then(() => 'ready' as const),
+      new Promise<'timeout'>(resolve => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout') {
+      logger.warn(
+        `[forward-followup] seed routing gate timed out after ${timeoutMs}ms `
+        + `for root=${messageId.substring(0, 12)}; continuing without pairing`,
+      );
+    }
+  };
   const registerSeedRoutingGate = (messageId: string) => {
     let resolveReady!: () => void;
     const ready = new Promise<void>(resolve => { resolveReady = resolve; });
@@ -2210,8 +2229,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Serialize per anchor so back-to-back messages to the same thread
           // (e.g. dispatch's /repo prime + brief kickoff) don't interleave with
           // the first's async session-spawn. See anchor-serializer.ts.
-          await serializeByAnchor(ctx.anchor, () =>
-            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }))
+          void serializeByAnchor(ctx.anchor, () =>
+            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }), 0)
             .catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
@@ -2341,8 +2360,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
-        await serializeByAnchor(ctx.anchor, () =>
-          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }))
+        void serializeByAnchor(ctx.anchor, () =>
+          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }), 0)
           .catch(err => logger.error(`Error handling bot @mention: ${err}`));
         return;
       }
@@ -2614,6 +2633,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         : '';
       const isControlCommand = strippedRoutingText.startsWith('/');
       let pairedForwardSeed;
+      let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a
       // sender who was /revoked within the grace window must not consume the
       // seed from the buffer or overwrite the durable paired record. The seed
@@ -2621,7 +2641,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
       if (senderOpenId && isAllowed && message.root_id && !isControlCommand) {
-        await seedRoutingGates.get(message.root_id)?.ready;
+        await waitForSeedRoutingGate(message.root_id);
         const pairingInput = {
           larkAppId,
           chatId,
@@ -2636,17 +2656,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (pairingDelayEnabled && !ambientRedirect) {
           pairedForwardSeed = forwardFollowups.take(pairingInput);
         } else if (!pairingDelayEnabled) {
-          const stalePendingSeed = forwardFollowups.take(pairingInput);
-          if (stalePendingSeed) {
-            try {
-              await dispatchPersistedForwardFollowup(stalePendingSeed.messageId, stalePendingSeed.payload);
-            } catch (err) {
-              logger.warn(
-                `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; ` +
-                `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
-              );
-            }
-          }
+          stalePendingSeed = forwardFollowups.take(pairingInput);
         }
       }
       if (pairedForwardSeed) {
@@ -2850,8 +2860,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         } catch (err) {
           logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
         }
-        await dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
+        void dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
           .catch(err => logger.error(`Error handling paired message event: ${err}`));
+        return;
+      }
+
+      if (stalePendingSeed) {
+        // The mention mode changed while a seed was held. Release the raw chat
+        // ingress lane immediately, but enqueue the stale seed before the
+        // current reply once session restoration is complete. Both calls append
+        // synchronously to the same canonical FIFO; their handler completion is
+        // deliberately not awaited by the raw lane.
+        void sessionsReady.then(() => {
+          void dispatchHumanMessage(stalePendingSeed.payload)
+            .then(() => removeForwardFollowup(larkAppId, stalePendingSeed.messageId))
+            .catch(err => logger.warn(
+              `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; `
+              + `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
+            ));
+          void dispatchHumanMessage(payload)
+            .catch(err => logger.error(`Error handling message event: ${err}`));
+        }).catch(err => logger.error(`Error awaiting restored sessions for stale seed: ${err}`));
         return;
       }
 
@@ -2943,7 +2972,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         () => serializeByAnchor(
           ingressAnchor,
           () => processMessageEvent(data, seedRoutingGate),
-          0,
         ),
         'message event',
         claim,

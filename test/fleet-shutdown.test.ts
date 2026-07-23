@@ -861,6 +861,47 @@ describe('generation-aware fleet graceful shutdown', () => {
     expect(greatestNow).toBeLessThanOrEqual(50);
   });
 
+  it('reserves production-size projection budgets and retries one transient jlist failure', () => {
+    const alive = new Set([101, 202]);
+    let now = 0;
+    let compensated = false;
+    const listBudgets: number[] = [];
+    let listCalls = 0;
+
+    expect(() => signalAndAwaitFleet(entries.slice(0, 2), 'restart', 60_000, {
+      signal(pid) {
+        if (pid === 202) alive.delete(pid);
+      },
+      isAlive: pid => alive.has(pid),
+      now: () => now,
+      sleep(ms) { now += ms; },
+      startOffline(offline, budgetMs) {
+        expect(offline.map(entry => entry.name)).toEqual(['botmux-b']);
+        expect(budgetMs).toBeGreaterThanOrEqual(10_000);
+        compensated = true;
+        alive.add(303);
+      },
+      list: budgetMs => {
+        listBudgets.push(budgetMs);
+        listCalls += 1;
+        if (listCalls === 1) throw new Error('transient jlist timeout');
+        return [
+          { name: 'botmux-a', pmId: 1, pid: 101, online: true },
+          compensated
+            ? { name: 'botmux-b', pmId: 2, pid: 303, online: true }
+            : {
+                name: 'botmux-b', pmId: 2, pid: 0, online: false,
+                status: 'waiting restart', exitCode: 0, stopExitCodes: [0],
+              },
+        ];
+      },
+      pollMs: 5_000,
+    })).toThrow(/restored 1 offline PM2 entry.*live generation untouched/);
+
+    expect(listCalls).toBe(3);
+    expect(listBudgets.every(budget => budget >= 5_000)).toBe(true);
+  });
+
   it('does not conditionally start a row whose PM2 policy may still have a restart timer', () => {
     const alive = new Set([101, 202]);
     let now = 0;

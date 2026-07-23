@@ -714,6 +714,18 @@ function reportIdentityConflict(turn: ActiveTurn, observedNativeTurnId?: string,
     ...(observedNativeTurnId ? { observedNativeTurnId } : {}),
     atMs: Date.now(),
   });
+  // Attribution failed closed, but the logical Botmux turn must still settle.
+  // Leaving turn.done unresolved permanently poisons the runner FIFO and keeps
+  // the session "busy" forever. Emit one explicit error final under the stable
+  // client turn id; never reuse untrusted native text.
+  turn.finalText = `Codex App turn failed: ${message}`;
+  turn.allAgentText = '';
+  if (turn.nativeTurnId && nativeActiveTurnId === turn.nativeTurnId) {
+    nativeActiveTurnId = undefined;
+  }
+  turn.completed = true;
+  emitTurnActivity(turn, 'completed', true);
+  turn.resolveDone();
 }
 
 async function reconcileCompletedTurn(turn: ActiveTurn, observedNativeTurnId?: string): Promise<void> {
@@ -795,7 +807,8 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       // only) progress edge. Replay it after the RPC binds nativeTurnId.
       if (!turn.requestAccepted && turn.requestKind === 'start') {
         const alreadyBufferedStart = turn.pendingNotifications.some(
-          notification => notification.method === 'turn/started',
+          notification => notification.method === 'turn/started'
+            && (notification.params?.turnId ?? notification.params?.turn?.id) === startedId,
         );
         if (!alreadyBufferedStart) turn.pendingNotifications.push(msg);
         return;

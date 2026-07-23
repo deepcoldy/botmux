@@ -906,6 +906,8 @@ interface ObservedPosixLeaseDirectory {
   names: string[];
   generationName?: string;
   generationStat?: BigIntStats;
+  generationNames?: string[];
+  generationStats?: Map<string, BigIntStats>;
 }
 
 function errnoCode(err: unknown): string | undefined {
@@ -1064,50 +1066,58 @@ function observePosixLeaseDirectory(
   if (!samePosixStatIdentity(before, after)) return undefined;
   assertPosixLeaseDirectoryStat(after, platform);
   const generationNames = names.filter(name => POSIX_DIRECTORY_GENERATION_RE.test(name));
+  const generationStats = new Map<string, BigIntStats>();
+  for (const candidateName of generationNames) {
+    const candidateGeneration = candidateName.match(POSIX_DIRECTORY_GENERATION_RE)?.[1];
+    const candidatePath = join(directory, candidateName);
+    try {
+      const candidateStat = lstatSync(candidatePath, { bigint: true });
+      assertPrivatePosixLeaseRecord(
+        candidateStat,
+        'Codex App POSIX directory generation',
+        platform,
+      );
+      const persistedGeneration = readOwnedRegularFile(
+        candidatePath,
+        128,
+        'Codex App POSIX directory generation',
+        platform,
+      );
+      const verifiedStat = lstatSync(candidatePath, { bigint: true });
+      assertPrivatePosixLeaseRecord(
+        verifiedStat,
+        'Codex App POSIX directory generation',
+        platform,
+      );
+      if (!candidateGeneration || persistedGeneration !== candidateGeneration
+          || !samePosixStatIdentity(candidateStat, verifiedStat)) {
+        throw new Error('Codex App POSIX directory generation verification failed');
+      }
+      generationStats.set(candidateName, verifiedStat);
+    } catch (err) {
+      if (errnoCode(err) === 'ENOENT') return undefined;
+      throw err;
+    }
+  }
   if (generationNames.length > 1) {
-    throw new Error('Codex App POSIX owner lease contains multiple directory generations');
+    return {
+      stat: after,
+      identity: posixFileIdentity(after),
+      names,
+      generationNames,
+      generationStats,
+    };
   }
   const generationName = generationNames[0];
   if (!generationName) return { stat: after, identity: posixFileIdentity(after), names };
   const generation = generationName.match(POSIX_DIRECTORY_GENERATION_RE)?.[1];
-  const generationPath = join(directory, generationName);
-  try {
-    const generationStat = lstatSync(generationPath, { bigint: true });
-    assertPrivatePosixLeaseRecord(
-      generationStat,
-      'Codex App POSIX directory generation',
-      platform,
-    );
-    const persistedGeneration = readOwnedRegularFile(
-      generationPath,
-      128,
-      'Codex App POSIX directory generation',
-      platform,
-    );
-    const verifiedGenerationStat = lstatSync(generationPath, { bigint: true });
-    assertPrivatePosixLeaseRecord(
-      verifiedGenerationStat,
-      'Codex App POSIX directory generation',
-      platform,
-    );
-    if (!generation || persistedGeneration !== generation
-        || !samePosixStatIdentity(generationStat, verifiedGenerationStat)) {
-      throw new Error('Codex App POSIX directory generation verification failed');
-    }
-    return {
-      stat: after,
-      identity: { ...posixFileIdentity(after), generation },
-      names,
-      generationName,
-      generationStat: verifiedGenerationStat,
-    };
-  } catch (err) {
-    // The exact marker can disappear after readdir when the owner releases or
-    // a contender completes cleanup. Treat that as a changed snapshot so the
-    // caller retries against the next directory generation.
-    if (errnoCode(err) === 'ENOENT') return undefined;
-    throw err;
-  }
+  return {
+    stat: after,
+    identity: { ...posixFileIdentity(after), generation },
+    names,
+    generationName,
+    generationStat: generationStats.get(generationName),
+  };
 }
 
 function createStagedPosixLeaseRecord(input: {
@@ -1230,6 +1240,62 @@ function retirePosixDirectoryGeneration(
   return true;
 }
 
+/** Recover only the crash residue in which the directory contains two or more
+ * individually valid generation markers and no actor can still be live. Each
+ * exact marker inode is moved out before unlink, so a concurrent replacement
+ * turns into a retry instead of deleting successor authority. */
+function retireAmbiguousPosixDirectoryGenerations(
+  directory: string,
+  observed: ObservedPosixLeaseDirectory,
+  leasesRoot: string,
+  sessionId: string,
+  platform: NodeJS.Platform,
+): boolean {
+  const observedNames = observed.generationNames;
+  const observedStats = observed.generationStats;
+  if (!observedNames || observedNames.length < 2 || !observedStats) return false;
+  const current = observePosixLeaseDirectory(directory, platform);
+  if (!current
+      || !samePosixFileIdentity(current.identity, observed.identity)
+      || current.names.length !== observedNames.length
+      || current.generationNames?.length !== observedNames.length
+      || current.generationNames.some((name, index) => name !== observedNames[index])) return false;
+  for (const name of observedNames) {
+    const expectedStat = observedStats.get(name);
+    const currentStat = current.generationStats?.get(name);
+    if (!expectedStat || !currentStat || !samePosixStatIdentity(expectedStat, currentStat)) {
+      return false;
+    }
+  }
+  for (const name of observedNames) {
+    const expectedStat = observedStats.get(name)!;
+    const markerPath = join(directory, name);
+    const retired = join(
+      leasesRoot,
+      `.retired-generation-${sessionKey(sessionId).slice(0, 16)}-${randomBytes(16).toString('hex')}`,
+    );
+    try {
+      renameSync(markerPath, retired);
+    } catch (err) {
+      if (errnoCode(err) === 'ENOENT') return false;
+      throw err;
+    }
+    try {
+      const moved = lstatSync(retired, { bigint: true });
+      assertPrivatePosixLeaseRecord(moved, 'Retired Codex App POSIX directory generation', platform);
+      if (!samePosixStatIdentity(expectedStat, moved)) {
+        throw new Error('Codex App POSIX directory generation changed during retirement');
+      }
+    } finally {
+      try { unlinkSync(retired); } catch { /* residue is outside authority */ }
+    }
+  }
+  try { rmdirSync(directory); } catch (err) {
+    if (errnoCode(err) !== 'ENOENT' && errnoCode(err) !== 'ENOTEMPTY') throw err;
+  }
+  return true;
+}
+
 function assertPosixLeaseDirectoryStat(stat: BigIntStats, platform: NodeJS.Platform): void {
   if (!stat.isDirectory() || stat.isSymbolicLink() || exactBigIntMode(stat.mode) !== PRIVATE_DIRECTORY_MODE) {
     throw new Error('Codex App POSIX owner lease must be a real 0700 directory');
@@ -1245,7 +1311,7 @@ function posixLeaseRecordMatchesDirectory(
   const identity = 'identity' in directory ? directory.identity : directory;
   if (!samePosixFileIdentity(observed.record.directoryIdentity, identity)) return false;
   return observed.record.version === 2
-    ? observed.record.directoryIdentity.generation === undefined
+    ? identity.generation === undefined
     : observed.record.directoryIdentity.generation === identity.generation;
 }
 
@@ -1478,6 +1544,65 @@ export async function acquireCodexAppPosixOwnerLease(
     ));
     if (knownNames.length !== snapshot.names.length) {
       throw new Error('Codex App POSIX owner lease contains an unknown record');
+    }
+
+    if ((snapshot.generationNames?.length ?? 0) > 1) {
+      let retiredActor = false;
+      for (const name of snapshot.names.filter(candidate => (
+        POSIX_OWNER_RECORD_RE.test(candidate)
+        || POSIX_OWNER_PENDING_RE.test(candidate)
+        || POSIX_REAPER_RECORD_RE.test(candidate)
+        || POSIX_REAPER_PENDING_RE.test(candidate)
+      ))) {
+        const observed = observePosixLeaseRecord(
+          join(directory, name),
+          name,
+          options.sessionId,
+          platform,
+          now(),
+          'Codex App POSIX ambiguous-generation actor',
+        );
+        if (!observed) {
+          await retry();
+          continue acquireLoop;
+        }
+        if (observed.record) {
+          const status = inspectOwner(
+            observed.record.pid,
+            observed.record.processStartToken,
+          );
+          if (status !== 'dead') {
+            await retry();
+            continue acquireLoop;
+          }
+        } else if (observed.ageMs < initializationGraceMs) {
+          await retry();
+          continue acquireLoop;
+        }
+        if (!retireObservedPosixLeaseRecord(
+          observed,
+          leasesRoot,
+          options.sessionId,
+          platform,
+        )) {
+          await retry();
+          continue acquireLoop;
+        }
+        retiredActor = true;
+      }
+      if (retiredActor) continue;
+      const ageMs = Math.max(0, now() - Number(snapshot.stat.mtimeMs));
+      if (ageMs < initializationGraceMs
+          || !retireAmbiguousPosixDirectoryGenerations(
+            directory,
+            snapshot,
+            leasesRoot,
+            options.sessionId,
+            platform,
+          )) {
+        await retry();
+      }
+      continue;
     }
 
     // A live/unknown cleaner is authority and blocks fail-closed. A dead or

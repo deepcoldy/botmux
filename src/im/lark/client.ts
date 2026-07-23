@@ -2,7 +2,13 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
+import {
+  configureLarkClientHttpTimeout,
+  getBotClient,
+  getAllBots,
+  getBot,
+  formatLarkError,
+} from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
@@ -67,11 +73,16 @@ function getAllBotClients() {
       // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
       cfgs = getAllBots().map((b) => b.config);
     }
-    allBotClients = cfgs.map((cfg) => ({
-      appId: cfg.larkAppId,
-      cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
-    }));
+    allBotClients = cfgs.map((cfg) => {
+      const client = new Client({
+        appId: cfg.larkAppId,
+        appSecret: cfg.larkAppSecret,
+        domain: sdkDomain(normalizeBrand(cfg.brand as any)),
+        logger: probeLarkLogger,
+      });
+      configureLarkClientHttpTimeout(client);
+      return { appId: cfg.larkAppId, cliId: cfg.cliId, client };
+    });
   }
   return allBotClients;
 }

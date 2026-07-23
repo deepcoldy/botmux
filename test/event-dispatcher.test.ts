@@ -5955,6 +5955,61 @@ describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
     expect(handled).toEqual(['msg-topic-seed', 'msg-topic-reply']);
   });
 
+  it('bounds a reply wait when the earlier seed routing lookup is wedged', async () => {
+    vi.useFakeTimers();
+    try {
+      capturedHandlers = {};
+      __resetAnchorQueues();
+      __resetEventClaimsForTest();
+      config.daemon.forwardFollowupWaitMs = 25;
+      let releaseSeedMode!: (mode: 'topic') => void;
+      const seedMode = new Promise<'topic'>(resolve => { releaseSeedMode = resolve; });
+      mockGetChatMode.mockReset()
+        .mockImplementationOnce(async () => seedMode)
+        .mockResolvedValue('topic');
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      const handled: string[] = [];
+      handlers.handleNewTopic.mockImplementation(async data => {
+        handled.push(data.message.message_id);
+      });
+      handlers.handleThreadReply.mockImplementation(async data => {
+        handled.push(data.message.message_id);
+      });
+      const mentions = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA seed' }),
+        messageId: 'msg-wedged-seed',
+        chatId: 'chat-wedged-seed',
+        chatType: 'group',
+        mentions,
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA reply' }),
+        messageId: 'msg-wedged-reply',
+        rootId: 'msg-wedged-seed',
+        threadId: 'omt-wedged',
+        chatId: 'chat-wedged-seed',
+        chatType: 'group',
+        mentions,
+      });
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      capturedHandlers['im.message.receive_v1'](reply);
+      await vi.advanceTimersByTimeAsync(5_030);
+      expect(handled).toContain('msg-wedged-reply');
+
+      releaseSeedMode('topic');
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      expect(handled).toContain('msg-wedged-seed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('releases the chat routing barrier after enqueue so distinct topics still execute concurrently', async () => {
     mockGetChatMode.mockReset().mockResolvedValue('topic');
     let releaseFirst!: () => void;

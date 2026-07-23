@@ -1144,7 +1144,7 @@ describe('codex-app-runner app-server protocol integration', () => {
     ['history-no-match', 'found no match'],
     ['history-multi-match', 'found multiple matches'],
   ] as const) {
-    it(`fails closed without settlement when bounded history ${expectedReason}`, async () => {
+    it(`fails closed with an explicit settled error when bounded history ${expectedReason}`, async () => {
       const dir = mkdtempSync(join(tmpdir(), `botmux-codex-runner-${behavior}-`));
       const fakeCodex = join(dir, 'fake-codex');
       const logPath = join(dir, 'requests.jsonl');
@@ -1159,16 +1159,20 @@ describe('codex-app-runner app-server protocol integration', () => {
           text: 'must match exactly',
           clientUserMessageId: 'om_conflict',
         })}\r`);
-        await waitFor(harness, () => control.markers.some(marker => marker.kind === 'diagnostic'));
-        await new Promise(resolvePromise => setTimeout(resolvePromise, 100));
+        await waitFor(harness, () => control.markers.some(marker => marker.kind === 'diagnostic')
+          && control.finals.length === 1
+          && control.states.filter(state => state.busy === false).length >= 2);
         const diagnostic = control.markers.find(marker => marker.kind === 'diagnostic');
         expect(diagnostic?.payload).toMatchObject({
           code: 'native_turn_identity_conflict',
           turnId: 'om_conflict',
           message: expect.stringContaining(expectedReason),
         });
-        expect(control.finals).toEqual([]);
-        expect(control.states.filter(state => state.busy === false)).toHaveLength(1);
+        expect(control.finals[0]).toMatchObject({
+          turnId: 'om_conflict',
+          content: expect.stringContaining('Codex App native turn identity conflict'),
+        });
+        expect(control.states.filter(state => state.busy === false).length).toBeGreaterThanOrEqual(2);
         expect(harness.child.exitCode).toBeNull();
       } finally {
         await stopChild(harness.child);

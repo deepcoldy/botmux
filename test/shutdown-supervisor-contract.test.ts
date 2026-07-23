@@ -287,6 +287,8 @@ describe('graceful shutdown supervisor contract', () => {
   });
 
   it('bounds and freshly verifies every public PM2 start surface with compensation', () => {
+    expect(cli).toContain('const PM2_START_VERIFY_MIN_TIMEOUT_MS = 60_000;');
+    expect(cli).toContain('pm2StartVerifyTimeoutMs(configuredNames.length)');
     const regions = [
       cli.slice(cli.indexOf('async function cmdStart()'), cli.indexOf('/**\n * Wipe stale dashboard-daemon descriptors')),
       cli.slice(cli.indexOf('async function cmdRestart()'), cli.indexOf('/**\n * Bring a SINGLE bot')),
@@ -351,7 +353,7 @@ describe('graceful shutdown supervisor contract', () => {
   });
 
   it('discovers legacy Gods from the process table and rechecks duplicate Gods before mutation', () => {
-    const start = cli.indexOf('function cleanupLegacyPm2()');
+    const start = cli.indexOf('function cleanupLegacyPm2(');
     const end = cli.indexOf('async function cmdStop()', start);
     const legacy = cli.slice(start, end);
     expect(legacy).toContain('listPm2GodDaemonPids(legacyHome)');
@@ -360,6 +362,24 @@ describe('graceful shutdown supervisor contract', () => {
     expect(legacy).toContain('preflightNodeSanity(legacyHome)');
 
     expect(cli).not.toContain("runPm2(['kill']");
+  });
+
+  it('exposes an explicit double-confirmed first-upgrade bootstrap without weakening normal shutdown', () => {
+    const bootstrapStart = cli.indexOf('function bootstrapDeleteAllBotmuxProcesses(');
+    const bootstrapEnd = cli.indexOf('/**\n * One-time migration', bootstrapStart);
+    const bootstrap = cli.slice(bootstrapStart, bootstrapEnd);
+    expect(bootstrap).toContain('readSupervisorProcessStartIdentity(entry.pid)');
+    expect(bootstrap).toContain('current.pid !== original.pid');
+    expect(bootstrap).toContain("runPm2(\n      ['delete', String(current.pmId)]");
+
+    const restartStart = cli.indexOf('async function cmdRestart()');
+    const restartEnd = cli.indexOf('/**\n * Bring a SINGLE bot', restartStart);
+    const restart = cli.slice(restartStart, restartEnd);
+    expect(restart).toContain("process.argv.includes('--bootstrap-shutdown-protocol')");
+    expect(restart).toContain("process.argv.includes('--yes')");
+    expect(restart).toContain("bootstrapDeleteAllBotmuxProcesses('restart')");
+    expect(restart).toContain('else deleteAllBotmuxProcesses()');
+    expect(cli).toContain('botmux restart --bootstrap-shutdown-protocol --yes');
   });
 
   it('rejects include-pm2 before breadcrumb/fleet mutation when a live God exists', () => {

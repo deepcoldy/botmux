@@ -273,6 +273,7 @@ describe('worker pipe initial screen ordering', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const spawnStart = source.indexOf('async function spawnCli(');
     const prepareIdx = source.indexOf('await prepareCodexAppControlGeneration(', spawnStart);
+    const pluginPrepareIdx = source.indexOf('await prepareCliPluginGenerationAndGateway(cfg, cliAdapter)', prepareIdx);
     const backendSpawnIdx = source.indexOf('backend.spawn(spawnBin, spawnArgs', prepareIdx);
 
     expect(spawnStart).toBeGreaterThan(-1);
@@ -282,6 +283,9 @@ describe('worker pipe initial screen ordering', () => {
     expect(source.slice(spawnStart, prepareIdx)).toContain('const spawnGeneration = ++cliSpawnGeneration;');
     expect(source.slice(prepareIdx, backendSpawnIdx))
       .toContain('if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();');
+    expect(source.slice(pluginPrepareIdx, backendSpawnIdx)
+      .match(/if \(spawnGeneration !== cliSpawnGeneration\) throw new CliSpawnSupersededError\(\);/g))
+      .toHaveLength(2);
     expect(source).toContain('function killCli(opts: { preservePending?: boolean } = {}): void {\n  cliSpawnGeneration++;');
     expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(3);
   });

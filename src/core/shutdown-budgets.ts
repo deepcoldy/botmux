@@ -29,7 +29,7 @@ export const PM2_DAEMON_RESTART_DELAY_MS = 3_000;
 /** A full restart-delay plus projection jitter. The fleet helper must observe
  * this quiet window after every signalled generation exits. */
 export const FLEET_SUCCESSOR_SETTLE_MS = PM2_DAEMON_RESTART_DELAY_MS + 500;
-export const FLEET_DAEMON_EXIT_WAIT_MS = 35_000;
+export const FLEET_DAEMON_EXIT_WAIT_MS = 60_000;
 
 if (PM2_DAEMON_KILL_TIMEOUT_MS <= DAEMON_SHUTDOWN_MAX_MS) {
   throw new Error('PM2 daemon kill timeout must exceed the complete daemon shutdown budget');

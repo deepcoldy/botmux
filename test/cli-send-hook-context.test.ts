@@ -93,6 +93,12 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toContain('a document-comment turn supports only its exact plain-text comment reply');
   });
 
+  it('retains per-turn document-comment routing for non-Codex CLI adapters only', () => {
+    expect(cliSource).toContain("originSession?.cliId !== 'codex-app' && !!docTarget");
+    expect(cliSource).toContain('const isOriginDocCommentTurn =');
+    expect(cliSource.match(/if \(isOriginDocCommentTurn\)/g)).toHaveLength(2);
+  });
+
   it('binds delivery-sink authority to the trusted origin, not --session-id destination', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
@@ -383,7 +389,7 @@ describe('cmdSend hook context wiring', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const docGuard = cmdSend.indexOf("if (exactOriginDispatch?.deliverySink === 'doc_comment')");
+    const docGuard = cmdSend.indexOf('if (isOriginDocCommentTurn)');
     expect(docGuard).toBeGreaterThan(-1);
     expect(docGuard).toBeLessThan(cmdSend.indexOf('// Read content from:'));
     expect(docGuard).toBeLessThan(cmdSend.indexOf('content = readFileSync(contentFile'));
@@ -409,7 +415,7 @@ describe('cmdSend hook context wiring', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const docSendStart = cmdSend.indexOf("if (exactOriginDispatch?.deliverySink === 'doc_comment')", cmdSend.indexOf('// Read content from:'));
+    const docSendStart = cmdSend.indexOf('if (isOriginDocCommentTurn)', cmdSend.indexOf('// Read content from:'));
     const mentionParsing = cmdSend.indexOf('// Parse mentions:', docSendStart);
     const docSend = cmdSend.slice(docSendStart, mentionParsing);
     expect(docSend).toContain('Daemon settlement owns exact target retirement.');

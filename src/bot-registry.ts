@@ -30,6 +30,16 @@ export type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 
+/** Bound every official-SDK HTTP call so one stalled provider request cannot
+ * hold a bot-turn admission or maintenance mutation indefinitely. */
+export const LARK_REQUEST_TIMEOUT_MS = 15_000;
+
+export function configureLarkClientHttpTimeout(client: unknown): void {
+  const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
+    ?.httpInstance?.defaults;
+  if (defaults) defaults.timeout = LARK_REQUEST_TIMEOUT_MS;
+}
+
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
@@ -1393,6 +1403,7 @@ export function registerBot(cfg: BotConfig): BotState {
     domain: sdkDomain(normalizeBrand(cfg.brand)),
     logger: larkLogger,
   });
+  configureLarkClientHttpTimeout(client);
   const state: BotState = {
     config: cfg,
     client,

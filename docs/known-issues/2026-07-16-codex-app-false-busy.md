@@ -129,7 +129,7 @@ spawn 前，pending 状态同时保留旧 public identity 和 fresh candidate pu
 
 **改动规模与兼容性：** 这是一次较大的 supervisor control-plane 改动，涉及 CLI fleet admission、daemon descriptor、loopback shutdown IPC、start rollback 和 restart report；它不改变 Codex App turn / final 的业务协议，也不把不安全的自动 kill 当成兼容降级。外部脚本若绕过 Botmux 直接改 `bots.json` 或直接调用 PM2，不受 advisory lock 保护，仍属于明确的外部边界。
 
-**首次升级操作边界：** 已运行的旧 daemon 没有新 capability 时，普通 `botmux stop` / `botmux restart` 会在任何 daemon signal 前 fail closed；这是预期安全行为，不是可自动忽略的错误。操作者必须先确认所有 Session 与 Riff workload 均 idle，在获批维护窗口内做一次人工 bootstrap：按环境的受控流程终止旧 core / PM2 runtime，再启动新版本，并验证全部配置 row 都 `online` 且发布 handler-ready descriptor。自动更新只能报告“新包已安装、restart 已请求或被阻断”；在新 fleet 完整验证并提交 restart attempt 之前，不得宣称更新已应用。
+**首次升级操作边界：** 已运行的旧 daemon 没有新 capability 时，普通 `botmux stop` / `botmux restart` 会在任何 daemon signal 前 fail closed；这是预期安全行为，不是可自动忽略的错误。操作者必须先独立确认所有 Session 与 Riff workload 均 idle，在获批维护窗口内一次性运行 `botmux restart --bootstrap-shutdown-protocol --yes`。该显式双确认入口逐个绑定并复核 PM2 `name + pm_id + PID + process birth` 后退役旧 core，再按新协议启动并验证全部配置 row 都 `online` 且发布 handler-ready descriptor；它不会由 upgrade/update 自动调用。自动更新只能报告“新包已安装、restart 已请求或被阻断”；在新 fleet 完整验证并提交 restart attempt 之前，不得宣称更新已应用。
 
 ## 修复前后效果
 

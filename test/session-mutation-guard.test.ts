@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
-import { hasProtectedSessionMutationOwnership } from '../src/core/session-mutation-guard.js';
+import {
+  hasProtectedSessionMutationOwnership,
+  protectedSessionMutationReasons,
+} from '../src/core/session-mutation-guard.js';
 
 function session(overrides: Partial<Session> = {}): Session {
   return {
@@ -48,6 +51,20 @@ describe('hasProtectedSessionMutationOwnership', () => {
     } as DaemonSession;
     expect(hasProtectedSessionMutationOwnership(ds)).toBe(true);
     expect(hasProtectedSessionMutationOwnership(session())).toBe(false);
+  });
+
+  it('classifies backend-neutral ownership separately from Codex App dispatches', () => {
+    expect(protectedSessionMutationReasons(session({
+      cliId: 'traex',
+      queued: true,
+      pendingRepoSetup: { mode: 'picker', prompt: 'OPENING_N' },
+    }))).toEqual(['queued_todo', 'repository_setup']);
+    expect(protectedSessionMutationReasons(session({
+      cliId: 'codex-app',
+      codexAppDispatchLedger: [{
+        dispatchId: 'dispatch-n', turnId: 'turn-n', state: 'accepted', content: 'N',
+      }],
+    }))).toEqual(['codex_app_dispatch']);
   });
 
   it.each([

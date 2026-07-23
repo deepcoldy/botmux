@@ -367,6 +367,15 @@ describe('closeSession()', () => {
     expect(reloaded!.closedAt).toBeDefined();
   });
 
+  it('clears the non-generational worker pid atomically on close', () => {
+    const session = createSession('chat1', 'root1', 'Close PID');
+    session.pid = process.pid;
+    updateSession(session);
+    closeSession(session.sessionId);
+    init();
+    expect(getSession(session.sessionId)?.pid).toBeUndefined();
+  });
+
   it('durably abandons Codex App dispatch recovery state on explicit close', () => {
     const session = createSession('chat1', 'root1', 'Close Pending Codex');
     session.codexAppDispatchLedger = [{

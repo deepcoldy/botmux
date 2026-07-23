@@ -504,6 +504,7 @@ export function closeSession(
   if (session) {
     const priorStatus = session.status;
     const priorClosedAt = session.closedAt;
+    const priorPid = session.pid;
     const priorLedger = session.codexAppDispatchLedger;
     const priorCommits = session.codexAppGenerationCommits;
     const priorRiffParentTaskId = session.riffParentTaskId;
@@ -526,6 +527,11 @@ export function closeSession(
     };
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
+    // A persisted worker pid is not a teardown identity: after close it can be
+    // reused by an unrelated process and make later policy checks report a
+    // permanent false-live row. Runtime worker/pane teardown remains tracked by
+    // the active registry and stamped persistent backend.
+    session.pid = undefined;
     // Closing is an explicit abandon boundary, unlike suspend/daemon crash.
     // Never let a later generic resume replay prepared Codex App input the
     // user intentionally discarded, and retire generation ACK history with
@@ -557,6 +563,7 @@ export function closeSession(
     } catch (err) {
       session.status = priorStatus;
       session.closedAt = priorClosedAt;
+      session.pid = priorPid;
       session.codexAppDispatchLedger = priorLedger;
       session.codexAppGenerationCommits = priorCommits;
       session.riffParentTaskId = priorRiffParentTaskId;
