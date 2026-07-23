@@ -1,8 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
-import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
-import { shouldDeferInitialPromptForArgLimit } from '../src/utils/pending-input-queue.js';
+import {
+  resolveInitialPromptDelivery,
+  shouldDeferInitialPromptForArgLimit,
+} from '../src/utils/pending-input-queue.js';
+import { PI_INITIAL_PROMPT_COMMAND } from '../src/adapters/cli/pi-initial-prompt-extension.js';
 
 process.env.BOTMUX_TIME_SCALE ??= '0.01';
 
@@ -41,45 +47,71 @@ describe('initial prompt argv byte-limit fallback', () => {
     })).toBe(false);
   });
 
-  it('routes over-limit Pi first prompts out of spawn args and into the worker queue exactly once', async () => {
+  it('routes long Pi first prompts through @file argv instead of the worker queue', () => {
     const adapter = createPiAdapter('/bin/pi');
-    const prompt = '长卡片'.repeat(2500); // > 10KB UTF-8, above Pi's tmux-safe argv budget.
+    const prompt = '长卡片'.repeat(2500); // > 10KB UTF-8, above Pi's old tmux-safe argv budget.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-limit-'));
+    try {
+      const prepared = adapter.prepareInitialPromptArg!({
+        initialPrompt: prompt,
+        sessionId: 'sess-pi-long',
+        sessionDataDir: dataDir,
+      });
+      const deferInitialPrompt = shouldDeferInitialPromptForArgLimit({
+        passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+        prompt: prepared.initialPrompt,
+        maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+      });
+      const args = adapter.buildArgs({
+        sessionId: 'sess-pi-long',
+        resume: false,
+        initialPrompt: deferInitialPrompt ? undefined : prepared.initialPrompt,
+      });
+      const shouldQueue = shouldQueueInitialPrompt({
+        hasPrompt: true,
+        rpcEngineActive: false,
+        queuePrompt: false,
+        passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
+        deferInitialPrompt,
+      });
 
-    const deferInitialPrompt = shouldDeferInitialPromptForArgLimit({
-      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
-      prompt,
-      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+      expect(adapter.maxInitialPromptArgBytes).toBeUndefined();
+      expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(10_000);
+      expect(prepared.initialPrompt).toMatch(/^@.+\.prompt\.md$/);
+      expect(readFileSync(prepared.cleanupPaths![0]!, 'utf-8')).toBe(prompt);
+      expect(deferInitialPrompt).toBe(false);
+      expect(args).toEqual(['--session-id', 'sess-pi-long', prepared.initialPrompt]);
+      expect(args).not.toContain(prompt);
+      expect(shouldQueue).toBe(false);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('uses Pi native message delivery instead of TUI-pasting a transformed long prompt when deferred', () => {
+    const original = 'x'.repeat(10_000);
+    const preparedArg = '@/data/pi-initial-prompts/session/initial.prompt.md';
+    expect(resolveInitialPromptDelivery({
+      originalPrompt: original,
+      preparedArg,
+      preparedDeferredContent: PI_INITIAL_PROMPT_COMMAND,
+      defer: true,
+    })).toEqual({
+      queuedContent: PI_INITIAL_PROMPT_COMMAND,
+      logicalContent: original,
     });
-    const args = adapter.buildArgs({
-      sessionId: 'sess-pi-long',
-      resume: false,
-      initialPrompt: deferInitialPrompt ? undefined : prompt,
-    });
-    const shouldQueue = shouldQueueInitialPrompt({
-      hasPrompt: true,
-      rpcEngineActive: false,
-      queuePrompt: false,
-      passesInitialPromptViaArgs: adapter.passesInitialPromptViaArgs === true,
-      deferInitialPrompt,
-    });
+  });
 
-    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
-    expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(10_000);
-    expect(deferInitialPrompt).toBe(true);
-    expect(args).toEqual(['--session-id', 'sess-pi-long']);
-    expect(args).not.toContain(prompt);
-    expect(shouldQueue).toBe(true);
-
-    const pty = {
-      write: vi.fn(),
-      pasteText: vi.fn(),
-      sendSpecialKeys: vi.fn(),
-    } satisfies PtyHandle;
-    if (shouldQueue) await adapter.writeInput(pty, prompt);
-
-    expect(pty.pasteText).toHaveBeenCalledTimes(1);
-    expect(pty.pasteText).toHaveBeenCalledWith(prompt);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  it('preserves legacy argv and deferred queue behavior without an adapter command', () => {
+    expect(resolveInitialPromptDelivery({
+      originalPrompt: 'hello',
+      preparedArg: 'prepared',
+      defer: false,
+    })).toEqual({ argvPrompt: 'prepared' });
+    expect(resolveInitialPromptDelivery({
+      originalPrompt: 'hello',
+      preparedArg: 'prepared',
+      defer: true,
+    })).toEqual({ queuedContent: 'hello' });
   });
 });

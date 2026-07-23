@@ -44,6 +44,15 @@ export interface DaemonSession {
   /** Independent read-only xterm capability. Optional for hydrated/legacy
    * sessions; live workers publish it with their ready event. */
   workerViewToken?: string | null;
+  /** Latest process identity reported over the trusted worker IPC channel.
+   * Used to quiesce legacy unconfined CLIs before device credentials exist. */
+  localProcessAttestation?: {
+    backendType: import('../adapters/backend/types.js').BackendType;
+    credentialIsolated: boolean;
+    cliPid?: number;
+    cliProcStart?: string;
+    workerGeneration?: number;
+  };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;

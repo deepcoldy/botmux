@@ -1,6 +1,7 @@
 import { Menu, Tray, nativeImage, type BrowserWindow } from 'electron';
 
 export function createDesktopTray(args: {
+  iconPath: string;
   window: BrowserWindow;
   onStart: () => void;
   onStop: () => void;
@@ -8,9 +9,9 @@ export function createDesktopTray(args: {
   onOpenLogs: () => void;
   onOpenHome: () => void;
 }): Tray {
-  // Keep the menu-bar lifecycle functional even before a branded tray icon
-  // asset exists.
-  const tray = new Tray(nativeImage.createEmpty());
+  const icon = nativeImage.createFromPath(args.iconPath);
+  icon.setTemplateImage(true);
+  const tray = new Tray(icon);
   const showWindow = () => {
     args.window.show();
     args.window.focus();

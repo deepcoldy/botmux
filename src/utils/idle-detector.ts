@@ -1,5 +1,7 @@
 import type { CliAdapter } from '../adapters/cli/types.js';
 
+export type IdleEvidenceSource = 'screen' | 'external';
+
 /** Spinner frames — animate while CLI is working.
  *  Includes Claude Code symbols, Ink dots braille chars (Gemini),
  *  and OpenCode progress bar chars (■⬝). */
@@ -15,7 +17,7 @@ export class IdleDetector {
   private lastSpinnerAt = 0;
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
-  private idleCallback: (() => void) | null = null;
+  private idleCallback: ((source: IdleEvidenceSource) => void) | null = null;
   private completionPattern: RegExp | undefined;
   private readyPattern: RegExp | undefined;
   private readySeen = false;
@@ -25,7 +27,7 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
   }
 
-  onIdle(cb: () => void): void {
+  onIdle(cb: (source: IdleEvidenceSource) => void): void {
     this.idleCallback = cb;
   }
 
@@ -68,7 +70,7 @@ export class IdleDetector {
       this.clearTimer();
       this.quiescenceTimer = setTimeout(() => {
         this.quiescenceTimer = null;
-        if (!this.isIdle) this.markIdle();
+        if (!this.isIdle) this.markIdle('screen');
       }, 500);
       return;
     }
@@ -89,6 +91,20 @@ export class IdleDetector {
     this.clearTimer();
   }
 
+  /**
+   * Drop prompt evidence observed before a SessionStart boundary. Unlike the
+   * ordinary per-turn reset, this does not synthesize a recent spinner: once
+   * Claude finishes the remaining parallel hooks, its newly rendered prompt
+   * should need only the normal quiescence window.
+   */
+  resetReadyEvidence(): void {
+    this.isIdle = false;
+    this.outputTail = '';
+    this.readySeen = false;
+    this.lastSpinnerAt = 0;
+    this.clearTimer();
+  }
+
   /** External idle source — lets transcript-driven detectors (Claude jsonl
    *  Stop, Codex rollout assistant_final, CoCo events.jsonl finish_reason
    *  stop) push idle without waiting for screen-pattern + quiescence to
@@ -96,7 +112,7 @@ export class IdleDetector {
    *  for the next turn — same lifecycle as the internal markIdle path. */
   fireIdle(): void {
     if (this.isIdle) return;
-    this.markIdle();
+    this.markIdle('external');
   }
 
   dispose(): void {
@@ -115,14 +131,14 @@ export class IdleDetector {
       );
       return;
     }
-    this.markIdle();
+    this.markIdle('screen');
   }
 
-  private markIdle(): void {
+  private markIdle(source: IdleEvidenceSource): void {
     this.isIdle = true;
     this.outputTail = '';
     this.clearTimer();
-    this.idleCallback?.();
+    this.idleCallback?.(source);
   }
 
   private clearTimer(): void {

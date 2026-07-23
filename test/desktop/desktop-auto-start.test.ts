@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DesktopRuntimeState } from '../../src/desktop/shared/types.js';
-import { autoStartCliRuntimeOnLaunch, shouldAutoStartCliRuntime } from '../../src/desktop/main/auto-start.js';
+import { autoStartCliRuntimeOnLaunch, shouldAutoStartCliRuntime, shouldTakeOverExternalRuntime } from '../../src/desktop/main/auto-start.js';
 
 function runtimeState(overrides: Partial<DesktopRuntimeState>): DesktopRuntimeState {
   return {
@@ -21,12 +21,14 @@ function runtimeState(overrides: Partial<DesktopRuntimeState>): DesktopRuntimeSt
 describe('desktop launch auto-start', () => {
   it('starts the selected CLI runtime when the app opens and the runtime is stopped', async () => {
     const start = vi.fn().mockResolvedValue({ code: 0, stdout: 'started', stderr: '' });
+    const takeover = vi.fn();
     const monitor = { refresh: vi.fn().mockResolvedValue(undefined) };
 
     const result = await autoStartCliRuntimeOnLaunch({
       runtime: {
         getState: vi.fn().mockResolvedValue(runtimeState({ status: 'stopped' })),
         start,
+        takeover,
       },
       monitor,
     });
@@ -34,6 +36,26 @@ describe('desktop launch auto-start', () => {
     expect(result).toBe('started');
     expect(start).toHaveBeenCalledTimes(1);
     expect(monitor.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('replaces an external fleet with the bundled runtime on launch', async () => {
+    const takeover = vi.fn().mockResolvedValue({ code: 0, stdout: 'restarted', stderr: '' });
+    const result = await autoStartCliRuntimeOnLaunch({
+      runtime: {
+        getState: vi.fn().mockResolvedValue(runtimeState({
+          status: 'degraded',
+          runtimeManaged: false,
+          runtimeSource: 'global-cli',
+          runtimePath: '/usr/local/lib/node_modules/botmux/dist/index-daemon.js',
+        })),
+        start: vi.fn(),
+        takeover,
+      },
+    });
+
+    expect(result).toBe('started');
+    expect(takeover).toHaveBeenCalledOnce();
+    expect(shouldTakeOverExternalRuntime(runtimeState({ status: 'degraded', runtimeManaged: false }))).toBe(true);
   });
 
   it('skips states that are not safe for Desktop to start automatically', async () => {

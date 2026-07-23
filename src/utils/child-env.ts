@@ -107,6 +107,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_OWNER_OPEN_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
+  // Pi deferred long-first-prompt extension reads one exact per-session file.
+  'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
   // (whose daemon discovery dir is Seatbelt-denied) need it to reach the
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).

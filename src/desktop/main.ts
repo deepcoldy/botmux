@@ -2,10 +2,11 @@ import { app, session, shell, type BrowserWindow, type Session, type Tray } from
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { autoStartCliRuntimeOnLaunch } from './main/auto-start.js';
-import { discoverExternalRuntimeCandidate } from './main/external-runtime.js';
+import { autoStartCliRuntimeOnLaunch, shouldTakeOverExternalRuntime } from './main/auto-start.js';
 import { createRuntimeStateMonitor, registerDesktopIpc } from './main/ipc.js';
 import { resolveDesktopPaths } from './main/paths.js';
+import { resolveBundledRuntimeCandidate } from './main/bundled-runtime.js';
+import { probeShellPathEnv } from './main/external-runtime.js';
 import { listPm2Apps } from './main/pm2-apps.js';
 import { createRuntimeService } from './main/runtime-service.js';
 import { createDesktopTray } from './main/tray.js';
@@ -61,33 +62,51 @@ async function bootstrap(): Promise<void> {
     devRepoRoot: process.cwd(),
   });
   const appVersion = resolveDesktopAppVersion(app.getVersion());
+  const bundledRuntime = resolveBundledRuntimeCandidate({
+    resourcesPath: process.resourcesPath,
+    repoRoot: process.cwd(),
+    isPackaged: app.isPackaged,
+    arch: process.arch,
+    appVersion,
+    env: process.env,
+  });
   const runtime = createRuntimeService({
     paths,
     appVersion,
     execPath: process.execPath,
     env: process.env,
     fs: { existsSync, readFileSync },
-    // Re-scan the user's global CLI on every status/action path so an in-place
-    // `botmux upgrade` is detected without requiring the desktop app to restart.
-    discoverExternalRuntime: () => discoverExternalRuntimeCandidate(paths),
-    pm2Apps: async selectedRuntime => listPm2Apps(paths, selectedRuntime),
+    bundledRuntime,
+    // Finder-launched apps inherit launchd's minimal PATH; the daemon needs the
+    // user's real shell PATH (zsh/bash, profile+rc) to find per-bot CLIs.
+    shellPathEnv: () => probeShellPathEnv(),
+    pm2Apps: async selectedRuntime => listPm2Apps(paths, selectedRuntime, { pathEnv: probeShellPathEnv() }),
   });
 
   const win = createMainWindow(join(desktopDir, 'preload.cjs'), join(desktopDir, 'renderer'));
   mainWindow = win;
+  let ownershipRepair: Promise<void> | null = null;
   const monitor = createRuntimeStateMonitor({
     runtime,
     sendState: state => {
       if (!win.isDestroyed()) win.webContents.send('desktop:state-changed', state);
+      // A user may invoke an older/global `botmux restart` after Desktop has
+      // launched. Reclaim the fleet instead of allowing the external runtime
+      // to remain connected to the same bots.
+      if (shouldTakeOverExternalRuntime(state) && !ownershipRepair) {
+        ownershipRepair = runtime.takeover()
+          .then(() => monitor.refresh())
+          .catch(error => console.warn('[desktop] bundled runtime ownership repair failed', error))
+          .finally(() => { ownershipRepair = null; });
+      }
     },
   });
   registerDesktopIpc({ paths, runtime, monitor });
-  monitor.start();
   void autoStartCliRuntimeOnLaunch({
     runtime,
     monitor,
     warn: message => console.warn(`[desktop] ${message}`),
-  });
+  }).finally(() => monitor.start());
   win.on('close', event => {
     // Closing the window should not stop the supervised daemon; explicit Quit
     // exits the shell, explicit Stop controls the runtime.
@@ -98,6 +117,7 @@ async function bootstrap(): Promise<void> {
   });
 
   tray = createDesktopTray({
+    iconPath: join(desktopDir, 'assets', 'trayTemplate.png'),
     window: win,
     onStart: () => {
       void runtime.start();

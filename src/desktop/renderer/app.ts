@@ -1,4 +1,10 @@
-import type { DashboardLocateResult, DesktopRuntimeState, LogTail, LogTarget } from '../shared/types.js';
+import type {
+  DashboardLocateResult,
+  DesktopDeviceStatusResult,
+  DesktopRuntimeState,
+  LogTail,
+  LogTarget,
+} from '../shared/types.js';
 import {
   currentDashboardUrlFromSrc,
   dashboardRouteFromUrl,
@@ -35,6 +41,7 @@ type DesktopLocale = 'zh' | 'en';
 
 interface BotmuxDesktopApi {
   getState: () => Promise<unknown>;
+  getDeviceStatus?: () => Promise<DesktopDeviceStatusResult>;
   start: () => Promise<RunResult>;
   stop: () => Promise<RunResult>;
   restart: () => Promise<RunResult>;
@@ -67,7 +74,10 @@ const desktopShellInjectedCss = `
   }
 
   .app-shell {
-    display: block !important;
+    /* Preserve the dashboard's viewport-height flex chain so its main element
+       receives a definite height and remains the vertical scroll container. */
+    display: flex !important;
+    flex-direction: column !important;
     grid-template-columns: minmax(0, 1fr) !important;
     min-height: 100vh !important;
   }
@@ -121,6 +131,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'runtime.bridgeUnavailable': '桌面桥接不可用',
     'runtime.bridgeUnavailableDetail': '重启 Botmux Desktop 以重新连接 IPC。',
     'runtimeSource.globalCli': '全局 CLI',
+    'runtimeSource.bundled': '内置运行时',
     'runtimeSource.none': '未连接 CLI',
     'version.unavailable': '版本信息不可用',
     'empty.notConfigured': '添加机器人后启动 CLI，即可加载控制台。',
@@ -202,6 +213,7 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'runtime.bridgeUnavailable': 'Desktop bridge unavailable',
     'runtime.bridgeUnavailableDetail': 'Restart Botmux Desktop to reconnect IPC.',
     'runtimeSource.globalCli': 'Global CLI',
+    'runtimeSource.bundled': 'Bundled runtime',
     'runtimeSource.none': 'No CLI connected',
     'version.unavailable': 'Version unavailable',
     'empty.notConfigured': 'Add a bot, then start the CLI to load the dashboard.',

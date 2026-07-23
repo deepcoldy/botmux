@@ -112,6 +112,27 @@ export interface CliAdapter {
     remoteThreadId?: string;
   }): string[];
 
+  /** Adapter-specific chance to rewrite the first prompt before buildArgs sees
+   *  it. Used for CLIs that support file positional args for long prompts: the
+   *  worker can still treat the prompt as args-baked and skip stdin fallback. */
+  prepareInitialPromptArg?(opts: {
+    initialPrompt: string;
+    sessionId: string;
+    sessionDataDir?: string;
+  }): {
+    initialPrompt: string;
+    readonlyRoots?: string[];
+    cleanupPaths?: string[];
+    cleanupDirs?: string[];
+    /** Safe, short TUI input used only when worker policy must defer this
+     * prepared argv prompt (startup commands, durable cold-start, etc.). */
+    deferredInput?: {
+      content: string;
+      additionalArgs?: string[];
+      env?: Record<string, string>;
+    };
+  };
+
   /** When true, the adapter passes the initial prompt via CLI args (e.g. -i).
    *  The worker skips queuing the prompt for stdin write unless another
    *  defer condition routes it through the post-start input queue. */

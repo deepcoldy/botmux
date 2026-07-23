@@ -13,6 +13,8 @@ describe('desktop local source installer docs', () => {
     expect(script).toContain('BOTMUX_DESKTOP_VERSION');
     expect(script).toContain('-c.extraMetadata.version="$APP_VERSION"');
     expect(script).toContain('pnpm desktop:bundle');
+    expect(script).toContain('pnpm desktop:runtime');
+    expect(script).toContain('pnpm build');
     expect(script).toContain('electron-builder --mac dir');
     expect(script).toContain('codesign --force --deep --sign -');
     expect(script).toContain('xattr -dr com.apple.quarantine');
@@ -24,9 +26,12 @@ describe('desktop local source installer docs', () => {
     expect(script).not.toContain('botmux app');
 
     expect(electronBuilderConfig).toContain('afterPack: build/after-pack.cjs');
+    expect(electronBuilderConfig).toContain('from: build/desktop-runtime');
+    expect(electronBuilderConfig).toContain('icon: build/icon.png');
 
     expect(readme).toContain('bash src/desktop/install-local.sh');
     expect(readme).toContain('脚本只安装 App');
+    expect(readme).toContain('App 自带版本匹配的 Node、botmux 和 PM2');
     expect(readme).toContain('BOTMUX_DESKTOP_VERSION');
     expect(readme).not.toContain('pnpm link --global');
     expect(readme).not.toContain('~/.botmux/bin/botmux');
@@ -56,6 +61,7 @@ describe('desktop local source installer docs', () => {
     expect(hook).toContain('NSMicrophoneUsageDescription');
     expect(hook).toContain('NSScreenCaptureUsageDescription');
     expect(hook).toContain('/usr/libexec/PlistBuddy');
+    expect(hook).toContain("execFileSync('tar', ['-xzf', stagedModules");
     expect(hook).not.toContain('osascript');
   });
 });

@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm install -g pnpm
+      - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
@@ -41,6 +41,7 @@ jobs:
 
       - run: pnpm build
       - run: pnpm desktop:bundle
+      - run: pnpm desktop:runtime
 
       - name: Decode App Store Connect API key
         env:
@@ -100,7 +101,7 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - run: npm install -g pnpm
+      - run: npm install -g pnpm@9.5.0
       - run: pnpm install --frozen-lockfile
 
       - name: Sync version from git tag to package.json

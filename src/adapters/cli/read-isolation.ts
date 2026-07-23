@@ -21,6 +21,11 @@
  */
 
 import { managedOriginCapabilityPath } from '../../core/managed-origin-capability.js';
+import {
+  DEVICE_AUTHORITY_DIRECTORY,
+  DEVICE_CREDENTIAL_FILE,
+  DEVICE_ENROLLMENT_JOURNAL_FILE,
+} from '../../platform/device-paths.js';
 
 /** Normalize a path for the deny/allow lists: require ABSOLUTE, strip trailing
  *  slashes, reject `..` traversal. Returns null for anything unusable so the
@@ -122,6 +127,134 @@ export interface V2IsolationContext {
   extraDenyPaths?: string[];
 }
 
+/** Root-level host authority files retained for machine binding/back-compat.
+ * They live outside every per-bot BOT_HOME, so no chat-driven CLI may read or
+ * rotate them. New device secrets live below DEVICE_AUTHORITY_DIRECTORY and
+ * are masked by directory, so future filenames/atomic sidecars need no policy
+ * update. */
+export const HOST_DEVICE_CREDENTIAL_FILES = [
+  'platform.json',
+  // Pre-dedicated-directory builds. Keep exact + sidecar policy so an upgrade
+  // never exposes a legacy credential left at BOTMUX_HOME root.
+  DEVICE_CREDENTIAL_FILE,
+  DEVICE_ENROLLMENT_JOURNAL_FILE,
+] as const;
+export const DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME = '.device-credential-isolation';
+
+function hostDeviceAuthorityPaths(root: string): string[] {
+  return [
+    `${root}/${DEVICE_AUTHORITY_DIRECTORY}`,
+    ...HOST_DEVICE_CREDENTIAL_FILES.map(file => `${root}/${file}`),
+  ];
+}
+
+/** Fixed authority marker. It deliberately ignores SESSION_DATA_DIR and every
+ * child-controlled env value: enrollment writes this under the real user home
+ * before credentials exist, then workers treat it as a one-way security gate. */
+export function deviceCredentialIsolationMarkerPath(homeDir: string): string {
+  return `${homeDir.replace(/\/+$/, '')}/.botmux/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+}
+
+/** A root entry hidden by credential-only isolation. Prefix matching lets the
+ * worker include current atomic-write sidecars and legacy backups; arbitrary
+ * future device files are covered wholesale by DEVICE_AUTHORITY_DIRECTORY. */
+export function isCredentialIsolationReservedBasename(name: string): boolean {
+  return name === DEVICE_AUTHORITY_DIRECTORY
+    || name === DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME
+    || name.startsWith(`${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}.`)
+    || HOST_DEVICE_CREDENTIAL_FILES.some(file => name === file || name.startsWith(`${file}.`));
+}
+
+export function credentialIsolationRequired(input: {
+  markerExists: boolean;
+  deviceCredentialExists: boolean;
+}): boolean {
+  return input.markerExists || input.deviceCredentialExists;
+}
+
+export type CredentialOnlyIsolationGate =
+  | { required: false; mode: 'off' }
+  | { required: true; mode: 'remote-bypass' }
+  | { required: true; mode: 'covered' }
+  | { required: true; mode: 'seatbelt' | 'bwrap' }
+  | { required: true; mode: 'blocked'; failClosedReason: string };
+
+/**
+ * Resolve the mandatory credential boundary independently of optional/full
+ * read isolation. There is intentionally no adapter capability or bot sandbox
+ * toggle input: once the marker/device exists, every locally spawned CLI must
+ * be covered even when `supportsReadIsolation=false` and `sandbox=false`.
+ */
+export function evaluateCredentialOnlyIsolationGate(input: {
+  markerExists: boolean;
+  deviceCredentialExists: boolean;
+  remoteBackend: boolean;
+  platform: string;
+  mechanismAvailable: boolean;
+  /** An already-selected Seatbelt/full-bwrap profile will include this policy. */
+  fullIsolationCoversCredentials: boolean;
+}): CredentialOnlyIsolationGate {
+  const required = credentialIsolationRequired(input);
+  if (!required) return { required: false, mode: 'off' };
+  if (input.remoteBackend) return { required: true, mode: 'remote-bypass' };
+  if (input.fullIsolationCoversCredentials) return { required: true, mode: 'covered' };
+  if (input.platform !== 'darwin' && input.platform !== 'linux') {
+    return {
+      required: true,
+      mode: 'blocked',
+      failClosedReason: `credential isolation unsupported on ${input.platform}`,
+    };
+  }
+  if (!input.mechanismAvailable) {
+    return {
+      required: true,
+      mode: 'blocked',
+      failClosedReason: input.platform === 'darwin'
+        ? 'sandbox-exec is unavailable'
+        : 'bubblewrap is unavailable',
+    };
+  }
+  return { required: true, mode: input.platform === 'darwin' ? 'seatbelt' : 'bwrap' };
+}
+
+export interface CredentialIsolationContext {
+  homeDir: string;
+  botmuxHome: string;
+  defaultBotmuxHome?: string;
+}
+
+export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
+  roots: string[];
+  denyPaths: string[];
+  denyRegexes: string[];
+  denyWritePaths: string[];
+  denyWriteRegexes: string[];
+  denyWriteLiterals: string[];
+} {
+  const h = ctx.homeDir.replace(/\/+$/, '');
+  const bh = ctx.botmuxHome.replace(/\/+$/, '');
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
+  const roots = dedupe([defaultBh, bh]);
+  const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
+  const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  const denyRegexes = roots.flatMap(root =>
+    HOST_DEVICE_CREDENTIAL_FILES.map(file =>
+      `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
+  denyRegexes.push(
+    `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+  );
+  return {
+    roots,
+    denyPaths: dedupe([...credentialPaths, markerPath]),
+    denyRegexes: dedupe(denyRegexes),
+    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWriteRegexes: dedupe(denyRegexes),
+    // Prevent replacing a credential root symlink/directory to escape the
+    // canonical path rules. Literal does not deny unrelated descendants.
+    denyWriteLiterals: roots,
+  };
+}
+
 /** v2 DENY set (HYBRID). The F1 fix is a WHOLE-deny of the CLI data dirs `~/.claude`
  *  (+ `~/.claude.json`) and `~/.codex`: this bot's OWN CLI data is redirected into its
  *  BOT_HOME (readable) via CLAUDE_CONFIG_DIR/CODEX_HOME, so whole-denying the globals
@@ -184,6 +317,10 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       `${sd}/frozen-cards`,            // conversation content (all bots')
       `${sd}/turn-sends`,              // CLI only APPENDS markers here — read-deny is safe
       `${sd}/crash-diagnostics`,
+      // Long Pi first prompts may contain the full hidden routing/identity
+      // context. Deny the shared root, then the worker carves back only this
+      // session's private subdirectory.
+      `${sd}/pi-initial-prompts`,
       // All bots' Feishu-uploaded files. Own per-appId bucket (attachments/<self>/) is
       // re-allowed via buildV2CarveOuts; siblings' buckets + the legacy flat
       // per-messageId layout stay denied.
@@ -212,6 +349,11 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       // (isolated bots can read others' scheduled prompts) until schedule-store
       // fail-closes on read errors (ENOENT vs EPERM). See PR #387 review.
       `${bh}/feishu-session.json`,     // Feishu web login session (setup automation) — can mint bots
+      // Machine + device bearer/refresh credentials belong to the trusted host.
+      // Deny both the fixed ~/.botmux location used by platform binding and the
+      // configured BOTMUX_HOME so a custom SESSION_DATA_DIR cannot create a gap.
+      ...[defaultBh, bh].flatMap(hostDeviceAuthorityPaths),
+      `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`,
       // The dashboard admin credentials. `.dashboard-secret` signs the loopback-HMAC
       // that gates `/__cli/rotate` AND the daemon-IPC write-link routes — the ipc-server
       // comment (dashboard-ipc-server.ts) explicitly relies on the sandbox hiding it to
@@ -278,11 +420,14 @@ export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
     // the whole basename class at both the fixed and custom roots so a live
     // isolated process cannot race-read a fully populated temp inode.
     ...botmuxRoots.flatMap(root => [
+      ...HOST_DEVICE_CREDENTIAL_FILES.map(file =>
+        `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`),
       `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
       `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
       `^${escapeForRegex(root)}/plugins/[^/]+/private(?:/|$)`,
       `^${escapeForRegex(root)}/plugins/[^/]+/dist/mcp/index\\.json$`,
     ]),
+    `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
     `^${escapeForRegex(sd)}/sessions/[^/]+/plugin-mcp-runtime\\.json$`,
   ]);
 }
@@ -316,7 +461,9 @@ export function buildReadIsolationProtectedWriteRules(
       ...dashboardRoots.flatMap(root => [
         `${root}/.dashboard-secret`,
         `${root}/.dashboard-token`,
+        ...hostDeviceAuthorityPaths(root),
       ]),
+      `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`,
       ...sessionDataDirs.flatMap(root => [
         `${root}/.botmux-cli-pids`,
         `${root}/read-isolation`,
@@ -324,6 +471,8 @@ export function buildReadIsolationProtectedWriteRules(
     ]),
     denyWriteRegexes: dedupe([
       ...dashboardRoots.flatMap(root => [
+        ...HOST_DEVICE_CREDENTIAL_FILES.map(file =>
+          `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`),
         `^${escapeForRegex(root)}/\\.dashboard-secret(?:\\.|$)`,
         `^${escapeForRegex(root)}/\\.dashboard-token(?:\\.|$)`,
         `^${escapeForRegex(root)}/plugins/[^/]+/private(?:/|$)`,
@@ -331,6 +480,7 @@ export function buildReadIsolationProtectedWriteRules(
       ]),
       ...sessionDataDirs.map(root =>
         `^${escapeForRegex(root)}/sessions/[^/]+/plugin-mcp-runtime\\.json$`),
+      `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
     ]),
     // Prevent replacing an entire authority-bearing root to sidestep the
     // exact/regex child rules. `literal` protects only the directory entry;
@@ -390,6 +540,8 @@ export interface WriteSandboxContext {
   homeDir: string;
   /** BOTMUX_HOME root (e.g. `~/.botmux`). */
   botmuxHome: string;
+  /** Canonical fixed `~/.botmux` root when it differs from botmuxHome. */
+  defaultBotmuxHome?: string;
   /** botmux session data root (SESSION_DATA_DIR, e.g. `~/.botmux/data`). */
   sessionDataDir: string;
   /** The session's project working dir — writes here PERSIST (the point of the sandbox). */
@@ -423,11 +575,12 @@ export function buildWriteSandboxRules(ctx: WriteSandboxContext): {
   allowWritePaths: string[];
   allowWriteRegexes: string[];
   denyWritePaths: string[];
+  denyWriteRegexes: string[];
 } {
   const h = ctx.homeDir.replace(/\/+$/, '');
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const sd = ctx.sessionDataDir.replace(/\/+$/, '');
-  const defaultBh = `${h}/.botmux`;
+  const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
   const wd = ctx.workingDir.replace(/\/+$/, '');
   const keep = (arr: string[]) =>
     dedupe(arr.map(normalizeIsolationPath).filter((p): p is string => !!p));
@@ -473,8 +626,18 @@ export function buildWriteSandboxRules(ctx: WriteSandboxContext): {
       `${bh}/feishu-session.json`,
       `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
       `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
+      ...[defaultBh, bh].flatMap(hostDeviceAuthorityPaths),
+      `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`,
       `${sd}/.botmux-cli-pids`, `${sd}/read-isolation`,
     ]),
+    // Atomic credential writes use `<name>.<pid>.<random>.tmp` beside the
+    // target. Protect the whole basename class so a broad project/home allow
+    // cannot stage and rename a replacement around the exact-file deny.
+    denyWriteRegexes: dedupe([defaultBh, bh].flatMap(root =>
+      HOST_DEVICE_CREDENTIAL_FILES.map(file =>
+        `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`)).concat(
+      `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+    )),
   };
 }
 
@@ -549,8 +712,11 @@ export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
     `${bh}/feishu-session.json`,
     `${defaultBh}/.dashboard-secret`, `${defaultBh}/.dashboard-token`,
     `${bh}/.dashboard-secret`, `${bh}/.dashboard-token`,
+    ...[defaultBh, bh].flatMap(hostDeviceAuthorityPaths),
+    `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`,
     `${sd}/sessions.json`, `${sd}/frozen-cards`, `${sd}/turn-sends`,
     `${sd}/crash-diagnostics`, `${sd}/queues`, `${sd}/read-isolation`,
+    `${sd}/pi-initial-prompts`,
     `${sd}/.botmux-cli-pids`,
     // attachments/ is masked WHOLESALE (like macOS) — covers every sibling bucket
     // AND the legacy flat per-messageId layout (which per-sibling enumeration can't
@@ -640,7 +806,12 @@ export function buildSeatbeltProfile(
   /** When set, layer the macOS file-sandbox WRITE isolation (Linux-bwrap twin) into
    *  the SAME profile: deny all writes, re-allow the writable zones, then final-deny
    *  the crown jewels. Reads are unaffected. Omit for read-isolation-only sessions. */
-  writeSandbox?: { allowWritePaths: string[]; allowWriteRegexes?: string[]; denyWritePaths: string[] },
+  writeSandbox?: {
+    allowWritePaths: string[];
+    allowWriteRegexes?: string[];
+    denyWritePaths: string[];
+    denyWriteRegexes?: string[];
+  },
   /** Host-owned files that must remain immutable even for legacy read-only
    * isolation (where writes are otherwise unrestricted). Emitted last so they
    * also win over a broad write-sandbox allow. */
@@ -681,6 +852,7 @@ export function buildSeatbeltProfile(
     for (const p of writeSandbox.allowWritePaths) lines.push(`(allow file-write* (subpath "${esc(p)}"))`);
     for (const r of writeSandbox.allowWriteRegexes ?? []) lines.push(`(allow file-write* (regex #"${escRe(r)}"))`);
     for (const p of writeSandbox.denyWritePaths) lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
+    for (const r of writeSandbox.denyWriteRegexes ?? []) lines.push(`(deny file-write* (regex #"${escRe(r)}"))`);
   }
   for (const p of protectedWrites?.denyWritePaths ?? []) {
     lines.push(`(deny file-write* (subpath "${esc(p)}"))`);
@@ -694,11 +866,39 @@ export function buildSeatbeltProfile(
   return lines.join('\n') + '\n';
 }
 
-export const ISOLATION_PANE_MARKER_VERSION = 5;
+// Version 7 records the exact confinement capabilities attached to a live
+// process. A credential-only pane is safe to reattach while the bot remains in
+// credential-only mode, but must cold-spawn if full read/write isolation is
+// enabled later. A version alone cannot express that strengthening transition.
+// Version 6 was intentionally skipped to avoid colliding with an experimental
+// marker layout that briefly shipped in intermediate device-isolation branches.
+export const ISOLATION_PANE_MARKER_VERSION = 7;
+
+export type IsolationCapability = 'credential' | 'read' | 'write';
+
+const ALL_ISOLATION_CAPABILITIES: readonly IsolationCapability[] = [
+  'credential',
+  'read',
+  'write',
+] as const;
+
+function normalizeIsolationCapabilities(
+  capabilities: readonly IsolationCapability[],
+): IsolationCapability[] {
+  const requested = new Set(capabilities);
+  return ALL_ISOLATION_CAPABILITIES.filter(capability => requested.has(capability));
+}
 
 /** Versioned marker written beside a freshly spawned persistent sandbox. */
-export function isolationPaneMarkerContent(bootId: string): string {
-  return JSON.stringify({ version: ISOLATION_PANE_MARKER_VERSION, bootId });
+export function isolationPaneMarkerContent(
+  bootId: string,
+  capabilities: readonly IsolationCapability[],
+): string {
+  return JSON.stringify({
+    version: ISOLATION_PANE_MARKER_VERSION,
+    bootId,
+    capabilities: normalizeIsolationCapabilities(capabilities),
+  });
 }
 
 /**
@@ -714,12 +914,27 @@ export function isolationPaneMarkerContent(bootId: string): string {
  * permissions across daemon restarts and must be cold-spawned under the new
  * profile. The boot id remains diagnostic and is not compared across restarts.
  */
-export function isolatedPaneReattachSafe(markerContent: string | null | undefined): boolean {
+export function isolatedPaneReattachSafe(
+  markerContent: string | null | undefined,
+  requiredCapabilities: readonly IsolationCapability[] = [],
+): boolean {
   try {
-    const parsed = JSON.parse(markerContent ?? '') as { version?: unknown; bootId?: unknown };
+    const parsed = JSON.parse(markerContent ?? '') as {
+      version?: unknown;
+      bootId?: unknown;
+      capabilities?: unknown;
+    };
+    if (!Array.isArray(parsed.capabilities)
+      || parsed.capabilities.some(capability =>
+        typeof capability !== 'string'
+        || !ALL_ISOLATION_CAPABILITIES.includes(capability as IsolationCapability))) {
+      return false;
+    }
+    const actual = new Set(parsed.capabilities as IsolationCapability[]);
     return parsed.version === ISOLATION_PANE_MARKER_VERSION
       && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0;
+      && parsed.bootId.trim().length > 0
+      && requiredCapabilities.every(capability => actual.has(capability));
   } catch {
     return false;
   }

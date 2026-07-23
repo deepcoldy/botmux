@@ -135,7 +135,7 @@ done
 ```bash
 #!/bin/bash
 # ~/bin/agentbuddy-update.sh
-export npm_config_registry="https://bnpm.byted.org"
+export npm_config_registry="https://your-registry.example.com"  # 如使用私有 npm 源
 npx -y agentbuddy update -y 2>/dev/null
 ```
 

@@ -2,7 +2,8 @@ import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node
 import { existsSync as pathExistsSync } from 'node:fs';
 import { delimiter, dirname, join } from 'node:path';
 import type { DesktopPaths } from '../shared/types.js';
-import type { ExternalRuntimeCandidate } from './runtime-service.js';
+import { buildBundledPath } from './node-command.js';
+import type { RuntimeLaunchTarget } from './runtime-service.js';
 import { parsePm2Apps, type Pm2AppSummary } from './runtime-source.js';
 
 interface Pm2ListDeps {
@@ -11,13 +12,15 @@ interface Pm2ListDeps {
   execPath?: string;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  /** Probed user shell PATH for bundled runtimes (see probeShellPathEnv). */
+  pathEnv?: string;
 }
 
 export const defaultPm2ListTimeoutMs = 25_000;
 
 export function listPm2Apps(
   paths: DesktopPaths,
-  runtime: ExternalRuntimeCandidate,
+  runtime: RuntimeLaunchTarget,
   deps: Pm2ListDeps = {},
 ): Promise<Pm2AppSummary[]> {
   const existsSync = deps.existsSync ?? pathExistsSync;
@@ -27,14 +30,21 @@ export function listPm2Apps(
     return Promise.reject(new Error(`PM2 binary not found: ${pm2Bin}`));
   }
 
-  const command = pm2Bin;
-  const args = ['jlist'];
+  const command = runtime.kind === 'bundled' ? runtime.nodePath : pm2Bin;
+  const args = runtime.kind === 'bundled' ? [pm2Bin, 'jlist'] : ['jlist'];
   const baseEnv = deps.env ?? process.env;
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     // External PM2 bins use /usr/bin/env node; Finder-launched apps need a
     // repaired PATH so discovery does not depend on the user's shell startup.
-    PATH: withRuntimePath(baseEnv.PATH, runtime.binPath, runtime.pathEnv),
+    // jlist may be the first pm2 contact and thus start the pm2 daemon, whose
+    // env sticks and propagates into resurrected apps — so the bundled branch
+    // carries the probed shell PATH with the SAME ordering as the daemon-start
+    // spawn (buildBundledPath); pm2 itself is launched via the absolute
+    // nodePath and never resolves node through this PATH.
+    PATH: runtime.kind === 'bundled'
+      ? buildBundledPath(baseEnv.PATH, runtime.nodePath, deps.pathEnv)
+      : withRuntimePath(baseEnv.PATH, runtime.binPath, runtime.pathEnv),
     PM2_HOME: paths.pm2Home,
     SESSION_DATA_DIR: paths.dataDir,
   };

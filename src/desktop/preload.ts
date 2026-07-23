@@ -4,6 +4,9 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 // primitives into the browser context.
 contextBridge.exposeInMainWorld('botmuxDesktop', {
   getState: () => ipcRenderer.invoke('desktop:get-state'),
+  // Main returns an allow-listed public DTO only. The renderer never receives
+  // device access/refresh tokens or raw CLI stdout/stderr.
+  getDeviceStatus: () => ipcRenderer.invoke('desktop:get-device-status'),
   start: () => ipcRenderer.invoke('desktop:start'),
   stop: () => ipcRenderer.invoke('desktop:stop'),
   restart: () => ipcRenderer.invoke('desktop:restart'),

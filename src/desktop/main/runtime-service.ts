@@ -2,8 +2,9 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { callDashboard, type DashboardResult } from '../../cli/dashboard-endpoint.js';
 import type { DesktopPaths, DesktopRuntimeState, RuntimeSource } from '../shared/types.js';
-import { buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
+import { buildBundledBotmuxCommand, buildExternalBotmuxCommand, type BotmuxCommand } from './node-command.js';
 import { classifyRuntimeSource, countActiveBotmuxDaemonApps, type Pm2AppSummary } from './runtime-source.js';
+import { sanitizeDeviceStatusCommandResult } from './device-status.js';
 
 export interface RunResult {
   code: number;
@@ -12,9 +13,16 @@ export interface RunResult {
   signal?: NodeJS.Signals | null;
 }
 
-type RunCommand = (cmd: BotmuxCommand) => Promise<RunResult>;
+interface RunCommandOptions {
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+}
+
+type RunCommand = (cmd: BotmuxCommand, options?: RunCommandOptions) => Promise<RunResult>;
 type DashboardEndpointCaller = (path: '/__cli/current') => Promise<DashboardResult>;
 const defaultCommandTimeoutMs = 30_000;
+const defaultCommandOutputLimitBytes = 1024 * 1024;
+const deviceStatusOutputLimitBytes = 4 * 1024;
 
 export interface ExternalRuntimeCandidate {
   kind: 'external';
@@ -23,23 +31,42 @@ export interface ExternalRuntimeCandidate {
   binPath: string;
   pathEnv?: string;
   version: string;
-  runtimeSource?: Exclude<RuntimeSource, 'none'>;
+  runtimeSource?: 'global-cli';
 }
 
-export type RuntimeLaunchTarget = ExternalRuntimeCandidate;
+export interface BundledRuntimeCandidate {
+  kind: 'bundled';
+  root: string;
+  cliPath: string;
+  nodePath: string;
+  version: string;
+  runtimeSource: 'bundled';
+}
 
-function defaultRun(cmd: BotmuxCommand, timeoutMs = defaultCommandTimeoutMs): Promise<RunResult> {
+export type RuntimeLaunchTarget = ExternalRuntimeCandidate | BundledRuntimeCandidate;
+
+function defaultRun(
+  cmd: BotmuxCommand,
+  timeoutMs = defaultCommandTimeoutMs,
+  maxOutputBytes = defaultCommandOutputLimitBytes,
+): Promise<RunResult> {
   return new Promise(resolve => {
     const child = spawn(cmd.command, cmd.args, { env: cmd.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let outputBytes = 0;
     let settled = false;
+    let forceKillTimer: NodeJS.Timeout | undefined;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       // Timeout is surfaced as an ordinary failed action so renderer controls
       // can recover and show the last error without waiting for child close.
       child.kill();
+      forceKillTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 1_000);
+      forceKillTimer.unref?.();
       resolve({
         code: 1,
         stdout,
@@ -55,16 +82,36 @@ function defaultRun(cmd: BotmuxCommand, timeoutMs = defaultCommandTimeoutMs): Pr
       resolve(result);
     };
 
+    const appendOutput = (target: 'stdout' | 'stderr', chunk: Buffer | string) => {
+      if (settled) return;
+      const text = String(chunk);
+      const bytes = Buffer.byteLength(text);
+      if (outputBytes + bytes > maxOutputBytes) {
+        child.kill('SIGKILL');
+        finish({
+          code: 1,
+          stdout,
+          stderr: `Command output exceeded ${maxOutputBytes} bytes`,
+          signal: null,
+        });
+        return;
+      }
+      outputBytes += bytes;
+      if (target === 'stdout') stdout += text;
+      else stderr += text;
+    };
+
     child.stdout.on('data', chunk => {
-      stdout += String(chunk);
+      appendOutput('stdout', chunk);
     });
     child.stderr.on('data', chunk => {
-      stderr += String(chunk);
+      appendOutput('stderr', chunk);
     });
     child.on('error', error => {
       finish({ code: 1, stdout, stderr: stderr || error.message, signal: null });
     });
     child.on('close', (code, signal) => {
+      if (forceKillTimer) clearTimeout(forceKillTimer);
       // Signal-only exits still represent a failed desktop action to the UI.
       finish({
         code: code ?? 1,
@@ -101,15 +148,34 @@ export interface RuntimeServiceDeps {
   commandTimeoutMs?: number;
   externalRuntime?: ExternalRuntimeCandidate | null;
   discoverExternalRuntime?: () => ExternalRuntimeCandidate | null;
-  pm2Apps?: (runtime: ExternalRuntimeCandidate) => Promise<Pm2AppSummary[]>;
+  bundledRuntime?: BundledRuntimeCandidate;
+  /** Probed user shell PATH for bundled-runtime spawns (see probeShellPathEnv). */
+  shellPathEnv?: () => string | undefined;
+  pm2Apps?: (runtime: RuntimeLaunchTarget) => Promise<Pm2AppSummary[]>;
 }
 
 export function createRuntimeService(deps: RuntimeServiceDeps) {
-  const run = deps.run ?? ((cmd: BotmuxCommand) => defaultRun(cmd, deps.commandTimeoutMs));
+  const run = deps.run ?? ((cmd: BotmuxCommand, options?: RunCommandOptions) => defaultRun(
+    cmd,
+    options?.timeoutMs ?? deps.commandTimeoutMs,
+    options?.maxOutputBytes ?? defaultCommandOutputLimitBytes,
+  ));
   const botsPath = join(deps.paths.botmuxHome, 'bots.json');
-  const installCliMessage = 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
+  const installCliMessage = deps.bundledRuntime
+    ? 'The bundled botmux runtime is unavailable. Reinstall Botmux Desktop.'
+    : 'Install the global botmux CLI with `npm install -g botmux`, then reopen Botmux Desktop.';
 
-  function command(runtime: ExternalRuntimeCandidate, args: string[]): BotmuxCommand {
+  function command(runtime: RuntimeLaunchTarget, args: string[]): BotmuxCommand {
+    if (runtime.kind === 'bundled') {
+      return buildBundledBotmuxCommand({
+        nodePath: runtime.nodePath,
+        cliPath: runtime.cliPath,
+        botmuxHome: deps.paths.botmuxHome,
+        args,
+        baseEnv: deps.env,
+        pathEnv: deps.shellPathEnv?.(),
+      });
+    }
     return buildExternalBotmuxCommand({
       binPath: runtime.binPath,
       botmuxHome: deps.paths.botmuxHome,
@@ -123,8 +189,8 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     return deps.discoverExternalRuntime ? deps.discoverExternalRuntime() : deps.externalRuntime ?? null;
   }
 
-  function activeRuntime(): ExternalRuntimeCandidate | null {
-    return currentExternalRuntime();
+  function activeRuntime(): RuntimeLaunchTarget | null {
+    return deps.bundledRuntime ?? currentExternalRuntime();
   }
 
   function rejectedCliRequired(): RunResult {
@@ -152,8 +218,14 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     return run(command(runtime, args));
   }
 
-  function externalSource(runtime: ExternalRuntimeCandidate): RuntimeSource {
+  function externalSource(runtime: RuntimeLaunchTarget): RuntimeSource {
     return runtime.runtimeSource ?? 'global-cli';
+  }
+
+  function isRuntimeOwned(runtime: RuntimeLaunchTarget, sourcePath: string | null, sourceVersion: string | null): boolean {
+    if (runtime.kind !== 'bundled') return true;
+    const ownedPath = Boolean(sourcePath && (sourcePath === runtime.cliPath || sourcePath.startsWith(`${runtime.root}/`)));
+    return ownedPath && (!sourceVersion || sourceVersion === runtime.version);
   }
 
   function readBotConfig(): { status: 'not_configured'; count: 0 } | { status: 'configured'; count: number } | { status: 'invalid'; message: string } {
@@ -182,7 +254,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
 
   async function computeState(): Promise<DesktopRuntimeState> {
     const config = readBotConfig();
-    const active = currentExternalRuntime();
+    const active = activeRuntime();
     const selectedSource = active ? externalSource(active) : 'none';
 
     if (config.status === 'invalid') {
@@ -240,6 +312,21 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         const source = classifyRuntimeSource({ pm2Apps });
         const onlineDaemonCount = countActiveBotmuxDaemonApps(pm2Apps);
         if (source.running) {
+          if (!isRuntimeOwned(active, source.sourcePath, source.sourceVersion)) {
+            return {
+              status: 'degraded',
+              appVersion: deps.appVersion,
+              runtimeVersion: active.version,
+              runtimeSource: 'global-cli',
+              runtimeManaged: false,
+              runtimePath: source.sourcePath,
+              botCount: config.count,
+              onlineDaemonCount,
+              attentionCount: 1,
+              dashboardUrl: null,
+              message: '检测到由外置 botmux 启动的运行时，Desktop 正在切换到内置运行时。',
+            };
+          }
           return {
             status: 'running',
             appVersion: deps.appVersion,
@@ -308,8 +395,13 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     },
     async takeover(): Promise<RunResult> {
       const state = await this.getState();
-      // Compatibility shim for the old IPC name: "takeover" now means adopt
-      // the selected global CLI runtime. It never stops or replaces a runtime.
+      const runtime = activeRuntime();
+      if (!runtime) return rejectedCliRequired();
+      if (runtime.kind === 'bundled') {
+        // Replace core processes only. The generated ecosystem pins their
+        // interpreter to bundled Node, while unrelated plugin services survive.
+        return run(command(runtime, ['restart']));
+      }
       return {
         code: state.runtimeManaged ? 0 : 1,
         stdout: '',
@@ -339,6 +431,17 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
             path: '/__cli/current',
           });
       return dashboardEndpointResultToRunResult(result);
+    },
+    async getDeviceStatus() {
+      const runtime = activeRuntime();
+      if (!runtime) return { ok: false as const, reason: 'cli_unavailable' as const };
+      // Device credentials stay inside the host CLI. Electron receives only the
+      // command's public status JSON, then reconstructs an allow-listed DTO
+      // before anything can cross the renderer IPC boundary.
+      const result = await run(command(runtime, ['device', 'status', '--json']), {
+        maxOutputBytes: deviceStatusOutputLimitBytes,
+      });
+      return sanitizeDeviceStatusCommandResult(result);
     },
   };
   return service;

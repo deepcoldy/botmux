@@ -9,6 +9,7 @@ function makeDeps(
   const output: string[] = [];
   return {
     platform: 'darwin',
+    arch: 'arm64',
     env: { BOTMUX_DASHBOARD_URL: 'http://127.0.0.1:7891' },
     homeDir: '/Users/me',
     exists: path => paths.includes(path),
@@ -33,7 +34,9 @@ describe('desktop smoke', () => {
   ];
 
   it('passes when the installed app, CLI, and dashboard compat endpoint are healthy', async () => {
-    const deps = makeDeps(appPaths, {
+    const bundledNode = '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node';
+    const bundledCli = '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js';
+    const deps = makeDeps([...appPaths, bundledNode, bundledCli], {
       'plutil -extract CFBundleShortVersionString raw -o - /Applications/Botmux.app/Contents/Info.plist': {
         status: 0,
         stdout: '2.96.0\n',
@@ -44,7 +47,7 @@ describe('desktop smoke', () => {
         stdout: '',
         stderr: '',
       },
-      'botmux status': {
+      [`${bundledNode} ${bundledCli} status`]: {
         status: 0,
         stdout: 'botmux running\n',
         stderr: '',
@@ -156,6 +159,44 @@ describe('desktop smoke', () => {
         stderr: '',
       },
     });
+
+    const code = await runAppSmokeCommand([], deps);
+
+    expect(code).toBe(0);
+    expect(deps.output.join('\n')).toContain('botmux CLI status');
+  });
+
+  it('falls back to the bash rc shell for bash users when botmux is missing from PATH', async () => {
+    const deps = makeDeps(appPaths, {
+      'plutil -extract CFBundleShortVersionString raw -o - /Applications/Botmux.app/Contents/Info.plist': {
+        status: 0,
+        stdout: '2.96.0\n',
+        stderr: '',
+      },
+      'codesign --verify --deep --strict --verbose=2 /Applications/Botmux.app': {
+        status: 0,
+        stdout: '',
+        stderr: '',
+      },
+      'botmux status': {
+        status: null,
+        stdout: '',
+        stderr: '',
+        error: new Error('spawnSync botmux ENOENT'),
+      },
+      // nvm-in-.bashrc install: only the interactive bash probe can see botmux.
+      '/bin/bash -ic botmux status': {
+        status: 0,
+        stdout: 'botmux running\n',
+        stderr: '',
+      },
+      'curl -fsS --max-time 5 http://127.0.0.1:7891/__desktop/compat': {
+        status: 0,
+        stdout: JSON.stringify({ schemaVersion: 1, product: 'botmux', runtimeVersion: '2.96.0', dashboardProtocolVersion: 1 }),
+        stderr: '',
+      },
+    });
+    deps.env.SHELL = '/bin/bash';
 
     const code = await runAppSmokeCommand([], deps);
 

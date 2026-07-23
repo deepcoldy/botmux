@@ -19,7 +19,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
+    "build": "pnpm audit:domains && node scripts/clean-dist.mjs && tsc && cp src/setup/lark-scopes.json dist/setup/ && pnpm dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs",
+    "audit:domains": "node scripts/audit-public-domains.mjs",
     "dashboard:bundle": "node scripts/build-dashboard.mjs",
     "dashboard:watch": "node scripts/build-dashboard.mjs --watch",
     "daemon": "tsx src/index-daemon.ts",
@@ -42,7 +43,8 @@
     "test:e2e-browser:setup": "tsx test/e2e-browser/setup-login.ts",
     "test:e2e-browser": "tsx scripts/run-e2e.ts",
     "report:dashboard": "tsx scripts/report-dashboard.ts",
-    "desktop:bundle": "esbuild src/desktop/main.ts --bundle --outfile=dist/desktop/main.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/preload.ts --bundle --outfile=dist/desktop/preload.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/renderer/app.ts --bundle --outfile=dist/desktop/renderer/app.js --platform=browser --format=iife && cp src/desktop/renderer/index.html dist/desktop/renderer/index.html && cp src/desktop/renderer/style.css dist/desktop/renderer/style.css",
+    "desktop:bundle": "node scripts/build-desktop-icons.mjs && esbuild src/desktop/main.ts --bundle --outfile=dist/desktop/main.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/preload.ts --bundle --outfile=dist/desktop/preload.cjs --platform=node --format=cjs --external:electron && esbuild src/desktop/renderer/app.ts --bundle --outfile=dist/desktop/renderer/app.js --platform=browser --format=iife && cp src/desktop/renderer/index.html dist/desktop/renderer/index.html && cp src/desktop/renderer/style.css dist/desktop/renderer/style.css && cp -R src/desktop/assets dist/desktop/assets",
+    "desktop:runtime": "node scripts/prepare-desktop-runtime.mjs",
     "desktop:smoke": "tsx scripts/desktop-smoke.ts",
     "desktop:install:local": "bash src/desktop/install-local.sh",
     "desktop:dev": "pnpm build && pnpm desktop:bundle && electron dist/desktop/main.cjs",

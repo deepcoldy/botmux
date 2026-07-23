@@ -1,5 +1,13 @@
 import { defineConfig } from '@rspress/core';
 
+const docsBase = process.env.BOTMUX_DOCS_BASE || '/';
+// Rspress resolves public assets against `base` when emitting HTML. Keeping
+// the favicon root-relative avoids a duplicated docs/public/botmux lookup;
+// the navbar logo itself needs the public base included in its emitted URL.
+const faviconPath = '/botmux-logo.png';
+const productLogoPath = `${docsBase.replace(/\/+$/, '')}/botmux-logo.png`;
+const socialLogoUrl = 'https://deepcoldy.github.io/botmux/botmux-logo.png';
+
 const zhSidebar = [
   {
     text: '开始',
@@ -148,12 +156,12 @@ const enSidebar = [
 
 export default defineConfig({
   root: 'docs',
-  base: process.env.BOTMUX_DOCS_BASE || '/',
+  base: docsBase,
   lang: 'zh',
   title: 'botmux 文档',
   description: '飞书话题群 ↔ AI 编程 CLI 桥接',
-  icon: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592185_botmux-favicon.svg',
-  logo: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592185_botmux-favicon.svg',
+  icon: faviconPath,
+  logo: productLogoPath,
   logoText: 'botmux 文档',
   // 多语言：zh 为默认语（无前缀），en 走 /en/ 前缀
   locales: [
@@ -164,10 +172,10 @@ export default defineConfig({
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
     ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
-    ['meta', { property: 'og:image', content: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592455_botmux-logo.svg' }],
+    ['meta', { property: 'og:image', content: socialLogoUrl }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
-    ['meta', { name: 'twitter:image', content: 'https://magic-builder.tos-cn-beijing.volces.com/uploads/1780767592455_botmux-logo.svg' }],
-    ['meta', { name: 'theme-color', content: '#06b6d4' }],
+    ['meta', { name: 'twitter:image', content: socialLogoUrl }],
+    ['meta', { name: 'theme-color', content: '#646CEA' }],
   ],
   search: { codeBlocks: true },
   markdown: { link: { checkDeadLinks: true } },

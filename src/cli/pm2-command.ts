@@ -25,5 +25,11 @@ export function buildPm2SpawnCommand(
     }
     return { command: nodePath, args: [pm2Script, ...args] };
   }
+  if (pm2Script !== 'pm2') {
+    // PM2's package script uses `#!/usr/bin/env node`. GUI apps, launchd and
+    // systemd commonly have a deliberately small PATH, so always use the same
+    // absolute Node interpreter that is already running botmux.
+    return { command: nodePath, args: [pm2Script, ...args] };
+  }
   return { command: pm2Script, args };
 }

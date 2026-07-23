@@ -135,7 +135,7 @@ If you prefer running `npx agentbuddy update` directly (updating the user's glob
 ```bash
 #!/bin/bash
 # ~/bin/agentbuddy-update.sh
-export npm_config_registry="https://bnpm.byted.org"
+export npm_config_registry="https://your-registry.example.com"  # if you use a private npm registry
 npx -y agentbuddy update -y 2>/dev/null
 ```
 

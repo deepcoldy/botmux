@@ -625,10 +625,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // settings.json（见下方 hookInstall.sessionStartCommand）。原因有二：
       //   1. wrapperCli=`aiden x claude` 会剥掉本 --settings（aiden 硬拒），进程级那份它拿
       //      不到；全局是它唯一能读到就绪 hook 的渠道。
-      //   2. 若进程级和全局**同时**注入 SessionStart，Claude 会等两条 hook 都退出才渲染输入框，
-      //      但 worker 在第一条 hook 发来的信号就放行首条 prompt → 首条 prompt 抢在输入框渲染前
-      //      落地 → 触发 Claude 的 paste-burst 启发式 → 多行里的软换行 `\` 被当字面量保留。
-      //      单一来源（全局）消除这个竞态，恢复原先单 hook 的时序。
+      //   2. 避免重复执行同一 botmux hook。项目级的其它 SessionStart hook 仍会按
+      //      Claude 语义并行执行；worker 把本 hook 当 selector 边界，并等待 hook 后
+      //      新 prompt 证据，所以慢项目 hook 不会让首条消息提前落地。
       // 全局即足够：Claude（含 cjadk / aiden 等启动器跑的真 claude）默认读 ~/.claude/settings.json，
       // 与 askUserQuestion hook 同源同渠道，比进程级更稳（还覆盖 adopt / 剥 --settings 的场景）。
       const inlineSettings: Record<string, unknown> = {};
@@ -922,9 +921,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
-    // Claude 家族在 spawn 时注入 SessionStart hook（见 buildArgs），回调
-    // `botmux session-ready` 给出「真就绪」信号。worker 据此武装 ready-gate：
-    // 收到信号前不投首条 prompt，绕开 cjadk 启动选择器吞首条消息的 bug。
+    // Claude 家族在 spawn 时注入 SessionStart hook，回调
+    // `botmux session-ready` 给出启动 selector 边界。worker 收到后清掉旧
+    // readyPattern 证据，并等待新 prompt 再投首条消息。
     injectsReadyHook: true,
     defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the

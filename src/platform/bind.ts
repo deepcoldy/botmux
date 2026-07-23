@@ -8,6 +8,11 @@ import { readPlatformBinding, writePlatformBinding } from './binding.js';
 import { postJson, type PostJsonResult } from './platform-http.js';
 import { callDashboard } from '../cli/dashboard-endpoint.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
+import { isManagedAgentHostCommandContext } from './host-command-context.js';
+
+export interface BindCommandDependencies {
+  isAgentContext?: () => boolean;
+}
 
 /** 解码平台生成的 bind blob：base64url(JSON{u:平台地址, t:绑定token})。 */
 function decodeBindBlob(blob: string): { platformUrl: string; token: string } | null {
@@ -22,7 +27,18 @@ function decodeBindBlob(blob: string): { platformUrl: string; token: string } | 
   return null;
 }
 
-export async function cmdBind(args: string[]): Promise<void> {
+export async function cmdBind(
+  args: string[],
+  dependencies: BindCommandDependencies = {},
+): Promise<void> {
+  // Refuse before parsing/decoding the one-time bind credential or touching the
+  // network. The OS mask is the security boundary; this guard prevents a user
+  // from accidentally handing a reusable host-authority command to an agent.
+  if ((dependencies.isAgentContext ?? isManagedAgentHostCommandContext)()) {
+    console.error('❌ botmux bind 只能在宿主终端执行；AI CLI 会话不能消费绑定凭证或修改机器归属。');
+    process.exitCode = 2;
+    return;
+  }
   let arg = '';
   let platformOverride = '';
   for (let i = 0; i < args.length; i++) {

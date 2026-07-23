@@ -12,7 +12,7 @@ import { tmpdir, homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { chmodSync, mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
+import { buildSandboxArgs, buildCredentialOnlySandboxArgs, probeHostCredentialIsolationMechanism, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
 import { defaultGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
@@ -45,6 +45,13 @@ function bindDest(args: string[], flag: string, src: string): string | undefined
 function tripleIdx(args: string[], flag: string, a: string, b: string): number {
   for (let i = 0; i < args.length - 2; i++) {
     if (args[i] === flag && args[i + 1] === a && args[i + 2] === b) return i;
+  }
+  return -1;
+}
+
+function pairIdx(args: string[], flag: string, value: string): number {
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === flag && args[i + 1] === value) return i;
   }
   return -1;
 }
@@ -189,6 +196,132 @@ describe('buildSandboxArgs (overlay model)', () => {
       expect(a).toContain(flag);
     }
   });
+});
+
+describe('credential-only bwrap authority masks', () => {
+  it('exposes a host-only, zero-input pre-enrollment mechanism probe', () => {
+    const probe = probeHostCredentialIsolationMechanism();
+    if (probe.supported) {
+      expect(['seatbelt', 'bwrap']).toContain(probe.mechanism);
+      expect(probe.executable.length).toBeGreaterThan(0);
+    } else {
+      expect(probe.mechanism).toBeNull();
+      expect(probe.reason.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('masks only dedicated authority directories and exact host files while keeping BOTMUX_HOME live', () => {
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: [
+        '/home/u/.botmux/device-auth',
+        '/srv/botmux/device-auth',
+      ],
+      hideFiles: [
+        '/home/u/.botmux/platform.json',
+        '/home/u/.botmux/.device-credential-isolation',
+        '/srv/botmux/.dashboard-secret',
+      ],
+      readonlyPaths: ['/home/u/.botmux/data/read-isolation'],
+      workingDir: '/repo',
+      cliBin: '/usr/bin/codex',
+      cliArgs: ['--resume'],
+    });
+    expect(tripleIdx(args, '--bind', '/', '/')).toBeGreaterThanOrEqual(0);
+    expect(pairIdx(args, '--tmpfs', '/home/u/.botmux/device-auth')).toBeGreaterThanOrEqual(0);
+    expect(pairIdx(args, '--tmpfs', '/srv/botmux/device-auth')).toBeGreaterThanOrEqual(0);
+    expect(tripleIdx(args, '--ro-bind', '/dev/null', '/home/u/.botmux/platform.json'))
+      .toBeGreaterThanOrEqual(0);
+    expect(tripleIdx(args, '--ro-bind', '/dev/null', '/srv/botmux/.dashboard-secret'))
+      .toBeGreaterThanOrEqual(0);
+    expect(tripleIdx(
+      args,
+      '--ro-bind',
+      '/home/u/.botmux/data/read-isolation',
+      '/home/u/.botmux/data/read-isolation',
+    )).toBeGreaterThanOrEqual(0);
+    expect(pairIdx(args, '--tmpfs', '/home/u/.botmux')).toBe(-1);
+    expect(args).not.toContain('--remount-ro');
+    expect(args).not.toContain('/home/u/.botmux/config.json');
+    expect(args.slice(-3)).toEqual(['--', '/usr/bin/codex', '--resume']);
+  });
+
+  it('rejects unsafe or empty authority masks', () => {
+    expect(() => buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/'], hideFiles: [],
+      workingDir: '/repo', cliBin: '/bin/true', cliArgs: [],
+    })).toThrow(/invalid credential isolation directory/);
+    expect(() => buildCredentialOnlySandboxArgs({
+      hideDirectories: [], hideFiles: ['relative/device.json'],
+      workingDir: '/repo', cliBin: '/bin/true', cliArgs: [],
+    })).toThrow(/invalid credential isolation file/);
+    expect(() => buildCredentialOnlySandboxArgs({
+      hideDirectories: [], hideFiles: [],
+      workingDir: '/repo', cliBin: '/bin/true', cliArgs: [],
+    })).toThrow(/at least one authority mask/);
+  });
+
+  it.runIf(process.platform === 'linux' && spawnSync('bwrap', ['--version'], { stdio: 'ignore' }).status === 0)(
+    'hides the whole device authority while preserving live root atomic writes and new directories',
+    () => {
+      const host = tmp();
+      const root = join(host, 'botmux');
+      const authority = join(root, 'device-auth');
+      const safe = join(root, 'data');
+      const panePolicy = join(safe, 'read-isolation');
+      mkdirSync(safe, { recursive: true });
+      mkdirSync(authority, { recursive: true });
+      mkdirSync(panePolicy, { recursive: true });
+      writeFileSync(join(safe, 'state.txt'), 'before');
+      writeFileSync(join(root, 'config.json'), 'old');
+      symlinkSync(join(safe, 'state.txt'), join(root, 'state-link'));
+      writeFileSync(join(panePolicy, 'session.boot'), 'trusted');
+      writeFileSync(join(authority, 'device.json'), 'secret');
+      writeFileSync(join(authority, 'device-enroll-pending.json'), 'secret');
+      const exactFiles = [
+        join(root, 'platform.json'),
+        join(root, '.device-credential-isolation'),
+        join(root, '.dashboard-secret'),
+      ];
+      for (const file of exactFiles) writeFileSync(file, 'secret');
+      const args = buildCredentialOnlySandboxArgs({
+        hideDirectories: [authority],
+        hideFiles: exactFiles,
+        readonlyPaths: [panePolicy],
+        workingDir: host,
+        cliBin: '/bin/sh',
+        cliArgs: ['-c', [
+          `test ! -e ${JSON.stringify(join(authority, 'device.json'))}`,
+          `test ! -e ${JSON.stringify(join(authority, 'device-enroll-pending.json'))}`,
+          `test ! -e ${JSON.stringify(join(authority, 'device.json.99.future.tmp'))}`,
+          `test ! -s ${JSON.stringify(join(root, 'platform.json'))}`,
+          `test ! -s ${JSON.stringify(join(root, '.device-credential-isolation'))}`,
+          `test ! -s ${JSON.stringify(join(root, '.dashboard-secret'))}`,
+          `test ! -e ${JSON.stringify(`/proc/${process.pid}/root${join(authority, 'device.json')}`)}`,
+          `test "$(cat ${JSON.stringify(join(root, 'state-link'))})" = before`,
+          `printf after > ${JSON.stringify(join(safe, 'state.txt'))}`,
+          `printf new > ${JSON.stringify(join(root, 'config.json.tmp'))}`,
+          `mv ${JSON.stringify(join(root, 'config.json.tmp'))} ${JSON.stringify(join(root, 'config.json'))}`,
+          `mkdir ${JSON.stringify(join(root, 'plugins'))} ${JSON.stringify(join(root, 'skills'))} ${JSON.stringify(join(root, 'v3-runs'))}`,
+          `touch ${JSON.stringify(join(root, 'new-root-entry'))}`,
+          `printf private > ${JSON.stringify(join(authority, 'child-only'))}`,
+          `! /bin/sh -c ${JSON.stringify(`printf evil > ${JSON.stringify(join(panePolicy, 'session.boot'))}`)}`,
+        ].join(' && ')],
+      });
+      // Simulate a future device sidecar created after the mount plan itself.
+      writeFileSync(join(authority, 'device.json.99.future.tmp'), 'future-secret');
+      const result = spawnSync('bwrap', args, { encoding: 'utf8' });
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(join(safe, 'state.txt'), 'utf8')).toBe('after');
+      expect(readFileSync(join(root, 'config.json'), 'utf8')).toBe('new');
+      expect(readFileSync(join(root, 'state-link'), 'utf8')).toBe('after');
+      expect(readFileSync(join(panePolicy, 'session.boot'), 'utf8')).toBe('trusted');
+      expect(existsSync(join(root, 'new-root-entry'))).toBe(true);
+      for (const directory of ['plugins', 'skills', 'v3-runs']) {
+        expect(existsSync(join(root, directory))).toBe(true);
+      }
+      expect(existsSync(join(authority, 'child-only'))).toBe(false);
+    },
+  );
 });
 
 describe('resolveSandboxMountPath', () => {
@@ -488,12 +621,18 @@ describe('sandbox credential boundary', () => {
     ].sort());
   });
 
-  it('covers timestamped/future bots.json sidecars by masking their parent state root', () => {
+  it('masks device/platform credentials and future sidecars through the parent state root', () => {
     const home = tmp();
     mkdirSync(join(home, '.botmux'), { recursive: true });
+    mkdirSync(join(home, '.botmux', 'device-auth'), { recursive: true });
     writeFileSync(join(home, '.botmux', 'bots.json.bak-20260711'), '{}');
     writeFileSync(join(home, '.botmux', 'bots.json.previous.json'), '{}');
+    writeFileSync(join(home, '.botmux', 'device-auth', 'device.json'), '{"refreshToken":"secret"}');
+    writeFileSync(join(home, '.botmux', 'device.json'), '{"refreshToken":"legacy-secret"}');
+    writeFileSync(join(home, '.botmux', 'platform.json'), '{"machineToken":"secret"}');
     const hidden = sandboxCredentialHidePaths(home);
+    // bwrap blanks the whole root (not individual current filenames), so both
+    // credentials and any atomic-write sidecars remain unreadable/unwritable.
     expect(hidden).toContain(join(home, '.botmux'));
   });
 

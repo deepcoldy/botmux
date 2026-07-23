@@ -251,6 +251,173 @@ export function buildSandboxArgs(plan: SandboxPlan): string[] {
   return a;
 }
 
+function assertCredentialIsolationPath(path: string, kind: string): string {
+  const normalized = resolve(path);
+  if (!isAbsolute(path) || normalized !== path || normalized === '/') {
+    throw new Error(`invalid credential isolation ${kind}: ${path}`);
+  }
+  return normalized;
+}
+
+/**
+ * Build the lightweight bwrap wrapper used when full overlay sandboxing is off.
+ * The host filesystem, including BOTMUX_HOME itself, remains live/read-write.
+ * Device credentials and their arbitrary future sidecars live below a dedicated
+ * authority directory which is replaced wholesale with a private tmpfs. The
+ * few legacy/root authority files are masked individually with read-only
+ * /dev/null mounts. This preserves root-level atomic writes, newly created
+ * plugin/skill/run directories, symlinks, and live config replacement.
+ */
+export function buildCredentialOnlySandboxArgs(input: {
+  hideDirectories: string[];
+  hideFiles: string[];
+  /** Worker-owned marker/profile roots that must remain immutable to the CLI. */
+  readonlyPaths?: string[];
+  workingDir: string;
+  cliBin: string;
+  cliArgs: string[];
+}): string[] {
+  if (!isAbsolute(input.workingDir) || !isAbsolute(input.cliBin)) {
+    throw new Error('credential isolation requires absolute cwd and CLI binary paths');
+  }
+  const hideDirectories = [...new Set(input.hideDirectories.map(path =>
+    assertCredentialIsolationPath(path, 'directory')))];
+  const hideFiles = [...new Set(input.hideFiles.map(path =>
+    assertCredentialIsolationPath(path, 'file')))];
+  if (hideDirectories.length === 0 && hideFiles.length === 0) {
+    throw new Error('credential isolation requires at least one authority mask');
+  }
+
+  const args: string[] = [
+    '--bind', '/', '/',
+    // Do not expose host PIDs: `/proc/<worker-pid>/root/...` would otherwise
+    // cross back into the worker's unfiltered mount namespace and recover a
+    // credential despite the private authority mounts below.
+    '--proc', '/proc',
+  ];
+  for (const path of [...new Set(input.readonlyPaths ?? [])].sort()) {
+    const normalized = assertCredentialIsolationPath(path, 'readonly path');
+    args.push('--ro-bind', normalized, normalized);
+  }
+  // Authority masks are deliberately LAST so no readonly carve-out can
+  // accidentally re-expose a credential ancestor.
+  for (const directory of hideDirectories.sort()) args.push('--tmpfs', directory);
+  for (const file of hideFiles.sort()) args.push('--ro-bind', '/dev/null', file);
+  args.push(
+    '--unshare-user',
+    '--unshare-pid',
+    '--unshare-ipc',
+    '--unshare-uts',
+    '--unshare-cgroup-try',
+    '--die-with-parent',
+    '--new-session',
+    '--chdir', input.workingDir,
+    '--', input.cliBin, ...input.cliArgs,
+  );
+  return args;
+}
+
+export interface CredentialOnlySandboxSpawn {
+  bin: string;
+  args: string[];
+}
+
+export type HostCredentialIsolationMechanismProbe =
+  | { supported: true; mechanism: 'seatbelt' | 'bwrap'; executable: string }
+  | { supported: false; mechanism: null; reason: string };
+
+function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe {
+  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
+  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
+  if (!located || !isAbsolute(located)) {
+    return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
+  }
+  let executable = located;
+  try { executable = realpathSync(located); } catch { /* spawn probe reports failure below */ }
+  const probe = spawnSync(executable, ['--help'], { encoding: 'utf8' });
+  if (probe.status !== 0) {
+    return {
+      supported: false,
+      mechanism: null,
+      reason: 'bubblewrap is unavailable',
+    };
+  }
+  // Prove this host can actually create the namespaces/mounts, not merely that
+  // a binary exists. A private /tmp exercises the directory-mask primitive
+  // without touching host files.
+  const runtime = spawnSync(executable, [
+    '--bind', '/', '/',
+    '--proc', '/proc',
+    '--tmpfs', '/tmp',
+    '--unshare-user',
+    '--unshare-pid',
+    '--unshare-ipc',
+    '--unshare-uts',
+    '--unshare-cgroup-try',
+    '--die-with-parent',
+    '--new-session',
+    '--', '/bin/true',
+  ], { stdio: 'ignore', timeout: 5_000 });
+  if (runtime.status === 0) return { supported: true, mechanism: 'bwrap', executable };
+  return {
+    supported: false,
+    mechanism: null,
+    reason: runtime.error?.message
+      ? `bubblewrap execution probe failed: ${runtime.error.message}`
+      : 'bubblewrap cannot establish the required user/mount/PID namespaces',
+  };
+}
+
+/** Host-side pre-enrollment probe. It accepts no child/session environment or
+ * adapter input, performs no writes/installation, and therefore can safely run
+ * before the fixed marker is created. Enrollment uses this to refuse enabling
+ * device credentials on a host where future workers could not confine them. */
+export function probeHostCredentialIsolationMechanism(): HostCredentialIsolationMechanismProbe {
+  if (process.platform === 'darwin') {
+    const executable = '/usr/bin/sandbox-exec';
+    try {
+      if (existsSync(executable) && statSync(executable).isFile()) {
+        const probe = spawnSync(executable, ['-h'], { stdio: 'ignore', timeout: 2_000 });
+        if (!probe.error) return { supported: true, mechanism: 'seatbelt', executable };
+      }
+    } catch { /* fail closed below */ }
+    return { supported: false, mechanism: null, reason: 'sandbox-exec is unavailable' };
+  }
+  if (process.platform === 'linux') return probeBubblewrapCredentialMasks();
+  return {
+    supported: false,
+    mechanism: null,
+    reason: `credential isolation unsupported on ${process.platform}`,
+  };
+}
+
+/** Probe/install the one lightweight Linux dependency. Kept separate so the
+ * worker can make the mandatory gate decision before any local CLI is spawned. */
+export function credentialOnlySandboxAvailable(): boolean {
+  if (process.platform !== 'linux' || !ensureSandboxDeps(false)) return false;
+  const probe = probeBubblewrapCredentialMasks();
+  if (probe.supported) return true;
+  console.error(`[sandbox] ${probe.reason}`);
+  return false;
+}
+
+export function prepareCredentialOnlySandbox(input: {
+  hideDirectories: string[];
+  hideFiles: string[];
+  readonlyPaths?: string[];
+  workingDir: string;
+  cliBin: string;
+  cliArgs: string[];
+}): CredentialOnlySandboxSpawn | null {
+  if (process.platform !== 'linux' || !ensureSandboxDeps(false)) return null;
+  const probe = probeBubblewrapCredentialMasks();
+  if (!probe.supported || probe.mechanism !== 'bwrap') return null;
+  return {
+    bin: probe.executable,
+    args: buildCredentialOnlySandboxArgs(input),
+  };
+}
+
 /**
  * After `buildSandboxArgs` masks `/run` with a fresh tmpfs, any executable whose
  * resolved path lives UNDER `/run` (the common case: fnm/nvm/volta expose the

@@ -1,8 +1,12 @@
 // 平台绑定状态：存在 ~/.botmux/platform.json，记录这台机器绑到了哪个平台。
-import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import {
+  readSecureHostFileSync,
+  unlinkSecureHostFileSync,
+  UnsafeHostAuthorityFileError,
+  writeSecureHostFileSync,
+} from './secure-host-file.js';
 
 export interface PlatformBinding {
   /** 平台对外地址 */
@@ -30,19 +34,29 @@ export const PLATFORM_BINDING_PATH = join(homedir(), '.botmux', 'platform.json')
 
 export function readPlatformBinding(): PlatformBinding | null {
   try {
-    if (!existsSync(PLATFORM_BINDING_PATH)) return null;
-    const obj = JSON.parse(readFileSync(PLATFORM_BINDING_PATH, 'utf8'));
+    const raw = readSecureHostFileSync(PLATFORM_BINDING_PATH);
+    if (raw === null) return null;
+    const obj = JSON.parse(raw);
     if (obj && typeof obj.platformUrl === 'string' && typeof obj.machineToken === 'string' && typeof obj.machineId === 'string') {
       return obj as PlatformBinding;
     }
-  } catch {
-    /* ignore */
+  } catch (error) {
+    // File-missing / parse failures still mean "unbound". Permission/symlink
+    // failures are different: treat as unbound for callers, but log a clear
+    // recovery hint so a hand-copied platform.json does not look like a silent
+    // drop-binding mystery.
+    if (error instanceof UnsafeHostAuthorityFileError) {
+      console.error(
+        `[platform-binding] 拒绝读取 ${PLATFORM_BINDING_PATH}: ${error.message}`
+        + '（请确保文件权限为 0600、路径不是符号链接，且 ~/.botmux 不可被组/其他用户写入；例: chmod 600 ~/.botmux/platform.json）',
+      );
+    }
   }
   return null;
 }
 
 export function writePlatformBinding(b: PlatformBinding): void {
-  atomicWriteFileSync(PLATFORM_BINDING_PATH, JSON.stringify(b, null, 2), { mode: 0o600 });
+  writeSecureHostFileSync(PLATFORM_BINDING_PATH, `${JSON.stringify(b, null, 2)}\n`);
 }
 
 /**
@@ -52,7 +66,7 @@ export function writePlatformBinding(b: PlatformBinding): void {
  */
 export function clearPlatformBinding(): void {
   try {
-    if (existsSync(PLATFORM_BINDING_PATH)) rmSync(PLATFORM_BINDING_PATH);
+    unlinkSecureHostFileSync(PLATFORM_BINDING_PATH);
   } catch {
     /* ignore */
   }

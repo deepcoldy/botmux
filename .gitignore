@@ -30,3 +30,9 @@ src/dashboard/web/game/index.pck
 # Playwright MCP verification artifacts
 .playwright-mcp/
 dashboard-substitute*.png
+
+# Desktop packaging staging/generated raster assets
+build/desktop-node/
+build/desktop-runtime/
+build/icon.png
+src/desktop/assets/*.png

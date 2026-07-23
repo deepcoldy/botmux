@@ -11,6 +11,7 @@ const statusValues = new Set<RuntimeStatus>([
 ]);
 
 const runtimeSourceValues = new Set<RuntimeSource>([
+  'bundled',
   'global-cli',
   'none',
 ]);
@@ -19,6 +20,7 @@ export function buildRuntimeMeta(state: DesktopRuntimeState, t: RendererTranslat
   // Routine CLI sources are already implied by the status and version line.
   // Keep this row available for exceptional sources that need explanation.
   switch (state.runtimeSource) {
+    case 'bundled':
     case 'global-cli':
       return '';
     case 'none':

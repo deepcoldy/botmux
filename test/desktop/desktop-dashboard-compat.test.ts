@@ -29,10 +29,10 @@ describe('desktop dashboard compat validation', () => {
       routes: ['#/'],
     }));
 
-    await expect(validateDashboardCompat('https://m-test.botmux.bytedance.net/?t=secret-token#/sessions', { fetch }))
+    await expect(validateDashboardCompat('https://m-test.botmux.example.test/?t=secret-token#/sessions', { fetch }))
       .resolves.toEqual({ ok: true });
     expect(fetch).toHaveBeenCalledWith(
-      'https://m-test.botmux.bytedance.net/__desktop/compat?t=secret-token',
+      'https://m-test.botmux.example.test/__desktop/compat?t=secret-token',
       expect.any(Object),
     );
   });

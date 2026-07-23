@@ -134,6 +134,16 @@ import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPo
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
 import { readSkillRegistry } from '../services/skill-registry-store.js';
+import {
+  commitDeviceIsolationActivation,
+  DEVICE_ISOLATION_COMMIT_PATH,
+  DEVICE_ISOLATION_PREPARE_PATH,
+  DEVICE_ISOLATION_RELEASE_PATH,
+  logDeviceIsolationActivationError,
+  prepareDeviceIsolationActivation,
+  releaseDeviceIsolationActivation,
+  type DeviceIsolationDaemonResult,
+} from './device-isolation-daemon.js';
 
 export interface IpcServerHandle {
   port: number;
@@ -301,6 +311,34 @@ export function setBotName(name: string): void { setRowsBotName(name); }
 // endpoints below which proxy calls into groups-store on this bot's behalf.
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
+
+async function handleDeviceIsolationActivationRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  handler: (body: unknown) => DeviceIsolationDaemonResult | Promise<DeviceIsolationDaemonResult>,
+): Promise<void> {
+  // Keep this explicit even though production enables the server-wide gate:
+  // unit-test/dev servers must not accidentally turn this authority-bearing
+  // transition into a bare-loopback endpoint.
+  if (!ipcHmacAuthorized(req)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  try {
+    const body = await readJsonBody(req);
+    const result = await handler(body);
+    jsonRes(res, result.status, result.body);
+  } catch (error) {
+    logDeviceIsolationActivationError(error);
+    jsonRes(res, 503, { ok: false, error: 'activation_unavailable' });
+  }
+}
+
+ipcRoute('POST', DEVICE_ISOLATION_PREPARE_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, prepareDeviceIsolationActivation));
+ipcRoute('POST', DEVICE_ISOLATION_COMMIT_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, commitDeviceIsolationActivation));
+ipcRoute('POST', DEVICE_ISOLATION_RELEASE_PATH, (req, res) =>
+  handleDeviceIsolationActivationRoute(req, res, releaseDeviceIsolationActivation));
 
 ipcRoute('GET', '/api/sessions', (_req, res) => {
   // Active first (live state), closed appended (historical)
