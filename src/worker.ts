@@ -8539,6 +8539,7 @@ async function spawnCli(
       const policyMatches = appliedIsolationCapabilities.length > 0
         ? isolatedPaneReattachSafe(marker, {
             requiredCapabilities: appliedIsolationCapabilities,
+            exactCapabilities: true,
             ...(darwinPolicyExpected ? {
               readIsolation: willReadIsolate,
               writeSandbox: willWriteSandbox,

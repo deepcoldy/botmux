@@ -977,6 +977,20 @@ describe('isolatedPaneReattachSafe', () => {
       requireOriginChannel: false,
     })).toBe(true);
     expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'credential-only-v7', ['credential'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'old-broader-policy-v7', ['credential', 'read', 'write'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
       'linux-v7', ['credential', 'read'],
     ), {
       requiredCapabilities: ['credential', 'read'],
@@ -1047,6 +1061,7 @@ describe('worker capability carve-out ordering', () => {
     expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(source).toContain('isCredentialIsolationReservedBasename(name)');
     expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 
