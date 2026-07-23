@@ -42,6 +42,7 @@ import {
   validateAdoptTargetState,
   adoptTargetLabel,
   adoptTargetKey,
+  excludeOwnedHerdrAdoptTargets,
 } from '../src/core/session-discovery.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -51,7 +52,9 @@ const mockedExecSync = vi.mocked(execSync);
 
 interface HerdrFixture {
   sessions: Array<{ name: string; running: boolean }>;
-  agentsBySession: Record<string, Array<{ name?: string; agent?: string; pane_id?: string; terminal_id?: string; cwd?: string }>>;
+  agentsBySession: Record<string, Array<{ name?: string; agent?: string; agent_session?: { kind?: string; value?: string }; pane_id?: string; terminal_id?: string; cwd?: string }>>;
+  panesBySession?: Record<string, Array<{ name?: string; pane_id?: string; terminal_id?: string; cwd?: string; foreground_cwd?: string }>>;
+  processByPane?: Record<string, { pid: number; name: string; argv?: string[]; argv0?: string; cwd: string }>;
   /** Throw on certain probes to simulate `unknown` validation result. */
   failOn?: (args: string[]) => boolean;
 }
@@ -70,6 +73,14 @@ function installHerdrFixture(fx: HerdrFixture) {
       if (argv.includes('agent') && argv.includes('list')) {
         const agents = fx.agentsBySession[sessionName] ?? [];
         return JSON.stringify({ result: { agents } }) as any;
+      }
+      if (argv.includes('pane') && argv.includes('list')) {
+        return JSON.stringify({ result: { panes: fx.panesBySession?.[sessionName] ?? [] } }) as any;
+      }
+      if (argv.includes('pane') && argv.includes('process-info')) {
+        const paneId = argv[argv.indexOf('--pane') + 1];
+        const proc = fx.processByPane?.[`${sessionName}:${paneId}`];
+        return JSON.stringify({ result: { process_info: { foreground_processes: proc ? [proc] : [] } } }) as any;
       }
     }
     return '' as any;
@@ -90,7 +101,8 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
     installHerdrFixture({
       sessions: [
         { name: 'work', running: true },
-        { name: 'bmx-deadbeef', running: true },  // must be filtered (botmux-owned)
+        { name: 'botmux', running: true },        // machine-wide rendezvous → adoptable
+        { name: 'bmx-deadbeef', running: true },  // legacy per-topic host → filtered
         { name: 'stopped', running: false },      // must be filtered (not running)
       ],
       agentsBySession: {
@@ -98,16 +110,33 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'cc', agent: 'claude', pane_id: '1-1', terminal_id: 't-1', cwd: '/projects/api' },
           { name: 'cx', agent: 'codex',  pane_id: '1-2', terminal_id: 't-2', cwd: '/projects/web' },
           { name: 'sh', agent: 'bash',   pane_id: '1-3', terminal_id: 't-3', cwd: '/home' },          // unknown CLI → filtered
+          { name: 'botmux-deadbeef', agent: 'claude', pane_id: '1-4', cwd: '/projects/managed' },      // names are not a discovery policy
           { name: 'no-pane', agent: 'claude', cwd: '/projects/x' },                                   // missing pane_id → filtered
+        ],
+        botmux: [
+          {
+            name: 'botmux-feed1234',
+            agent: 'pi',
+            agent_session: {
+              kind: 'path',
+              value: '/home/testuser/.pi/agent/sessions/--projects-pi--/2026-07-23T06-07-29-246Z_019f8d96-0dde-7e12-8a8b-51a09766d97f.jsonl',
+            },
+            pane_id: 'w1:p1',
+            terminal_id: 't-pi',
+            cwd: '/projects/pi',
+          },
         ],
         'bmx-deadbeef': [
           { name: 'botmux', agent: 'claude', pane_id: '5-5', cwd: '/projects/own' },
         ],
       },
+      processByPane: {
+        'botmux:w1:p1': { pid: 75275, name: 'node', argv0: 'pi', cwd: '/projects/pi' },
+      },
     });
 
     const sessions = discoverAdoptableSessions();
-    expect(sessions).toHaveLength(2);
+    expect(sessions).toHaveLength(4);
     expect(sessions.every(s => s.source === 'herdr')).toBe(true);
 
     const claude = sessions.find(s => s.cliId === 'claude-code');
@@ -127,6 +156,78 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrPaneId: '1-2',
       cwd: '/projects/web',
     });
+
+    expect(sessions).toContainEqual(expect.objectContaining({
+      source: 'herdr',
+      herdrSessionName: 'work',
+      herdrPaneId: '1-4',
+      cwd: '/projects/managed',
+    }));
+
+    const pi = sessions.find(s => s.cliId === 'pi');
+    expect(pi).toMatchObject({
+      source: 'herdr',
+      herdrSessionName: 'botmux',
+      herdrPaneId: 'w1:p1',
+      herdrTerminalId: 't-pi',
+      cliPid: 75275,
+      sessionId: '019f8d96-0dde-7e12-8a8b-51a09766d97f',
+      cwd: '/projects/pi',
+    });
+  });
+
+  it('discovers a TraeX foreground process even before Herdr reports it as an agent', () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: { work: [] },
+      panesBySession: {
+        work: [{ pane_id: 'w1:p1', terminal_id: 'term-1', cwd: '/projects/traex' }],
+      },
+      processByPane: {
+        'work:w1:p1': { pid: 4321, name: 'traex', argv: ['traex', '--resume'], cwd: '/projects/traex' },
+      },
+    });
+
+    expect(discoverAdoptableSessions('traex')).toEqual([
+      expect.objectContaining({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w1:p1',
+        herdrTerminalId: 'term-1',
+        cliPid: 4321,
+        cliId: 'traex',
+        cwd: '/projects/traex',
+      }),
+    ]);
+  });
+
+  it('excludes a managed Herdr agent with an active owner but keeps orphaned siblings', () => {
+    const candidates = [
+      {
+        source: 'herdr' as const,
+        herdrSessionName: 'botmux',
+        herdrPaneId: 'w1:p1',
+        herdrAgentName: 'botmux-owned',
+        cliId: 'pi' as const,
+        cwd: '/a',
+        paneCols: 200,
+        paneRows: 50,
+      },
+      {
+        source: 'herdr' as const,
+        herdrSessionName: 'botmux',
+        herdrPaneId: 'w2:p1',
+        herdrAgentName: 'botmux-orphan',
+        cliId: 'pi' as const,
+        cwd: '/b',
+        paneCols: 200,
+        paneRows: 50,
+      },
+    ];
+
+    expect(excludeOwnedHerdrAdoptTargets(candidates, [
+      { sessionName: 'botmux', agentName: 'botmux-owned' },
+    ])).toEqual([candidates[1]]);
   });
 
   it('filters by CliId when requested', () => {
@@ -174,6 +275,9 @@ describe('validateAdoptTarget (herdr branch)', () => {
     installHerdrFixture({
       sessions: [{ name: 'work', running: true }],
       agentsBySession: { work: [{ pane_id: '1-1', agent: 'claude' }] },
+      processByPane: {
+        'work:1-1': { pid: 1234, name: 'claude', argv: ['claude'], cwd: '/x' },
+      },
     });
     const target = {
       source: 'herdr' as const,
@@ -186,6 +290,48 @@ describe('validateAdoptTarget (herdr branch)', () => {
     };
     expect(validateAdoptTargetState(target)).toBe('alive');
     expect(validateAdoptTarget(target)).toBe(true);
+  });
+
+  it("returns 'alive' for Herdr 0.7.5 Pi process-info that reports node + argv0 only", () => {
+    installHerdrFixture({
+      sessions: [{ name: 'collie', running: true }],
+      agentsBySession: { collie: [{ pane_id: 'w3:p1', agent: 'pi', cwd: '/x' }] },
+      processByPane: {
+        'collie:w3:p1': { pid: 75275, name: 'node', argv0: 'pi', cwd: '/x' },
+      },
+    });
+    const target = {
+      source: 'herdr' as const,
+      herdrSessionName: 'collie',
+      herdrPaneId: 'w3:p1',
+      cliId: 'pi' as const,
+      cwd: '/x',
+      paneCols: 200,
+      paneRows: 50,
+    };
+    expect(validateAdoptTargetState(target)).toBe('alive');
+  });
+
+  it("returns 'alive' for a hook-less TraeX pane whose foreground process still matches", () => {
+    installHerdrFixture({
+      sessions: [{ name: 'work', running: true }],
+      agentsBySession: { work: [] },
+      panesBySession: { work: [{ pane_id: 'w1:p1', cwd: '/x' }] },
+      processByPane: {
+        'work:w1:p1': { pid: 4321, name: 'traex', argv: ['traex', '--resume'], cwd: '/x' },
+      },
+    });
+    const target = {
+      source: 'herdr' as const,
+      herdrSessionName: 'work',
+      herdrPaneId: 'w1:p1',
+      cliPid: 4321,
+      cliId: 'traex' as const,
+      cwd: '/x',
+      paneCols: 200,
+      paneRows: 50,
+    };
+    expect(validateAdoptTargetState(target)).toBe('alive');
   });
 
   it("returns 'missing' when the pane disappeared (kept agent list, no match)", () => {

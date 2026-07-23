@@ -18,7 +18,17 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: { backendType: bot.backendType } })),
 }));
 
-import { getSessionPersistentBackendType, resolvePairedSpawnBackendType, resolveSpawnBackendType, shutdownBackendDisposition } from '../src/core/persistent-backend.js';
+import {
+  getSessionPersistentBackendType,
+  killPersistentBackendTarget,
+  managedTargetsForCliChange,
+  probePersistentBackendTarget,
+  resolvePersistentBackendTarget,
+  resolvePairedSpawnBackendType,
+  resolveSpawnBackendType,
+  shutdownBackendDisposition,
+} from '../src/core/persistent-backend.js';
+import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 
 function ds(opts: { initBackend?: string; sessionBackend?: string }): any {
   return {
@@ -52,6 +62,65 @@ describe('getSessionPersistentBackendType', () => {
   it('a stamped pty session is not a persistent backend', () => {
     expect(getSessionPersistentBackendType(ds({ sessionBackend: 'pty' }))).toBeUndefined();
     expect(getSessionPersistentBackendType(ds({ initBackend: 'pty' }))).toBeUndefined();
+  });
+});
+
+describe('shared Herdr persistent target', () => {
+  it('preserves a recorded host session + agent and rejects a mismatched stale stamp', () => {
+    const shared = {
+      backendType: 'herdr' as const,
+      sessionName: 'work',
+      agentName: 'botmux-abcdef12',
+    };
+    expect(resolvePersistentBackendTarget('herdr', 'abcdef123456', shared)).toEqual(shared);
+    expect(resolvePersistentBackendTarget('tmux', 'abcdef123456', shared)).toEqual({
+      backendType: 'tmux',
+      sessionName: 'bmx-abcdef12',
+    });
+  });
+
+  it('returns exact shared agents for CLI-change cleanup and excludes adopted panes', () => {
+    const targets = managedTargetsForCliChange('herdr', [
+      {
+        sessionId: 'abcdef123456',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'botmux',
+          agentName: 'botmux-abcdef12',
+        },
+      },
+      {
+        sessionId: 'user-pane',
+        adoptedFrom: { source: 'herdr', herdrSessionName: 'collie', herdrPaneId: 'w3:p1' },
+      },
+    ] as any);
+
+    expect(targets).toEqual([{
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: 'botmux-abcdef12',
+    }]);
+  });
+
+  it('probes and kills only the recorded agent rather than the host session', () => {
+    const target = {
+      backendType: 'herdr' as const,
+      sessionName: 'work',
+      agentName: 'botmux-abcdef12',
+    };
+    const probeAgent = vi.spyOn(HerdrBackend, 'probeAgent').mockReturnValue('exists');
+    const killAgent = vi.spyOn(HerdrBackend, 'killAgent').mockImplementation(() => {});
+    const killSession = vi.spyOn(HerdrBackend, 'killSession').mockImplementation(() => {});
+
+    expect(probePersistentBackendTarget(target)).toBe('exists');
+    killPersistentBackendTarget(target);
+
+    expect(probeAgent).toHaveBeenCalledWith('work', 'botmux-abcdef12');
+    expect(killAgent).toHaveBeenCalledWith('work', 'botmux-abcdef12');
+    expect(killSession).not.toHaveBeenCalled();
+    probeAgent.mockRestore();
+    killAgent.mockRestore();
+    killSession.mockRestore();
   });
 });
 

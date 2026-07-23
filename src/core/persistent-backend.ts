@@ -15,10 +15,11 @@ import { getBot } from '../bot-registry.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
-import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
-export type PersistentBackendType = Exclude<BackendType, 'pty'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij'>;
 
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
@@ -132,6 +133,65 @@ export function persistentSessionName(backendType: PersistentBackendType, sessio
   if (backendType === 'tmux') return TmuxBackend.sessionName(sessionId);
   if (backendType === 'zellij') return ZellijBackend.sessionName(sessionId);
   return HerdrBackend.sessionName(sessionId);
+}
+
+/**
+ * Resolve the exact backing resource for daemon lifecycle work. The persisted
+ * worker-selected target wins only when it still matches the frozen backend;
+ * legacy rows fall back to the historical deterministic whole-session target.
+ */
+export function resolvePersistentBackendTarget(
+  backendType: PersistentBackendType,
+  sessionId: string,
+  persisted?: PersistentBackendTarget,
+): PersistentBackendTarget {
+  if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
+    if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
+      return persisted;
+    }
+  }
+  return { backendType, sessionName: persistentSessionName(backendType, sessionId) };
+}
+
+export function persistentBackendTargetForSession(ds: DaemonSession): PersistentBackendTarget | undefined {
+  const backendType = getSessionPersistentBackendType(ds);
+  if (!backendType) return undefined;
+  return resolvePersistentBackendTarget(
+    backendType,
+    ds.session.sessionId,
+    ds.session.persistentBackendTarget,
+  );
+}
+
+/** Exact managed resources to remove when a single-bot CLI changes.
+ * Adopted panes are user-owned; machine-wide Herdr agents must be returned as
+ * agent-scoped targets rather than collapsing to the shared host session. */
+export function managedTargetsForCliChange(
+  backendType: PersistentBackendType,
+  sessions: readonly Pick<Session, 'sessionId' | 'adoptedFrom' | 'persistentBackendTarget'>[],
+): PersistentBackendTarget[] {
+  return sessions
+    .filter(session => !session.adoptedFrom)
+    .map(session => resolvePersistentBackendTarget(
+      backendType,
+      session.sessionId,
+      session.persistentBackendTarget,
+    ));
+}
+
+export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
+  if (target.backendType === 'herdr' && target.agentName) {
+    return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+  }
+  return probePersistentSession(target.backendType, target.sessionName);
+}
+
+export function killPersistentBackendTarget(target: PersistentBackendTarget): void {
+  if (target.backendType === 'herdr' && target.agentName) {
+    HerdrBackend.killAgent(target.sessionName, target.agentName);
+    return;
+  }
+  killPersistentSession(target.backendType, target.sessionName);
 }
 
 export function probePersistentSession(backendType: PersistentBackendType, name: string): SessionProbe {

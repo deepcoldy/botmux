@@ -226,6 +226,41 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).not.toContain('pendingMessages.length > 0');
   });
 
+  it('flushes an initial prompt queued after a fast backend became ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const queueIdx = source.indexOf('if (shouldQueueInitialPrompt({');
+    const readyFlushIdx = source.indexOf('if (isPromptReady && pendingMessages.length > 0)', queueIdx);
+    const readySendIdx = source.indexOf("type: 'ready',", queueIdx);
+
+    expect(queueIdx).toBeGreaterThan(-1);
+    expect(readyFlushIdx).toBeGreaterThan(queueIdx);
+    expect(readyFlushIdx).toBeLessThan(readySendIdx);
+    expect(source.slice(readyFlushIdx, readySendIdx)).toContain('flushPending();');
+  });
+
+  it('uses authoritative Herdr settled status to release queued Pi input', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const hookStart = source.indexOf('observedBackend.onAgentStatus((status) => {');
+    const hookEnd = source.indexOf('backend.onAccessUrl?.', hookStart);
+    const hook = source.slice(hookStart, hookEnd);
+
+    expect(hookStart).toBeGreaterThan(-1);
+    expect(hook).toContain("status === 'idle' || status === 'done'");
+    expect(hook).toContain("drainBridgesThenMarkReady('structured');");
+    expect(hook).toContain("status === 'working'");
+    expect(hook).toContain('isPromptReady = false;');
+
+    const helperStart = source.indexOf("const drainBridgesThenMarkReady = (");
+    const helperEnd = source.indexOf('// Set up idle detection.', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const claudeDrain = helper.indexOf('bridgeDrainAndMaybeEmit();');
+    const structuredDrain = helper.indexOf('codexBridgeDrainAndMaybeEmit();');
+    const ready = helper.indexOf('markPromptReady();');
+    expect(claudeDrain).toBeGreaterThan(-1);
+    expect(structuredDrain).toBeGreaterThan(claudeDrain);
+    expect(ready).toBeGreaterThan(structuredDrain);
+  });
+
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const guardStart = source.indexOf('let effectiveBackend = cfg.backendType;');

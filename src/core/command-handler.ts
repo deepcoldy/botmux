@@ -39,7 +39,7 @@ import {
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { discoverAdoptableSessions, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
+import { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
 import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
@@ -2370,14 +2370,23 @@ export async function handleCommand(
 
         const botCliId = botCfgForAdopt?.cliId;
 
-        // Discover BOTH tmux AND zellij sessions, regardless of the bot's own
-        // backend — a normal tmux bot should still be able to adopt a CLI the
-        // user is running inside zellij (and vice-versa). The adopt itself
-        // picks the right observe backend from the chosen target.
-        // discoverAdoptableZellijSessions returns [] when zellij isn't
-        // installed, so this is safe on tmux-only hosts.
+        // Discover every supported backend, but only offer live sessions for
+        // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
+        // adopting one would unexpectedly change the agent behind the bot.
+        const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+          const target = active.session.persistentBackendTarget;
+          return active.session.status === 'active'
+            && !active.adoptedFrom
+            && target?.backendType === 'herdr'
+            && !!target.agentName
+            ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+            : [];
+        });
         const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
-          ...discoverAdoptableSessions(botCliId),
+          ...excludeOwnedHerdrAdoptTargets(
+            discoverAdoptableSessions(botCliId),
+            ownedHerdrTargets,
+          ),
           ...discoverAdoptableZellijSessions(botCliId),
         ];
 
@@ -3456,6 +3465,19 @@ export async function startAdoptSession(
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
 
   const zellij = isZellijTarget(target);
+  if (!zellij && target.source === 'herdr' && target.herdrSessionName && target.herdrAgentName) {
+    const occupied = [...deps.activeSessions.values()].some(active => {
+      if (active.session.sessionId === ds.session.sessionId || active.session.status !== 'active' || active.adoptedFrom) return false;
+      const owned = active.session.persistentBackendTarget;
+      return owned?.backendType === 'herdr'
+        && owned.sessionName === target.herdrSessionName
+        && owned.agentName === target.herdrAgentName;
+    });
+    if (occupied) {
+      await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
+      return;
+    }
+  }
   const valid = zellij
     ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
     : validateAdoptTarget(target);
