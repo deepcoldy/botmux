@@ -421,6 +421,12 @@ interface PendingRpcTerminal {
 const pendingRpcTurnTerminals = new Map<string, PendingRpcTerminal>();
 const rpcTurnsAwaitingActivation = new Map<string, RpcTurnGeneration>();
 const rpcTurnsAwaitingActivationIdentities = new Map<string, CodexRpcTurnIdentity>();
+/** Local send-start anchor for each exact awaiting owner. A predecessor's
+ *  terminal hydration may ingest this successor's transcript before turn/start
+ *  ACK returns. Reusing the send-start time when the bridge mark is installed
+ *  keeps that already-buffered user/final pair inside its original bounded
+ *  attribution window without widening replay for unrelated turns. */
+const rpcTurnsAwaitingActivationReplayAnchors = new Map<string, number>();
 /** A bridge mark/activation failure after an accepted RPC submit must never
  *  degrade to ready. Keep a separate fail-closed gate until that exact native
  *  turn reaches terminal or the engine is torn down. */
@@ -464,6 +470,18 @@ function installAwaitingRpcActivation(
   const ownerKey = rpcTurnOwnerKey(identity);
   rpcTurnsAwaitingActivation.set(ownerKey, generation);
   rpcTurnsAwaitingActivationIdentities.set(ownerKey, identity);
+  rpcTurnsAwaitingActivationReplayAnchors.set(ownerKey, Date.now());
+}
+
+function awaitingRpcActivationReplayAnchorMs(
+  identity: CodexRpcTurnIdentity,
+  generation: RpcTurnGeneration,
+): number | undefined {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    return undefined;
+  }
+  return rpcTurnsAwaitingActivationReplayAnchors.get(ownerKey);
 }
 
 function clearRpcLifecycleFailClosedOwner(
@@ -487,6 +505,7 @@ function clearAwaitingRpcActivation(
   if (sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
     rpcTurnsAwaitingActivation.delete(ownerKey);
     rpcTurnsAwaitingActivationIdentities.delete(ownerKey);
+    rpcTurnsAwaitingActivationReplayAnchors.delete(ownerKey);
   }
   const pending = pendingRpcTurnTerminals.get(ownerKey);
   if (pending && sameRpcGeneration(pending.generation, generation)) {
@@ -600,6 +619,7 @@ function stopCodexRpcEngine(): void {
   pendingRpcTurnTerminals.clear();
   rpcTurnsAwaitingActivation.clear();
   rpcTurnsAwaitingActivationIdentities.clear();
+  rpcTurnsAwaitingActivationReplayAnchors.clear();
   rpcLifecycleFailClosedOwners.clear();
   rpcLifecycleFailClosedIdentities.clear();
   rpcActiveOwners.clear();
@@ -820,6 +840,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
             cfg.prompt,
             firstIdentity.turnId,
             firstIdentity.dispatchAttempt,
+            awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
           );
           installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
           deferredFreshRpcTurn = {
@@ -862,6 +883,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           cfg.prompt,
           firstIdentity.turnId,
           firstIdentity.dispatchAttempt,
+          awaitingRpcActivationReplayAnchorMs(firstIdentity, firstGeneration),
         );
         installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration);
         deferredFreshRpcTurn = {
@@ -5003,10 +5025,11 @@ function codexBridgeMarkPendingTurn(
   messageText: string,
   preferredTurnId?: string,
   dispatchAttempt?: number,
+  markTimeMs: number = Date.now(),
 ): string | undefined {
   if (!codexBridgeFallbackActive()) return undefined;
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
-  codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt);
+  codexBridgeQueue.mark(turnId, messageText, markTimeMs, dispatchAttempt);
   return turnId;
 }
 
@@ -5195,6 +5218,7 @@ function activateRpcTurnLifecycle(
     log(`Refused stale Codex RPC lifecycle activation for ${identity.turnId}`);
     return false;
   }
+  const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(identity, generation);
   let marked = alreadyMarked
     && (codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)
       || codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt));
@@ -5203,6 +5227,7 @@ function activateRpcTurnLifecycle(
       messageText,
       identity.turnId,
       identity.dispatchAttempt,
+      replayAnchorMs,
     );
     marked = bridgeTurnId === identity.turnId;
   }
@@ -5226,6 +5251,7 @@ function activateRpcTurnLifecycle(
     && sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
     rpcTurnsAwaitingActivation.delete(ownerKey);
     rpcTurnsAwaitingActivationIdentities.delete(ownerKey);
+    rpcTurnsAwaitingActivationReplayAnchors.delete(ownerKey);
   }
   if (!activated) {
     if (marked) codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
@@ -5260,6 +5286,7 @@ function releaseRpcTurnTerminalDeferral(
   if (sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
     rpcTurnsAwaitingActivation.delete(ownerKey);
     rpcTurnsAwaitingActivationIdentities.delete(ownerKey);
+    rpcTurnsAwaitingActivationReplayAnchors.delete(ownerKey);
   }
   const pendingTerminal = pendingRpcTurnTerminals.get(ownerKey);
   if (pendingTerminal && sameRpcGeneration(pendingTerminal.generation, generation)) {
@@ -8054,11 +8081,16 @@ async function flushPending(): Promise<void> {
           break;
         }
         if (rpcTurnIdentity && rpcTurnGeneration && writeRpcEngine) {
+          const replayAnchorMs = awaitingRpcActivationReplayAnchorMs(
+            rpcTurnIdentity,
+            rpcTurnGeneration,
+          );
           clearAwaitingRpcActivation(rpcTurnIdentity, rpcTurnGeneration);
           bridgeTurnId = codexBridgeMarkPendingTurn(
             msg,
             rpcTurnIdentity.turnId,
             rpcTurnIdentity.dispatchAttempt,
+            replayAnchorMs,
           );
           installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration);
           log(
