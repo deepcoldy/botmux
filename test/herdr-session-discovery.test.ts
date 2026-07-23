@@ -109,7 +109,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'cc', agent: 'claude', pane_id: '1-1', terminal_id: 't-1', cwd: '/projects/api' },
           { name: 'cx', agent: 'codex',  pane_id: '1-2', terminal_id: 't-2', cwd: '/projects/web' },
           { name: 'sh', agent: 'bash',   pane_id: '1-3', terminal_id: 't-3', cwd: '/home' },          // unknown CLI → filtered
-          { name: 'botmux-deadbeef', agent: 'claude', pane_id: '1-4', cwd: '/projects/managed' },      // botmux-managed shared agent → filtered
+          { name: 'botmux-deadbeef', agent: 'claude', pane_id: '1-4', cwd: '/projects/managed' },      // names are not a discovery policy
           { name: 'no-pane', agent: 'claude', cwd: '/projects/x' },                                   // missing pane_id → filtered
         ],
         botmux: [
@@ -122,7 +122,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
     });
 
     const sessions = discoverAdoptableSessions();
-    expect(sessions).toHaveLength(3);
+    expect(sessions).toHaveLength(4);
     expect(sessions.every(s => s.source === 'herdr')).toBe(true);
 
     const claude = sessions.find(s => s.cliId === 'claude-code');
@@ -142,6 +142,13 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrPaneId: '1-2',
       cwd: '/projects/web',
     });
+
+    expect(sessions).toContainEqual(expect.objectContaining({
+      source: 'herdr',
+      herdrSessionName: 'work',
+      herdrPaneId: '1-4',
+      cwd: '/projects/managed',
+    }));
 
     const pi = sessions.find(s => s.cliId === 'pi');
     expect(pi).toMatchObject({
