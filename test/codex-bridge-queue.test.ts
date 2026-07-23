@@ -1043,6 +1043,39 @@ describe('CodexBridgeQueue', () => {
     expect(q.hasBlockingTurn(now)).toBe(false);
   });
 
+  it('replays successor events drained during predecessor terminal hydration after the exact mark arrives', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('turn-n', 'first prompt', 100, 1);
+    q.markRpcActive('turn-n', 1);
+    q.ingest([userEv('first prompt', 'u-n', 200)]);
+
+    q.stopRpcActive('turn-n', 1);
+    q.ingest([
+      asstEv('first answer', 'a-n', 300),
+      userEv('second prompt', 'u-n-plus-1', 400),
+      asstEv('second answer', 'a-n-plus-1', 500),
+    ]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-n',
+        dispatchAttempt: 1,
+        finalText: 'first answer',
+      }),
+    ]);
+
+    q.mark('turn-n-plus-1', 'second prompt', 350, 2);
+    expect(q.hasTerminalTurn('turn-n-plus-1', 2)).toBe(true);
+    expect(q.markRpcActive('turn-n-plus-1', 2)).toBe(false);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 'turn-n-plus-1',
+        dispatchAttempt: 2,
+        finalText: 'second answer',
+      }),
+    ]);
+  });
+
   it('markRpcActive clears any pending verification/confirmation lease', () => {
     let now = 1_000;
     const q = new CodexBridgeQueue(() => now);

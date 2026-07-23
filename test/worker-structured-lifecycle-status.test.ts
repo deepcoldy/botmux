@@ -91,8 +91,11 @@ describe('worker structured-turn status wiring', () => {
 
   it('limits the strong ready gate to drivers with a complete terminal contract', () => {
     const gate = functionSlice('hasStructuredLifecycleBlock', 'structuredBridgeIsCodex');
+    const awaitingGate = gate.indexOf('rpcTurnsAwaitingActivation.size > 0');
     const rpcGate = gate.indexOf('turn.rpcActive === true');
     const transcriptAllowlist = gate.indexOf('isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)');
+    expect(awaitingGate).toBeGreaterThanOrEqual(0);
+    expect(awaitingGate).toBeLessThan(rpcGate);
     expect(rpcGate).toBeGreaterThanOrEqual(0);
     expect(transcriptAllowlist).toBeGreaterThan(rpcGate);
     expect(gate).toContain('isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)');
@@ -188,7 +191,9 @@ describe('worker structured-turn status wiring', () => {
     expect(rpcBranch.slice(0, sendAck)).not.toContain('codexBridgeMarkPendingTurn(');
 
     const ingest = functionSlice('codexBridgeIngest', 'codexBridgeMarkPendingTurn');
-    expect(ingest).toContain('if (rpcTurnsAwaitingActivation.size > 0) return;');
+    expect(ingest).toContain('rpcTranscriptIngestBlockedByAwaitingActivation(');
+    expect(ingest).toContain('rpcTurnsAwaitingActivation.keys()');
+    expect(ingest).toContain('opts.hydrationOwnerKey');
   });
 
   it('fails closed on an ambiguous follow-up RPC response before generic submit-failure cleanup', () => {
@@ -301,14 +306,19 @@ describe('worker structured-turn status wiring', () => {
     expect(handle).toContain('sameRpcGeneration(awaiting, generation)');
 
     const activate = functionSlice('activateRpcTurnLifecycle', 'releaseRpcTurnTerminalDeferral');
-    expect(activate).toContain('codexBridgeQueue.markRpcActive(identity.turnId, identity.dispatchAttempt)');
+    expect(activate).toContain('codexBridgeQueue.markRpcActive(');
+    expect(activate).toContain('identity.turnId,');
+    expect(activate).toContain('identity.dispatchAttempt,');
+    expect(activate).toContain('codexBridgeQueue.hasTerminalTurn(identity.turnId, identity.dispatchAttempt)');
+    expect(activate).toContain('if (transcriptTerminalObserved) emitReadyCodexTurns()');
     expect(activate).toContain('settleRpcTurnTerminal(pendingTerminal.terminal, generation)');
 
     const hydrate = functionSlice('hydrateCompletedRpcTurn', 'settleRpcTurnTerminal');
-    const drain = hydrate.indexOf('codexBridgeDrainAndMaybeEmit({ signalIdle: false })');
-    const finalize = hydrate.indexOf('finalizeRpcTurnTerminal(', drain);
-    expect(drain).toBeGreaterThanOrEqual(0);
-    expect(finalize).toBeGreaterThan(drain);
+    expect(hydrate).toContain('hydrationOwnerKey: ownerKey');
+    const hydrationDrain = hydrate.indexOf('codexBridgeDrainAndMaybeEmit({');
+    const finalize = hydrate.indexOf('finalizeRpcTurnTerminal(', hydrationDrain);
+    expect(hydrationDrain).toBeGreaterThanOrEqual(0);
+    expect(finalize).toBeGreaterThan(hydrationDrain);
     expect(hydrate).toContain('CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS');
 
     const init = source.slice(source.indexOf('await spawnCli(msg'), source.indexOf('// Queue the initial prompt'));
