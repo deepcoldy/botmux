@@ -98,6 +98,34 @@ export function isBareShellComm(comm: string | undefined): boolean {
   return BARE_SHELL_COMMS.has(comm.startsWith('.') ? comm.slice(1) : comm);
 }
 
+/**
+ * Let a managed launch wrapper finish its final `exec <cli>` before deciding
+ * that the pane is stuck at an interactive shell.
+ *
+ * A tmux pane can legitimately report the wrapper shell for a few milliseconds
+ * after spawn. Treating that single sample as terminal permanently blocks the
+ * session even though the CLI starts immediately afterward. Non-shell samples
+ * return without delay; only a shell-shaped sample consumes the bounded grace
+ * period.
+ */
+export async function settleLaunchComm(
+  read: () => string | undefined,
+  opts: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<string | undefined> {
+  let comm = read();
+  if (!isBareShellComm(comm)) return comm;
+
+  const timeoutMs = Math.max(0, opts.timeoutMs ?? 2_000);
+  const pollMs = Math.max(1, opts.pollMs ?? 100);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+    comm = read();
+    if (!isBareShellComm(comm)) return comm;
+  }
+  return comm;
+}
+
 /** Classify a confirmed bare-shell launch for diagnostics: 'trampoline' when the
  *  observed leaf shell differs from the shell botmux launched with — the
  *  signature of an rcfile that `exec`-trampolines into another shell (e.g.
