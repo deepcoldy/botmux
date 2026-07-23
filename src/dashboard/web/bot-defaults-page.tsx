@@ -3,6 +3,7 @@ import { openBotOnboarding } from './bot-onboarding.js';
 import {
   agentSelectionKey,
   cliIdOf,
+  createRefreshGate,
   displayCliId,
   fallbackCliOptionsState,
   fetchBotDefaults,
@@ -269,9 +270,13 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
   };
 }
 
-function BotDefaultsPage() {
+export function BotDefaultsPage() {
   const tr = useT();
   const mountedRef = useRef(true);
+  // Latest-wins guard: mount's first refresh() and bots.changed-triggered
+  // refresh()es can overlap, so a slow earlier response must not clobber a
+  // newer roster ("后发先回"). Only the latest in-flight request commits.
+  const refreshGateRef = useRef(createRefreshGate());
   const [bots, setBots] = useState<BotDefaultsRow[]>([]);
   const [cliState, setCliState] = useState<CliOptionsState>(fallbackCliOptionsState);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -285,15 +290,21 @@ function BotDefaultsPage() {
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
+    const req = refreshGateRef.current.begin();
     setLoading(true);
     try {
       const [nextBots, nextCli] = await Promise.all([fetchBotDefaults(), fetchCliOptions()]);
-      if (!mountedRef.current) return;
+      // Drop a stale response: a newer refresh() started after us (e.g. a
+      // bots.changed fired while this request was in flight) — committing here
+      // would overwrite the fresher roster and re-hide the new bot.
+      if (!mountedRef.current || !req.commit()) return;
       setBots(nextBots.bots);
       setLoadError(nextBots.error);
       setCliState(nextCli);
     } finally {
-      if (mountedRef.current) setLoading(false);
+      // Only the latest request owns the loading flag — an out-of-order earlier
+      // response must not flip loading off while the newest is still pending.
+      if (mountedRef.current && req.commit()) setLoading(false);
     }
   }, []);
 
