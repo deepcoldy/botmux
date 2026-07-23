@@ -167,6 +167,18 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).not.toContain('pendingMessages.length > 0');
   });
 
+  it('flushes an initial prompt queued after a fast backend became ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const queueIdx = source.indexOf('if (shouldQueueInitialPrompt({');
+    const readyFlushIdx = source.indexOf('if (isPromptReady && pendingMessages.length > 0)', queueIdx);
+    const readySendIdx = source.indexOf("type: 'ready',", queueIdx);
+
+    expect(queueIdx).toBeGreaterThan(-1);
+    expect(readyFlushIdx).toBeGreaterThan(queueIdx);
+    expect(readyFlushIdx).toBeLessThan(readySendIdx);
+    expect(source.slice(readyFlushIdx, readySendIdx)).toContain('flushPending();');
+  });
+
   it('uses authoritative Herdr settled status to release queued Pi input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const hookStart = source.indexOf('observedBackend.onAgentStatus((status) => {');

@@ -9110,12 +9110,13 @@ process.on('message', async (raw: unknown) => {
           });
         }
 
-        // Riff (remote HTTP backends): spawnCli already marked the prompt ready
-        // (no local boot → isPromptReady=true immediately), but the initial prompt
-        // was queued AFTER spawnCli returned, so flushPending() ran on an empty
-        // queue. Flush now that the prompt is enqueued. isPromptReady is already
-        // true so the flush gates all pass.
-        if (effectiveBackendType === 'riff' && pendingMessages.length > 0) {
+        // A backend may become prompt-ready before spawnCli() returns. The
+        // initial prompt is queued only afterwards, so the earlier
+        // markPromptReady() necessarily flushed an empty queue. This is normal
+        // for riff (ready immediately) and can also happen when Herdr reports a
+        // fast-starting TUI as idle during spawn. Flush again after enqueueing;
+        // the ready flag keeps booting/busy backends gated.
+        if (isPromptReady && pendingMessages.length > 0) {
           flushPending();
         }
 
