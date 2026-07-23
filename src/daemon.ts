@@ -391,8 +391,7 @@ import {
   verifyVcMeetingManagedOriginClaim,
 } from './services/vc-meeting-send-policy.js';
 import {
-  getVcMeetingListenerTopicRoot,
-  recordVcMeetingListenerTopicRoot,
+  ensureVcMeetingListenerTopicRoot,
 } from './services/vc-meeting-listener-topic-store.js';
 import {
   finishVcMeetingManagedActionProvider,
@@ -2636,27 +2635,15 @@ async function sessionReply(
       if (!topicKey || topicKey.targetChatId !== chatId) {
         throw new Error('meeting topic placement is missing a matching durable topic key');
       }
-      const rootMessageId = getVcMeetingListenerTopicRoot(config.session.dataDir, topicKey);
-      if (rootMessageId) {
-        return replyWithHookPolicy(rootMessageId, content, msgType, true, opts.uuid);
-      }
-      const messageId = await sendWithHookPolicy(chatId, content, msgType, opts.uuid);
-      const recorded = recordVcMeetingListenerTopicRoot(
+      const root = await ensureVcMeetingListenerTopicRoot(
         config.session.dataDir,
         topicKey,
-        messageId,
+        () => sendWithHookPolicy(chatId, content, msgType, opts.uuid),
       );
-      if (!recorded.ok) {
-        // The provider send has already succeeded, so throwing here would make
-        // the durable action replay and risk duplicating the visible message.
-        // A conflict can only come from a concurrent first send; preserve the
-        // first-writer anchor and let later outputs converge on it.
-        logger.error(
-          `[routing] failed to persist VC listener topic root meeting=${topicKey.meetingId} `
-          + `member=${topicKey.memberId}: ${recorded.reason}`,
-        );
+      if (root.created) {
+        return root.rootMessageId;
       }
-      return messageId;
+      return replyWithHookPolicy(root.rootMessageId, content, msgType, true, opts.uuid);
     }
     if (ds?.scope === 'chat') {
       const fresh = readSessionFreshFromDisk(ds.session.sessionId, ds.larkAppId);

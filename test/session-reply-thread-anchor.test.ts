@@ -23,6 +23,7 @@ const mocks = vi.hoisted(() => ({
   sendMessage: vi.fn(async () => 'om_top'),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
   topicRoots: new Map<string, string>(),
+  topicQueues: new Map<string, Promise<void>>(),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -39,6 +40,30 @@ vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
   getVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>) => (
     mocks.topicRoots.get(JSON.stringify(key))
   )),
+  ensureVcMeetingListenerTopicRoot: vi.fn(async (
+    _dataDir: string,
+    key: Record<string, unknown>,
+    createRoot: () => Promise<string>,
+  ) => {
+    const serialized = JSON.stringify(key);
+    const previous = mocks.topicQueues.get(serialized) ?? Promise.resolve();
+    const waitForPrevious = previous.catch(() => undefined);
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    const tail = waitForPrevious.then(() => current);
+    mocks.topicQueues.set(serialized, tail);
+    await waitForPrevious;
+    try {
+      const prior = mocks.topicRoots.get(serialized);
+      if (prior) return { rootMessageId: prior, created: false };
+      const rootMessageId = await createRoot();
+      mocks.topicRoots.set(serialized, rootMessageId);
+      return { rootMessageId, created: true };
+    } finally {
+      release();
+      if (mocks.topicQueues.get(serialized) === tail) mocks.topicQueues.delete(serialized);
+    }
+  }),
   recordVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>, root: string) => {
     const serialized = JSON.stringify(key);
     const prior = mocks.topicRoots.get(serialized);
@@ -113,6 +138,7 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.topicRoots.clear();
+    mocks.topicQueues.clear();
     activeSessions.clear();
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
   });
@@ -289,6 +315,59 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     );
     expect(mocks.replyMessage).toHaveBeenCalledWith(
       APP, 'om_top', 'second update', 'text', true, undefined, expect.anything(), { suppressHook: true },
+    );
+  });
+
+  it('single-flights concurrent first topic outputs before creating the durable root', async () => {
+    const receiver = seedReceiverSession();
+    const meetingTopicKey = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-concurrent',
+      memberId: 'member-1',
+      memberEpoch: 1,
+      targetChatId: CHAT,
+    };
+    let releaseFirstSend!: () => void;
+    let markFirstSendStarted!: () => void;
+    const firstSendStarted = new Promise<void>(resolve => { markFirstSendStarted = resolve; });
+    const firstSendBlocked = new Promise<void>(resolve => { releaseFirstSend = resolve; });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      markFirstSendStarted();
+      await firstSendBlocked;
+      return 'om_concurrent_root';
+    });
+
+    const first = sessionReply(CHAT, 'first update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+    await firstSendStarted;
+    const second = sessionReply(CHAT, 'second update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+
+    await Promise.resolve();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+
+    releaseFirstSend();
+    await expect(first).resolves.toBe('om_concurrent_root');
+    await expect(second).resolves.toBe('om_reply');
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP,
+      'om_concurrent_root',
+      'second update',
+      'text',
+      true,
+      undefined,
+      expect.anything(),
+      { suppressHook: true },
     );
   });
 

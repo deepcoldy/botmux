@@ -190,7 +190,7 @@ Example:
 
 `vcMeetingAgent.meetingConsumer.consumerProfiles` defines reusable meeting-listener roles. `responseMode` controls whether automatic model output is authorized; `listenerDelivery.placement` independently controls where authorized output appears:
 
-The Dashboard meeting-role editor includes a local built-in template library: Important information sync, Structured meeting minutes, Decision and action tracker, and Risk and assumption watch. “Use template” copies the selected template into a normal, fully editable profile; later template changes never overwrite user configuration. The catalog has stable template IDs, versions, and source metadata so a community source can use the same model later. This release makes no network request and uploads no usage data, so popularity rankings are intentionally unavailable.
+The Dashboard meeting-role editor includes a local built-in template library: Important information sync, Meeting minutes and action items, Meeting facilitator, Design review and risk challenge, and Interview and discovery. “Use template” copies the selected template into a normal, fully editable profile; later template changes never overwrite user configuration. The catalog has stable template IDs, versions, and source metadata so a community source can use the same model later. This release makes no network request and uploads no usage data, so popularity rankings are intentionally unavailable.
 
 - `silent`: automatic model output stays hidden.
 - `listener_thread`: automatic output may be sent to the listener group and requires `listener.output.request`.

@@ -476,7 +476,7 @@ export function VcConsumerProfilesSection(props: {
     if (!profile.id) return;
     mutate(state => {
       const ids = enabled
-        ? [profile.id]
+        ? [...new Set([...state.defaultConsumerIds, profile.id])]
         : state.defaultConsumerIds.filter(id => id !== profile.id);
       return {
         ...state,

@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { withFileLockSync } from '../utils/file-lock.js';
+import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 
 const DIR_NAME = 'vc-meeting-listener-topics';
 const SCHEMA_VERSION = 1 as const;
@@ -79,6 +79,46 @@ export function getVcMeetingListenerTopicRoot(
 ): string | undefined {
   if (!validKey(key)) return undefined;
   return readRecord(filePath(dataDir, key), key)?.rootMessageId;
+}
+
+/**
+ * Return the existing topic root or create it exactly once.
+ *
+ * The async file lock intentionally covers the provider send as well as the
+ * durable write. Checking before the send and locking only the write leaves a
+ * race where two concurrent outputs can both create top-level messages before
+ * either one persists the winning root.
+ */
+export async function ensureVcMeetingListenerTopicRoot(
+  dataDir: string,
+  key: VcMeetingListenerTopicKey,
+  createRoot: () => Promise<string>,
+): Promise<{ rootMessageId: string; created: boolean }> {
+  if (!validKey(key)) {
+    throw new Error('invalid VC meeting listener-topic key');
+  }
+  const fp = filePath(dataDir, key);
+  const dir = join(dataDir, DIR_NAME);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return withFileLock(fp, async () => {
+    const prior = readRecord(fp, key);
+    if (prior) return { rootMessageId: prior.rootMessageId, created: false };
+
+    const rootMessageId = (await createRoot()).trim();
+    if (!nonEmpty(rootMessageId)) {
+      throw new Error('VC meeting listener topic root provider returned an empty message id');
+    }
+    const now = Date.now();
+    const record: VcMeetingListenerTopicRecord = {
+      schemaVersion: SCHEMA_VERSION,
+      ...key,
+      rootMessageId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    atomicWriteFileSync(fp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+    return { rootMessageId, created: true };
+  });
 }
 
 /** First successful provider message wins. A conflicting later root is a hard

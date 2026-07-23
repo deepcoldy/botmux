@@ -190,7 +190,7 @@
 
 `vcMeetingAgent.meetingConsumer.consumerProfiles` 可以定义通用的会议监听角色。`responseMode` 与 `listenerDelivery.placement` 是两个独立维度：
 
-Dashboard 的“会议角色预设”提供本地内置模板库，当前包含“会议重要信息同步”“结构化会议纪要”“决策与行动项跟踪”“风险与假设观察”。点击“使用此模板”会复制出一个普通、可完整编辑的 profile；之后修改模板不会改写用户配置。模板目录带稳定的 `templateId`、版本和来源，未来可以在同一模型上接入社区源。本期不联网、不上传模板使用情况，因此不提供热度或使用量排行。
+Dashboard 的“会议角色预设”提供本地内置模板库，当前包含“会议重要信息同步”“会议纪要与行动项”“会议主持”“方案评审与风险挑战”“访谈与需求洞察”。点击“使用此模板”会复制出一个普通、可完整编辑的 profile；之后修改模板不会改写用户配置。模板目录带稳定的 `templateId`、版本和来源，未来可以在同一模型上接入社区源。本期不联网、不上传模板使用情况，因此不提供热度或使用量排行。
 
 - `responseMode: "silent"`：自动模型输出不可见；适合只做内部处理或通过受管会议能力执行动作。
 - `responseMode: "listener_thread"`：允许把自动模型输出发到会议监听群，需要 `listener.output.request` capability。

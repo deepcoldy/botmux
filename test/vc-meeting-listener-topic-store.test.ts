@@ -1,8 +1,9 @@
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  ensureVcMeetingListenerTopicRoot,
   getVcMeetingListenerTopicRoot,
   recordVcMeetingListenerTopicRoot,
 } from '../src/services/vc-meeting-listener-topic-store.js';
@@ -55,6 +56,34 @@ describe('vc meeting listener topic store', () => {
       ok: false,
       reason: 'conflict',
     });
+    expect(getVcMeetingListenerTopicRoot(dir, key)).toBe('om_first');
+  });
+
+  it('serializes concurrent root creation across provider send and persistence', async () => {
+    const dir = tempDir();
+    let releaseFirst!: () => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>(resolve => { markFirstStarted = resolve; });
+    const firstBlocked = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const createFirst = vi.fn(async () => {
+      markFirstStarted();
+      await firstBlocked;
+      return 'om_first';
+    });
+    const createSecond = vi.fn(async () => 'om_second');
+
+    const first = ensureVcMeetingListenerTopicRoot(dir, key, createFirst);
+    await firstStarted;
+    const second = ensureVcMeetingListenerTopicRoot(dir, key, createSecond);
+
+    await Promise.resolve();
+    expect(createFirst).toHaveBeenCalledTimes(1);
+    expect(createSecond).not.toHaveBeenCalled();
+
+    releaseFirst();
+    await expect(first).resolves.toEqual({ rootMessageId: 'om_first', created: true });
+    await expect(second).resolves.toEqual({ rootMessageId: 'om_first', created: false });
+    expect(createSecond).not.toHaveBeenCalled();
     expect(getVcMeetingListenerTopicRoot(dir, key)).toBe('om_first');
   });
 

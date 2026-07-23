@@ -431,7 +431,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
       .some(node => textOf(node).includes('暂时无法生成默认角色'))).toBe(true);
   });
 
-  it('save posts catalog.forBot + revision; id rename & card removal sync defaultConsumerIds', async () => {
+  it('save posts catalog.forBot + revision; id rename & card removal preserve valid multiple defaults', async () => {
     const fetchMock = stubFetchImmediate({
       A: catalogBody('A', {
         defaultMode: 'agents',
@@ -445,13 +445,13 @@ describe('VcConsumerProfilesSection · 保存', () => {
     await openProfile(r, 1);
     await act(async () => { buttonByClass(r, 'vc-profile-remove')!.props.onClick(); });
 
-    // 新增预设 → 起名 a → 勾为默认：旧默认必须立刻取消；改名 b 后默认 id 跟着更新。
+    // 新增预设 → 起名 a → 勾为默认：保留已有默认；改名 b 后默认 id 跟着更新。
     await act(async () => { addButton(r)!.props.onClick(); });
     await setInput(idInput(r), 'a');
     await act(async () => {
       defaultConsumerCheckbox(r, 'a')!.props.onChange({ currentTarget: { checked: true } });
     });
-    expect(defaultConsumerCheckbox(r, 'minutes')?.props.checked).toBe(false);
+    expect(defaultConsumerCheckbox(r, 'minutes')?.props.checked).toBe(true);
     expect(defaultConsumerCheckbox(r, 'a')?.props.checked).toBe(true);
     await setInput(idInput(r), 'b');
 
@@ -462,7 +462,7 @@ describe('VcConsumerProfilesSection · 保存', () => {
     expect(puts).toHaveLength(1);
     expect(puts[0].listenerBotAppId).toBe('A');
     expect(puts[0].expectedRevision).toBe('rev-A-1');
-    expect(puts[0].defaultConsumerIds).toEqual(['b']);
+    expect(puts[0].defaultConsumerIds).toEqual(['minutes', 'b']);
     expect((puts[0].profiles as Json[]).map(p => p.id)).toEqual(['minutes', 'b']);
   });
 
