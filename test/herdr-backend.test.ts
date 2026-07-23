@@ -557,8 +557,24 @@ describe('HerdrBackend.spawn', () => {
     be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
 
     expect(herdrCall('agent', 'start', 'botmux')).toBeUndefined();
+    expect(be.captureCurrentScreen()).toBe('adopted screen');
     const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
     expect(serverSpawn).toBeUndefined();
+    be.kill();
+  });
+
+  it('external target adopt accepts Herdr 0.7.5 raw ANSI read output', () => {
+    const rawScreen = '\u001b[1mPi output\u001b[0m\n> ';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('read') && a.includes('agent'), reply: () => rawScreen },
+    ]);
+    const be = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: 'w3:p1', paneId: 'w3:p1' },
+    });
+    be.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    expect(be.captureCurrentScreen()).toBe(rawScreen);
     be.kill();
   });
 

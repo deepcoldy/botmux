@@ -298,6 +298,35 @@ function extractReadText(raw: any): string {
   return typeof raw?.result?.read?.text === 'string' ? raw.result.read.text : '';
 }
 
+/** Read terminal text across Herdr CLI output contracts.
+ *
+ * Herdr 0.6.x wrapped `agent read` in JSON (`result.read.text`), while 0.7.5
+ * writes the terminal snapshot directly to stdout even though most other
+ * commands remain JSON. Parsing every read via jsonCommand() therefore turned
+ * a successful 0.7.5 read into an empty screen. Preserve raw ANSI bytes, but
+ * still unwrap the legacy JSON response for older installations.
+ */
+function readHerdrTextCommand(args: string[]): string {
+  try {
+    const raw = execFileSync('herdr', args, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    const candidate = raw.trim();
+    if (candidate.startsWith('{')) {
+      try {
+        const text = extractReadText(JSON.parse(candidate));
+        if (text || candidate.includes('"read"')) return text;
+      } catch { /* Herdr 0.7.5 raw terminal text may itself begin with `{`. */ }
+    }
+    return raw;
+  } catch {
+    return '';
+  }
+}
+
 function longestSuffixPrefix(previous: string, next: string): number {
   const max = Math.min(previous.length, next.length);
   for (let len = max; len > 0; len--) {
@@ -869,26 +898,18 @@ export class HerdrBackend implements SessionBackend {
     return raw.ok ? extractAgents(raw.value) : null;
   }
 
-  // NOTE: we use `agent read` (not `pane read`) for capture. Both accept the
-  // same target shapes (pane_id, agent name, terminal_id), but `pane read`
-  // prints raw text while `agent read` prints JSON with `result.read.text`.
-  // Routing reads through JSON keeps the parsing path uniform with the rest
-  // of the herdr CLI surface and gives us a hard "did the call succeed"
-  // signal instead of treating raw bytes as opaque text.
   private readVisibleAnsi(): string {
     const target = this.paneId ?? this.agentName;
-    return extractReadText(jsonCommand(
+    return readHerdrTextCommand(
       herdrSessionArgs(this.sessionName, ['agent', 'read', target, '--source', 'visible', '--lines', String(this.rows), '--format', 'ansi']),
-      { timeout: 5000 },
-    ));
+    );
   }
 
   private readRecentAnsi(): string {
     const target = this.paneId ?? this.agentName;
-    return extractReadText(jsonCommand(
+    return readHerdrTextCommand(
       herdrSessionArgs(this.sessionName, ['agent', 'read', target, '--source', 'recent', '--lines', String(READ_LINES), '--format', 'ansi']),
-      { timeout: 5000 },
-    ));
+    );
   }
 
   private startPolling(): void {
