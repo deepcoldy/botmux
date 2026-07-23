@@ -40,6 +40,10 @@ const autoOk = (): OpenPlatformAutomationResult => ({
   skippedScopeCount: 0,
 });
 
+const immediateCriticalScopePolling = {
+  criticalScopePollIntervalMs: 0,
+};
+
 describe('BotOnboardingManager', () => {
   beforeEach(() => {
     userGetMock.mockReset();
@@ -739,6 +743,7 @@ describe('BotOnboardingManager', () => {
     const calls: Array<Parameters<NonNullable<ConstructorParameters<typeof BotOnboardingManager>[0]['automateOpenPlatform']>>[0]> = [];
     const manager = new BotOnboardingManager({
       botsJsonPath,
+      ...immediateCriticalScopePolling,
       createApp,
       registerApp,
       stopBotLive,
@@ -752,6 +757,7 @@ describe('BotOnboardingManager', () => {
       automateOpenPlatform: async (opts) => {
         calls.push(opts);
         await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"recover"}}' });
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
         await gate.promise;
         return { ...autoOk(), sessionSource: 'qr_login' };
       },
@@ -906,6 +912,7 @@ describe('BotOnboardingManager', () => {
     const firstGate = deferred<void>();
     const firstManager = new BotOnboardingManager({
       botsJsonPath,
+      ...immediateCriticalScopePolling,
       permissionRecoveryStorePath,
       automateOpenPlatform: async (opts) => {
         await opts.onQrCode?.({ qrText: 'ascii', qrPayload: '{"qrlogin":{"token":"first"}}' });
@@ -942,8 +949,12 @@ describe('BotOnboardingManager', () => {
 
     const secondManager = new BotOnboardingManager({
       botsJsonPath,
+      ...immediateCriticalScopePolling,
       permissionRecoveryStorePath,
-      automateOpenPlatform: async () => autoOk(),
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
       verifyCriticalScopes: async () => ({ ok: true, granted: [], missingCritical: [], missingOptional: [] }),
       stopBotLive: async () => ({ ok: true, message: 'already stopped' }),
       startBotLive: async () => ({ ok: true, message: 'recovered after restart' }),
@@ -1068,6 +1079,7 @@ describe('BotOnboardingManager', () => {
     const automateOpenPlatform = vi.fn(async () => autoOk());
     const manager = new BotOnboardingManager({
       botsJsonPath,
+      ...immediateCriticalScopePolling,
       automateOpenPlatform,
       verifyCriticalScopes: async () => ({
         ok: true,
@@ -1142,6 +1154,7 @@ describe('BotOnboardingManager', () => {
     const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
     const manager = new BotOnboardingManager({
       botsJsonPath: join(dir, 'bots.json'),
+      ...immediateCriticalScopePolling,
       registerApp: async () => ({
         ok: true,
         appId: 'cli_mosa_pending',
@@ -1150,7 +1163,10 @@ describe('BotOnboardingManager', () => {
         userOpenId: 'ou_scanner',
       }),
       validateCredentials: async () => ({ ok: true }),
-      automateOpenPlatform: async () => autoOk(),
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
       verifyCriticalScopes: async () => ({
         ok: true,
         granted: [],
@@ -1190,6 +1206,121 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('keeps a fresh MOSA bot activation-pending when scopes are ready but the second QR was never scanned', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-initial-no-scan-'));
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
+    });
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      ...immediateCriticalScopePolling,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_mosa_initial_no_scan',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_scanner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      startBotLive,
+    });
+
+    const job = manager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir: dir,
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await job.done;
+
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      criticalScopeActivationRequired: true,
+    });
+    expect(manager.get(job.id)?.platformQrScanConfirmedAt).toBeUndefined();
+    expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_mosa_initial_no_scan',
+      activationPending: true,
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not activate a fresh MOSA bot until critical scopes remain complete across consecutive readbacks', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-stable-'));
+    userGetMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user: { union_id: 'on_scanner', name: 'Scanner' } },
+    });
+    const missingScope = {
+      name: 'contact:user.base:readonly',
+      desc: '用户基本信息',
+      critical: true,
+    };
+    const readbacks = [
+      { ok: true as const, granted: [], missingCritical: [], missingOptional: [] },
+      { ok: true as const, granted: [], missingCritical: [missingScope], missingOptional: [] },
+      { ok: true as const, granted: [], missingCritical: [], missingOptional: [] },
+      { ok: true as const, granted: [], missingCritical: [], missingOptional: [] },
+      { ok: true as const, granted: [], missingCritical: [], missingOptional: [] },
+    ];
+    const verifyCriticalScopes = vi.fn(async () => (
+      readbacks.shift()
+      ?? { ok: true as const, granted: [], missingCritical: [], missingOptional: [] }
+    ));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'bot online' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      ...immediateCriticalScopePolling,
+      criticalScopeMaxAttempts: 5,
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_mosa_stable',
+        appSecret: 's',
+        brand: 'feishu',
+        userOpenId: 'ou_scanner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes,
+      startBotLive,
+    });
+
+    const job = manager.start({
+      registrationMode: 'compat',
+      cliId: 'traex',
+      workingDir: dir,
+      requireCriticalScopesBeforeActivation: true,
+    });
+    await job.done;
+
+    expect(verifyCriticalScopes).toHaveBeenCalledTimes(5);
+    expect(startBotLive).toHaveBeenCalledOnce();
+    expect(manager.get(job.id)).toMatchObject({
+      status: 'completed',
+      criticalScopeActivationRequired: true,
+      liveStarted: true,
+    });
+    expect(manager.get(job.id)).not.toMatchObject({ activationPending: true });
+    expect(JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf8'))).toEqual([
+      expect.not.objectContaining({ activationPending: true }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('activates an exact pending MOSA bot only after permission recovery reads every critical scope', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-recovery-'));
     const botsJsonPath = join(dir, 'bots.json');
@@ -1203,15 +1334,20 @@ describe('BotOnboardingManager', () => {
       activationPending: true,
     }]));
     const startBotLive = vi.fn(async () => ({ ok: true, message: 'bot online' }));
+    const verifyCriticalScopes = vi.fn(async () => ({
+      ok: true as const,
+      granted: [],
+      missingCritical: [],
+      missingOptional: [],
+    }));
     const manager = new BotOnboardingManager({
       botsJsonPath,
-      automateOpenPlatform: async () => autoOk(),
-      verifyCriticalScopes: async () => ({
-        ok: true,
-        granted: [],
-        missingCritical: [],
-        missingOptional: [],
-      }),
+      ...immediateCriticalScopePolling,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
+      verifyCriticalScopes,
       stopBotLive: async () => ({ ok: true, message: 'not running yet' }),
       startBotLive,
     });
@@ -1227,6 +1363,7 @@ describe('BotOnboardingManager', () => {
     await started.job.done;
 
     expect(startBotLive).toHaveBeenCalledOnce();
+    expect(verifyCriticalScopes).toHaveBeenCalledTimes(3);
     expect(startBotLive).toHaveBeenCalledWith('cli_pending_recovery');
     expect(manager.get(started.job.id)).toMatchObject({
       status: 'completed',
@@ -1235,6 +1372,60 @@ describe('BotOnboardingManager', () => {
     });
     expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
       expect.not.objectContaining({ activationPending: true }),
+    ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps an exact pending MOSA bot inactive when scopes are ready but the second QR scan was not confirmed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-critical-recovery-no-scan-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_pending_no_scan',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+    }]));
+    const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      ...immediateCriticalScopePolling,
+      automateOpenPlatform: async () => autoOk(),
+      verifyCriticalScopes: async () => ({
+        ok: true,
+        granted: [],
+        missingCritical: [],
+        missingOptional: [],
+      }),
+      stopBotLive: async () => ({ ok: true, message: 'not running yet' }),
+      startBotLive,
+    });
+
+    const started = manager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_pending_no_scan',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error(started.error);
+    await started.job.done;
+
+    expect(startBotLive).not.toHaveBeenCalled();
+    expect(manager.get(started.job.id)).toMatchObject({
+      status: 'failed',
+      activationPending: true,
+      criticalScopeActivationRequired: true,
+      error: 'permission_recovery_failed',
+      message: expect.stringContaining('platform_qr_scan_not_confirmed'),
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.objectContaining({
+        larkAppId: 'cli_pending_no_scan',
+        activationPending: true,
+      }),
     ]);
     rmSync(dir, { recursive: true, force: true });
   });
@@ -1253,7 +1444,11 @@ describe('BotOnboardingManager', () => {
     }]));
     const manager = new BotOnboardingManager({
       botsJsonPath,
-      automateOpenPlatform: async () => autoOk(),
+      ...immediateCriticalScopePolling,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+        return autoOk();
+      },
       verifyCriticalScopes: async () => ({
         ok: true,
         granted: [],
@@ -1304,7 +1499,9 @@ describe('BotOnboardingManager', () => {
     const startBotLive = vi.fn(async () => ({ ok: true, message: 'must not start' }));
     const manager = new BotOnboardingManager({
       botsJsonPath,
-      automateOpenPlatform: async () => {
+      ...immediateCriticalScopePolling,
+      automateOpenPlatform: async opts => {
+        await opts.onQrScanConfirmed?.({ confirmedAt: Date.now() });
         writeFileSync(botsJsonPath, JSON.stringify([{
           larkAppId: 'cli_replaced_target',
           larkAppSecret: 'different-secret',
@@ -1357,6 +1554,7 @@ describe('BotOnboardingManager', () => {
     const automateOpenPlatform = vi.fn(async () => autoOk());
     const manager = new BotOnboardingManager({
       botsJsonPath,
+      ...immediateCriticalScopePolling,
       automateOpenPlatform,
       stopBotLive: async () => ({ ok: false, message: 'pm2 stop rejected' }),
       verifyCriticalScopes: async () => ({

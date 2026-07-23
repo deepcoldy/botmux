@@ -75,6 +75,8 @@ export interface BotOnboardingSnapshot {
   expireAt?: number;
   // 显式兼容模式的开放平台登录扫码；主路径不会出现。
   platformQrDataUrl?: string;
+  /** Exact second Open Platform QR was observed as scanned by Feishu polling. */
+  platformQrScanConfirmedAt?: number;
   /** 自动配置进度文案 (来自 automation onStatus) */
   permissionStatusMsg?: string;
   appId?: string;
@@ -183,6 +185,17 @@ export interface BotOnboardingManagerOptions {
   validateCredentials?: ValidateCredentialsFn;
   automateOpenPlatform?: AutomateOpenPlatformFn;
   verifyCriticalScopes?: VerifyCriticalScopesFn;
+  /**
+   * A single complete application-info response is not an activation ACK:
+   * Feishu permission propagation can briefly expose an incomplete or stale
+   * view after the owner scan. Require consecutive complete observations
+   * before removing activationPending.
+   */
+  criticalScopeStableReads?: number;
+  /** Maximum bounded application-info observations for the stable gate. */
+  criticalScopeMaxAttempts?: number;
+  /** Delay between stable-gate observations. Tests may set this to zero. */
+  criticalScopePollIntervalMs?: number;
   renderQrDataUrl?: (url: string) => string;
   now?: () => number;
   /**
@@ -271,6 +284,9 @@ export class BotOnboardingManager {
   private readonly validateCredentials: ValidateCredentialsFn;
   private readonly automateOpenPlatform: AutomateOpenPlatformFn;
   private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
+  private readonly criticalScopeStableReads: number;
+  private readonly criticalScopeMaxAttempts: number;
+  private readonly criticalScopePollIntervalMs: number;
   private readonly renderQrDataUrl: (url: string) => string;
   private readonly now: () => number;
   private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
@@ -288,6 +304,22 @@ export class BotOnboardingManager {
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
     this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
     this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
+    this.criticalScopeStableReads = Number.isInteger(opts.criticalScopeStableReads)
+      && (opts.criticalScopeStableReads ?? 0) > 0
+      ? opts.criticalScopeStableReads!
+      : 3;
+    const configuredMaxAttempts = Number.isInteger(opts.criticalScopeMaxAttempts)
+      && (opts.criticalScopeMaxAttempts ?? 0) > 0
+      ? opts.criticalScopeMaxAttempts!
+      : 12;
+    this.criticalScopeMaxAttempts = Math.max(
+      this.criticalScopeStableReads,
+      configuredMaxAttempts,
+    );
+    this.criticalScopePollIntervalMs = Number.isInteger(opts.criticalScopePollIntervalMs)
+      && (opts.criticalScopePollIntervalMs ?? -1) >= 0
+      ? opts.criticalScopePollIntervalMs!
+      : 5_000;
     this.renderQrDataUrl = opts.renderQrDataUrl ?? renderQrSvgDataUrl;
     this.now = opts.now ?? (() => Date.now());
     this.startBotLive = opts.startBotLive;
@@ -388,6 +420,8 @@ export class BotOnboardingManager {
         || !['starting', 'configuring_permissions', 'waiting_for_platform_scan', 'completed', 'failed'].includes(raw.status)
         || !['feishu', 'lark'].includes(raw.brand)
         || (raw.previousRecoveryJobId !== undefined && typeof raw.previousRecoveryJobId !== 'string')
+        || (raw.platformQrScanConfirmedAt !== undefined
+          && (!Number.isInteger(raw.platformQrScanConfirmedAt) || raw.platformQrScanConfirmedAt <= 0))
       ) {
         this.permissionRecoveryStateError = 'permission recovery ledger contains an invalid record';
         return;
@@ -413,6 +447,9 @@ export class BotOnboardingManager {
           ? { criticalScopeActivationRequired: true }
           : {}),
         ...(raw.activationPending === true ? { activationPending: true } : {}),
+        ...(Number.isInteger(raw.platformQrScanConfirmedAt)
+          ? { platformQrScanConfirmedAt: raw.platformQrScanConfirmedAt }
+          : {}),
         ...(status === 'failed'
           ? {
               error: raw.status === 'failed' && typeof raw.error === 'string'
@@ -484,6 +521,7 @@ export class BotOnboardingManager {
         previousRecoveryJobId: job.previousRecoveryJobId,
         criticalScopeActivationRequired: job.criticalScopeActivationRequired,
         activationPending: job.activationPending,
+        platformQrScanConfirmedAt: job.platformQrScanConfirmedAt,
         error: job.error,
         message: job.message,
       }));
@@ -536,17 +574,51 @@ export class BotOnboardingManager {
     }
   }
 
-  private async criticalScopesReady(
+  private async stableCriticalScopeReadback(
+    id: string,
     appId: string,
     appSecret: string,
     brand: 'feishu' | 'lark',
-  ): Promise<boolean> {
-    try {
-      const readback = await this.verifyCriticalScopes(appId, appSecret, brand);
-      return readback.ok && readback.missingCritical.length === 0;
-    } catch {
-      return false;
+  ): Promise<{ ready: boolean; readback: CriticalScopeReadbackResult }> {
+    let consecutiveComplete = 0;
+    let readback: CriticalScopeReadbackResult = {
+      ok: false,
+      error: 'network',
+      message: '尚未读取权限状态',
+    };
+    for (let attempt = 1; attempt <= this.criticalScopeMaxAttempts; attempt += 1) {
+      try {
+        readback = await this.verifyCriticalScopes(appId, appSecret, brand);
+      } catch (err) {
+        readback = {
+          ok: false,
+          error: 'network',
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (readback.ok && readback.missingCritical.length === 0) {
+        consecutiveComplete += 1;
+      } else {
+        consecutiveComplete = 0;
+      }
+      this.patch(id, {
+        permissionStatusMsg: consecutiveComplete > 0
+          ? `正在确认 9 项核心权限稳定生效（${consecutiveComplete}/${this.criticalScopeStableReads}）`
+          : `正在等待 9 项核心权限生效（${attempt}/${this.criticalScopeMaxAttempts}）`,
+      });
+      if (consecutiveComplete >= this.criticalScopeStableReads) {
+        return { ready: true, readback };
+      }
+      if (
+        attempt < this.criticalScopeMaxAttempts
+        && this.criticalScopePollIntervalMs > 0
+      ) {
+        await new Promise<void>(resolve => {
+          setTimeout(resolve, this.criticalScopePollIntervalMs);
+        });
+      }
     }
+    return { ready: false, readback };
   }
 
   private async activateRecoveredBot(
@@ -754,6 +826,15 @@ export class BotOnboardingManager {
     if (current.recoveryOfJobId) this.savePermissionRecoveryJobsBestEffort();
   }
 
+  private confirmPlatformQrScan(id: string, confirmedAt: number): void {
+    const current = this.jobs.get(id);
+    if (!current || current.platformQrScanConfirmedAt !== undefined) return;
+    if (!Number.isInteger(confirmedAt) || confirmedAt <= 0) {
+      throw new Error('platform_qr_scan_confirmation_invalid');
+    }
+    this.patch(id, { platformQrScanConfirmedAt: confirmedAt });
+  }
+
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
     // Freeze the resolved name before any asynchronous work. Later bot list
     // changes must not make the name drift midway through onboarding.
@@ -865,8 +946,14 @@ export class BotOnboardingManager {
       workingDir,
       registrationMode: input.registrationMode ?? 'web',
     });
+    const platformQrScanConfirmed = this.jobs.get(id)?.platformQrScanConfirmedAt !== undefined;
+    const stableScopeReadback = input.requireCriticalScopesBeforeActivation === true
+      && platformQrScanConfirmed
+      ? await this.stableCriticalScopeReadback(id, result.appId, result.appSecret, result.brand)
+      : undefined;
     const activationPending = input.requireCriticalScopesBeforeActivation === true
-      && !(await this.criticalScopesReady(result.appId, result.appSecret, result.brand));
+      && (!platformQrScanConfirmed
+        || stableScopeReadback?.ready !== true);
     if (activationPending) {
       bot.activationPending = true;
       this.patch(id, { activationPending: true });
@@ -1010,6 +1097,9 @@ export class BotOnboardingManager {
           platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
         });
       },
+      onQrScanConfirmed: (info: { confirmedAt: number }) => {
+        this.confirmPlatformQrScan(id, info.confirmedAt);
+      },
       onStatus: (msg: string) => {
         // onStatus follows onQrCode while polling; keep the QR visible.
         this.patch(id, { permissionStatusMsg: msg });
@@ -1072,24 +1162,36 @@ export class BotOnboardingManager {
           platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
         });
       },
+      onQrScanConfirmed: (info: { confirmedAt: number }) => {
+        this.confirmPlatformQrScan(id, info.confirmedAt);
+      },
       onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
     }, sessionFilePath);
     if (!auto.ok) {
       this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'failed', 'permission_recovery_failed');
       return;
     }
-    let scopeReadback: CriticalScopeReadbackResult;
-    try {
-      scopeReadback = await this.verifyCriticalScopes(appId, appSecret, brand);
-    } catch (err) {
-      scopeReadback = { ok: false, error: 'network', message: err instanceof Error ? err.message : String(err) };
+    if (
+      requireCriticalScopesBeforeActivation
+      && this.jobs.get(id)?.platformQrScanConfirmedAt === undefined
+    ) {
+      throw new Error('platform_qr_scan_not_confirmed');
     }
-    if (!scopeReadback.ok || scopeReadback.missingCritical.length > 0) {
+    const stableScopeReadback = await this.stableCriticalScopeReadback(
+      id,
+      appId,
+      appSecret,
+      brand,
+    );
+    const scopeReadback = stableScopeReadback.readback;
+    if (!stableScopeReadback.ready) {
       const failed: OpenPlatformAutomationResult = {
         ok: false,
         reason: scopeReadback.ok ? 'scope_mapping_failed' : 'api_error',
         message: scopeReadback.ok
-          ? `关键权限回读仍缺失: ${scopeReadback.missingCritical.map(scope => scope.name).join(', ')}`
+          ? scopeReadback.missingCritical.length > 0
+            ? `关键权限回读仍缺失: ${scopeReadback.missingCritical.map(scope => scope.name).join(', ')}`
+            : `9 项核心权限尚未连续稳定生效（需要连续 ${this.criticalScopeStableReads} 次）`
           : `关键权限回读失败: ${scopeReadback.message}`,
       };
       this.finalizePermissions(id, appId, brand, addedBotIndex, failed, 'failed', 'permission_recovery_failed');
@@ -1103,7 +1205,7 @@ export class BotOnboardingManager {
     id: string,
     appId: string,
     brand: 'feishu' | 'lark',
-    callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onStatus'>,
+    callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onQrScanConfirmed' | 'onStatus'>,
     sessionFilePath: string,
   ): Promise<OpenPlatformAutomationResult> {
     try {

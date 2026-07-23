@@ -163,6 +163,8 @@ export interface OpenPlatformAutomationOptions {
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
+  /** Emitted once only after Feishu reports this exact QR as scanned. */
+  onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
 }
 
@@ -202,6 +204,8 @@ export interface FeishuWebSessionOptions {
   pollIntervalMs?: number;
   maxWaitMs?: number;
   onQrCode?: (info: { qrText: string; qrPayload: string }) => void | Promise<void>;
+  /** Emitted once only after polling observes Feishu status=2 for this QR. */
+  onQrScanConfirmed?: (info: { confirmedAt: number }) => void | Promise<void>;
   onStatus?: (message: string) => void | Promise<void>;
 }
 
@@ -596,6 +600,7 @@ export async function automateOpenPlatformSetup(
     pollIntervalMs: options.pollIntervalMs,
     maxWaitMs: options.maxWaitMs,
     onQrCode: options.onQrCode,
+    onQrScanConfirmed: options.onQrScanConfirmed,
     onStatus: options.onStatus,
   });
   if (!preparedSession.ok) {
@@ -1410,12 +1415,17 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
   const maxWaitMs = options.maxWaitMs ?? 120_000;
   const start = Date.now();
   let lastStatusMessage = '';
+  let scanConfirmationEmitted = false;
   for (;;) {
     if (Date.now() - start > maxWaitMs) {
       throw new FeishuWebSessionError('等待飞书扫码超时', 'timeout');
     }
 
     const poll = await pollFeishuQrLogin(session, fetcher, qrInit.flowKey);
+    if (poll.status === 2 && !scanConfirmationEmitted) {
+      scanConfirmationEmitted = true;
+      await options.onQrScanConfirmed?.({ confirmedAt: Date.now() });
+    }
     if (poll.nextStep === 'enter_app') {
       if (poll.crossLoginUri) {
         await session.fetchRaw(fetcher, poll.crossLoginUri, { method: 'GET' });

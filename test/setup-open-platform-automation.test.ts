@@ -250,6 +250,111 @@ describe('prepareFeishuWebSession', () => {
     }
   });
 
+  it('emits a structured scan confirmation only after Feishu reports the exact QR as scanned', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-scan-confirmation-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    const confirmations: number[] = [];
+    let pollingCount = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'qr-token' } } },
+          { headers: { 'x-flow-key': 'flow-key' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        pollingCount += 1;
+        if (pollingCount === 1) {
+          return Response.json({
+            code: 0,
+            data: { next_step: null, step_info: { status: 2 } },
+          });
+        }
+        return Response.json({
+          code: 0,
+          data: {
+            next_step: 'enter_app',
+            step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/cross-login' },
+          },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/cross-login') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=secret-cookie-value; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+      onQrScanConfirmed: ({ confirmedAt }) => confirmations.push(confirmedAt),
+    });
+
+    expect(result.ok && result.source).toBe('qr_login');
+    expect(confirmations).toHaveLength(1);
+    expect(Number.isInteger(confirmations[0])).toBe(true);
+  });
+
+  it('does not fabricate a scan confirmation when Feishu jumps directly to enter_app', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-no-scan-confirmation-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    const onQrScanConfirmed = vi.fn();
+    const fetchImpl = (async (url: string | URL | Request) => {
+      const href = String(url);
+      if (href.includes('/accounts/qrlogin/init')) {
+        return Response.json(
+          { code: 0, data: { step_info: { token: 'qr-token' } } },
+          { headers: { 'x-flow-key': 'flow-key' } },
+        );
+      }
+      if (href.includes('/accounts/qrlogin/polling')) {
+        return Response.json({
+          code: 0,
+          data: {
+            next_step: 'enter_app',
+            step_info: { status: 1, cross_login_uri: 'https://accounts.feishu.cn/cross-login' },
+          },
+        });
+      }
+      if (href === 'https://accounts.feishu.cn/cross-login') {
+        return new Response('', {
+          status: 302,
+          headers: {
+            location: 'https://ask.feishu.cn/',
+            'set-cookie': 'session=secret-cookie-value; Domain=.feishu.cn; Path=/; Secure; HttpOnly',
+          },
+        });
+      }
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      throw new Error(`unexpected url: ${href}`);
+    }) as typeof fetch;
+
+    const result = await prepareFeishuWebSession({
+      sessionFilePath: sessionFile,
+      forceQrLogin: true,
+      fetchImpl,
+      pollIntervalMs: 0,
+      maxWaitMs: 1000,
+      onQrCode: () => {},
+      onQrScanConfirmed,
+    });
+
+    expect(result.ok && result.source).toBe('qr_login');
+    expect(onQrScanConfirmed).not.toHaveBeenCalled();
+  });
+
   it('forces a fresh QR login for onboarding even when a valid cache exists', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-open-platform-force-'));
     const sessionFile = join(dir, 'feishu-session.json');
