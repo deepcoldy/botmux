@@ -197,6 +197,7 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { ScreenAnalyzer } from './utils/screen-analyzer.js';
+import { StuckDetector, writeStuckWarningAction, type HookReviewScreenType } from './utils/stuck-detector.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -859,6 +860,22 @@ let isFlushing = false;
  * cancellation; this gate prevents new input or an old idle callback from
  * crossing that teardown fence. */
 let cliRestartInProgress = false;
+/** Rotates whenever the worker installs a replacement CLI/backend. Stuck-warning
+ * authority is bound to this lifetime even when the Node worker itself survives. */
+let cliLifetimeNonce = randomBytes(12).toString('hex');
+let terminalInputTail: Promise<void> = Promise.resolve();
+
+async function withTerminalInputLock<T>(action: () => Promise<T> | T): Promise<T> {
+  const previous = terminalInputTail;
+  let release!: () => void;
+  terminalInputTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release();
+  }
+}
 /** Raw slash commands require a real prompt and cannot use the ordinary
  * type-ahead fallback. Keep them fenced across an owned restart until the
  * replacement generation reaches its prompt. */
@@ -1095,7 +1112,7 @@ async function runStartupCommands(): Promise<void> {
   for (const cmd of cmds) {
     if (!backend) break;
     try {
-      await sendRawCommandLineSerially(backend, cmd);
+      await withTerminalInputLock(() => sendRawCommandLineSerially(backend!, cmd));
       await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
       log(`Startup command sent: ${cmd}`);
     } catch (e: any) {
@@ -1175,7 +1192,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
 
   let sent = false;
   try {
-    await sendRawCommandLineSerially(targetBackend, msg.content);
+    await withTerminalInputLock(() => sendRawCommandLineSerially(targetBackend, msg.content));
     sent = true;
     isPromptReady = false;
     idleDetector?.reset();
@@ -3698,6 +3715,7 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // both when the next message respawns the CLI.
   stopScreenUpdates();
   stopScreenAnalyzer();
+  stopStuckDetector();
   log(`Crash diagnostic tmux session parked at ${TmuxBackend.diagnosticSessionName(sessionId)}`);
   return true;
 }
@@ -3817,6 +3835,60 @@ function stopScreenAnalyzer(): void {
   screenAnalyzer?.dispose();
   screenAnalyzer = null;
   tuiPromptBlocking = false;
+}
+
+// ─── Stuck Detector (AI-free fallback for blocked CLI states) ───────────────
+
+let stuckDetector: StuckDetector | null = null;
+
+function startStuckDetector(): void {
+  const sd = config.stuckDetector;
+  if (!sd.enabled) return;
+  stopStuckDetector();
+  stuckDetector = new StuckDetector(sd.timeoutMs, {
+    isActuallyStuck: () => {
+      // Scope gate: this PR only handles the Codex PreToolUse hook-review
+      // screen. Other CLIs (Claude Code, Gemini, ...) must never see the
+      // Codex-specific t/Enter/Esc card, even if their output happens to
+      // contain the same strings.
+      if (lastInitConfig?.cliId !== 'codex') return false;
+      // Only warn if the CLI is not at its idle prompt AND no TUI prompt card
+      // is already posted. A long legitimate turn (model thinking, tool calls)
+      // must not trigger this.
+      if (isPromptReady) return false;
+      if (tuiPromptBlocking) return false;
+      // Anti-false-positive: if the PTY produced output recently the CLI is
+      // still actively working (model streaming, tool output, spinner) — not
+      // stuck. Require quiescence before firing.
+      const sincePty = Date.now() - lastPtyActivityAtMs;
+      if (sincePty < 15_000) return false;
+      // Do NOT gate on durableTurnInFlight: the original hook-review incident
+      // ran on a non-durable (ordinary IM) turn, and a durable turn's 20s
+      // submit-recheck failure clears durableTurnInFlight before the 45s
+      // detector fires. The PTY-quiescence + !isPromptReady combination is
+      // sufficient to detect a genuinely stalled turn.
+      return true;
+    },
+    onStuck: (elapsedMs, matchedLabel) => {
+      const snapshot = renderer?.rawSnapshot() || lastAnalyzerSnapshot || '';
+      log(`StuckDetector: turn unresolved for ${Math.round(elapsedMs / 1000)}s${matchedLabel ? ` (${matchedLabel})` : ''}`);
+      send({
+        type: 'stuck_warning',
+        elapsedMs,
+        snapshot: snapshot.slice(-3000),
+        matchedPattern: matchedLabel,
+        cliLifetimeNonce,
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+      });
+    },
+    getSnapshot: () => renderer?.rawSnapshot() || lastAnalyzerSnapshot || '',
+  });
+}
+
+function stopStuckDetector(): void {
+  stuckDetector?.dispose();
+  stuckDetector = null;
 }
 
 // ─── Screenshot Capture (PNG → Feishu image_key) ────────────────────────────
@@ -3977,7 +4049,8 @@ function exitTmuxScrollMode(): void {
   tmuxScrolledHalfPages = 0;
 }
 
-function handleTermAction(key: TermActionKey): void {
+async function handleTermAction(key: TermActionKey): Promise<void> {
+  await withTerminalInputLock(async () => {
   // riff：没有远端终端可驱动——把控制字符 write 进 RiffBackend 会变成一个内容为
   // ANSI 序列的 follow-up 任务（^C 也不会 cancel 任务），必须整体拒绝。
   if (effectiveBackendType === 'riff') {
@@ -4031,6 +4104,7 @@ function handleTermAction(key: TermActionKey): void {
   }
   log(`Term action: ${key}`);
   scheduleOneShotAfterAction();
+  });
 }
 
 /** Key name → ANSI escape sequence (for PtyBackend) */
@@ -4044,10 +4118,47 @@ const KEY_TO_ANSI: Record<string, string> = {
  * @param keys — key names like ["Down","Down","Space","Up","Up"]
  * @param isFinal — if true, this action ends the prompt (clear blocking state)
  */
-async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
-  if (!backend || keys.length === 0) return;
-
-  if ('sendSpecialKeys' in backend) {
+async function handleTuiKeys(
+  keys: string[],
+  isFinal: boolean,
+  expectedStuckPattern?: HookReviewScreenType,
+  stuckCardNonce?: number,
+): Promise<boolean> {
+  return withTerminalInputLock(async () => {
+  if (!backend || keys.length === 0) return false;
+  if (expectedStuckPattern) {
+    const capturedBackend = backend;
+    if (isPromptReady || lastInitConfig?.cliId !== 'codex' || effectiveBackendType === 'riff') {
+      const current = isPromptReady ? 'prompt-ready' : lastInitConfig?.cliId !== 'codex' ? 'wrong-cli' : 'unsupported-backend';
+      log(`Rejected stale stuck-warning keys: expected=${expectedStuckPattern} current=${current}`);
+      return false;
+    }
+    const capture = async (): Promise<string | null> => {
+      if (backend !== capturedBackend) return null;
+      if (capturedBackend.captureViewport && capturedBackend.getPaneSize) {
+        const fresh = await snapshotToText(capturedBackend, renderCols, renderRows, { filter: false });
+        return fresh?.content ?? null;
+      }
+      // PTY/Zellij managed sessions have no independent viewport query. Their
+      // long-lived xterm is fed synchronously by the sole PTY stream, so read it
+      // at this boundary rather than using the detector/analyzer caches.
+      return await renderer?.rawSnapshotAsync() ?? null;
+    };
+    const wrote = await writeStuckWarningAction(expectedStuckPattern, keys, capture, key => {
+      if (backend !== capturedBackend) return;
+      let delivered = true;
+      if ('sendSpecialKeys' in capturedBackend) {
+        delivered = (capturedBackend as { sendSpecialKeys: (...keys: string[]) => boolean | void }).sendSpecialKeys(key) !== false;
+      } else {
+        capturedBackend.write(KEY_TO_ANSI[key] ?? key);
+      }
+      if (!delivered) throw new Error('sendSpecialKeys returned false');
+    }, () => backend === capturedBackend);
+    if (!wrote) {
+      log(`Rejected stale stuck-warning keys: expected=${expectedStuckPattern} current=fresh-screen-mismatch`);
+      return false;
+    }
+  } else if ('sendSpecialKeys' in backend) {
     const b = backend as any;
     // Send each key individually with 100ms delay for TUI state processing
     for (const key of keys) {
@@ -4071,6 +4182,8 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
   }
 
   log(`TUI keys: ${keys.join(' ')}${isFinal ? ' (final)' : ''}`);
+  return true;
+  });
 }
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
@@ -4124,7 +4237,7 @@ async function flushPendingInjections(): Promise<void> {
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
         // 字面命令行写入互斥链（text → beat → Enter 窗口不被拼接）。
-        await sendRawCommandLineSerially(backend, cmd);
+      await withTerminalInputLock(() => sendRawCommandLineSerially(backend!, cmd));
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
         log(`Injected command: ${cmd}`);
       } catch (e: any) {
@@ -4151,6 +4264,7 @@ async function flushPendingInjections(): Promise<void> {
  * auto-switches to text input mode as soon as a character is typed.
  */
 async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
+  await withTerminalInputLock(async () => {
   if (!backend || !cliAdapter) return;
 
   // Strip trailing Enter from keys — we don't want to press Enter on "Type something"
@@ -4188,6 +4302,7 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
   } catch (err: any) {
     log(`TUI text input write failed: ${err.message}`);
   }
+  });
 }
 
 /**
@@ -4572,6 +4687,7 @@ function markPromptReady(): void {
   // CLI exits, onCliExit still reports ambiguous while deliberately declining
   // worker-local replay of the durable attempt.
   if (!durableTurnInFlight) inflightInputs.onTurnComplete();
+  stuckDetector?.disarm();
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
@@ -5033,7 +5149,10 @@ async function flushPending(): Promise<void> {
       // auto-re-queued: a lost/late ack surfaces as a submit-failure the user can
       // resend manually, and the stable clientUserMessageId lets codex dedupe a
       // resend (Codex delta P1-1).
-      if (!codexRpcEngine) inflightInputs.onWrite(item);
+      if (!codexRpcEngine) {
+        inflightInputs.onWrite(item);
+        stuckDetector?.arm();
+      }
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       currentBotmuxDispatchAttempt = item.dispatchAttempt;
@@ -5095,9 +5214,9 @@ async function flushPending(): Promise<void> {
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
-          result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);
+          result = await withTerminalInputLock(() => cliAdapter!.writeStructuredInput!(backend!, msg, item.codexAppInput!));
         } else {
-          result = await cliAdapter.writeInput(backend, msg);
+          result = await withTerminalInputLock(() => cliAdapter!.writeInput(backend!, msg));
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
@@ -5593,6 +5712,10 @@ async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   opts: { pluginGenerationPrepared?: boolean } = {},
 ): Promise<void> {
+  // A CLI/backend replacement can happen without replacing this Node worker.
+  // Revoke the prior lifetime before installing any new backend or prompt.
+  send({ type: 'stuck_warning_invalidated', cliLifetimeNonce });
+  cliLifetimeNonce = randomBytes(12).toString('hex');
   clearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
   // Enrollment writes the fixed marker before any device credential appears.
@@ -7604,6 +7727,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   promptReadyDetectedDuringSettle = false;
   readyPatternSeenDuringHold = false;
   stopScreenAnalyzer();
+  stopStuckDetector();
   stopScreenUpdates();
   backend?.kill();
   backend = null;
@@ -7675,6 +7799,10 @@ async function restartCliProcess(
   // remain queued until a replacement backend has been installed.
   cliRestartInProgress = true;
   rawInputRestartGate = true;
+  // Invalidate stuck-warning cards before any replacement prompt can appear.
+  // The Node worker survives this boundary, so rotate an explicit CLI lifetime.
+  send({ type: 'stuck_warning_invalidated', cliLifetimeNonce });
+  cliLifetimeNonce = randomBytes(12).toString('hex');
   // The Node worker stays alive through this restart, so the daemon will see
   // neither claude_exit nor worker-exit. Explicitly revoke the old turn's
   // authority now, before jitter/async teardown leaves a stale-send window.
@@ -7716,6 +7844,7 @@ async function restartCliProcess(
         if (lastInitConfig) {
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
           try {
             const restartCfg = { ...lastInitConfig, resume: true, prompt: '', cliSessionId: rpcThreadId ?? lastInitConfig.cliSessionId };
             // Re-engage RPC so the new --remote pane binds to the CURRENT app-server
@@ -7898,8 +8027,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // a mouse-aware TUI may bind any of them to approvals/actions.
               // A view capability therefore forwards no input bytes at all.
               if (!authedClients.has(ws)) return;
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+        void withTerminalInputLock(() => {
+          if (cp) cp.write(msg.data);
+          else pendingInput.push(msg.data);
+        });
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -7968,8 +8099,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else cp.resize(msg.cols, msg.rows);
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               if (!authedClients.has(ws)) return;
-              if (cp) cp.write(msg.data);
-              else pendingInput.push(msg.data);
+        void withTerminalInputLock(() => {
+          if (cp) cp.write(msg.data);
+          else pendingInput.push(msg.data);
+        });
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -8039,7 +8172,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
-              backend?.write(msg.data);
+              void withTerminalInputLock(() => { backend?.write(msg.data); });
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -8997,6 +9130,7 @@ process.on('message', async (raw: unknown) => {
           port = await startWebServer(config.web.workerHost, msg.webPort);
           startScreenUpdates();
           startScreenAnalyzer();
+          startStuckDetector();
         } else {
           // Workflow attempts still expose a read-only web terminal so the
           // workflow dashboard can observe in-flight subagents.  Keep the
@@ -9147,10 +9281,12 @@ process.on('message', async (raw: unknown) => {
         log('Message received after crash-loop stop; retrying CLI start');
         destroyCrashDiagnosticTerminal('retry after message');
         stopScreenAnalyzer();
+        stopStuckDetector();
         stopScreenUpdates();
         awaitingFirstPrompt = true;
         startScreenUpdates();
         startScreenAnalyzer();
+        startStuckDetector();
         try {
           await spawnCli({ ...lastInitConfig, resume: true, prompt: '' });
         } catch (err) {
@@ -9392,7 +9528,35 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_keys': {
-      handleTuiKeys(msg.keys, msg.isFinal);
+      if (msg.expectedCliLifetimeNonce && msg.expectedCliLifetimeNonce !== cliLifetimeNonce) {
+        log(`Rejected stale stuck-warning keys: expected CLI lifetime ${msg.expectedCliLifetimeNonce}, current ${cliLifetimeNonce}`);
+        if (msg.stuckCardNonce !== undefined) send({
+          type: 'stuck_warning_action_result',
+          cardNonce: msg.stuckCardNonce,
+          delivered: false,
+          rearmStuckDetector: msg.rearmStuckDetector ?? false,
+          reason: 'CLI lifetime changed',
+        });
+        break;
+      }
+      const wroteKeys = await handleTuiKeys(
+        msg.keys,
+        msg.isFinal,
+        msg.expectedStuckPattern,
+        msg.stuckCardNonce,
+      );
+      if (msg.stuckCardNonce !== undefined) send({
+        type: 'stuck_warning_action_result',
+        cardNonce: msg.stuckCardNonce,
+        delivered: wroteKeys,
+        rearmStuckDetector: msg.rearmStuckDetector ?? false,
+        ...(!wroteKeys ? { reason: 'terminal screen no longer matches' } : {}),
+      });
+      break;
+    }
+
+    case 'rearm_stuck_detector': {
+      stuckDetector?.arm();
       break;
     }
 

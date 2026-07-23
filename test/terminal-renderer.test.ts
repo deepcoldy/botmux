@@ -85,6 +85,14 @@ describe('TerminalRenderer width matches source pane', () => {
     r.dispose();
   });
 
+  it('rawSnapshotAsync drains queued PTY writes before reading', async () => {
+    const r = new TerminalRenderer(80, 5);
+    r.write('fresh viewport marker\r\n');
+    const snap = await r.rawSnapshotAsync();
+    expect(snap).toContain('fresh viewport marker');
+    r.dispose();
+  });
+
   it('legacy 160-col renderer would NOT see content past col 160 in row 1 (wrap symptom)', async () => {
     const r = new TerminalRenderer(160, 5);
     const marker = 'BEYOND_OLD_CLAMP_MARKER';

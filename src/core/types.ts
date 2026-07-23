@@ -228,6 +228,21 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** turnId of the last stuck_warning posted — dedup so we don't spam the
+   *  thread with repeated warnings for the same unresolved turn. */
+  stuckWarningTurnId?: string;
+  /** message_id of the stuck_warning interactive card (if active) */
+  stuckWarningCardId?: string;
+  /** Monotonic nonce for invalidating an in-flight stuck-warning card POST. */
+  stuckWarningNonce?: number;
+  /** Hook-review screen type that the active stuck-warning card controls. */
+  stuckWarningPattern?: 'hooks overview' | 'pretooluse hooks detail';
+  /** Worker generation that issued the active stuck-warning card. */
+  stuckWarningWorkerGeneration?: number;
+  /** In-worker CLI/backend lifetime that issued the active stuck-warning card. */
+  stuckWarningCliLifetimeNonce?: string;
+  /** Active warning nonce awaiting the worker's delivered/rejected ACK. */
+  stuckWarningProcessingNonce?: number;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;

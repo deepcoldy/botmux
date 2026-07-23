@@ -1300,6 +1300,21 @@ export function killWorker(ds: DaemonSession): void {
   // daemon-side copy synchronously; the worker may never get a chance to send
   // its ordered revoke IPC on close/crash paths.
   ds.managedTurnOrigin = undefined;
+  if (ds.stuckWarningCardId) {
+    const locDs = localeForBot(ds.larkAppId);
+    const resolvedCard = buildTuiPromptResolvedCard('会话进程已结束，操作未发送', locDs);
+    updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+      logger.debug(`[${tag(ds)}] Failed to resolve stuck-warning card while killing worker: ${err}`),
+    );
+    ds.stuckWarningCardId = undefined;
+    ds.stuckWarningTurnId = undefined;
+    ds.stuckWarningPattern = undefined;
+    ds.stuckWarningWorkerGeneration = undefined;
+    ds.stuckWarningCliLifetimeNonce = undefined;
+    ds.stuckWarningProcessingNonce = undefined;
+    ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+    publishAttentionPatch(ds);
+  }
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij) — never
@@ -2245,8 +2260,40 @@ function setupWorkerHandlers(
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  const previousStuckCardId = ds.stuckWarningCardId;
+  if (ds.stuckWarningPattern || previousStuckCardId) {
+    if (previousStuckCardId) {
+      const locDs = localeForBot(ds.larkAppId);
+      const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+      updateMessage(ds.larkAppId, previousStuckCardId, resolvedCard).catch(err =>
+        logger.debug(`[${t}] Failed to resolve prior-generation stuck-warning card: ${err}`),
+      );
+    }
+    ds.stuckWarningCardId = undefined;
+    ds.stuckWarningTurnId = undefined;
+    ds.stuckWarningPattern = undefined;
+    ds.stuckWarningWorkerGeneration = undefined;
+    ds.stuckWarningCliLifetimeNonce = undefined;
+    ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+  }
   const workerGeneration = (ds.workerGeneration ?? 0) + 1;
   ds.workerGeneration = workerGeneration;
+  if ((ds.stuckWarningCardId || ds.stuckWarningPattern || ds.stuckWarningWorkerGeneration !== undefined)
+    && ds.stuckWarningWorkerGeneration !== workerGeneration) {
+    if (ds.stuckWarningCardId) {
+      const locDs = localeForBot(ds.larkAppId);
+      const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+      updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+        logger.debug(`[${t}] Failed to resolve stuck-warning card on worker replacement: ${err}`),
+      );
+    }
+    ds.stuckWarningCardId = undefined;
+    ds.stuckWarningTurnId = undefined;
+    ds.stuckWarningPattern = undefined;
+    ds.stuckWarningWorkerGeneration = undefined;
+    ds.stuckWarningCliLifetimeNonce = undefined;
+    ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+  }
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2620,6 +2667,10 @@ function setupWorkerHandlers(
       }
 
       case 'prompt_ready': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored prompt_ready from stale worker generation`);
+          break;
+        }
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} is ready for input`);
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
@@ -2661,6 +2712,23 @@ function setupWorkerHandlers(
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
           }, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
+        // CLI reached its prompt — any previously posted stuck warning is stale.
+        // Disable the card first so a late click can't inject keys into the
+        // now-idle CLI, then clear the markers.
+        if (ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
+          );
+        }
+        ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningCardId = undefined;
+        ds.stuckWarningPattern = undefined;
+        ds.stuckWarningWorkerGeneration = undefined;
+        ds.stuckWarningCliLifetimeNonce = undefined;
+        ds.stuckWarningProcessingNonce = undefined;
+        ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
         break;
       }
 
@@ -2954,6 +3022,155 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'stuck_warning': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored stuck_warning from stale worker generation`);
+          break;
+        }
+        // AI-free StuckDetector fired: a written input hasn't produced a
+        // completed turn within the timeout AND the PTY has been quiet.
+        // Scope is intentionally narrow: only the Codex PreToolUse hook-review
+        // screen gets an interactive card with safe, known-good keys (t/Enter/
+        // Esc). Unknown stalls get a plain text warning WITHOUT the terminal
+        // snapshot (to avoid leaking content) and WITHOUT guessed keys.
+        // Dedup: skip if we already posted a warning for THIS turn, OR if a
+        // stuck-warning card is already active (covers the no-turnId case where
+        // a second stall fires before the first card is resolved).
+        const isDuplicateTurn = msg.turnId !== undefined && ds.stuckWarningTurnId === msg.turnId;
+        const hasActiveCard = !!ds.stuckWarningCardId;
+        if (isDuplicateTurn || hasActiveCard) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
+          break;
+        }
+        ds.stuckWarningTurnId = msg.turnId;
+        const secs = Math.round(msg.elapsedMs / 1000);
+        logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s${msg.matchedPattern ? ` (${msg.matchedPattern})` : ''}`);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'stuck_warning',
+          elapsedMs: msg.elapsedMs,
+          matchedPattern: msg.matchedPattern,
+        });
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (msg.matchedPattern === 'hooks overview' || msg.matchedPattern === 'pretooluse hooks detail') {
+          const nonce = (ds.stuckWarningNonce ?? 0) + 1;
+          ds.stuckWarningNonce = nonce;
+          ds.stuckWarningPattern = msg.matchedPattern;
+          ds.stuckWarningWorkerGeneration = workerGeneration;
+          ds.stuckWarningCliLifetimeNonce = msg.cliLifetimeNonce;
+          const isOverview = msg.matchedPattern === 'hooks overview';
+          const description = isOverview
+            ? `⚠️ Codex 卡在 Hooks 审核总览——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`
+            : `⚠️ Codex 卡在 PreToolUse hook 详情审核——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
+          const options = isOverview
+            ? [
+                { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
+                { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
+                { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
+              ]
+            : [
+                { label: 't', text: '信任此 hook (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
+                { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
+              ];
+          try {
+            const cardJson = buildTuiPromptCard(
+              sessionAnchorId(ds),
+              ds.session.sessionId,
+              description,
+              options,
+              false,
+              undefined,
+              loc,
+              { nonce, workerGeneration },
+            );
+            const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+            if (ds.worker !== worker
+              || ds.workerGeneration !== workerGeneration
+              || ds.stuckWarningNonce !== nonce
+              || ds.stuckWarningPattern !== msg.matchedPattern
+              || ds.stuckWarningWorkerGeneration !== workerGeneration
+              || ds.stuckWarningCliLifetimeNonce !== msg.cliLifetimeNonce) {
+              const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, loc), loc);
+              updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
+                logger.debug(`[${t}] Failed to resolve superseded stuck-warning card: ${err}`),
+              );
+              break;
+            }
+            ds.stuckWarningCardId = cardMsgId;
+            publishAttentionPatch(ds);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+            if (ds.stuckWarningNonce === nonce) {
+              ds.stuckWarningCardId = undefined;
+              ds.stuckWarningTurnId = undefined;
+              ds.stuckWarningPattern = undefined;
+              ds.stuckWarningWorkerGeneration = undefined;
+              ds.stuckWarningCliLifetimeNonce = undefined;
+            }
+          }
+        } else {
+          // Unknown stall — warn but do NOT leak the terminal snapshot and do
+          // NOT guess keys. The user can open the terminal to investigate.
+          const text = `⚠️ CLI 似乎卡住了——消息已写入但 ${secs}s 未完成处理，且终端无输出。\n\n请打开终端查看具体原因，或直接回复消息继续（会清除此告警）。`;
+          try {
+            await scopedReply(text, 'text', msg.turnId);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post stuck warning: ${err}`);
+          }
+        }
+        break;
+      }
+
+      case 'stuck_warning_invalidated': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        if (ds.stuckWarningCliLifetimeNonce !== msg.cliLifetimeNonce) break;
+        if (ds.stuckWarningCardId) {
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, loc), loc);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on CLI replacement: ${err}`),
+          );
+        }
+        ds.stuckWarningCardId = undefined;
+        ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningPattern = undefined;
+        ds.stuckWarningWorkerGeneration = undefined;
+        ds.stuckWarningCliLifetimeNonce = undefined;
+        ds.stuckWarningProcessingNonce = undefined;
+        ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+        publishAttentionPatch(ds);
+        break;
+      }
+
+      case 'stuck_warning_action_result': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored stuck warning action result from stale worker generation`);
+          break;
+        }
+        if (ds.stuckWarningWorkerGeneration !== workerGeneration
+          || ds.stuckWarningNonce !== msg.cardNonce
+          || ds.stuckWarningProcessingNonce !== msg.cardNonce) break;
+        if (ds.stuckWarningCardId) {
+          const text = msg.delivered
+            ? tr('card.action.tui_done', undefined, loc)
+            : `未发送：${msg.reason ?? '终端状态已变化，请稍后重试'}`;
+          const resolvedCard = buildTuiPromptResolvedCard(text, loc);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning action result: ${err}`),
+          );
+        }
+        ds.stuckWarningCardId = undefined;
+        ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningPattern = undefined;
+        ds.stuckWarningWorkerGeneration = undefined;
+        ds.stuckWarningCliLifetimeNonce = undefined;
+        ds.stuckWarningProcessingNonce = undefined;
+        ds.stuckWarningNonce = msg.cardNonce + 1;
+        if (!msg.delivered || msg.rearmStuckDetector) {
+          worker.send({ type: 'rearm_stuck_detector' } as DaemonToWorker);
+        }
+        publishAttentionPatch(ds);
+        break;
+      }
+
       case 'claude_exit': {
         // CLI-generation authority must not outlive the concrete worker/CLI
         // pair that issued it. A delayed message from a replaced Node worker
@@ -2963,6 +3180,23 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        // The worker/CLI generation ended. Disable an outstanding stuck-warning
+        // card before any replacement worker can be attached; otherwise a late
+        // click could inject its keys into the replacement CLI.
+        if (ds.stuckWarningCardId) {
+          const locDs = localeForBot(ds.larkAppId);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+            logger.debug(`[${t}] Failed to resolve stuck-warning card on CLI exit: ${err}`),
+          );
+        }
+        ds.stuckWarningCardId = undefined;
+        ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningPattern = undefined;
+        ds.stuckWarningWorkerGeneration = undefined;
+        ds.stuckWarningCliLifetimeNonce = undefined;
+        ds.stuckWarningProcessingNonce = undefined;
+        ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -3390,6 +3624,20 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
+      if (ds.stuckWarningCardId && ds.stuckWarningWorkerGeneration === workerGeneration) {
+        const resolvedCard = buildTuiPromptResolvedCard('会话进程已退出，操作未发送', loc);
+        updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
+          logger.debug(`[${t}] Failed to resolve stuck-warning card on abrupt worker exit: ${err}`),
+        );
+        ds.stuckWarningCardId = undefined;
+        ds.stuckWarningTurnId = undefined;
+        ds.stuckWarningPattern = undefined;
+        ds.stuckWarningWorkerGeneration = undefined;
+        ds.stuckWarningCliLifetimeNonce = undefined;
+        ds.stuckWarningProcessingNonce = undefined;
+        ds.stuckWarningNonce = (ds.stuckWarningNonce ?? 0) + 1;
+        publishAttentionPatch(ds);
+      }
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;

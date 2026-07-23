@@ -251,6 +251,20 @@ export const config = {
       catch { return {}; }
     })() as Record<string, unknown>,
   },
+  stuckDetector: {
+    /**
+     * Lightweight, AI-free fallback that warns the user when a written input
+     * has not produced a completed turn within `timeoutMs`. Catches blocking
+     * states the ScreenAnalyzer (opt-in, LLM-backed) might miss — e.g. Codex
+     * PreToolUse hook review, a bare [Y/n] prompt, a "Press any key" pause.
+     * Enabled by default because it has no external dependencies and only
+     * fires when the worker confirms inputs are genuinely in flight.
+     */
+    enabled: (process.env.STUCK_DETECTOR_ENABLED ?? 'true').toLowerCase() !== 'false',
+    /** Milliseconds after a write before the detector checks whether the turn
+     *  is still unresolved. */
+    timeoutMs: Number(process.env.STUCK_DETECTOR_TIMEOUT_MS) || 45_000,
+  },
   worktreeSlugAI: {
     /**
      * Optional AI slugger for `/repo wt` auto branch/worktree naming. Disabled

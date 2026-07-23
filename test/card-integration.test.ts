@@ -225,6 +225,31 @@ function makeDeps(activeSessions: Map<string, DaemonSession>): CardHandlerDeps {
   };
 }
 
+function makeTuiKeysEvent(
+  rootId: string,
+  messageId: string,
+  selectedIndex: number,
+  valueOverrides: Record<string, string> = {},
+) {
+  return {
+    action: {
+      value: {
+        action: 'tui_keys',
+        root_id: rootId,
+        session_id: 'uuid-integ-test',
+        selected_index: String(selectedIndex),
+        selected_text: 'forged callback text',
+        keys: JSON.stringify(['x']),
+        is_final: '0',
+        option_type: 'toggle',
+        ...valueOverrides,
+      },
+    },
+    operator: { open_id: 'ou_user' },
+    context: { open_message_id: messageId },
+  };
+}
+
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
@@ -240,6 +265,162 @@ describe('Card integration: full event flow', () => {
     fakeLark.reset();
     sessionReplyResults = [];
     vi.clearAllMocks();
+  });
+
+  describe('Stuck-warning card actions', () => {
+    it('ignores forged callback keys/finality and derives overview Enter server-side', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        workerGeneration: 4,
+        stuckWarningCardId: 'om_stuck',
+        stuckWarningNonce: 7,
+        stuckWarningPattern: 'hooks overview',
+        stuckWarningWorkerGeneration: 4,
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+      const response = await handleCardAction(makeTuiKeysEvent(ROOT_ID, 'om_stuck', 1, {
+        stuck_warning_nonce: '7',
+        stuck_warning_generation: '4',
+        selected_text: 'FORGED: restart the daemon',
+      }), makeDeps(sessions), APP_ID);
+
+      expect(worker.send).toHaveBeenCalledWith({
+        type: 'tui_keys',
+        keys: ['Enter'],
+        isFinal: true,
+        rearmStuckDetector: true,
+        expectedStuckPattern: 'hooks overview',
+        stuckCardNonce: 7,
+      });
+      expect(ds.stuckWarningCardId).toBe('om_stuck');
+      expect(ds.stuckWarningNonce).toBe(7);
+      expect(ds.stuckWarningProcessingNonce).toBe(7);
+      expect(response).toEqual({ type: 'tui-processing' });
+      expect(JSON.stringify(response)).not.toContain('FORGED');
+    });
+
+    it('preserves active authority after a malformed current-card click, then accepts a valid click', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        workerGeneration: 4,
+        stuckWarningCardId: 'om_stuck',
+        stuckWarningNonce: 7,
+        stuckWarningPattern: 'hooks overview',
+        stuckWarningWorkerGeneration: 4,
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const deps = makeDeps(sessions);
+
+      const invalid = await handleCardAction(makeTuiKeysEvent(ROOT_ID, 'om_stuck', 99, {
+        stuck_warning_nonce: '7',
+        stuck_warning_generation: '4',
+      }), deps, APP_ID);
+
+      expect(worker.send).not.toHaveBeenCalled();
+      expect(invalid).toEqual({ toast: { type: 'warning', content: '操作无效，请使用当前卡片上的按钮重试' } });
+      expect(ds.stuckWarningCardId).toBe('om_stuck');
+      expect(ds.stuckWarningNonce).toBe(7);
+      expect(ds.stuckWarningPattern).toBe('hooks overview');
+
+      await handleCardAction(makeTuiKeysEvent(ROOT_ID, 'om_stuck', 0, {
+        stuck_warning_nonce: '7',
+        stuck_warning_generation: '4',
+      }), deps, APP_ID);
+
+      expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'tui_keys',
+        keys: ['t'],
+        stuckCardNonce: 7,
+      }));
+      expect(ds.stuckWarningProcessingNonce).toBe(7);
+    });
+
+    it('rejects alternate action types tied to stuck-warning authority with zero worker writes', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        workerGeneration: 4,
+        stuckWarningCardId: 'om_stuck',
+        stuckWarningNonce: 7,
+        stuckWarningPattern: 'hooks overview',
+        stuckWarningWorkerGeneration: 4,
+        stuckWarningCliLifetimeNonce: 'cli-1',
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+      await handleCardAction({
+        action: {
+          value: {
+            action: 'tui_text_input',
+            root_id: ROOT_ID,
+            session_id: 'uuid-integ-test',
+            input_keys: JSON.stringify(['Enter']),
+            stuck_warning_nonce: '7',
+            stuck_warning_generation: '4',
+          },
+          form_value: { tui_custom_input: 'bypass' },
+        },
+        operator: { open_id: 'ou_user' },
+        context: { open_message_id: 'om_stuck' },
+      }, makeDeps(sessions), APP_ID);
+
+      expect(worker.send).not.toHaveBeenCalled();
+    });
+
+    it('preserves ordinary ScreenAnalyzer tui_text_input behavior', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({ worker, tuiPromptCardId: 'om_tui' });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+      await handleCardAction({
+        action: {
+          value: {
+            action: 'tui_text_input',
+            root_id: ROOT_ID,
+            session_id: 'uuid-integ-test',
+            input_keys: JSON.stringify(['Down', 'Enter']),
+          },
+          form_value: { tui_custom_input: 'ordinary' },
+        },
+        operator: { open_id: 'ou_user' },
+        context: { open_message_id: 'om_tui' },
+      }, makeDeps(sessions), APP_ID);
+
+      expect(worker.send).toHaveBeenCalledWith({
+        type: 'tui_text_input',
+        keys: ['Down', 'Enter'],
+        text: 'ordinary',
+      });
+    });
+
+    it('rejects detail Enter and actions bound to another worker generation', async () => {
+      const worker = { killed: false, send: vi.fn() } as any;
+      const ds = makeDaemonSession({
+        worker,
+        workerGeneration: 5,
+        stuckWarningCardId: 'om_stuck',
+        stuckWarningNonce: 8,
+        stuckWarningPattern: 'pretooluse hooks detail',
+        stuckWarningWorkerGeneration: 5,
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeTuiKeysEvent(ROOT_ID, 'om_stuck', 2, {
+        stuck_warning_nonce: '8',
+        stuck_warning_generation: '5',
+      }), deps, APP_ID);
+      ds.stuckWarningWorkerGeneration = 4;
+      await handleCardAction(makeTuiKeysEvent(ROOT_ID, 'om_stuck', 0, {
+        stuck_warning_nonce: '8',
+        stuck_warning_generation: '5',
+      }), deps, APP_ID);
+
+      expect(worker.send).not.toHaveBeenCalled();
+    });
   });
 
   // ── Scenario 1: screen_update → POST card → toggle → PATCH ────────────

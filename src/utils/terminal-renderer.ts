@@ -104,6 +104,12 @@ export class TerminalRenderer {
     return this.readViewport(false);
   }
 
+  /** Raw viewport after all previously queued xterm writes have parsed. */
+  async rawSnapshotAsync(): Promise<string> {
+    await new Promise<void>(resolve => this.terminal.write('', () => resolve()));
+    return this.readViewport(false);
+  }
+
   private readViewport(filter: boolean): string {
     return readViewportText(this.terminal, { filter });
   }

@@ -570,7 +570,7 @@ export type DaemonToWorker =
   // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
-  | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
+  | { type: 'tui_keys'; keys: string[]; isFinal: boolean; rearmStuckDetector?: boolean; expectedStuckPattern?: 'hooks overview' | 'pretooluse hooks detail'; stuckCardNonce?: number; expectedCliLifetimeNonce?: string }
   // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
   // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
   // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
@@ -586,6 +586,7 @@ export type DaemonToWorker =
   | { type: 'set_locale'; locale: 'zh' | 'en' }
   | { type: 'term_action'; key: TermActionKey }
   | { type: 'refresh_screen' }
+  | { type: 'rearm_stuck_detector' }
   // Claude-family「真就绪」信号：CLI 的 SessionStart hook 经 `botmux session-ready`
   // 调到 daemon，daemon 转发给本会话 worker，放行被 ready-gate 门控的首条 prompt
   // （绕开 cjadk 启动选择器吞首条消息）。source = SessionStart 的 startup/resume/… 。
@@ -611,6 +612,9 @@ export type WorkerToDaemon =
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'stuck_warning'; elapsedMs: number; snapshot: string; matchedPattern?: string; cliLifetimeNonce: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'stuck_warning_action_result'; cardNonce: number; delivered: boolean; rearmStuckDetector: boolean; reason?: string }
+  | { type: 'stuck_warning_invalidated'; cliLifetimeNonce: string }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }

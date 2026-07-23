@@ -63,10 +63,10 @@ describe('worker raw_input handler', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 2600);
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 4200);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
-    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
+    const sendIdx = region.indexOf('await withTerminalInputLock(() => sendRawCommandLineSerially(targetBackend, msg.content))');
     const followIdx = region.indexOf('msg.followUpContent');
     expect(sendIdx).toBeGreaterThanOrEqual(0);
     expect(followIdx).toBeGreaterThanOrEqual(0);
@@ -82,7 +82,7 @@ describe('worker raw_input delivery', () => {
     const bindIdx = region.indexOf('currentBotmuxTurnId = msg.turnId');
     const markerIdx = region.indexOf('writeCliPidMarker()');
     const capabilityIdx = region.indexOf('publishSandboxRelayCapability()');
-    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
+    const sendIdx = region.indexOf('await withTerminalInputLock(() => sendRawCommandLineSerially(targetBackend, msg.content))');
     expect(bindIdx).toBeGreaterThanOrEqual(0);
     expect(markerIdx).toBeGreaterThan(bindIdx);
     expect(capabilityIdx).toBeGreaterThan(markerIdx);
@@ -148,7 +148,7 @@ describe('worker sendRawCommandLine helper', () => {
 });
 
 describe('daemon prompt_ready dispatch', () => {
-  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2000);
+  const region = caseRegion(poolSrc, "case 'prompt_ready':", 4200);
 
   it('bundles the follow-up onto the raw_input IPC instead of a second message IPC', () => {
     expect(region).toContain('followUpContent: followUp?.cliInput');
