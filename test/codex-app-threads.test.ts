@@ -39,23 +39,23 @@ describe('setCodexAppThreadName', () => {
     }));
   });
 
-  it('waits until the automatic Codex title is readable before setting the final title', async () => {
+  it('waits until the first-message preview is readable before setting the final title', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-title-barrier-'));
     tempDirs.push(dir);
     const logPath = join(dir, 'requests.jsonl');
 
     await setCodexAppThreadName({
-      threadId: 'thread-delayed-title',
+      threadId: 'thread-delayed-preview',
       name: '[BotMux·Lark] 最终标题',
       codexBin: FAKE_CODEX,
       cwd: dir,
       env: {
         ...process.env,
         FAKE_CODEX_LOG: logPath,
-        FAKE_CODEX_TITLE_DELAY_READS: '2',
+        FAKE_CODEX_PREVIEW_DELAY_READS: '2',
       },
       timeoutMs: 20_000,
-      waitForExistingName: true,
+      waitForExistingPreview: true,
     });
 
     const methods = readFileSync(logPath, 'utf8')
@@ -64,6 +64,42 @@ describe('setCodexAppThreadName', () => {
       .map(line => JSON.parse(line).method);
     const setIndex = methods.indexOf('thread/name/set');
     expect(methods.slice(0, setIndex).filter(method => method === 'thread/read')).toHaveLength(3);
+    expect(methods.slice(setIndex + 1)).toContain('thread/read');
+  });
+
+  it('sets the final title when the first-message preview remains unavailable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-title-fallback-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-without-preview',
+      name: '[BotMux·Lark] 最终标题',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_PREVIEW_DELAY_READS: '999999',
+      },
+      timeoutMs: 200,
+      waitForExistingPreview: true,
+    });
+
+    const requests = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    const methods = requests.map(request => request.method);
+    const setIndex = methods.indexOf('thread/name/set');
+    expect(methods.slice(0, setIndex)).toContain('thread/read');
+    expect(requests[setIndex]).toEqual(expect.objectContaining({
+      method: 'thread/name/set',
+      params: {
+        threadId: 'thread-without-preview',
+        name: '[BotMux·Lark] 最终标题',
+      },
+    }));
     expect(methods.slice(setIndex + 1)).toContain('thread/read');
   });
 

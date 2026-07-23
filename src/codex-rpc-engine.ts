@@ -225,15 +225,15 @@ export class CodexRpcEngine {
     throw new Error('Codex thread name did not persist after 3 attempts');
   }
 
-  /** 等待 Codex 的首条消息派生标题可读，作为自动标题已落库的时序屏障。 */
-  async waitForThreadName(timeoutMs = 10_000): Promise<string> {
-    if (!this.threadId) throw new Error('waitForThreadName before startThread/resumeThread');
+  /** 等待 Codex 的首条消息预览落盘；超时后由调用方继续设置标题。 */
+  async waitForThreadPreview(timeoutMs = 10_000): Promise<string | undefined> {
+    if (!this.threadId) throw new Error('waitForThreadPreview before startThread/resumeThread');
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`Codex thread name was not ready after ${timeoutMs}ms`);
-      const { name } = await this.readThreadMetadata(Math.min(remaining, 2000));
-      if (name) return name;
+      if (remaining <= 0) return undefined;
+      const { preview } = await this.readThreadMetadata(Math.min(remaining, 2000));
+      if (preview) return preview;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
     }
   }
@@ -249,16 +249,18 @@ export class CodexRpcEngine {
     }
   }
 
-  async readThreadMetadata(timeoutMs = 7000): Promise<{ name?: string; updatedAt?: number }> {
+  async readThreadMetadata(timeoutMs = 7000): Promise<{ name?: string; preview?: string; updatedAt?: number }> {
     if (!this.threadId) throw new Error('readThreadMetadata before startThread/resumeThread');
     const result = await this.request('thread/read', {
       threadId: this.threadId,
       includeTurns: false,
     }, { timeoutMs, fatalOnTimeout: false });
     const name = typeof result?.thread?.name === 'string' ? result.thread.name.trim() : '';
+    const preview = typeof result?.thread?.preview === 'string' ? result.thread.preview.trim() : '';
     const updatedAt = typeof result?.thread?.updatedAt === 'number' ? result.thread.updatedAt : undefined;
     return {
       ...(name ? { name } : {}),
+      ...(preview ? { preview } : {}),
       ...(updatedAt !== undefined ? { updatedAt } : {}),
     };
   }

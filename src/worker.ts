@@ -335,7 +335,7 @@ async function codexRolloutProbe(cliId: string, threadId: string, promptText: st
   return false;
 }
 
-/** 首条 UserMessage 落盘后再设置标题，避免被 Codex 的自动标题反向覆盖。 */
+/** 首条 UserMessage 预览落盘后设置标题，避免标题先于线程元数据写入。 */
 async function syncFreshCodexNativeSessionTitle(
   threadId: string,
   engine?: CodexRpcEngine,
@@ -357,7 +357,7 @@ async function syncFreshCodexNativeSessionTitle(
           10_000,
         );
       } else {
-        await engine.waitForThreadName(10_000);
+        await engine.waitForThreadPreview(10_000);
       }
       if (revision !== nativeSessionTitleRevision) {
         syncLatestTitle = true;
@@ -382,7 +382,7 @@ async function syncFreshCodexNativeSessionTitle(
         timeoutMs: 10_000,
         signal: abortController.signal,
         detached: true,
-        waitForExistingName: !resumeGeneration,
+        waitForExistingPreview: !resumeGeneration,
         ...(resumeGeneration ? {
           waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt ?? Math.floor(Date.now() / 1000),
         } : {}),

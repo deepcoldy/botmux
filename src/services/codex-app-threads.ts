@@ -38,7 +38,7 @@ export interface SetCodexAppThreadNameOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   detached?: boolean;
-  waitForExistingName?: boolean;
+  waitForExistingPreview?: boolean;
   waitForUpdatedAfter?: number;
   registerForceClose?: (forceClose: () => void) => (() => void);
 }
@@ -56,6 +56,7 @@ export interface ReadCodexAppThreadMetadataOptions {
 
 export interface CodexAppThreadMetadata {
   name?: string;
+  preview?: string;
   updatedAt?: number;
 }
 
@@ -142,16 +143,14 @@ class CodexAppServerProbe {
     this.child.stdin.write(JSON.stringify(msg) + '\n');
   }
 
-  async waitForThreadName(threadId: string, timeoutMs: number): Promise<string> {
+  async waitForThreadPreview(threadId: string, timeoutMs: number): Promise<string | undefined> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
       if (this.closed) throw new Error('Codex app-server is closed');
       const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new Error(`Codex app-server thread name was not ready after ${timeoutMs}ms`);
-      }
-      const { name } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000));
-      if (name) return name;
+      if (remaining <= 0) return undefined;
+      const { preview } = await this.readThreadMetadata(threadId, Math.min(remaining, 2000));
+      if (preview) return preview;
       await new Promise(resolve => setTimeout(resolve, Math.min(250, Math.max(1, deadline - Date.now()))));
     }
   }
@@ -172,9 +171,11 @@ class CodexAppServerProbe {
       includeTurns: false,
     }), timeoutMs, 'thread/read');
     const name = typeof result?.thread?.name === 'string' ? result.thread.name.trim() : '';
+    const preview = typeof result?.thread?.preview === 'string' ? result.thread.preview.trim() : '';
     const updatedAt = typeof result?.thread?.updatedAt === 'number' ? result.thread.updatedAt : undefined;
     return {
       ...(name ? { name } : {}),
+      ...(preview ? { preview } : {}),
       ...(updatedAt !== undefined ? { updatedAt } : {}),
     };
   }
@@ -320,7 +321,7 @@ export async function listCodexAppThreads(opts: ListCodexAppThreadsOptions = {})
   }
 }
 
-/** 在 Codex 首条消息元数据落盘后，通过原生接口设置最终会话标题。 */
+/** 等待首条消息预览落盘后设置最终标题；预览缺失时超时兜底写入。 */
 export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 7000;
   const codexBin = resolveCommand(opts.codexBin ?? 'codex');
@@ -335,8 +336,8 @@ export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions):
   );
   try {
     await client.initialize(timeoutMs);
-    if (opts.waitForExistingName) {
-      await client.waitForThreadName(opts.threadId, timeoutMs);
+    if (opts.waitForExistingPreview) {
+      await client.waitForThreadPreview(opts.threadId, timeoutMs);
     }
     if (opts.waitForUpdatedAfter !== undefined) {
       await client.waitForThreadUpdatedAfter(opts.threadId, opts.waitForUpdatedAfter, timeoutMs);

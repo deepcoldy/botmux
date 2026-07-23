@@ -15,7 +15,7 @@ describe('worker native session rename queue', () => {
     expect(region).not.toContain('pendingSessionRename = msg.nativeSessionTitle');
   });
 
-  it('waits for the automatic Codex title before applying the native title', () => {
+  it('waits for the first-message preview before applying the native title', () => {
     const syncStart = workerSource.indexOf('async function syncFreshCodexNativeSessionTitle(');
     const syncEnd = workerSource.indexOf('/** Stand up (or re-establish)', syncStart);
     const syncRegion = workerSource.slice(syncStart, syncEnd);
@@ -23,10 +23,10 @@ describe('worker native session rename queue', () => {
     const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
     const flushRegion = workerSource.slice(flushStart, flushEnd);
 
-    expect(syncRegion).toContain('await engine.waitForThreadName(10_000)');
-    expect(syncRegion.indexOf('engine.waitForThreadName'))
+    expect(syncRegion).toContain('await engine.waitForThreadPreview(10_000)');
+    expect(syncRegion.indexOf('engine.waitForThreadPreview'))
       .toBeLessThan(syncRegion.indexOf('engine.setThreadName'));
-    expect(syncRegion).toContain('waitForExistingName: !resumeGeneration');
+    expect(syncRegion).toContain('waitForExistingPreview: !resumeGeneration');
     expect(syncRegion).toContain('engine.waitForThreadUpdatedAfter(');
     expect(syncRegion).toContain('waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt');
     expect(syncRegion).toContain('revision !== nativeSessionTitleRevision');

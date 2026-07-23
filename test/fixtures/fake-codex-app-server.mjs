@@ -18,7 +18,7 @@ if (args[0] !== 'app-server') {
 const logPath = process.env.FAKE_CODEX_LOG;
 const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
-const titleDelayReads = Number(process.env.FAKE_CODEX_TITLE_DELAY_READS ?? '0');
+const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
@@ -106,7 +106,8 @@ function handle(request) {
     respond(request.id, {
       thread: {
         id: request.params.threadId,
-        name: currentThreadName ?? (threadReadAttempt > titleDelayReads ? '<botmux_routing> 自动标题' : null),
+        name: currentThreadName ?? null,
+        preview: threadReadAttempt > previewDelayReads ? '<botmux_routing> 首条消息预览' : '',
         updatedAt: threadReadAttempt > updatedDelayReads ? updatedAfter : updatedBefore,
       },
     });
