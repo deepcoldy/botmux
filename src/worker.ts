@@ -5729,15 +5729,37 @@ function busyProbeRegion(content: string): string {
 
 function probeBusyPatternIdle(
   source: string,
-  be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>,
+  be: SessionBackend,
 ): boolean {
   try {
     const content = captureBackendScreen(be);
     if (!content) return false;
     if (cliAdapter?.busyPattern) {
       if (cliAdapter.busyPattern.test(busyProbeRegion(content))) return false;
-      log(`${source} idle probe: busy marker absent, marking prompt ready`);
-      markPromptReady();
+      if (!be.settleCurrentScreen) {
+        log(`${source} idle probe: busy marker absent, marking prompt ready`);
+        markPromptReady();
+        return true;
+      }
+
+      // A busy-marker probe reads the backend's cached screen. ZMX refreshes
+      // that cache from `history`, so absence in the current sample is not yet
+      // an authoritative turn boundary. Reuse the same revision-keyed settle
+      // fence as IdleDetector before publishing prompt_ready; otherwise this
+      // fallback can finalize a whole turn from a pre-tail/poll snapshot.
+      const revisionBeforeSettle = backendScreenRevision;
+      log(`${source} idle probe: busy marker absent, settling authoritative screen before prompt ready`);
+      void settleBackendScreenBeforeIdle(be, revisionBeforeSettle).then((settle) => {
+        if (!settle.proceed || backend !== be || isPromptReady) return;
+        if (backendScreenRevision !== revisionBeforeSettle) {
+          log(`${source} idle probe: authoritative screen changed during settle; deferring completion`);
+          return;
+        }
+        if (settle.degraded) {
+          log(`${source} idle probe: screen settle degraded; finalizing from the last successful snapshot`);
+        }
+        markPromptReady();
+      });
       return true;
     }
   } catch (err: any) {
@@ -5746,7 +5768,7 @@ function probeBusyPatternIdle(
   return false;
 }
 
-function scheduleReattachIdleProbe(source: string, be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): void {
+function scheduleReattachIdleProbe(source: string, be: SessionBackend): void {
   stopReattachIdleProbe();
   if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;
   reattachIdleProbeTimer = setTimeout(() => {

@@ -174,6 +174,25 @@ describe('worker pipe initial screen ordering', () => {
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
   });
 
+  it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe', probeStart);
+    const probe = source.slice(probeStart, probeEnd);
+
+    const revisionIdx = probe.indexOf('const revisionBeforeSettle = backendScreenRevision;');
+    const settleIdx = probe.indexOf('settleBackendScreenBeforeIdle(be, revisionBeforeSettle)');
+    const backendFenceIdx = probe.indexOf('backend !== be', settleIdx);
+    const revisionFenceIdx = probe.indexOf('backendScreenRevision !== revisionBeforeSettle', settleIdx);
+    const markIdx = probe.indexOf('markPromptReady();', settleIdx);
+
+    expect(revisionIdx).toBeGreaterThan(-1);
+    expect(settleIdx).toBeGreaterThan(revisionIdx);
+    expect(backendFenceIdx).toBeGreaterThan(settleIdx);
+    expect(revisionFenceIdx).toBeGreaterThan(backendFenceIdx);
+    expect(markIdx).toBeGreaterThan(revisionFenceIdx);
+  });
+
   it('limits the reattach idle probe to adapters with a busy marker', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const helperStart = source.indexOf('function scheduleReattachIdleProbe');
