@@ -21,6 +21,7 @@ vi.mock('../src/bot-registry.js', () => ({
 import {
   getSessionPersistentBackendType,
   killPersistentBackendTarget,
+  managedTargetsForCliChange,
   probePersistentBackendTarget,
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
@@ -76,6 +77,29 @@ describe('shared Herdr persistent target', () => {
       backendType: 'tmux',
       sessionName: 'bmx-abcdef12',
     });
+  });
+
+  it('returns exact shared agents for CLI-change cleanup and excludes adopted panes', () => {
+    const targets = managedTargetsForCliChange('herdr', [
+      {
+        sessionId: 'abcdef123456',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'botmux',
+          agentName: 'botmux-abcdef12',
+        },
+      },
+      {
+        sessionId: 'user-pane',
+        adoptedFrom: { source: 'herdr', herdrSessionName: 'collie', herdrPaneId: 'w3:p1' },
+      },
+    ] as any);
+
+    expect(targets).toEqual([{
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: 'botmux-abcdef12',
+    }]);
   });
 
   it('probes and kills only the recorded agent rather than the host session', () => {

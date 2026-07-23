@@ -35,7 +35,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -4203,8 +4203,16 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
+    // Legacy per-topic hosts are still enumerable by bmx-* name.
     for (const name of backend.listBotmuxSessions()) {
       backend.killSession(name);
+    }
+    // Machine-wide Herdr agents are not separate bmx-* sessions. Tear down
+    // each persisted managed target precisely so a CLI switch cannot reattach
+    // the old executable, while never stopping the shared `botmux` host or an
+    // explicitly adopted user pane.
+    for (const target of managedTargetsForCliChange(backendType, activeSessions_)) {
+      killPersistentBackendTarget(target);
     }
   } else {
     const activeNames = new Set(

@@ -674,7 +674,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const cwd = typeof agent?.cwd === 'string' ? agent.cwd : undefined;
       const paneId = typeof agent?.pane_id === 'string' ? agent.pane_id : undefined;
       const terminalId = typeof agent?.terminal_id === 'string' ? agent.terminal_id : undefined;
-      const agentName = typeof agent?.agent === 'string' ? agent.agent : undefined;
+      const agentName = typeof agent?.name === 'string' && agent.name
+        ? agent.name
+        : typeof agent?.agent === 'string' ? agent.agent : undefined;
       if (!cwd || !paneId) continue;
       // `agent list` identifies the CLI kind but does not expose its pid. Probe
       // the pane as well: structured adopt bridges (Pi/Codex/TraeX/...) need the
@@ -766,6 +768,20 @@ export function adoptTargetLabel(target: AdoptableSession | NonNullable<import('
 export function adoptTargetKey(target: AdoptableSession): string {
   if (target.source === 'herdr') return `herdr:${target.herdrSessionName}:${target.herdrPaneId ?? target.herdrTarget}`;
   return `tmux:${target.tmuxTarget}:${target.cliPid}`;
+}
+
+/** Remove Herdr agents that already have an active Botmux owner. Orphaned
+ * managed agents remain adoptable, but two live workers must never share one
+ * pane. Matching uses the persisted host + managed agent identity. */
+export function excludeOwnedHerdrAdoptTargets(
+  candidates: readonly AdoptableSession[],
+  ownedTargets: readonly { sessionName: string; agentName: string }[],
+): AdoptableSession[] {
+  const owned = new Set(ownedTargets.map(target => `${target.sessionName}\0${target.agentName}`));
+  return candidates.filter(candidate => {
+    if (candidate.source !== 'herdr' || !candidate.herdrSessionName || !candidate.herdrAgentName) return true;
+    return !owned.has(`${candidate.herdrSessionName}\0${candidate.herdrAgentName}`);
+  });
 }
 
 

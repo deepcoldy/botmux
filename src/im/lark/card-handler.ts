@@ -2397,9 +2397,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, adoptTargetKey } = await import('../../core/session-discovery.js');
-      return discoverAdoptableSessions(botCfg.cliId)
-        .find(s => selected.key
+      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+        const target = active.session.persistentBackendTarget;
+        return active.session.status === 'active'
+          && !active.adoptedFrom
+          && target?.backendType === 'herdr'
+          && !!target.agentName
+          ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+          : [];
+      });
+      return excludeOwnedHerdrAdoptTargets(
+        discoverAdoptableSessions(botCfg.cliId),
+        ownedHerdrTargets,
+      ).find(s => selected.key
           ? adoptTargetKey(s) === selected.key
           : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     }

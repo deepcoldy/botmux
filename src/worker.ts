@@ -7536,29 +7536,30 @@ async function spawnCli(
     readySignalTimer.unref?.();
   }
 
+  // A settled signal is a turn boundary. Drain structured transcripts before
+  // markPromptReady(): that call may synchronously flush a type-ahead turn and
+  // advance bridge attribution. Both screen-idle and authoritative Herdr status
+  // must preserve this ordering.
+  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+    if (bridgeJsonlPath) {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+    }
+    if (codexBridgeFallbackActive()) {
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    }
+    if (evidenceSource === 'screen') markPromptReadyFromPty();
+    else markPromptReady();
+  };
+
   // Set up idle detection. Riff (remote HTTP backend) has no PTY output and
   // is marked ready immediately after spawn (see below), so the idle detector
   // is unnecessary — and without a readyPattern it would fire on every
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   if (effectiveBackendType !== 'riff') {
     idleDetector = new IdleDetector(cliAdapter);
-    idleDetector.onIdle(async (evidenceSource) => {
+    idleDetector.onIdle((evidenceSource) => {
       log('Prompt detected (idle)');
-      // Bridge drain MUST run before markPromptReady() — the latter calls
-      // flushPending() which can immediately fire the next queued message
-      // (type-ahead adapters), shifting bridgeQueue's notion of "current
-      // turn" before we've had a chance to emit the previous one.
-      if (bridgeJsonlPath) {
-        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-      }
-      if (codexBridgeFallbackActive()) {
-        try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
-      }
-      if (evidenceSource === 'screen') {
-        markPromptReadyFromPty();
-      } else {
-        markPromptReady();
-      }
+      drainBridgesThenMarkReady(evidenceSource);
     });
   }
 
@@ -7568,8 +7569,8 @@ async function spawnCli(
     observedBackend.onAgentStatus((status) => {
       if (backend !== observedBackend) return;
       if (status === 'idle' || status === 'done') {
-        log(`Herdr agent ${status} — marking prompt ready`);
-        markPromptReady();
+        log(`Herdr agent ${status} — draining bridges before marking prompt ready`);
+        drainBridgesThenMarkReady('structured');
       } else if (status === 'working') {
         isPromptReady = false;
         idleDetector?.reset();

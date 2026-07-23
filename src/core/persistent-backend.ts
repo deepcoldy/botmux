@@ -17,6 +17,7 @@ import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
+import type { Session } from '../types.js';
 
 export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij'>;
 
@@ -160,6 +161,22 @@ export function persistentBackendTargetForSession(ds: DaemonSession): Persistent
     ds.session.sessionId,
     ds.session.persistentBackendTarget,
   );
+}
+
+/** Exact managed resources to remove when a single-bot CLI changes.
+ * Adopted panes are user-owned; machine-wide Herdr agents must be returned as
+ * agent-scoped targets rather than collapsing to the shared host session. */
+export function managedTargetsForCliChange(
+  backendType: PersistentBackendType,
+  sessions: readonly Pick<Session, 'sessionId' | 'adoptedFrom' | 'persistentBackendTarget'>[],
+): PersistentBackendTarget[] {
+  return sessions
+    .filter(session => !session.adoptedFrom)
+    .map(session => resolvePersistentBackendTarget(
+      backendType,
+      session.sessionId,
+      session.persistentBackendTarget,
+    ));
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {

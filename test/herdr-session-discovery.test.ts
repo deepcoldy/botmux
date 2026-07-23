@@ -42,6 +42,7 @@ import {
   validateAdoptTargetState,
   adoptTargetLabel,
   adoptTargetKey,
+  excludeOwnedHerdrAdoptTargets,
 } from '../src/core/session-discovery.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -198,6 +199,35 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
         cwd: '/projects/traex',
       }),
     ]);
+  });
+
+  it('excludes a managed Herdr agent with an active owner but keeps orphaned siblings', () => {
+    const candidates = [
+      {
+        source: 'herdr' as const,
+        herdrSessionName: 'botmux',
+        herdrPaneId: 'w1:p1',
+        herdrAgentName: 'botmux-owned',
+        cliId: 'pi' as const,
+        cwd: '/a',
+        paneCols: 200,
+        paneRows: 50,
+      },
+      {
+        source: 'herdr' as const,
+        herdrSessionName: 'botmux',
+        herdrPaneId: 'w2:p1',
+        herdrAgentName: 'botmux-orphan',
+        cliId: 'pi' as const,
+        cwd: '/b',
+        paneCols: 200,
+        paneRows: 50,
+      },
+    ];
+
+    expect(excludeOwnedHerdrAdoptTargets(candidates, [
+      { sessionName: 'botmux', agentName: 'botmux-owned' },
+    ])).toEqual([candidates[1]]);
   });
 
   it('filters by CliId when requested', () => {

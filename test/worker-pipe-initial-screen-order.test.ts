@@ -246,9 +246,19 @@ describe('worker pipe initial screen ordering', () => {
 
     expect(hookStart).toBeGreaterThan(-1);
     expect(hook).toContain("status === 'idle' || status === 'done'");
-    expect(hook).toContain('markPromptReady();');
+    expect(hook).toContain("drainBridgesThenMarkReady('structured');");
     expect(hook).toContain("status === 'working'");
     expect(hook).toContain('isPromptReady = false;');
+
+    const helperStart = source.indexOf("const drainBridgesThenMarkReady = (");
+    const helperEnd = source.indexOf('// Set up idle detection.', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const claudeDrain = helper.indexOf('bridgeDrainAndMaybeEmit();');
+    const structuredDrain = helper.indexOf('codexBridgeDrainAndMaybeEmit();');
+    const ready = helper.indexOf('markPromptReady();');
+    expect(claudeDrain).toBeGreaterThan(-1);
+    expect(structuredDrain).toBeGreaterThan(claudeDrain);
+    expect(ready).toBeGreaterThan(structuredDrain);
   });
 
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
