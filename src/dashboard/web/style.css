@@ -1802,6 +1802,36 @@ a:focus-visible {
   transform: translateY(-1px);
 }
 
+/* 调试终端按钮：复用监控室按钮的胶囊样式，保持工具栏一致。 */
+.debug-terminal-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: var(--button-height);
+  min-height: var(--button-height);
+  padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    color 150ms ease,
+    transform 150ms ease;
+}
+
+.debug-terminal-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--accent-strong);
+  transform: translateY(-1px);
+}
+
 .filter-toggle {
   display: inline-flex;
   align-items: center;
@@ -2637,6 +2667,7 @@ button.primary {
 .session-card-actions {
   padding-top: 2px;
   justify-content: flex-end;
+  gap: 6px;
 }
 
 .session-card-actions button,
@@ -3038,15 +3069,42 @@ button.primary {
   transform: translateY(-50%);
   display: inline-flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: flex-end;
   flex: none;
   flex-wrap: nowrap;
-  gap: 2px;
+  gap: 3px;
   max-width: 100%;
   min-width: 0;
   margin-left: 0;
-  overflow: hidden;
+  padding-left: 24px;
+  /* rail 是 hover 浮层，绝对定位盖在顶行上。默认完全透明、不占视觉（否则常驻的
+     渐变背景会把没 hover 的卡片 CLI 徽章也糊掉——见回归）。只有 hover/focus 时
+     才浮出：给一层与 hover 态卡片同色的背景 + 左侧渐变淡出，干净盖住徽章而非糊字。 */
+  --kanban-rail-bg: color-mix(in srgb, var(--accent) 4%, var(--surface-raised));
+  background: transparent;
   z-index: 2;
+}
+
+.kanban-card:hover .kanban-card-actions-rail,
+.kanban-card:focus-within .kanban-card-actions-rail {
+  background: linear-gradient(
+    to right,
+    transparent 0,
+    var(--kanban-rail-bg) 24px,
+    var(--kanban-rail-bg) 100%
+  );
+}
+
+@media (hover: none), (max-width: 720px) {
+  /* 触屏/窄屏按钮常显，背景也常显，避免图标浮在徽章上重叠。 */
+  .kanban-card-actions-rail {
+    background: linear-gradient(
+      to right,
+      transparent 0,
+      var(--kanban-rail-bg) 24px,
+      var(--kanban-rail-bg) 100%
+    );
+  }
 }
 
 .kanban-card-dot {
@@ -3561,6 +3619,52 @@ button.primary {
 }
 .term-pill .term-write:hover { filter: brightness(1.1); }
 .term-pill .term-btn:active { transform: scale(0.88); }
+
+/* ── 全局图标 tooltip（icon-tooltip.ts 委托渲染到 body，逃出容器 overflow）────── */
+.icon-tip {
+  position: fixed;
+  z-index: 9999;
+  max-width: 260px;
+  padding: 5px 9px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-inverse, #1f2430);
+  color: var(--on-inverse, #eef1f7);
+  border: 1px solid var(--border-soft);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 600;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 120ms ease, transform 120ms ease;
+}
+.icon-tip.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+/* 小箭头指向触发按钮 */
+.icon-tip::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 7px;
+  height: 7px;
+  transform: translateX(-50%) rotate(45deg);
+  background: var(--surface-inverse, #1f2430);
+  border: 1px solid var(--border-soft);
+}
+.icon-tip[data-placement="top"]::after {
+  bottom: -4px;
+  border-top: none;
+  border-left: none;
+}
+.icon-tip[data-placement="bottom"]::after {
+  top: -4px;
+  border-bottom: none;
+  border-right: none;
+}
 
 dialog {
   width: min(680px, calc(100vw - 32px));
@@ -8778,6 +8882,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   box-shadow: var(--modal-shadow);
   transform: translateX(-50%);
 }
+/* 会话筛选里的「来源 / 所在聊天」弹层宽度自适应 + 不折行的规则统一定义在下方
+   （.sessions-filters .sect-sort-pop，靠后覆盖），此处不再重复。 */
 .sect-sort-pop button {
   display: flex;
   align-items: center;
@@ -8794,6 +8900,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   line-height: 1;
   text-align: left;
   cursor: pointer;
+  /* 选项不换行：长文案（如「来源：外部接入 (/adopt)」「单聊 · 申晗 · <bot名>」）
+     以前会折成多行、显得拥挤。改为单行 + 超长省略号；弹层宽度下方放宽。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* 长列表下拉的过滤框：滚动时钉在弹层顶部（负 margin 盖住弹层 padding）。 */
 .sect-sort-pop input.sect-sort-search[type="search"] {
@@ -9129,7 +9240,28 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   min-width: 0;
 }
 .sessions-filters .sect-sort-pop {
-  min-width: var(--dropdown-trigger-width);
+  /* 「来源 / 所在聊天」选项文案偏长（如「来源：外部接入 (/adopt)」、含 bot 后缀的
+     单聊名）：弹层按最长选项自适应、不折行，封顶后省略号；左对齐避免右侧超出视口。
+     用 .dashboard-toolbar 前缀匹配上 `.dashboard-toolbar > .sect-sort-menu >
+     .sect-sort-pop`（那条把宽度锁成 100%），靠后 + 同等特指度覆盖它。 */
+  left: 0;
+  transform: none;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(380px, calc(100vw - 48px));
+}
+.dashboard-toolbar.sessions-filters > .sect-sort-menu > .sect-sort-pop {
+  left: 0;
+  transform: none;
+  width: max-content;
+  min-width: 220px;
+  max-width: min(380px, calc(100vw - 48px));
+}
+/* 让选项按 max-content 撑开弹层：默认按钮的 ellipsis 会把 max-content 量成最小宽度，
+   这里放开——只有触达 max-width 上限时才由按钮自身 ellipsis 收尾。 */
+.sessions-filters .sect-sort-pop button {
+  min-width: 0;
+  white-space: nowrap;
 }
 :root[data-theme="dark"] .sessions-filters input[type=search] {
   background-color: var(--surface);
@@ -9238,13 +9370,66 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   min-width: var(--dropdown-trigger-width);
   max-width: calc(100vw - 48px);
   display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 6px;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
   border-radius: var(--radius-lg);
   border: 1px solid var(--border-soft);
   background: var(--surface);
   box-shadow: var(--modal-shadow);
+}
+.filter-cli-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.filter-cli-search {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--button-compact-height);
+  padding: 0 10px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  color: var(--fg);
+  font-size: 12px;
+}
+.filter-cli-search:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft));
+}
+.filter-cli-bulk {
+  display: inline-flex;
+  gap: 4px;
+  flex: none;
+}
+.filter-cli-bulk button {
+  min-height: var(--button-compact-height);
+  padding: 0 9px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-raised);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.filter-cli-bulk button:hover {
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border-soft));
+  color: var(--accent-strong);
+}
+.filter-cli-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.filter-cli-empty {
+  padding: 8px 4px;
+  color: var(--faint);
+  font-size: 12px;
 }
 .filter-cli-pop .filter-check {
   min-height: var(--button-compact-height);

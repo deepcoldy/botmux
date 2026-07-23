@@ -326,7 +326,7 @@ function CardActButton(props: {
       type="button"
       className={`card-act kanban-card-act${props.className ? ` ${props.className}` : ''}`}
       data-action={props.action}
-      title={props.label}
+      data-tip={props.label}
       aria-label={props.label}
       onClick={(event) => {
         event.stopPropagation();
@@ -441,7 +441,7 @@ function KanbanCard(props: {
           href={row.feishuChatLink}
           target="_blank"
           rel="noopener"
-          title={t('sessions.kanban.openFeishu')}
+          data-tip={t('sessions.kanban.openFeishu')}
           aria-label={t('sessions.kanban.openFeishu')}
           onClick={event => event.stopPropagation()}
           dangerouslySetInnerHTML={rawHtml(callbacks.icons.feishu)}

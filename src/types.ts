@@ -171,6 +171,11 @@ export interface Session {
    * the CLI can read them, then removed by session-store on close. */
   dashboardAttachments?: LarkAttachment[];
   createdAt: string;
+  /** Dashboard「复现命令」：session 启动时 worker 组装的真实 CLI 调用（bin + argv +
+   *  工作目录 + 关键 env），供用户复制到调试终端里改参数复现问题。原样保留（含
+   *  token / --append-system-prompt / 凭证 env），只在有写权限的 dashboard 视图暴露。
+   *  worker `ready` 时上报并持久化，扛 daemon 重启。 */
+  spawnCommand?: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
   closedAt?: string;
@@ -594,7 +599,7 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; turnId?: string; dispatchAttempt?: number }
   /** Trusted worker observation used only by the host activation transaction.
    * PID markers are child-writable diagnostics and are never security proof. */
   | {

@@ -54,6 +54,7 @@ import {
   isUnknownChatSession,
   lockActionLabel,
   openWriteLink,
+  copySpawnCommand,
   repoBasename,
   restartConfirmMessage,
   sessionLocationText,
@@ -224,7 +225,7 @@ function IconActionButton(props: {
       id={props.id}
       className={className}
       data-action={props.action}
-      title={props.label}
+      data-tip={props.label}
       aria-label={props.label}
       disabled={props.disabled}
       onClick={(event) => {
@@ -247,7 +248,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
           href={props.url}
           target="_blank"
           rel="noopener"
-          title={t('sessions.openTerminal')}
+          data-tip={t('sessions.openTerminal')}
           aria-label={t('sessions.openTerminal')}
           onClick={event => event.stopPropagation()}
           dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
@@ -257,7 +258,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
           type="button"
           className="term-btn term-write"
           data-action="write-link"
-          title={t('sessions.openTerminal')}
+          data-tip={t('sessions.openTerminal')}
           aria-label={t('sessions.openTerminal')}
           onClick={(event) => {
             event.stopPropagation();
@@ -279,7 +280,7 @@ function ChatScopeLink(props: { row: any; className?: string }): JSX.Element | n
       href={row.feishuChatLink}
       target="_blank"
       rel="noopener"
-      title={t('sessions.openChat')}
+      data-tip={t('sessions.openChat')}
       aria-label={t('sessions.openChat')}
       onClick={event => event.stopPropagation()}
       dangerouslySetInnerHTML={rawHtml(ICON.feishu)}
@@ -443,6 +444,7 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
 export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): JSX.Element {
   const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
   const detailsRef = useRef<HTMLDetailsElement>(null);
+  const [query, setQuery] = useState('');
 
   useEffect(() => {
     const close = () => {
@@ -463,24 +465,52 @@ export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: s
     };
   }, []);
 
+  const q = query.trim().toLowerCase();
+  const visible = q ? CLI_FILTER_OPTIONS.filter(cli => cli.toLowerCase().includes(q)) : CLI_FILTER_OPTIONS;
+
   return (
     <details className="filter-cli" ref={detailsRef}>
       <summary>{t('sessions.cli')} · <b id="cli-filter-count" className={checked === CLI_FILTER_OPTIONS.length ? undefined : 'cli-filter-active'}>
         {checked === CLI_FILTER_OPTIONS.length ? t('common.all') : `${checked}/${CLI_FILTER_OPTIONS.length}`}
       </b></summary>
       <div className="filter-cli-pop" role="group" aria-label={t('sessions.cli')}>
-        {CLI_FILTER_OPTIONS.map(cli => (
-          <label key={cli} className="filter-check">
-            <input
-              type="checkbox"
-              name="cli"
-              value={cli}
-              checked={props.selected.has(cli)}
-              onChange={event => props.onToggle(cli, event.currentTarget.checked)}
-            />
-            <span>{cli}</span>
-          </label>
-        ))}
+        <div className="filter-cli-head">
+          <input
+            type="search"
+            className="filter-cli-search"
+            placeholder={t('sessions.cliSearch')}
+            value={query}
+            autoFocus
+            onChange={event => setQuery(event.currentTarget.value)}
+            onClick={event => event.stopPropagation()}
+          />
+          <div className="filter-cli-bulk">
+            <button
+              type="button"
+              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (!props.selected.has(cli)) props.onToggle(cli, true); }}
+            >{t('sessions.cliSelectAll')}</button>
+            <button
+              type="button"
+              onClick={() => { for (const cli of CLI_FILTER_OPTIONS) if (props.selected.has(cli)) props.onToggle(cli, false); }}
+            >{t('sessions.cliClear')}</button>
+          </div>
+        </div>
+        <div className="filter-cli-options">
+          {visible.length === 0 ? (
+            <span className="filter-cli-empty">{t('sessions.cliNoMatch')}</span>
+          ) : visible.map(cli => (
+            <label key={cli} className="filter-check">
+              <input
+                type="checkbox"
+                name="cli"
+                value={cli}
+                checked={props.selected.has(cli)}
+                onChange={event => props.onToggle(cli, event.currentTarget.checked)}
+              />
+              <span>{cli}</span>
+            </label>
+          ))}
+        </div>
       </div>
     </details>
   );
@@ -535,9 +565,13 @@ function SessionsFilters(props: {
       />
       <DropdownMenu
         ariaLabel={t('sessions.location')}
+        className="filter-chat-menu"
         label={chatLabel}
         value={props.filters.chat}
         options={chatOptions}
+        searchable
+        searchPlaceholder={t('sessions.chatSearch')}
+        searchEmptyLabel={t('sessions.chatNoMatch')}
         onChange={value => props.setFilters(prev => ({ ...prev, chat: value }))}
       />
       <CliFilterGroup
@@ -1623,6 +1657,16 @@ function Drawer(props: {
             {!row.feishuChatLink || row.scope !== 'chat' ? <LocateButton row={row} locateSession={props.locateSession} /> : null}
             <button id="history-drawer-btn" type="button" onClick={() => props.openHistory(row)}>{t('sessions.history.title')}</button>
             <TerminalControls row={row} url={terminal} />
+            {shouldOpenWritableTerminal() && row.status !== 'closed' ? (
+              <button
+                id="copy-cmd-btn"
+                type="button"
+                data-tip={t('sessions.copyCommandHint')}
+                onClick={event => void copySpawnCommand(row, event.currentTarget)}
+              >
+                {t('sessions.copyCommand')}
+              </button>
+            ) : null}
             {canRestartSession(row) ? (
               <button id="restart-btn" type="button" onClick={async event => { if (await props.restartSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.restart')}</button>
             ) : null}
@@ -2885,7 +2929,34 @@ function SessionsPage(): JSX.Element {
     }
   }, []);
 
-  // 侧边菜单「创建会话」入口：已在本页时收事件直接打开；跨页跳转时消费挂载前的 pending
+  // 调试终端：起一个 owner-only 裸 bash（不绑飞书话题），在新标签打开 xterm 页面。
+  // 让用户把「复制复现命令」拿到的命令粘进去改参数复现问题，用完关闭即回收。
+  const openDebugTerminal = useCallback(async (): Promise<void> => {
+    const input = window.prompt(t('sessions.debugTerminalPrompt'), '');
+    if (input === null) return; // 用户取消
+    const workingDir = input.trim();
+    const tab = window.open('about:blank', '_blank');
+    if (tab) tab.opener = null;
+    try {
+      const r = await fetch('/api/debug-terminal', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(workingDir ? { workingDir } : {}),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok || body?.ok === false || !body?.url) {
+        tab?.close();
+        if (r.status !== 401) alert(`${t('sessions.debugTerminalFail')}: ${body?.error ?? r.status}`);
+        return;
+      }
+      if (tab) tab.location.href = body.url;
+      else window.open(body.url, '_blank', 'noopener');
+    } catch (e) {
+      tab?.close();
+      alert(`${t('sessions.debugTerminalFail')}: ${e}`);
+    }
+  }, []);
+
   useEffect(() => {
     const maybeOpenFromEntry = () => {
       if (consumePendingCreateSession() && ui.authed) void openCreateSession();
@@ -2974,6 +3045,16 @@ function SessionsPage(): JSX.Element {
           <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
             {t('sessions.monitorRoom')}
           </button>
+          {ui.authed ? (
+            <button
+              type="button"
+              className="debug-terminal-btn"
+              title={t('sessions.debugTerminalHint')}
+              onClick={() => void openDebugTerminal()}
+            >
+              {t('sessions.debugTerminal')}
+            </button>
+          ) : null}
           {ui.authed ? (
             <CreateActionButton
               className="page-primary-action create-session-btn"

@@ -879,6 +879,10 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+/** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
+ *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
+ *  持久化。仅有写权限的 dashboard 视图可见。 */
+let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
 const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff' };
@@ -7210,6 +7214,25 @@ async function spawnCli(
     );
   }
 
+  // Dashboard「复现命令」：把最终交给 backend.spawn 的真实调用组装成一条可粘贴的
+  // shell 命令（bin + argv + cwd + 关键 per-bot env）。原样保留，供用户复制到调试终端
+  // 复现问题。此处 spawnBin/spawnArgs 已经过 wrapperCli / sandbox / credential 等全部
+  // 改写，是子进程真正 exec 的形态。
+  try {
+    const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`;
+    const parts: string[] = [];
+    const injectKeys = Object.keys(perBotInjectEnv);
+    if (injectKeys.length) {
+      for (const k of injectKeys) parts.push(`${k}=${shq(perBotInjectEnv[k] ?? '')}`);
+    }
+    parts.push(shq(spawnBin), ...spawnArgs.map(shq));
+    const cmd = parts.join(' ');
+    capturedSpawnCommand = spawnCwd ? `cd ${shq(spawnCwd)} && ${cmd}` : cmd;
+  } catch (err: any) {
+    capturedSpawnCommand = null;
+    log(`Failed to capture spawn command: ${err?.message ?? err}`);
+  }
+
   backend.spawn(spawnBin, spawnArgs, {
     cwd: spawnCwd,
     cols: PTY_COLS,
@@ -9227,6 +9250,7 @@ process.on('message', async (raw: unknown) => {
           port,
           token: writeToken,
           viewToken,
+          ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
