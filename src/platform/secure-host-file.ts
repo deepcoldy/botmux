@@ -44,6 +44,20 @@ function assertOwnedByCurrentUser(stats: import('node:fs').Stats, label: string)
 }
 
 /**
+ * Escape hatch for trusted-but-awkward shared hosts (e.g. corporate devboxes)
+ * where some ancestor like `/data00` is owned by an unrelated service account
+ * and owner-writable (`0755`), yet the physical machine is trusted and the
+ * user cannot chmod that level. `BOTMUX_SKIP_HOST_AUTH_CHECK=1` skips ONLY the
+ * ancestor-chain replaceability walk below; the direct credential-dir/leaf
+ * checks (owner, exact 0600, no group/other write) still apply.
+ */
+function ancestorChainCheckDisabled(): boolean {
+  return process.env.BOTMUX_SKIP_HOST_AUTH_CHECK === '1';
+}
+
+let warnedAncestorChainSkipped = false;
+
+/**
  * A 0700 credential directory is still replaceable when one of its ancestors
  * is writable by another user. Walk the canonical chain so later path-based
  * open/rename operations cannot be redirected by renaming the whole directory.
@@ -54,6 +68,16 @@ function assertOwnedByCurrentUser(stats: import('node:fs').Stats, label: string)
  */
 function assertAncestorChainCannotReplace(canonicalParent: string): void {
   if (process.platform === 'win32' || !process.getuid) return;
+  if (ancestorChainCheckDisabled()) {
+    if (!warnedAncestorChainSkipped) {
+      warnedAncestorChainSkipped = true;
+      console.error(
+        '[secure-host-file] BOTMUX_SKIP_HOST_AUTH_CHECK=1 已跳过宿主凭证祖先链检查；'
+        + '仅在本机物理环境可信（如共享 devbox 上某级父目录归属服务账号）时使用。',
+      );
+    }
+    return;
+  }
   const uid = process.getuid();
   const trustedOwner = (owner: number) => owner === uid || owner === 0;
   let childPath = canonicalParent;
@@ -75,7 +99,11 @@ function assertAncestorChainCannotReplace(canonicalParent: string): void {
         && trustedOwner(ancestorStats.uid)
         && trustedOwner(childStats.uid);
       if (!stickyProtectsChild) {
-        throw new UnsafeHostAuthorityFileError('宿主凭证目录可被不可信祖先目录替换');
+        throw new UnsafeHostAuthorityFileError(
+          '宿主凭证目录可被不可信祖先目录替换'
+          + `（祖先 ${ancestorPath} 可被非本人账号写入）；`
+          + '若本机物理环境可信，可设 BOTMUX_SKIP_HOST_AUTH_CHECK=1 跳过祖先链检查',
+        );
       }
     }
 
