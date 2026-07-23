@@ -51,6 +51,13 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // to become interactive, so let it use its 30s default plus a small IPC margin.
 const PANE_AGENT_START_TIMEOUT_MS = 30_000;
 const PANE_AGENT_EXEC_TIMEOUT_MS = PANE_AGENT_START_TIMEOUT_MS + 5_000;
+// A newly-created workspace can be returned before its login shell reaches an
+// interactive prompt. `agent start` then fails immediately with
+// `agent_pane_busy`; retry only that transient response, bounded independently
+// from the agent's own startup timeout.
+const PANE_SHELL_READY_TIMEOUT_MS = 5_000;
+const PANE_SHELL_READY_POLL_MS = 100;
+const PANE_SHELL_READY_MAX_ATTEMPTS = Math.ceil(PANE_SHELL_READY_TIMEOUT_MS / PANE_SHELL_READY_POLL_MS);
 // Watch the full useful lifecycle, not just settled statuses. Herdr's
 // `wait agent-status --status X` is level-triggered: when the pane is already
 // in X it succeeds immediately. After one status wins we therefore exclude it
@@ -692,16 +699,28 @@ export class HerdrBackend implements SessionBackend {
         throw new Error(`herdr workspace create for ${this.agentName} in ${this.sessionName} failed: missing root pane`);
       }
 
-      const started = requiredJsonCommand(
-        `herdr agent start ${this.agentName} in ${this.sessionName}`,
-        herdrSessionArgs(this.sessionName, [
-          'agent', 'start', this.agentName,
-          '--kind', kind,
-          '--pane', paneId,
-          '--timeout', String(PANE_AGENT_START_TIMEOUT_MS),
-        ]),
-        { timeout: PANE_AGENT_EXEC_TIMEOUT_MS, env: this.childEnv },
-      );
+      const startArgs = herdrSessionArgs(this.sessionName, [
+        'agent', 'start', this.agentName,
+        '--kind', kind,
+        '--pane', paneId,
+        '--timeout', String(PANE_AGENT_START_TIMEOUT_MS),
+      ]);
+      const readyDeadline = Date.now() + PANE_SHELL_READY_TIMEOUT_MS;
+      let started: any;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          started = requiredJsonCommand(
+            `herdr agent start ${this.agentName} in ${this.sessionName}`,
+            startArgs,
+            { timeout: PANE_AGENT_EXEC_TIMEOUT_MS, env: this.childEnv },
+          );
+          break;
+        } catch (err) {
+          const paneBusy = err instanceof Error && err.message.includes('agent_pane_busy');
+          if (!paneBusy || attempt >= PANE_SHELL_READY_MAX_ATTEMPTS || Date.now() >= readyDeadline) throw err;
+          sleepSync(PANE_SHELL_READY_POLL_MS);
+        }
+      }
       const agent = extractAgent(started);
       if (!agent?.pane_id) {
         throw new Error(`herdr agent start ${this.agentName} in ${this.sessionName} failed: missing agent pane`);

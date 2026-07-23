@@ -328,6 +328,36 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('Herdr 0.7.5: retries while a new workspace shell is not yet available', () => {
+    let startAttempts = 0;
+    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
+      if (cmd !== 'herdr') return '' as any;
+      const argv = args as string[];
+      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
+      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
+      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_race', 'w_race-1') as any;
+      if (argv.includes('agent') && argv.includes('start')) {
+        startAttempts++;
+        if (startAttempts < 3) {
+          const err: any = new Error('exit 1');
+          err.stdout = JSON.stringify({ error: { code: 'agent_pane_busy', message: 'agent target pane is not an available shell' } });
+          err.stderr = '';
+          throw err;
+        }
+        return AGENT_GET_REPLY('w_race-1') as any;
+      }
+      if (argv.includes('read')) return PANE_READ_REPLY('hello') as any;
+      return '' as any;
+    }) as any);
+
+    const be = new HerdrBackend(SESSION);
+    be.spawn('pi', [], { cwd: '/work', cols: 120, rows: 30, env: {} });
+
+    expect(startAttempts).toBe(3);
+    expect(herdrCall('workspace', 'close', 'w_race')).toBeUndefined();
+    be.kill();
+  });
+
   it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
     setHerdrResponses([
       { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
