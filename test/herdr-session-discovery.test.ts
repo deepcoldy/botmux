@@ -51,7 +51,7 @@ const mockedExecSync = vi.mocked(execSync);
 
 interface HerdrFixture {
   sessions: Array<{ name: string; running: boolean }>;
-  agentsBySession: Record<string, Array<{ name?: string; agent?: string; pane_id?: string; terminal_id?: string; cwd?: string }>>;
+  agentsBySession: Record<string, Array<{ name?: string; agent?: string; agent_session?: { kind?: string; value?: string }; pane_id?: string; terminal_id?: string; cwd?: string }>>;
   panesBySession?: Record<string, Array<{ name?: string; pane_id?: string; terminal_id?: string; cwd?: string; foreground_cwd?: string }>>;
   processByPane?: Record<string, { pid: number; name: string; argv?: string[]; argv0?: string; cwd: string }>;
   /** Throw on certain probes to simulate `unknown` validation result. */
@@ -113,7 +113,17 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'no-pane', agent: 'claude', cwd: '/projects/x' },                                   // missing pane_id → filtered
         ],
         botmux: [
-          { name: 'botmux-feed1234', agent: 'pi', pane_id: 'w1:p1', terminal_id: 't-pi', cwd: '/projects/pi' },
+          {
+            name: 'botmux-feed1234',
+            agent: 'pi',
+            agent_session: {
+              kind: 'path',
+              value: '/home/testuser/.pi/agent/sessions/--projects-pi--/2026-07-23T06-07-29-246Z_019f8d96-0dde-7e12-8a8b-51a09766d97f.jsonl',
+            },
+            pane_id: 'w1:p1',
+            terminal_id: 't-pi',
+            cwd: '/projects/pi',
+          },
         ],
         'bmx-deadbeef': [
           { name: 'botmux', agent: 'claude', pane_id: '5-5', cwd: '/projects/own' },
@@ -160,6 +170,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrPaneId: 'w1:p1',
       herdrTerminalId: 't-pi',
       cliPid: 75275,
+      sessionId: '019f8d96-0dde-7e12-8a8b-51a09766d97f',
       cwd: '/projects/pi',
     });
   });

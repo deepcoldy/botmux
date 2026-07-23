@@ -643,6 +643,19 @@ function herdrAgentCliId(agent: any, filterCliId?: CliId): CliId | undefined {
   return name ? cliIdForComm(name, filterCliId) : undefined;
 }
 
+const HERDR_SESSION_UUID_RE = /(?:^|_)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i;
+
+/** Herdr integrations expose the authoritative resumed CLI session in
+ * `agent_session`. Pi does not keep its JSONL fd open, so pid/lsof discovery
+ * cannot recover this path on macOS; use Herdr's own binding instead. */
+function herdrAgentSessionId(agent: any): string | undefined {
+  const value = typeof agent?.agent_session?.value === 'string'
+    ? agent.agent_session.value
+    : undefined;
+  if (!value) return undefined;
+  return HERDR_SESSION_UUID_RE.exec(value)?.[1];
+}
+
 function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[] {
   const rawSessions = herdrJson(['session', 'list', '--json']);
   const sessions = extractHerdrSessions(rawSessions).filter((s: any) => {
@@ -671,8 +684,8 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
       const process = herdrPaneCliProcess(rawInfo, cliId);
       const cliPid = process?.pid;
-      let sessionId: string | undefined;
-      if (cliPid) {
+      let sessionId = herdrAgentSessionId(agent);
+      if (!sessionId && cliPid) {
         if (cliId === 'traex') sessionId = findTraexRolloutByPid(cliPid)?.cliSessionId;
         else if (cliId === 'codex') sessionId = findCodexRolloutByPid(cliPid)?.cliSessionId;
         else if (cliId === 'coco') sessionId = findCocoSessionByPid(cliPid)?.sessionId;
