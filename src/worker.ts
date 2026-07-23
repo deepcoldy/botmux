@@ -19,7 +19,6 @@ import { join, basename, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
-  evaluateReadIsolationGate,
   evaluateCredentialOnlyIsolationGate,
   credentialIsolationRequired,
   deviceCredentialIsolationMarkerPath,
@@ -29,17 +28,11 @@ import {
   isolatedPaneReattachSafe,
   sendCredFilePath,
   botHomePath,
-  buildV2DenyPaths,
-  buildV2DenyRegexes,
-  buildV2CarveOuts,
-  buildReadIsolationProtectedWriteRules,
   buildCliExecutableReadCarveOuts,
-  buildWriteSandboxRules,
-  buildLinuxReadIsolationMasks,
   isolationPaneMarkerContent,
   type IsolationCapability,
-  type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
 import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
@@ -90,7 +83,7 @@ import {
   type SessionMcpRuntimeManifest,
 } from './core/plugins/mcp/session-runtime.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
-import { loadBotConfigs, type BotConfig } from './bot-registry.js';
+import { loadBotConfigs, resolveBrandLabel, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
   deriveTerminalViewToken,
@@ -133,6 +126,7 @@ import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByCha
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
+import { fileURLToPath } from 'node:url';
 import { createServer as createHttpServer, type IncomingMessage } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
@@ -185,14 +179,13 @@ import {
   isValidRiffSandboxCluster,
 } from './adapters/backend/riff-backend.js';
 import {
-  prepareSandbox,
+  prepareDirectSandbox,
   prepareCredentialOnlySandbox,
   credentialOnlySandboxAvailable,
   probeHostCredentialIsolationMechanism,
   attachSandboxOutbox,
   startOutboxWatcher,
   sandboxEnabled,
-  sandboxedClaudeDataDir,
   localSandboxApplies,
 } from './adapters/backend/sandbox.js';
 import {
@@ -5981,86 +5974,20 @@ async function spawnCli(
   // so a fork inherits the whole submit-confirm + bridge-fallback machinery.
   let claudeDataDir = cliAdapter.claudeDataDir;
   let effectiveReadyHookInstall: HookInstallConfig | undefined = cliAdapter.hookInstall;
-  // When this session will be file-sandboxed, the CLI's session jsonl is written
-  // into the overlay's EPHEMERAL home upper (CLAUDE_CONFIG_DIR lives under $HOME),
-  // invisible at the real path the bridge normally watches → "Bridge mark expired"
-  // and the turn never relays (2026-06-10 incident). Redirect every jsonl/pid/
-  // bridge gate below to the upper copy where the sandboxed CLI actually writes.
-  const willFileSandbox =
-    process.platform === 'linux' &&          // bwrap overlay is Linux-only; macOS uses the Seatbelt write-sandbox below
-    (cfg.sandbox === true || sandboxEnabled()) &&
-    (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux') &&
-    !!process.env.SESSION_DATA_DIR;
-  if (claudeDataDir && willFileSandbox) {
-    const redirected = sandboxedClaudeDataDir(cfg.sessionId, claudeDataDir, {
-      sourceWorkingDir: cfg.workingDir,
-      dataDir: process.env.SESSION_DATA_DIR,
-    });
-    log(`[sandbox] redirecting Claude bridge dataDir → overlay upper: ${redirected}`);
-    claudeDataDir = redirected;
-  }
-  // v2 read isolation: relocate the CLI's data root into the per-bot BOT_HOME
-  // (`<BOTMUX_HOME>/bots/<appId>/{claude,codex}`) so each bot's transcripts/memory
-  // land in its OWN (Seatbelt-allowed) dir, NOT the shared/global ~/.claude|~/.codex
-  // (which v2 denies wholesale). Decided EARLY — like willFileSandbox above — so
-  // every JSONL/bridge/resume path below already targets the per-bot dir. The
-  // matching CLAUDE_CONFIG_DIR/CODEX_HOME env, per-bot provisioning and Seatbelt
-  // wrapper are applied at spawn time further down. This gate is the SINGLE
-  // decision point: configured-but-unenforceable fail-closes HERE (never run a
-  // session unisolated that asked for isolation).
-  // UNIFIED file sandbox: read isolation engages with the same toggle as write
-  // isolation. On darwin the legacy standalone `readIsolation` flag ALSO engages it
-  // (Seatbelt can read-deny without a write overlay). On Linux read isolation RIDES
-  // the bwrap sandbox (its masks go into the same bwrap plan), so it requires the
-  // sandbox to be on — hence the trigger is the sandbox toggle there, never the bare
-  // legacy flag (which would redirect the data dir but apply no masks → a hole).
-  // riff runs in its own REMOTE sandbox with no local CLI process — every
-  // local isolation flavor (Linux bwrap, macOS Seatbelt write-sandbox, read
-  // isolation incl. the legacy fail-closed flag) is meaningless for it and
-  // must be bypassed on ALL platforms, or a sandbox/readIsolation-enabled bot
-  // bricks the moment it switches to riff.
-  const riffRemoteBackend = effectiveBackendType === 'riff';
+  // ── UNIFIED file sandbox (fs-policy, 2026-07-16 refactor) ──
+  // ONE toggle, BOTH platforms, identical three-tier deny-by-default semantics
+  // (adapters/cli/fs-policy.ts). Legacy `readIsolation` is auto-migrated to
+  // `sandbox` at daemon startup; honored here too for an unmigrated read-only
+  // BOTS_CONFIG. riff runs in its own REMOTE sandbox with no local CLI process —
+  // local confinement is meaningless there and must be bypassed on ALL
+  // platforms, or a sandbox-enabled bot bricks the moment it switches to riff.
+  const riffRemoteBackend = !localSandboxApplies(effectiveBackendType);
   if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
-    log('Sandbox/read-isolation flags set but backend is riff (remote sandbox, no local process) — local isolation bypassed');
+    log('Sandbox flag set but backend is riff (remote sandbox, no local process) — local sandbox bypassed');
   }
-  const wantsFileSandbox = !riffRemoteBackend && (cfg.sandbox === true || sandboxEnabled());
-  // Legacy EXPLICIT read-isolation opt-in (macOS only — Linux read-iso rides the
-  // bwrap sandbox, so it's driven solely by the sandbox toggle there). Keeps
-  // FAIL-CLOSED semantics: you asked for read isolation → refuse to start without it.
-  const explicitLegacyReadIso = process.platform === 'darwin' && cfg.readIsolation === true && !riffRemoteBackend;
-  const readIsolationGate = evaluateReadIsolationGate({
-    configured: wantsFileSandbox || explicitLegacyReadIso,
-    adapterSupports: cliAdapter.supportsReadIsolation === true,
-    wrapperCliSet: !!cfg.wrapperCli,
-    platform: process.platform,
-    sessionDataDirSet: !!process.env.SESSION_DATA_DIR,
-  });
-  // Fail-closed ONLY for the explicit legacy flag. Under the UNIFIED sandbox toggle
-  // read isolation is BEST-EFFORT: a CLI/platform that can't enforce the read-deny
-  // (e.g. a non-supporting adapter) still runs WRITE-isolated — it just doesn't get
-  // the read masks. Never brick a sandboxed session just because read-iso is N/A.
-  if (readIsolationGate.failClosedReason && explicitLegacyReadIso) {
-    throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: ${readIsolationGate.failClosedReason}`);
-  }
-  const willReadIsolate = readIsolationGate.enabled;
-  // macOS FILE SANDBOX — the Seatbelt WRITE-isolation twin of the Linux bwrap
-  // overlay. On darwin, `sandbox: true` (or the global sandboxEnabled()) confines
-  // WRITES via the same `sandbox-exec` wrapper as read isolation instead of bwrap
-  // (Linux-only). Reads stay open, matching the Linux "read-all / write-isolated"
-  // model; if read isolation is ALSO on, its read-deny set layers into the SAME
-  // profile. Like bwrap this is FAIL-SAFE: a requested sandbox that can't be
-  // established (unsandboxable backend, no SESSION_DATA_DIR) is a hard error at the
-  // spawn site below, never a silent unconfined run.
-  const willWriteSandbox = process.platform === 'darwin' && wantsFileSandbox;
-  if (willWriteSandbox && !process.env.SESSION_DATA_DIR) {
-    throw new Error(
-      `[file-sandbox] refusing to start session ${cfg.sessionId}: missing SESSION_DATA_DIR`,
-    );
-  }
-  const fullIsolationCoversCredentials = !riffRemoteBackend && (
-    (process.platform === 'darwin' && (willReadIsolate || willWriteSandbox))
-    || (process.platform === 'linux' && wantsFileSandbox)
-  );
+  const sandboxRequested = !riffRemoteBackend
+    && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  const fullIsolationCoversCredentials = sandboxRequested;
   let credentialMechanismAvailable = true;
   let credentialMechanismExecutable: string | undefined;
   if (mandatoryCredentialIsolation && !riffRemoteBackend && !fullIsolationCoversCredentials) {
@@ -6093,18 +6020,25 @@ async function spawnCli(
   const credentialOnlySeatbelt = credentialIsolationGate.mode === 'seatbelt';
   const credentialOnlyBwrap = credentialIsolationGate.mode === 'bwrap';
   const appliedIsolationCapabilities: IsolationCapability[] = [];
-  if (credentialBoundaryActive
-    || willReadIsolate
-    || (process.platform === 'linux' && wantsFileSandbox)) {
+  if (credentialBoundaryActive || sandboxRequested) {
     appliedIsolationCapabilities.push('credential');
   }
-  if (willReadIsolate) appliedIsolationCapabilities.push('read');
-  if (willWriteSandbox || (process.platform === 'linux' && wantsFileSandbox)) {
-    appliedIsolationCapabilities.push('write');
-  }
+  if (sandboxRequested) appliedIsolationCapabilities.push('read', 'write');
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(defaultBotmuxHome, 'data');
+  // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it keep
+  // their CLI data (transcripts/memory/auth) in their own BOT_HOME via
+  // CLAUDE_CONFIG_DIR/CODEX_HOME — under deny-by-default the global ~/.claude|
+  // ~/.codex are simply not exposed. Best-effort: a non-supporting adapter
+  // keeps its REAL data dirs instead, which the policy exposes readWrite (the
+  // sandbox itself still applies). Decided EARLY so every JSONL/bridge/resume
+  // path below already targets the right dir. wrapperCli strips spawn args, so
+  // the redirect (and its env) can't be guaranteed there → not redirected.
+  const willRedirectCliData = sandboxRequested
+    && cliAdapter.supportsReadIsolation === true
+    && !cfg.wrapperCli
+    && !!process.env.SESSION_DATA_DIR;
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -6122,7 +6056,7 @@ async function spawnCli(
   }
   let isolationBotHome: string | undefined;
   let isolatedCodexHome: string | undefined;
-  if (willReadIsolate) {
+  if (willRedirectCliData) {
     isolationBotHome = ownBotHome!;
     const isClaudeFam = !!claudeDataDir;
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
@@ -6178,11 +6112,11 @@ async function spawnCli(
   // survive a daemon restart still running a CLI that may NOT be isolated (e.g.
   // spawned before isolation was enabled, or by an old build). Isolation is only
   // injectable at spawn time, so reattaching such a pane would silently run
-  // unisolated. We stamp a versioned policy marker when we spawn an isolated
-  // pane; if an existing pane was not spawned under the current policy, kill it
-  // so the probe below sees no pane and we cold-spawn fresh isolated. A current-
-  // policy pane survives daemon restarts and suspend→resume safely because the
-  // confinement remains attached to the live process.
+  // unisolated. We stamp a boot-id marker when we spawn an isolated pane; if this
+  // isolated bot's existing pane is NOT stamped by THIS daemon lifetime, kill it
+  // so the probe below sees no pane and we cold-spawn fresh isolated. A pane from
+  // this lifetime (suspend→resume) keeps its marker → reattaches normally (it is
+  // still the isolated process). This lets isolated bots use tmux/zellij/herdr.
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
     const paneLive = effectiveBackendType === 'tmux'
       ? TmuxBackend.hasSession(persistentSessionName)
@@ -6430,42 +6364,14 @@ async function spawnCli(
   lastSpawnDeferInitialPrompt = deferInitialPrompt;
   kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
   kiroSessionIdCaptureBuffer = '';
-  // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
-  // already fail-closed above — reaching here with willReadIsolate means it is
-  // enforceable). The worker is on the host (NOT sandboxed), so it holds the
-  // secret; only the spawned CLI child is confined. A reattach that reaches here
-  // is safe: the stale-pane guard above already killed any persistent pane not
-  // stamped as isolated, so `willReattachPersistent` can now only be true for a
-  // pane spawned isolated (still the confined process).
-  let readIsolationCtx: V2IsolationContext | undefined;
-  if (willReadIsolate) {
-    const sessionDataDir = process.env.SESSION_DATA_DIR!;
-    readIsolationCtx = {
-      homeDir: homedir(),
-      botmuxHome: dirname(sessionDataDir),
-      defaultBotmuxHome: join(homedir(), '.botmux'),
-      sessionDataDir,
-      currentAppId: cfg.larkAppId,
-      currentSessionId: cfg.sessionId,
-      extraDenyPaths: cfg.readDenyExtraPaths,
-    };
-    readIsolationOriginCapabilityFile = process.platform === 'darwin'
-      ? managedOriginCapabilityPath(sessionDataDir, cfg.sessionId)
-      : null;
-    // Replace any legacy child-planted symlink before Seatbelt canonicalizes
-    // carve-outs. A failure is fatal: spawning with a missing/ambiguous
-    // capability transport would either break all IPC or reopen an attacker-
-    // selected realpath in the generated profile.
-    if (readIsolationOriginCapabilityFile) {
-      publishSandboxRelayCapability({ failClosed: true });
-    }
-    // Write this bot's OWN send-credential into its BOT_HOME (the same per-bot
-    // private storage as its CLI data; siblings' BOT_HOMEs are whole-denied).
-    // `botmux send` reads the secret from here instead of bots.json — so the
-    // secret never travels via env/argv (no cross-bot `ps aux` leak) and the CLI
-    // never needs to escape the sandbox.
+  // Sandboxed sessions: write this bot's OWN send-credential into its BOT_HOME.
+  // `botmux send` reads the secret from here instead of bots.json (which
+  // deny-by-default never exposes) — the secret never travels via env/argv (no
+  // cross-bot `ps aux` leak) and the CLI never needs to escape the sandbox.
+  // The worker itself runs on the host (NOT sandboxed) and keeps full access.
+  if (sandboxRequested && process.env.SESSION_DATA_DIR) {
     try {
-      const credPath = sendCredFilePath(sessionDataDir, cfg.larkAppId);
+      const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
       writeFileSync(
         credPath,
@@ -6473,36 +6379,8 @@ async function spawnCli(
         { mode: 0o600 },
       );
     } catch (e) {
-      log(`[read-isolation] WARN could not write send-cred file: ${(e as Error).message}`);
+      log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
     }
-  }
-  // macOS write-sandbox rules (pure): the writable-zone allow-list + crown-jewel
-  // re-denies. Realpath'd + emitted into the Seatbelt profile at the spawn site.
-  let writeSandboxRules: {
-    allowWritePaths: string[];
-    allowWriteRegexes: string[];
-    denyWritePaths: string[];
-    denyWriteRegexes: string[];
-  } | undefined;
-  if (willWriteSandbox && process.env.SESSION_DATA_DIR) {
-    const sessionDataDir = process.env.SESSION_DATA_DIR;
-    // Regex rules cannot be realpath'd after construction, so build their home
-    // prefix from the canonical path up front (Seatbelt matches canonical paths).
-    const canonicalSandboxPath = (path: string) => {
-      try { return realpathSync(path); } catch { return path; }
-    };
-    const sandboxHome = canonicalSandboxPath(homedir());
-    writeSandboxRules = buildWriteSandboxRules({
-      homeDir: sandboxHome,
-      botmuxHome: canonicalSandboxPath(dirname(sessionDataDir)),
-      defaultBotmuxHome: canonicalSandboxPath(join(homedir(), '.botmux')),
-      sessionDataDir: canonicalSandboxPath(sessionDataDir),
-      workingDir: cfg.workingDir,
-      currentAppId: cfg.larkAppId,
-      // TMPDIR on macOS resolves under /private/var/folders (already allowed), but
-      // pass it explicitly so a customized TMPDIR is covered too.
-      extraWritePaths: process.env.TMPDIR ? [process.env.TMPDIR] : [],
-    });
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
@@ -6517,12 +6395,7 @@ async function spawnCli(
     model: ttadkGateway ? undefined : cfg.model,
     disableCliBypass: cfg.disableCliBypass === true,
     skillPluginDir: cfg.skillPluginDir,
-    readIsolation: willReadIsolate,
-    // Set (as a pair) by the init handler when hybrid RPC input is engaged;
-    // makes buildArgs launch `codex --remote <ws> resume <thread>` instead of
-    // the normal paste-mode codex. Undefined for every other bot/CLI.
-    remoteWsUrl,
-    remoteThreadId,
+    readIsolation: willRedirectCliData,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -6624,13 +6497,17 @@ async function spawnCli(
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  // Session owner under the standard BOTMUX_* name (the riff backend already
-  // exposes it; `__OWNER_OPEN_ID` stays for back-compat). Custom CLI wrappers
-  // use it for per-user permission isolation. Advisory identity only — botmux's
-  // own authz paths (v3 command authority, host.ts) ignore env owner values and
-  // resolve the current-turn caller from turn provenance instead.
-  if (cfg.ownerOpenId) childEnv.BOTMUX_OWNER_OPEN_ID = cfg.ownerOpenId;
-  else delete childEnv.BOTMUX_OWNER_OPEN_ID;
+  // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
+  // send` renders the role-name footer without reading bots.json (deny-by-
+  // default → EPERM → role footer would silently fall back to the default
+  // [botmux] label). resolveBrandLabel honours this env first (gated on the
+  // own appId). Only set the key when a brandLabel is configured (present-but-
+  // empty '' = suppress is preserved; unset key → the CLI falls through). It is
+  // a cosmetic markdown template, not a credential, so env-passing is safe.
+  {
+    const bl = resolveBrandLabel(cfg.larkAppId);
+    if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
+  }
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-
   // written cred FILE in its BOT_HOME (send-cred.json, see sendCredFilePath) located
   // via the BOTMUX_LARK_APP_ID above — NOT from the env. The secret is deliberately kept OUT
@@ -6699,239 +6576,14 @@ async function spawnCli(
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
-  // Read isolation (macOS): wrap the whole CLI process in a Seatbelt sandbox that
-  // denies reads of the sensitive paths (blocklist). The CLI bypasses its OWN
-  // sandbox (see adapter) so the outer wrapper is the sole enforcer. DARWIN ONLY —
-  // on Linux read isolation is enforced by bwrap masks fed into the overlay sandbox
-  // below (see readIsoLinuxMasks), NOT sandbox-exec (which doesn't exist there).
-  if (process.platform === 'darwin' && (readIsolationCtx || writeSandboxRules)) {
-    // Seatbelt matches CANONICAL paths (it resolves symlinks), so realpath every
-    // deny/allow before emitting the profile — otherwise a sensitive root reached
-    // through a symlinked prefix (e.g. a symlinked home / SESSION_DATA_DIR) would
-    // silently fail-open (the /tmp→/private/tmp class of miss). realpath-if-exists:
-    // a non-existent path has nothing to read, so its literal form is harmless.
-    // The ROOT dirs are canonicalized FIRST (profileCtx) so the regex patterns —
-    // which can't be realpath'd as a result — are built on canonical prefixes too.
-    const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
-    // READ rules — only when read isolation is on. v2 HYBRID model: whole-deny
-    // ~/.claude|~/.codex (F1 fix — own CLI data is redirected into BOT_HOME,
-    // readable) + surgical-deny only the cross-bot-SENSITIVE parts of the otherwise-
-    // readable ~/.botmux + system creds; the own slice is re-opened via carve-outs.
-    // For a WRITE-sandbox-only session these stay empty → reads wide open (Linux parity).
-    let denyPaths: string[] = [], denyRegexes: string[] = [], allowPaths: string[] = [],
-        finalDenyPaths: string[] = [], traverseDirs: string[] = [];
-    let protectedWrites: {
-      denyWritePaths: string[];
-      denyWriteRegexes: string[];
-      denyWriteLiterals: string[];
-    } | undefined;
-    if (readIsolationCtx) {
-      const profileCtx: V2IsolationContext = {
-        ...readIsolationCtx,
-        homeDir: canonical(readIsolationCtx.homeDir),
-        botmuxHome: canonical(readIsolationCtx.botmuxHome),
-        defaultBotmuxHome: canonical(
-          readIsolationCtx.defaultBotmuxHome ?? join(readIsolationCtx.homeDir, '.botmux'),
-        ),
-        sessionDataDir: canonical(readIsolationCtx.sessionDataDir),
-      };
-      denyPaths = buildV2DenyPaths(profileCtx).map(canonical);
-      denyRegexes = buildV2DenyRegexes(profileCtx);
-      const carve = buildV2CarveOuts(profileCtx);
-      const capabilityCarvePath = managedOriginCapabilityPath(
-        profileCtx.sessionDataDir,
-        profileCtx.currentSessionId,
-      );
-      allowPaths = [
-        // Never realpath the capability leaf: another legacy sandbox can race
-        // a symlink into that shared host directory while multiple persistent
-        // sessions recover. Keeping the exact path may fail closed on a raced
-        // symlink, but can never turn its target into a Seatbelt allow rule.
-        ...carve.allowPaths.map(path => path === capabilityCarvePath ? path : canonical(path)),
-        ...buildCliExecutableReadCarveOuts({
-          homeDir: profileCtx.homeDir,
-          cliId: cliAdapter.id,
-          resolvedBin: canonical(cliAdapter.resolvedBin),
-        }),
-        // buildV2DenyPaths masks the shared pi-initial-prompts root. Re-open
-        // only this session's private child directory for Pi's @file/extension.
-        ...piInitialPromptReadonlyRoots.map(canonical),
-      ];
-      finalDenyPaths = carve.finalDenyPaths.map(canonical);
-      traverseDirs = carve.traverseDirs.map(canonical);
-      protectedWrites = buildReadIsolationProtectedWriteRules(profileCtx, {
-        // Keep lexical roots as well as their canonical targets. Canonical
-        // rules protect contents reached through a symlink; lexical literals
-        // prevent replacing the symlink/root directory entry itself.
-        dashboardRoots: [
-          readIsolationCtx.defaultBotmuxHome ?? join(readIsolationCtx.homeDir, '.botmux'),
-          readIsolationCtx.botmuxHome,
-        ],
-        sessionDataDirs: [readIsolationCtx.sessionDataDir],
-      });
-    }
-    if (credentialBoundaryActive) {
-      const credentialRules = buildCredentialIsolationRules({
-        homeDir: canonical(hostHomeDir),
-        botmuxHome: canonical(configuredBotmuxHome),
-        defaultBotmuxHome: canonical(defaultBotmuxHome),
-      });
-      denyPaths = [...new Set([...denyPaths, ...credentialRules.denyPaths.map(canonical)])];
-      denyRegexes = [...new Set([...denyRegexes, ...credentialRules.denyRegexes])];
-      protectedWrites = {
-        denyWritePaths: [...new Set([
-          ...(protectedWrites?.denyWritePaths ?? []),
-          ...credentialRules.denyWritePaths.map(canonical),
-        ])],
-        denyWriteRegexes: [...new Set([
-          ...(protectedWrites?.denyWriteRegexes ?? []),
-          ...credentialRules.denyWriteRegexes,
-        ])],
-        denyWriteLiterals: [...new Set([
-          ...(protectedWrites?.denyWriteLiterals ?? []),
-          ...credentialRules.denyWriteLiterals.map(canonical),
-          defaultBotmuxHome,
-          configuredBotmuxHome,
-        ])],
-      };
-    }
-    if (mcpRuntimeManifest) {
-      finalDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
-        mcpRuntimeManifest,
-        config.session.dataDir,
-      ).map(canonical));
-    }
-    // Every isolated macOS CLI is denied access to all same-UID Gateway socket
-    // directories. A session with its own Gateway gets one narrow, later READ
-    // carve-out for its token; writes stay denied so the CLI cannot unlink or
-    // replace even its own worker-managed socket. Sessions without plugin MCP
-    // state get no read carve-out at all.
-    const gatewaySocketRoot = canonical(
-      sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
-    );
-    const gatewaySocketRegex = sessionMcpGatewayPathRegex(gatewaySocketRoot);
-    denyRegexes.push(gatewaySocketRegex);
-    if (sessionMcpGatewayHost) allowPaths.push(canonical(sessionMcpGatewayHost.socketDir));
-    protectedWrites = {
-      denyWritePaths: protectedWrites?.denyWritePaths ?? [],
-      denyWriteRegexes: [...(protectedWrites?.denyWriteRegexes ?? []), gatewaySocketRegex],
-      denyWriteLiterals: protectedWrites?.denyWriteLiterals ?? [],
-    };
-    // WRITE rules — the macOS file-sandbox (Linux-bwrap twin). Realpath the writable
-    // zones + crown-jewel re-denies for the same symlink-safety reason as reads.
-    const writeRules = writeSandboxRules
-      ? {
-          allowWritePaths: writeSandboxRules.allowWritePaths.map(canonical),
-          allowWriteRegexes: writeSandboxRules.allowWriteRegexes,
-          denyWritePaths: writeSandboxRules.denyWritePaths.map(canonical),
-          denyWriteRegexes: writeSandboxRules.denyWriteRegexes,
-        }
-      : undefined;
-    if (!locateOnPath('sandbox-exec')) {
-      throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
-    }
-    const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
-    mkdirSync(profileDir, { recursive: true });
-    const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
-    replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(
-      denyPaths,
-      allowPaths,
-      finalDenyPaths,
-      traverseDirs,
-      denyRegexes,
-      writeRules,
-      protectedWrites,
-    ));
-    seatbeltProfilePath = profilePath;
-    spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
-    spawnBin = credentialMechanismExecutable ?? '/usr/bin/sandbox-exec';
-    log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (read-isolation=${!!readIsolationCtx}, write-sandbox=${!!writeRules}): sandbox-exec -f ${profilePath}`);
-  }
-  // Fresh sandboxed spawn on a persistent backend: stamp the pane with this daemon's
-  // policy version + boot id so a later suspend→resume reattach can be trusted (see the stale-pane
-  // guard above). Applies to read-isolation AND write-sandbox panes (both carry the
-  // Seatbelt confinement on the live process). pty needs no marker (never reattached).
-  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
-    try {
-      const markerDir = join(isolationRuntimeDataDir, 'read-isolation');
-      mkdirSync(markerDir, { recursive: true });
-      replaceManagedOriginCapabilityFile(
-        join(markerDir, `${cfg.sessionId}.boot`),
-        isolationPaneMarkerContent(cfg.daemonBootId ?? '', appliedIsolationCapabilities),
-      );
-    } catch { /* non-fatal: worst case a same-lifetime reattach cold-spawns instead */ }
-  }
-  // Sandbox wraps the spawned binary in bwrap. Works for pty (PtyBackend runs
-  // bwrap directly) and tmux (the tmux pane's command becomes `bwrap … -- cli`);
-  // env is carried via bwrap --setenv (see prepareSandbox), not the backend.
-  // Linux ONLY — on macOS the same `sandbox: true` is enforced by the Seatbelt
-  // write-sandbox above (willWriteSandbox), so bwrap must not run here.
-  //
-  // riff bypass: there is NO local CLI process to wrap — execution happens in
-  // riff's own remote sandbox, and the fail-safe "backend not sandboxable"
-  // hard error below would otherwise brick every sandbox-enabled bot the
-  // moment it switches to riff (the dashboard agent switch clears only
-  // readIsolation, not `sandbox`). Bypassing is safe (nothing local runs);
-  // log it so the state is visible.
-  if (cfg.sandbox === true && effectiveBackendType === 'riff') {
-    log('Sandbox flag set but backend is riff (remote sandbox, no local process) — local file sandbox bypassed');
-  }
-  const sandboxOn = localSandboxApplies(process.platform, effectiveBackendType) && (cfg.sandbox === true || sandboxEnabled());
-  // Linux read isolation: build the bwrap MASK set (the Seatbelt read-deny twin) and
-  // fold it into the SAME overlay sandbox plan below. Enumerate sibling bots from the
-  // FILESYSTEM (the worker runs unsandboxed on the host; bots.json may be denied) —
-  // spawn-time-static, so a bot added after this spawn is covered on its next cold
-  // start (the accepted Linux tradeoff vs the macOS regex). Only when read isolation
-  // is enforceable here (willReadIsolate ⇒ readIsolationCtx set) AND on Linux.
-  let readIsoLinuxMasks: { hidePaths: string[]; ownReadWritePaths: string[]; ownReadOnlyPaths: string[] } | undefined;
-  if (readIsolationCtx && process.platform === 'linux') {
-    const canon = (p: string) => { try { return realpathSync(p); } catch { return p; } };
-    // Canonicalize the root prefixes FIRST so every derived mask path is symlink-safe
-    // (bwrap masks resolve symlinks — a symlinked home/data root would else fail-open).
-    const ctxReal: V2IsolationContext = {
-      ...readIsolationCtx,
-      homeDir: canon(readIsolationCtx.homeDir),
-      botmuxHome: canon(readIsolationCtx.botmuxHome),
-      defaultBotmuxHome: canon(
-        readIsolationCtx.defaultBotmuxHome ?? join(readIsolationCtx.homeDir, '.botmux'),
-      ),
-      sessionDataDir: canon(readIsolationCtx.sessionDataDir),
-    };
-    const ids = new Set<string>();
-    const scan = (dir: string, pick: (name: string) => string | null) => {
-      try { for (const name of readdirSync(dir)) { const id = pick(name); if (id) ids.add(id); } } catch { /* dir absent → no siblings there */ }
-    };
-    scan(join(ctxReal.botmuxHome, 'bots'), n => n);                                    // sibling BOT_HOME dirs
-    scan(join(ctxReal.homeDir, '.lark-cli-bots'), n => n);                             // sibling lark configs
-    scan(ctxReal.sessionDataDir, n => { const m = /^sessions-(.+)\.json$/.exec(n); return m ? m[1] : null; });
-    ids.delete(cfg.larkAppId);                                                          // never mask own
-    let sidecars: string[] = [];
-    try { sidecars = readdirSync(ctxReal.botmuxHome).filter(n => n.startsWith('bots.json.')).map(n => join(ctxReal.botmuxHome, n)); } catch { /* */ }
-    const m = buildLinuxReadIsolationMasks({ ctx: ctxReal, siblingAppIds: [...ids], botsJsonSidecars: sidecars });
-    // Same execvp carve-out as macOS (Codex 342a3e1c): a standalone Codex whose
-    // binary lives UNDER the now-masked ~/.codex would fail execvp. Re-expose ONLY
-    // its executable package tree (read-only, after the masks) — auth/config/sessions
-    // stay masked. No-op for npm/system installs (binary not under ~/.codex) + non-codex.
-    const execCarveOuts = buildCliExecutableReadCarveOuts({
-      homeDir: ctxReal.homeDir,
-      cliId: cliAdapter.id,
-      resolvedBin: canon(cliAdapter.resolvedBin),
-    }).map(canon);
-    readIsoLinuxMasks = {
-      hidePaths: m.hidePaths.map(canon),
-      ownReadWritePaths: m.ownReadWritePaths.map(canon),
-      ownReadOnlyPaths: [...m.ownReadOnlyPaths.map(canon), ...execCarveOuts],
-    };
-    log(`[read-isolation] linux bwrap masks: ${m.hidePaths.length} hide, ${[...ids].length} siblings enumerated${execCarveOuts.length ? ', +codex-standalone exec carve' : ''}`);
-  }
-  if (sandboxOn) {
-    // FAIL-SAFE (not fail-open): when the sandbox is requested, a missing
-    // precondition (no SESSION_DATA_DIR, or a backend we can't wrap) must be a
-    // HARD ERROR, never a silent skip — otherwise the CLI would spawn UNSANDBOXED
-    // with full host write access and no log, the exact opposite of the
-    // oncall-untrusted-agent invariant. In normal operation worker-pool sets
-    // SESSION_DATA_DIR and the backend is pty/tmux, so this never trips.
+  // ── UNIFIED file sandbox (fs-policy): ONE policy source, BOTH platforms. ──
+  // Three-tier deny-by-default whitelist compiled to Seatbelt (darwin) or bwrap
+  // (linux). Cross-bot read isolation is inherent (siblings' data simply isn't
+  // exposed) — no enumeration, no deny-list to keep in sync.
+  if (sandboxRequested) {
     const dataDir = process.env.SESSION_DATA_DIR;
+    // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
+    // must be a HARD ERROR, never a silent unconfined run.
     if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
       const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn to avoid an unsandboxed run`;
       log(msg);
@@ -6942,96 +6594,280 @@ async function spawnCli(
       log(msg);
       throw new Error(msg);
     }
-    try {
-      if (willReattachPersistent) {
-        // Daemon-restart reattach to a persistent (tmux/herdr/zellij) pane whose
-        // bwrap'd CLI is STILL ALIVE. backend.spawn() ignores bin/args here and
-        // just re-attaches, and the live CLI is bound to its own namespace-pinned
-        // overlay — so we must NOT unmount/remount (prepareSandbox would leave a
-        // duplicate host-side overlay the CLI isn't using). We only re-wire the
-        // outbox watcher (so the live CLI's `botmux send` keeps being serviced)
-        // and the cleanup ref (so close/exit reclaims the residue). No re-prep.
-        const att = attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir });
-        if (att) {
-          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-          if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
-          sandboxCleanup = att.cleanup;
-          sandboxRelayOutbox = att.outbox;
-          sandboxStopWatcher = startOutboxWatcher(att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend });
-          publishSandboxRelayCapability();
-          log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox} (no remount)`);
-        } else {
-          // No sandbox tree on disk for a session we're reattaching to: the
-          // pane's CLI may be unsandboxed (sandbox enabled after it spawned). Do
-          // NOT remount under a live CLI; just continue the reattach as-is.
-          log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane without re-prep`);
-        }
-      } else {
-        const sbx = prepareSandbox({
-          enabled: sandboxOn,
-          cliId: cfg.cliId,
-          sessionId: cfg.sessionId,
-          sourceWorkingDir: cfg.workingDir,
-          dataDir,
-          cliBin: cliAdapter.resolvedBin,
-          cliArgs: args,
-          // Read-isolation masks (Linux) fold into the same plan: hide the cross-bot
-          // sensitive set, keep the own BOT_HOME real+writable (authPaths), and re-
-          // expose the own attachments bucket read-only after the masks (readonlyRoots).
-          hidePaths: [...(cfg.sandboxHidePaths ?? []), ...(readIsoLinuxMasks?.hidePaths ?? [])],
-          authPaths: [...(cliAdapter.authPaths ?? [])],
-          // BOTMUX_HOME is credential-masked wholesale. Re-open only this
-          // bot's daemon-derived private CLI home after that parent mask, then
-          // re-mask its send credential so an untrusted receiver cannot bypass
-          // the host-authorized relay with a direct Lark API call.
-          trustedWritablePaths: readIsoLinuxMasks?.ownReadWritePaths ?? [],
-          finalHidePaths: readIsoLinuxMasks
-            ? [sendCredFilePath(dataDir, cfg.larkAppId)]
-            : [],
-          extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
-          readonlyRoots: [
-            ...(cfg.skillReadonlyRoots ?? []),
-            ...piInitialPromptReadonlyRoots,
-            ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
-          ],
-          mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
-          trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
-          userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
-          net: cfg.sandboxNetwork !== false,
-        });
-        if (sbx) {
-          spawnBin = sbx.bin;
-          spawnArgs = sbx.args;
-          // In the overlay model the child still chdirs to projectMount (via bwrap
-          // --chdir), so spawnCwd stays the real workingDir; the overlay merged dir
-          // is bound there. sbx.workDir is the UPPER changeset (for landing), NOT a cwd.
-          Object.assign(childEnv, sbx.env);
-          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-          if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
-          sandboxCleanup = sbx.cleanup;
-          sandboxRelayOutbox = sbx.outbox;
-          // session-id is FORCED here so a relayed send can't target another session.
-          sandboxStopWatcher = startOutboxWatcher(sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend });
-          publishSandboxRelayCapability();
-          log(`Sandbox ON (${cfg.cliId}): upper=${sbx.workDir} outbox=${sbx.outbox}`);
-        } else {
-          // Sandbox was requested but prepareSandbox returned null (a required
-          // overlay mount failed, or non-Linux). Fail safe: do NOT silently run
-          // unsandboxed — surface a hard error so the session doesn't leak.
-          log(`Sandbox ENABLED but prepare returned null (mount failed / unsupported) — aborting spawn to avoid an unsandboxed run`);
-          throw new Error('sandbox requested but could not be established');
-        }
+    // Both engines match CANONICAL paths (Seatbelt resolves symlinks, bwrap
+    // resolves mount sources) — realpath everything, or a symlinked prefix
+    // (the /tmp→/private/tmp class) silently fail-opens.
+    const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+    const sandboxHome = canonical(homedir());
+    const expandTilde = (raw: string) => raw.replace(/^~(?=\/|$)/, sandboxHome);
+    const keepExisting = (paths: (string | undefined)[]) => {
+      const out: string[] = [];
+      for (const raw of paths) {
+        if (!raw || typeof raw !== 'string') continue;
+        const p = expandTilde(raw);
+        try { if (existsSync(p)) out.push(canonical(p)); } catch { /* */ }
       }
-    } catch (err: any) {
-      log(`Sandbox prepare failed (${err.message}) — aborting (sandbox is a hard requirement when enabled)`);
-      throw err;
+      return out;
+    };
+
+    // User three-tier lists: the new sandboxPaths field, or a pre-migration
+    // session/config's legacy fields mapped through the SAME lossless mapping
+    // the startup migration uses.
+    const legacyMapped = migrateLegacySandboxFields({
+      sandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation,
+      sandboxReadonlyPaths: cfg.sandboxReadonlyPaths,
+      sandboxHidePaths: cfg.sandboxHidePaths,
+      readDenyExtraPaths: cfg.readDenyExtraPaths,
+      sandboxPaths: cfg.sandboxPaths,
+    });
+    const userLists = cfg.sandboxPaths ?? legacyMapped?.sandboxPaths;
+    const droppedUser: string[] = [];
+    const resolveUser = (paths?: readonly string[]) => {
+      const out: string[] = [];
+      for (const raw of paths ?? []) {
+        if (!raw || typeof raw !== 'string') continue;
+        const p = expandTilde(raw);
+        if (existsSync(p)) out.push(canonical(p));
+        else droppedUser.push(raw);
+      }
+      return out;
+    };
+    // deny paths are NOT existence-filtered on EITHER platform: a deny must guard
+    // a path that does not exist YET (else the agent creates it under an exposed
+    // rw parent and the deny is bypassed — codex review finding). Seatbelt keeps
+    // the rule literally; bwrap masks it with a tmpfs the mount creates (writes
+    // land in the ephemeral tmpfs, the real path is never created).
+    const resolveDeny = (paths?: readonly string[]) =>
+      (paths ?? []).filter((p): p is string => typeof p === 'string' && !!p).map(p => canonical(expandTilde(p)));
+    const userPaths = {
+      readWrite: resolveUser(userLists?.readWrite),
+      readOnly: resolveUser(userLists?.readOnly),
+      deny: resolveDeny(userLists?.deny),
+    };
+    if (droppedUser.length) log(`[sandbox] sandboxPaths entries dropped (path not found): ${droppedUser.join(', ')}`);
+
+    // Every executable spawned INSIDE the sandbox must be readable: the CLI
+    // binary's dir, the daemon's own node (fnm farms under /run land here),
+    // adapter second-stage bins, plus the standalone-codex package tree.
+    const execDirs = [cliAdapter.resolvedBin, process.execPath, ...(cliAdapter.sandboxExtraExecPaths?.() ?? [])]
+      .filter((p): p is string => typeof p === 'string' && !!p)
+      .map(p => dirname(canonical(p)));
+    const execCarve = buildCliExecutableReadCarveOuts({
+      homeDir: sandboxHome,
+      cliId: cliAdapter.id,
+      resolvedBin: canonical(cliAdapter.resolvedBin),
+    }).map(canonical);
+
+    // Linux relay outbox (created by prepareDirectSandbox; in the policy so the
+    // compiled plan binds it read-write).
+    const outbox = process.platform === 'linux'
+      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
+      : undefined;
+
+    // The botmux install/checkout root (dir containing dist/ + node_modules).
+    // This module compiles to <checkout>/dist/worker.js, so `../../` from here is
+    // the checkout root. Exposed readOnly so `botmux` + claude hooks can exec
+    // `node <checkout>/dist/cli.js`.
+    const botmuxInstallRoot = canonical(dirname(dirname(fileURLToPath(import.meta.url))));
+
+    // Pre-create the OWN writable dirs the sandboxed CLI creates on demand, so
+    // they EXIST at spawn and survive the existence-filter below (bwrap can't
+    // bind a nonexistent source; a dropped rule → the CLI's mkdir/write EPERMs).
+    //  - data/turn-sends: `botmux send` appends its <sid>.jsonl dedup marker
+    //  - data/attachments/<self>: `botmux quoted`/downloadResources writes here
+    // (BOT_HOME + outbox are created elsewhere.) Best-effort — a failure just
+    // reverts to the pre-existing drop behaviour.
+    try { mkdirSync(join(dataDir, 'turn-sends'), { recursive: true }); } catch { /* */ }
+    try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }
+    // schedules.json is a shared RMW store (`botmux schedule`); pre-create as an
+    // empty map if absent (same content schedule-store itself writes) so a fresh
+    // install's first in-sandbox `schedule add` can bind+write it on bwrap too.
+    try { const sf = join(dataDir, 'schedules.json'); if (!existsSync(sf)) writeFileSync(sf, '{}'); } catch { /* */ }
+
+    const mandatoryDenyPaths: string[] = [];
+    const mandatoryDenyRegexes: string[] = [];
+    const mandatoryReadOnlyPaths: string[] = [];
+    readIsolationOriginCapabilityFile = process.platform === 'darwin'
+      ? managedOriginCapabilityPath(dataDir, cfg.sessionId)
+      : null;
+    // The macOS child reads the per-session rotating capability directly.
+    // Materialize it before the policy's existence filter, and make the exact
+    // file a mandatory read-only carve-out that user rules cannot shadow.
+    if (readIsolationOriginCapabilityFile) {
+      publishSandboxRelayCapability({ failClosed: true });
+      mandatoryReadOnlyPaths.push(readIsolationOriginCapabilityFile);
     }
+    if (credentialBoundaryActive) {
+      const credentialRules = buildCredentialIsolationRules({
+        homeDir: sandboxHome,
+        botmuxHome: canonical(configuredBotmuxHome),
+        defaultBotmuxHome: canonical(defaultBotmuxHome),
+      });
+      mandatoryDenyPaths.push(...credentialRules.denyPaths.map(canonical));
+      mandatoryDenyRegexes.push(...credentialRules.denyRegexes);
+      // Materialize every existing atomic sidecar as a concrete Linux mask.
+      // Seatbelt additionally keeps the regexes above for files created later.
+      for (const root of [...new Set([defaultBotmuxHome, configuredBotmuxHome])]) {
+        try {
+          for (const name of readdirSync(root)) {
+            if (isCredentialIsolationReservedBasename(name)) {
+              mandatoryDenyPaths.push(canonical(join(root, name)));
+            }
+          }
+        } catch { /* absent authority root */ }
+      }
+    }
+    if (mcpRuntimeManifest) {
+      mandatoryDenyPaths.push(...sessionMcpRuntimeHostOnlyPaths(
+        mcpRuntimeManifest,
+        config.session.dataDir,
+      ).map(canonical));
+    }
+    if (process.platform === 'darwin') {
+      const gatewaySocketRoot = canonical(
+        sessionMcpGatewayHost ? dirname(sessionMcpGatewayHost.socketDir) : tmpdir(),
+      );
+      mandatoryDenyRegexes.push(sessionMcpGatewayPathRegex(gatewaySocketRoot));
+      if (sessionMcpGatewayHost) {
+        mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir));
+      }
+    }
+
+    const policy = buildFsPolicy({
+      platform: process.platform as 'darwin' | 'linux',
+      homeDir: sandboxHome,
+      botmuxHome: canonical(dirname(dataDir)),
+      sessionDataDir: canonical(dataDir),
+      workingDir: canonical(cfg.workingDir),
+      currentAppId: cfg.larkAppId,
+      botHome: canonical(ownBotHome!),
+      redirectedCliData: willRedirectCliData,
+      cliDataPaths: willRedirectCliData ? undefined : keepExisting([
+        cliAdapter.claudeDataDir,
+        claudeDataDir ? `${sandboxHome}/.claude.json` : undefined,
+        claudeDataDir ? `${sandboxHome}/.claude.json.lock` : undefined,
+        claudeDataDir ? `${sandboxHome}/.claude.lock` : undefined,
+        claudeDataDir ? `${sandboxHome}/.local/state/claude` : undefined,
+      ]),
+      authPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+      execPaths: keepExisting([...execDirs, ...execCarve]),
+      readonlyRoots: keepExisting([
+        ...(cfg.skillReadonlyRoots ?? []),
+        ...piInitialPromptReadonlyRoots,
+      ]),
+      botmuxInstallRoot,
+      outbox,
+      extraWritePaths: keepExisting([process.env.TMPDIR]),
+      userPaths,
+      mandatoryDenyPaths,
+      mandatoryDenyRegexes,
+      mandatoryReadOnlyPaths,
+      net: cfg.sandboxNetwork !== false,
+      // Claude Code saves ~/.claude.json atomically via a PID/random-suffixed
+      // sibling — only relevant when the data dir is NOT redirected to BOT_HOME.
+      writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
+        ? [`^${sandboxHome.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.claude\\.json\\.tmp\\.[^/]+$`]
+        : [],
+    });
+    // Existence-filter only the ALLOW rules (baseline entries are candidates,
+    // not guarantees): a non-existent allow path has nothing to expose, and
+    // bwrap cannot bind a non-existent SOURCE. DENY rules are kept regardless —
+    // they must guard a path created later in the session (Seatbelt keeps the
+    // literal rule; bwrap masks with a tmpfs whose mountpoint the mount creates).
+    policy.rules = policy.rules.filter(r => {
+      if (r.access === 'deny') return true;
+      try { return existsSync(r.path); } catch { return false; }
+    });
+
+    if (process.platform === 'darwin') {
+      if (!locateOnPath('sandbox-exec')) {
+        throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: sandbox-exec not found`);
+      }
+      const profileDir = join(dataDir, 'read-isolation');
+      mkdirSync(profileDir, { recursive: true });
+      const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
+      writeFileSync(profilePath, compileToSeatbelt(policy), { mode: 0o600 });
+      seatbeltProfilePath = profilePath;
+      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      spawnBin = 'sandbox-exec';
+      log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
+    } else if (willReattachPersistent) {
+      // Daemon-restart reattach to a live bwrap'd pane: backend.spawn() ignores
+      // bin/args and just re-attaches. Only re-wire the outbox watcher (so the
+      // live CLI's `botmux send` keeps being serviced) + the cleanup ref. The
+      // direct model has NO mounts — cleanup is a plain rm at close/exit.
+      const att = attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir });
+      if (att) {
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        sandboxCleanup = att.cleanup;
+        sandboxRelayOutbox = att.outbox;
+        sandboxStopWatcher = startOutboxWatcher(
+          att.outbox,
+          childEnv,
+          cfg.sessionId,
+          { authorize: authorizeManagedSend },
+        );
+        publishSandboxRelayCapability();
+        log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
+      } else {
+        log(`Sandbox REATTACH (${cfg.cliId}): no on-disk sandbox tree — reattaching live pane as-is`);
+      }
+    } else {
+      const sbx = prepareDirectSandbox({
+        sessionId: cfg.sessionId,
+        dataDir,
+        policy,
+        chdir: canonical(cfg.workingDir),
+        home: sandboxHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+      });
+      if (!sbx) {
+        // FAIL-SAFE: never silently run unsandboxed.
+        const msg = 'sandbox requested but could not be established (bwrap missing or setup failed) — aborting spawn';
+        log(msg);
+        throw new Error(msg);
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      // session-id is FORCED here so a relayed send can't target another session.
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox,
+        childEnv,
+        cfg.sessionId,
+        { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
+    }
+  }
+  // Fresh sandboxed spawn on a persistent backend: stamp the pane with this
+  // daemon's boot id so a later reattach can be trusted (see the stale-pane
+  // guard above). pty needs no marker (never reattached).
+  if (appliedIsolationCapabilities.length > 0 && persistentSessionName && !willReattachPersistent) {
+    try {
+      const markerDir = join(isolationRuntimeDataDir, 'read-isolation');
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(
+        join(markerDir, `${cfg.sessionId}.boot`),
+        isolationPaneMarkerContent(cfg.daemonBootId ?? '', appliedIsolationCapabilities),
+        { mode: 0o600 },
+      );
+    } catch { /* non-fatal: worst case a same-lifetime reattach cold-spawns instead */ }
   }
 
   // 通用启动前缀（wrapperCli）：把启动命令重写成 `<wrapperCli> <CLI 参数>`（首 token 当
   // bin 走 PATH 解析），无需 wrapper 脚本、跨系统。aiden x claude 形态会剥掉 aiden 拒收的
   // --settings（见 buildWrappedLaunch）。与文件沙盒互斥：沙盒已把命令重写成 bwrap，叠加
-  // 前缀会破坏隔离，故 sandboxOn 时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
+  // 前缀会破坏隔离，故沙盒开启时跳过并告警（网关 + oncall 沙盒本就不是合理组合）。
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // below. Strip any value inherited from the daemon's own env first so a
   // daemon launched under `cjadk feishu` (which exports it) can't leak it via
@@ -7041,8 +6877,8 @@ async function spawnCli(
   delete (childEnv as Record<string, string>).CJADK_INTERACTIVE;
 
   if (cfg.wrapperCli && cfg.wrapperCli.trim()) {
-    if (sandboxOn) {
-      log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with bwrap)`);
+    if (sandboxRequested) {
+      log(`wrapperCli="${cfg.wrapperCli}" ignored: file sandbox enabled and takes precedence (cannot combine launch prefix with the sandbox wrapper)`);
     } else {
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
         ttadkModel: cfg.model,
@@ -7253,7 +7089,7 @@ async function spawnCli(
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
   const startWrapperRealPidResolve = (launcherPid: number): void => {
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxOn || !claudeDataDir) return;
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || !claudeDataDir) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
@@ -7457,7 +7293,7 @@ async function spawnCli(
   const readyHookAvailable = effectiveReadyHookInstall
     ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
     : true; // Hermes emits BOTMUX_READY_COMMAND directly instead of a config hook.
-  const isolatedReadyTransportRequired = sandboxOn || willReadIsolate;
+  const isolatedReadyTransportRequired = sandboxRequested || credentialBoundaryActive;
   const readyPortAvailable = !isolatedReadyTransportRequired
     || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;
   const readyCapabilityAvailable = !isolatedReadyTransportRequired

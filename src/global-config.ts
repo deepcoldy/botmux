@@ -350,7 +350,10 @@ function readRawConfig(): Record<string, unknown> {
     const parsed = JSON.parse(readFileSync(path, 'utf-8'));
     return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {};
   } catch (err: any) {
-    if (!warnedOnce) {
+    // Under the file sandbox config.json is intentionally NOT exposed (it can
+    // hold voice TTS credentials); EPERM/EACCES here is EXPECTED, not a parse
+    // failure — return defaults silently. Only warn on a genuine corrupt-JSON.
+    if (err?.code !== 'EPERM' && err?.code !== 'EACCES' && !warnedOnce) {
       warnedOnce = true;
       // eslint-disable-next-line no-console
       console.warn(`[botmux] Failed to parse ${path}: ${err?.message ?? err}. Ignoring file.`);

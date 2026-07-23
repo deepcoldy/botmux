@@ -9,18 +9,13 @@ import { describe, it, expect } from 'vitest';
 import { localSandboxApplies } from '../src/adapters/backend/sandbox.js';
 
 describe('localSandboxApplies', () => {
-  it('bypasses the local file sandbox for the riff backend on Linux', () => {
-    expect(localSandboxApplies('linux', 'riff')).toBe(false);
+  it('bypasses the local file sandbox for the riff backend (remote sandbox, no local process)', () => {
+    expect(localSandboxApplies('riff')).toBe(false);
   });
 
-  it('keeps the sandbox for local backends on Linux', () => {
-    expect(localSandboxApplies('linux', 'pty')).toBe(true);
-    expect(localSandboxApplies('linux', 'tmux')).toBe(true);
-  });
-
-  it('never applies on macOS (Seatbelt handles sandbox there)', () => {
-    expect(localSandboxApplies('darwin', 'pty')).toBe(false);
-    expect(localSandboxApplies('darwin', 'riff')).toBe(false);
+  it('keeps the sandbox for local backends — fs-policy applies on BOTH platforms now', () => {
+    expect(localSandboxApplies('pty')).toBe(true);
+    expect(localSandboxApplies('tmux')).toBe(true);
   });
 });
 

@@ -54,7 +54,6 @@ import { findConfigField, applyConfigField, coerceConfigValue } from '../service
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
 import { config } from '../config.js';
-import { computeSandboxDiff, applySandboxDiff } from '../services/sandbox-land.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
@@ -1000,28 +999,6 @@ function workingDirForSession(sessionId: string): string | undefined {
   if (ds) return ds.session.workingDir;
   return sessionStore.listSessions().find(s => s.sessionId === sessionId)?.workingDir;
 }
-
-ipcRoute('GET', '/api/sessions/:sessionId/sandbox-diff', (_req, res, params) => {
-  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, localeForBot(cachedLarkAppId));
-  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
-  jsonRes(res, 200, {
-    ok: true, empty: d.empty, files: d.files, insertions: d.insertions, deletions: d.deletions,
-    statText: d.statText, patch: d.patch, workingDir: workingDirForSession(params.sessionId) ?? null,
-  });
-});
-
-ipcRoute('POST', '/api/sessions/:sessionId/sandbox-land/:action', (_req, res, params) => {
-  if (params.action === 'discard') return jsonRes(res, 200, { ok: true, discarded: true });
-  if (params.action !== 'apply') return jsonRes(res, 400, { ok: false, error: 'unknown action' });
-  const locLand = localeForBot(cachedLarkAppId);
-  const wd = workingDirForSession(params.sessionId);
-  if (!wd) return jsonRes(res, 404, { ok: false, error: t('sandbox.workingdir_not_found', undefined, locLand) });
-  const d = computeSandboxDiff(config.session.dataDir, params.sessionId, locLand);
-  if (!d.ok) return jsonRes(res, 200, { ok: false, error: d.error });
-  if (d.empty) return jsonRes(res, 200, { ok: false, error: t('sandbox.no_changes_left', undefined, locLand) });
-  const a = applySandboxDiff(wd, config.session.dataDir, params.sessionId, locLand);
-  jsonRes(res, 200, a.ok ? { ok: true, files: d.files, insertions: d.insertions, deletions: d.deletions, workingDir: wd } : { ok: false, error: a.error });
-});
 
 /**
  * Reactivate a closed session — counterpart to `/close`. Used by both the

@@ -49,6 +49,7 @@ import {
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
+import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -16265,6 +16266,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
   // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
   ensureCjkFontsInstalled();
+
+  // Auto-migrate legacy sandbox fields (readIsolation / sandboxHidePaths /
+  // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
+  // loading, so the parsed configs below already carry the new model. Writes
+  // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
+  await migrateSandboxConfigAtStartup();
 
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();

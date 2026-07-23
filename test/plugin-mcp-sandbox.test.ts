@@ -10,10 +10,11 @@ import {
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { prepareSandbox } from '../src/adapters/backend/sandbox.js';
+import { prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
@@ -117,17 +118,44 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
       const forwardedKeys = codexForwardedEnvKeys(codexConfig);
 
       let gatewayHost: SessionMcpGatewayHost | null = null;
-      let sandbox: ReturnType<typeof prepareSandbox> = null;
+      let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
       let client: Client | null = null;
       let transport: StdioClientTransport | null = null;
       try {
         gatewayHost = await startSessionMcpGatewayHost({ sessionId, dataDir });
-        sandbox = prepareSandbox({
-          enabled: true,
-          cliId: 'codex',
+        const hostOnlyPaths = [
+          sessionMcpRuntimeManifestPath(sessionId, dataDir),
+          sessionMcpRuntimeManifestPath(siblingSessionId, dataDir),
+          pluginMcpPrivatePath(pluginId),
+          join(home, '.botmux', 'plugins', pluginId, 'dist', 'mcp', 'index.json'),
+        ];
+        const botmuxHome = join(dataDir, '..');
+        const botHome = join(botmuxHome, 'bots', 'cli_test');
+        const outbox = join(dataDir, 'sandboxes', sessionId, 'outbox');
+        mkdirSync(botHome, { recursive: true });
+        mkdirSync(outbox, { recursive: true });
+        const policy = buildFsPolicy({
+          platform: 'linux',
+          homeDir: home,
+          botmuxHome,
+          sessionDataDir: dataDir,
+          workingDir: project,
+          currentAppId: 'cli_test',
+          botHome,
+          redirectedCliData: true,
+          execPaths: [dirname(process.execPath)],
+          botmuxInstallRoot: resolve('.'),
+          outbox,
+          mandatoryDenyPaths: hostOnlyPaths,
+        });
+        policy.rules = policy.rules.filter(rule =>
+          rule.access === 'deny' || existsSync(rule.path));
+        sandbox = prepareDirectSandbox({
           sessionId,
-          sourceWorkingDir: project,
           dataDir,
+          policy,
+          chdir: project,
+          home,
           cliBin: gatewayBin,
           cliArgs: ['mcp', 'serve'],
           trustedBotmuxCommandPaths: [gatewayBin],
@@ -135,12 +163,6 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli))('plugin M
         });
         if (!sandbox) return; // Required Linux sandbox runtime is unavailable.
 
-        const hostOnlyPaths = [
-          sessionMcpRuntimeManifestPath(sessionId, dataDir),
-          sessionMcpRuntimeManifestPath(siblingSessionId, dataDir),
-          pluginMcpPrivatePath(pluginId),
-          join(home, '.botmux', 'plugins', pluginId, 'dist', 'mcp', 'index.json'),
-        ];
         const commandIndex = sandbox.args.lastIndexOf('--');
         expect(commandIndex).toBeGreaterThanOrEqual(0);
         const probe = spawnSync(

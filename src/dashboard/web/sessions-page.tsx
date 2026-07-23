@@ -1421,60 +1421,6 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
   );
 }
 
-function LandPanel(props: { row: any }): JSX.Element {
-  const [state, setState] = useState<{ loading: boolean; diff?: any; patch?: string; message?: ReactNode } | null>(null);
-  useEffect(() => setState(null), [props.row.sessionId]);
-  const load = async () => {
-    setState({ loading: true });
-    try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-diff`);
-      const d = await r.json().catch(() => ({}));
-      if (!d.ok) { setState({ loading: false, message: <p>{t('sessions.landUnavailable')}: {String(d.error ?? r.status)}</p> }); return; }
-      if (d.empty) { setState({ loading: false, message: <p>{t('sessions.landEmpty')}</p> }); return; }
-      const full = String(d.patch ?? '');
-      setState({
-        loading: false,
-        diff: d,
-        patch: full.slice(0, 20000) + (full.length > 20000 ? '\n...(truncated)' : ''),
-      });
-    } catch (e) {
-      setState({ loading: false, message: <p>{t('sessions.landUnavailable')}: {String(e)}</p> });
-    }
-  };
-  const apply = async () => {
-    const rr = await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-land/apply`, { method: 'POST' });
-    const res = await rr.json().catch(() => ({}));
-    setState({
-      loading: false,
-      message: res.ok
-        ? <p>{t('sessions.landApplied')}: {res.files} files (+{res.insertions}/-{res.deletions}) → <code>{String(res.workingDir ?? '')}</code></p>
-        : <p>{t('sessions.landFailed')}: {String(res.error ?? rr.status)}</p>,
-    });
-  };
-  const discard = async () => {
-    await fetch(`/api/sessions/${encodeURIComponent(props.row.sessionId)}/sandbox-land/discard`, { method: 'POST' });
-    setState({ loading: false, message: <p>{t('sessions.landDiscarded')}</p> });
-  };
-  return (
-    <>
-      <button id="land-btn" type="button" disabled={state?.loading} onClick={() => void load()}>{t('sessions.land')}</button>
-      <div id="land-area">
-        {state?.loading ? <LoadingState label={t('sessions.landLoading')} compact /> : null}
-        {state?.message}
-        {state?.diff && state.patch !== undefined ? (
-          <>
-            <p><b>{state.diff.files}</b> files (+{state.diff.insertions}/-{state.diff.deletions}) → <code>{String(state.diff.workingDir ?? '')}</code></p>
-            <pre style={{ maxHeight: 320, overflow: 'auto', whiteSpace: 'pre-wrap' }}>{state.patch}</pre>
-            <div className="actions">
-              <button id="land-apply" type="button" className="primary" onClick={() => void apply()}>{t('sessions.landApply')}</button>
-              <button id="land-discard" type="button" className="contrast" onClick={() => void discard()}>{t('sessions.landDiscard')}</button>
-            </div>
-          </>
-        ) : null}
-      </div>
-    </>
-  );
-}
 
 function InsightReport(props: { report: any }): JSX.Element {
   const rep = props.report;
@@ -1638,7 +1584,6 @@ function Drawer(props: {
             {row.status !== 'closed' ? (
               <button id="close-btn" type="button" className="contrast" onClick={async event => { if (await props.closeSession(row, event.currentTarget)) props.onClose(); }}>{t('sessions.close')}</button>
             ) : null}
-            <LandPanel row={row} />
             <InsightPanel row={row} />
           </div>
         </article>

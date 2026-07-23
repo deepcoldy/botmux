@@ -9,8 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildLandResultCard, buildRepoSelectCard } from './card-builder.js';
-import { computeSandboxDiff, applySandboxDiff } from '../../services/sandbox-land.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
@@ -737,30 +736,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   // Use the receiving bot's allowedUsers — the operator open_id in card actions
   // is scoped to the app that received the callback.
   const operatorOpenId = data?.operator?.open_id;
-  // ─── 沙盒落盘卡（land_apply / land_discard）──────────────────────────────────
-  // 不绑 session（sessionId + workingDir 都在 value 里）。owner 强闸门：只有 owner 能把
-  // 隔离副本的改动应用回真实磁盘。agent 在沙盒里无感，不参与。
-  if (value?.action && (value.action === 'land_apply' || value.action === 'land_discard') && larkAppId) {
-    const loc = localeForBot(larkAppId);
-    const owner = getOwnerOpenId(larkAppId);
-    if (!operatorOpenId || operatorOpenId !== owner) {
-      logger.info(`Land action "${value.action}" blocked for non-owner: ${operatorOpenId}`);
-      return { toast: { type: 'error', content: t('card.land.toast_owner_only', undefined, loc) } };
-    }
-    if (value.action === 'land_discard') {
-      return JSON.parse(buildLandResultCard('discarded', '', loc));
-    }
-    const sid: string = value.sessionId;
-    const wd: string = value.workingDir;
-    if (!sid || !wd) return JSON.parse(buildLandResultCard('failed', t('card.land.stale', undefined, loc), loc));
-    const d = computeSandboxDiff(config.session.dataDir, sid, loc);
-    if (!d.ok) return JSON.parse(buildLandResultCard('failed', d.error, loc));
-    if (d.empty) return JSON.parse(buildLandResultCard('discarded', '', loc));
-    const a = applySandboxDiff(wd, config.session.dataDir, sid, loc);
-    if (!a.ok) return JSON.parse(buildLandResultCard('failed', a.error, loc));
-    logger.info(`Land applied: ${d.files} files (+${d.insertions}/-${d.deletions}) → ${wd}`);
-    return JSON.parse(buildLandResultCard('applied', t('card.land.applied_body', { files: d.files, ins: d.insertions, del: d.deletions, dir: wd }, loc), loc));
-  }
   // ─── 群内授权卡片动作（grant_chat / grant_global / grant_deny，talk-only）─────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (value.action === 'grant_chat' || value.action === 'grant_global' || value.action === 'grant_deny') && larkAppId) {

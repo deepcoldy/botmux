@@ -3,7 +3,7 @@
  *
  * Run:  pnpm vitest run test/bot-registry.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -764,6 +764,35 @@ describe('getBot / getBotClient', () => {
 
   it('getBotClient should throw for unknown appId', () => {
     expect(() => mod.getBotClient('missing')).toThrow('Bot not registered: missing');
+  });
+});
+
+describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  const saved = { app: process.env.BOTMUX_LARK_APP_ID, brand: process.env.BOTMUX_BRAND_LABEL };
+  beforeEach(async () => { mod = await freshImport(); });
+  afterEach(() => {
+    if (saved.app === undefined) delete process.env.BOTMUX_LARK_APP_ID; else process.env.BOTMUX_LARK_APP_ID = saved.app;
+    if (saved.brand === undefined) delete process.env.BOTMUX_BRAND_LABEL; else process.env.BOTMUX_BRAND_LABEL = saved.brand;
+  });
+
+  it('returns the injected env brandLabel for the own appId WITHOUT reading bots.json (the sandbox path)', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_BRAND_LABEL = '[{cwdName}]({cwdUrl})';
+    // No bot registered, no config path — old code would return undefined; env wins.
+    expect(mod.resolveBrandLabel('app_sbx')).toBe('[{cwdName}]({cwdUrl})');
+  });
+
+  it('present-but-empty env brandLabel means suppress (returns "")', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
+    process.env.BOTMUX_BRAND_LABEL = '';
+    expect(mod.resolveBrandLabel('app_sbx')).toBe('');
+  });
+
+  it('ignores env when the appId is NOT the current process bot (no cross-bot bleed)', () => {
+    process.env.BOTMUX_LARK_APP_ID = 'app_self';
+    process.env.BOTMUX_BRAND_LABEL = '[self]()';
+    expect(mod.resolveBrandLabel('app_other')).toBeUndefined();
   });
 });
 

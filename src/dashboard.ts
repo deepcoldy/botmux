@@ -3352,25 +3352,6 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // Sandbox landing: review the clone's diff (GET) then apply/discard (POST).
-    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-diff$/))) {
-      const sid = decodeURIComponent(m[1]);
-      const owner = aggregator.ownerOf(sid);
-      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-diff`, { method: 'GET' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-land\/(apply|discard)$/))) {
-      const sid = decodeURIComponent(m[1]); const action = m[2];
-      const owner = aggregator.ownerOf(sid);
-      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
-      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/sandbox-land/${action}`, { method: 'POST' });
-      res.writeHead(upstream.status, { 'content-type': 'application/json' });
-      res.end(await upstream.text());
-      return;
-    }
 
     if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/(run|pause|resume|delivery)$/))) {
       const id = decodeURIComponent(m[1]); const op = m[2];

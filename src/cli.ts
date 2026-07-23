@@ -2945,26 +2945,32 @@ function loadSessions(): Map<string, SessionData> {
     } catch { /* ignore */ }
   }
 
-  // Read per-bot session files (sessions-{appId}.json)
+  // Read per-bot session files (sessions-{appId}.json).
+  const loadPerBot = (appId: string) => {
+    try {
+      const data = JSON.parse(readFileSync(join(dataDir, `sessions-${appId}.json`), 'utf-8'));
+      for (const [, v] of Object.entries(data)) {
+        const session = v as SessionData;
+        if (!session || typeof session !== 'object' || !session.sessionId) continue;
+        repairMissingChatScope(session);
+        if (!session.larkAppId) session.larkAppId = appId;  // stamp so saveSession writes back correctly
+        sessions.set(session.sessionId, session);
+      }
+    } catch { /* ignore */ }
+  };
   try {
     for (const file of readdirSync(dataDir)) {
       if (file.startsWith('sessions-') && file.endsWith('.json')) {
-        try {
-          // Extract appId from filename: sessions-{appId}.json
-          const appId = file.slice('sessions-'.length, -'.json'.length);
-          const data = JSON.parse(readFileSync(join(dataDir, file), 'utf-8'));
-          for (const [, v] of Object.entries(data)) {
-            const session = v as SessionData;
-            if (!session || typeof session !== 'object' || !session.sessionId) continue;
-            repairMissingChatScope(session);
-            // Stamp larkAppId so saveSession writes back to the correct file
-            if (!session.larkAppId) session.larkAppId = appId;
-            sessions.set(session.sessionId, session);
-          }
-        } catch { /* ignore */ }
+        loadPerBot(file.slice('sessions-'.length, -'.json'.length));
       }
     }
-  } catch { /* ignore */ }
+  } catch {
+    // readdir(dataDir) EPERMs under the file sandbox (the deny-by-default policy
+    // exposes sessions-<self>.json but NOT a listing of data/). Fall back to the
+    // OWN per-bot file directly via the injected appId — the sandboxed agent only
+    // ever operates its own session, so no enumeration is needed.
+    if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
+  }
 
   // Migrate: remove sessions from legacy file if they have larkAppId (belong in per-bot files)
   let legacyDirty = false;

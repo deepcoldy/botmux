@@ -15,8 +15,7 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { resolvePairedSpawnBackendType } from './persistent-backend.js';
-import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildLandCard } from '../im/lark/card-builder.js';
-import { computeSandboxDiff } from '../services/sandbox-land.js';
+import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard } from '../im/lark/card-builder.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
@@ -1297,41 +1296,6 @@ export async function handleCommand(
         break;
       }
 
-      case '/land': {
-        // 把沙盒会话副本里 agent 的改动落回真实仓库。owner 审阅 diff 卡后点「应用到磁盘」。
-        // agent 在沙盒里无感（以为改的就是真文件），所以只能由 owner 在此手动触发。
-        if (!ds) { await sessionReply(rootId, t('cmd.no_active_session', undefined, loc)); break; }
-        const sid = ds.session.sessionId;
-        const wd = ds.session.workingDir;
-        if (!wd) { await sessionReply(rootId, t('cmd.land.no_workingdir', undefined, loc)); break; }
-        const d = computeSandboxDiff(config.session.dataDir, sid, loc);
-        if (!d.ok) { await sessionReply(rootId, t('cmd.land.cannot', { error: d.error }, loc)); break; }
-        if (d.empty) { await sessionReply(rootId, t('cmd.land.empty', undefined, loc)); break; }
-        // In-card preview: cap by lines AND chars (Lark card size limit); the FULL
-        // diff goes to an attached .patch file (better for large changesets).
-        const MAX_LINES = 60, MAX_CHARS = 4000;
-        const allLines = d.patch.split('\n');
-        let preview = allLines.slice(0, MAX_LINES).join('\n');
-        let truncated = allLines.length > MAX_LINES;
-        if (preview.length > MAX_CHARS) { preview = preview.slice(0, MAX_CHARS); truncated = true; }
-        // Attach the full .patch (git apply-able) — sent as a file message first,
-        // then the review card below it.
-        let patchAttached = false;
-        if (larkAppId) {
-          try {
-            const patchName = `botmux-land-${sid.slice(0, 8)}.patch`;
-            const patchPath = join(config.session.dataDir, 'sandboxes', sid, patchName);
-            writeFileSync(patchPath, d.patch);
-            const fileKey = await uploadFile(larkAppId, patchPath);
-            await sendMessage(larkAppId, ds.session.chatId, JSON.stringify({ file_key: fileKey }), 'file');
-            patchAttached = true;
-          } catch (e) { logger.warn(`[${logTag}] /land patch attach failed: ${(e as Error).message}`); }
-        }
-        const card = buildLandCard({ sessionId: sid, workingDir: wd, statText: d.statText, files: d.files, insertions: d.insertions, deletions: d.deletions, preview, truncated, patchAttached }, loc);
-        await sessionReply(rootId, card, 'interactive');
-        logger.info(`[${logTag}] /land: ${d.files} files (+${d.insertions}/-${d.deletions}) → card${patchAttached ? ' + .patch' : ''}`);
-        break;
-      }
 
       case '/detach':
       case '/disconnect': {

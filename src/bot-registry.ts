@@ -897,25 +897,29 @@ export interface BotConfig {
    */
   codexRpcInput?: boolean;
   /**
-   * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
-   * the agent sees only a clone of the project + a de-identified config dir,
-   * never the host home/secrets/other sessions. Intended for oncall bots shared
-   * with semi-trusted users. Linux-only; ignored elsewhere. Env BOTMUX_SANDBOX=1
-   * forces it on regardless (testing).
+   * Run this bot's CLI inside a per-session file sandbox (unified three-tier
+   * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
+   * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
+   * project + its own BOT_HOME, read the system toolchain baseline, and touch
+   * NOTHING else. Env BOTMUX_SANDBOX=1 forces it on regardless (testing).
    */
   sandbox?: boolean;
   /**
-   * Per-bot privacy masks for the sandbox: absolute paths blanked inside the
-   * overlay sandbox (dirs → empty tmpfs; files → empty placeholder). OPT-IN with
-   * NO defaults — the agent reads the entire real fs natively unless a path is
-   * listed here. Only meaningful when `sandbox` is true. Linux-only.
+   * User增量 three-tier path lists layered ON TOP of the baseline preset
+   * (never replacing it). Deepest matching rule wins, so nested black/white
+   * lists work (readOnly a tree, deny a subdir inside it). Same semantics on
+   * Linux and macOS. Absent → pure baseline.
+   */
+  sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
+  /**
+   * LEGACY (pre fs-policy, kept for downgrade only): privacy masks under the
+   * old read-everything model. Auto-migrated into sandboxPaths.deny at daemon
+   * startup (old fields are kept on disk so a downgraded daemon still reads
+   * them); no longer consulted by the new spawn path.
    */
   sandboxHidePaths?: string[];
-  /**
-   * Extra paths to expose read-only inside the sandbox. Useful when a bot should
-   * inspect sibling/source repos without being able to write to them. Only
-   * meaningful when `sandbox` is true. Linux-only.
-   */
+  /** LEGACY: extra read-only paths — auto-migrated into sandboxPaths.readOnly
+   *  (see sandboxHidePaths note). */
   sandboxReadonlyPaths?: string[];
   /**
    * Whether the sandbox keeps network access. Missing/true preserves the existing
@@ -924,18 +928,13 @@ export interface BotConfig {
    */
   sandboxNetwork?: boolean;
   /**
-   * Per-bot LOCAL READ ISOLATION (distinct from the Linux bwrap `sandbox`
-   * above). When true, the bot's CLI data is redirected into its own BOT_HOME
-   * and the whole CLI process is wrapped in a macOS Seatbelt sandbox, so its
-   * agent cannot read OTHER bots' session data / lark-cli credentials / the
-   * full bots.json / common host credentials. Only honored on CLIs whose
-   * adapter reports `supportsReadIsolation` and on macOS; a bot that sets this
-   * where it cannot be enforced is fail-closed (refused) rather than run
-   * unisolated. Default false → no behavior change.
+   * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
+   * deny-by-default, so cross-bot read isolation is inherent — this flag is
+   * auto-migrated to `sandbox: true` at daemon startup and kept on disk only
+   * for downgrade. No longer consulted by the new spawn path.
    */
   readIsolation?: boolean;
-  /** Extra absolute paths to deny reading, appended to the built-in default
-   *  credential set. Only meaningful when `readIsolation` is true. */
+  /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
   /**
@@ -1560,6 +1559,15 @@ function botsConfigDiskPath(): string | null {
  * result into {@link brandFooterSegment} for the unset→default / ''→off rule.
  */
 export function resolveBrandLabel(larkAppId: string): string | undefined {
+  // A sandboxed one-shot `botmux send` can't read bots.json (deny-by-default),
+  // so it has no in-memory registry and would fall through to a bots.json read
+  // that EPERMs → role footer lost. The worker injects THIS bot's resolved
+  // brandLabel via env; honour it first (gated on the own appId). Present-but-
+  // empty ('') = suppress; absent → fall through. brandLabel is a cosmetic
+  // markdown template, not a secret, so env-passing is safe.
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId && 'BOTMUX_BRAND_LABEL' in process.env) {
+    return process.env.BOTMUX_BRAND_LABEL;
+  }
   const inMem = bots.get(larkAppId);
   if (inMem) return inMem.config.brandLabel;
   const path = loadedConfigPath ?? botsConfigDiskPath();
@@ -1859,6 +1867,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       codexRpcInput: entry.codexRpcInput === true,
       sandbox: entry.sandbox === true,
+      sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
+        ? {
+            readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
+            readOnly: normalizeStringList(entry.sandboxPaths.readOnly),
+            deny: normalizeStringList(entry.sandboxPaths.deny),
+          }
+        : undefined,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,

@@ -107,6 +107,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_OWNER_OPEN_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
+  // Resolved display footer for sandboxed `botmux send`; avoids reading the
+  // credential-bearing bots.json from inside the child.
+  'BOTMUX_BRAND_LABEL',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
