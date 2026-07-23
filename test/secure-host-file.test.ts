@@ -87,6 +87,29 @@ describe('secure host authority files', () => {
     }
   });
 
+  it('BOTMUX_SKIP_HOST_AUTH_CHECK=1 bypasses only the ancestor-chain walk', () => {
+    if (process.platform === 'win32') return;
+    const root = tempRoot();
+    chmodSync(root, 0o777);
+    const dir = join(root, '.botmux');
+    mkdirSync(dir, { mode: 0o700 });
+    const file = join(dir, 'device.json');
+
+    const prev = process.env.BOTMUX_SKIP_HOST_AUTH_CHECK;
+    process.env.BOTMUX_SKIP_HOST_AUTH_CHECK = '1';
+    try {
+      writeSecureHostFileSync(file, 'secret');
+      expect(readSecureHostFileSync(file)).toBe('secret');
+      // The direct leaf/dir checks stay enforced even with the escape hatch on:
+      // a group/other-writable credential dir must still fail closed.
+      chmodSync(dir, 0o720);
+      expect(() => writeSecureHostFileSync(file, 'again')).toThrow(/其它用户写入|组内/);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SKIP_HOST_AUTH_CHECK;
+      else process.env.BOTMUX_SKIP_HOST_AUTH_CHECK = prev;
+    }
+  });
+
   it('accepts an owned child under a sticky writable ancestor', () => {
     if (process.platform === 'win32') return;
     const root = tempRoot();
