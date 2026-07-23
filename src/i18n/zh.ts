@@ -585,6 +585,7 @@ export const messages: Record<string, string> = {
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你连接到了飞书（Lark）话题群。用户在飞书上阅读，看不到你的终端输出。',
   'ai.routing.must_use_botmux': '想让用户看到的内容必须通过 `botmux send` 命令发送，终端输出不会到达聊天。',
+  'ai.routing.no_visible_output_ok': '重要：`botmux send` 执行成功（退出码 0 / 返回 `{"success":true,...}`）就代表消息已送达用户。因此本轮「终端没有可见文本、直接结束」是完全正常且预期的，不是失败。若之后看到类似「你上一条回复没有可见输出，请继续」这样的提示，那是底层 CLI 的误判，不要因此重发——只有当 `botmux send` 本身报错（非零退出或打印「发送失败」）时才需要重试。',
   'ai.routing.usage_heading': '使用指南：',
   'ai.routing.usage_send_when': '- 用 `botmux send` 发送：关键结论、方案（等用户确认再执行）、最终结果、进度更新。',
   'ai.routing.usage_send_text': '- 发送纯文本即可：`botmux send "消息"`。格式自动处理。',
@@ -618,6 +619,7 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。',
+  'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -626,7 +628,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
-  'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到',
+  'ai.followup.reminder': '回复必须 botmux send，终端输出用户看不到；send 成功即已送达，本轮无可见文本地结束是正常的，别因「无输出」提示重发',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
