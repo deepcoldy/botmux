@@ -65,7 +65,8 @@ const PANE_SHELL_READY_MAX_ATTEMPTS = Math.ceil(PANE_SHELL_READY_TIMEOUT_MS / PA
 // is what re-enables `done`/`blocked`/`idle` for the following turn without
 // hot-looping on the settled state between turns.
 const WATCHED_STATUSES = ['working', 'done', 'blocked', 'idle'] as const;
-type WatchedStatus = typeof WATCHED_STATUSES[number];
+export type HerdrAgentStatus = typeof WATCHED_STATUSES[number];
+type WatchedStatus = HerdrAgentStatus;
 
 type JsonCommandResult = { ok: true; value: any | undefined } | { ok: false };
 
@@ -294,6 +295,7 @@ export class HerdrBackend implements SessionBackend {
   private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
   private readonly webCursorCbs: Array<(cursor: HerdrWebTerminalCursor) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
+  private readonly agentStatusCbs: Array<(status: HerdrAgentStatus) => void> = [];
   private readonly agentName: string;
   private paneId: string | undefined;
   private lastText = '';
@@ -588,6 +590,24 @@ export class HerdrBackend implements SessionBackend {
 
   onExit(cb: (code: number | null, signal: string | null) => void): void {
     this.exitCbs.push(cb);
+  }
+
+  /** Authoritative Herdr lifecycle signal for input gating.
+   *
+   * Screen deltas are insufficient for TUIs such as Pi whose empty prompt can
+   * render identically before and after becoming interactive. Herdr already
+   * classifies that state, so expose it to the worker rather than guessing from
+   * terminal text. Registration also reports the current settled state to avoid
+   * missing a fast `idle` transition that happened during spawn().
+   */
+  onAgentStatus(cb: (status: HerdrAgentStatus) => void): void {
+    this.agentStatusCbs.push(cb);
+    const current = this.getAgent()?.agent_status;
+    if (!WATCHED_STATUSES.includes(current)) return;
+    queueMicrotask(() => {
+      if (this.exited || !this.agentStatusCbs.includes(cb)) return;
+      try { cb(current); } catch { /* listener crash shouldn't kill backend */ }
+    });
   }
 
   kill(): void {
@@ -966,6 +986,9 @@ export class HerdrBackend implements SessionBackend {
         // immediately while a status remains current, so including it again is
         // the level-triggered success storm this state machine prevents.
         if (code === 0) {
+          for (const cb of this.agentStatusCbs) {
+            try { cb(status); } catch { /* listener crash shouldn't kill watcher */ }
+          }
           this.startStatusWatcher(status);
           return;
         }

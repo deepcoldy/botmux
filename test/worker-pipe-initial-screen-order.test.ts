@@ -167,6 +167,19 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).not.toContain('pendingMessages.length > 0');
   });
 
+  it('uses authoritative Herdr settled status to release queued Pi input', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const hookStart = source.indexOf('observedBackend.onAgentStatus((status) => {');
+    const hookEnd = source.indexOf('backend.onAccessUrl?.', hookStart);
+    const hook = source.slice(hookStart, hookEnd);
+
+    expect(hookStart).toBeGreaterThan(-1);
+    expect(hook).toContain("status === 'idle' || status === 'done'");
+    expect(hook).toContain('markPromptReady();');
+    expect(hook).toContain("status === 'working'");
+    expect(hook).toContain('isPromptReady = false;');
+  });
+
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const guardStart = source.indexOf('let effectiveBackend = cfg.backendType;');

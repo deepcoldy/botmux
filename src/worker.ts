@@ -7419,6 +7419,18 @@ async function spawnCli(
 
   backend.onData(onPtyData);
   const observedBackend = backend;
+  if (observedBackend instanceof HerdrBackend) {
+    observedBackend.onAgentStatus((status) => {
+      if (backend !== observedBackend) return;
+      if (status === 'idle' || status === 'done') {
+        log(`Herdr agent ${status} — marking prompt ready`);
+        markPromptReady();
+      } else if (status === 'working') {
+        isPromptReady = false;
+        idleDetector?.reset();
+      }
+    });
+  }
   backend.onAccessUrl?.((url) => {
     send({
       type: 'riff_access_url',

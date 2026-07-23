@@ -849,6 +849,27 @@ describe('HerdrBackend message writing', () => {
 // ─── Callbacks: onData delta + onExit ──────────────────────────────────────
 
 describe('HerdrBackend callbacks', () => {
+  it('onAgentStatus reports an already-settled agent registered after spawn', async () => {
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('get'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '1-1', agent_status: 'idle' } } }),
+      },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const statuses: string[] = [];
+    be.onAgentStatus(status => statuses.push(status));
+    await Promise.resolve();
+
+    expect(statuses).toEqual(['idle']);
+    be.kill();
+  });
+
   it('onData fires with the prefix-delta when pane recent output grows', () => {
     let paneText = 'hello';
     setHerdrResponses([
