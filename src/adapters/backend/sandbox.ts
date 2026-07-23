@@ -1090,7 +1090,7 @@ export function prepareSandbox(opts: {
 /**
  * Re-attach the daemon/worker side to an ALREADY-spawned sandbox session WITHOUT
  * touching the overlays. Used on daemon-restart reattach to a persistent
- * (tmux/herdr/zellij) pane whose bwrap'd CLI is still alive: the CLI is bound to
+ * (tmux/herdr/zellij/zmx) pane whose bwrap'd CLI is still alive: the CLI is bound to
  * its own namespace-pinned overlay, so we must NOT unmount/remount (that would
  * leave a duplicate host-side mount the CLI isn't using). We only need the outbox
  * path back so the watcher can keep servicing the live CLI's `botmux send`, plus
@@ -1161,7 +1161,7 @@ function liveSandboxSids(): Set<string> {
  *     status='active' on disk, so the old "skip if active" rule would let the
  *     leaked upper/work dirs survive across restarts indefinitely. We only GC an
  *     active sid when its mounts are ALREADY gone — we NEVER tear down a live
- *     mount (a CLI persisting in a tmux/herdr/zellij pane is still bound to it),
+ *     mount (a CLI persisting in a tmux/herdr/zellij/zmx pane is still bound to it),
  *     so a genuinely-live persistent session keeps its changeset.
  *
  * Safe to call repeatedly: wire once at daemon bootstrap AND on a periodic timer
@@ -1198,7 +1198,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
       // live CLI may be bound to the changeset). If BOTH merged overlays are gone
       // AND the tree is older than the spawn grace, the worker/CLI is dead →
       // reclaim the dead residue. We NEVER tear down a live mount, so a genuinely
-      // live persistent (tmux/herdr/zellij) session keeps its changeset.
+      // live persistent (tmux/herdr/zellij/zmx) session keeps its changeset.
       if (hasMountedSandboxOverlay(overlayPaths)) continue;
       let ageOk = false;
       try { ageOk = now - statSync(sessionRoot).mtimeMs > ACTIVE_DEAD_GRACE_MS; } catch { ageOk = false; }

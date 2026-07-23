@@ -109,6 +109,20 @@ describe('deliverWriteLinkCard', () => {
 });
 
 describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
+  it('distinguishes a backend that never provides Web Terminal from temporary readiness', async () => {
+    botState.owners = ['ou_owner1'];
+    const r = await deliverWriteLinkCardToOwners(liveDs({
+      session: {
+        sessionId: 'sess1234abcd',
+        rootMessageId: 'om_root',
+        title: 'demo',
+        cliId: 'claude-code',
+        backendType: 'zmx',
+      },
+    }));
+    expect(r).toEqual({ ok: false, error: 'terminal_unsupported', delivered: 0, total: 0, channels: [] });
+  });
+
   it('refuses when the terminal is not ready (no worker token) — never builds a card', async () => {
     botState.owners = ['ou_owner1'];
     const r = await deliverWriteLinkCardToOwners(liveDs({ workerToken: null }));
@@ -160,6 +174,19 @@ describe('deliverWriteLinkCardToOwners (botmux term-link backend)', () => {
 });
 
 describe('deliverWritableTerminalCardTo (/term slash command backend)', () => {
+  it('returns unsupported for a backend with no Web Terminal capability', async () => {
+    const r = await deliverWritableTerminalCardTo(liveDs({
+      session: {
+        sessionId: 'sess1234abcd',
+        rootMessageId: 'om_root',
+        title: 'demo',
+        cliId: 'claude-code',
+        backendType: 'zmx',
+      },
+    }), 'ou_owner');
+    expect(r).toBe('unsupported');
+  });
+
   it('returns not_ready (and never sends) when the terminal has no token', async () => {
     const r = await deliverWritableTerminalCardTo(liveDs({ workerToken: null }), 'ou_owner');
     expect(r).toBe('not_ready');

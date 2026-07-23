@@ -11,7 +11,8 @@ Manage the daemon and sessions from the terminal.
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
-| `botmux list` (alias `ls`) | List all active sessions |
+| `botmux list` (alias `ls`) | Interactively list active sessions; select a managed tmux / ZMX session and press Enter to attach (use `--plain` in scripts) |
+| `botmux title [--session-id <id-or-prefix>] <new-title>` | Rename the current or specified session |
 | `botmux delete <id>` (aliases `del`/`rm`) | Close the specified session, with ID prefix matching |
 | `botmux delete all` | Close all active sessions |
 | `botmux delete stopped` | Clean up zombie sessions whose processes have exited |

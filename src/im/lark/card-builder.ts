@@ -296,23 +296,26 @@ export function buildSessionCard(
   const cliName = getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId };
-  const actions: any[] = [
-    {
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t(showManageButtons ? 'card.btn.open_writable_terminal' : 'card.btn.open_terminal', undefined, locale) },
       type: 'primary',
       multi_url: terminalMultiUrl(terminalUrl),
-    },
-  ];
+    });
+  }
   if (!showManageButtons) {
     const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
     if (localBtn) actions.push(localBtn);
-    actions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-      type: 'default',
-      value: { action: 'get_write_link', ...actionBase },
-    });
+    if (terminalUrl) {
+      actions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+        type: 'default',
+        value: { action: 'get_write_link', ...actionBase },
+      });
+    }
   }
   if (showManageButtons && !adoptMode) {
     actions.push({
@@ -744,12 +747,14 @@ export function buildStreamingCard(
       value: { action: 'refresh_screenshot', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
-    type: 'primary',
-    multi_url: terminalMultiUrl(terminalUrl),
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
+      type: 'primary',
+      multi_url: terminalMultiUrl(terminalUrl),
+    });
+  }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady) : undefined;
   if (localBtn) headerActions.push(localBtn);
   if (status === 'limited' && usageLimit?.retryReady) {
@@ -760,12 +765,14 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
-    type: 'default',
-    value: { action: 'get_write_link', ...actionBase },
-  });
+  if (terminalUrl) {
+    headerActions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
+      type: 'default',
+      value: { action: 'get_write_link', ...actionBase },
+    });
+  }
   if (adoptMode) {
     if (showTakeover) {
       headerActions.push({
@@ -851,9 +858,8 @@ export function buildStreamingCard(
  * Build a static "private snapshot" card for `/card` in private mode — sent via
  * the ephemeral API to one user at a time. Unlike {@link buildStreamingCard} it
  * is **never PATCH-updated** (ephemeral cards can't be), so it carries only a
- * one-shot snapshot of the terminal screenshot plus three buttons:
- *   • read-only "open terminal" link (a plain URL button — no callback);
- *   • "get write link", whose callback DMs the writable link to the clicker;
+ * one-shot snapshot of the terminal screenshot plus controls:
+ *   • when available, a read-only "open terminal" link and "get write link";
  *   • "close session", whose callback kills the session and (in private mode)
  *     sends the "closed" card ephemeral to the owner audience too — so the
  *     session title / CLI name / workingDir on it don't leak to the group.
@@ -909,9 +915,9 @@ export function buildPrivateSnapshotCard(
     }
   }
 
-  elements.push({
-    tag: 'action',
-    actions: [
+  const actions: any[] = [];
+  if (terminalUrl) {
+    actions.push(
       {
         tag: 'button',
         text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -924,17 +930,21 @@ export function buildPrivateSnapshotCard(
         type: 'default',
         value: { action: 'get_write_link', ...actionBase },
       },
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
-        type: 'danger',
-        value: { action: 'close', ...actionBase },
-      },
-    ],
+    );
+  }
+  actions.push({
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
+    type: 'danger',
+    value: { action: 'close', ...actionBase },
   });
+  elements.push({ tag: 'action', actions });
   elements.push({
     tag: 'note',
-    elements: [{ tag: 'lark_md', content: t('card.private.snapshot_note', undefined, locale) }],
+    elements: [{
+      tag: 'lark_md',
+      content: t(terminalUrl ? 'card.private.snapshot_note' : 'card.private.snapshot_note_no_terminal', undefined, locale),
+    }],
   });
 
   const card = {

@@ -58,6 +58,7 @@ export const messages: Record<string, string> = {
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
   'card.usage_limit.retry_ready': '✅ {cliName} 限额预计已刷新。你可以重发上一条任务，或直接发送新消息。',
   'card.private.snapshot_note': '🔒 仅你可见的静态快照（不会实时刷新）。点「打开 Web 终端」查看实时画面。',
+  'card.private.snapshot_note_no_terminal': '🔒 仅你可见的静态快照（不会实时刷新）。当前后端不提供 Web 终端。',
 
   // ─── Repo select card ────────────────────────────────────────────────────
   'card.repo.title': '📁 项目仓库管理',
@@ -217,6 +218,7 @@ export const messages: Record<string, string> = {
   'cmd.card.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /card。',
   'cmd.term.operator_only': '⚠️ 仅授权用户（allowedUsers）可以用 /term 获取可操作终端链接。',
   'cmd.term.no_session': '当前话题没有活跃会话，/term 需要一个跑着的会话。',
+  'cmd.term.unsupported': '当前会话后端不提供 Web 终端；ZMX 会话请在本机运行 botmux list 或 zmx attach。',
   'cmd.term.not_ready': '🔒 终端还没就绪，等会话起好后再发 /term。',
   'cmd.term.failed': '⚠️ 可操作链接发送失败（私密卡与 DM 均失败），看 daemon 日志。',
   'cmd.term.sent_dm': '🔑 可操作终端链接已私信发你（不在群里暴露）。',
@@ -280,6 +282,7 @@ export const messages: Record<string, string> = {
   'cmd.repo.card_already_consumed': '✅ 仓库已选定，请忽略旧的选仓卡片',
   'cmd.repo.worktree_created_not_switched': '🌿 worktree 已创建：`{path}`（分支 `{branch}`），但会话状态已变化，未自动切换。需要时可用 `/repo {path}` 打开。',
   'cmd.repo.worktree_switch_failed': '⚠️ worktree 已创建：`{path}`，但自动切换失败：{error}\n可用 `/repo {path}` 手动打开。',
+  'cmd.repo.switch_close_failed': '⚠️ 无法安全关闭当前会话，仓库未切换：{error}',
   // 「仅默认目录」模式开启「自动创建 worktree」后，新会话启动时用（daemon 交互新话题 /
   // dashboard 建会话 / webhook 外部事件三条路复用）。
   'worktree.auto_creating': '🌿 正在为本会话创建独立 worktree（含 git fetch，可能需要几秒）…',
@@ -695,6 +698,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_holder': '（占用者：{short}）',
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
+  'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
   'card.voice.toast_wait': '🔊 正在生成语音总结，请耐心等待…',
   'card.voice.toast_already': '🔊 这条已经在生成语音啦，请稍候',
@@ -704,8 +708,9 @@ export const messages: Record<string, string> = {
   'card.voice.user_message': '生成语音总结',
   'card.action.takeover_retired': '⚠️ 旧版"接管"按钮已停用。bridge 模式下原 CLI 由 botmux 桥接，无需接管即可在飞书中收到回答。如需 /resume 完整接管能力，请等待 /adopt --takeover 命令上线。',
   'card.action.terminal_not_ready': '⚠️ 终端尚未就绪，请稍后再试。',
+  'card.action.terminal_unsupported': '⚠️ 当前会话后端不提供 Web 终端；ZMX 会话请在本机运行 `botmux list` 或 `zmx attach`。',
   'card.action.local_terminal_opened': '💻 已请求打开本机 {cliName}',
-  'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用 Web 终端。',
+  'card.action.local_terminal_unsupported': '⚠️ 当前 {cliName} 会话暂不支持本机直开，请使用该后端支持的终端接入方式。',
   'card.action.local_cli_missing': '⚠️ 本机未找到 {cliName} 可执行文件（{executable}），请先安装或配置 PATH / cliPathOverride。',
   'card.action.local_terminal_failed': '⚠️ 打开本机 CLI 失败：{reason}',
   'card.action.local_terminal_no_permission': '🔒 没有操作权限，无法打开本机 CLI',
@@ -854,6 +859,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.confirm.resume.title': '确认恢复会话？',
   'card.dashboard.sessions.confirm.resume.text': '恢复后将重新创建工作进程并继续会话。会话：{title}',
   'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web 终端端口（未启动或已关闭）',
+  'card.dashboard.sessions.terminal.disabled.unsupported': '当前后端不提供 Web 终端',
   'card.dashboard.sessions.resume.disabled.onlyClosed': '仅可恢复已关闭的会话',
 
   // schedules card (PR3 slice 1)
@@ -1037,9 +1043,9 @@ export const messages: Record<string, string> = {
   'settings.openTerminalInFeishu': '飞书内打开 Web 终端',
   'settings.openTerminalInFeishuHelp': '终端链接默认在飞书 webview 打开。',
   'settings.enableLocalCliOpen': '启用本机 CLI 直开',
-  'settings.enableLocalCliOpenHelp': '默认关闭，仅 macOS daemon 可用。附加模式支持当前 tmux / Herdr 会话，尽量保持同一路 I/O/历史和飞书连续性；resume 模式会另起 CLI resume 进程，可能使飞书侧不再跟随该会话。',
+  'settings.enableLocalCliOpenHelp': '默认关闭，仅 macOS daemon 可用。附加模式支持当前 tmux / Herdr / ZMX 会话并进入同一个 CLI；ZMX 本地 attach 使用原生终端，飞书侧仍为纯文本流。resume 模式会另起 CLI resume 进程，可能使飞书侧不再跟随该会话。',
   'settings.localCliOpenMode': '本机 CLI 打开模式',
-  'settings.localCliOpenModeHelp': '默认附加当前会话：managed tmux / Herdr 走精确 attach，adopt 会话只在已有可靠目标时附加；direct resume 适合明确接受飞书连续性风险的本机调试。',
+  'settings.localCliOpenModeHelp': '默认附加当前会话：managed tmux / Herdr / ZMX 走精确 attach，adopt 会话只在已有可靠目标时附加；ZMX 的原生 attach 不代表 botmux 提供 Web TUI。direct resume 适合明确接受飞书连续性风险的本机调试。',
   'settings.localCliOpenModeAttach': '附加当前会话（推荐）',
   'settings.localCliOpenModeResume': '另起 CLI resume',
   'settings.autoUpdate': '每日自动更新',
@@ -1105,6 +1111,10 @@ export const messages: Record<string, string> = {
   // Worker-side submit / notify messages
   'worker.submit_impossible': '⚠️ 刚才那条消息没有写入 {cliName}，因为当前按键配置无法从终端自动提交。\n原因：{reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。ZMX 不提供 Web 终端；请重发，或在本机运行 botmux list 进入该会话检查。\n开头：{preview}',
+  'worker.interrupt_unconfirmed': '⚠️ 中断键 {key} 连续两次未送达 {cliName}，CLI 可能仍在运行；卡片不会把这次操作标成已停止。{recovery}',
+  'worker.interrupt_recovery_zmx': '请重试；也可在本机运行 botmux list，进入该 ZMX 会话后手动中断。',
+  'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
 

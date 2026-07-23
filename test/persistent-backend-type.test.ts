@@ -18,7 +18,15 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: { backendType: bot.backendType } })),
 }));
 
-import { getSessionPersistentBackendType, resolvePairedSpawnBackendType, resolveSpawnBackendType, shutdownBackendDisposition } from '../src/core/persistent-backend.js';
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import {
+  getSessionPersistentBackendType,
+  killPersistentSession,
+  probePersistentSessions,
+  resolvePairedSpawnBackendType,
+  resolveSpawnBackendType,
+  shutdownBackendDisposition,
+} from '../src/core/persistent-backend.js';
 
 function ds(opts: { initBackend?: string; sessionBackend?: string }): any {
   return {
@@ -33,6 +41,11 @@ describe('getSessionPersistentBackendType', () => {
 
   it('prefers the live worker initConfig backend', () => {
     expect(getSessionPersistentBackendType(ds({ initBackend: 'tmux', sessionBackend: 'zellij' }))).toBe('tmux');
+  });
+
+  it('keeps the running persistent backend authoritative after bot config hot-switches to PTY', () => {
+    bot.backendType = 'pty';
+    expect(getSessionPersistentBackendType(ds({ initBackend: 'zmx', sessionBackend: 'zmx' }))).toBe('zmx');
   });
 
   it('falls back to the backend stamped on the persisted session', () => {
@@ -54,7 +67,6 @@ describe('getSessionPersistentBackendType', () => {
     expect(getSessionPersistentBackendType(ds({ initBackend: 'pty' }))).toBeUndefined();
   });
 });
-
 // ── Freeze-once (PR #397) — cover the ACTUAL call sites, not just the helper.
 // These test the two tiny functions production now calls (worker-pool forkWorker
 // via resolveSpawnBackendType, daemon shutdown via shutdownBackendDisposition), so
@@ -92,5 +104,53 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
   it('closes a frozen pty session even after the bot flips to herdr (never detaches a pane it never had)', () => {
     bot.backendType = 'herdr';
     expect(shutdownBackendDisposition(ds({ sessionBackend: 'pty' }))).toBe('close');
+  });
+});
+
+describe('probePersistentSessions', () => {
+  it('classifies all ZMX names from one full-list snapshot', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({
+      ok: true,
+      sessions: ['bmx-live'],
+      unhealthySessions: ['bmx-timeout'],
+      raw: '',
+    });
+
+    expect([...probePersistentSessions('zmx', [
+      'bmx-live',
+      'bmx-timeout',
+      'bmx-missing',
+      'bmx-live',
+    ])]).toEqual([
+      ['bmx-live', 'exists'],
+      ['bmx-timeout', 'unknown'],
+      ['bmx-missing', 'missing'],
+    ]);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockRestore();
+  });
+
+  it('keeps every ZMX name unknown when the shared snapshot fails', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({ ok: false });
+    expect([...probePersistentSessions('zmx', ['bmx-a', 'bmx-b']).values()]).toEqual([
+      'unknown',
+      'unknown',
+    ]);
+    expect(probe).toHaveBeenCalledTimes(1);
+    probe.mockRestore();
+  });
+});
+
+describe('killPersistentSession ZMX ownership fence', () => {
+  it('refuses name-only deletion and delegates the complete UUID to the managed kill', () => {
+    expect(() => killPersistentSession('zmx', 'bmx-abcdef12')).toThrow(/name-only ZMX kill/);
+
+    const kill = vi.spyOn(ZmxBackend, 'killManagedSession').mockImplementation(() => {});
+    killPersistentSession('zmx', 'bmx-abcdef12', 'abcdef12-1111-2222-3333-444444444444');
+    expect(kill).toHaveBeenCalledWith(
+      'bmx-abcdef12',
+      'abcdef12-1111-2222-3333-444444444444',
+    );
+    kill.mockRestore();
   });
 });

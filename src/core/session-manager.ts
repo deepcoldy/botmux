@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, forkAdoptWorker, killStalePids, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionIfActive, setActiveSessionSafe, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -21,7 +21,15 @@ import {
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
 } from '../skills/injection-mode.js';
-import { getSessionPersistentBackendType, persistentSessionName, probePersistentSession, probePersistentBackendServer, killPersistentSession, type PersistentBackendType } from './persistent-backend.js';
+import {
+  getSessionPersistentBackendType,
+  persistentSessionName,
+  probePersistentBackendServer,
+  probePersistentSession,
+  probePersistentSessions,
+  killPersistentSession,
+  type PersistentBackendType,
+} from './persistent-backend.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -36,8 +44,9 @@ import {
   type Coworker,
 } from './session-create.js';
 import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
-import type { BackendType } from '../adapters/backend/types.js';
-import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, SubstituteTrigger } from '../types.js';
+import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
+import type { CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
@@ -97,9 +106,11 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   return null;
 }
 
-async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boolean> {
+type CliMismatchCloseResult = 'not_mismatched' | 'closed' | 'teardown_failed';
+
+async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
   const mismatch = sessionBotCliMismatch(ds);
-  if (!mismatch) return false;
+  if (!mismatch) return 'not_mismatched';
 
   const tag = ds.session.sessionId.substring(0, 8);
   const backendType = getSessionPersistentBackendType(ds);
@@ -110,12 +121,25 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<boole
   if (backendType && (!ds.worker || ds.worker.killed)) {
     const backendName = persistentSessionName(backendType, ds.session.sessionId);
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session and killing ${backendType} ${backendName}`);
-    killPersistentSession(backendType, backendName);
+    try {
+      killPersistentSession(backendType, backendName, ds.session.sessionId);
+    } catch (err) {
+      // ZMX destruction is deliberately identity-verified and can fail on an
+      // inconclusive probe or a generation change. Never close the persisted
+      // row in that state: doing so would orphan a possibly-live CLI with no
+      // retryable ownership record. The caller skips this row and continues
+      // restoring/sweeping unrelated sessions.
+      logger.error(
+        `[${tag}] CLI mismatch backing teardown failed; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 'teardown_failed';
+    }
   } else {
     logger.warn(`[${tag}] CLI mismatch (session=${mismatch.sessionCli}, bot=${mismatch.botCli}), closing active session`);
   }
   await closeSession(ds.session.sessionId);
-  return true;
+  return 'closed';
 }
 
 /**
@@ -137,7 +161,14 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
-    if (await closeActiveSessionIfCliMismatch(ds)) closed++;
+    try {
+      if (await closeActiveSessionIfCliMismatch(ds) === 'closed') closed++;
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return closed;
 }
@@ -1137,7 +1168,7 @@ export function rememberLastCliInput(
 
 /**
  * Whether daemon restore should eagerly re-fork a worker to re-attach a
- * surviving backing pane. True for every persistent backend (tmux/herdr/zellij);
+ * surviving backing pane. True for every persistent backend (tmux/herdr/zellij/zmx);
  * the pty backend has nothing to re-attach to, so it stays lazy.
  *
  * Eager re-attach is what makes a session actually come back after a restart —
@@ -1184,7 +1215,18 @@ export async function staggeredRecoveryFork(
 
 export async function restoreActiveSessions(activeSessions: Map<string, DaemonSession>): Promise<void> {
   const sessions = sessionStore.listSessions();
-  const active = sessions.filter(s => s.status === 'active');
+  const restorePriority = (session: Session): number => {
+    if (session.adoptedFrom || session.cliId || session.lastCliInput || session.backendType) return 2;
+    if (session.queued) return 1;
+    return 0; // disposable daemon-command scratch
+  };
+  // Deterministic winner policy for corrupt/legacy same-anchor duplicates:
+  // real CLI/adopt rows first, queued intent second, command scratches last.
+  // Registration itself is CAS, so a fresh runtime occupant always wins over
+  // every startup candidate regardless of this disk ordering.
+  const active = sessions
+    .filter(s => s.status === 'active')
+    .sort((a, b) => restorePriority(b) - restorePriority(a));
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
@@ -1192,11 +1234,33 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   }
 
   // Kill any stale CLI processes from previous daemon run
-  killStalePids(active);
+  // Dispatcher/IPC are already live while restore runs. Pass the runtime map
+  // so the stale-PID sweep cannot kill a fresh worker that won the startup
+  // race for the same logical session. The full snapshot still reaches backend
+  // cleanup, preserving its backing-session name as active.
+  killStalePids(active, activeSessions);
 
   logger.info(`Registering ${active.length} active session(s) (no CLI spawn until new messages arrive)...`);
+  const runtimeWinnerFor = (sessionId: string, candidate?: DaemonSession): DaemonSession | undefined =>
+    [...activeSessions.values()].find(ds => ds !== candidate && ds.session.sessionId === sessionId);
+  // Persistent recovery below must only inspect rows registered by THIS
+  // restore pass. The dispatcher/IPC are already live and may add a fresh
+  // runtime session while one of the CAS registrations awaits; sweeping the
+  // whole live Map would then mistake that new session for a startup snapshot
+  // row and could close it while its backing pane is still being created.
+  const restoredByThisInvocation: DaemonSession[] = [];
+  const stillOwnsRestoreRegistration = (ds: DaemonSession): boolean =>
+    ds.session.status === 'active'
+    && activeSessions.get(activeSessionKey(ds)) === ds;
 
   for (const session of active) {
+    // Dispatcher/IPC may create and register this exact persisted row while
+    // startup restore is running. The runtime object is authoritative; never
+    // rebuild or later close it as a collision loser.
+    if (runtimeWinnerFor(session.sessionId)) {
+      logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
+      continue;
+    }
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1259,9 +1323,21 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // Same-key collision guard: if a prior iteration already set an entry
       // at this key (legitimately possible if disk holds two active sessions
       // resolving to the same chat-scope key — e.g. a leaked scratch +
-      // relayed real session from a prior buggy run), close the loser
-      // rather than silently overwriting it.
-      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      // relayed real session from a prior buggy run), reject and close the
+      // incoming loser rather than silently overwriting the runtime winner.
+      const adoptKey = activeSessionKey(ds);
+      const adoptRegistered = await setActiveSessionSafe(activeSessions, adoptKey, ds);
+      const adoptCurrent = activeSessions.get(adoptKey);
+      if (runtimeWinnerFor(session.sessionId, ds)) {
+        logger.debug(`[${session.sessionId.substring(0, 8)}] Live runtime won adopt restore registration`);
+        continue;
+      }
+      if (!adoptRegistered || session.status !== 'active' || adoptCurrent !== ds) {
+        logger.warn(`[${session.sessionId.substring(0, 8)}] Adopt restore was cancelled while resolving a routing collision`);
+        await closeSession(session.sessionId);
+        continue;
+      }
+      restoredByThisInvocation.push(ds);
       announceSessionRow(ds);
       forkAdoptWorker(ds, { restoredFromMetadata: true });
       logger.info(`[${session.sessionId.substring(0, 8)}] Restored adopt session (target: ${adoptTargetLabel(adopted)}, scope: ${scope})`);
@@ -1303,7 +1379,19 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       };
       const anchor = sessionAnchorId(ds);
       messageQueue.ensureQueue(anchor);
-      await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+      const queuedKey = activeSessionKey(ds);
+      const queuedRegistered = await setActiveSessionSafe(activeSessions, queuedKey, ds);
+      const queuedCurrent = activeSessions.get(queuedKey);
+      if (runtimeWinnerFor(session.sessionId, ds)) {
+        logger.debug(`[${session.sessionId.substring(0, 8)}] Live runtime won queued restore registration`);
+        continue;
+      }
+      if (!queuedRegistered || session.status !== 'active' || queuedCurrent !== ds) {
+        logger.warn(`[${session.sessionId.substring(0, 8)}] Queued restore was cancelled while resolving a routing collision`);
+        await closeSession(session.sessionId);
+        continue;
+      }
+      restoredByThisInvocation.push(ds);
       // 重启后把待办池卡片重新广播给 dashboard，否则会从看板消失（#277 同款修复，
       // 我这条 queued 分支提前 continue 绕过了下面的 announceSessionRow，要自己补）。
       announceSessionRow(ds);
@@ -1356,7 +1444,23 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         // instead of resurrecting an invisible worker.
         const backendType = getSessionPersistentBackendType(ds);
         if (backendType) {
-          killPersistentSession(backendType, persistentSessionName(backendType, session.sessionId));
+          try {
+            killPersistentSession(
+              backendType,
+              persistentSessionName(backendType, session.sessionId),
+              session.sessionId,
+            );
+          } catch (err) {
+            // Keep the row active when destruction cannot be proved. Closing it
+            // would strand a possibly-live hidden run with no ownership record;
+            // skipping registration also prevents this restore pass from
+            // accidentally reattaching it. Continue with the remaining rows.
+            logger.error(
+              `[${session.sessionId.substring(0, 8)}] Could not tear down unmaterialized deferred run; keeping active row: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+            continue;
+          }
         }
         sessionStore.closeSession(session.sessionId);
         removeDeferredTopicBinding(config.session.dataDir, session.sessionId);
@@ -1374,12 +1478,43 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       ds.replyThreadAliases = aliases;
       sessionStore.updateSession(session);
     }
-    if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    try {
+      const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
+      if (mismatchClose !== 'not_mismatched') continue;
+    } catch (err) {
+      logger.error(
+        `[${session.sessionId.substring(0, 8)}] CLI mismatch close failed during restore; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
-    await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
+    const restoreKey = activeSessionKey(ds);
+    const restored = await setActiveSessionSafe(activeSessions, restoreKey, ds);
+    const restoreCurrent = activeSessions.get(restoreKey);
+    if (runtimeWinnerFor(session.sessionId, ds)) {
+      logger.debug(`[${session.sessionId.substring(0, 8)}] Live runtime won restore registration`);
+      continue;
+    }
+    if (!restored || session.status !== 'active' || restoreCurrent !== ds) {
+      logger.warn(`[${session.sessionId.substring(0, 8)}] Restore was cancelled while resolving a routing collision`);
+      try {
+        await closeSession(session.sessionId);
+      } catch (err) {
+        // A rejected ZMX ownership/generation probe means teardown was not
+        // proven. Keep the persisted row active for a later retry and continue
+        // restoring unrelated sessions instead of crash-looping daemon boot.
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Could not close restore collision loser; keeping active row: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      continue;
+    }
+    restoredByThisInvocation.push(ds);
     announceSessionRow(ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
@@ -1390,6 +1525,42 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   // actual re-fork is deferred into `toReattach` and staggered below so a box
   // with dozens of surviving sessions doesn't spike on restart.
   const toReattach: DaemonSession[] = [];
+  const restoreCandidates: Array<{
+    ds: DaemonSession;
+    backendType: PersistentBackendType;
+    backendName: string;
+  }> = [];
+  const namesByBackend = new Map<PersistentBackendType, Set<string>>();
+  for (const ds of restoredByThisInvocation) {
+    // A later restore CAS awaited after this row was registered. During that
+    // yield the user may have closed/resumed/replaced it; never carry the stale
+    // object into a session-id based close that could hit its fresh successor.
+    // A real message may also have synchronously forked this exact ds while the
+    // registration Promise yielded. Its backing pane can still be starting, so
+    // a missing probe is not zombie evidence and restore must leave it alone.
+    if (!stillOwnsRestoreRegistration(ds) || ds.worker) continue;
+    // External /adopt sessions use their discovered source target rather than
+    // Botmux's deterministic managed backing name. They were already restored
+    // through the adopt path above and must not enter the managed probe batch.
+    if (ds.adoptedFrom) continue;
+    // Queued（待办池）会话从没起过 CLI，没有任何后端会话——别去探它，否则 tmux 后端
+    // 会把「找不到 backing」误判成僵尸而关掉它。
+    if (ds.session.queued) continue;
+    const backendType = getSessionPersistentBackendType(ds);
+    if (!backendType || !shouldAutoForkOnRestore(backendType)) continue;
+    const backendName = persistentSessionName(backendType, ds.session.sessionId);
+    restoreCandidates.push({ ds, backendType, backendName });
+    const names = namesByBackend.get(backendType) ?? new Set<string>();
+    names.add(backendName);
+    namesByBackend.set(backendType, names);
+  }
+  // ZMX/Zellij can classify every requested name from one control-plane list.
+  // This is both a consistent restore snapshot and avoids an O(N²) ZMX restart
+  // when each per-row probe would otherwise scan every per-session daemon.
+  const probeSnapshots = new Map<PersistentBackendType, ReadonlyMap<string, SessionProbe>>();
+  for (const [backendType, names] of namesByBackend) {
+    probeSnapshots.set(backendType, probePersistentSessions(backendType, names));
+  }
   // Server-liveness is sampled ONCE per backend type (cached): a single
   // `tmux list-sessions` answers for all of that backend's sessions, and a
   // consistent snapshot avoids a mid-loop race where an early lazy fork could
@@ -1400,21 +1571,13 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     if (s === undefined) { s = probePersistentBackendServer(bt); serverStateCache.set(bt, s); }
     return s;
   };
-  for (const [, ds] of activeSessions) {
-    // Queued（待办池）会话从没起过 CLI，没有任何后端会话——别去探它，否则 tmux 后端
-    // 会把「找不到 backing」误判成僵尸而关掉它。
-    if (ds.session.queued) continue;
-    // External /adopt sessions were already validated and re-forked above
-    // against their real tmux/zellij target. They never own Botmux's
-    // deterministic bmx-<sessionId> backing session, so probing that name here
-    // would immediately zombie-close the session we just restored.
-    if (ds.adoptedFrom) continue;
-    const backendType = getSessionPersistentBackendType(ds);
-    if (!backendType) continue;
-    if (!shouldAutoForkOnRestore(backendType)) continue;
-
-    const backendName = persistentSessionName(backendType, ds.session.sessionId);
-    const probe = probePersistentSession(backendType, backendName);
+  for (const { ds, backendType, backendName } of restoreCandidates) {
+    // An earlier candidate's mismatch close can await document cleanup, so
+    // revalidate exact ownership and worker state for every row before any
+    // destructive action. A message can wake a later candidate during that
+    // await, while its persistent backing is still being created.
+    if (!stillOwnsRestoreRegistration(ds) || ds.worker) continue;
+    const probe = probeSnapshots.get(backendType)?.get(backendName) ?? 'unknown';
     if (probe === 'missing') {
       const tag = ds.session.sessionId.substring(0, 8);
       // Intentionally cold-resume-suspended (idle-worker sweeper killed the
@@ -1424,6 +1587,14 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // (forkWorker(resume=true) clears the marker once the worker is back).
       if (ds.session.suspendedColdResume) {
         logger.info(`[${tag}] ${backendType} session was cap-suspended — keeping active for lazy cold-resume`);
+        continue;
+      }
+      // ZMX is not a shared multiplexer server: every session owns an
+      // independent daemon. Another live ZMX session says nothing about this
+      // one, so "missing" cannot safely drive a destructive zombie close.
+      // Preserve the transcript-backed row and cold-resume on the next message.
+      if (backendType === 'zmx') {
+        logger.warn(`[${tag}] zmx backing session "${backendName}" is missing — keeping active for lazy resume`);
         continue;
       }
       // 'missing' is ambiguous: it means EITHER this one pane is gone while the
@@ -1461,7 +1632,16 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // check on the reattach path too — persistent-backend reattach ignores the
     // bin/args handed to backend.spawn(), so anything that slips through here
     // would silently resurrect the old frozen CLI.
-    if (await closeActiveSessionIfCliMismatch(ds)) continue;
+    try {
+      const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
+      if (mismatchClose !== 'not_mismatched') continue;
+    } catch (err) {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed during reattach; keeping active row: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      continue;
+    }
 
     const tag = ds.session.sessionId.substring(0, 8);
     logger.info(`[${tag}] ${backendType} session alive, queued for re-attach`);
@@ -1497,6 +1677,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
  * only the first forks; the rest just await the same `ds.workerPort`.
  */
 export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<number | undefined> {
+  const frozenBackendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (frozenBackendType !== undefined && !backendSupportsWebTerminal(frozenBackendType)) {
+    return undefined;
+  }
   if (ds.workerPort) return ds.workerPort;
   if (ds.session.status !== 'active') return undefined;
 
@@ -1547,12 +1731,13 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          manual resume could resurrect a stale member epoch
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
+ *   - 'resume_cancelled' — a concurrent close won while resume was committing
  */
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'vc_receiver_managed' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
   const session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -1605,10 +1790,14 @@ export async function resumeSession(
   // throwaway command container, so clobbering it would lose real intent.
   const existing = activeSessions.get(key);
   if (existing) {
-    if (isRelayableRealSession(existing) || existing.pendingRepo) {
+    if (!isDisposableCommandScratch(existing)) {
       return { ok: false, error: 'anchor_occupied', activeSessionId: existing.session.sessionId };
     }
     await closeSession(existing.session.sessionId);
+    const replacement = activeSessions.get(key);
+    if (replacement) {
+      return { ok: false, error: 'anchor_occupied', activeSessionId: replacement.session.sessionId };
+    }
   }
 
   // Belt-and-suspenders: also scan persisted sessions for any *other* active
@@ -1643,12 +1832,22 @@ export async function resumeSession(
     && (s.scope === 'chat' ? 'chat' : 'thread') === scope
     && storedSessionAnchorId(s) === anchor,
   );
-  const realConflict = conflicts.find(s => !!s.cliId || !!s.lastCliInput);
+  const realConflict = conflicts.find(s =>
+    !!s.cliId || !!s.lastCliInput || !!s.backendType || !!s.adoptedFrom || s.queued === true,
+  );
   if (realConflict) {
     return { ok: false, error: 'anchor_occupied', activeSessionId: realConflict.sessionId };
   }
   for (const scratch of conflicts) {
     await closeSession(scratch.sessionId);
+  }
+  const replacementAfterDiskCleanup = activeSessions.get(key);
+  if (replacementAfterDiskCleanup) {
+    return {
+      ok: false,
+      error: 'anchor_occupied',
+      activeSessionId: replacementAfterDiskCleanup.session.sessionId,
+    };
   }
 
   // Reactivate in store — clear closedAt so dashboard rows don't keep showing
@@ -1689,9 +1888,17 @@ export async function resumeSession(
 
   messageQueue.ensureQueue(anchor);
   // setActiveSessionSafe over a bare Map.set: the scratch-eviction above
-  // should already have freed `key`, but if any occupant remains it closes
-  // it rather than silently orphaning it (consistent with restore/transfer).
-  await setActiveSessionSafe(activeSessions, key, ds);
+  // should already have freed `key`, but its compare-and-set gate lets any
+  // concurrent runtime occupant win rather than silently orphaning it.
+  const registered = await setActiveSessionSafe(activeSessions, key, ds);
+  if (!registered || session.status !== 'active' || activeSessions.get(key) !== ds) {
+    const occupant = activeSessions.get(key);
+    if (session.status === 'active') await closeSession(sessionId);
+    if (occupant && occupant !== ds) {
+      return { ok: false, error: 'anchor_occupied', activeSessionId: occupant.session.sessionId };
+    }
+    return { ok: false, error: 'resume_cancelled' };
+  }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
   return { ok: true, ds };
 }
@@ -2029,7 +2236,10 @@ export async function executeScheduledTask(
   }
   ensureSessionWhiteboard(ds);
   const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  if (!setActiveSessionIfActive(activeSessions, sessionKey(anchor, larkAppId), ds)) {
+    await closeSession(session.sessionId);
+    return;
+  }
   rememberLastCliInput(ds, task.prompt, prompt);
   if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
   try {
@@ -2276,7 +2486,10 @@ export async function spawnDashboardSession(
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: args.attachments,
   };
-  activeSessions.set(sessionKey(anchor, larkAppId), ds);
+  if (!setActiveSessionIfActive(activeSessions, sessionKey(anchor, larkAppId), ds)) {
+    await closeSession(session.sessionId);
+    return { ok: false, error: 'session_exists' };
+  }
 
   if (column === 'backlog') {
     // Parked：不起 CLI。手动广播 session.spawned，让 dashboard 立刻显示待办池卡片

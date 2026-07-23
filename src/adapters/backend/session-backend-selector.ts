@@ -4,6 +4,7 @@ import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
+import { ZmxBackend } from './zmx-backend.js';
 import type { BackendType, SessionBackend } from './types.js';
 
 export type BackendGateDecision =
@@ -11,7 +12,7 @@ export type BackendGateDecision =
   | { action: 'gate'; reason: string };
 
 /**
- * Hard gate (PTY 退役): a requested *persistent* backend (tmux/herdr/zellij)
+ * Hard gate (PTY 退役): a requested *persistent* backend (tmux/herdr/zellij/zmx)
  * that isn't functional on this host no longer silently degrades to raw PTY.
  * That silent fallback was the root of the "secretly running on PTY, then
  * hitting all of PTY's problems (no survival across daemon restart, etc.)"
@@ -22,12 +23,11 @@ export type BackendGateDecision =
  * and is always allowed straight through.
  *
  * `hasExistingSession` lets an already-running persistent session reattach
- * regardless of a transient probe failure (a disposable "can we start a new
- * server?" probe is far less authoritative than a live session — see PR#249):
+ * regardless of a transient functional-probe failure (the known live session
+ * is more authoritative than a separate capability check — see PR#249):
  * abandoning it would spawn a duplicate CLI and orphan the real conversation.
- * The caller computes it only for backends whose probe is a disposable
- * session (tmux, zellij); herdr's probe is a cheap non-destructive
- * `herdr --version`, so it passes `hasExistingSession: false`.
+ * tmux/zellij capability probes use disposable sessions; ZMX checks its
+ * version and full-list control plane; Herdr uses `herdr --version`.
  */
 export function decideBackendGate(opts: {
   requested: BackendType;
@@ -45,6 +45,8 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
   const installHint =
     backend === 'tmux'
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
+      : backend === 'zmx'
+        ? '需要包含 PR #202 send 行为的 zmx >= 0.7.1；当前官方 0.6.0 尚不满足，请等待对应正式版'
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,
@@ -52,6 +54,38 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
     `请安装/修复后重试 —— ${installHint}`,
     `（如确需在没有 ${backend} 的环境运行，可显式设置环境变量 BACKEND_TYPE=pty 用 PTY 后端兜底；` +
       `但 PTY 会话不跨 daemon 重启存活，仅作应急。）`,
+  ].join('\n');
+}
+
+/**
+ * ZMX owns the child PTY inside its per-session daemon, outside botmux's
+ * bwrap/Seatbelt launch wrapper. Until ZMX can enforce the same filesystem
+ * boundary, a requested sandbox must fail closed instead of silently running
+ * the CLI with broader access than configured.
+ */
+export function backendSandboxCompatibilityError(opts: {
+  backendType: BackendType;
+  fileSandboxRequested: boolean;
+  /** True only when the legacy standalone readIsolation flag is effective
+   * on this host. The raw config value is intentionally not accepted here:
+   * on Linux that legacy flag is a no-op unless the unified sandbox is on. */
+  effectiveReadIsolationRequested: boolean;
+}): string | undefined {
+  if (
+    opts.backendType === 'zmx' &&
+    (opts.fileSandboxRequested || opts.effectiveReadIsolationRequested)
+  ) {
+    return 'backend "zmx" does not support file/read isolation; use tmux/pty or disable sandbox for this bot';
+  }
+  return undefined;
+}
+
+/** Actionable card shown before an incompatible ZMX/isolation launch fails. */
+export function backendSandboxCompatibilityUserMessage(reason: string): string {
+  return [
+    '⚠️ ZMX 当前无法执行 botmux 的文件沙盒或读隔离，已拒绝启动以避免未隔离运行。',
+    `原因：${reason}`,
+    '请将该 bot 的 backendType 改为 tmux / pty，或关闭 sandbox（含全局 BOTMUX_SANDBOX）及 macOS 上独立生效的 readIsolation 后重试。',
   ].join('\n');
 }
 
@@ -65,7 +99,12 @@ export interface SelectedSessionBackend {
   isZellijMode: boolean;
 }
 
-export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig }): SelectedSessionBackend {
+export function selectSessionBackend(opts: {
+  sessionId: string;
+  backendType: BackendType;
+  backendConfig?: RiffBackendConfig;
+  hasExistingSession?: boolean;
+}): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
@@ -74,6 +113,24 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       backend: new RiffBackend(opts.backendConfig, opts.sessionId),
       isTmuxMode: false,
       isPipeMode: false,
+      isZellijMode: false,
+    };
+  }
+
+  if (opts.backendType === 'zmx') {
+    const sessionName = ZmxBackend.sessionName(opts.sessionId);
+    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName);
+    return {
+      backend: new ZmxBackend(sessionName, {
+        ownsSession: true,
+        isReattach: reattach,
+        sessionId: opts.sessionId,
+      }),
+      isTmuxMode: false,
+      // ZMX is observed out-of-band (`zmx tail`) and driven independently
+      // (`zmx send`), matching the worker's pipe-backend data path rather than
+      // a bidirectional PTY attach client.
+      isPipeMode: true,
       isZellijMode: false,
     };
   }

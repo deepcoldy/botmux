@@ -66,6 +66,11 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
+    if (map.has(k) && map.get(k) !== ds) return false;
+    map.set(k, ds);
+    return true;
+  }),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
   getActiveSessionsRegistry: vi.fn(() => null),
   isRelayableRealSession: vi.fn(() => false),

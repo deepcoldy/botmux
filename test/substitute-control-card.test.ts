@@ -2,7 +2,8 @@
  * Integration test: substitute-mode owner control card delivery.
  *
  * When a substitute-mode (分身) session's worker reports ready, the worker-pool
- * automatically DMs a writable-terminal control card to the bot's owner(s).
+ * automatically DMs a control card to the bot's owner(s). Web-capable backends
+ * include a writable terminal; ZMX receives manage-only controls.
  *
  * Scenarios covered:
  *   1. Substitute session → DM sent to each owner with a writable-terminal card.
@@ -156,6 +157,28 @@ describe('deliverSubstituteControlCard', () => {
     expect(ds.session.substituteControlCardSent).toBe(true);
     expect(updateSessionCalls).toHaveLength(1);
     expect(updateSessionCalls[0].substituteControlCardSent).toBe(true);
+  });
+
+  it('DMs a manage-only control card for ZMX without a Web Terminal', async () => {
+    botState.resolvedAllowedUsers = ['ou_owner1'];
+    const ds = makeDs({
+      session: makeSession({ backendType: 'zmx' }),
+      workerPort: null,
+      workerToken: null,
+    });
+
+    const result = await deliverSubstituteControlCard(ds);
+
+    expect(result).toEqual({ sent: 1, total: 1 });
+    expect(sendUserMessageCalls).toHaveLength(1);
+    expect(JSON.parse(sendUserMessageCalls[0].cardJson)).toMatchObject({
+      type: 'session',
+      url: '',
+      showManageButtons: true,
+      adoptMode: false,
+    });
+    expect(ds.session.substituteControlCardSent).toBe(true);
+    expect(updateSessionCalls).toHaveLength(1);
   });
 
   it('skips when the persistent sent flag is already set', async () => {

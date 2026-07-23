@@ -64,6 +64,7 @@ vi.mock('../src/services/session-store.js', () => ({
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   killWorker: vi.fn(),
+  teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   scheduleCardPatch: vi.fn(),
   parkStreamCard: vi.fn(),
   clearUsageLimitState: vi.fn(),
@@ -124,7 +125,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { forkWorker, killWorker, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
+import { forkWorker, killWorker, teardownAuthoritativePersistentBackingBeforeClose, deliverEphemeralOrReply, deliverWriteLinkCard } from '../src/core/worker-pool.js';
 import { buildNewTopicCliInput, getAvailableBots, getSessionWorkingDir } from '../src/core/session-manager.js';
 import { getBot } from '../src/bot-registry.js';
 import { createSession, closeSession, updateSession } from '../src/services/session-store.js';
@@ -236,6 +237,7 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
   vi.mocked(getBot).mockImplementation(() => ({
     config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
@@ -656,6 +658,31 @@ describe('repo select card — plain switch', () => {
     expect(closedCard).not.toContain('beta');
     expect(ds.repoCardMessageId).toBeUndefined();
     expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('keeps the old ZMX session and repo card active when authoritative teardown is refused', async () => {
+    const ds = makeDs();
+    ds.session.backendType = 'zmx';
+    ds.session.workingDir = '/repos/gamma';
+    const oldSession = ds.session;
+    const { deps, sessionReply } = makeDeps(ds);
+    vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementationOnce(() => {
+      throw new Error('ownership probe unavailable');
+    });
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(teardownAuthoritativePersistentBackingBeforeClose).toHaveBeenCalledWith(ds);
+    expect(killWorker).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(createSession).not.toHaveBeenCalled();
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(ds.session).toBe(oldSession);
+    expect(ds.session.status).toBe('active');
+    expect(ds.session.workingDir).toBe('/repos/gamma');
+    expect(ds.repoCardMessageId).toBe('om_card');
+    expect(ds.consumedRepoCardMessageIds).toBeUndefined();
+    expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('ownership probe unavailable');
   });
 
   it('mid-session claims the card before confirm await so a second click cannot double kill/fork', async () => {

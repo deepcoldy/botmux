@@ -7,7 +7,10 @@ vi.mock('../src/services/session-store.js', () => ({
 
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
-import { updateSessionTitle } from '../src/core/session-title.js';
+import {
+  normalizeSessionTitleSource,
+  updateSessionTitle,
+} from '../src/core/session-title.js';
 
 function makeSession(): Session {
   return {
@@ -23,25 +26,39 @@ function makeSession(): Session {
 describe('updateSessionTitle', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('normalizes, persists, and publishes one dashboard patch', () => {
+  it('normalizes, persists, and publishes one dashboard patch with title metadata', () => {
     const session = makeSession();
     const events: DashboardEvent[] = [];
     const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+    let result;
 
     try {
-      expect(updateSessionTitle(session, '  First line\n  Second line  ')).toEqual({
-        ok: true,
-        title: 'First line Second line',
-      });
+      result = updateSessionTitle(session, '  First line\n  Second line  ', 'agent');
     } finally {
       unsubscribe();
     }
 
-    expect(session.title).toBe('First line Second line');
+    expect(result).toMatchObject({
+      ok: true,
+      title: 'First line Second line',
+      source: 'agent',
+    });
+    expect(session).toMatchObject({
+      title: 'First line Second line',
+      titleSource: 'agent',
+      titleUpdatedAt: expect.any(String),
+    });
     expect(sessionStore.updateSession).toHaveBeenCalledWith(session);
     expect(events).toEqual([{
       type: 'session.update',
-      body: { sessionId: 'session-1', patch: { title: 'First line Second line' } },
+      body: {
+        sessionId: 'session-1',
+        patch: {
+          title: 'First line Second line',
+          titleUpdatedAt: session.titleUpdatedAt,
+          titleSource: 'agent',
+        },
+      },
     }]);
   });
 
@@ -51,7 +68,10 @@ describe('updateSessionTitle', () => {
     const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
 
     try {
-      expect(updateSessionTitle(session, '   ')).toEqual({ ok: false, error: 'bad_title' });
+      expect(updateSessionTitle(session, '   ', 'dashboard')).toEqual({
+        ok: false,
+        error: 'bad_title',
+      });
     } finally {
       unsubscribe();
     }
@@ -59,6 +79,11 @@ describe('updateSessionTitle', () => {
     expect(session.title).toBe('Old title');
     expect(sessionStore.updateSession).not.toHaveBeenCalled();
     expect(events).toEqual([]);
+  });
+
+  it('normalizes untrusted source labels to the caller fallback', () => {
+    expect(normalizeSessionTitleSource('agent', 'dashboard')).toBe('agent');
+    expect(normalizeSessionTitleSource('spoofed', 'dashboard')).toBe('dashboard');
   });
 
   it('keeps the canonical dashboard title separate from temporary TUI prompt labels', async () => {

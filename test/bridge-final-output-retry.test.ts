@@ -14,6 +14,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
+const replyToDocCommentMock = vi.fn(async () => {});
+const removeCommentReactionMock = vi.fn(async () => {});
+const updateSessionMock = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
@@ -24,6 +27,13 @@ vi.mock('../src/im/lark/client.js', () => ({
   MessageWithdrawnError: class MessageWithdrawnError extends Error {
     constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
   },
+}));
+
+vi.mock('../src/im/lark/doc-comment.js', () => ({
+  replyToDocComment: (...args: any[]) => replyToDocCommentMock(...args),
+  chunkCommentText: vi.fn((content: string) => [content]),
+  unsubscribeDocFile: vi.fn(async () => {}),
+  removeCommentReaction: (...args: any[]) => removeCommentReactionMock(...args),
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -57,7 +67,7 @@ vi.mock('../src/config.js', () => ({
 
 vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
-  updateSession: vi.fn(),
+  updateSession: (...args: any[]) => updateSessionMock(...args),
   createSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -1127,6 +1137,101 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(listVcMeetingListenerMessageIds('/tmp/test-sessions', {
       listenerAppId: 'listener-app', meetingId: 'meeting-1', targetChatId: ds.chatId,
     })).toEqual([]);
+  });
+
+  it('recovers a doc-comment destination from persisted per-turn state after restart', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+    ds.session.docCommentTargets = {
+      'turn-1': {
+        fileToken: 'doc-token',
+        fileType: 'docx',
+        commentId: 'comment-1',
+        turnId: 'turn-1',
+        replyId: 'reply-1',
+        reactionId: 'reaction-1',
+      },
+    };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.docCommentTargets).toBeUndefined();
+    expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('consumes doc-comment turn state after posting even when reaction cleanup fails', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    removeCommentReactionMock.mockRejectedValueOnce(new Error('reaction already gone'));
+
+    const ds = makeDs();
+    const target = {
+      fileToken: 'doc-token',
+      fileType: 'docx',
+      commentId: 'comment-1',
+      replyId: 'reply-1',
+      reactionId: 'reaction-1',
+    };
+    ds.docCommentTurns = new Map([['turn-1', target]]);
+    ds.session.docCommentTargets = {
+      'turn-1': { ...target, turnId: 'turn-1' },
+    };
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.docCommentTurns).toBeUndefined();
+    expect(ds.session.docCommentTargets).toBeUndefined();
+    expect(updateSessionMock).toHaveBeenCalledWith(ds.session);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('never posts a fallback card for a doc-native session without a safe comment target', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const ds = makeDs();
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(replyToDocCommentMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
   });
 
   it('retries on transient failure and commits after success', async () => {

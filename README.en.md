@@ -20,7 +20,7 @@
 
 [中文](README.md) | English
 
-**Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards, a web terminal, and zero glue code.**
+**Plug any AI coding CLI into Feishu/Lark — every DM, group or topic gets its own CLI session, with live-streaming cards and, except on the plain-text ZMX backend, a web terminal.**
 
 > 📖 **Full docs** (commands / config / best practices / troubleshooting): **<https://deepcoldy.github.io/botmux/en/>** — this README only covers why and how to get started fast.
 
@@ -53,10 +53,10 @@ Compared to OpenClaw-style approaches built on Agent SDKs:
 | CLI Upgrades | Zero-adaptation automatic benefit | Must track SDK version changes |
 | Memory / Context | Reuses CLI's built-in memory system, improves as the CLI evolves | Must build custom memory system, duplicating CLI-native capabilities |
 | Multi-CLI Support | Many CLIs, switch with one config (Claude Code / Codex / Cursor / Gemini / OpenCode / Antigravity / GitHub Copilot / Kimi Code / Grok Build / Kiro, …) | Tied to a single SDK, cannot switch CLIs |
-| Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync | Usually web chat UI or read-only output |
+| Web Terminal | Interactive full terminal, mobile shortcut toolbar, phone/desktop/Lark tri-screen sync (except on ZMX) | Usually web chat UI or read-only output |
 | Multi-Bot Collaboration | Multiple bots in same group via @mention routing, isolated processes, different CLIs sparring | Usually single bot |
 | Multi-Topic Collaboration | A lead bot auto-splits the task, opens multiple topics, and dispatches several bots to work in parallel (coder + reviewer), with a Lark task list as the shared progress board | Usually manual one-by-one assignment, no unified progress board |
-| Terminal Access | tmux attach directly into the CLI process, same as local dev experience | No direct terminal access |
+| Terminal Access | Local tmux / ZMX attach directly into the CLI process, same as local dev experience | No direct terminal access |
 | Installation | `npm install -g botmux`, 5-min Lark setup | Easy to install, but more configuration needed |
 
 ---
@@ -217,16 +217,16 @@ Then restart the daemon: `botmux restart`.
 
 Each conversation turn gets a live-updating Feishu card — your main window for sensing and driving the CLI from phone/Lark:
 
-- **Live terminal screenshot streamed to the card** (rendered headlessly via xterm into a PNG, faithfully reproducing the CLI's TUI); one-tap "show/hide output", "export text", "page up/down"
+- **Live terminal screenshot streamed to the card** (raw terminal streams are rendered headlessly through xterm to reproduce the CLI's TUI; ZMX instead refreshes from its eventually consistent plain-text `history` screen); one-tap "show/hide output", "export text", "page up/down"
 - **Live status**: Starting → Analyzing → Working / Executing → Idle; marks "limit reached · retryable" when quota runs out
-- **Act right from the card**: open (writable) terminal, 🔑 get write link, restart / close / take over the session, re-send last task
+- **Act right from the card**: backends with a Web Terminal can open it and issue a 🔑 write link; all backends retain their applicable restart / close / takeover / re-send controls
 - **One new card per turn**, the previous one frozen as an archive; after `/relay` moves a session to another group, the old card auto-freezes as an archive
 - **Closing leaves a resumable card** (with the CLI's native resume command) — click back in anytime
 
 
 ### Web Terminal (Interactive)
 
-Each session exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`.
+Every session except a ZMX-backed one exposes a web terminal at `http://<WEB_EXTERNAL_HOST>:<port>`. ZMX does not provide a Web TUI; run `botmux list` or `zmx attach` locally to enter the same CLI.
 
 - When `WEB_EXTERNAL_HOST` is unset or blank, start/restart auto-detects the current non-loopback IPv4 address. To pin a proxy, NAT address, or hostname, set it explicitly in `~/.botmux/.env`. Restarts launched from a botmux session, the Dashboard, or auto-update treat that file as authoritative so the old daemon address cannot leak into the new processes.
 - **Read-only link** — shown on the streaming card in the group thread
@@ -292,6 +292,12 @@ BACKEND_TYPE=pty botmux start
 | `/close` or close button | Destroyed | Terminated (SIGHUP) |
 | CLI exits / crashes | Closes with it | Already exited (auto-restart creates new session) |
 
+### ZMX Session Backend (Explicit Opt-In)
+
+[ZMX](https://github.com/neurosnap/zmx) is a lightweight persistent-session alternative to tmux. botmux uses `tail` as a change signal, `history` as the authoritative plain-text screen, and the corrected `send` for input, while `zmx attach` still opens the same CLI locally. It supports macOS and Linux and is enabled only with an explicit `backendType: "zmx"` or `BACKEND_TYPE=zmx`; botmux never installs or selects it automatically.
+
+This integration treats **zmx 0.7.1** as the first release assumed to contain the `send` behavior from [ZMX PR #202](https://github.com/neurosnap/zmx/pull/202), and requires **zmx >= 0.7.1**. See the [ZMX backend documentation](https://deepcoldy.github.io/botmux/en/zmx) for installation, upgrades, eventually consistent plain-text output, and sandbox / adopt boundaries.
+
 ### Session Adopt
 
 Seamlessly connect Botmux to CLI processes already running in tmux — monitor and interact from your phone via Lark.
@@ -354,6 +360,8 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
   - Create, run, save, and reuse workflows in Lark with natural language or `/workflow`; the v2 Dashboard/Catalog has been retired
 
 <img src="docs/dashboard.png" alt="botmux dashboard" width="800" />
+
+Dashboard `GET /api/sessions` and SSE `GET /events` expose the optional `backendType`, `backendSessionName`, `titleUpdatedAt`, and `titleSource` fields on session rows/events. `backendSessionName` is only a deterministic name derived from the session id; it is **not proof of liveness**. `titleSource` is display/debug metadata, **not an authenticated caller identity**. When `publicReadOnly` is enabled, these two read surfaces are accessible without a token; every mutation, non-allow-listed read, and raw terminal log still requires the current token issued by `botmux dashboard`. If session metadata should not be visible on the network, turn off **Public read-only** in Dashboard settings (or set `BOTMUX_DASHBOARD_PUBLIC_READONLY=false` before the UI has persisted an override) and enforce access with a firewall or reverse proxy.
 
 ---
 

@@ -13,6 +13,7 @@ import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import { isSuspendableBackendType, persistentSessionName } from './persistent-backend.js';
 
 export interface SessionRow {
   sessionId: string;
@@ -41,6 +42,13 @@ export interface SessionRow {
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
   title?: string;
+  titleUpdatedAt?: string;
+  /** Informational only; callers must not treat it as authenticated identity. */
+  titleSource?: Session['titleSource'];
+  /** Backend stamped at spawn time. Exposed so external surfaces can filter zmx/tmux/etc. */
+  backendType?: Session['backendType'];
+  /** Deterministic backing multiplexer name, not proof the session is currently live. */
+  backendSessionName?: string;
   /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
    *  未设置时前端按运行状态推导默认列。 */
   kanbanColumn?: string;
@@ -128,6 +136,12 @@ function directChatDisplayName(s: Session, larkAppId?: string): string | undefin
   return undefined;
 }
 
+function backendSessionNameForRow(s: Session): string | undefined {
+  const backendType = s.backendType;
+  if (s.adoptedFrom || !isSuspendableBackendType(backendType)) return undefined;
+  return persistentSessionName(backendType, s.sessionId);
+}
+
 export function composeRowFromActive(ds: DaemonSession): SessionRow {
   return {
     sessionId: ds.session.sessionId,
@@ -153,6 +167,10 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
     title: ds.session.title,
+    titleUpdatedAt: ds.session.titleUpdatedAt,
+    titleSource: ds.session.titleSource,
+    backendType: ds.session.backendType,
+    backendSessionName: backendSessionNameForRow(ds.session),
     kanbanColumn: ds.session.kanbanColumn,
     kanbanPosition: ds.session.kanbanPosition,
     locked: !!ds.session.locked,
@@ -199,6 +217,10 @@ export function composeRowFromClosed(s: Session): SessionRow {
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
     title: s.title,
+    titleUpdatedAt: s.titleUpdatedAt,
+    titleSource: s.titleSource,
+    backendType: s.backendType,
+    backendSessionName: backendSessionNameForRow(s),
     kanbanColumn: s.kanbanColumn,
     kanbanPosition: s.kanbanPosition,
     locked: !!s.locked,

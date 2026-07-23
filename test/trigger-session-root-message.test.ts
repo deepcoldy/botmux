@@ -57,6 +57,12 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return true;
   },
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
+  setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => {
+    if (map.has(key) && map.get(key) !== ds) return false;
+    map.set(key, ds);
+    return true;
+  },
+  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
 }));
 
 const mockRememberLastCliInput = vi.fn();

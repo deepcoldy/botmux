@@ -1391,6 +1391,7 @@ const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
   { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
   { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
   { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
+  { value: 'zmx', labelKey: 'botDefaults.backendZmx' },
   { value: 'pty', labelKey: 'botDefaults.backendPty' },
 ];
 

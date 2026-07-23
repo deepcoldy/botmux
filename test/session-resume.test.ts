@@ -52,19 +52,26 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
-  // Faithful: mirror the real setActiveSessionSafe — if a DIFFERENT entry
-  // already holds the key, evict it (close) before setting, instead of a
-  // bare overwrite that would mask a lingering occupant.
+  // Faithful compare-and-set registration: a newer/different occupant wins.
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
-    if (prev && prev !== ds) {
-      for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
-    }
+    if (prev && prev !== ds) return false;
     map.set(key, ds);
+    return true;
   }),
   // Real predicate (same logic as production): worker OR persisted CLI markers.
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
+  isDisposableCommandScratch: (ds: any) =>
+    !ds?.worker
+    && !ds?.pendingRepo
+    && ds?.pendingPrompt === undefined
+    && ds?.pendingRawInput === undefined
+    && !ds?.adoptedFrom
+    && !ds?.session?.adoptedFrom
+    && !ds?.session?.queued
+    && !ds?.session?.cliId
+    && !ds?.session?.lastCliInput,
   // Faithful closeSession: actually evict the entry from the live Map (by
   // sessionId, as the real one does via activeSessionsRegistry) AND mark the
   // persisted row closed — so tests verify the eviction MECHANISM, not just
@@ -138,7 +145,13 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
-import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '../src/core/worker-pool.js';
+import {
+  closeSession,
+  forkAdoptWorker,
+  killStalePids,
+  restoreUsageLimitRuntimeState,
+  setActiveSessionSafe,
+} from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
@@ -367,6 +380,39 @@ describe('resumeSession', () => {
       }
     });
 
+    it.each(['queued', 'dormant-real', 'deferred-prompt'] as const)(
+      'blocks on a worker-less %s occupant instead of treating it as scratch',
+      async (kind) => {
+        const chatId = `oc_${kind}`;
+        const closed = makeClosedSession({ chatId, scope: 'chat' });
+        const map = new Map<string, DaemonSession>();
+        const occupant: any = {
+          session: {
+            sessionId: `occupant-${kind}`,
+            cliId: kind === 'dormant-real' ? 'claude-code' : undefined,
+            lastCliInput: undefined,
+            queued: kind === 'queued',
+          },
+          worker: null,
+          pendingRepo: false,
+          pendingPrompt: kind === 'deferred-prompt' ? '' : undefined,
+          chatId,
+          scope: 'chat',
+          larkAppId: 'app_test',
+        };
+        map.set(sessionKey(chatId, 'app_test'), occupant);
+
+        const r = await resumeSession(closed.sessionId, map);
+        expect(r).toEqual({
+          ok: false,
+          error: 'anchor_occupied',
+          activeSessionId: `occupant-${kind}`,
+        });
+        expect(closeSession).not.toHaveBeenCalled();
+        expect(map.get(sessionKey(chatId, 'app_test'))).toBe(occupant);
+      },
+    );
+
     it('does NOT block on a persisted scratch sibling (no cliId / lastCliInput) — closes it and resumes', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_scratch_thread' });
       // Store-only scratch sibling: active, same anchor, but never ran a CLI.
@@ -477,6 +523,173 @@ describe('resumeSession', () => {
       expect(map.get(sessionKey(`vc-receiver:${meetingB.sessionId}`, 'app_test'))?.session.sessionId)
         .toBe(meetingB.sessionId);
       expect(map.size).toBe(3);
+    });
+
+    it('keeps the row closed when a concurrent close cancels resume registration', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_cancel_resume' });
+      vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (_map, _key, ds) => {
+        sessionStore.closeSession(ds.session.sessionId);
+        return false;
+      });
+
+      const r = await resumeSession(closed.sessionId, new Map());
+      expect(r).toEqual({ ok: false, error: 'resume_cancelled' });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    });
+
+    it('restores a real session ahead of an older same-anchor command scratch', async () => {
+      const scratch = sessionStore.createSession('oc_collision', 'om_collision', '/help');
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined;
+      scratch.lastCliInput = undefined;
+      sessionStore.updateSession(scratch);
+
+      const real = sessionStore.createSession('oc_collision', 'om_collision', 'real work');
+      real.larkAppId = 'app_test';
+      real.scope = 'thread';
+      real.cliId = 'claude-code';
+      real.lastCliInput = 'continue';
+      sessionStore.updateSession(real);
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_collision', 'app_test'))?.session.sessionId).toBe(real.sessionId);
+      expect(sessionStore.getSession(scratch.sessionId)?.status).toBe('closed');
+      expect(sessionStore.getSession(real.sessionId)?.status).toBe('active');
+    });
+
+    it('never lets startup restore overwrite a fresh runtime occupant', async () => {
+      const persisted = sessionStore.createSession('oc_runtime', 'om_runtime', 'persisted work');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      sessionStore.updateSession(persisted);
+
+      const fresh: any = {
+        session: { sessionId: 'fresh-runtime', status: 'active', cliId: 'claude-code' },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: 'oc_runtime',
+        scope: 'thread',
+      };
+      const map = new Map<string, DaemonSession>([
+        [sessionKey('om_runtime', 'app_test'), fresh],
+      ]);
+      wp.registry = map;
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_runtime', 'app_test'))).toBe(fresh);
+      expect(sessionStore.getSession(persisted.sessionId)?.status).toBe('closed');
+    });
+
+    it('preserves a different live object for the same session id before stale-PID cleanup', async () => {
+      const persisted = sessionStore.createSession('oc_runtime_same', 'om_runtime_same', 'persisted work');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      persisted.pid = 54_321;
+      sessionStore.updateSession(persisted);
+
+      const live: any = {
+        session: { ...persisted },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: persisted.chatId,
+        chatType: 'group',
+        scope: 'thread',
+      };
+      const map = new Map<string, DaemonSession>([
+        [sessionKey('om_runtime_same', 'app_test'), live],
+      ]);
+      wp.registry = map;
+      const processKill = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+      vi.mocked(killStalePids).mockImplementationOnce((rows: any[], runtime?: ReadonlyMap<string, any>) => {
+        const runtimeIds = new Set([...(runtime?.values() ?? [])].map(ds => ds.session.sessionId));
+        for (const row of rows) {
+          if (row.pid && !runtimeIds.has(row.sessionId)) process.kill(row.pid, 0);
+        }
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(killStalePids).toHaveBeenCalledWith(expect.any(Array), map);
+      expect(processKill).not.toHaveBeenCalled();
+      expect(map.get(sessionKey('om_runtime_same', 'app_test'))).toBe(live);
+      expect(closeSession).not.toHaveBeenCalledWith(persisted.sessionId);
+      processKill.mockRestore();
+    });
+
+    it('does not probe-close a fresh persistent runtime session registered during restore', async () => {
+      const persisted = sessionStore.createSession('oc_restore_seed', 'om_restore_seed', 'restore seed');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      sessionStore.updateSession(persisted);
+
+      const fresh: any = {
+        session: {
+          sessionId: 'fresh-live-persistent',
+          status: 'active',
+          backendType: 'tmux',
+          cliId: 'claude-code',
+        },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: 'oc_fresh_runtime',
+        chatType: 'group',
+        scope: 'thread',
+      };
+      const freshKey = sessionKey('om_fresh_runtime', 'app_test');
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+
+      // Inject the dispatcher-created session at the exact await boundary of
+      // startup CAS registration. It is not part of the disk snapshot and
+      // therefore must not enter restore's backing probe/zombie-close pass.
+      vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (target, key, ds) => {
+        target.set(freshKey, fresh);
+        target.set(key, ds);
+        return true;
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(freshKey)).toBe(fresh);
+      expect(fresh.session.status).toBe('active');
+      expect(closeSession).not.toHaveBeenCalledWith(fresh.session.sessionId);
+    });
+
+    it('does not probe-close a restored persistent session woken during registration', async () => {
+      const persisted = sessionStore.createSession('oc_woken_restore', 'om_woken_restore', 'woken restore');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      persisted.backendType = 'tmux';
+      sessionStore.updateSession(persisted);
+
+      const key = sessionKey('om_woken_restore', 'app_test');
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+
+      // The CAS publishes ds synchronously, then its Promise yields. A real
+      // inbound message can fork this exact object before restore resumes; its
+      // tmux pane may not exist yet and must not be classified as a zombie.
+      vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (target, restoreKey, ds) => {
+        target.set(restoreKey, ds);
+        ds.worker = { killed: false };
+        return true;
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(key)?.session.sessionId).toBe(persisted.sessionId);
+      expect(map.get(key)?.worker).toBeTruthy();
+      expect(sessionStore.getSession(persisted.sessionId)?.status).toBe('active');
+      expect(closeSession).not.toHaveBeenCalledWith(persisted.sessionId);
     });
 
     it('restores usage-limit runtime state for active sessions after daemon restart', async () => {

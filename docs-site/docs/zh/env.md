@@ -9,7 +9,7 @@
 | `WEB_EXTERNAL_HOST` | _(自动探测局域网 IP)_ | 终端链接中的外部主机名/IP（公网/内网域名访问见 [Web 终端](/web-terminal)） |
 | `WEB_EXTERNAL_PORT` | _(取本机代理端口)_ | 终端链接中的外部端口，覆盖本机代理端口（`8800 + botIndex`），让中转主机可监听不同端口号；多 bot 时为基准端口，实际取 `WEB_EXTERNAL_PORT + botIndex`（见 [Web 终端](/web-terminal)） |
 | `SESSION_DATA_DIR` | `~/.botmux/data` | 会话和队列存储目录 |
-| `BACKEND_TYPE` | _(自动检测)_ | `pty` 强制降级到纯 pty 模式 |
+| `BACKEND_TYPE` | `tmux` | 部署级会话后端：`tmux` / `herdr` / `zellij` / `zmx` / `pty`。`zmx` 需显式选择且要求 >= 0.7.1；持久后端不可用时 fail closed，不自动回落 PTY；`pty` 只作显式应急选项 |
 | `BOTMUX_FORWARD_FOLLOWUP_WAIT_MS` | `1500` | 话题群新消息等待补充说明的毫秒数；命中同用户、同群且 `root_id` 指向首条消息时合并，设为 `0` 关闭，最大 `10000` |
 | `DEBUG` | _(未设置)_ | 设为 `1` 启用调试日志 |
 | `GITHUB_TOKEN` | _(未设置)_ | GitHub Releases API 认证 token。用于 Dashboard changelog、更新检查、restart-report 等 botmux 自身发起的 GitHub 请求。优先级高于 `GH_TOKEN`。 |
@@ -27,6 +27,7 @@
 | `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` 或自动探测 | CLI 输出 URL 用的 host |
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | 每个 daemon 的 IPC 端口 = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | workflow run 存储目录 |
+| `BOTMUX_DASHBOARD_PUBLIC_READONLY` | `true` | 是否允许无 token 访问 Dashboard 白名单只读 API / SSE；一旦在 Dashboard 设置页保存过该开关，`~/.botmux/config.json` 中的值优先于本环境变量 |
 
 ## 文件位置
 

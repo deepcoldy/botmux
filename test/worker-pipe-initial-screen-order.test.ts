@@ -17,7 +17,11 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);');
+    // The backend is now wrapped by adapterInputHandle() so ZMX can turn an
+    // explicit false send result into a submission failure. Pin the call site,
+    // rather than its argument formatting, while preserving the ordering
+    // contract this test protects.
+    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(');
     const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
@@ -173,6 +177,21 @@ describe('worker pipe initial screen ordering', () => {
     expect(markReadyIdx).toBeGreaterThan(flushIdx);
   });
 
+  it('keys overlapping authoritative screen settles by the idle-edge revision', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const settleStart = source.indexOf('function settleBackendScreenBeforeIdle');
+    const settleEnd = source.indexOf('/** Submission writes', settleStart);
+    const settle = source.slice(settleStart, settleEnd);
+    const idleStart = source.indexOf('idleDetector.onIdle(async () =>');
+    const idleEnd = source.indexOf('backend.onData(onPtyData);', idleStart);
+    const idle = source.slice(idleStart, idleEnd);
+
+    expect(settle).toContain('existing.revision >= requestedRevision');
+    expect(settle).toContain('if (existing) await existing.promise;');
+    expect(settle).toContain('revision: requestedRevision');
+    expect(idle).toContain('settleBackendScreenBeforeIdle(idleBackend, revisionBeforeSettle)');
+  });
+
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
     // releaseReadyGate from the real signal is skipped entirely. A CLI whose
@@ -212,6 +231,25 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
+  it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe', probeStart);
+    const probe = source.slice(probeStart, probeEnd);
+
+    const revisionIdx = probe.indexOf('const revisionBeforeSettle = backendScreenRevision;');
+    const settleIdx = probe.indexOf('settleBackendScreenBeforeIdle(be, revisionBeforeSettle)');
+    const backendFenceIdx = probe.indexOf('backend !== be', settleIdx);
+    const revisionFenceIdx = probe.indexOf('backendScreenRevision !== revisionBeforeSettle', settleIdx);
+    const markIdx = probe.indexOf('markPromptReady();', settleIdx);
+
+    expect(revisionIdx).toBeGreaterThan(-1);
+    expect(settleIdx).toBeGreaterThan(revisionIdx);
+    expect(backendFenceIdx).toBeGreaterThan(settleIdx);
+    expect(revisionFenceIdx).toBeGreaterThan(backendFenceIdx);
+    expect(markIdx).toBeGreaterThan(revisionFenceIdx);
   });
 
   it('limits the reattach idle probe to adapters with a busy marker', () => {
