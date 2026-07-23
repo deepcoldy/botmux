@@ -145,9 +145,8 @@ describe('HerdrBackend connection surface', () => {
     expect(HerdrBackend.isAvailable()).toBe(false);
   });
 
-  it('derives one stable Herdr host name per bot identity', () => {
-    expect(HerdrBackend.botSessionName('cli_aac603fe35f91be8')).toBe('bmx-bot-3fb565c0');
-    expect(HerdrBackend.botSessionName('cli_other')).toBe('bmx-bot-5a3fa7eb');
+  it('uses one machine-wide Herdr host for Botmux-launched agents', () => {
+    expect(HerdrBackend.managedSessionName()).toBe('botmux');
   });
 
   it('hasSession() parses `session list --json` and matches running sessions', () => {
@@ -432,6 +431,42 @@ describe('HerdrBackend.spawn', () => {
     // agent-start call carries it too (defense in depth).
     const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
     expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('glm-key');
+    be.kill();
+  });
+
+  it('keeps the machine-wide shared server credential-neutral while passing env to its agent', () => {
+    let listCount = 0;
+    setHerdrResponses([
+      {
+        match: a => a[0] === 'session' && a[1] === 'list',
+        reply: () => {
+          listCount++;
+          return listCount >= 2
+            ? JSON.stringify({ sessions: [{ name: 'botmux', running: true }] })
+            : EMPTY_SESSIONS_REPLY;
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const be = new HerdrBackend('botmux', {
+      createSession: true,
+      agentName: 'botmux-topic1',
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    be.spawn('claude', [], {
+      cwd: '/work', cols: 80, rows: 24,
+      env: { BOTMUX_SESSION_ID: 'topic1' },
+      injectEnv: { ANTHROPIC_AUTH_TOKEN: 'bot-secret' },
+    });
+
+    const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
+    expect(serverSpawn?.[2].env.BOTMUX_SESSION_ID).toBeUndefined();
+    expect(serverSpawn?.[2].env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.BOTMUX_SESSION_ID).toBe('topic1');
+    expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('bot-secret');
     be.kill();
   });
 

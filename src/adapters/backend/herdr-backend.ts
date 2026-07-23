@@ -1,5 +1,4 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -237,6 +236,25 @@ function envCommandArgs(env: Record<string, string>): string[] {
   return Object.entries(env).flatMap(([key, value]) => ['--env', `${key}=${value}`]);
 }
 
+/** Neutral environment for the machine-wide shared Herdr server.
+ *
+ * Every managed agent receives its complete sanitized environment explicitly
+ * at workspace/agent creation. The long-lived server must therefore not retain
+ * whichever bot happened to create it first (provider tokens, BOTMUX_* routing,
+ * etc.), or later bots could inherit cross-bot state for variables they omit.
+ */
+function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const safeKeys = [
+    'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
+    'TMPDIR', 'TMP', 'TEMP',
+    'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR',
+    'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'COLORTERM',
+  ];
+  return Object.fromEntries(
+    safeKeys.flatMap(key => source[key] === undefined ? [] : [[key, source[key]]]),
+  );
+}
+
 function runHerdr(args: string[], opts?: { timeout?: number; input?: string }): boolean {
   try {
     execFileSync('herdr', args, {
@@ -340,10 +358,9 @@ export class HerdrBackend implements SessionBackend {
     return `bmx-${sessionId.slice(0, 8)}`;
   }
 
-  /** One Botmux-owned Herdr host per bot; topics are separate managed agents. */
-  static botSessionName(botId: string): string {
-    const suffix = createHash('sha256').update(botId).digest('hex').slice(0, 8);
-    return `bmx-bot-${suffix}`;
+  /** Machine-wide host for every agent actively launched by Botmux. */
+  static managedSessionName(): string {
+    return 'botmux';
   }
 
   static hasSession(name: string): boolean {
@@ -435,14 +452,11 @@ export class HerdrBackend implements SessionBackend {
     // Skip on externalTarget: that's the user's own pre-existing herdr
     // session; we can't (and shouldn't) re-env an already-running CLI.
     //
-    // Per-bot env (opts.injectEnv, e.g. ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM
-    // bot): herdr runs a per-session server (one `herdr --session <name> server`
-    // per botmux session, see ensureServer), so unlike tmux/zellij there is no
-    // shared cross-bot server whose global env we'd pollute — merging it into
-    // childEnv is safe (same reasoning as the pty backend). childEnv flows to
-    // both the daemon spawn and the agent-start call, and the daemon forks the
-    // CLI as its child, so the per-bot env reaches the CLI. Already sanitized by
-    // the worker. Appended last so it wins over a same-named key in opts.env.
+    // Per-bot env (opts.injectEnv, e.g. provider credentials) is merged into
+    // the environment passed explicitly when this agent/workspace is created.
+    // The machine-wide server itself gets only sharedServerEnv(), so the first
+    // bot to create `botmux` cannot leak its routing or credentials to siblings.
+    // Appended last so injected values win over same-named keys in opts.env.
     this.childEnv = this.opts.externalTarget
       ? undefined
       : { ...opts.env, ...(opts.injectEnv ?? {}) };
@@ -654,14 +668,17 @@ export class HerdrBackend implements SessionBackend {
   private ensureServer(): void {
     if (HerdrBackend.hasSession(this.sessionName)) return;
     if (this.opts.externalTarget) throw new Error(`herdr session ${this.sessionName} is not running`);
-    // Pass childEnv to the herdr daemon: the daemon forks the agent CLI as
-    // its own child, so the daemon's env is what the CLI ultimately
-    // inherits. Without this, the CLI would see worker.ts process.env (bare
-    // LARK_APP_SECRET, no BOTMUX_*).
+    // Botmux's machine-wide host is shared across bots, so its long-lived
+    // server must be credential-neutral. Each agent receives childEnv
+    // explicitly in startPaneAgent()/agent start. Legacy per-topic owned
+    // sessions keep the historical server-env behavior for compatibility.
+    const serverEnv = this.opts.ownsSession === false
+      ? sharedServerEnv(process.env)
+      : this.childEnv;
     this.serverProcess = spawn('herdr', ['--session', this.sessionName, 'server'], {
       stdio: 'ignore',
       detached: true,
-      env: this.childEnv,
+      env: serverEnv,
     });
     this.serverProcess.unref();
 

@@ -75,8 +75,6 @@ export function selectSessionBackend(opts: {
   sessionId: string;
   backendType: BackendType;
   backendConfig?: RiffBackendConfig;
-  /** Stable bot identity used to choose the Botmux-owned Herdr host session. */
-  herdrOwnerId?: string;
   /** Migration compatibility for sessions previously placed in a shared user host. */
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
@@ -123,7 +121,7 @@ export function selectSessionBackend(opts: {
     // different workspace, start a duplicate CLI there, and orphan
     // the still-live managed agent in the recorded host. Isolation/MCP callers
     // explicitly disable shared reuse, so they intentionally ignore this stamp
-    // and converge back to a bot-owned bmx-* session.
+    // and converge back to the machine-wide Botmux-managed session.
     const recorded = opts.reuseRecordedHerdrTarget === false
       ? undefined
       : opts.persistentBackendTarget?.backendType === 'herdr'
@@ -170,14 +168,11 @@ export function selectSessionBackend(opts: {
       };
     }
 
-    // Fresh topics share one Botmux-owned Herdr host per bot, but each gets a
-    // distinct managed agent/pane. This avoids both ambiguous reuse of a user's
-    // sessions and a proliferation of one Herdr server per Lark topic. /adopt
-    // remains the only path that intentionally binds to a user-owned session.
-    if (!opts.herdrOwnerId?.trim()) {
-      throw new Error('herdr backend requires herdrOwnerId');
-    }
-    const hostSessionName = HerdrBackend.botSessionName(opts.herdrOwnerId);
+    // Every fresh agent actively launched by this machine's Botmux shares the
+    // reserved `botmux` Herdr host, regardless of which Lark bot, dashboard, or
+    // other Botmux entry point requested it. Topics remain isolated as distinct
+    // managed agents/panes. /adopt stays bound to its explicit user session.
+    const hostSessionName = HerdrBackend.managedSessionName();
     const agentName = `botmux-${opts.sessionId.slice(0, 8)}`;
     const hostExists = HerdrBackend.hasSession(hostSessionName);
     const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);

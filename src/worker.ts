@@ -6029,12 +6029,11 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
-    herdrOwnerId: cfg.larkAppId,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
     // Preserve that recorded target for compatibility unless this incarnation
     // requires an isolation/MCP boundary that only a Botmux-owned session can
-    // safely provide. Fresh topics use distinct agents in one bot-owned host.
+    // safely provide. Fresh tasks use distinct agents in one machine-wide host.
     reuseRecordedHerdrTarget: !willReadIsolate
       && !willWriteSandbox
       && !hasMcpRuntimeEntries,
@@ -7120,7 +7119,7 @@ async function spawnCli(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
-      message: `已为当前机器人创建专属 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
+      message: `已创建 Botmux 专属 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
     });
   }
 

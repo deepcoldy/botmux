@@ -21,7 +21,7 @@ vi.mock('../src/adapters/backend/tmux-pipe-backend.js', () => ({
 vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
   HerdrBackend: class MockHerdrBackend {
     static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
-    static botSessionName = vi.fn((id: string) => `bmx-bot-${id.slice(-8)}`);
+    static managedSessionName = vi.fn(() => 'botmux');
     static hasSession = vi.fn(() => false);
     static probeSession = vi.fn(() => 'missing');
     static hasAgent = vi.fn(() => false);
@@ -91,14 +91,13 @@ describe('selectSessionBackend', () => {
     expect('tmuxBackend' in selected).toBe(false);
   });
 
-  it('creates one bot-owned Herdr host and a topic-specific agent', () => {
+  it('creates the machine-wide botmux Herdr host and a topic-specific agent', () => {
     const selected = selectSessionBackend({
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
       backendType: 'herdr',
-      herdrOwnerId: 'cli_aac603fe35f91be8',
     });
 
-    expect((selected.backend as any).sessionName).toBe('bmx-bot-35f91be8');
+    expect((selected.backend as any).sessionName).toBe('botmux');
     expect((selected.backend as any).opts).toEqual({
       createSession: true,
       agentName: 'botmux-9cfa0024',
@@ -108,22 +107,21 @@ describe('selectSessionBackend', () => {
     });
     expect(selected.persistentBackendTarget).toEqual({
       backendType: 'herdr',
-      sessionName: 'bmx-bot-35f91be8',
+      sessionName: 'botmux',
       agentName: 'botmux-9cfa0024',
     });
-    expect(selected.createdHerdrSessionName).toBe('bmx-bot-35f91be8');
+    expect(selected.createdHerdrSessionName).toBe('botmux');
   });
 
-  it('puts a second topic agent in the same existing bot-owned Herdr host', () => {
-    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'bmx-bot-35f91be8');
+  it('puts another bot or topic agent in the same machine-wide botmux host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux');
 
     const selected = selectSessionBackend({
       sessionId: 'fedcba98-197d-4781-845b-c541dceb8980',
       backendType: 'herdr',
-      herdrOwnerId: 'cli_aac603fe35f91be8',
     });
 
-    expect((selected.backend as any).sessionName).toBe('bmx-bot-35f91be8');
+    expect((selected.backend as any).sessionName).toBe('botmux');
     expect((selected.backend as any).opts).toEqual({
       createSession: false,
       agentName: 'botmux-fedcba98',
