@@ -7435,7 +7435,10 @@ async function restartCliProcess(
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
         if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
-        void flushPending();
+        // A local replacement process can exist before its TUI input box does.
+        // Only re-kick a prompt that became ready while the restart fence was
+        // still armed; otherwise markPromptReady() owns the first flush.
+        if (isPromptReady) void flushPending();
       }, 500);
     } catch (err) {
       cliRestartInProgress = false;
