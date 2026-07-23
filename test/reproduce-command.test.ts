@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildReproduceCommand } from '../src/adapters/backend/reproduce-command.js';
+import { buildReproduceCommand, selectReproduceLaunch } from '../src/adapters/backend/reproduce-command.js';
 
 // Dashboard「复现命令」跨后端准确性（codex review issue 1）。
 describe('buildReproduceCommand', () => {
@@ -95,5 +95,57 @@ describe('buildReproduceCommand', () => {
     })!;
     expect(cmd.startsWith('cd ')).toBe(false);
     expect(cmd).toContain("'/opt/claude'");
+  });
+});
+
+// selectReproduceLaunch：复现命令的 bin/args 决策——绝不含 sandbox wrapper（codex P1）。
+// 输入永远是**基础 CLI** bin/args（sandbox 包装前的快照）；此函数只决定是否套 wrapperCli。
+describe('selectReproduceLaunch (never surfaces sandbox wrapper)', () => {
+  const base = { baseBin: '/opt/claude', baseArgs: ['--session-id', 's1'] };
+
+  it('Linux bwrap/sandbox on: returns the base CLI, never bwrap', () => {
+    const r = selectReproduceLaunch({ ...base, sandboxOn: true });
+    expect(r.bin).toBe('/opt/claude');
+    expect(r.args).toEqual(['--session-id', 's1']);
+    expect(r.bin).not.toContain('bwrap');
+  });
+
+  it('macOS Seatbelt (write sandbox, sandboxOn=false but bin was going to be sandbox-exec): base only', () => {
+    // reproduce 决策只看 base 快照——不含 sandbox-exec -f，无论平台。
+    const r = selectReproduceLaunch({ ...base, sandboxOn: false });
+    expect(r.bin).toBe('/opt/claude');
+    expect(r.args.join(' ')).not.toContain('sandbox-exec');
+    expect(r.args.join(' ')).not.toContain('-f ');
+  });
+
+  it('wrapperCli set + sandbox off: returns wrapper form (aiden x claude ...)', () => {
+    const r = selectReproduceLaunch({
+      ...base,
+      wrapperCli: 'aiden x claude',
+      sandboxOn: false,
+      binResolver: (b) => b,
+    });
+    expect(r.bin).toBe('aiden');
+    // wrapper tokens 前置，基础 CLI args 跟随（aiden wrapper 会 strip 部分 unsafe args，
+    // 但 --session-id 应保留）。
+    expect(r.args[0]).toBe('x');
+    expect(r.args).toContain('--session-id');
+  });
+
+  it('wrapperCli set + sandbox ON: wrapper ignored (matches worker: wrapper vs bwrap mutually exclusive), base only', () => {
+    const r = selectReproduceLaunch({
+      ...base,
+      wrapperCli: 'aiden x claude',
+      sandboxOn: true,
+      binResolver: (b) => b,
+    });
+    expect(r.bin).toBe('/opt/claude');
+    expect(r.args).toEqual(['--session-id', 's1']);
+  });
+
+  it('no wrapper, no sandbox: base CLI unchanged', () => {
+    const r = selectReproduceLaunch({ ...base, sandboxOn: false });
+    expect(r.bin).toBe('/opt/claude');
+    expect(r.args).toEqual(['--session-id', 's1']);
   });
 });

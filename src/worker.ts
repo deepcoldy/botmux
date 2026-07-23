@@ -178,7 +178,7 @@ import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.
 import { zellijEnv } from './setup/ensure-zellij.js';
 import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
 import { selectSessionBackend, decideBackendGate, backendGateUserMessage } from './adapters/backend/session-backend-selector.js';
-import { buildReproduceCommand } from './adapters/backend/reproduce-command.js';
+import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
   deriveRiffRepoFromWorkingDir,
@@ -6704,6 +6704,14 @@ async function spawnCli(
   let spawnArgs = args;
   let spawnCwd = cfg.workingDir;
 
+  // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
+  // credential-only）之前，记下**基础 CLI** 的 bin/args（cliAdapter.resolvedBin +
+  // buildArgs 产出）。独立维护、绝不从已被外层包装的 spawnBin/spawnArgs 回推。最终
+  // 复现形态（是否套 wrapperCli）由 selectReproduceLaunch 在 spawn 时统一决策——见
+  // reproduce-command.ts。这里只锁定"包装前的基础"这个事实。
+  const reproduceBaseBin = spawnBin;
+  const reproduceBaseArgs = [...spawnArgs];
+
   // Read isolation (macOS): wrap the whole CLI process in a Seatbelt sandbox that
   // denies reads of the sensitive paths (blocklist). The CLI bypasses its OWN
   // sandbox (see adapter) so the outer wrapper is the sole enforcer. DARWIN ONLY —
@@ -7081,12 +7089,6 @@ async function spawnCli(
     }
   }
 
-  // Dashboard「复现命令」：在任何 sandbox（bwrap/seatbelt/credential）包装之前，先
-  // 记下 CLI 自身的 bin/args（含 wrapperCli 改写）。sandbox 包装是机器相关的外层，
-  // 粘进裸 bash 也跑不起来、且会掩盖真正要复现的 CLI 行为，故复现命令刻意省略它。
-  const reproduceBinPristine = spawnBin;
-  const reproduceArgsPristine = [...spawnArgs];
-
   // Mandatory credential-only confinement is the OUTERMOST launch wrapper so
   // wrapperCli and every descendant it starts inherit the boundary. Full
   // Seatbelt/bwrap sessions were already wrapped above and never enter these
@@ -7222,13 +7224,22 @@ async function spawnCli(
   }
 
   // Dashboard「复现命令」：算出本次冷启的**近似**可复现命令（bin + argv + cwd +
-  // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。用 sandbox
-  // 包装前的 pristine bin/args；riff 后端返回 null（无本地命令）；见 reproduce-command.ts。
+  // 权威注入 env），随 ready 上报、只驻 daemon 内存（含凭证，绝不落盘）。基础 CLI
+  // bin/args 取 sandbox 包装前的快照，最终形态（含/不含 wrapperCli）由
+  // selectReproduceLaunch 决策——绝不含 sandbox-exec/bwrap 外层。riff 返回 null。
   try {
+    const reproduceLaunch = selectReproduceLaunch({
+      baseBin: reproduceBaseBin,
+      baseArgs: reproduceBaseArgs,
+      wrapperCli: cfg.wrapperCli,
+      sandboxOn,
+      binResolver: (b) => locateOnPath(b) ?? b,
+      ttadkModel: cfg.model,
+    });
     capturedSpawnCommand = buildReproduceCommand({
       backendType: effectiveBackendType,
-      bin: reproduceBinPristine,
-      args: reproduceArgsPristine,
+      bin: reproduceLaunch.bin,
+      args: reproduceLaunch.args,
       cwd: spawnCwd,
       env: childEnv,
       injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,

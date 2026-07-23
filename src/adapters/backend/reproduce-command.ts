@@ -14,10 +14,43 @@
 
 import type { BackendType } from './types.js';
 import { buildBotmuxEnvAssignments } from './tmux-backend.js';
+import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 
 /** POSIX 单引号转义，安全用于 bash 粘贴。 */
 function shq(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * 选出复现命令应展示的 bin/args——mirror worker.ts spawnCli 里 reproduce 快照的决策，
+ * 抽成纯函数便于锁测试（codex review P1：确保绝不含 sandbox wrapper）。
+ *
+ * 输入是**基础 CLI** 的 bin/args（cliAdapter.resolvedBin + buildArgs 产出，未经任何
+ * Seatbelt/bwrap/credential 改写）。规则：
+ *   - wrapperCli 生效**且** sandbox 关闭时 → 返回 wrapper 形态（`aiden x claude …`）。
+ *     worker 侧 wrapperCli 与 file sandbox 互斥（sandboxOn 时忽略 wrapper），这里同构。
+ *   - 其余（无 wrapper，或 sandbox 开启）→ 返回基础 CLI bin/args 原样。
+ * 无论如何都**不**含 sandbox-exec / bwrap 外层——那是机器相关、裸 bash 跑不起来的包装。
+ */
+export function selectReproduceLaunch(input: {
+  baseBin: string;
+  baseArgs: string[];
+  wrapperCli?: string;
+  sandboxOn: boolean;
+  binResolver?: (bin: string) => string;
+  ttadkModel?: string;
+}): { bin: string; args: string[] } {
+  const { baseBin, baseArgs, wrapperCli, sandboxOn } = input;
+  if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
+    const launch = buildWrappedLaunch(
+      wrapperCli,
+      baseArgs,
+      input.binResolver ?? ((b) => b),
+      { ttadkModel: input.ttadkModel },
+    );
+    if (launch.bin) return { bin: launch.bin, args: launch.args };
+  }
+  return { bin: baseBin, args: [...baseArgs] };
 }
 
 export interface ReproduceCommandInput {
