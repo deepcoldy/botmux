@@ -127,6 +127,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports under test ────────────────────────────────────────────────────
 
 import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 
@@ -284,6 +285,32 @@ describe('Worker ready: set_display_mode re-sync', () => {
       (args: any[]) => args[0]?.type === 'set_display_mode',
     );
     expect(displayModeCalls).toHaveLength(0);
+  });
+
+  it('preserves worker and pending Codex FIFO when the root is withdrawn during ready POST', async () => {
+    sessionReplyMock.mockRejectedValueOnce(new MessageWithdrawnError('om_root'));
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+    ds.session.codexAppDispatchLedger = [{
+      dispatchId: 'dispatch-pending',
+      turnId: 'turn-pending',
+      state: 'prepared',
+      content: 'pending',
+    }];
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'ready', port: 9999, token: 'tok_abc', turnId: 'turn-pending',
+    });
+    await flush();
+
+    expect(closeSessionMock).not.toHaveBeenCalled();
+    expect(fakeWorker.kill).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger).toHaveLength(1);
   });
 
   it('PATCH path sends set_display_mode when displayMode is screenshot', async () => {
@@ -515,6 +542,51 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: 'raw_input' }),
     );
+  });
+
+  it('replays a restored raw opening with its durable token and releases only on the matching ACK', async () => {
+    const submitted = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: closeSessionMock,
+      onQueuedActivationSubmitted: submitted,
+    });
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      pendingRawInput: '/goal RESTORED_RAW_N',
+      initialStartPending: true,
+    } as Partial<DaemonSession>);
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'raw-activation-token',
+      queuedActivationTurnId: 'turn-raw-n',
+      pendingRepoSetup: {
+        mode: 'picker', prompt: '', rawInput: '/goal RESTORED_RAW_N', turnId: 'turn-raw-n',
+      },
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal RESTORED_RAW_N',
+      queuedActivationToken: 'raw-activation-token',
+      turnId: 'turn-raw-n',
+    });
+    expect(submitted).not.toHaveBeenCalled();
+
+    fakeWorker.emit('message', {
+      type: 'queued_activation_submitted',
+      sessionId: ds.session.sessionId,
+      activationToken: 'raw-activation-token',
+    });
+    await flush();
+    expect(submitted).toHaveBeenCalledWith(ds, 'raw-activation-token');
   });
 
   it('prompt_ready bundles the buffered follow-up ONTO the raw_input IPC (single atomic message)', async () => {

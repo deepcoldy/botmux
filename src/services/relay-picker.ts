@@ -38,6 +38,11 @@ export async function collectRelayPickerEntries(
     if (sessionAnchorId(c) === currentAnchor) continue;
     if (c.session.ownerOpenId !== operatorOpenId) continue;
     if (c.session.adoptedFrom) continue;
+    // A Riff sandbox keeps the BOTMUX reply route injected at task creation;
+    // follow-ups cannot retarget it. Do not offer an action transferSession
+    // must reject.
+    if ((c.initConfig?.backendType ?? c.session.backendType) === 'riff'
+        || c.session.cliId === 'riff') continue;
     // Daemon-command scratches (worker:null + no persisted CLI markers)
     // are placeholder records for /help / unfinished /relay etc. — they
     // have no real conversation to bring along. Don't surface them in

@@ -368,6 +368,7 @@ export function attentionReason(s: Record<string, any>): string | null {
   if (s.pendingRepo) return t('sessions.board.signalRepo');
   if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
   if (s.status === 'limited') return t('sessions.board.signalLimited');
+  if (s.status === 'stalled') return t('sessions.board.signalStalled');
   return null;
 }
 

@@ -278,7 +278,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         if (match.found) {
           return match.cliSessionId
             ? { submitted: true, cliSessionId: match.cliSessionId }
-            : undefined;
+            : { submitted: true };
         }
         if (!trySendEnter()) return { submitted: false };
       }
@@ -286,7 +286,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (match.found) {
         return match.cliSessionId
           ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
+          : { submitted: true };
       }
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy

@@ -614,20 +614,25 @@ async function waitForConsumerApplyFinalCard(afterIndex = patchedMessages.length
 }
 
 /** 新交互流程：下拉选 agent 只暂存，点"确认"才生效。返回确认后的卡片响应。 */
-async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
-  await __vcMeetingAgentTest.handleCardAction({
-    operator: { open_id: operatorOpenId },
-    action: lastInteractiveCardSelectOption(label),
-  }, APP_ID);
+async function confirmLatestConsumerCard(operatorOpenId = TARGET_OPEN_ID): Promise<any> {
   const patchIndex = patchedMessages.length;
   const result = await __vcMeetingAgentTest.handleCardAction({
     operator: { open_id: operatorOpenId },
     action: { value: lastInteractiveCardButton('确认') },
   }, APP_ID);
-  if (result?.header?.title?.content === '会议处理设置中') {
+  if (result?.header?.title?.content === '会议处理设置中'
+    || result?.toast?.content === '会议 agent 选择正在处理中') {
     return (await waitForConsumerApplyFinalCard(patchIndex)) ?? result;
   }
   return result;
+}
+
+async function selectConsumerAgentViaCard(label: string, operatorOpenId = TARGET_OPEN_ID): Promise<any> {
+  await __vcMeetingAgentTest.handleCardAction({
+    operator: { open_id: operatorOpenId },
+    action: lastInteractiveCardSelectOption(label),
+  }, APP_ID);
+  return confirmLatestConsumerCard(operatorOpenId);
 }
 
 async function selectConsumerProfilesViaCard(
@@ -5654,7 +5659,14 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls).toHaveLength(0);
 
     __vcMeetingAgentTest.setConsumerPendingItemLimitForTest(undefined);
-    await selectConsumerAgentViaCard('Claude Loopy');
+    for (let i = 0; i < 20
+      && sentMessages.filter(message => message.msgType === 'interactive').length < 2;
+      i += 1) await Promise.resolve();
+    expect(sentMessages.filter(message => message.msgType === 'interactive')).toHaveLength(2);
+    // The overflow recovery card already stages the current agent; confirming
+    // it resumes the same durable member/cursor without starting a second
+    // dropdown apply in parallel.
+    await confirmLatestConsumerCard();
     await __vcMeetingAgentTest.injectConsumer(APP_ID, 'm_joined_464646464', { force: true });
     expect(triggerSessionCalls).toHaveLength(1);
     expect(triggerSessionCalls[0].req.envelope.payload.entries.filter((entry: any) => entry.kind === 'item'))

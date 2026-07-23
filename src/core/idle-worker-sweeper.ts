@@ -1,6 +1,7 @@
 import type { DaemonSession } from './types.js';
 import { suspendWorker } from './worker-pool.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
+import { tryWithBotTurnMutation } from './bot-turn-mutation-gate.js';
 
 /**
  * Default per-bot live-session cap applied when a bot has no explicit
@@ -11,6 +12,7 @@ import { isSuspendableBackendType } from './persistent-backend.js';
  * ('botDefaults.maxLiveWorkers*' i18n) — keep them in sync.
  */
 export const DEFAULT_MAX_LIVE_WORKERS = 30;
+export const IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS = 1_000;
 
 export interface IdleWorkerSweepOptions {
   /**
@@ -20,6 +22,11 @@ export interface IdleWorkerSweepOptions {
    * never suspend).
    */
   maxLiveWorkers?: number;
+  /**
+   * Bound how long a detached sweep may wait for already-admitted turns.
+   * A wedged admission must not hold the bot-wide mutation gate forever.
+   */
+  mutationAcquireTimeoutMs?: number;
 }
 
 export interface IdleWorkerSweepResult {
@@ -79,4 +86,29 @@ export function sweepIdleWorkers(
     liveCount--;
   }
   return suspended;
+}
+
+/**
+ * Run a cap sweep only after every already-admitted inbound turn has either
+ * durably accepted its input or finished.  A worker spawn can put the bot over
+ * cap while another handler is paused in sender/reaction setup, before that
+ * handler has changed its screen status or dispatch ledger.  A synchronous
+ * sweep could otherwise mistake that handler's worker for idle, suspend it,
+ * and make the subsequent send fail before acceptance.
+ *
+ * Spawn/idle callbacks commonly run inside an admission, so the mutation gate
+ * upgrades the current lease when possible. Otherwise acquisition is bounded:
+ * a wedged admission skips this sweep instead of freezing every later turn for
+ * the bot. The next idle/spawn callback retries.
+ */
+export function sweepIdleWorkersAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  opts: IdleWorkerSweepOptions = {},
+): Promise<IdleWorkerSweepResult[]> {
+  return tryWithBotTurnMutation(
+    larkAppId,
+    opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
+    () => sweepIdleWorkers(activeSessions, opts),
+  ).then(result => result.acquired ? result.value : []);
 }

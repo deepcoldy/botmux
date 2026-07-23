@@ -23,7 +23,10 @@ export interface RuntimeBotInput {
   daemonStatus?: RuntimeDaemonStatus;
 }
 
-const WORKING_STATUSES = new Set(['working', 'analyzing', 'active']);
+// `stalled` means no observable progress, not completion: the CLI/model/tool
+// may still be executing. Keep it in active runtime pressure rather than
+// misclassifying it as idle, human-waiting, or unknown.
+const WORKING_STATUSES = new Set(['working', 'analyzing', 'active', 'stalled']);
 const STARTING_STATUSES = new Set(['starting', 'queued']);
 const IDLE_STATUSES = new Set(['idle', 'dormant']);
 

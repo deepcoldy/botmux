@@ -112,18 +112,20 @@ export function resolvePairedSpawnBackendType(
 /**
  * How a session's worker is torn down at daemon shutdown, branched on the
  * session's FROZEN backend (via getSessionPersistentBackendType), NOT live config:
+ *   'riff-drain-detach' — Riff only: three-phase non-cancelling write drain,
+ *                         durable lineage ACK, then worker exit.
  *   'detach' — persistent backend (tmux/herdr/zellij): SIGTERM the worker only,
  *              leaving the multiplexer session alive for re-attach.
  *   'close'  — non-persistent (frozen pty, or unresolvable legacy): killWorker.
  * Freezing here stops a live backendType edit from changing how a running session
  * tears down — e.g. detach-preserving a "herdr" session whose real pane is tmux.
  */
-export function shutdownBackendDisposition(ds: DaemonSession): 'detach' | 'close' {
-  // riff：远端任务独立于本地进程存活。daemon shutdown 走 'close' 会经 worker 的
-  // destroySession() 取消远端任务——重启不该杀任务（血缘已持久化，重启后
-  // follow-up 续上，agent 的 botmux send 照常送达）。detach = 仅 SIGTERM worker。
+export function shutdownBackendDisposition(ds: DaemonSession): 'riff-drain-detach' | 'detach' | 'close' {
+  // Riff 不能落进普通 detach 的直接 SIGTERM：create/follow-up 最长 10s 才返回
+  // task id，而 worker SIGTERM 会立即 exit，丢掉唯一血缘。独立 disposition 迫使
+  // daemon 先走 drain → durable ACK → commit 协议；类型检查防止未来回归。
   const frozen = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (frozen === 'riff') return 'detach';
+  if (frozen === 'riff') return 'riff-drain-detach';
   return getSessionPersistentBackendType(ds) ? 'detach' : 'close';
 }
 

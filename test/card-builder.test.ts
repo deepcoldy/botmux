@@ -502,6 +502,19 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
+    it('shows a red, neutral no-progress label for stalled turns', () => {
+      const zh = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'stalled'));
+      expect(zh.header.template).toBe('red');
+      expect(zh.header.title.content).toContain('长时间无进展');
+
+      const en = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'stalled', undefined, 'hidden',
+        undefined, undefined, false, false, 'en',
+      ));
+      expect(en.header.template).toBe('red');
+      expect(en.header.title.content).toContain('No recent progress');
+    });
+
     it('should show green template and "等待输入" for idle status', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
       expect(card.header.template).toBe('green');

@@ -123,6 +123,30 @@ describe('suspendWorker', () => {
     expect(ds.managedTurnOrigin).toEqual({ capability: 'cap-pty', turnId: 'om-pty' });
   });
 
+  it('refuses suspension while the durable Codex App dispatch ledger is non-empty', () => {
+    const worker = fakeWorker();
+    const ds: any = {
+      session: {
+        sessionId: 'sid-owned',
+        status: 'active',
+        codexAppDispatchLedger: [
+          { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+        ],
+      },
+      initConfig: { backendType: 'tmux' },
+      worker,
+      workerPort: 3456,
+      workerToken: 'token',
+      lastScreenStatus: 'idle',
+    };
+
+    expect(suspendWorker(ds, 'manual_suspend')).toBe(false);
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(worker);
+    expect(ds.workerPort).toBe(3456);
+    expect(ds.workerToken).toBe('token');
+  });
+
   it.each([
     ['missing', null],
     ['already killed', { killed: true }],

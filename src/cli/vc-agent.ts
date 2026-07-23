@@ -297,6 +297,7 @@ async function cmdRequestOutput(args: string[]): Promise<void> {
     config.session.dataDir,
     receiverSessionId,
     relayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   const discoveredReceiver = receiverAppId ? findOnlineDaemon(receiverAppId) : null;
   const receiverPort = Number.isSafeInteger(receiverPortRaw) && receiverPortRaw > 0

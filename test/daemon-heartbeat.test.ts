@@ -7,6 +7,7 @@ import {
   anyDaemonBusyTo,
   heartbeatDirIn,
   HEARTBEAT_FRESH_MS,
+  isMaintenanceBusyStatus,
 } from '../src/core/daemon-heartbeat.js';
 
 const T0 = Date.parse('2026-06-07T04:00:00.000Z');
@@ -57,5 +58,12 @@ describe('daemon heartbeat / anyDaemonBusy', () => {
   it('writes atomically (no .tmp leftover)', () => {
     writeHeartbeatTo(dir, 'cli_app_a', 1, iso(T0));
     expect(readdirSync(heartbeatDirIn(dir)).filter(f => f.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('keeps stalled turns inside the fleet-wide maintenance restart gate', () => {
+    expect(isMaintenanceBusyStatus('working')).toBe(true);
+    expect(isMaintenanceBusyStatus('stalled')).toBe(true);
+    expect(isMaintenanceBusyStatus('idle')).toBe(false);
+    expect(isMaintenanceBusyStatus(undefined)).toBe(false);
   });
 });

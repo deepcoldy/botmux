@@ -98,7 +98,7 @@ export interface VcMeetingConsumerConfig {
 }
 
 /** Runtime status the worker derives from screen content. */
-export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited';
+export type ScreenStatus = 'working' | 'idle' | 'analyzing' | 'limited' | 'stalled';
 /** Status shown on a streaming card — adds the pre-spawn 'starting' phase. */
 export type StreamStatus = ScreenStatus | 'starting';
 
@@ -170,6 +170,28 @@ export interface Session {
   /** Dashboard-created image files retained while the session is active so
    * the CLI can read them, then removed by session-store on close. */
   dashboardAttachments?: LarkAttachment[];
+  /** Durable journal for a queued activation until the worker confirms that
+   * the exact initial input crossed its adapter submission boundary. */
+  queuedActivationPending?: boolean;
+  /** Generation-scoped identity for the exact queued activation journal. */
+  queuedActivationToken?: string;
+  /** Exact final worker input retained for retry. This may include a triggering
+   * group reply in addition to the original dashboard backlog prompt. */
+  queuedActivationInput?: CliTurnPayload;
+  queuedActivationTurnId?: string;
+  queuedActivationDispatchAttempt?: number;
+  /** Frozen resume mode for the exact journal head. Backlog activations are
+   * fresh (`false`); post-history promoted successors resume (`true`). */
+  queuedActivationResume?: boolean;
+  /** Durable FIFO of exact turns accepted while an activation/setup gate owns
+   * the route. Entries are removed only when promoted into the tokened journal. */
+  queuedActivationTail?: QueuedActivationTailEntry[];
+  /** Monotonic per-session reservation cursor. Reserved synchronously before
+   * async prompt materialization so completion order cannot reorder arrivals. */
+  queuedActivationTailNextOrder?: number;
+  /** Crash-safe pending-repo owner. Presence means picker/worktree setup must
+   * be restored instead of classifying the active worker:null row as scratch. */
+  pendingRepoSetup?: PendingRepoSetup;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
@@ -247,6 +269,9 @@ export interface Session {
   replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
+  /** Bounded exact destination captured at inbound turn start. Codex App copies
+   * this into its durable dispatch ledger after any intervening awaits. */
+  turnReplyContexts?: Record<string, FrozenSessionReplyContext>;
   /**
    * 文档评论入口（/watch-comment / /subscribe-lark-doc）：当本会话「当前这一轮」由飞书文档评论
    * 触发时，`botmux send` 的用户可见回复要回到该文档评论（而非飞书）。因 botmux
@@ -278,6 +303,10 @@ export interface Session {
   /** Structured companion for lastCliInput so retry_last_task can preserve a
    * clean Codex App turn. The legacy string remains authoritative fallback. */
   lastCodexAppInput?: CodexAppTurnInput;
+  /** Crash-safe Codex App accepted/prepared FIFO; daemon is the sole writer. */
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  /** Cumulative ACK boundary retained until a fresh runner retires the generation. */
+  codexAppGenerationCommits?: CodexAppGenerationCommit[];
   /** Default local project whiteboard bound to this session when the optional whiteboard feature is enabled. */
   whiteboardId?: string;
   /** CLI-native resume id when it differs from botmux's sessionId (for example Codex thread id). */
@@ -534,30 +563,138 @@ export interface CodexAppTurnInput {
   clientUserMessageId?: string;
 }
 
+/** Daemon-frozen Lark destination for one accepted turn. This is separate
+ * from `currentReplyTarget`, which is mutable session UI state. */
+export type FrozenSessionReplyTarget =
+  | { mode: 'plain'; chatId: string }
+  | { mode: 'thread'; rootMessageId: string }
+  | { mode: 'quote'; rootMessageId: string };
+
+export interface FrozenSessionReplyContext {
+  target: FrozenSessionReplyTarget;
+  quoteTargetId?: string;
+  replyTargetSenderOpenId?: string;
+  replyTargetSenderIsBot?: boolean;
+}
+
+/** Host-side destination frozen when a Codex App turn crosses daemon
+ * acceptance. Transient HTTP/silent sinks deliberately carry only their kind:
+ * after daemon restart their in-memory consumer no longer exists, so recovery
+ * must fail closed instead of leaking the result into ordinary Lark IM. */
+export type CodexAppDeliverySink =
+  | 'lark'
+  | 'doc_comment'
+  | 'http_wait'
+  | 'http_async'
+  | 'suppressed';
+
+/**
+ * Daemon-owned durable attribution for one Codex App runner submission.
+ *
+ * `accepted` means the daemon accepted the IM turn but the worker has not yet
+ * crossed the runner write boundary. `prepared` is published by the worker
+ * immediately before that write. It is restored into a replacement FIFO, but
+ * remains uncertain until a signed final arrives. A replacement runner's idle
+ * marker cannot prove the prior generation never buffered the frame, so warm
+ * prepared recovery fails closed and requires exact generation fencing.
+ */
+export interface CodexAppDispatchLedgerEntry {
+  dispatchId: string;
+  turnId: string;
+  /** Links a queued activation journal to the exact accepted FIFO item. */
+  queuedActivationToken?: string;
+  /** Frozen chat/thread routing identity. May differ from daemon-minted
+   * turnId for scheduler/card inputs that arrived without a native message id. */
+  replyTurnId?: string;
+  /** Exact daemon-owned destination captured when the inbound turn began. */
+  replyTarget?: FrozenSessionReplyTarget;
+  quoteTargetId?: string;
+  replyTargetSenderOpenId?: string;
+  replyTargetSenderIsBot?: boolean;
+  /** Exact output channel selected at acceptance. Undefined is legacy Lark. */
+  deliverySink?: CodexAppDeliverySink;
+  dispatchAttempt?: number;
+  state: 'accepted' | 'prepared';
+  content: string;
+  codexAppInput?: CodexAppTurnInput;
+  vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
+}
+
+/** Monotonic cumulative ACK boundary for one authenticated runner generation. */
+export interface CodexAppGenerationCommit {
+  generation: string;
+  committedThrough: number;
+}
+
 /** A legacy CLI prompt plus an optional backend-specific structured sidecar. */
 export interface CliTurnPayload {
   content: string;
   codexAppInput?: CodexAppTurnInput;
 }
 
+/** Exact ordered successor retained behind an adapter-ACKed activation. */
+export interface QueuedActivationTailEntry {
+  id: string;
+  order: number;
+  userPrompt: string;
+  cliInput: CliTurnPayload;
+  turnId: string;
+  dispatchAttempt?: number;
+}
+
+/** Durable opening/setup state while a repository picker or detached default
+ * worktree owns the first turn. Runtime DaemonSession buffers are rebuilt from
+ * this record after restart; the record is cleared only with the activation
+ * journal's adapter-level ACK. */
+export interface PendingRepoSetup {
+  mode: 'picker' | 'auto_worktree';
+  prompt: string;
+  rawInput?: string;
+  turnId?: string;
+  baseDir?: string;
+  repoCardMessageId?: string;
+  codexAppText?: string;
+  codexAppApplicationContext?: string;
+  codexAppMessageContext?: string;
+  attachments?: LarkAttachment[];
+  mentions?: LarkMention[];
+  substituteTrigger?: SubstituteTrigger;
+  sender?: { openId: string; type: 'user' | 'bot'; name?: string };
+}
+
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
-  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
+  | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
-  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput }
+  | { type: 'raw_input'; content: string; turnId?: string; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
    *  it; all other CLIs ignore it. */
   | { type: 'rename_session'; title: string }
-  | { type: 'close' }
+  | { type: 'close'; requestId?: string }
+  /** Commit a successful Riff prepare-close handshake after the daemon has
+   * durably closed the row. The worker must not exit between prepare ACK and
+   * this commit or its exit handler could race a replacement generation. */
+  | { type: 'close_commit'; requestId: string }
+  /** Abort a Riff prepare after durable close/lineage persistence failed. */
+  | { type: 'close_abort'; requestId: string }
+  /** Graceful daemon shutdown: fence new Riff writes and drain all writes
+   * accepted before this prepare without cancelling the remote task. */
+  | { type: 'riff_shutdown_prepare'; requestId: string }
+  /** The daemon durably persisted the exact drained lineage; the worker may
+   * now detach and exit. */
+  | { type: 'riff_shutdown_commit'; requestId: string }
+  /** Persistence/coordination failed; restore the prepared Riff owner. */
+  | { type: 'riff_shutdown_abort'; requestId: string }
   | { type: 'suspend' }
-  | { type: 'restart' }
+  | { type: 'restart'; reason?: 'operator' | 'cli_crash' }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -604,6 +741,15 @@ export type WorkerToDaemon =
       cliPid?: number;
       cliProcStart?: string;
     }
+  | {
+      type: 'queued_activation_submitted';
+      sessionId: string;
+      activationToken: string;
+      /** Riff accepts asynchronously. When present, daemon persistence must
+       * commit this exact new lineage atomically with clearing the activation
+       * journal; generic adapter write-return is not acceptance. */
+      riffTaskId?: string;
+    }
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'prompt_ready' }
@@ -627,12 +773,20 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
    * has already published a fresh token. */
-  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'managed_turn_origin_revoked'; sessionId: string; capability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
+  | {
+      type: 'codex_app_dispatch_transition';
+      sessionId: string;
+      requestId: string;
+      operation: 'submit' | 'cancel' | 'retry';
+      entries: Array<Pick<CodexAppDispatchLedgerEntry, 'dispatchId' | 'turnId' | 'dispatchAttempt'>>;
+    }
+  | { type: 'codex_app_generation_active'; sessionId: string; generation: string; fresh: boolean }
   | {
       type: 'final_output';
       /** Worker-side botmux session identity. Daemon validates this before
@@ -647,6 +801,7 @@ export type WorkerToDaemon =
       content: string;
       lastUuid: string;
       turnId: string;
+      replyTurnId?: string;
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;
@@ -658,6 +813,15 @@ export type WorkerToDaemon =
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
+      /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
+      codexAppSettlement?: {
+        requestId: string;
+        generation: string;
+        seq: number;
+        dispatchId: string;
+      };
+      /** The model already delivered through botmux send; settle without fallback output. */
+      suppressDelivery?: boolean;
     }
   | {
       type: 'turn_terminal';
@@ -680,4 +844,27 @@ export type WorkerToDaemon =
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
-  | { type: 'riff_task_id'; taskId: string | null };
+  | { type: 'riff_task_id'; taskId: string | null }
+  | {
+      type: 'riff_shutdown_result';
+      requestId: string;
+      phase: 'prepare' | 'abort';
+      ok: boolean;
+      /** Required exact lineage. `null` authoritatively clears stale state. */
+      taskId: string | null;
+      error?: string;
+    }
+  | {
+      type: 'close_abort_result';
+      requestId: string;
+      ok: boolean;
+      error?: string;
+    }
+  | {
+      type: 'close_result';
+      requestId: string;
+      ok: boolean;
+      /** Exact Riff task that remains live when cancellation failed. */
+      taskId?: string;
+      error?: string;
+    };

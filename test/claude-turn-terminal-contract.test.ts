@@ -212,7 +212,7 @@ describe('Claude durable turn terminal contract', () => {
     expect(source).toContain("emitDurableFailure(`submit_impossible:${reason}`)");
     expect(source).toContain("emitDurableFailure('submit_usage_limit')");
     expect(source).toContain("emitDurableFailure('submit_unconfirmed')");
-    expect(source).toContain('bridgeQueue.dropPendingTurn(bridgeTurnId, turnIdentity?.dispatchAttempt)');
+    expect(source).toContain('bridgeQueue.dropPendingTurn(bridgeTurnId, dispatchAttempt)');
     expect(source).toContain("'terminal_bridge_unavailable'");
     expect(source).toMatch(/emitTurnTerminal\([\s\S]*?'ambiguous',[\s\S]*?'cli_exit'/);
     expect(source).toContain('requireExplicitTerminalForDurable: true');

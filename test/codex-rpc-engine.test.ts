@@ -19,6 +19,10 @@ function makeEngine(over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0
     ...over,
   });
 }
+const owner = (turnId: string, dispatchAttempt?: number) => ({
+  turnId,
+  ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+});
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
   it('start (spawn → /readyz → connect → initialize) then startThread → sendTurn → stop', async () => {
@@ -28,7 +32,8 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(tid).toBe('thread-fake-1');
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
-    await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await expect(engine.sendTurn('hello world', owner('turn-1', 1)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
     engine.stop();
   }, 20_000);
 
@@ -37,6 +42,96 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     await engine.start();
     const tid = await engine.resumeThread('thread-persisted-42');
     expect(tid).toBe('thread-persisted-42');
+    engine.stop();
+  }, 20_000);
+
+  it('maps an ultra-fast turn/completed to the exact Botmux attempt', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-map',
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('fast', owner('botmux-fast', 7));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'botmux-fast', dispatchAttempt: 7 },
+      nativeTurnId: 'turn-fake-1',
+      status: 'completed',
+    })]);
+    engine.stop();
+  }, 20_000);
+
+  it('maps turn/completed that arrives before turn/start response without resurrecting the turn', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-before-response',
+      env: { ...process.env, FAKE_TERMINAL_BEFORE_RESPONSE: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('fastest', owner('before-response', 8)))
+      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'before-response', dispatchAttempt: 8 },
+      nativeTurnId: 'turn-fake-1',
+      status: 'completed',
+    })]);
+
+    // If response binding resurrected the already-terminal native id, stop()
+    // would attempt another terminal callback. Native-terminal de-dupe masks
+    // that callback, so assert the internal active ownership is actually empty.
+    expect((engine as any).turnOwners.size).toBe(0);
+    engine.stop();
+  }, 20_000);
+
+  it('deduplicates duplicate native terminal notifications', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'duplicate-terminal',
+      env: { ...process.env, FAKE_DUPLICATE_TERMINAL: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('once', owner('dedupe', 9));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]).toEqual(expect.objectContaining({
+      identity: { turnId: 'dedupe', dispatchAttempt: 9 },
+      status: 'completed',
+    }));
+    engine.stop();
+  }, 20_000);
+
+  it('keeps the first terminal buffered for an unowned native turn', () => {
+    const engine = makeEngine({ sessionId: 'unowned-first-terminal-wins' });
+    (engine as any).emitTurnTerminal('unowned-native', 'failed', 'first_failure');
+    (engine as any).emitTurnTerminal('unowned-native', 'completed');
+    expect((engine as any).deferredUnownedTerminals.get('unowned-native')).toEqual({
+      status: 'failed',
+      errorCode: 'first_failure',
+    });
+    engine.stop();
+  });
+
+  it('keeps sequential resume/typeahead attempts isolated by native turn id', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'terminal-sequential',
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.resumeThread('thread-persisted');
+    await engine.sendTurn('one', owner('same-logical', 1));
+    await engine.sendTurn('two', owner('same-logical', 2));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals.map(t => [t.nativeTurnId, t.identity.dispatchAttempt])).toEqual([
+      ['turn-fake-1', 1],
+      ['turn-fake-2', 2],
+    ]);
     engine.stop();
   }, 20_000);
 });
@@ -52,8 +147,49 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     });
     await engine.start();
     await engine.startThread();
-    await expect(engine.sendTurn('never answered')).rejects.toThrow(/timed out/);
+    await expect(engine.sendTurn('never answered', owner('turn-hang', 1))).rejects.toThrow(/timed out/);
     expect(deadCount).toBe(1); // failAll → onDead exactly once
+    engine.stop();
+  }, 20_000);
+
+  it('does not guess a lost follow-up response from an unowned native terminal', async () => {
+    let deadCount = 0;
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'followup-lost-ack-terminal',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+      },
+      requestTimeoutMs: 400,
+      onDead: () => { deadCount++; },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('completed despite lost ack', owner('followup-proof', 4)))
+      .rejects.toThrow(/timed out/);
+    expect(deadCount).toBe(1);
+    expect(terminals).toEqual([]);
+    engine.stop();
+  }, 20_000);
+
+  it('does not bind an unrelated pre-response turn/started when the request response rejects', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'followup-response-error-after-started',
+      env: { ...process.env, FAKE_ERROR_AFTER_STARTED: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('started before response error', owner('started-proof', 5)))
+      .rejects.toThrow(/fake response failure/);
+    expect((engine as any).turnOwners.size).toBe(0);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(terminals).toEqual([]);
+    expect((engine as any).turnOwners.size).toBe(0);
     engine.stop();
   }, 20_000);
 
@@ -96,8 +232,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     const engine = makeEngine({ sessionId: 'first-ok' });
     await engine.start();
     await engine.startThread();
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => { probed = true; return false; });
-    expect(outcome).toBe('accepted');
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => { probed = true; return false; });
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: 'turn-fake-1' });
     expect(probed).toBe(false); // ack answered → no need to consult the rollout
     engine.stop();
   }, 20_000);
@@ -107,8 +243,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await engine.start();
     await engine.startThread();
     (engine as any).ws = undefined; // simulate ws not open → send() throws before the frame leaves
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => true);
-    expect(outcome).toBe('not-sent');
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => true);
+    expect(outcome).toEqual({ outcome: 'not-sent' });
     engine.stop();
   }, 20_000);
 
@@ -117,8 +253,78 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await engine.start();
     await engine.startThread();
     // frame dispatched, no ack within 400ms, but the rollout shows the user turn.
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => true);
-    expect(outcome).toBe('accepted'); // positive evidence → never resend
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => true);
+    expect(outcome).toEqual({ outcome: 'accepted' }); // positive evidence → never resend
+    engine.stop();
+  }, 20_000);
+
+  it('uses rollout evidence, not a sole pending request, when first-turn response is lost', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'first-lost-ack-native',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+      },
+      requestTimeoutMs: 400,
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('first-native', 3),
+      async () => true,
+    );
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: undefined });
+    expect(terminals).toEqual([]);
+    engine.stop();
+  }, 20_000);
+
+  it('does not treat an uncorrelated turn/started as first-turn delivery evidence', async () => {
+    let probed = false;
+    const engine = makeEngine({
+      sessionId: 'first-lost-ack-started',
+      env: {
+        ...process.env,
+        FAKE_HANG_TURN: '1',
+        FAKE_HANG_TURN_NOTIFY: '1',
+        FAKE_NO_TURN_TERMINAL: '1',
+      },
+      requestTimeoutMs: 400,
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('first-started', 5),
+      async () => { probed = true; return false; },
+    );
+    expect(outcome).toEqual({ outcome: 'ambiguous' });
+    expect(probed).toBe(true);
+    engine.stop();
+  }, 20_000);
+
+  it.each([
+    ['aborted', 'aborted', undefined],
+    ['failed', 'failed', 'fake_failed'],
+  ] as const)('maps native %s completion to worker terminal %s', async (nativeStatus, expectedStatus, errorCode) => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: `terminal-${nativeStatus}`,
+      env: { ...process.env, FAKE_TURN_STATUS: nativeStatus },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn(nativeStatus, owner(`turn-${nativeStatus}`, 6));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: `turn-${nativeStatus}`, dispatchAttempt: 6 },
+      status: expectedStatus,
+      ...(errorCode ? { errorCode } : {}),
+    })]);
     engine.stop();
   }, 20_000);
 
@@ -126,8 +332,25 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     const engine = makeEngine({ sessionId: 'first-amb', env: { ...process.env, FAKE_HANG_TURN: '1' }, requestTimeoutMs: 400 });
     await engine.start();
     await engine.startThread();
-    const outcome = await engine.sendFirstTurn('hello', 'turn-1', async () => false);
-    expect(outcome).toBe('ambiguous'); // absence of evidence stays ambiguous → 0 auto-paste
+    const outcome = await engine.sendFirstTurn('hello', owner('turn-1', 1), async () => false);
+    expect(outcome).toEqual({ outcome: 'ambiguous' }); // absence of evidence stays ambiguous → 0 auto-paste
+    engine.stop();
+  }, 20_000);
+
+  it('P1-1 sendFirstTurn: rollout probe failure stays ambiguous instead of falling back to paste', async () => {
+    const engine = makeEngine({
+      sessionId: 'first-probe-error',
+      env: { ...process.env, FAKE_HANG_TURN: '1' },
+      requestTimeoutMs: 400,
+    });
+    await engine.start();
+    await engine.startThread();
+    const outcome = await engine.sendFirstTurn(
+      'hello',
+      owner('turn-probe-error', 2),
+      async () => { throw new Error('rollout unavailable'); },
+    );
+    expect(outcome).toEqual({ outcome: 'ambiguous' });
     engine.stop();
   }, 20_000);
 
@@ -156,5 +379,43 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
     await new Promise((r) => setTimeout(r, 300));
     expect(dead).toBe(false);
+  }, 20_000);
+
+  it('stop releases every still-active native turn with its exact owner', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'stop-active',
+      env: { ...process.env, FAKE_NO_TURN_TERMINAL: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('keep running', owner('active-stop', 11));
+    engine.stop();
+    expect(terminals).toEqual([expect.objectContaining({
+      identity: { turnId: 'active-stop', dispatchAttempt: 11 },
+      status: 'stopped',
+      errorCode: 'rpc_engine_stopped',
+    })]);
+  }, 20_000);
+
+  it('engine death releases every still-active native turn before onDead recovery', async () => {
+    const order: string[] = [];
+    const engine = makeEngine({
+      sessionId: 'death-active',
+      env: {
+        ...process.env,
+        FAKE_NO_TURN_TERMINAL: '1',
+        FAKE_DIE_AFTER_MS: '600',
+      },
+      onTurnTerminal: terminal => order.push(`terminal:${terminal.identity.turnId}:${terminal.status}`),
+      onDead: () => order.push('dead'),
+    });
+    await engine.start();
+    await engine.startThread();
+    await engine.sendTurn('active on crash', owner('active-dead', 12));
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    expect(order).toEqual(['terminal:active-dead:engine-dead', 'dead']);
+    engine.stop();
   }, 20_000);
 });

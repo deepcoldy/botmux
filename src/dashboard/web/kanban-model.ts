@@ -25,7 +25,7 @@ export function deriveKanbanColumn(s: KanbanRowLike): SessionKanbanColumn {
   if (s.status === 'closed') return 'done';
   const manual = normalizeKanbanColumn(s.kanbanColumn);
   if (manual) return manual;
-  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited') return 'in_review';
+  if (s.pendingRepo || s.tuiPromptActive || s.agentAttention || s.status === 'limited' || s.status === 'stalled') return 'in_review';
   if (s.status === 'starting' || s.status === 'working' || s.status === 'analyzing' || s.status === 'active') {
     return 'in_progress';
   }

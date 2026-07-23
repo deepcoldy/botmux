@@ -93,4 +93,8 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
     bot.backendType = 'herdr';
     expect(shutdownBackendDisposition(ds({ sessionBackend: 'pty' }))).toBe('close');
   });
+  it('routes a frozen Riff worker through drain + durable lineage ACK, never direct SIGTERM', () => {
+    bot.backendType = 'pty';
+    expect(shutdownBackendDisposition(ds({ sessionBackend: 'riff' }))).toBe('riff-drain-detach');
+  });
 });

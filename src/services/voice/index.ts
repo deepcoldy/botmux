@@ -9,7 +9,7 @@
  * default). Neither pulls a heavyweight dependency into the package.
  */
 import { encodePcmToOpus, toSpoken, type OpusResult, type Pcm } from './audio.js';
-import { samiSynthesizePcm, type SamiCreds } from './sami.js';
+import { samiSynthesizePcm, type SamiCreds, type VoiceProviderEffectOptions } from './sami.js';
 import { openaiSynthesizePcm, type OpenAITtsConfig } from './openai.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { loadBotConfigs } from '../../bot-registry.js';
@@ -84,7 +84,11 @@ function effectiveSpeaker(v: VoiceConfig): string {
  * Synthesize `text` into raw signed-16 PCM. Realtime VC voice uses this
  * intermediate directly; IM voice bubbles encode it to ogg/opus below.
  */
-export async function synthesizeVoicePcmForMessage(larkAppId: string | undefined, text: string): Promise<Pcm> {
+export async function synthesizeVoicePcmForMessage(
+  larkAppId: string | undefined,
+  text: string,
+  effects: VoiceProviderEffectOptions = {},
+): Promise<Pcm> {
   const cfg = resolveVoiceConfig(larkAppId);
   if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容引擎。');
   const spoken = toSpoken(text);
@@ -92,8 +96,8 @@ export async function synthesizeVoicePcmForMessage(larkAppId: string | undefined
   const speaker = effectiveSpeaker(cfg);
 
   return cfg.engine === 'openai'
-    ? await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate })
-    : await samiSynthesizePcm(cfg.sami as SamiCreds, spoken, { speaker, rate: cfg.rate });
+    ? await openaiSynthesizePcm(cfg.openai as OpenAITtsConfig, spoken, { speaker, rate: cfg.rate }, effects)
+    : await samiSynthesizePcm(cfg.sami as SamiCreds, spoken, { speaker, rate: cfg.rate }, effects);
 }
 
 /**
@@ -101,7 +105,11 @@ export async function synthesizeVoicePcmForMessage(larkAppId: string | undefined
  * Caller owns the returned temp dir and must rm -rf it after sending.
  * Throws when voice isn't configured for this bot or synthesis fails.
  */
-export async function synthesizeVoiceOpus(larkAppId: string | undefined, text: string): Promise<OpusResult> {
-  const pcm = await synthesizeVoicePcmForMessage(larkAppId, text);
+export async function synthesizeVoiceOpus(
+  larkAppId: string | undefined,
+  text: string,
+  effects: VoiceProviderEffectOptions = {},
+): Promise<OpusResult> {
+  const pcm = await synthesizeVoicePcmForMessage(larkAppId, text, effects);
   return encodePcmToOpus(pcm);
 }

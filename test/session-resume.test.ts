@@ -52,6 +52,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // Faithful: mirror the real setActiveSessionSafe — if a DIFFERENT entry
   // already holds the key, evict it (close) before setting, instead of a
   // bare overwrite that would mask a lingering occupant.
@@ -61,6 +62,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
       for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
     }
     map.set(key, ds);
+    return { accepted: true };
   }),
   // Real predicate (same logic as production): worker OR persisted CLI markers.
   isRelayableRealSession: (ds: any) =>
@@ -318,6 +320,26 @@ describe('resumeSession', () => {
       expect(r.ok).toBe(true);
     });
 
+    it('treats a persisted Riff task id as a real anchor conflict', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_riff_conflict' });
+      const sibling = sessionStore.createSession('oc_chat1', 'om_riff_conflict', 'Riff owner');
+      sibling.larkAppId = 'app_test';
+      sibling.scope = 'thread';
+      sibling.riffParentTaskId = 'riff-task-still-live';
+      sibling.cliId = undefined;
+      sibling.lastCliInput = undefined;
+      sessionStore.updateSession(sibling);
+
+      const result = await resumeSession(closed.sessionId, new Map());
+
+      expect(result).toEqual({
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: sibling.sessionId,
+      });
+      expect(sessionStore.getSession(sibling.sessionId)?.status).toBe('active');
+    });
+
     // ── Scratch carve-out (王皓's resume-after-/relay bug) ────────────────────
 
     it('does NOT block on an in-memory daemon-command scratch — evicts it and resumes', async () => {
@@ -382,6 +404,51 @@ describe('resumeSession', () => {
       // Scratch store row should now be closed.
       expect(sessionStore.getSession(scratch.sessionId)!.status).toBe('closed');
     });
+
+    it('keeps a fresh first owner that appears while resume awaits scratch cleanup', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_resume_race' });
+      const scratch = sessionStore.createSession('oc_chat1', 'om_resume_race', '/relay');
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined as any;
+      scratch.lastCliInput = undefined as any;
+      sessionStore.updateSession(scratch);
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      let releaseCleanup!: () => void;
+      let cleanupStarted!: () => void;
+      const paused = new Promise<void>(resolve => { releaseCleanup = resolve; });
+      const started = new Promise<void>(resolve => { cleanupStarted = resolve; });
+      vi.mocked(closeSession).mockImplementationOnce(async (sid: string) => {
+        cleanupStarted();
+        await paused;
+        sessionStore.closeSession(sid);
+        return { ok: true, alreadyClosed: false } as any;
+      });
+
+      const resuming = resumeSession(closed.sessionId, map);
+      await started;
+      const key = sessionKey('om_resume_race', 'app_test');
+      const fresh = {
+        session: { sessionId: 'fresh-first-owner', status: 'active', queued: false },
+        worker: null,
+        initialStartPending: true,
+        larkAppId: 'app_test',
+        chatId: 'oc_chat1',
+        scope: 'thread',
+      } as any;
+      map.set(key, fresh);
+      releaseCleanup();
+
+      const result = await resuming;
+      expect(result).toEqual({
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: 'fresh-first-owner',
+      });
+      expect(map.get(key)).toBe(fresh);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    });
   });
 
   describe('success path', () => {
@@ -444,6 +511,51 @@ describe('resumeSession', () => {
       expect(restored?.session.sessionId).toBe(materialized.sessionId);
       expect(restored?.session.rootMessageId).toBe('om_materialized_root');
       expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
+    });
+
+    it.each([
+      ['pending repo setup', (session: any) => {
+        session.queued = true;
+        session.queuedPrompt = 'abandoned picker prompt';
+        session.pendingRepoSetup = { mode: 'picker', prompt: 'abandoned picker prompt', repoCardMessageId: 'om_old_picker' };
+      }],
+      ['tokened activation head', (session: any) => {
+        session.queuedActivationPending = true;
+        session.queuedActivationToken = 'abandoned-token';
+        session.queuedActivationInput = { content: 'abandoned head' };
+        session.queuedActivationTurnId = 'abandoned-turn';
+        session.queuedActivationDispatchAttempt = 3;
+      }],
+      ['activation tail', (session: any) => {
+        session.queuedActivationTail = [{
+          id: 'abandoned-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'abandoned tail' }, turnId: 'tail-turn',
+        }];
+        session.queuedActivationTailNextOrder = 2;
+      }],
+    ] as const)('never revives legacy %s when a closed row is resumed', async (_label, injectLegacyState) => {
+      const closed = makeClosedSession({ rootMessageId: `om_legacy_${_label.replaceAll(' ', '_')}` });
+      injectLegacyState(closed);
+      // Simulate a row written by an older release: closed status plus queued
+      // ownership that the historical close path did not remove.
+      sessionStore.updateSession(closed);
+      const map = new Map<string, DaemonSession>();
+
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const persisted = sessionStore.getSession(closed.sessionId)!;
+      expect(persisted.status).toBe('active');
+      expect(persisted.queued).toBeUndefined();
+      expect(persisted.queuedPrompt).toBeUndefined();
+      expect(persisted.pendingRepoSetup).toBeUndefined();
+      expect(persisted.queuedActivationPending).toBeUndefined();
+      expect(persisted.queuedActivationToken).toBeUndefined();
+      expect(persisted.queuedActivationInput).toBeUndefined();
+      expect(persisted.queuedActivationTail).toBeUndefined();
+      expect(persisted.queuedActivationTailNextOrder).toBeUndefined();
+      expect(result.ds.initialStartPending).toBeFalsy();
+      expect(result.ds.pendingRepo).toBeFalsy();
     });
 
     it('restores dedicated VC receivers without collapsing them into the ordinary chat slot', async () => {

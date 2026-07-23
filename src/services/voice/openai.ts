@@ -10,6 +10,7 @@
  * that don't implement pcm should be configured against one that does.
  */
 import type { Pcm } from './audio.js';
+import type { VoiceProviderEffectOptions } from './sami.js';
 
 export interface OpenAITtsConfig {
   baseUrl: string; // e.g. https://api.openai.com/v1 or http://127.0.0.1:8880/v1
@@ -25,7 +26,12 @@ export interface OpenAISynthOpts {
   timeoutMs?: number;
 }
 
-export async function openaiSynthesizePcm(cfg: OpenAITtsConfig, text: string, opts: OpenAISynthOpts): Promise<Pcm> {
+export async function openaiSynthesizePcm(
+  cfg: OpenAITtsConfig,
+  text: string,
+  opts: OpenAISynthOpts,
+  effects: VoiceProviderEffectOptions = {},
+): Promise<Pcm> {
   const clean = text.trim();
   if (!clean) throw new Error('没有要合成的文字');
   if (!cfg.baseUrl || !cfg.model) throw new Error('OpenAI 兼容引擎配置不完整（需要 baseUrl / model）。');
@@ -41,6 +47,7 @@ export async function openaiSynthesizePcm(cfg: OpenAITtsConfig, text: string, op
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60000);
   try {
+    await effects.beforeProviderEffect?.();
     const res = await fetch(url, {
       method: 'POST',
       headers: {

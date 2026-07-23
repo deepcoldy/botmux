@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -27,6 +27,68 @@ describe('codexRpcEligible — the eligible base case', () => {
   });
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
+  });
+});
+
+describe('RPC terminal rollout hydration window', () => {
+  it('keeps polling through delayed 9s visibility and remains bounded near the 12s first-turn probe', () => {
+    const totalMs = CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS
+      .reduce((sum, delayMs) => sum + delayMs, 0);
+    expect(totalMs).toBeGreaterThanOrEqual(10_000);
+    expect(totalMs).toBeLessThanOrEqual(12_000);
+
+    // Model a rollout that becomes visible nine seconds after the native
+    // terminal. The retry sequence must still have a scheduled observation at
+    // or after visibility, rather than retiring the bridge mark early.
+    let elapsedMs = 0;
+    let observed = false;
+    for (const delayMs of CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS) {
+      elapsedMs += delayMs;
+      if (elapsedMs >= 9_000) {
+        observed = true;
+        break;
+      }
+    }
+    expect(observed).toBe(true);
+  });
+
+  it('lets an older terminal hydrate while a different successor awaits activation', () => {
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n-plus-1'],
+      'turn-n',
+    )).toBe(false);
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n-plus-1'],
+    )).toBe(true);
+    expect(rpcTranscriptIngestBlockedByAwaitingActivation(
+      ['turn-n', 'turn-n-plus-1'],
+      'turn-n',
+    )).toBe(true);
+  });
+});
+
+describe('RpcEngagementFence', () => {
+  it('rejects a delayed first-turn result after restart invalidates its lease', async () => {
+    const fence = new RpcEngagementFence();
+    const lease = fence.begin();
+    let resolveProbe!: (value: 'accepted') => void;
+    const probe = new Promise<'accepted'>(resolve => { resolveProbe = resolve; });
+    let published = false;
+    let requeued = false;
+    const engage = (async () => {
+      const outcome = await probe;
+      if (!fence.isCurrent(lease)) return 'superseded';
+      published = true;
+      if (outcome !== 'accepted') requeued = true;
+      return outcome;
+    })();
+
+    fence.invalidate();
+    resolveProbe('accepted');
+
+    await expect(engage).resolves.toBe('superseded');
+    expect(published).toBe(false);
+    expect(requeued).toBe(false);
   });
 });
 

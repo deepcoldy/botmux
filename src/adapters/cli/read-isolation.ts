@@ -20,7 +20,13 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
-import { managedOriginCapabilityPath } from '../../core/managed-origin-capability.js';
+import { createHash } from 'node:crypto';
+import {
+  managedOriginAttestationDirectory,
+  managedOriginCapabilityPath,
+  managedOriginIsolationSentinelPath,
+  managedOriginRootLocatorPath,
+} from '../../core/managed-origin-capability.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -107,6 +113,9 @@ export function buildCliExecutableReadCarveOuts(input: {
 export interface V2IsolationContext {
   /** The bot user's home directory. */
   homeDir: string;
+  /** OS account home from getpwuid/userInfo, never the mutable HOME env. Used
+   * only for the fixed kernel-observable isolation sentinel. */
+  osUserHomeDir?: string;
   /** BOTMUX_HOME root (e.g. `~/.botmux`). NOT denied wholesale — the botmux CLI the
    *  agent runs (`botmux send`/`list`/`status`) needs broad read access to it (config,
    *  daemon registry, pm2, session store). Only its cross-bot-SENSITIVE parts are denied. */
@@ -123,6 +132,8 @@ export interface V2IsolationContext {
   /** Current botmux session. Used only to carve back the exact rotating IPC
    * capability file from the otherwise denied read-isolation runtime dir. */
   currentSessionId: string;
+  /** Unguessable authority channel bound to this exact persistent pane/profile. */
+  currentOriginChannelId?: string;
   /** Per-bot extra deny paths (BotConfig.readDenyExtraPaths). */
   extraDenyPaths?: string[];
 }
@@ -299,6 +310,9 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       `${h}/.docker/config.json`,
       `${h}/.kube`,
       `${h}/Library/Keychains`,
+      // Fixed host-readable sentinel used by cmdSend to ask the kernel whether
+      // this process is inside Seatbelt. Never carve it back in.
+      managedOriginIsolationSentinelPath((ctx.osUserHomeDir ?? h).replace(/\/+$/, '')),
       // ── botmux SENSITIVE (surgical — leave config/registry/pm2/data structure readable) ──
       `${bh}/bots.json`,               // ALL bots' secrets
       `${bh}/logs`,                    // daemon logs (cross-bot content)
@@ -400,7 +414,8 @@ export function buildV2DenyRegexes(ctx: V2IsolationContext): string[] {
   const bh = ctx.botmuxHome.replace(/\/+$/, '');
   const h = ctx.homeDir.replace(/\/+$/, '');
   const defaultBh = (ctx.defaultBotmuxHome ?? `${h}/.botmux`).replace(/\/+$/, '');
-  const botmuxRoots = dedupe([defaultBh, bh]);
+  const osBh = `${(ctx.osUserHomeDir ?? h).replace(/\/+$/, '')}/.botmux`;
+  const botmuxRoots = dedupe([defaultBh, bh, osBh]);
   return dedupe([
     `^${escapeForRegex(sd)}/sessions-[^/]+\\.json$`,
     // Any `bots.json.` sidecar (backups/temp) — trailing dot so it matches
@@ -450,6 +465,7 @@ export function buildReadIsolationProtectedWriteRules(
   const dashboardRoots = dedupe([
     defaultBh,
     bh,
+    `${(ctx.osUserHomeDir ?? h).replace(/\/+$/, '')}/.botmux`,
     ...(extraRoots.dashboardRoots ?? []).map(root => root.replace(/\/+$/, '')),
   ]);
   const sessionDataDirs = dedupe([
@@ -458,6 +474,7 @@ export function buildReadIsolationProtectedWriteRules(
   ]);
   return {
     denyWritePaths: dedupe([
+      managedOriginIsolationSentinelPath((ctx.osUserHomeDir ?? h).replace(/\/+$/, '')),
       ...dashboardRoots.flatMap(root => [
         `${root}/.dashboard-secret`,
         `${root}/.dashboard-token`,
@@ -520,7 +537,21 @@ export function buildV2CarveOuts(ctx: V2IsolationContext): {
       `${sd}/attachments/${self}`,
       // Parent read-isolation/ stays wholesale-denied; only this session's
       // rotating origin capability is visible to the confined CLI.
-      managedOriginCapabilityPath(sd, ctx.currentSessionId),
+      ...(ctx.currentOriginChannelId
+        ? [managedOriginCapabilityPath(sd, ctx.currentSessionId, ctx.currentOriginChannelId)]
+        : []),
+      // The CLI challenges the owning daemon with a random nonce and accepts
+      // only the corresponding host-written proof from this read-only carve.
+      // A fake loopback listener cannot manufacture files here.
+      ...(ctx.currentOriginChannelId
+        ? [managedOriginAttestationDirectory(sd, ctx.currentSessionId, ctx.currentOriginChannelId)]
+        : []),
+      // Fixed-home root locator binds mutable SESSION_DATA_DIR back to the
+      // daemon's true root. The legacy dashboard-secret regex denies the class;
+      // only this current-session leaf is reopened for reading.
+      ...(ctx.currentOriginChannelId
+        ? [managedOriginRootLocatorPath(ctx.osUserHomeDir ?? h, ctx.currentSessionId)]
+        : []),
     ],
     // file-read-metadata on the wholesale-denied parents so the CLI/skill can realpath()
     // through them WITHOUT `ls` (enumeration) leaking.
@@ -889,16 +920,86 @@ function normalizeIsolationCapabilities(
   return ALL_ISOLATION_CAPABILITIES.filter(capability => requested.has(capability));
 }
 
+export interface IsolationPanePolicyInput {
+  readIsolation: boolean;
+  writeSandbox: boolean;
+  readDenyExtraPaths?: readonly string[];
+  writeAllowExtraPaths?: readonly string[];
+  workingDir?: string;
+  homeDir?: string;
+  osUserHomeDir?: string;
+  botmuxHome?: string;
+  sessionDataDir?: string;
+  currentAppId?: string;
+  cliId?: string;
+  resolvedBin?: string;
+}
+
+/** Deterministic fingerprint of effective Darwin Seatbelt inputs that can
+ * change between worker forks while the pane survives. Arrays are normalized
+ * as sets because rule order does not change their final deny semantics. */
+export function isolationPanePolicyDigest(input: IsolationPanePolicyInput): string {
+  const normalizedExtra = (input.readDenyExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  const normalizedWriteExtra = (input.writeAllowExtraPaths ?? [])
+    .map(normalizeIsolationPath)
+    .filter((value): value is string => !!value)
+    .sort();
+  return createHash('sha256').update(JSON.stringify({
+    domain: 'botmux.darwin-seatbelt-policy.v7',
+    readIsolation: input.readIsolation,
+    writeSandbox: input.writeSandbox,
+    readDenyExtraPaths: normalizedExtra,
+    writeAllowExtraPaths: normalizedWriteExtra,
+    workingDir: input.workingDir ?? '',
+    homeDir: input.homeDir ?? '',
+    osUserHomeDir: input.osUserHomeDir ?? '',
+    botmuxHome: input.botmuxHome ?? '',
+    sessionDataDir: input.sessionDataDir ?? '',
+    currentAppId: input.currentAppId ?? '',
+    cliId: input.cliId ?? '',
+    resolvedBin: input.resolvedBin ?? '',
+  })).digest('hex');
+}
+
 /** Versioned marker written beside a freshly spawned persistent sandbox. */
 export function isolationPaneMarkerContent(
   bootId: string,
   capabilities: readonly IsolationCapability[],
+  policy?: {
+    originChannelId: string;
+    readIsolation: boolean;
+    writeSandbox: boolean;
+    policyDigest: string;
+  },
 ): string {
+  if (policy
+    && (!/^[a-f0-9]{64}$/.test(policy.originChannelId)
+      || !/^[a-f0-9]{64}$/.test(policy.policyDigest))) {
+    throw new Error('invalid Darwin isolation marker policy');
+  }
   return JSON.stringify({
     version: ISOLATION_PANE_MARKER_VERSION,
     bootId,
     capabilities: normalizeIsolationCapabilities(capabilities),
+    ...(policy ?? {}),
   });
+}
+
+export function isolatedPaneOriginChannel(
+  markerContent: string | null | undefined,
+): string | undefined {
+  try {
+    const parsed = JSON.parse(markerContent ?? '') as { originChannelId?: unknown };
+    return typeof parsed.originChannelId === 'string'
+      && /^[a-f0-9]{64}$/.test(parsed.originChannelId)
+      ? parsed.originChannelId
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -916,25 +1017,61 @@ export function isolationPaneMarkerContent(
  */
 export function isolatedPaneReattachSafe(
   markerContent: string | null | undefined,
-  requiredCapabilities: readonly IsolationCapability[] = [],
+  expected: readonly IsolationCapability[] | {
+    requiredCapabilities: readonly IsolationCapability[];
+    exactCapabilities?: boolean;
+    readIsolation?: boolean;
+    writeSandbox?: boolean;
+    requireOriginChannel?: boolean;
+    policyDigest?: string;
+  } = [],
 ): boolean {
   try {
     const parsed = JSON.parse(markerContent ?? '') as {
       version?: unknown;
       bootId?: unknown;
       capabilities?: unknown;
+      readIsolation?: unknown;
+      writeSandbox?: unknown;
+      originChannelId?: unknown;
+      policyDigest?: unknown;
     };
-    if (!Array.isArray(parsed.capabilities)
+    if (parsed.version !== ISOLATION_PANE_MARKER_VERSION
+      || typeof parsed.bootId !== 'string'
+      || parsed.bootId.trim().length === 0
+      || !Array.isArray(parsed.capabilities)
       || parsed.capabilities.some(capability =>
         typeof capability !== 'string'
         || !ALL_ISOLATION_CAPABILITIES.includes(capability as IsolationCapability))) {
       return false;
     }
+    const expectedPolicy = Array.isArray(expected)
+      ? undefined
+      : expected as {
+          requiredCapabilities: readonly IsolationCapability[];
+          exactCapabilities?: boolean;
+          readIsolation?: boolean;
+          writeSandbox?: boolean;
+          requireOriginChannel?: boolean;
+          policyDigest?: string;
+        };
+    const requiredCapabilities: readonly IsolationCapability[] = expectedPolicy
+      ? expectedPolicy.requiredCapabilities
+      : expected as readonly IsolationCapability[];
     const actual = new Set(parsed.capabilities as IsolationCapability[]);
-    return parsed.version === ISOLATION_PANE_MARKER_VERSION
-      && typeof parsed.bootId === 'string'
-      && parsed.bootId.trim().length > 0
-      && requiredCapabilities.every(capability => actual.has(capability));
+    if (!requiredCapabilities.every(capability => actual.has(capability))) return false;
+    if (expectedPolicy?.exactCapabilities
+      && actual.size !== new Set(requiredCapabilities).size) return false;
+    if (!expectedPolicy) return true;
+    if (expectedPolicy.readIsolation !== undefined
+      && parsed.readIsolation !== expectedPolicy.readIsolation) return false;
+    if (expectedPolicy.writeSandbox !== undefined
+      && parsed.writeSandbox !== expectedPolicy.writeSandbox) return false;
+    if (expectedPolicy.policyDigest !== undefined
+      && parsed.policyDigest !== expectedPolicy.policyDigest) return false;
+    return !expectedPolicy.requireOriginChannel
+      || (typeof parsed.originChannelId === 'string'
+        && /^[a-f0-9]{64}$/.test(parsed.originChannelId));
   } catch {
     return false;
   }

@@ -131,7 +131,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __resetEventClaimsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -5870,6 +5870,213 @@ describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
     await flushEventWork();
   });
 
+  it('reserves same-chat arrival order before the first async routing lookup', async () => {
+    let releaseFirstMode!: (mode: 'group') => void;
+    const firstMode = new Promise<'group'>(resolve => { releaseFirstMode = resolve; });
+    mockGetChatMode.mockReset()
+      .mockImplementationOnce(async () => firstMode)
+      .mockResolvedValue('group');
+
+    const handled: string[] = [];
+    handlers.handleNewTopic.mockImplementation(async (data: any) => {
+      handled.push(data.message.message_id);
+    });
+    const event = (messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: `@BotA ${messageId}` }),
+      messageId,
+      chatId: 'chat-ingress-order',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    capturedHandlers['im.message.receive_v1'](event('msg-ingress-n'));
+    capturedHandlers['im.message.receive_v1'](event('msg-ingress-n-plus-1'));
+    await new Promise(resolve => setImmediate(resolve));
+    await Promise.resolve();
+
+    // N is blocked inside decideRouting. N+1 must not even enter that lookup;
+    // ordering at the later canonical anchor is already too late.
+    expect(mockGetChatMode).toHaveBeenCalledTimes(1);
+    expect(handled).toEqual([]);
+
+    releaseFirstMode('group');
+    await flushEventWork();
+    await flushEventWork();
+    expect(handled).toEqual(['msg-ingress-n', 'msg-ingress-n-plus-1']);
+  });
+
+  it('orders a topic seed before its thread-shaped reply across raw topology', async () => {
+    let releaseSeedMode!: (mode: 'topic') => void;
+    const seedMode = new Promise<'topic'>(resolve => { releaseSeedMode = resolve; });
+    mockGetChatMode.mockReset()
+      .mockImplementationOnce(async () => seedMode)
+      .mockResolvedValue('topic');
+
+    const handled: string[] = [];
+    handlers.handleNewTopic.mockImplementation(async (data: any) => {
+      handled.push(data.message.message_id);
+    });
+    handlers.handleThreadReply.mockImplementation(async (data: any) => {
+      handled.push(data.message.message_id);
+    });
+    const mentions = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA seed' }),
+      messageId: 'msg-topic-seed',
+      chatId: 'chat-topic-ingress',
+      chatType: 'group',
+      mentions,
+    });
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA reply' }),
+      messageId: 'msg-topic-reply',
+      rootId: 'msg-topic-seed',
+      threadId: 'omt-topic-thread',
+      chatId: 'chat-topic-ingress',
+      chatType: 'group',
+      mentions,
+    });
+
+    capturedHandlers['im.message.receive_v1'](seed);
+    capturedHandlers['im.message.receive_v1'](reply);
+    await new Promise(resolve => setImmediate(resolve));
+    await Promise.resolve();
+
+    // A thread-specific raw lane lets the reply bypass the seed here even
+    // though both later canonicalize to anchor=msg-topic-seed.
+    expect(handled).toEqual([]);
+
+    releaseSeedMode('topic');
+    await flushEventWork();
+    await flushEventWork();
+    expect(handled).toEqual(['msg-topic-seed', 'msg-topic-reply']);
+  });
+
+  it('bounds a reply wait when the earlier seed routing lookup is wedged', async () => {
+    vi.useFakeTimers();
+    try {
+      capturedHandlers = {};
+      __resetAnchorQueues();
+      __resetEventClaimsForTest();
+      config.daemon.forwardFollowupWaitMs = 25;
+      let releaseSeedMode!: (mode: 'topic') => void;
+      const seedMode = new Promise<'topic'>(resolve => { releaseSeedMode = resolve; });
+      mockGetChatMode.mockReset()
+        .mockImplementationOnce(async () => seedMode)
+        .mockResolvedValue('topic');
+      startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+      const handled: string[] = [];
+      handlers.handleNewTopic.mockImplementation(async data => {
+        handled.push(data.message.message_id);
+      });
+      handlers.handleThreadReply.mockImplementation(async data => {
+        handled.push(data.message.message_id);
+      });
+      const mentions = [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }];
+      const seed = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA seed' }),
+        messageId: 'msg-wedged-seed',
+        chatId: 'chat-wedged-seed',
+        chatType: 'group',
+        mentions,
+      });
+      const reply = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA reply' }),
+        messageId: 'msg-wedged-reply',
+        rootId: 'msg-wedged-seed',
+        threadId: 'omt-wedged',
+        chatId: 'chat-wedged-seed',
+        chatType: 'group',
+        mentions,
+      });
+
+      capturedHandlers['im.message.receive_v1'](seed);
+      capturedHandlers['im.message.receive_v1'](reply);
+      await vi.advanceTimersByTimeAsync(5_030);
+      expect(handled).toContain('msg-wedged-reply');
+
+      releaseSeedMode('topic');
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      expect(handled).toContain('msg-wedged-seed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('releases the chat routing barrier after enqueue so distinct topics still execute concurrently', async () => {
+    mockGetChatMode.mockReset().mockResolvedValue('topic');
+    let releaseFirst!: () => void;
+    const firstPending = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const started: string[] = [];
+    handlers.handleNewTopic.mockImplementation(async (data: any) => {
+      started.push(data.message.message_id);
+      if (data.message.message_id === 'msg-independent-topic-1') await firstPending;
+    });
+    const event = (messageId: string) => makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: `@BotA ${messageId}` }),
+      messageId,
+      chatId: 'chat-independent-topics',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    capturedHandlers['im.message.receive_v1'](event('msg-independent-topic-1'));
+    capturedHandlers['im.message.receive_v1'](event('msg-independent-topic-2'));
+    await flushEventWork();
+
+    expect(started).toEqual(['msg-independent-topic-1', 'msg-independent-topic-2']);
+    releaseFirst();
+    await flushEventWork();
+  });
+
+  it('keeps the canonical session FIFO strict past five seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      mockGetChatMode.mockReset().mockResolvedValue('group');
+      let releaseFirst!: () => void;
+      const firstPending = new Promise<void>(resolve => { releaseFirst = resolve; });
+      const started: string[] = [];
+      handlers.handleNewTopic.mockImplementation(async (data: any) => {
+        started.push(data.message.message_id);
+        if (data.message.message_id === 'msg-canonical-strict-1') await firstPending;
+      });
+      const event = (messageId: string) => makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: `@BotA ${messageId}` }),
+        messageId,
+        chatId: 'chat-canonical-strict',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+
+      capturedHandlers['im.message.receive_v1'](event('msg-canonical-strict-1'));
+      capturedHandlers['im.message.receive_v1'](event('msg-canonical-strict-2'));
+      await vi.advanceTimersByTimeAsync(0);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(started).toEqual(['msg-canonical-strict-1']);
+
+      await vi.advanceTimersByTimeAsync(5_100);
+      expect(started).toEqual(['msg-canonical-strict-1']);
+
+      releaseFirst();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(started).toEqual(['msg-canonical-strict-1', 'msg-canonical-strict-2']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('dedupes timeout redelivery of the same message_id', async () => {
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
@@ -5906,6 +6113,49 @@ describe('im.message.receive_v1 — ack-safe duplicate delivery', () => {
     await flushEventWork();
 
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('rawMessageIngressAnchor', () => {
+  it('keeps top-level and quote-bubble messages on the same chat lane', () => {
+    const topLevel = rawMessageIngressAnchor(MY_APP_ID, { chat_id: 'oc_same' });
+    const quoteBubble = rawMessageIngressAnchor(MY_APP_ID, {
+      chat_id: 'oc_same',
+      root_id: 'om_quoted',
+    });
+    expect(quoteBubble).toBe(topLevel);
+  });
+
+  it('uses one routing barrier per chat while isolating bot apps', () => {
+    const first = rawMessageIngressAnchor(MY_APP_ID, {
+      chat_id: 'oc_same',
+      thread_id: 'omt_first',
+    });
+    const second = rawMessageIngressAnchor(MY_APP_ID, {
+      chat_id: 'oc_same',
+      thread_id: 'omt_second',
+    });
+    const otherBot = rawMessageIngressAnchor(OTHER_BOT_APP_ID, {
+      chat_id: 'oc_same',
+      thread_id: 'omt_first',
+    });
+    expect(second).toBe(first);
+    expect(otherBot).not.toBe(first);
+  });
+
+  it('folds thread-shaped p2p replies together when DM routing is chat-scope', () => {
+    setupBotState({ p2pMode: 'chat' });
+    const first = rawMessageIngressAnchor(MY_APP_ID, {
+      chat_id: 'oc_dm',
+      chat_type: 'p2p',
+      thread_id: 'omt_first',
+    });
+    const second = rawMessageIngressAnchor(MY_APP_ID, {
+      chat_id: 'oc_dm',
+      chat_type: 'p2p',
+      thread_id: 'omt_second',
+    });
+    expect(second).toBe(first);
   });
 });
 

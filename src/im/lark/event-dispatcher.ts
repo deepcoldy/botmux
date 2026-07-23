@@ -600,6 +600,28 @@ function eventIdForKey(data: any): string | undefined {
   return data?.event_id ?? data?.uuid ?? data?.header?.event_id ?? data?.event?.event_id;
 }
 
+/**
+ * Synchronous first-stage routing lane for inbound Lark messages.
+ *
+ * Routing can await bot identity, chat mode, oncall binding, summary expansion,
+ * and VC catch-up before it discovers the canonical daemon anchor. Reserving
+ * only at that later anchor lets a faster N+1 reach the session before N.
+ *
+ * This barrier must be chat-wide, not thread-wide: a topic seed has no thread_id
+ * and initially looks chat-shaped, while its first reply carries thread_id; both
+ * later canonicalize to the seed message_id. Shared-topic aliases likewise fold
+ * a thread-shaped event back into a chat owner. Per-thread raw lanes therefore
+ * cannot prove arrival order. The barrier is released as soon as canonical work
+ * is synchronously enqueued below, so handlers for distinct canonical topics can
+ * still run concurrently.
+ */
+export function rawMessageIngressAnchor(larkAppId: string, message: any): string {
+  const chatId = typeof message?.chat_id === 'string' && message.chat_id.trim()
+    ? message.chat_id.trim()
+    : '__chatless__';
+  return `lark-message-routing:${larkAppId}:${chatId}`;
+}
+
 // card.action.trigger is a synchronous callback with a 3s deadline and NO
 // re-push (unlike events). If a handler (e.g. restart, which spawns a worker)
 // might exceed the budget, we ACK before 3s with a toast and patch the card
@@ -2055,14 +2077,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   const sessionsReady = new Promise<void>(resolve => { resolveSessionsReady = resolve; });
   if (sessionsReadyApps.has(larkAppId)) resolveSessionsReady();
   sessionsReadyBarriers.set(larkAppId, { promise: sessionsReady, resolve: resolveSessionsReady });
-  const dispatchHumanMessage = async (payload: PendingForwardTopicPayload): Promise<void> => {
-    await serializeByAnchor(payload.ctx.anchor, () => {
+  const dispatchHumanMessage = (payload: PendingForwardTopicPayload): Promise<void> =>
+    serializeByAnchor(payload.ctx.anchor, () => {
       const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
       return ownsSession
         ? handlers.handleThreadReply(payload.data, payload.ctx)
         : handlers.handleNewTopic(payload.data, payload.ctx);
-    });
-  };
+    }, 0);
   const dispatchPersistedForwardFollowup = async (
     seedMessageId: string,
     payload: PendingForwardTopicPayload,
@@ -2102,6 +2123,26 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     }
   }
   const seedRoutingGates = new Map<string, { ready: Promise<void>; complete: () => void }>();
+  const waitForSeedRoutingGate = async (messageId: string): Promise<void> => {
+    const gate = seedRoutingGates.get(messageId);
+    if (!gate) return;
+    const timeoutMs = Math.max(1, config.daemon.forwardFollowupWaitMs);
+    let timer: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      gate.ready.then(() => 'ready' as const),
+      new Promise<'timeout'>(resolve => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout') {
+      logger.warn(
+        `[forward-followup] seed routing gate timed out after ${timeoutMs}ms `
+        + `for root=${messageId.substring(0, 12)}; continuing without pairing`,
+      );
+    }
+  };
   const registerSeedRoutingGate = (messageId: string) => {
     let resolveReady!: () => void;
     const ready = new Promise<void>(resolve => { resolveReady = resolve; });
@@ -2188,8 +2229,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           // Serialize per anchor so back-to-back messages to the same thread
           // (e.g. dispatch's /repo prime + brief kickoff) don't interleave with
           // the first's async session-spawn. See anchor-serializer.ts.
-          await serializeByAnchor(ctx.anchor, () =>
-            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }))
+          void serializeByAnchor(ctx.anchor, () =>
+            handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId }), 0)
             .catch(err => logger.error(`Error handling message event: ${err}`));
           return;
         }
@@ -2319,8 +2360,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
-        await serializeByAnchor(ctx.anchor, () =>
-          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }))
+        void serializeByAnchor(ctx.anchor, () =>
+          handlers.handleThreadReply(data, { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId }), 0)
           .catch(err => logger.error(`Error handling bot @mention: ${err}`));
         return;
       }
@@ -2592,6 +2633,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         : '';
       const isControlCommand = strippedRoutingText.startsWith('/');
       let pairedForwardSeed;
+      let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a
       // sender who was /revoked within the grace window must not consume the
       // seed from the buffer or overwrite the durable paired record. The seed
@@ -2599,7 +2641,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
       if (senderOpenId && isAllowed && message.root_id && !isControlCommand) {
-        await seedRoutingGates.get(message.root_id)?.ready;
+        await waitForSeedRoutingGate(message.root_id);
         const pairingInput = {
           larkAppId,
           chatId,
@@ -2614,17 +2656,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (pairingDelayEnabled && !ambientRedirect) {
           pairedForwardSeed = forwardFollowups.take(pairingInput);
         } else if (!pairingDelayEnabled) {
-          const stalePendingSeed = forwardFollowups.take(pairingInput);
-          if (stalePendingSeed) {
-            try {
-              await dispatchPersistedForwardFollowup(stalePendingSeed.messageId, stalePendingSeed.payload);
-            } catch (err) {
-              logger.warn(
-                `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; ` +
-                `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
-              );
-            }
-          }
+          stalePendingSeed = forwardFollowups.take(pairingInput);
         }
       }
       if (pairedForwardSeed) {
@@ -2828,8 +2860,27 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         } catch (err) {
           logger.warn(`[forward-followup] failed to persist paired payload before dispatch: ${err}`);
         }
-        await dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
+        void dispatchPersistedForwardFollowup(pairedForwardSeed.messageId, payload)
           .catch(err => logger.error(`Error handling paired message event: ${err}`));
+        return;
+      }
+
+      if (stalePendingSeed) {
+        // The mention mode changed while a seed was held. Release the raw chat
+        // ingress lane immediately, but enqueue the stale seed before the
+        // current reply once session restoration is complete. Both calls append
+        // synchronously to the same canonical FIFO; their handler completion is
+        // deliberately not awaited by the raw lane.
+        void sessionsReady.then(() => {
+          void dispatchHumanMessage(stalePendingSeed.payload)
+            .then(() => removeForwardFollowup(larkAppId, stalePendingSeed.messageId))
+            .catch(err => logger.warn(
+              `[forward-followup] failed to flush stale seed=${stalePendingSeed.messageId.substring(0, 12)}; `
+              + `continuing current msg=${messageId.substring(0, 12)}: ${err}`,
+            ));
+          void dispatchHumanMessage(payload)
+            .catch(err => logger.error(`Error handling message event: ${err}`));
+        }).catch(err => logger.error(`Error awaiting restored sessions for stale seed: ${err}`));
         return;
       }
 
@@ -2837,7 +2888,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // processed in arrival order — never concurrently. Without this a fast
       // second message interleaves with the first's async session-spawn and is
       // dropped (worker-not-ready → re-fork branch). See anchor-serializer.ts.
-      await dispatchHumanMessage(payload)
+      // The chat-wide ingress lane protects only asynchronous routing. Once
+      // canonical work has been synchronously appended to its own anchor FIFO,
+      // release the raw lane so independent topics in the same chat can run
+      // concurrently. Same-anchor handlers remain strictly serialized by
+      // dispatchHumanMessage's canonical queue.
+      void dispatchHumanMessage(payload)
         .catch(err => logger.error(`Error handling message event: ${err}`));
     } catch (err) {
       logger.error(`Error handling message event: ${err}`);
@@ -2905,9 +2961,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const claim = messageIdForKey
         ? () => claimMessageOnce(larkAppId, messageIdForKey)
         : () => claimEventOnce(eventKey);
-      let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
-      const scheduled = scheduleAckSafeEvent(eventKey, () => processMessageEvent(data, seedRoutingGate), 'message event', claim);
       const rawMessage = data?.message;
+      const ingressAnchor = rawMessageIngressAnchor(larkAppId, rawMessage);
+      let seedRoutingGate: { ready: Promise<void>; complete: () => void } | undefined;
+      // Reserve the app/chat ingress lane before any routing await. Canonical
+      // per-anchor serialization inside processMessageEvent remains the final
+      // execution fence after aliases and chat mode are resolved.
+      const scheduled = scheduleAckSafeEvent(
+        eventKey,
+        () => serializeByAnchor(
+          ingressAnchor,
+          () => processMessageEvent(data, seedRoutingGate),
+        ),
+        'message event',
+        claim,
+      );
       const rawSenderType = data?.sender?.sender_type;
       if (
         scheduled

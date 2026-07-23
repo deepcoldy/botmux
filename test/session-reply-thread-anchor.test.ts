@@ -118,6 +118,18 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 
+  it('honors a daemon-frozen turn-A root after mutable session state advances to turn B', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    await sessionReply(CHAT, 'late A', 'text', APP, 'turn-a', {
+      replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' },
+    });
+
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_topic_a', 'late A', 'text', true, undefined, expect.anything(),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('plain chat session (no fold-back anchor) keeps replying flat to the chat top-level', async () => {
     seedSharedSession(undefined);
     await sessionReply(CHAT, 'hello', 'text', APP);

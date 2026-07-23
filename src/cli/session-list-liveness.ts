@@ -3,6 +3,7 @@ export interface SessionListMarkers {
   cliId?: unknown;
   lastCliInput?: unknown;
   adoptedFrom?: unknown;
+  codexAppDispatchLedger?: readonly unknown[];
 }
 
 export type SessionListDisposition = 'keep' | 'prune_real' | 'prune_scratch';
@@ -22,6 +23,7 @@ export function sessionListDisposition(
 ): SessionListDisposition {
   if (runtime.hasPid || runtime.hasBackingSession) return 'keep';
   if (session.suspendedColdResume === true) return 'keep';
+  if ((session.codexAppDispatchLedger?.length ?? 0) > 0) return 'keep';
   return session.cliId || session.lastCliInput || session.adoptedFrom
     ? 'prune_real'
     : 'prune_scratch';

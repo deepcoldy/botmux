@@ -8,6 +8,7 @@ import {
   deviceCredentialIsolationMarkerPath,
   isCredentialIsolationReservedBasename,
   buildCredentialIsolationRules,
+  isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   botHomePath,
   buildV2DenyPaths,
@@ -21,10 +22,24 @@ import {
   assertSafeAppId,
   normalizeIsolationPath,
   isolationPaneMarkerContent,
+  isolationPanePolicyDigest,
   type V2IsolationContext,
   type WriteSandboxContext,
 } from '../src/adapters/cli/read-isolation.js';
-import { managedOriginCapabilityPath } from '../src/core/managed-origin-capability.js';
+import {
+  managedOriginAttestationDirectory,
+  managedOriginCapabilityPath,
+  managedOriginIsolationSentinelPath,
+  managedOriginRootLocatorPath,
+} from '../src/core/managed-origin-capability.js';
+
+const G1 = '11'.repeat(32);
+const G2 = '22'.repeat(32);
+const POLICY1 = isolationPanePolicyDigest({
+  readIsolation: true,
+  writeSandbox: false,
+  readDenyExtraPaths: ['/private/a'],
+});
 
 const ws = (o: Partial<WriteSandboxContext> = {}): WriteSandboxContext => ({
   homeDir: '/Users/bot',
@@ -41,6 +56,7 @@ const v2 = (o: Partial<V2IsolationContext> = {}): V2IsolationContext => ({
   sessionDataDir: '/Users/bot/.botmux/data',
   currentAppId: 'cli_self',
   currentSessionId: 'session-self',
+  currentOriginChannelId: G1,
   ...o,
 });
 
@@ -482,7 +498,9 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
       '/Users/bot/.lark-cli-bots/cli_self',
       '/Users/bot/.botmux/data/sessions-cli_self.json',
       '/Users/bot/.botmux/data/attachments/cli_self',
-      managedOriginCapabilityPath('/Users/bot/.botmux/data', 'session-self'),
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', 'session-self', G1),
+      managedOriginAttestationDirectory('/Users/bot/.botmux/data', 'session-self', G1),
+      managedOriginRootLocatorPath('/Users/bot', 'session-self'),
     ]);
     // traverse shim on each wholesale-denied parent (stat/realpath, not listing)
     expect(carve.traverseDirs).toEqual([
@@ -517,7 +535,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(() => assertSafeAppId('...')).toThrow();
     expect(() => buildV2CarveOuts(v2({ currentAppId: '..' }))).toThrow();
     expect(buildV2CarveOuts(v2({ currentSessionId: '../other' })).allowPaths).toContain(
-      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other'),
+      managedOriginCapabilityPath('/Users/bot/.botmux/data', '../other', G1),
     );
     // botHomePath must also reject an unsafe id (used for own + other BOT_HOMEs)
     expect(() => botHomePath('/Users/bot/.botmux', '../x')).toThrow();
@@ -564,18 +582,32 @@ describe('buildSeatbeltProfile (verified format)', () => {
       .toBeGreaterThan(prof.indexOf('(allow file-read* (subpath "/Users/bot/.botmux/bots/cli_self"))'));
   });
 
-  it('carves only the current session capability and keeps its parent immutable', () => {
+  it('carves only the current session capability/proof dir and keeps it write-denied', () => {
     const ownCapability = managedOriginCapabilityPath(
       '/Users/bot/.botmux/data',
       'session-self',
+      G1,
     );
     const siblingCapability = managedOriginCapabilityPath(
       '/Users/bot/.botmux/data',
       'session-sibling',
+      G2,
+    );
+    const ownProofDir = managedOriginAttestationDirectory(
+      '/Users/bot/.botmux/data',
+      'session-self',
+      G1,
+    );
+    const siblingProofDir = managedOriginAttestationDirectory(
+      '/Users/bot/.botmux/data',
+      'session-sibling',
+      G2,
     );
     const carve = buildV2CarveOuts(v2());
     expect(carve.allowPaths).toContain(ownCapability);
     expect(carve.allowPaths).not.toContain(siblingCapability);
+    expect(carve.allowPaths).toContain(ownProofDir);
+    expect(carve.allowPaths).not.toContain(siblingProofDir);
 
     const parent = '/Users/bot/.botmux/data/read-isolation';
     const protectedWrites = buildReadIsolationProtectedWriteRules(v2());
@@ -593,6 +625,8 @@ describe('buildSeatbeltProfile (verified format)', () => {
     expect(prof).toContain(readAllow);
     expect(prof).toContain(writeDeny);
     expect(prof.indexOf(writeDeny)).toBeGreaterThan(prof.indexOf(readAllow));
+    expect(prof).not.toContain(`(allow file-write* (subpath "${ownProofDir}"))`);
+    expect(prof).toContain(`(deny file-read* (subpath "${managedOriginIsolationSentinelPath('/Users/bot')}"))`);
     expect(prof).toContain(
       '(deny file-write* (subpath "/Users/bot/.botmux/.dashboard-secret"))',
     );
@@ -788,7 +822,11 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
     // per-sibling), so exclude just those two from the comparison.
     const macDeny = buildV2DenyPaths(v2());
     const linux = buildLinuxReadIsolationMasks({ ctx: v2(), siblingAppIds: [] }).hidePaths;
-    const wholesalePerBot = new Set(['/Users/bot/.botmux/bots', '/Users/bot/.lark-cli-bots']);
+    const wholesalePerBot = new Set([
+      '/Users/bot/.botmux/bots',
+      '/Users/bot/.lark-cli-bots',
+      managedOriginIsolationSentinelPath('/Users/bot'),
+    ]);
     const shouldMatch = macDeny.filter(p => !wholesalePerBot.has(p));
     for (const p of shouldMatch) expect(linux).toContain(p);
   });
@@ -857,6 +895,108 @@ describe('isolatedPaneReattachSafe', () => {
     expect(isolatedPaneReattachSafe('')).toBe(false);
     expect(isolatedPaneReattachSafe('   ')).toBe(false);
   });
+
+  it('binds Darwin warm reattach to the pane channel and exact read/write policy', () => {
+    const marker = isolationPaneMarkerContent(
+      'boot-new',
+      ['credential', 'read'],
+      {
+        originChannelId: G1,
+        readIsolation: true,
+        writeSandbox: false,
+        policyDigest: POLICY1,
+      },
+    );
+    expect(isolatedPaneOriginChannel(marker)).toBe(G1);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: false, writeSandbox: false, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    const broadTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/custom/broad-tmp'],
+    });
+    const narrowTmpDigest = isolationPanePolicyDigest({
+      readIsolation: true,
+      writeSandbox: true,
+      writeAllowExtraPaths: ['/private/var/folders/narrow'],
+    });
+    const broadTmpMarker = isolationPaneMarkerContent('boot-old', ['credential', 'read', 'write'], {
+      originChannelId: G1,
+      readIsolation: true,
+      writeSandbox: true,
+      policyDigest: broadTmpDigest,
+    });
+    expect(isolatedPaneReattachSafe(broadTmpMarker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true,
+      writeSandbox: true,
+      requireOriginChannel: true,
+      policyDigest: narrowTmpDigest,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read', 'write'],
+      readIsolation: true, writeSandbox: true, requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(marker, {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: isolationPanePolicyDigest({
+        readIsolation: true,
+        writeSandbox: false,
+        readDenyExtraPaths: ['/private/b'],
+      }),
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(JSON.stringify({
+      version: 4,
+      bootId: 'legacy-v4',
+      readIsolation: true,
+      writeSandbox: false,
+      originChannelId: G1,
+    }), {
+      requiredCapabilities: ['credential', 'read'],
+      readIsolation: true,
+      writeSandbox: false,
+      requireOriginChannel: true,
+      policyDigest: POLICY1,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'credential-only-v7', ['credential'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(true);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'old-broader-policy-v7', ['credential', 'read', 'write'],
+    ), {
+      requiredCapabilities: ['credential'],
+      exactCapabilities: true,
+      requireOriginChannel: false,
+    })).toBe(false);
+    expect(isolatedPaneReattachSafe(isolationPaneMarkerContent(
+      'linux-v7', ['credential', 'read'],
+    ), {
+      requiredCapabilities: ['credential', 'read'],
+      requireOriginChannel: true,
+    })).toBe(false);
+  });
 });
 
 describe('worker capability carve-out ordering', () => {
@@ -865,12 +1005,22 @@ describe('worker capability carve-out ordering', () => {
   it('replaces a planted capability symlink before canonicalizing allow paths', () => {
     const publishAt = source.indexOf('publishSandboxRelayCapability({ failClosed: true })');
     const canonicalizeAt = source.indexOf(
-      'carve.allowPaths.map(path => path === capabilityCarvePath ? path : canonical(path))',
+      '...carve.allowPaths.map(path =>',
     );
     expect(publishAt).toBeGreaterThanOrEqual(0);
     expect(canonicalizeAt).toBeGreaterThan(publishAt);
     expect(source).toContain('replaceManagedOriginCapabilityFile(profilePath, buildSeatbeltProfile(');
-    expect(source).toContain('marker = readRegularHostFileNoFollow(');
+    expect(source).toContain('marker = readManagedOriginAuthorityFile(');
+  });
+
+  it('never lets old-generation teardown unlink the stable mac capability path', () => {
+    const unlinkStart = source.indexOf('function unlinkManagedOriginCapabilityFiles()');
+    const unlinkEnd = source.indexOf('/** Read a host-owned isolation marker', unlinkStart);
+    const unlink = source.slice(unlinkStart, unlinkEnd);
+    expect(unlink).toContain('sandboxRelayOutbox');
+    expect(unlink).not.toContain('readIsolationOriginCapabilityFile ??');
+    expect(source).toContain('ensureManagedOriginIsolationSentinel(osUserHomeDir)');
+    expect(source).toContain('osUserHomeDir: canonical(');
   });
 
   it('denies every same-UID Gateway socket before allowing only the current session socket', () => {
@@ -910,7 +1060,8 @@ describe('worker capability carve-out ordering', () => {
     expect(credentialWrapperAt).toBeLessThan(spawnAt);
     expect(source).toContain('if (!willReattachPersistent && credentialOnlyBwrap)');
     expect(source).toContain('isCredentialIsolationReservedBasename(name)');
-    expect(source).toContain('isolatedPaneReattachSafe(marker, appliedIsolationCapabilities)');
+    expect(source).toContain('requiredCapabilities: appliedIsolationCapabilities');
+    expect(source).toContain('exactCapabilities: true');
   });
 });
 
@@ -918,9 +1069,15 @@ describe('CLI protected capability wiring', () => {
   const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
   const vcSource = readFileSync(new URL('../src/cli/vc-agent.ts', import.meta.url), 'utf8');
 
-  it('passes the session id when resolving protected turn snapshots', () => {
+  it('requires host-file attestation when the fixed sentinel is kernel-denied', () => {
     expect(cliSource).toContain(
-      'const liveMarkerCtx = resolveSessionContext(\n    resolveDataDir(),\n    process.env.BOTMUX_SESSION_ID,',
+      'let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);',
+    );
+    expect(cliSource).toContain(
+      'managedOriginIsolationSentinelAccess(osUserHomeDir)',
+    );
+    expect(cliSource).toContain(
+      'if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx)',
     );
     expect(cliSource).toContain(
       'const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);',
