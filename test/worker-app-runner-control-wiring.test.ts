@@ -24,10 +24,9 @@ describe('worker app-runner control-channel wiring', () => {
     const flushEnd = workerSource.indexOf('function sendToPty', flushStart);
     const flush = workerSource.slice(flushStart, flushEnd);
     const reserveIdx = flush.indexOf('codexAppTurnDispatchQueue.reserve(');
-    // The master merge wraps the structured write in runAmbiguousSubmissionTransaction,
-    // so the call is now a `() => targetAdapter.writeStructuredInput!(...)` thunk
-    // (was `await cliAdapter.writeStructuredInput(...)` pre-merge).
-    const writeIdx = flush.indexOf('() => targetAdapter.writeStructuredInput!(');
+    // The master recovery wrapper keeps the structured write in a thunk; the
+    // captured adapter prevents an async continuation from crossing generation.
+    const writeIdx = flush.indexOf('() => writeAdapter.writeStructuredInput!(');
     expect(reserveIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(reserveIdx);
     expect(flush).toContain("result.submissionDisposition === 'untouched'");
@@ -73,12 +72,12 @@ describe('worker app-runner control-channel wiring', () => {
     const engageEnd = workerSource.indexOf('/** RPC panes have NO terminal input path', engageStart);
     const engage = workerSource.slice(engageStart, engageEnd);
     const firstTurn = engage.indexOf('await engine.sendFirstTurn(');
-    const accepted = engage.indexOf("if (first === 'accepted' && cfg.queuedActivationToken)", firstTurn);
+    const accepted = engage.indexOf("if (first.outcome === 'accepted' && cfg.queuedActivationToken)", firstTurn);
     const ack = engage.indexOf("type: 'queued_activation_submitted'", accepted);
     expect(firstTurn).toBeGreaterThan(-1);
     expect(accepted).toBeGreaterThan(firstTurn);
     expect(ack).toBeGreaterThan(accepted);
-    expect(engage.slice(firstTurn, accepted)).toContain("if (first === 'not-sent')");
+    expect(engage.slice(firstTurn, accepted)).toContain("if (first.outcome === 'not-sent')");
   });
 
   it('restores the durable FIFO but never treats warm signed idle as proof that prepared input was unwritten', () => {

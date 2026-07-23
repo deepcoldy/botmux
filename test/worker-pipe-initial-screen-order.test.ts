@@ -104,7 +104,7 @@ describe('worker pipe initial screen ordering', () => {
     const flushStart = source.indexOf('async function flushPending(): Promise<void>');
     const flushEnd = source.indexOf('function sendToPty(', flushStart);
     const flush = source.slice(flushStart, flushEnd);
-    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const writeIdx = flush.indexOf('() => writeAdapter.writeInput(');
     const gateIdx = flush.indexOf('if (cliAdapter.reliableTurnTerminal !== true) {', writeIdx);
     const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);', writeIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
@@ -439,7 +439,24 @@ describe('worker pipe initial screen ordering', () => {
     expect(killCliIdx).toBeGreaterThan(-1);
     const killCliBody = source.slice(source.indexOf('} = {}): void {', killCliIdx));
     expect(killCliBody.slice(0, 300)).toContain('cliSpawnGeneration++;');
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(3);
+    // Two additional checks normalize nested spawn failures before the three
+    // restart/init/message handlers consume them.
+    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(5);
+    const restartHandler = source.slice(
+      source.indexOf('async function restartCliProcess('),
+      source.indexOf('// ─── HTTP + WebSocket Server'),
+    );
+    const initHandler = source.slice(
+      source.indexOf("case 'init':"),
+      source.indexOf("case 'codex_app_dispatch_persisted':"),
+    );
+    const messageHandler = source.slice(
+      source.indexOf("case 'message':"),
+      source.indexOf("case 'raw_input':"),
+    );
+    for (const handler of [restartHandler, initHandler, messageHandler]) {
+      expect(handler).toContain('if (err instanceof CliSpawnSupersededError) return;');
+    }
   });
 
   it('uses hardened locators, random endpoints, and process-lifetime publisher leases', () => {

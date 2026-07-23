@@ -191,6 +191,21 @@ describe('worker structured-turn status wiring', () => {
     expect(ingest).toContain('if (rpcTurnsAwaitingActivation.size > 0) return;');
   });
 
+  it('fails closed on an ambiguous follow-up RPC response before generic submit-failure cleanup', () => {
+    const flush = source.slice(
+      source.indexOf('async function flushPending'),
+      source.indexOf('function sendToPty'),
+    );
+    const rpcCatch = flush.indexOf('if (rpcTurnIdentity && rpcTurnGeneration && writeRpcEngine)');
+    const install = flush.indexOf('installRpcLifecycleFailClosedOwner(rpcTurnIdentity, rpcTurnGeneration)', rpcCatch);
+    const genericCleanup = flush.indexOf('codexAppPromptReplay.cancelSubmission(', rpcCatch);
+    expect(rpcCatch).toBeGreaterThanOrEqual(0);
+    expect(install).toBeGreaterThan(rpcCatch);
+    expect(install).toBeLessThan(genericCleanup);
+    expect(flush.slice(rpcCatch, genericCleanup)).toContain('codexBridgeMarkPendingTurn(');
+    expect(flush.slice(rpcCatch, genericCleanup)).toContain('break;');
+  });
+
   it('registers fresh accepted RPC turns by exact id+attempt and fails closed on lifecycle registration loss', () => {
     const engage = source.slice(
       source.indexOf('async function engageCodexRpc'),
@@ -198,15 +213,85 @@ describe('worker structured-turn status wiring', () => {
     );
     expect(engage).toContain('turnId: cfg.turnId ??');
     expect(engage).toContain('dispatchAttempt: cfg.dispatchAttempt');
-    expect(engage).toContain('rpcTurnsAwaitingActivation.set(');
+    expect(engage).toContain('installAwaitingRpcActivation(');
     expect(engage).toContain('if (!first.nativeTurnId)');
-    expect(engage).toContain('rpcLifecycleFailClosedOwners.set(ownerKey, firstGeneration)');
+    expect(engage).toContain('installRpcLifecycleFailClosedOwner(firstIdentity, firstGeneration)');
     expect(engage).toContain('activateRpcTurnLifecycle(');
     expect(engage).toContain('firstGeneration,');
     expect(engage).toContain('deferredFreshRpcTurn = {');
     expect(engage).toContain('A dispatched-but-unconfirmed first turn is never re-sent');
-    expect(engage).toContain('rpcLifecycleFailClosedOwners.set(');
+    const notSent = engage.indexOf("if (first.outcome === 'not-sent')");
+    const durableClaim = engage.indexOf('durableTurnInFlight = true', notSent);
+    expect(durableClaim).toBeGreaterThan(notSent);
+    expect(engage.slice(notSent, durableClaim)).toContain("return 'not-engaged'");
+    expect(engage.match(/installRpcLifecycleFailClosedOwner\(firstIdentity, firstGeneration\)/g))
+      .toHaveLength(2);
     expect(engage).toContain('codexBridgeMarkPendingTurn(');
+  });
+
+  it('generation-fences every awaited RPC engagement stage and never paste-falls back after supersession', () => {
+    const engage = source.slice(
+      source.indexOf('async function engageCodexRpc'),
+      source.indexOf('function armRpcStartupDialogDismiss'),
+    );
+    const start = engage.indexOf('await engine.start()');
+    const startFence = engage.indexOf('assertRpcEngagementCurrent()', start);
+    const thread = engage.indexOf('await engine.resumeThread', startFence);
+    const threadFence = engage.indexOf('assertRpcEngagementCurrent()', thread);
+    const first = engage.indexOf('await engine.sendFirstTurn', threadFence);
+    const firstFence = engage.indexOf('assertRpcEngagementCurrent()', first);
+    const durable = engage.indexOf('durableTurnInFlight = true', firstFence);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(startFence).toBeGreaterThan(start);
+    expect(thread).toBeGreaterThan(startFence);
+    expect(threadFence).toBeGreaterThan(thread);
+    expect(first).toBeGreaterThan(threadFence);
+    expect(firstFence).toBeGreaterThan(first);
+    expect(firstFence).toBeLessThan(durable);
+    expect(engage).toContain('!rpcEngagementFence.isCurrent(engagementLease)');
+    expect(engage).toContain('throw err instanceof CliSpawnSupersededError');
+    expect(engage).toContain('clearRpcEnginePidMarker(enginePidMarker)');
+
+    const stop = functionSlice('stopCodexRpcEngine', 'persistentPaneInfo');
+    expect(stop).toContain('rpcEngagementFence.invalidate()');
+  });
+
+  it('keeps stale RPC write ownership until exact teardown instead of ordinary carryover replay', () => {
+    const flush = source.slice(
+      source.indexOf('async function flushPending'),
+      source.indexOf('function sendToPty'),
+    );
+    const ackStale = flush.indexOf('if (!writeContinuationIsCurrent())', flush.indexOf('await writeRpcEngine.sendTurn'));
+    const ackBreak = flush.indexOf('break;', ackStale);
+    const rpcCatch = flush.indexOf('} catch (err: any) {', ackBreak);
+    const errorStale = flush.indexOf('if (!writeContinuationIsCurrent())', rpcCatch);
+    const errorBreak = flush.indexOf('break;', errorStale);
+    expect(flush.slice(ackStale, ackBreak)).toContain('Deferred stale Codex RPC continuation to engine teardown');
+    expect(flush.slice(ackStale, ackBreak)).not.toContain('clearAwaitingRpcActivation(');
+    expect(flush.slice(ackStale, ackBreak)).not.toContain('handleStaleWriteContinuation(');
+    expect(flush.slice(errorStale, errorBreak)).toContain('Deferred stale failed Codex RPC continuation to engine teardown');
+    expect(flush.slice(errorStale, errorBreak)).not.toContain('clearAwaitingRpcActivation(');
+  });
+
+  it('retires a no-native RPC fail-closed owner when its bounded pre-start attribution lease expires', () => {
+    const prune = functionSlice('pruneExpiredStructuredHeadsAndEmit', 'codexBridgeDrainAndMaybeEmit');
+    const lookup = prune.indexOf('rpcLifecycleFailClosedOwners.get(ownerKey)');
+    const clear = prune.indexOf('clearRpcLifecycleFailClosedOwner(identity, failedClosedGeneration)', lookup);
+    const terminal = prune.indexOf('emitTurnTerminal(', clear);
+    const restart = prune.indexOf('void restartCliProcess(', clear);
+    const pruneReturn = prune.indexOf('if (dropped.length === 0) return false');
+    const redrive = prune.indexOf('redriveRejectedStructuredReady()', terminal);
+    expect(lookup).toBeGreaterThanOrEqual(0);
+    expect(clear).toBeGreaterThan(lookup);
+    expect(terminal).toBeGreaterThan(clear);
+    expect(restart).toBeGreaterThan(clear);
+    expect(terminal).toBeLessThan(restart);
+    expect(restart).toBeLessThan(pruneReturn);
+    expect(redrive).toBeGreaterThan(terminal);
+    expect(prune).toContain('clearAwaitingRpcActivation(identity, failedClosedGeneration)');
+    expect(prune).toContain('deferredFreshRpcTurn = undefined');
+    expect(prune.indexOf('if (turn.dispatchAttempt === undefined) continue')).toBe(-1);
+    expect(prune).toContain("'rpc_delivery_ambiguous_timeout'");
   });
 
   it('buffers a fast native terminal until exact activation and hydrates output before terminal retirement', () => {
@@ -230,6 +315,39 @@ describe('worker structured-turn status wiring', () => {
     expect(init.indexOf('await spawnCli(msg')).toBeLessThan(init.indexOf('releaseRpcTurnTerminalDeferral('));
   });
 
+  it('attaches fresh Codex-family RPC rollouts from offset zero so a fast first terminal remains hydratable', () => {
+    const spawn = source.slice(
+      source.indexOf('async function spawnCli'),
+      source.indexOf('async function restartCliProcess'),
+    );
+    const codexBranch = spawn.slice(
+      spawn.indexOf("} else if (cfg.cliId === 'codex')"),
+      spawn.indexOf("} else if (cfg.cliId === 'traex')"),
+    );
+    const traexBranch = spawn.slice(
+      spawn.indexOf("} else if (cfg.cliId === 'traex')"),
+      spawn.indexOf("} else if (cfg.cliId === 'coco')"),
+    );
+    for (const branch of [codexBranch, traexBranch]) {
+      expect(branch).toContain("effectiveResume ? 'baseline-existing' : 'fresh-empty'");
+      expect(branch).not.toContain("codexBridgeAttach(rolloutPath, 'baseline-existing')");
+    }
+  });
+
+  it('holds every successor behind an unresolved fail-closed RPC owner even when Codex type-ahead is enabled', () => {
+    const flush = source.slice(
+      source.indexOf('async function flushPending'),
+      source.indexOf('function sendToPty'),
+    );
+    const preflightGate = flush.indexOf('if (rpcLifecycleFailClosedOwners.size > 0)');
+    const typeAheadDecision = flush.indexOf('const typeAheadAllowed = pendingInputAllowsTypeAhead');
+    const loopStart = flush.indexOf('while (pendingMessages.length > 0');
+    const postWriteBreak = flush.indexOf('if (rpcLifecycleFailClosedOwners.size > 0) break', loopStart);
+    expect(preflightGate).toBeGreaterThanOrEqual(0);
+    expect(preflightGate).toBeLessThan(typeAheadDecision);
+    expect(postWriteBreak).toBeGreaterThan(loopStart);
+  });
+
   it('makes native terminal settlement idempotent and generation-owned across abort/death/stop cleanup', () => {
     const settle = functionSlice('settleRpcTurnTerminal', 'handleRpcTurnTerminal');
     expect(settle).toContain('const existingSettlement = settlingRpcTerminalOwners.get(ownerKey)');
@@ -245,6 +363,19 @@ describe('worker structured-turn status wiring', () => {
 
     const stop = functionSlice('stopCodexRpcEngine', 'persistentPaneInfo');
     expect(stop.indexOf('engine?.stop()')).toBeLessThan(stop.indexOf('codexRpcEngine = undefined'));
+    expect(stop.indexOf('for (const [ownerKey, pending] of [...pendingRpcTurnTerminals])'))
+      .toBeLessThan(stop.indexOf('pendingRpcTurnTerminals.clear()'));
+    expect(stop).toContain('settleRpcTurnTerminal(pending.terminal, pending.generation)');
+    const pendingLoop = stop.slice(
+      stop.indexOf('for (const [ownerKey, pending] of [...pendingRpcTurnTerminals])'),
+      stop.indexOf('for (const [ownerKey, identity] of [...rpcTurnsAwaitingActivationIdentities])'),
+    );
+    expect(pendingLoop).toContain('notifyRpcTeardownBeforeActivation(identity, pending.terminal.status)');
+    expect(stop).toContain('for (const [ownerKey, identity] of [...rpcTurnsAwaitingActivationIdentities])');
+    expect(stop).toContain("'rpc_engine_teardown_before_turn_start_ack'");
+    const notify = functionSlice('notifyRpcTeardownBeforeActivation', 'stopCodexRpcEngine');
+    expect(notify).toContain('为避免重复执行未自动重发');
+    expect(notify).toContain('兜底输出可能未被捕获');
     expect(stop).toContain('turn.finalText === undefined');
     expect(stop).toContain('turn.rpcActive');
     expect(stop).toContain('ownedRpcTurns.has(rpcTurnOwnerKey({');
@@ -262,7 +393,7 @@ describe('worker structured-turn status wiring', () => {
     const prune = functionSlice('pruneExpiredStructuredHeadsAndEmit', 'codexBridgeDrainAndMaybeEmit');
     expect(prune).toContain('pruneExpiredPreStartHeadsAndEmit(');
     expect(prune).toContain('emitReadyCodexTurns,');
-    expect(prune).toContain('if (turn.dispatchAttempt === undefined) continue;');
+    expect(prune).toContain('if (retiredRpcOwner || turn.dispatchAttempt !== undefined)');
     expect(prune).toContain("'ambiguous',");
     expect(prune).toContain("'structured_start_timeout',");
     expect(prune).toContain('turn.dispatchAttempt,');

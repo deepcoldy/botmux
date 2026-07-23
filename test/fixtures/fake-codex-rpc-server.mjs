@@ -6,6 +6,7 @@
 //   FAKE_HANG_TURN=1     → never answer turn/start (wedged app-server)
 //   FAKE_HANG_TURN_NOTIFY=1 → emit started/completed but lose the ack
 //   FAKE_TERMINAL_BEFORE_RESPONSE=1 → broadcast terminal before turn/start ack
+//   FAKE_ERROR_AFTER_STARTED=1 → emit turn/started, reject the response, then complete
 //   FAKE_DUPLICATE_TERMINAL=1 → broadcast turn/completed twice
 //   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
 //   FAKE_THREAD_CONFIG_FILE=path → write the received thread/start params to path
@@ -23,6 +24,7 @@ const port = m ? Number(m[1]) : 0;
 const HANG_TURN = process.env.FAKE_HANG_TURN === '1';
 const HANG_TURN_NOTIFY = process.env.FAKE_HANG_TURN_NOTIFY === '1';
 const TERMINAL_BEFORE_RESPONSE = process.env.FAKE_TERMINAL_BEFORE_RESPONSE === '1';
+const ERROR_AFTER_STARTED = process.env.FAKE_ERROR_AFTER_STARTED === '1';
 const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
 const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
 const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
@@ -45,12 +47,14 @@ wss.on('connection', (ws) => {
   let pendingTurnReply;
   let pendingNativeTurnId;
   let pendingThreadId;
-  const emitTurnLifecycle = (threadId, nativeTurnId, status = TURN_STATUS) => {
+  const emitTurnStarted = (threadId, nativeTurnId) => {
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       method: 'turn/started',
       params: { threadId, turn: { id: nativeTurnId } },
     }));
+  };
+  const emitTurnCompleted = (threadId, nativeTurnId, status = TURN_STATUS) => {
     if (NO_TURN_TERMINAL) return;
     const turn = {
       id: nativeTurnId,
@@ -66,6 +70,10 @@ wss.on('connection', (ws) => {
     });
     ws.send(completed);
     if (DUPLICATE_TERMINAL) ws.send(completed);
+  };
+  const emitTurnLifecycle = (threadId, nativeTurnId, status = TURN_STATUS) => {
+    emitTurnStarted(threadId, nativeTurnId);
+    emitTurnCompleted(threadId, nativeTurnId, status);
   };
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
@@ -168,6 +176,16 @@ wss.on('connection', (ws) => {
               }],
             },
           }));
+          return;
+        }
+        if (ERROR_AFTER_STARTED) {
+          emitTurnStarted(threadId, nativeTurnId);
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'fake response failure after turn/started' },
+          }));
+          setTimeout(() => emitTurnCompleted(threadId, nativeTurnId), 100);
           return;
         }
         if (TERMINAL_BEFORE_RESPONSE) {
