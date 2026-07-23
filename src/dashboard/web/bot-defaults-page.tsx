@@ -19,6 +19,7 @@ import {
 } from './bot-defaults.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { store } from './store.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -302,7 +303,14 @@ function BotDefaultsPage() {
     void loadNameMaps().then(() => {
       if (mountedRef.current) setAvatarVersion(value => value + 1);
     });
-    return () => { mountedRef.current = false; };
+    // Auto-refresh the roster when a bot is added / removed / renamed on the
+    // daemon side (SSE bots.changed), so the list stays live without a manual
+    // reload. The bot rows carry their own botName/cliId from /api/bots, so a
+    // plain refresh() is enough to surface a freshly-added bot.
+    const offBots = store.onBotsChanged(() => {
+      if (mountedRef.current) void refresh();
+    });
+    return () => { mountedRef.current = false; offBots(); };
   }, [refresh]);
 
   const filtered = useMemo(() => {
