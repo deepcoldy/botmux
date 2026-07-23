@@ -149,6 +149,8 @@ export interface RuntimeServiceDeps {
   externalRuntime?: ExternalRuntimeCandidate | null;
   discoverExternalRuntime?: () => ExternalRuntimeCandidate | null;
   bundledRuntime?: BundledRuntimeCandidate;
+  /** Probed user shell PATH for bundled-runtime spawns (see probeShellPathEnv). */
+  shellPathEnv?: () => string | undefined;
   pm2Apps?: (runtime: RuntimeLaunchTarget) => Promise<Pm2AppSummary[]>;
 }
 
@@ -171,6 +173,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         botmuxHome: deps.paths.botmuxHome,
         args,
         baseEnv: deps.env,
+        pathEnv: deps.shellPathEnv?.(),
       });
     }
     return buildExternalBotmuxCommand({

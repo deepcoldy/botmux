@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { normalizeBotmuxVersion } from '../utils/version-info.js';
+import { shellPathProbes } from './shared/shell-path-probes.js';
 
 export interface RunCaptureOptions {
   env?: NodeJS.ProcessEnv;
@@ -275,9 +276,15 @@ function runBotmuxStatus(deps: AppSmokeDeps, appPath: string): RunCaptureResult 
   const direct = deps.runCapture('botmux', ['status'], { timeout: 25000, env: deps.env });
   if (direct.status === 0 || deps.platform !== 'darwin' || !direct.error) return direct;
 
-  // macOS GUI/Codex environments can miss the user's login-shell PATH even when
-  // `botmux` is installed globally. Retry through zsh before reporting no CLI.
-  return deps.runCapture('/bin/zsh', ['-lc', 'botmux status'], { timeout: 25000, env: deps.env });
+  // macOS GUI/Codex environments can miss the user's shell PATH even when
+  // `botmux` is installed globally. Retry through the user's shell — both rc
+  // (-ic) and profile (-lc) flavors, zsh and bash — before reporting no CLI.
+  let last = direct;
+  for (const probe of shellPathProbes(deps.env)) {
+    last = deps.runCapture(probe.shell, [probe.flags, 'botmux status'], { timeout: 25000, env: deps.env });
+    if (last.status === 0) return last;
+  }
+  return last;
 }
 
 function commandError(result: RunCaptureResult): string {

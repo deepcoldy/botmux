@@ -70,23 +70,47 @@ describe('worker pipe initial screen ordering', () => {
     expect(hardTimerIdx).toBeGreaterThan(fallbackStart);
   });
 
-  it('treats an explicit session-ready signal as prompt-ready after settle', () => {
+  it('treats Claude SessionStart as a boundary and waits for fresh prompt evidence', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const settleStart = source.indexOf('function settleThenFlush');
     const markIdx = source.indexOf('markPromptReady();', settleStart);
     const flushIdx = source.indexOf('void flushPending();', settleStart);
     const sessionReadyCase = source.indexOf("case 'session_ready'");
+    const waitDecisionIdx = source.indexOf(
+      'const waitForPostHookPrompt = shouldWaitForPostSessionStartPromptEvidence({',
+      sessionReadyCase,
+    );
+    const resetEvidenceIdx = source.indexOf('idleDetector?.resetReadyEvidence();', waitDecisionIdx);
+    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty();');
+    const screenEvidenceGuardIdx = source.indexOf("if (evidenceSource === 'screen')");
     const signalReleaseIdx = source.indexOf(
-      "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });",
+      "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });",
       sessionReadyCase,
     );
     const timeoutReleaseIdx = source.indexOf("releaseReadyGate('signal timeout fallback');");
+    const flushStart = source.indexOf('async function flushPending');
+    const postHookFlushGuardIdx = source.indexOf(
+      'if (awaitingPostSessionStartPromptEvidence)',
+      flushStart,
+    );
+    const ackIdx = source.indexOf(
+      "send({ type: 'session_ready_ack', requestId: msg.requestId });",
+      sessionReadyCase,
+    );
 
     expect(settleStart).toBeGreaterThan(-1);
     expect(markIdx).toBeGreaterThan(settleStart);
     expect(flushIdx).toBeGreaterThan(markIdx);
     expect(sessionReadyCase).toBeGreaterThan(-1);
+    expect(waitDecisionIdx).toBeGreaterThan(sessionReadyCase);
+    expect(resetEvidenceIdx).toBeGreaterThan(waitDecisionIdx);
+    expect(ptyReadyIdx).toBeGreaterThan(-1);
+    expect(screenEvidenceGuardIdx).toBeGreaterThan(-1);
+    expect(ptyReadyIdx).toBeGreaterThan(screenEvidenceGuardIdx);
     expect(signalReleaseIdx).toBeGreaterThan(sessionReadyCase);
+    expect(postHookFlushGuardIdx).toBeGreaterThan(flushStart);
+    expect(postHookFlushGuardIdx).toBeLessThan(source.indexOf('isFlushing = true;', flushStart));
+    expect(ackIdx).toBeGreaterThan(signalReleaseIdx);
     // Timeout fallback must stay conservative: it opens the gate but does not
     // force prompt-ready for a CLI whose true ready signal never arrived.
     expect(timeoutReleaseIdx).toBeGreaterThan(-1);
@@ -108,28 +132,61 @@ describe('worker pipe initial screen ordering', () => {
     expect(deferredFlagIdx).toBeGreaterThan(settleGuardIdx);
     expect(deferredFlagIdx).toBeLessThan(readySetIdx);
 
-    expect(settle).toContain('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;');
-    expect(settle.indexOf('promptReadyDetectedDuringSettle = false;')).toBeGreaterThan(
-      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
-    );
-    expect(settle.indexOf('markPromptReady();')).toBeGreaterThan(
-      settle.indexOf('const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;'),
-    );
+    // THE HERMES FIX (gate fallback path): when markPromptReady fires while the
+    // ready-gate is still holding (a readyPattern like ❯ appeared before the
+    // SessionStart signal), it must record readyPatternSeenDuringHold so the
+    // gate's timeout-fallback settle marks the prompt ready — otherwise a
+    // non-type-ahead adapter's held first message is dropped by flushPending()
+    // on !isPromptReady && !typeAheadAllowed.
+    const holdGuardIdx = mark.indexOf('if (readyGate.shouldHold())');
+    const holdFlagIdx = mark.indexOf('readyPatternSeenDuringHold = true;', holdGuardIdx);
+    expect(holdGuardIdx).toBeGreaterThan(-1);
+    expect(holdFlagIdx).toBeGreaterThan(holdGuardIdx);
+    expect(holdFlagIdx).toBeLessThan(readySetIdx);
+
+    const decideIdx = settle.indexOf('const shouldMarkPromptReady = decideSettleMarkReady({');
+    expect(decideIdx).toBeGreaterThan(-1);
+    // readyPatternSeenDuringHold must be wired into the settle decision.
+    expect(settle.indexOf('readyPatternSeenDuringHold,', decideIdx)).toBeGreaterThan(decideIdx);
+    // Both deferred flags are reset after the decision (so the next spawn is clean).
+    expect(settle.indexOf('promptReadyDetectedDuringSettle = false;', decideIdx)).toBeGreaterThan(decideIdx);
+    expect(settle.indexOf('readyPatternSeenDuringHold = false;', decideIdx)).toBeGreaterThan(decideIdx);
+    expect(settle.indexOf('markPromptReady();', decideIdx)).toBeGreaterThan(decideIdx);
+  });
+
+  it('forces the first prompt for non-type-ahead adapters at the hard timeout', () => {
+    // THE HERMES FIX (hard-timeout path): previously the hard cap only logged
+    // "forcing queued message flush" and flushed for type-ahead adapters only;
+    // non-type-ahead adapters (Hermes) never delivered. The release must now
+    // route non-type-ahead adapters to markPromptReady() (which then flushes).
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
+    const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
+    const markReadyIdx = source.indexOf('markPromptReady();', decideIdx);
+    const flushIdx = source.indexOf("if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush')", fallbackStart);
+
+    expect(fallbackStart).toBeGreaterThan(-1);
+    expect(decideIdx).toBeGreaterThan(fallbackStart);
+    // The type-ahead flush branch and the non-type-ahead mark-ready path both
+    // exist, in the right order.
+    expect(flushIdx).toBeGreaterThan(fallbackStart);
+    expect(markReadyIdx).toBeGreaterThan(flushIdx);
   });
 
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
     // releaseReadyGate from the real signal is skipped entirely. A CLI whose
     // cold start exceeds READY_SIGNAL_TIMEOUT_MS (Hermes: 2-3 min) would then
-    // never take the authoritative markPromptReady path. The session_ready
-    // case must detect the late arrival (gate armed + already received) and
-    // mark prompt-ready directly — but only during the first-prompt phase
-    // (awaitingFirstPrompt), so clear/compact SessionStart fires mid-session
-    // stay no-ops.
+    // never take the authoritative markPromptReady path. The session_ready case
+    // must detect the late arrival (gate armed + already received) and mark
+    // prompt-ready directly for authoritative non-Claude signals. Claude waits
+    // for post-hook prompt evidence instead. Both paths are limited to the
+    // first-prompt phase, so clear/compact SessionStart stays a no-op.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const sessionReadyCase = source.indexOf("case 'session_ready'");
     const lateCheckIdx = source.indexOf('readyGate.isArmed && readyGate.isReceived', sessionReadyCase);
     const lateGuardIdx = source.indexOf('awaitingFirstPrompt && !isPromptReady', sessionReadyCase);
+    const claudeGuardIdx = source.indexOf('&& !waitForPostHookPrompt', lateGuardIdx);
     const lateMarkIdx = source.indexOf('markPromptReady();', lateGuardIdx);
     const caseEnd = source.indexOf('case ', sessionReadyCase + 1);
 
@@ -137,6 +194,8 @@ describe('worker pipe initial screen ordering', () => {
     expect(lateCheckIdx).toBeGreaterThan(sessionReadyCase);
     expect(lateCheckIdx).toBeLessThan(caseEnd);
     expect(lateGuardIdx).toBeGreaterThan(lateCheckIdx);
+    expect(claudeGuardIdx).toBeGreaterThan(lateGuardIdx);
+    expect(claudeGuardIdx).toBeLessThan(lateMarkIdx);
     expect(lateMarkIdx).toBeGreaterThan(lateGuardIdx);
     expect(lateMarkIdx).toBeLessThan(caseEnd);
   });

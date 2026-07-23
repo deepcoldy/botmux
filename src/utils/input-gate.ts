@@ -33,6 +33,31 @@ export function shouldWriteNow(state: {
   return state.supportsTypeAhead && !state.awaitingFirstPrompt;
 }
 
+/**
+ * Claude runs every matching SessionStart hook in parallel and waits for all of
+ * them before it renders the real input prompt. Botmux's own hook can therefore
+ * finish while a slower project hook is still running. During the first prompt,
+ * treat the signal as an outer-selector boundary only and wait for fresh prompt
+ * evidence emitted after that boundary.
+ *
+ * Other ready-integrated CLIs (notably Hermes) emit their signal only once their
+ * prompt is usable, so their established authoritative-signal behavior stays
+ * unchanged.
+ */
+export function shouldWaitForPostSessionStartPromptEvidence(state: {
+  isClaudeFamily: boolean;
+  hasReadyPattern: boolean;
+  awaitingFirstPrompt: boolean;
+  isPromptReady: boolean;
+  alreadyWaiting: boolean;
+}): boolean {
+  return state.isClaudeFamily
+    && state.hasReadyPattern
+    && state.awaitingFirstPrompt
+    && !state.isPromptReady
+    && !state.alreadyWaiting;
+}
+
 export function shouldReleaseFirstPromptTimeout(state: {
   /** Adapter wants the soft timeout to wait for a real readyPattern. */
   deferFirstPromptTimeoutUntilReady: boolean;
@@ -46,4 +71,52 @@ export function shouldReleaseFirstPromptTimeout(state: {
   if (!state.deferFirstPromptTimeoutUntilReady) return true;
   if (!state.hasReadyPattern) return true;
   return state.elapsedMs >= state.hardTimeoutMs;
+}
+
+/**
+ * After the ready-gate releases (SessionStart/direct-ready signal OR the timeout
+ * fallback), the worker settles for PTY quiescence and then decides whether to
+ * mark the prompt ready (which flushes for ALL adapters) vs. just calling
+ * flushPending() (which only flushes for type-ahead adapters). Marking ready is
+ * correct when ANY of these hold:
+ *   - promptReadyAfterSettle         — an authoritative direct ready command
+ *                                      fired (Hermes). Claude passes false here
+ *                                      and waits for post-hook PTY evidence.
+ *   - promptReadyDetectedDuringSettle — the idle detector fired during the
+ *                                      settle (a readyPattern/idle proved readiness).
+ *   - readyPatternSeenDuringHold      — a readyPattern fired WHILE the gate was
+ *                                      holding (markPromptReady was blocked by
+ *                                      readyGate.shouldHold()). The input box
+ *                                      exists; the gate only deferred delivery.
+ *
+ * Pins the Hermes regression: a non-type-ahead adapter that renders its prompt
+ * (❯) during the hold but never fires the SessionStart signal must be marked
+ * ready at settle — otherwise settle calls flushPending(), which bails on
+ * !isPromptReady && !typeAheadAllowed and leaves the first message queued until
+ * the hard timeout (and, before the hard-timeout fix, forever).
+ */
+export function decideSettleMarkReady(state: {
+  promptReadyAfterSettle: boolean;
+  promptReadyDetectedDuringSettle: boolean;
+  readyPatternSeenDuringHold: boolean;
+}): boolean {
+  return state.promptReadyAfterSettle || state.promptReadyDetectedDuringSettle || state.readyPatternSeenDuringHold;
+}
+
+/**
+ * At the first-prompt hard timeout the worker has waited the full cap. For
+ * type-ahead adapters flushPending() drains the queue even while !isPromptReady
+ * (the TUI parks input in its own queue). For non-type-ahead adapters
+ * flushPending() bails on !isPromptReady && !typeAheadAllowed, so the worker
+ * must mark the prompt ready first (markPromptReady() then flushes).
+ * Returns the action the worker must take:
+ *   - 'flush'      — call flushPending() (type-ahead adapters).
+ *   - 'mark-ready' — call markPromptReady() (non-type-ahead adapters).
+ *
+ * Pins the regression where non-type-ahead adapters only logged "forcing
+ * queued message flush" at the hard timeout without actually delivering the
+ * held first message.
+ */
+export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | 'mark-ready' {
+  return supportsTypeAhead ? 'flush' : 'mark-ready';
 }

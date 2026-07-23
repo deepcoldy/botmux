@@ -45,7 +45,13 @@ import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
-import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from './utils/input-gate.js';
+import {
+  decideHardTimeoutAction,
+  decideSettleMarkReady,
+  shouldReleaseFirstPromptTimeout,
+  shouldWaitForPostSessionStartPromptEvidence,
+  shouldWriteNow,
+} from './utils/input-gate.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
@@ -1097,17 +1103,16 @@ let bareShellLaunchBlocked = false;
  *  shell. Reset per spawn in spawnCli. */
 let bareShellChecked = false;
 /** Ready-gate (Claude-family): holds the first prompt until the SessionStart
- *  hook fires a true-ready signal, so a cjadk-style startup selector's ❯ (which
- *  falsely matches readyPattern) can't eat the first message. Recreated + armed
- *  per spawn in spawnCli; disarmed on signal or fallback timeout. */
+ *  hook proves a cjadk-style startup selector is behind us. Claude then needs
+ *  fresh post-hook prompt evidence because sibling hooks may still be running.
+ *  Recreated + armed per spawn; disarmed on signal or fallback timeout. */
 let readyGate = new ReadyGate();
 /** Fallback timer: if the SessionStart signal never arrives (hook injection
  *  failed / old CLI / launcher didn't pass --settings / adopt) release the gate
  *  and fall back to readyPattern + quiescence. */
 let readySignalTimer: ReturnType<typeof setTimeout> | null = null;
 /** How long the ready-gate waits for the SessionStart signal before falling
- *  back. The real signal lands within ~ms of the input box rendering, so this is
- *  pure insurance against a missing/failed hook — generous but bounded. */
+ *  back. This is insurance against a missing/failed hook — generous but bounded. */
 const READY_SIGNAL_TIMEOUT_MS = 45_000;
 /** Soft fallback for CLIs that never emit an idle/ready signal during startup.
  *  Legacy adapters release queued first input here. Adapters that opt into
@@ -1120,13 +1125,13 @@ const FIRST_PROMPT_HARD_TIMEOUT_MS = 90_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
-/** After the SessionStart signal fires, the input box has appeared but Ink's
- *  startup render isn't fully drained yet — typing immediately trips Claude's
+/** After the SessionStart signal fires, Ink's startup rendering or sibling
+ *  hooks may still be active — typing immediately can trip Claude's
  *  paste-burst heuristic and the `\` soft-newline markers (claude-code
  *  writeInput) get kept literally. This is pronounced under wrapperCli launchers
  *  (e.g. `aiden x claude`) whose Claude renders more at startup. So we wait for
- *  the PTY to fall quiet for SETTLE_MS before the first flush — the signal still
- *  gates readiness (anti-selector), the settle just lets the render drain. */
+ *  PTY quiescence, while Claude additionally requires fresh prompt evidence
+ *  after the SessionStart boundary. */
 const READY_FLUSH_SETTLE_MS = 1_000;
 /** Upper bound on the settle so a chatty startup (spinners, periodic redraw)
  *  can't stall the first prompt indefinitely. */
@@ -1140,20 +1145,41 @@ let isSettlingFirstFlush = false;
  *  ready yet, or flushPending will be blocked by isSettlingFirstFlush and a
  *  later markPromptReady call would return early with the first prompt stranded. */
 let promptReadyDetectedDuringSettle = false;
+/** While the ready-gate is holding, the IdleDetector may still fire on a real
+ *  readyPattern (e.g. Hermes's ❯) — proving the input box exists — but
+ *  markPromptReady() returns early because the gate is armed. Record that the
+ *  pattern was seen so the gate's timeout-fallback settle can mark the prompt
+ *  ready immediately instead of delivering into a !isPromptReady state that
+ *  flushPending() rejects for non-type-ahead adapters. Without this, a Hermes
+ *  spawn that renders ❯ but never fires BOTMUX_READY_COMMAND waits the full
+ *  hard timeout (and previously never delivered at all). */
+let readyPatternSeenDuringHold = false;
+/** Claude's SessionStart hooks run in parallel. Its botmux hook proves the
+ * startup selector is behind us, but sibling project hooks may still be
+ * running. Hold type-ahead until a fresh PTY prompt is observed after the
+ * SessionStart signal. */
+let awaitingPostSessionStartPromptEvidence = false;
+/** Scoped marker set only by IdleDetector's screen-driven callback. */
+let postSessionStartPromptEvidenceInFlight = false;
 
 /** Wait until the PTY has been quiet for READY_FLUSH_SETTLE_MS (Ink render
  *  drained), capped at READY_FLUSH_SETTLE_CAP_MS, then flush the held prompt.
- *  A real SessionStart/BOTMUX_READY_COMMAND signal is itself authoritative
- *  prompt readiness; the timeout fallback only opens the gate and lets the
- *  regular readyPattern/idle path prove readiness later. */
+ *  An authoritative direct ready command (Hermes) can mark prompt readiness;
+ *  Claude's SessionStart only opens the anti-selector boundary and its regular
+ *  readyPattern/idle path must prove readiness afterward. */
 function settleThenFlush(startedAtMs: number, promptReadyAfterSettle: boolean): void {
   readyFlushSettleTimer = null;
   const now = Date.now();
   const quietForMs = now - lastPtyOutputAtMs;
   if (quietForMs >= READY_FLUSH_SETTLE_MS || now - startedAtMs >= READY_FLUSH_SETTLE_CAP_MS) {
     isSettlingFirstFlush = false;
-    const shouldMarkPromptReady = promptReadyAfterSettle || promptReadyDetectedDuringSettle;
+    const shouldMarkPromptReady = decideSettleMarkReady({
+      promptReadyAfterSettle,
+      promptReadyDetectedDuringSettle,
+      readyPatternSeenDuringHold,
+    });
     promptReadyDetectedDuringSettle = false;
+    readyPatternSeenDuringHold = false;
     log(`Ready-gate settle done (quiet ${quietForMs}ms); ${shouldMarkPromptReady ? 'marking prompt ready' : 'delivering held first prompt'}`);
     if (shouldMarkPromptReady) {
       markPromptReady();
@@ -4742,6 +4768,15 @@ function releaseRawInputRestartGate(): void {
   log('Replacement CLI prompt ready — releasing deferred passthrough commands');
 }
 
+function markPromptReadyFromPty(): void {
+  postSessionStartPromptEvidenceInFlight = true;
+  try {
+    markPromptReady();
+  } finally {
+    postSessionStartPromptEvidenceInFlight = false;
+  }
+}
+
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   stopBusyPatternIdleProbe();
@@ -4752,8 +4787,21 @@ function markPromptReady(): void {
   // releaseReadyGate() drives flushPending() once the real signal lands, and a
   // later genuine idle then runs this fully. No-op for non-armed gates.
   if (readyGate.shouldHold()) {
+    // A real readyPattern fired while the gate was holding — the input box
+    // exists. Remember it so the gate's timeout-fallback settle can mark the
+    // prompt ready (see settleThenFlush) instead of letting flushPending()
+    // reject the held message for non-type-ahead adapters.
+    readyPatternSeenDuringHold = true;
     log('Idle detected but holding for SessionStart ready signal (startup selector guard)');
     return;
+  }
+  if (awaitingPostSessionStartPromptEvidence) {
+    if (!postSessionStartPromptEvidenceInFlight) {
+      log('Ignoring non-PTY ready source while waiting for post-SessionStart prompt evidence');
+      return;
+    }
+    awaitingPostSessionStartPromptEvidence = false;
+    log('Fresh prompt evidence observed after SessionStart hooks');
   }
   if (isSettlingFirstFlush) {
     promptReadyDetectedDuringSettle = true;
@@ -4784,6 +4832,7 @@ function markPromptReady(): void {
   maybeEmitWorkflowTranscriptOutput();
   if (awaitingFirstPrompt) {
     awaitingFirstPrompt = false;
+    awaitingPostSessionStartPromptEvidence = false;
     renderer?.markNewTurn();  // exclude history replay from streaming card
   }
   send({ type: 'prompt_ready' });
@@ -5119,6 +5168,10 @@ async function flushPending(): Promise<void> {
   // after Ink's startup render has drained (else paste-burst keeps `\` literal).
   if (isSettlingFirstFlush) {
     log(`Holding ${pendingMessages.length} pending message(s) until ready-gate settle completes`);
+    return;
+  }
+  if (awaitingPostSessionStartPromptEvidence) {
+    log(`Holding ${pendingMessages.length} pending message(s) until post-SessionStart prompt evidence`);
     return;
   }
   // Type-ahead adapters flush even while the CLI is busy; others wait for
@@ -7549,6 +7602,8 @@ async function spawnCli(
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
   promptReadyDetectedDuringSettle = false;
+  readyPatternSeenDuringHold = false;
+  awaitingPostSessionStartPromptEvidence = false;
   // Reset quiescence baseline so the settle measures silence from THIS spawn.
   lastPtyOutputAtMs = Date.now();
   const readyHookAvailable = effectiveReadyHookInstall
@@ -7599,7 +7654,7 @@ async function spawnCli(
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   if (effectiveBackendType !== 'riff') {
     idleDetector = new IdleDetector(cliAdapter);
-    idleDetector.onIdle(async () => {
+    idleDetector.onIdle(async (evidenceSource) => {
       log('Prompt detected (idle)');
       // Bridge drain MUST run before markPromptReady() — the latter calls
       // flushPending() which can immediately fire the next queued message
@@ -7611,7 +7666,11 @@ async function spawnCli(
       if (codexBridgeFallbackActive()) {
         try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
       }
-      markPromptReady();
+      if (evidenceSource === 'screen') {
+        markPromptReadyFromPty();
+      } else {
+        markPromptReady();
+      }
     });
   }
 
@@ -7761,6 +7820,7 @@ async function spawnCli(
     }
 
     awaitingFirstPrompt = false;
+    awaitingPostSessionStartPromptEvidence = false;
     renderer?.markNewTurn();
     log(forced
       ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
@@ -7773,7 +7833,23 @@ async function spawnCli(
     // invoking markPromptReady() would claim the CLI is idle while it's still
     // mid-boot, so flushPending() alone is safer — it respects typeAheadAllowed
     // and drains pendingMessages now.
-    if (cliAdapter?.supportsTypeAhead) flushPending();
+    //
+    // Non-type-ahead adapters (Hermes etc.) flushPending() rejects the held
+    // message while isPromptReady is false — it bails on
+    // `!isPromptReady && !typeAheadAllowed`. The hard cap means we've waited
+    // long enough. By now the ready gate's 45s fallback has already released
+    // the gate (READY_SIGNAL_TIMEOUT_MS < this 90s hard cap) and the post-
+    // release settle has drained, so markPromptReady() proceeds: it sets
+    // isPromptReady and drains the held first prompt. Without this, a spawn
+    // that never fires the ready signal (and whose readyPattern the idle
+    // detector never matched) would hold the first queued message forever —
+    // the previous code only logged "forcing flush" without actually flushing
+    // for non-type-ahead adapters.
+    if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+      flushPending();
+      return;
+    }
+    markPromptReady();
   };
   setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_TIMEOUT_MS, false), FIRST_PROMPT_TIMEOUT_MS);
 
@@ -7802,6 +7878,8 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   if (readyFlushSettleTimer) { clearTimeout(readyFlushSettleTimer); readyFlushSettleTimer = null; }
   isSettlingFirstFlush = false;
   promptReadyDetectedDuringSettle = false;
+  readyPatternSeenDuringHold = false;
+  awaitingPostSessionStartPromptEvidence = false;
   stopScreenAnalyzer();
   stopScreenUpdates();
   backend?.kill();
@@ -9644,23 +9722,42 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'session_ready': {
-      // Claude-family SessionStart hook fired (via `botmux session-ready` →
-      // daemon). The CLI's input box is genuinely rendered — release the
-      // ready-gate and deliver any held first prompt. Idempotent: a later
-      // duplicate (clear/compact source) is a no-op.
+      // Claude-family SessionStart hooks run in parallel. This signal proves
+      // the startup selector is behind us, but a slower project hook can still
+      // be running and Claude does not render its real prompt until ALL hooks
+      // finish. Clear selector-era evidence and require a fresh PTY prompt after
+      // the signal. Hermes keeps its authoritative ready-command behavior.
       log(`SessionStart ready signal received (source=${msg.source ?? '?'})`);
+      const waitForPostHookPrompt = shouldWaitForPostSessionStartPromptEvidence({
+        isClaudeFamily: !!cliAdapter?.claudeDataDir,
+        hasReadyPattern: !!cliAdapter?.readyPattern,
+        awaitingFirstPrompt,
+        isPromptReady,
+        alreadyWaiting: awaitingPostSessionStartPromptEvidence,
+      });
+      if (waitForPostHookPrompt) {
+        awaitingPostSessionStartPromptEvidence = true;
+        promptReadyDetectedDuringSettle = false;
+        readyPatternSeenDuringHold = false;
+        idleDetector?.resetReadyEvidence();
+        lastPtyOutputAtMs = Date.now();
+        log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
+      }
       // 先记下 gate 是否已被 45s fallback 释放：ReadyGate.receive() 是一次性
       // 语义，fallback 抢先后 releaseReadyGate 会整块跳过迟到的真信号。
       const lateAfterFallback = readyGate.isArmed && readyGate.isReceived;
-      releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: true });
+      releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });
       // 冷启动超过 READY_SIGNAL_TIMEOUT_MS 的 CLI（Hermes 常态是 2-3 分钟）恰好
       // 总落在 fallback 之后：fallback 只开闸不投递（非 type-ahead 的
       // flushPending 是 no-op），真信号依然是权威就绪，这里直接兑现。仅限首轮
       // （awaitingFirstPrompt）——首条 prompt 交付后 clear/compact 来源的
       // SessionStart 保持原有 no-op 语义，绝不在会话中途误标就绪。
-      if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady) {
+      if (lateAfterFallback && awaitingFirstPrompt && !isPromptReady && !waitForPostHookPrompt) {
         log('Late ready signal after timeout fallback — marking prompt ready now');
         markPromptReady();
+      }
+      if (msg.requestId) {
+        send({ type: 'session_ready_ack', requestId: msg.requestId });
       }
       break;
     }

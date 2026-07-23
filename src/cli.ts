@@ -7347,6 +7347,7 @@ botmux create-group — 用一组机器人新建飞书群
 用法:
   botmux create-group --bot <name|larkAppId> [--bot ...] [--name "群名"]
                       [--working-dir <path>]
+                      [--kickoff-bot <open_id> --kickoff-prompt "文本"]
 
 参数:
   --bot <ref>     至少一个，可多次。ref 推荐用 bot 显示名（同 botmux send 的 @<name>）或完整 larkAppId；
@@ -7357,6 +7358,10 @@ botmux create-group — 用一组机器人新建飞书群
   --working-dir <path>
                  可选；创建成功后，把新群为所有成功入群的 bot 绑定到该目录（等价于逐个 /oncall bind），
                  下次在群里开新话题时直接使用该目录，跳过仓库选择卡片。也可写作 --cwd / --dir。
+  --kickoff-bot <open_id>  可选；建群成功后由 creator @ 该 bot 并发送 --kickoff-prompt，
+                 触发该 bot 自动开始工作（如 PR review）。需配合 --kickoff-prompt 使用。
+                 该 bot 必须已在 --bot 列表中（即已是群成员）。
+  --kickoff-prompt "文本"  可选；与 --kickoff-bot 配合使用，@ bot 后发送的 prompt 文本。
 
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
@@ -7364,6 +7369,8 @@ botmux create-group — 用一组机器人新建飞书群
     转不出来或为空则跳过对应步骤，stderr warning）。
   - 不依赖 botmux 会话，任何环境都能跑。
   - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
+  - --kickoff-bot/--kickoff-prompt：creator 建群后 @ 指定 bot 并发 prompt；该 bot 收到 @ 会自动起会话。
+    注意：creator 不能 @ 自己（自消息被忽略），故 --kickoff-bot 应选 creator 之外的 bot。
 
 输出协议（skill 友好）:
   - 成功（即使 transfer/notify 部分失败）：stdout 单行 chatId，exit 0；stderr 打人类提示 + applink。
@@ -7377,6 +7384,8 @@ botmux create-group — 用一组机器人新建飞书群
   const botRefs = argValues(rest, '--bot');
   const name = argValue(rest, '--name');
   const workingDirArg = argValue(rest, '--working-dir', '--cwd', '--dir');
+  const kickoffBot = argValue(rest, '--kickoff-bot');
+  const kickoffPrompt = argValue(rest, '--kickoff-prompt');
 
   let bindWorkingDir: string | undefined;
   let bindWorkingDirResolved: string | undefined;
@@ -7418,7 +7427,7 @@ botmux create-group — 用一组机器人新建飞书群
   let botInfoEntries: BotInfoEntry[] = [];
   try { if (existsSync(botInfoPath)) botInfoEntries = JSON.parse(readFileSync(botInfoPath, 'utf-8')); } catch { /* */ }
 
-  const { resolveBotRefs } = await import('./cli/create-group-resolver.js');
+  const { resolveBotRefs, resolveKickoff } = await import('./cli/create-group-resolver.js');
   const resolved = resolveBotRefs(
     botRefs,
     botConfigs,
@@ -7441,6 +7450,16 @@ botmux create-group — 用一组机器人新建飞书群
   }
 
   const creatorLarkAppId = resolved.larkAppIds[0];
+  const kickoff = resolveKickoff(
+    kickoffBot,
+    kickoffPrompt,
+    resolved.larkAppIds,
+    botInfoEntries.map(b => ({ larkAppId: b.larkAppId, botOpenId: b.botOpenId })),
+  );
+  if (!kickoff.ok) {
+    console.error(kickoff.error);
+    process.exit(1);
+  }
 
   // Register bots so getBotClient works inside service
   const fullConfigs = loadBotConfigs();
@@ -7479,6 +7498,8 @@ botmux create-group — 用一组机器人新建飞书群
       transferOwnerTo: targetOpenId,
       notifyOwnerOpenId: targetOpenId,
       bindWorkingDir,
+      kickoffBotLarkAppId: kickoff.targetLarkAppId,
+      kickoffPrompt: kickoff.prompt,
     });
   } catch (err: any) {
     console.error(`建群失败: ${err?.message ?? err}`);
@@ -7507,6 +7528,11 @@ botmux create-group — 用一组机器人新建飞书群
     console.error(`⚠️  @通知发送失败: ${result.notifyError}`);
   } else if (result.notifyMessageId) {
     console.error(`✅ @通知已发送 (msg ${result.notifyMessageId})`);
+  }
+  if (result.kickoffError) {
+    console.error(`⚠️  kickoff 消息发送失败: ${result.kickoffError}`);
+  } else if (result.kickoffMessageId) {
+    console.error(`✅ kickoff 消息已发送 (msg ${result.kickoffMessageId})`);
   }
   if (bindWorkingDir) {
     const ok = result.oncallBindings.filter(b => b.ok).length;
@@ -7902,10 +7928,9 @@ async function cmdHook(cliId: string): Promise<void> {
 
 // ─── botmux session-ready ─────────────────────────────────────────────────────
 //
-// Claude 家族（claude/seed）的 SessionStart hook 客户端。Claude 在 TUI 输入框
-// 真正渲染就绪时（startup / resume / clear / compact）触发本命令；它通知 daemon
-// 「CLI 真就绪」，放行 worker 端被 ready-gate 门控的首条 prompt——绕开 cjadk 之类
-// 自定义 launcher 启动选择器的 ❯ 误命中 readyPattern、把首条消息整条吞掉的 bug。
+// Claude 家族（claude/seed）的 SessionStart hook 客户端。它通知 daemon 已越过
+// 外层 startup selector；worker 随即清除 selector 留下的旧 ❯ 证据，再等待所有
+// 并行 hook 完成后新渲染的输入框，避免 cjadk 选择器误吞首条消息。
 //
 // 会话归属只靠 hook 子进程继承的 env（worker spawn 时设的 BOTMUX_SESSION_ID /
 // BOTMUX_LARK_APP_ID）。任何失败（env 缺失=adopt/非 botmux 会话、daemon 不可达）
@@ -9092,7 +9117,7 @@ switch (command) {
   }
   case 'session-ready': {
     // `botmux session-ready` — Claude 家族 SessionStart hook 客户端，通知 daemon
-    // 「CLI 真就绪」，放行被门控的首条 prompt。
+    // 已越过外层 selector；worker 再等待 hook 后的新 prompt 证据。
     await cmdSessionReady();
     break;
   }

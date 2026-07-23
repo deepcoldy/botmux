@@ -13,7 +13,13 @@
  * Run: pnpm vitest run test/input-gate.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { shouldReleaseFirstPromptTimeout, shouldWriteNow } from '../src/utils/input-gate.js';
+import {
+  decideHardTimeoutAction,
+  decideSettleMarkReady,
+  shouldReleaseFirstPromptTimeout,
+  shouldWaitForPostSessionStartPromptEvidence,
+  shouldWriteNow,
+} from '../src/utils/input-gate.js';
 
 const base = {
   isPromptReady: false,
@@ -81,5 +87,110 @@ describe('shouldReleaseFirstPromptTimeout', () => {
       elapsedMs: 15_000,
       hardTimeoutMs: 90_000,
     })).toBe(true);
+  });
+});
+
+describe('shouldWaitForPostSessionStartPromptEvidence', () => {
+  const sessionStartBase = {
+    isClaudeFamily: true,
+    hasReadyPattern: true,
+    awaitingFirstPrompt: true,
+    isPromptReady: false,
+    alreadyWaiting: false,
+  };
+
+  it('requires fresh prompt evidence for a Claude-family first prompt', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence(sessionStartBase)).toBe(true);
+  });
+
+  it('keeps Hermes and other non-Claude ready signals authoritative', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      isClaudeFamily: false,
+    })).toBe(false);
+  });
+
+  it('does not create an unprovable fence without a readyPattern', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      hasReadyPattern: false,
+    })).toBe(false);
+  });
+
+  it('ignores duplicate and mid-session SessionStart signals', () => {
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      alreadyWaiting: true,
+    })).toBe(false);
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      awaitingFirstPrompt: false,
+    })).toBe(false);
+    expect(shouldWaitForPostSessionStartPromptEvidence({
+      ...sessionStartBase,
+      isPromptReady: true,
+    })).toBe(false);
+  });
+});
+
+describe('decideSettleMarkReady', () => {
+  it('marks ready when an authoritative direct ready signal fired', () => {
+    expect(decideSettleMarkReady({
+      promptReadyAfterSettle: true,
+      promptReadyDetectedDuringSettle: false,
+      readyPatternSeenDuringHold: false,
+    })).toBe(true);
+  });
+
+  it('marks ready when the idle detector fired during settle', () => {
+    expect(decideSettleMarkReady({
+      promptReadyAfterSettle: false,
+      promptReadyDetectedDuringSettle: true,
+      readyPatternSeenDuringHold: false,
+    })).toBe(true);
+  });
+
+  it('THE HERMES FIX: marks ready when a readyPattern fired while the gate held', () => {
+    // Hermes rendered ❯ (readyPattern) during the hold, but never fired the
+    // SessionStart signal. The gate's timeout fallback releases + settles;
+    // readyPatternSeenDuringHold alone must mark the prompt ready so the
+    // held first message flushes (not dropped by !isPromptReady).
+    expect(decideSettleMarkReady({
+      promptReadyAfterSettle: false,
+      promptReadyDetectedDuringSettle: false,
+      readyPatternSeenDuringHold: true,
+    })).toBe(true);
+  });
+
+  it('does NOT mark ready when nothing proved readiness (timeout fallback, no pattern seen)', () => {
+    // A CLI with no readyPattern that never fired the signal settles without
+    // marking ready — flushPending() delivers for type-ahead adapters only.
+    expect(decideSettleMarkReady({
+      promptReadyAfterSettle: false,
+      promptReadyDetectedDuringSettle: false,
+      readyPatternSeenDuringHold: false,
+    })).toBe(false);
+  });
+
+  it('any single signal is sufficient (OR of all three)', () => {
+    expect(decideSettleMarkReady({
+      promptReadyAfterSettle: false,
+      promptReadyDetectedDuringSettle: true,
+      readyPatternSeenDuringHold: true,
+    })).toBe(true);
+  });
+});
+
+describe('decideHardTimeoutAction', () => {
+  it('type-ahead adapters flush directly at the hard timeout', () => {
+    expect(decideHardTimeoutAction(true)).toBe('flush');
+  });
+
+  it('THE HERMES FIX: non-type-ahead adapters mark ready (then flush) at the hard timeout', () => {
+    // Before this fix, non-type-ahead adapters only logged "forcing flush"
+    // without actually delivering — decideHardTimeoutAction(false) must route
+    // to mark-ready so markPromptReady() sets isPromptReady and flushes the
+    // held first message.
+    expect(decideHardTimeoutAction(false)).toBe('mark-ready');
   });
 });

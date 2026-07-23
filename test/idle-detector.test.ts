@@ -430,6 +430,50 @@ describe('IdleDetector: reset()', () => {
   });
 });
 
+describe('IdleDetector: resetReadyEvidence()', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('drops a selector-era prompt and waits for a newly rendered prompt', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('startup selector ❯');
+    vi.advanceTimersByTime(1_000);
+    detector.resetReadyEvidence();
+
+    // The old quiescence timer and readySeen flag were both discarded.
+    vi.advanceTimersByTime(10_000);
+    expect(cb).not.toHaveBeenCalled();
+
+    detector.feed('real Claude prompt ❯');
+    vi.advanceTimersByTime(1_999);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('distinguishes screen evidence from an external idle source', () => {
+    const screenDetector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const screenCb = vi.fn();
+    screenDetector.onIdle(screenCb);
+    screenDetector.feed('real prompt ❯');
+    vi.advanceTimersByTime(2_000);
+    expect(screenCb).toHaveBeenCalledWith('screen');
+
+    const externalDetector = new IdleDetector(makeCli());
+    const externalCb = vi.fn();
+    externalDetector.onIdle(externalCb);
+    externalDetector.fireIdle();
+    expect(externalCb).toHaveBeenCalledWith('external');
+
+    screenDetector.dispose();
+    externalDetector.dispose();
+  });
+});
+
 // ─── dispose() ────────────────────────────────────────────────────────────
 
 describe('IdleDetector: dispose()', () => {

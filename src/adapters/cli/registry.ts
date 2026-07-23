@@ -109,8 +109,13 @@ export function resolveCommand(cmd: string): string {
         timeout: 5_000,
         stdio: ['ignore', 'pipe', 'ignore'],
       });
-      const found = (result.stdout ?? '').trim();
-      if (found && isAbsolute(found)) return found;
+      // Rc files may echo banners to stdout before the `which` output, so take
+      // the LAST absolute line — and only after a clean exit, so a failed
+      // `which` can't let an echoed path-looking line masquerade as a result.
+      if (result.status !== 0) continue;
+      const lines = (result.stdout ?? '').split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      const found = lines.reverse().find(line => isAbsolute(line));
+      if (found) return found;
     }
   }
   if (process.platform === 'darwin' && cmd === 'codex') {

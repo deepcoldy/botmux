@@ -1,5 +1,5 @@
 import { execFileSync, type ChildProcess } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname } from 'node:path';
@@ -106,6 +106,10 @@ import {
 } from './core/worker-pool.js';
 import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
+import {
+  cancelSessionReadyAck,
+  waitForSessionReadyAck,
+} from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret } from './dashboard/auth.js';
 import { daemonIpcAuthHeaders, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
@@ -4313,11 +4317,18 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   if (ds?.worker) {
+    const requestId = randomUUID();
+    const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source } as DaemonToWorker);
+      ds.worker.send({ type: 'session_ready', source, requestId } as DaemonToWorker);
       logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
+      cancelSessionReadyAck(requestId);
       logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const acknowledged = await ack;
+    if (!acknowledged) {
+      logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
     }
   }
   return jsonRes(res, 200, { ok: true });

@@ -893,7 +893,6 @@ describe('automateOpenPlatformSetup', () => {
           'im.message.receive_v1',
           'im.chat.member.bot.added_v1',
           'im.chat.member.bot.deleted_v1',
-          'drive.file.comment_add_v1',
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
           'im.message.reaction.deleted_v1',
@@ -924,8 +923,8 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('im.message.receive_v1');
       expect(result.eventWarning).toBeTruthy();
     }
-    // 批量失败后逐个重试过:baseline 7 + VC app 3 + VC user 1 = 批量 1 次 + 单个 11 次
-    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(12);
+    // 批量失败后逐个重试过:baseline 6 + VC app 3 + VC user 1 = 批量 1 次 + 单个 10 次
+    expect(sub.updateBodies.filter(body => Array.isArray(body.appEvents)).length).toBe(11);
     // 核心事件缺失时不再继续发版,避免发布一个收不到消息的版本
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);
   });
@@ -983,7 +982,7 @@ describe('automateOpenPlatformSetup', () => {
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(true);
     if (result.ok) {
       expect(result.missingVcEvents).toEqual(vcEvents);
-      expect(result.subscribedEventCount).toBe(8); // 7 baseline 事件 + 1 回调
+      expect(result.subscribedEventCount).toBe(7); // 6 baseline 事件 + 1 回调
       expect(result.eventWarning).toContain('VC 会议事件未确认订阅');
       // VC listener 保存门必须拦下这种结果(dashboard 两条分支都走这个门)
       expect(vcListenerEventGateError(result)).toContain('vc.bot.meeting_invited_v1');
@@ -992,7 +991,7 @@ describe('automateOpenPlatformSetup', () => {
 
   it('fails closed and blocks the listener gate when event mode readback stays webhook despite full subscriptions', async () => {
     // event/switch 返回成功(mock 默认 code 0)但回读 eventMode 仍是 1:
-    // 订阅名齐、count=12、missingVcEvents=[],唯一异常是接收方式。
+    // 订阅名齐、count=11、missingVcEvents=[],唯一异常是接收方式。
     const sub = openPlatformSubscriptionMock('cli_x', {
       initial: {
         eventMode: 1,
@@ -1000,7 +999,6 @@ describe('automateOpenPlatformSetup', () => {
           'im.message.receive_v1',
           'im.chat.member.bot.added_v1',
           'im.chat.member.bot.deleted_v1',
-          'drive.file.comment_add_v1',
           'drive.notice.comment_add_v1',
           'im.message.reaction.created_v1',
           'im.message.reaction.deleted_v1',
@@ -1021,7 +1019,7 @@ describe('automateOpenPlatformSetup', () => {
       expect(result.message).toContain('事件接收模式');
       expect(result.eventModeReady).toBe(false);
       expect(result.missingVcEvents).toEqual([]);
-      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=12/missingVc=[] 会放行)
+      // dashboard 非登录失败分支的 listener 门必须拦下(此前 count=11/missingVc=[] 会放行)
       expect(vcListenerEventGateError(result)).toContain('长连接');
     }
     expect(calls.some(u => u.includes('/publish/commit/'))).toBe(false);

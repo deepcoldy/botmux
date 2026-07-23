@@ -63,6 +63,33 @@ describe('runtime service', () => {
     expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
   });
 
+  it('repairs the bundled daemon PATH with the probed shell PATH', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      // nvm-in-.zshrc user: their node must stay ahead of the bundled fallback
+      // so PtyBackend-spawned CLIs resolve `#!/usr/bin/env node` like a terminal.
+      shellPathEnv: () => '/Users/me/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin',
+      pm2Apps: async () => [],
+    });
+
+    await svc.start();
+    expect(run.mock.calls[0]![0].env.PATH).toBe([
+      '/Users/me/.nvm/versions/node/v22.22.2/bin',
+      '/opt/homebrew/bin',
+      '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+    ].join(':'));
+  });
+
   it('detects an external fleet and replaces it through the bundled runtime', async () => {
     const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
     const svc = createRuntimeService({

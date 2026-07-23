@@ -49,6 +49,12 @@ export interface CreateGroupOpts {
    *  local entry directly; peer bots are prompted by a multi-mention
    *  `/role profile apply` command in the newly created chat. */
   roleProfileId?: string;
+  /** Optional kickoff: after the chat is created, the creator @-mentions this
+   *  bot and posts `kickoffPrompt` as a top-level message. Used to
+   *  auto-trigger a bot (e.g. a reviewer) in the new group without a human
+   *  having to @ it. The kickoff bot must be present in `larkAppIds`. */
+  kickoffBotLarkAppId?: string;
+  kickoffPrompt?: string;
 }
 
 export interface CreateGroupResult {
@@ -70,6 +76,8 @@ export interface CreateGroupResult {
   oncallBindings: { larkAppId: string; ok: boolean; created?: boolean; error?: string }[];
   roleProfileBootstrapMessageId: string | null;
   roleProfileBootstrapError: string | null;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
 }
 
 export interface TransferGroupOwnerOpts {
@@ -276,6 +284,47 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Kickoff: creator @-mentions a target bot with a prompt so it auto-starts
+  // working (e.g. a PR review). Resolve the @ handle from the creator's view of
+  // the new chat: Lark open_id values are app-scoped, so the target bot's
+  // self-reported open_id cannot be used directly by the creator app.
+  let kickoffMessageId: string | null = null;
+  let kickoffError: string | null = null;
+  const kickoffBot = opts.kickoffBotLarkAppId?.trim();
+  const kickoffPrompt = opts.kickoffPrompt?.trim();
+  if (!!kickoffBot !== !!kickoffPrompt) {
+    kickoffError = 'kickoff_args_must_be_paired';
+  } else if (kickoffBot && kickoffPrompt) {
+    if (kickoffBot === opts.creatorLarkAppId) {
+      kickoffError = 'creator_cannot_kickoff_self';
+    } else if (!opts.larkAppIds.includes(kickoffBot)) {
+      kickoffError = 'kickoff_bot_not_selected';
+    } else if (r.invalidBotIds.includes(kickoffBot)) {
+      kickoffError = 'invitee_rejected';
+    }
+
+    try {
+      if (!kickoffError) {
+        const members = await listChatBotMembers(opts.creatorLarkAppId, r.chatId);
+        const target = members.find(member => member.larkAppId === kickoffBot);
+        if (!target) {
+          kickoffError = 'kickoff_bot_not_found_in_chat';
+        } else if (!target.mentionable) {
+          kickoffError = 'kickoff_bot_not_mentionable';
+        } else {
+          kickoffMessageId = await sendMessage(
+            opts.creatorLarkAppId,
+            r.chatId,
+            `<at user_id="${target.openId}"></at> ${kickoffPrompt}`,
+            'text',
+          );
+        }
+      }
+    } catch (e: any) {
+      kickoffError = e?.message ?? String(e);
+    }
+  }
+
   return {
     ok: true,
     chatId: r.chatId,
@@ -292,5 +341,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     oncallBindings,
     roleProfileBootstrapMessageId,
     roleProfileBootstrapError,
+    kickoffMessageId,
+    kickoffError,
   };
 }
