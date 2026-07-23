@@ -30,6 +30,7 @@ const hostnamePattern = /\b(?:[a-z0-9-]+\.)+(?:bytedance\.net|byted\.org)\b/gi;
 const allowedHostSuffixes = [
   '.ai-sandbox-boe.byted.org',
 ];
+const generatedDirectories = new Set(['node_modules', 'dist', 'doc_build']);
 const selfPath = fileURLToPath(import.meta.url);
 
 function* walk(path) {
@@ -39,7 +40,7 @@ function* walk(path) {
     return;
   }
   for (const entry of readdirSync(path, { withFileTypes: true })) {
-    if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === '.git') continue;
+    if (generatedDirectories.has(entry.name) || entry.name === '.git') continue;
     const child = join(path, entry.name);
     if (entry.isDirectory()) yield* walk(child);
     else if (entry.isFile() && textExtensions.has(extname(entry.name))) yield child;
