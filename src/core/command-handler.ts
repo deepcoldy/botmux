@@ -114,17 +114,22 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  */
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
-const SLASH_GROUP_NAME_MAX_LENGTH = 50;
+const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
 /** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
- *  existing Lark headroom. `Array.from` avoids slicing through an emoji's
- *  surrogate pair when a long name is truncated. */
+ *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
+ *  iterating by code point keeps that limit without slicing an emoji's
+ *  surrogate pair. */
 export function formatSlashGroupName(name: string, prefix = ''): string {
   const prefixed = prefix && !name.startsWith(prefix) ? `${prefix}${name}` : name;
-  const characters = Array.from(prefixed);
-  return characters.length > SLASH_GROUP_NAME_MAX_LENGTH
-    ? `${characters.slice(0, SLASH_GROUP_NAME_MAX_LENGTH).join('')}…`
-    : prefixed;
+  if (prefixed.length <= SLASH_GROUP_NAME_MAX_UTF16_LENGTH) return prefixed;
+
+  let truncated = '';
+  for (const character of prefixed) {
+    if (truncated.length + character.length > SLASH_GROUP_NAME_MAX_UTF16_LENGTH) break;
+    truncated += character;
+  }
+  return `${truncated}…`;
 }
 
 /**

@@ -33,8 +33,8 @@ export const GROUP_NAME_PREFIX_MAX_LENGTH = 32;
  *  path; the Dashboard write path rejects invalid non-blank values. */
 export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined;
-  const value = raw.trim();
-  if (!value) return undefined;
+  const value = raw;
+  if (!value.trim()) return undefined;
   if (value.length > GROUP_NAME_PREFIX_MAX_LENGTH) return undefined;
   if (/[\u0000-\u001f\u007f]/u.test(value)) return undefined;
   return value;

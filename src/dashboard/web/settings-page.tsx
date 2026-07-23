@@ -612,7 +612,7 @@ function SettingsBody(props: {
             onSave={value => props.onSave(
               'groupNamePrefix',
               { groupNamePrefix: value },
-              s => ({ ...s, groupNamePrefix: value.trim() }),
+              s => ({ ...s, groupNamePrefix: value }),
             )}
           />
         </SettingsBlock>
@@ -934,11 +934,12 @@ export function GroupNamePrefixRow(props: {
   const [draft, setDraft] = useState(props.value);
   useEffect(() => setDraft(props.value), [props.value]);
 
-  const normalized = draft.trim();
-  const dirty = normalized !== props.value.trim();
+  const hasVisibleContent = draft.trim().length > 0;
+  const valid = draft === '' || hasVisibleContent;
+  const dirty = draft !== props.value;
   const submit = () => {
-    if (props.disabled || !dirty) return;
-    void props.onSave(normalized);
+    if (props.disabled || !dirty || !valid) return;
+    void props.onSave(draft);
   };
 
   return (
@@ -957,15 +958,15 @@ export function GroupNamePrefixRow(props: {
         />
       </div>
       <p className="settings-subfield-hint" data-group-name-prefix-preview>
-        {normalized
-          ? tr('settings.groupNamePrefixPreview', { name: `${normalized}${tr('settings.groupNamePrefixPreviewName')}` })
+        {hasVisibleContent
+          ? tr('settings.groupNamePrefixPreview', { name: `${draft}${tr('settings.groupNamePrefixPreviewName')}` })
           : tr('settings.groupNamePrefixDisabled')}
       </p>
       <div className="actions">
         <button
           type="button"
           className="page-primary-action"
-          disabled={props.disabled || !dirty}
+          disabled={props.disabled || !dirty || !valid}
           onClick={submit}
         >
           {tr('settings.groupNamePrefixSave')}

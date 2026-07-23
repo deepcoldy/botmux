@@ -57,16 +57,16 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
 }
 
 describe('applySettingsWrite happy paths', () => {
-  it('writes a trimmed groupNamePrefix through the top-level global config', async () => {
+  it('preserves separator whitespace in groupNamePrefix', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ groupNamePrefix: '  AI讨论·  ' }, deps);
+    const r = await applySettingsWrite({ groupNamePrefix: '[AI] ' }, deps);
     expect(r.ok).toBe(true);
-    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: 'AI讨论·' });
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: '[AI] ' });
   });
 
-  it('clears groupNamePrefix when the dashboard saves a blank value', async () => {
+  it('clears groupNamePrefix when the dashboard saves an empty value', async () => {
     const deps = makeDeps();
-    const r = await applySettingsWrite({ groupNamePrefix: '   ' }, deps);
+    const r = await applySettingsWrite({ groupNamePrefix: '' }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: null });
   });
@@ -187,6 +187,7 @@ describe('applySettingsWrite — validation errors', () => {
   it('rejects invalid groupNamePrefix payloads without writing', async () => {
     for (const groupNamePrefix of [
       42,
+      '   ',
       'AI\n讨论·',
       'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
     ]) {

@@ -3234,14 +3234,14 @@ describe('handleCommand', () => {
     });
 
     it('applies the configured global prefix to /group and reports the final name', async () => {
-      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
+      vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: '[AI] ' });
       const deps = makeDeps(makeDaemonSession());
 
       await handleCommand('/group', ROOT_ID, makeLarkMessage('/group My Project'), deps, LARK_APP_ID);
 
-      expect(mockedCreate.mock.calls[0][0].name).toBe('AI讨论·My Project');
+      expect(mockedCreate.mock.calls[0][0].name).toBe('[AI] My Project');
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(reply).toContain('AI讨论·My Project');
+      expect(reply).toContain('[AI] My Project');
     });
 
     it('applies the configured global prefix through the /g alias', async () => {
@@ -3271,15 +3271,15 @@ describe('handleCommand', () => {
       expect(mockedCreate.mock.calls[0][0].name).toMatch(/^AI讨论·新会话 \d{2}\/\d{2} \d{2}:\d{2}$/);
     });
 
-    it('truncates the final prefixed name by Unicode characters without splitting emoji', async () => {
+    it('keeps the legacy UTF-16 limit without splitting emoji', async () => {
       vi.mocked(readGlobalConfig).mockReturnValue({ groupNamePrefix: 'AI讨论·' });
       const deps = makeDeps(makeDaemonSession());
 
       await handleCommand('/group', ROOT_ID, makeLarkMessage(`/group ${'😀'.repeat(60)}`), deps, LARK_APP_ID);
 
       const name = mockedCreate.mock.calls[0][0].name!;
-      expect(Array.from(name)).toHaveLength(51);
-      expect(name).toBe(`AI讨论·${'😀'.repeat(45)}…`);
+      expect(name.length).toBeLessThanOrEqual(51);
+      expect(name).toBe(`AI讨论·${'😀'.repeat(22)}…`);
       expect(name).not.toContain('\uFFFD');
     });
 

@@ -108,9 +108,9 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
   });
 
-  it('reads a trimmed groupNamePrefix as a top-level global setting', () => {
-    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  AI讨论·  ' }));
-    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+  it('preserves separator whitespace in groupNamePrefix', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  [AI] ' }));
+    expect(readGlobalConfig().groupNamePrefix).toBe('  [AI] ');
   });
 
   it('ignores invalid groupNamePrefix values on the forgiving read path', () => {

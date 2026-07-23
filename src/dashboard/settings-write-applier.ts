@@ -198,9 +198,9 @@ export async function applySettingsWrite(
     if (typeof obj.groupNamePrefix !== 'string') {
       return { ok: false, error: 'invalid_groupNamePrefix' };
     }
-    const rawPrefix = obj.groupNamePrefix.trim();
+    const rawPrefix = obj.groupNamePrefix;
     const groupNamePrefix = normalizeGroupNamePrefix(rawPrefix);
-    if (rawPrefix && !groupNamePrefix) {
+    if (rawPrefix !== '' && !groupNamePrefix) {
       return { ok: false, error: 'invalid_groupNamePrefix' };
     }
     groupNamePrefixPatch = groupNamePrefix ?? null;
