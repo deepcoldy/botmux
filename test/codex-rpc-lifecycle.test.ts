@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -27,6 +27,29 @@ describe('codexRpcEligible — the eligible base case', () => {
   });
   it('a resume (no prompt but resume + cliSessionId) is eligible', () => {
     expect(codexRpcEligible(baseCfg({ prompt: '', resume: true, cliSessionId: 'thread-1' }))).toBe(true);
+  });
+});
+
+describe('RPC terminal rollout hydration window', () => {
+  it('keeps polling through delayed 9s visibility and remains bounded near the 12s first-turn probe', () => {
+    const totalMs = CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS
+      .reduce((sum, delayMs) => sum + delayMs, 0);
+    expect(totalMs).toBeGreaterThanOrEqual(10_000);
+    expect(totalMs).toBeLessThanOrEqual(12_000);
+
+    // Model a rollout that becomes visible nine seconds after the native
+    // terminal. The retry sequence must still have a scheduled observation at
+    // or after visibility, rather than retiring the bridge mark early.
+    let elapsedMs = 0;
+    let observed = false;
+    for (const delayMs of CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS) {
+      elapsedMs += delayMs;
+      if (elapsedMs >= 9_000) {
+        observed = true;
+        break;
+      }
+    }
+    expect(observed).toBe(true);
   });
 });
 

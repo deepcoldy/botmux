@@ -12,6 +12,22 @@ type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
  *  diverges (--resume flag) and needs its own verification before inclusion. */
 export const RPC_CAPABLE_CLIS = new Set(['codex', 'traex']);
 
+/** Retry cadence for native turn/completed → rollout visibility hydration.
+ *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
+ *  first-turn persistence probe so a fast terminal does not discard fallback
+ *  output merely because the rollout filesystem is a few seconds behind. */
+export const CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS = [
+  50,
+  100,
+  200,
+  400,
+  800,
+  1_600,
+  2_400,
+  3_000,
+  3_000,
+] as const;
+
 /** All fail-closed gates for codex-family RPC input in ONE place so the worker's
  *  pane-branching and engageCodexRpc agree. Every excluded case degrades to the
  *  normal paste path — never a silent capability/security change:
@@ -99,13 +115,15 @@ export interface PaneProbes {
  *   - 'not-engaged' — setup failed OR fresh frame never dispatched → paste. */
 export type EngageOutcome = 'accepted' | 'ambiguous' | 'resumed' | 'not-engaged';
 
-/** Whether the FRESH first turn should PRE-mark the codex bridge (so the reply is
- *  attributed even if the model skips `botmux send`). ONLY 'accepted' — a
- *  confirmed turn whose prompt is not re-queued, so exactly one mark exists and
- *  the reply consumes it. NOT 'ambiguous' (no positive evidence the turn ran → an
- *  unstarted queue head would wedge every later turn's drain — Codex P1) and NOT
- *  'not-sent'/'resumed' (those never reach the pre-mark; not-sent's paste flush
- *  marks once, resume flushes its queued prompt). */
+/** Whether the FRESH first turn should use the normal confirmed pre-mark path
+ *  (so the reply is attributed even if the model skips `botmux send`). ONLY
+ *  'accepted' — a confirmed turn whose prompt is not re-queued. The worker also
+ *  gives 'ambiguous' its own attribution-only mark plus a fail-closed owner:
+ *  structured terminal retires it when visible, while exact engine teardown is
+ *  the intentional fallback when no native owner can ever be mapped. That
+ *  separate path never resends the prompt and prevents a permanent queue head.
+ *  'not-sent'/'resumed' never reach either pre-mark path; not-sent's paste flush
+ *  marks once, and resume flushes its queued prompt. */
 export function shouldPreMarkFirstTurn(outcome: EngageOutcome): boolean {
   return outcome === 'accepted';
 }

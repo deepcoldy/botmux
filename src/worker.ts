@@ -174,7 +174,7 @@ import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -274,7 +274,11 @@ import {
   replaceManagedOriginCapabilityFile,
   sweepManagedOriginAttestationProofs,
 } from './core/managed-origin-capability.js';
-import { CodexRpcEngine } from './codex-rpc-engine.js';
+import {
+  CodexRpcEngine,
+  type CodexRpcTurnIdentity,
+  type CodexRpcTurnTerminal,
+} from './codex-rpc-engine.js';
 import {
   beginRuntimeWriteCycle,
   isCliBackendGenerationCurrent,
@@ -400,23 +404,108 @@ function cleanupPiInitialPromptFiles(): void {
   piInitialPromptEnv = {};
 }
 
+/** Native terminal notifications can beat the worker continuation that installs
+ *  rpcActive (response + notifications may share one socket read). Keep those
+ *  exact attempt terminals until the matching bridge entry is active. */
+interface RpcTurnGeneration {
+  engine: CodexRpcEngine;
+  cliGeneration: number;
+}
+
+interface PendingRpcTerminal {
+  terminal: CodexRpcTurnTerminal;
+  generation: RpcTurnGeneration;
+}
+
+const pendingRpcTurnTerminals = new Map<string, PendingRpcTerminal>();
+const rpcTurnsAwaitingActivation = new Map<string, RpcTurnGeneration>();
+/** A bridge mark/activation failure after an accepted RPC submit must never
+ *  degrade to ready. Keep a separate fail-closed gate until that exact native
+ *  turn reaches terminal or the engine is torn down. */
+const rpcLifecycleFailClosedOwners = new Map<string, RpcTurnGeneration>();
+const rpcActiveOwners = new Map<string, RpcTurnGeneration>();
+const rpcTerminalHydrationOwners = new Map<string, RpcTurnGeneration>();
+const rpcTerminalHydrationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const rpcTerminalHydrationTerminals = new Map<string, PendingRpcTerminal>();
+const settlingRpcTerminalOwners = new Map<string, RpcTurnGeneration>();
+let deferredFreshRpcTurn: {
+  identity: CodexRpcTurnIdentity;
+  generation: RpcTurnGeneration;
+} | undefined;
+
+function rpcTurnOwnerKey(identity: CodexRpcTurnIdentity): string {
+  return `${identity.turnId}\0${identity.dispatchAttempt ?? ''}`;
+}
+
+function sameRpcGeneration(
+  left: RpcTurnGeneration | undefined,
+  right: RpcTurnGeneration,
+): boolean {
+  return left?.engine === right.engine
+    && left.cliGeneration === right.cliGeneration;
+}
+
+function clearAwaitingRpcActivation(
+  identity: CodexRpcTurnIdentity,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    rpcTurnsAwaitingActivation.delete(ownerKey);
+  }
+  const pending = pendingRpcTurnTerminals.get(ownerKey);
+  if (pending && sameRpcGeneration(pending.generation, generation)) {
+    pendingRpcTurnTerminals.delete(ownerKey);
+  }
+}
+
 function stopCodexRpcEngine(): void {
   const engine = codexRpcEngine;
+  const ownedRpcTurns = new Set([
+    ...rpcTurnsAwaitingActivation.keys(),
+    ...rpcLifecycleFailClosedOwners.keys(),
+    ...rpcActiveOwners.keys(),
+    ...settlingRpcTerminalOwners.keys(),
+  ]);
+  // stop() emits exact 'stopped' terminals for every engine-owned native turn.
+  // Keep the engine identity installed until those synchronous callbacks have
+  // retired their matching rpcActive entries.
+  try { engine?.stop(); } catch { /* best effort */ }
+  for (const pending of [...rpcTerminalHydrationTerminals.values()]) {
+    finalizeRpcTurnTerminal(pending.terminal, pending.generation, true);
+  }
   codexRpcEngine = undefined;
   remoteWsUrl = undefined;
   remoteThreadId = undefined;
   clearRpcEnginePidMarker();
-  // Tear down the engine: release any RPC turn still holding the lifecycle gate
-  // open. Without this, a switch from RPC to paste mode leaves a never-started
-  // turn blocking idle forever (no transcript terminal event will arrive).
+  // Defensive cleanup for a protocol/transport failure that never yielded a
+  // native id. No RPC turn may survive an engine teardown holding the lifecycle
+  // gate open.
   for (const turn of codexBridgeQueue.peek()) {
-    if (turn.rpcActive && turn.finalText === undefined) {
+    if (turn.finalText === undefined
+      && (turn.rpcActive
+        || ownedRpcTurns.has(rpcTurnOwnerKey({
+          turnId: turn.turnId,
+          ...(turn.dispatchAttempt !== undefined
+            ? { dispatchAttempt: turn.dispatchAttempt }
+            : {}),
+        })))) {
       codexBridgeQueue.stopRpcActive(turn.turnId, turn.dispatchAttempt);
+      codexBridgeQueue.dropPendingTurn(turn.turnId, turn.dispatchAttempt, true);
     }
   }
+  pendingRpcTurnTerminals.clear();
+  rpcTurnsAwaitingActivation.clear();
+  rpcLifecycleFailClosedOwners.clear();
+  rpcActiveOwners.clear();
+  for (const timer of rpcTerminalHydrationTimers.values()) clearTimeout(timer);
+  rpcTerminalHydrationTimers.clear();
+  rpcTerminalHydrationTerminals.clear();
+  rpcTerminalHydrationOwners.clear();
+  settlingRpcTerminalOwners.clear();
+  deferredFreshRpcTurn = undefined;
   stopStructuredStartGraceRecheck();
   structuredRejectedReadyEvidenceGeneration = undefined;
-  try { engine?.stop(); } catch { /* best effort */ }
 }
 
 /** Resolve the persistent pane name + liveness for a backend type, mirroring
@@ -500,6 +589,11 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
   stopCodexRpcEngine();
   let engine: CodexRpcEngine | undefined;
   try {
+    // engage runs immediately before spawnCli, which advances the viewer
+    // generation once. Bind every callback from this app-server to that target
+    // generation so a late terminal from an old server can never retire a
+    // same-(turnId,attempt) entry installed by its replacement.
+    const engineCliGeneration = cliSpawnGeneration + 1;
     const cliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
     const engineEnv: NodeJS.ProcessEnv = { ...redactChildEnv(process.env) };
     engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
@@ -522,6 +616,13 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, log: (m: string) => log(m),
+      onTurnTerminal: (terminal) => {
+        if (!engine) return;
+        handleRpcTurnTerminal(terminal, {
+          engine,
+          cliGeneration: engineCliGeneration,
+        });
+      },
       onDead: () => {
         if (codexRpcEngine === engine) {
           log('Codex RPC app-server died; replacing the tmux session and re-engaging the thread');
@@ -546,12 +647,27 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
+      const firstIdentity: CodexRpcTurnIdentity = {
+        turnId: cfg.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
+        ...(cfg.dispatchAttempt !== undefined
+          ? { dispatchAttempt: cfg.dispatchAttempt }
+          : {}),
+      };
+      const firstGeneration: RpcTurnGeneration = {
+        engine,
+        cliGeneration: engineCliGeneration,
+      };
+      rpcTurnsAwaitingActivation.set(
+        rpcTurnOwnerKey(firstIdentity),
+        firstGeneration,
+      );
       // Three-state delivery (P1-1, exactly-once priority): 'accepted' (ack or
       // rollout evidence), 'not-sent' (frame never dispatched → safe paste), or
       // 'ambiguous' (dispatched, unconfirmed → engaged but NEVER resend).
-      const first = await engine.sendFirstTurn(cfg.prompt, cfg.turnId,
+      const first = await engine.sendFirstTurn(cfg.prompt, firstIdentity,
         (tid) => codexRolloutProbe(cfg.cliId, tid, cfg.prompt, 12_000));
-      if (first === 'not-sent') {
+      if (first.outcome === 'not-sent') {
+        clearAwaitingRpcActivation(firstIdentity, firstGeneration);
         // The turn/start frame never left → the turn cannot have run → tear the
         // engine down and fall back to paste. flushPending marks the bridge once
         // on the paste path — we must NOT pre-mark here or that would double-mark
@@ -564,12 +680,75 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // Bridge mark ONLY for a confirmed-accepted turn — so the structured
       // fallback can attribute the reply even if the model skips `botmux send`.
       // Marked here (after the outcome, before persistCliSessionId/attach — late
-      // attach from offset 0 still matches, timing-safe). 'ambiguous' does NOT
-      // mark: there is no positive evidence the turn ran, and an unstarted head
-      // would permanently block every later turn's drain — the notify + Web
-      // terminal are the authoritative recovery surface (Codex P1).
-      if (shouldPreMarkFirstTurn(first)) codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
-      if (first === 'accepted' && cfg.queuedActivationToken) {
+      // attach from offset 0 still matches, timing-safe). An ambiguous outcome
+      // gets an attribution-only mark plus a separate fail-closed owner below:
+      // it cannot publish false idle or head-of-line a successor because no
+      // successor is admitted until terminal/teardown retires that owner.
+      if (shouldPreMarkFirstTurn(first.outcome)) {
+        if (!first.nativeTurnId) {
+          // Positive rollout evidence proves delivery, but without a native id
+          // no terminal can be associated precisely. Preserve exactly-once
+          // (never paste/requeue) and hold the explicit fail-closed lifecycle
+          // gate until a structured terminal or engine teardown instead of
+          // guessing a latest turn.
+          const ownerKey = rpcTurnOwnerKey(firstIdentity);
+          codexBridgeMarkPendingTurn(
+            cfg.prompt,
+            firstIdentity.turnId,
+            firstIdentity.dispatchAttempt,
+          );
+          rpcLifecycleFailClosedOwners.set(ownerKey, firstGeneration);
+          deferredFreshRpcTurn = {
+            identity: firstIdentity,
+            generation: firstGeneration,
+          };
+          log(`Codex RPC fresh accepted turn has no native id; lifecycle failed closed for ${firstIdentity.turnId}`);
+          send({
+            type: 'user_notify',
+            message: 'Codex RPC 首条消息已确认落盘，但无法取得原生 turn id；为避免重复执行未重发，并保持忙碌直到检测到终态或会话重启。',
+            turnId: firstIdentity.turnId,
+            ...(firstIdentity.dispatchAttempt !== undefined
+              ? { dispatchAttempt: firstIdentity.dispatchAttempt }
+              : {}),
+          });
+        } else {
+          // Keep terminal delivery deferred until spawnCli has attached and
+          // baselined the rollout; otherwise an ultra-fast first completion can
+          // retire the bridge mark before fallback output is harvested.
+          activateRpcTurnLifecycle(
+            firstIdentity,
+            cfg.prompt,
+            false,
+            firstGeneration,
+            true,
+          );
+          deferredFreshRpcTurn = {
+            identity: firstIdentity,
+            generation: firstGeneration,
+          };
+        }
+      } else {
+        // A dispatched-but-unconfirmed first turn is never re-sent. Keep an
+        // exact attribution mark plus an explicit fail-closed gate even without
+        // a native id. A structured transcript terminal can retire it; a later
+        // native terminal without an owner is intentionally ignored instead of
+        // guessed. If no structured terminal becomes visible, exact engine
+        // teardown is the expected fallback and drops this attempt's mark.
+        codexBridgeMarkPendingTurn(
+          cfg.prompt,
+          firstIdentity.turnId,
+          firstIdentity.dispatchAttempt,
+        );
+        rpcLifecycleFailClosedOwners.set(
+          rpcTurnOwnerKey(firstIdentity),
+          firstGeneration,
+        );
+        deferredFreshRpcTurn = {
+          identity: firstIdentity,
+          generation: firstGeneration,
+        };
+      }
+      if (first.outcome === 'accepted' && cfg.queuedActivationToken) {
         // Fresh RPC input bypasses pendingMessages/flushPending entirely. The
         // app-server's accepted turn/start (or positive rollout proof) is the
         // durable submission boundary for the daemon's queued-opening journal.
@@ -579,7 +758,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
           activationToken: cfg.queuedActivationToken,
         });
       }
-      outcome = first; // 'accepted' | 'ambiguous' — both stay engaged, prompt never re-queued
+      outcome = first.outcome; // accepted | ambiguous — both stay engaged, prompt never re-queued
     }
     persistCliSessionId(threadId);
     codexRpcEngine = engine;
@@ -591,7 +770,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
     clearRpcEnginePidMarker();
     try { engine?.stop(); } catch { /* best effort */ }   // P1-3a: stop the LOCAL ref (codexRpcEngine may be unassigned)
-    codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined;
+    // The local engine may not yet have been published into codexRpcEngine.
+    // Still clear any exact lifecycle state its callbacks installed before the
+    // failure; otherwise paste fallback could inherit a stale fail-closed mark.
+    stopCodexRpcEngine();
     return 'not-engaged';
   }
 }
@@ -4103,6 +4285,14 @@ function codexBridgeFallbackActive(): boolean {
 /** Only drivers with a complete normal-final + interrupted-terminal contract
  *  may let a transcript-started turn override the screen-ready heuristic. */
 function hasStructuredLifecycleBlock(): boolean {
+  if (rpcLifecycleFailClosedOwners.size > 0) return true;
+  if (rpcTerminalHydrationOwners.size > 0) return true;
+  // rpcActive is an explicit native app-server ownership proof and is valid for
+  // every RPC-capable Codex-family adapter (currently codex + traex), including
+  // drivers intentionally excluded from transcript-only lifecycle blocking.
+  if (codexBridgeQueue.peek().some(turn =>
+    turn.rpcActive === true && turn.finalText === undefined,
+  )) return true;
   return isStructuredBridgeLifecycleBlockingCli(lastInitConfig?.cliId)
     && codexBridgeQueue.hasBlockingTurn();
 }
@@ -4634,6 +4824,11 @@ function maybeFollowTraexSessionRotationViaPid(): void {
 }
 
 function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
+  // Follow-up RPC turns install their exact bridge mark only after the
+  // turn/start ACK passes the generation fence. Do not advance the rollout
+  // cursor while such an activation is pending; after activation, the same
+  // unread bytes are replayed into the newly marked exact attempt.
+  if (rpcTurnsAwaitingActivation.size > 0) return;
   if (structuredBridgeIsHermes()) {
     hermesBridgeIngest();
     return;
@@ -4672,6 +4867,267 @@ function codexBridgeMarkPendingTurn(
   const turnId = preferredTurnId ?? `codex-${randomBytes(8).toString('hex')}`;
   codexBridgeQueue.mark(turnId, messageText, Date.now(), dispatchAttempt);
   return turnId;
+}
+
+function finalizeRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+  dropPending: boolean,
+): void {
+  const { identity } = terminal;
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    settlingRpcTerminalOwners.get(ownerKey),
+    generation,
+  )) return;
+  const timer = rpcTerminalHydrationTimers.get(ownerKey);
+  if (timer) clearTimeout(timer);
+  rpcTerminalHydrationTimers.delete(ownerKey);
+  if (sameRpcGeneration(rpcTerminalHydrationOwners.get(ownerKey), generation)) {
+    rpcTerminalHydrationOwners.delete(ownerKey);
+    rpcTerminalHydrationTerminals.delete(ownerKey);
+  }
+  settlingRpcTerminalOwners.delete(ownerKey);
+  clearAwaitingRpcActivation(identity, generation);
+  if (sameRpcGeneration(rpcLifecycleFailClosedOwners.get(ownerKey), generation)) {
+    rpcLifecycleFailClosedOwners.delete(ownerKey);
+  }
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
+  if (dropPending) {
+    codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
+  }
+
+  const status = terminal.status === 'completed' ? 'completed'
+    : terminal.status === 'failed' || terminal.status === 'aborted' ? 'failed'
+      : 'ambiguous';
+  const errorCode = terminal.errorCode
+    ?? (terminal.status === 'engine-dead' ? 'rpc_engine_dead'
+      : terminal.status === 'stopped' ? 'rpc_engine_stopped'
+        : terminal.status === 'aborted' ? 'rpc_turn_aborted'
+          : terminal.status === 'failed' ? 'rpc_turn_failed'
+            : undefined);
+  emitTurnTerminal(identity.turnId, status, errorCode, identity.dispatchAttempt);
+  log(
+    `Codex RPC terminal ${terminal.status}: native=${terminal.nativeTurnId.slice(0, 12)} `
+    + `turn=${identity.turnId.slice(0, 12)} attempt=${identity.dispatchAttempt ?? '-'}`,
+  );
+  redriveRejectedStructuredReady();
+  idleDetector?.fireIdle();
+}
+
+/** turn/completed can race ahead of rollout fs visibility even though it is an
+ *  authoritative execution terminal. Release rpcActive immediately, but retain
+ *  a short non-ready hydration gate while polling the structured transcript.
+ *  This preserves fallback final output without allowing the stale fingerprint
+ *  to head-of-line block a new RPC turn indefinitely. */
+function hydrateCompletedRpcTurn(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+  attempt = 0,
+): void {
+  const { identity } = terminal;
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    settlingRpcTerminalOwners.get(ownerKey),
+    generation,
+  )) return;
+  // restartCliProcess advances the generation before its asynchronous teardown.
+  // Do not let an old hydration timer touch a bridge queue that may already be
+  // owned by the replacement. stopCodexRpcEngine will synchronously retire the
+  // old generation when teardown reaches the engine.
+  if (cliSpawnGeneration !== generation.cliGeneration
+    || codexRpcEngine !== generation.engine) return;
+  try { codexBridgeDrainAndMaybeEmit({ signalIdle: false }); } catch { /* retry */ }
+  if (!codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt)) {
+    // Structured ingest already emitted final_output + terminal in the canonical
+    // order. The explicit native terminal below is idempotently suppressed.
+    finalizeRpcTurnTerminal(terminal, generation, false);
+    return;
+  }
+  // The native terminal can beat rollout persistence by seconds on a cold or
+  // busy filesystem. Keep this bounded (~11.6s), aligned with the fresh-turn
+  // 12s positive-evidence probe, rather than dropping fallback output after the
+  // previous 1.55s window.
+  const delays = CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS;
+  if (attempt >= delays.length) {
+    finalizeRpcTurnTerminal(terminal, generation, true);
+    return;
+  }
+  const timer = setTimeout(() => {
+    rpcTerminalHydrationTimers.delete(ownerKey);
+    hydrateCompletedRpcTurn(terminal, generation, attempt + 1);
+  }, delays[attempt]);
+  timer.unref?.();
+  rpcTerminalHydrationTimers.set(ownerKey, timer);
+}
+
+function settleRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(terminal.identity);
+  const existingSettlement = settlingRpcTerminalOwners.get(ownerKey);
+  if (existingSettlement) {
+    if (!sameRpcGeneration(existingSettlement, generation)) {
+      log(`Ignored stale Codex RPC terminal settlement for ${terminal.identity.turnId}`);
+    }
+    return;
+  }
+  settlingRpcTerminalOwners.set(ownerKey, generation);
+  clearAwaitingRpcActivation(terminal.identity, generation);
+  if (sameRpcGeneration(rpcLifecycleFailClosedOwners.get(ownerKey), generation)) {
+    rpcLifecycleFailClosedOwners.delete(ownerKey);
+  }
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  codexBridgeQueue.stopRpcActive(
+    terminal.identity.turnId,
+    terminal.identity.dispatchAttempt,
+  );
+  if (terminal.status === 'completed'
+    && codexBridgeQueue.hasPendingTurn(
+      terminal.identity.turnId,
+      terminal.identity.dispatchAttempt,
+    )) {
+    rpcTerminalHydrationOwners.set(ownerKey, generation);
+    rpcTerminalHydrationTerminals.set(ownerKey, { terminal, generation });
+    hydrateCompletedRpcTurn(terminal, generation);
+    return;
+  }
+  finalizeRpcTurnTerminal(terminal, generation, true);
+}
+
+function handleRpcTurnTerminal(
+  terminal: CodexRpcTurnTerminal,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(terminal.identity);
+  const awaiting = rpcTurnsAwaitingActivation.get(ownerKey);
+  if (awaiting && sameRpcGeneration(awaiting, generation)) {
+    // Response + turn/completed can be decoded before the await continuation
+    // installs rpcActive. The exact terminal is replayed immediately after that
+    // activation, never against a guessed/latest queue entry.
+    pendingRpcTurnTerminals.set(ownerKey, { terminal, generation });
+    return;
+  }
+  if (awaiting && !sameRpcGeneration(awaiting, generation)) {
+    log(`Ignored stale Codex RPC terminal from replaced engine for ${terminal.identity.turnId}`);
+    return;
+  }
+  const activeGeneration = rpcActiveOwners.get(ownerKey);
+  const failedClosedGeneration = rpcLifecycleFailClosedOwners.get(ownerKey);
+  if (!sameRpcGeneration(activeGeneration, generation)
+    && !sameRpcGeneration(failedClosedGeneration, generation)) {
+    // The structured bridge may already have consumed the same turn and emitted
+    // its terminal, or a replacement generation may own the same logical
+    // delivery key. In either case this callback has no queue state to mutate.
+    log(
+      `Codex RPC terminal already retired: native=${terminal.nativeTurnId.slice(0, 12)} `
+      + `turn=${terminal.identity.turnId.slice(0, 12)}`,
+    );
+    return;
+  }
+  settleRpcTurnTerminal(terminal, generation);
+}
+
+/** Install the exact bridge mark + rpcActive hand-off after turn/start is known
+ *  accepted. Failure is fail-closed: a separate lifecycle gate remains asserted
+ *  for this owner until its native terminal/engine teardown, so a bookkeeping
+ *  bug cannot publish false idle. */
+function activateRpcTurnLifecycle(
+  identity: CodexRpcTurnIdentity,
+  messageText: string,
+  alreadyMarked: boolean,
+  generation: RpcTurnGeneration,
+  deferTerminal = false,
+): boolean {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (!sameRpcGeneration(
+    rpcTurnsAwaitingActivation.get(ownerKey),
+    generation,
+  )) {
+    log(`Refused stale Codex RPC lifecycle activation for ${identity.turnId}`);
+    return false;
+  }
+  let marked = alreadyMarked
+    && codexBridgeQueue.hasPendingTurn(identity.turnId, identity.dispatchAttempt);
+  if (!alreadyMarked) {
+    const bridgeTurnId = codexBridgeMarkPendingTurn(
+      messageText,
+      identity.turnId,
+      identity.dispatchAttempt,
+    );
+    marked = bridgeTurnId === identity.turnId;
+  }
+  const activated = marked
+    && codexBridgeQueue.markRpcActive(identity.turnId, identity.dispatchAttempt);
+  if (activated) rpcActiveOwners.set(ownerKey, generation);
+  if (!deferTerminal
+    && sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    rpcTurnsAwaitingActivation.delete(ownerKey);
+  }
+  if (!activated) {
+    if (marked) codexBridgeQueue.dropPendingTurn(identity.turnId, identity.dispatchAttempt, true);
+    rpcLifecycleFailClosedOwners.set(ownerKey, generation);
+    log(
+      `Codex RPC lifecycle failed closed: mark=${marked} active=${activated} `
+      + `turn=${identity.turnId.slice(0, 12)} attempt=${identity.dispatchAttempt ?? '-'}`,
+    );
+    send({
+      type: 'user_notify',
+      message: 'Codex RPC 已接收消息，但本地生命周期登记失败；在原生终态到达前保持忙碌，未自动重发。',
+      turnId: identity.turnId,
+      ...(identity.dispatchAttempt !== undefined
+        ? { dispatchAttempt: identity.dispatchAttempt }
+        : {}),
+    });
+  }
+  const pendingTerminal = pendingRpcTurnTerminals.get(ownerKey);
+  if (pendingTerminal
+    && sameRpcGeneration(pendingTerminal.generation, generation)
+    && !deferTerminal) {
+    settleRpcTurnTerminal(pendingTerminal.terminal, generation);
+  }
+  return activated;
+}
+
+function releaseRpcTurnTerminalDeferral(
+  identity: CodexRpcTurnIdentity,
+  generation: RpcTurnGeneration,
+): void {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  if (sameRpcGeneration(rpcTurnsAwaitingActivation.get(ownerKey), generation)) {
+    rpcTurnsAwaitingActivation.delete(ownerKey);
+  }
+  const pendingTerminal = pendingRpcTurnTerminals.get(ownerKey);
+  if (pendingTerminal && sameRpcGeneration(pendingTerminal.generation, generation)) {
+    settleRpcTurnTerminal(pendingTerminal.terminal, generation);
+  }
+}
+
+function retireRpcLifecycleFromStructuredTerminal(
+  identity: CodexRpcTurnIdentity,
+): void {
+  const ownerKey = rpcTurnOwnerKey(identity);
+  // Native completion hydration owns its own finalization after this canonical
+  // drain returns. Do not tear down that generation's settlement underneath it.
+  if (settlingRpcTerminalOwners.has(ownerKey)) return;
+  const generation = rpcActiveOwners.get(ownerKey)
+    ?? rpcLifecycleFailClosedOwners.get(ownerKey)
+    ?? rpcTurnsAwaitingActivation.get(ownerKey);
+  if (!generation) return;
+  clearAwaitingRpcActivation(identity, generation);
+  if (sameRpcGeneration(rpcActiveOwners.get(ownerKey), generation)) {
+    rpcActiveOwners.delete(ownerKey);
+  }
+  if (sameRpcGeneration(rpcLifecycleFailClosedOwners.get(ownerKey), generation)) {
+    rpcLifecycleFailClosedOwners.delete(ownerKey);
+  }
+  codexBridgeQueue.stopRpcActive(identity.turnId, identity.dispatchAttempt);
 }
 
 /** Expire confirmed or attribution-only unstarted queue heads at an explicit worker
@@ -4771,6 +5227,12 @@ function emitReadyCodexTurns(): void {
     });
   }
   for (const turn of ready) {
+    retireRpcLifecycleFromStructuredTerminal({
+      turnId: turn.turnId,
+      ...(turn.dispatchAttempt !== undefined
+        ? { dispatchAttempt: turn.dispatchAttempt }
+        : {}),
+    });
     emitTurnTerminal(
       turn.turnId,
       turn.terminalStatus ?? 'completed',
@@ -7142,6 +7604,17 @@ async function flushPending(): Promise<void> {
     while (pendingMessages.length > 0 && backend && cliAdapter) {
       const item = pendingMessages.shift()!;
       beginCliWriteCycle();
+      const writeGeneration = cliSpawnGeneration;
+      const writeBackend = backend;
+      const writeAdapter = cliAdapter;
+      const writeRpcEngine = codexRpcEngine;
+      const writeContinuationIsCurrent = (): boolean => (
+        cliSpawnGeneration === writeGeneration
+        && backend === writeBackend
+        && cliAdapter === writeAdapter
+        && codexRpcEngine === writeRpcEngine
+        && !cliRestartInProgress
+      );
       const durableWrite = item.dispatchAttempt !== undefined;
       if (durableWrite) durableTurnInFlight = true;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
@@ -7173,7 +7646,7 @@ async function flushPending(): Promise<void> {
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
         bridgeTurnId = bridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
-      } else if (codexBridgeActive) {
+      } else if (codexBridgeActive && !writeRpcEngine) {
         // Codex mark works even before the rollout path is known: the
         // queue is path-agnostic, and the late-attach below will start
         // ingest from offset 0 so the user_message that lands shortly
@@ -7265,15 +7738,6 @@ async function flushPending(): Promise<void> {
           + 'awaiting exact remote task id',
         );
       }
-      const writeGeneration = cliSpawnGeneration;
-      const writeBackend = backend;
-      const writeAdapter = cliAdapter;
-      const writeContinuationIsCurrent = (): boolean => (
-        cliSpawnGeneration === writeGeneration
-        && backend === writeBackend
-        && cliAdapter === writeAdapter
-        && !cliRestartInProgress
-      );
       const handleStaleWriteContinuation = (errorCode: string): void => {
         const disposition = settleStaleWriteContinuation(
           item,
@@ -7288,21 +7752,61 @@ async function flushPending(): Promise<void> {
         log(`Discarded stale writeInput continuation turn=${item.turnId ?? '-'} attempt=${item.dispatchAttempt ?? '-'} generation=${writeGeneration} disposition=${disposition}`);
       };
       let result: Awaited<ReturnType<typeof writeAdapter.writeInput>> | undefined;
+      let rpcTurnIdentity: CodexRpcTurnIdentity | undefined;
+      let rpcTurnGeneration: RpcTurnGeneration | undefined;
       try {
-        if (codexRpcEngine) {
+        if (writeRpcEngine) {
+          rpcTurnIdentity = {
+            turnId: item.turnId ?? `codex-rpc-${randomBytes(8).toString('hex')}`,
+            ...(item.dispatchAttempt !== undefined
+              ? { dispatchAttempt: item.dispatchAttempt }
+              : {}),
+          };
+          rpcTurnGeneration = {
+            engine: writeRpcEngine,
+            cliGeneration: writeGeneration,
+          };
+          rpcTurnsAwaitingActivation.set(
+            rpcTurnOwnerKey(rpcTurnIdentity),
+            rpcTurnGeneration,
+          );
           // RPC input mode: deliver via JSON-RPC turn/start (its ack IS the
           // submit confirmation), which the attached `codex --remote` TUI
           // renders. No tmux paste → the history.jsonl verify/retry/recover
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
-          await codexRpcEngine.sendTurn(msg, item.turnId);
+          await writeRpcEngine.sendTurn(msg, rpcTurnIdentity);
+          // The await may overlap an engine/pane replacement. Fence the captured
+          // generation BEFORE touching the global bridge queue; a stale ack must
+          // never activate a mark owned by the replacement generation.
+          if (!writeContinuationIsCurrent()) {
+            clearAwaitingRpcActivation(
+              rpcTurnIdentity,
+              rpcTurnGeneration,
+            );
+            handleStaleWriteContinuation('write_generation_changed');
+            break;
+          }
           result = { submitted: true };
+          // Only the ACKed, still-current generation may create bridge state.
+          // While turn/start was pending, codexBridgeIngest left its cursor
+          // untouched; marking now therefore still precedes replay of any
+          // already-persisted user/final events.
+          bridgeTurnId = rpcTurnIdentity.turnId;
           // The app-server ack confirms execution has begun, but no local
           // transcript event will follow to flip started. Mark the turn active
           // so the lifecycle gate stays asserted for the full server-side run
           // instead of relying on the bounded 20s confirmation lease (which
           // would expire mid-turn on a long-running or approval-pending turn).
-          if (bridgeTurnId) codexBridgeQueue.markRpcActive(bridgeTurnId, item.dispatchAttempt);
+          const activated = activateRpcTurnLifecycle(
+            rpcTurnIdentity,
+            msg,
+            false,
+            rpcTurnGeneration,
+          );
+          if (activated) {
+            codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+          }
         } else {
           result = item.codexAppInput && writeAdapter.writeStructuredInput
             ? await writeAdapter.writeStructuredInput(writeBackend, msg, item.codexAppInput)
@@ -7318,8 +7822,20 @@ async function flushPending(): Promise<void> {
         // turn/attempt key. Fence before touching any process-global queue or
         // liveness state owned by that successor.
         if (!writeContinuationIsCurrent()) {
+          if (rpcTurnIdentity && rpcTurnGeneration) {
+            clearAwaitingRpcActivation(
+              rpcTurnIdentity,
+              rpcTurnGeneration,
+            );
+          }
           handleStaleWriteContinuation('write_generation_changed_after_error');
           break;
+        }
+        if (rpcTurnIdentity && rpcTurnGeneration) {
+          releaseRpcTurnTerminalDeferral(
+            rpcTurnIdentity,
+            rpcTurnGeneration,
+          );
         }
         codexAppPromptReplay.cancelSubmission(
           codexAppTurnLiveness,
@@ -11859,6 +12375,14 @@ process.on('message', async (raw: unknown) => {
         }
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
+        if (deferredFreshRpcTurn) {
+          const deferred = deferredFreshRpcTurn;
+          deferredFreshRpcTurn = undefined;
+          releaseRpcTurnTerminalDeferral(
+            deferred.identity,
+            deferred.generation,
+          );
+        }
 
         // Queue the initial prompt — flushed when CLI shows idle.
         // Adapters with passesInitialPromptViaArgs (e.g. Gemini -i) bake the

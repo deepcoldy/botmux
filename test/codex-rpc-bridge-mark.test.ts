@@ -4,10 +4,10 @@ import { shouldPreMarkFirstTurn, shouldQueueInitialPrompt, type EngageOutcome } 
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 // Consecutive-turn regressions against the REAL CodexBridgeQueue, locking the
-// fresh-first-turn mark discipline (Codex P1): the pre-mark must fire ONLY for a
-// confirmed-accepted turn. A stale/duplicate unstarted head wedges drainEmittable
-// forever, so not-sent (paste re-marks) and ambiguous (never starts) must NOT
-// leave a phantom head.
+// fresh-first-turn mark discipline (Codex P1): the active pre-mark fires only
+// for a confirmed-accepted turn. Ambiguous delivery now has a separate
+// fail-closed attribution mark that is explicitly retired at terminal/teardown;
+// not-sent still leaves no mark before the safe paste fallback.
 const T0 = 'first prompt alpha';
 const T1 = 'second prompt beta';
 const user = (uuid: string, text: string, ts: number): CodexBridgeEvent => ({ uuid, timestampMs: ts, kind: 'user', text });
@@ -47,10 +47,12 @@ describe('CodexBridgeQueue — fresh first-turn mark discipline (Codex P1 stale-
     expect(q.drainEmittable().map(t => t.turnId)).toEqual(['t1']);
   });
 
-  it('ambiguous → NO pre-mark → the next explicit prompt starts/emits (not blocked by a phantom head)', () => {
+  it('ambiguous fail-closed attribution mark is explicitly retired before a successor can run', () => {
     const q = new CodexBridgeQueue();
-    // ambiguous fresh turn leaves the queue untouched.
-    expect(q.size()).toBe(0);
+    q.mark('t0', T0, 1000);
+    // Engine teardown/terminal owns this explicit retirement. A successor is
+    // not admitted while the worker's separate fail-closed gate is asserted.
+    expect(q.dropPendingTurn('t0')).toBeDefined();
     q.mark('t1', T1, 2000);
     q.ingest([user('u1', T1, 2001), asst('a1', 'reply1', 2002)]);
     expect(q.drainEmittable().map(t => t.turnId)).toEqual(['t1']);
@@ -68,6 +70,10 @@ describe('CodexBridgeQueue — fresh first-turn mark discipline (Codex P1 stale-
     const preMark = preMarkAlways ? true : shouldPreMarkFirstTurn(outcome);
     const flushMark = shouldQueueInitialPrompt({ hasPrompt: true, rpcEngineActive: engineActive, queuePrompt: false, passesInitialPromptViaArgs: false, deferInitialPrompt: false });
     if (preMark) q.mark('t0', T0, 1000);
+    if (outcome === 'ambiguous') {
+      q.mark('t0', T0, 1000); // attribution-only while fail-closed
+      q.dropPendingTurn('t0'); // native terminal / engine teardown
+    }
     if (flushMark) q.mark('t0', T0, 1000); // paste flush re-marks the SAME turnId
     q.ingest([user('u0', T0, 1001), asst('a0', 'reply0', 1002)]);
     q.drainEmittable();
@@ -77,7 +83,8 @@ describe('CodexBridgeQueue — fresh first-turn mark discipline (Codex P1 stale-
   }
 
   it('FIXED worker: accepted / not-sent(→not-engaged) / ambiguous all let the NEXT turn emit', () => {
-    // accepted: pre-mark(1)+flush(0)=1; not-engaged: pre-mark(0)+flush(1)=1; ambiguous: 0.
+    // accepted: active pre-mark(1); not-engaged: paste mark(1);
+    // ambiguous: fail-closed attribution mark retired before successor.
     expect(nextTurnAfterFirst('accepted', false)).toEqual(['t1']);
     expect(nextTurnAfterFirst('not-engaged', false)).toEqual(['t1']);
     expect(nextTurnAfterFirst('ambiguous', false)).toEqual(['t1']);

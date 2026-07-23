@@ -4,6 +4,9 @@
 // SAME port (as the real app-server does), answering the handshake + thread/turn
 // requests. Env knobs drive the failure-path tests:
 //   FAKE_HANG_TURN=1     → never answer turn/start (wedged app-server)
+//   FAKE_HANG_TURN_NOTIFY=1 → emit started/completed but lose the ack
+//   FAKE_TERMINAL_BEFORE_RESPONSE=1 → broadcast terminal before turn/start ack
+//   FAKE_DUPLICATE_TERMINAL=1 → broadcast turn/completed twice
 //   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
@@ -12,7 +15,13 @@ const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;
 const HANG_TURN = process.env.FAKE_HANG_TURN === '1';
+const HANG_TURN_NOTIFY = process.env.FAKE_HANG_TURN_NOTIFY === '1';
+const TERMINAL_BEFORE_RESPONSE = process.env.FAKE_TERMINAL_BEFORE_RESPONSE === '1';
+const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
+const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
+const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
 const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
+let turnCount = 0;
 
 const httpServer = createServer((req, res) => {
   if (req.url === '/readyz') { res.writeHead(200); res.end('ok'); return; }
@@ -28,7 +37,45 @@ wss.on('connection', (ws) => {
       case 'initialize': return reply({ ok: true });
       case 'thread/start': return reply({ thread: { id: 'thread-fake-1' } });
       case 'thread/resume': return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
-      case 'turn/start': if (HANG_TURN) return; return reply({ accepted: true });
+      case 'turn/start': {
+        turnCount++;
+        const nativeTurnId = `turn-fake-${turnCount}`;
+        const terminal = () => {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'turn/started',
+            params: { threadId: msg.params?.threadId, turn: { id: nativeTurnId } },
+          }));
+          if (!NO_TURN_TERMINAL) {
+            const turn = {
+              id: nativeTurnId,
+              ...(TURN_STATUS ? { status: TURN_STATUS } : {}),
+              ...(TURN_STATUS === 'failed'
+                ? { error: { code: 'fake_failed', message: 'fake failure' } }
+                : {}),
+            };
+            const completed = JSON.stringify({
+              jsonrpc: '2.0',
+              method: 'turn/completed',
+              params: { threadId: msg.params?.threadId, turn },
+            });
+            ws.send(completed);
+            if (DUPLICATE_TERMINAL) ws.send(completed);
+          }
+        };
+        if (HANG_TURN) {
+          if (HANG_TURN_NOTIFY) terminal();
+          return;
+        }
+        if (TERMINAL_BEFORE_RESPONSE) {
+          terminal();
+          reply({ turn: { id: nativeTurnId } });
+        } else {
+          reply({ turn: { id: nativeTurnId } });
+          terminal();
+        }
+        return;
+      }
       default: return reply({});
     }
   });
