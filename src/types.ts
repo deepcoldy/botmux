@@ -192,9 +192,8 @@ export interface Session {
   riffRepoDirs?: string[];
   larkAppId?: string;
   ownerOpenId?: string;       // topic creator's open_id — for @mention in replies
-  /** Best-effort human-readable title for direct/p2p chats. Lark chat APIs
-   *  often return an empty chat name for p2p, so dashboard rows carry the
-   *  initiating user's display name here when we can resolve it. */
+  /** Best-effort human-readable chat name. Group sessions use the Lark group
+   *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
   /** open_id of whoever created this session (the first sender), app-scoped to
    *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)

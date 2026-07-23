@@ -2057,6 +2057,7 @@ export function forkWorker(
       ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
         titlePrompt ? ds.session.title : undefined,
         bot.botName ? [{ name: bot.botName }] : undefined,
+        ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
       );
       ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
       nativeSessionTitlePrompt = titlePrompt;
@@ -2077,6 +2078,11 @@ export function forkWorker(
     if (
       isFreshNativeSession
       || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+      || (
+        resume
+        && !!ds.session.nativeSessionTitleAwaitingContent
+        && !!ds.session.nativeSessionTitle
+      )
       || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
     ) {
       nativeSessionTitle = ds.session.nativeSessionTitle;

@@ -48,6 +48,19 @@ describe('buildBotmuxLarkNativeSessionTitle', () => {
     expect(buildBotmuxLarkNativeSessionTitle(undefined)).toBe('[BotMux·Lark] 新话题');
   });
 
+  it('uses the group name when mention-only topic content has no semantic title', () => {
+    expect(buildBotmuxLarkNativeSessionTitle(
+      '@@Botmux',
+      [{ name: 'Botmux' }],
+      '  BotMux 标题优化群  ',
+    )).toBe('[BotMux·Lark] BotMux 标题优化群');
+    expect(buildBotmuxLarkNativeSessionTitle(
+      '@Botmux 排查这个 logid',
+      [{ name: 'Botmux' }],
+      '不会覆盖正文',
+    )).toBe('[BotMux·Lark] 排查这个 logid');
+  });
+
   it('limits the complete title to 100 characters with an ellipsis', () => {
     const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(200));
 

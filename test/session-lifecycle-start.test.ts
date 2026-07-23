@@ -569,6 +569,7 @@ describe('session.start lifecycle integration', () => {
         ...makeDs().session,
         title: '@@TestBot',
         nativeSessionTitle: '[BotMux·Lark] @@TestBot',
+        chatDisplayName: 'BotMux 标题优化群',
       },
     });
     forkWorker(ds, `
@@ -580,7 +581,28 @@ describe('session.start lifecycle integration', () => {
     const init = vi.mocked(worker.send).mock.calls[0][0];
 
     expect(init).toEqual(expect.objectContaining({
-      nativeSessionTitle: '[BotMux·Lark] 新话题',
+      nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
+    }));
+    expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
+    expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);
+  });
+
+  it('reapplies the group fallback when a pending Codex worker restarts before any content', () => {
+    const ds = makeDs({
+      session: {
+        ...makeDs().session,
+        nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
+        nativeSessionTitleAwaitingContent: true,
+        chatDisplayName: 'BotMux 标题优化群',
+      },
+    });
+    forkWorker(ds, '<user_message>@@TestBot</user_message>', true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+
+    expect(init).toEqual(expect.objectContaining({
+      resume: true,
+      nativeSessionTitle: '[BotMux·Lark] BotMux 标题优化群',
     }));
     expect(init).not.toHaveProperty('nativeSessionTitlePrompt');
     expect(ds.session.nativeSessionTitleAwaitingContent).toBe(true);

@@ -60,13 +60,16 @@ export function extractBotmuxLarkNativeSessionTitlePrompt(
 export function buildBotmuxLarkNativeSessionTitle(
   rawContent: unknown,
   mentions?: readonly { name: string }[],
+  emptyContentFallback?: unknown,
 ): string {
   const content = stripLeadingKnownMentions(
     typeof rawContent === 'string' ? rawContent : '',
     mentions,
   );
 
-  const normalized = normalizeSessionTitle(content) ?? '新话题';
+  const normalized = normalizeSessionTitle(content)
+    ?? normalizeSessionTitle(emptyContentFallback)
+    ?? '新话题';
   const maxContentLength = BOTMUX_LARK_TITLE_MAX - Array.from(BOTMUX_LARK_TITLE_PREFIX).length - 1;
   const chars = Array.from(normalized);
   const displayContent = chars.length > maxContentLength
