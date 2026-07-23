@@ -214,6 +214,7 @@ describe('v2 HYBRID model (buildV2DenyPaths)', () => {
     expect(d).toContain('/Users/bot/.botmux/data/queues');        // all bots' inbound message content
     expect(d).toContain('/Users/bot/.botmux/data/read-isolation'); // profiles enumerate sibling sessions
     expect(d).toContain('/Users/bot/.botmux/data/.botmux-cli-pids'); // live cross-session tuples
+    expect(d).toContain('/Users/bot/.botmux/data/pi-initial-prompts'); // hidden first-turn context
     // schedules.json is a read-modify-write store — denying the read makes a
     // sandboxed `botmux schedule` load an empty map then overwrite the shared
     // file, wiping every bot's tasks. Deliberately NOT denied (accept the minor
@@ -757,7 +758,8 @@ describe('Linux read isolation (buildLinuxReadIsolationMasks)', () => {
     for (const p of ['/Users/bot/.claude', '/Users/bot/.codex', '/Users/bot/.ssh',
       '/Users/bot/.botmux/bots.json', '/Users/bot/.botmux/feishu-session.json',
       '/Users/bot/.botmux/.dashboard-secret', '/Users/bot/.botmux/data/frozen-cards',
-      '/Users/bot/.botmux/data/queues']) expect(r.hidePaths).toContain(p);
+      '/Users/bot/.botmux/data/queues',
+      '/Users/bot/.botmux/data/pi-initial-prompts']) expect(r.hidePaths).toContain(p);
     // per-sibling (enumerated — no regex on bwrap)
     for (const p of ['/Users/bot/.botmux/bots/cli_other1', '/Users/bot/.lark-cli-bots/cli_other2',
       '/Users/bot/.botmux/data/sessions-cli_other1.json', '/Users/bot/.botmux/data/identities-cli_other2.json',
@@ -886,6 +888,14 @@ describe('worker capability carve-out ordering', () => {
     expect(allowAt).toBeGreaterThan(denyAt);
     expect(writeDenyAt).toBeGreaterThan(allowAt);
     expect(profileAt).toBeGreaterThan(writeDenyAt);
+  });
+
+  it('carves back only the prepared Pi session prompt directory after masking the shared root', () => {
+    expect(source).toContain('...piInitialPromptReadonlyRoots.map(canonical),');
+    expect(source).toContain('...piInitialPromptReadonlyRoots,');
+    expect(source).not.toContain(
+      'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
+    );
   });
 
   it('enforces the mandatory credential gate before adopt and wraps wrapperCli from the outside', () => {

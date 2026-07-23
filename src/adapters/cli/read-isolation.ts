@@ -317,6 +317,10 @@ export function buildV2DenyPaths(ctx: V2IsolationContext): string[] {
       `${sd}/frozen-cards`,            // conversation content (all bots')
       `${sd}/turn-sends`,              // CLI only APPENDS markers here — read-deny is safe
       `${sd}/crash-diagnostics`,
+      // Long Pi first prompts may contain the full hidden routing/identity
+      // context. Deny the shared root, then the worker carves back only this
+      // session's private subdirectory.
+      `${sd}/pi-initial-prompts`,
       // All bots' Feishu-uploaded files. Own per-appId bucket (attachments/<self>/) is
       // re-allowed via buildV2CarveOuts; siblings' buckets + the legacy flat
       // per-messageId layout stay denied.
@@ -712,6 +716,7 @@ export function buildLinuxReadIsolationMasks(input: LinuxReadIsolationInput): {
     `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`,
     `${sd}/sessions.json`, `${sd}/frozen-cards`, `${sd}/turn-sends`,
     `${sd}/crash-diagnostics`, `${sd}/queues`, `${sd}/read-isolation`,
+    `${sd}/pi-initial-prompts`,
     `${sd}/.botmux-cli-pids`,
     // attachments/ is masked WHOLESALE (like macOS) — covers every sibling bucket
     // AND the legacy flat per-messageId layout (which per-sibling enumeration can't

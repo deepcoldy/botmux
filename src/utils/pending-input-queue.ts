@@ -2,6 +2,10 @@ import type { CodexAppTurnInput, VcMeetingImTurnOrigin } from '../types.js';
 
 export interface PendingCliInput {
   content: string;
+  /** The real user turn represented by `content` when delivery uses a short
+   * adapter command. Transcript bridges fingerprint this value, while the PTY
+   * receives `content`. */
+  logicalContent?: string;
   turnId?: string;
   dispatchAttempt?: number;
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
@@ -21,7 +25,8 @@ export function mergeQueuedCliInput(
   // would drop or mis-attach the sidecar.
   if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
-    || tail.codexAppInput || next.codexAppInput) return false;
+    || tail.codexAppInput || next.codexAppInput
+    || tail.logicalContent || next.logicalContent) return false;
   tail.content = `${tail.content}\n\n${next.content}`;
   tail.turnId = next.turnId ?? tail.turnId;
   return true;
@@ -71,6 +76,34 @@ export function shouldDeferInitialPromptForArgLimit(opts: {
   const limit = opts.maxInitialPromptArgBytes;
   if (typeof limit !== 'number' || !Number.isFinite(limit) || limit < 0) return false;
   return Buffer.byteLength(opts.prompt, 'utf8') > limit;
+}
+
+/** Resolve the physical first-prompt transport after worker defer policy is
+ * known. A transformed argv prompt can provide a short deferred command while
+ * retaining the original text for bridge attribution. Other adapters keep the
+ * legacy behavior: argv when not deferred, original text in the queue when
+ * deferred. */
+export function resolveInitialPromptDelivery(opts: {
+  originalPrompt?: string;
+  preparedArg?: string;
+  preparedDeferredContent?: string;
+  defer: boolean;
+}): {
+  argvPrompt?: string;
+  queuedContent?: string;
+  logicalContent?: string;
+} {
+  if (!opts.originalPrompt) return {};
+  if (!opts.defer) {
+    return { argvPrompt: opts.preparedArg ?? opts.originalPrompt };
+  }
+  const queuedContent = opts.preparedDeferredContent ?? opts.originalPrompt;
+  return {
+    queuedContent,
+    ...(queuedContent !== opts.originalPrompt
+      ? { logicalContent: opts.originalPrompt }
+      : {}),
+  };
 }
 
 /** Once either side of a queue boundary is durable, stop this batch and wait

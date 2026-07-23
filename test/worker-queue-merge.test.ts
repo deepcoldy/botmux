@@ -44,6 +44,20 @@ describe('mergeQueuedCliInput', () => {
     expect(ordinaryTail).toEqual([{ content: 'human turn', turnId: 'im-1' }]);
   });
 
+  it('never merges a transport command that represents different logical content', () => {
+    const deferred = [{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 't1',
+    }];
+    expect(mergeQueuedCliInput(deferred, { content: 'next', turnId: 't2' })).toBe(false);
+    expect(mergeQueuedCliInput([{ content: 'ordinary', turnId: 't1' }], {
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 't2',
+    })).toBe(false);
+  });
+
   it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
     const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
     expect(mergeQueuedCliInput(pending, {

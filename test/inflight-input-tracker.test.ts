@@ -41,6 +41,21 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
   });
 
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
+  });
+
   it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('hello'));

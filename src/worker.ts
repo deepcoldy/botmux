@@ -13,7 +13,7 @@
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync, unlinkSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, openSync, closeSync, fstatSync, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -60,6 +60,7 @@ import {
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
+  resolveInitialPromptDelivery,
   shouldDeferArgsBakedDurablePrompt,
   shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
@@ -270,6 +271,29 @@ let remoteWsUrl: string | undefined;
 let remoteThreadId: string | undefined;
 let rpcDialogDismissTimer: ReturnType<typeof setTimeout> | null = null;
 let rpcEnginePidMarker: string | null = null;
+const piInitialPromptCleanupPaths: string[] = [];
+const piInitialPromptCleanupDirs: string[] = [];
+let piInitialPromptReadonlyRoots: string[] = [];
+let piInitialPromptAdditionalArgs: string[] = [];
+let piInitialPromptEnv: Record<string, string> = {};
+
+function cleanupPiInitialPromptFiles(): void {
+  while (piInitialPromptCleanupPaths.length > 0) {
+    const p = piInitialPromptCleanupPaths.pop();
+    if (!p) continue;
+    try { unlinkSync(p); } catch { /* best effort */ }
+  }
+  while (piInitialPromptCleanupDirs.length > 0) {
+    const dir = piInitialPromptCleanupDirs.pop();
+    if (!dir) continue;
+    // Non-recursive on purpose: remove only an empty session-owned directory,
+    // never a shared root or a path that unexpectedly gained other content.
+    try { rmdirSync(dir); } catch { /* best effort */ }
+  }
+  piInitialPromptReadonlyRoots = [];
+  piInitialPromptAdditionalArgs = [];
+  piInitialPromptEnv = {};
+}
 
 function stopCodexRpcEngine(): void {
   const engine = codexRpcEngine;
@@ -761,6 +785,9 @@ let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
  *  adapter's hermesBridgeAttach reads the correct mode. */
 let lastSpawnEffectiveResume = false;
 let lastSpawnEffectiveCliSessionId: string | undefined;
+let lastSpawnDeferInitialPrompt = false;
+let lastSpawnQueuedInitialPrompt: string | undefined;
+let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -5069,6 +5096,7 @@ async function flushPending(): Promise<void> {
       // resend (Codex delta P1-1).
       if (!codexRpcEngine) inflightInputs.onWrite(item);
       const msg = item.content;
+      const logicalMsg = item.logicalContent ?? msg;
       currentBotmuxTurnId = item.turnId;
       currentBotmuxDispatchAttempt = item.dispatchAttempt;
       currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
@@ -5085,13 +5113,13 @@ async function flushPending(): Promise<void> {
       let bridgeTurnId: string | undefined;
       if (claudeBridgeActive) {
         try { bridgeIngest(); } catch { /* best-effort */ }
-        bridgeTurnId = bridgeMarkPendingTurn(msg, item.turnId, item.dispatchAttempt);
+        bridgeTurnId = bridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
       } else if (codexBridgeActive) {
         // Codex mark works even before the rollout path is known: the
         // queue is path-agnostic, and the late-attach below will start
         // ingest from offset 0 so the user_message that lands shortly
         // after still fingerprint-matches this turn.
-        codexBridgeMarkPendingTurn(msg, item.turnId, item.dispatchAttempt);
+        codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
       }
       if (durableWrite
         && cliAdapter.reliableTurnTerminal === true
@@ -5147,7 +5175,7 @@ async function flushPending(): Promise<void> {
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
         if (backend) scheduleSubmitFailureNotify(
-          msg,
+          logicalMsg,
           undefined,
           '会话 JSONL',
           bridgeTurnId,
@@ -5173,7 +5201,7 @@ async function flushPending(): Promise<void> {
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
         scheduleSubmitFailureNotify(
-          msg,
+          logicalMsg,
           result.recheck,
           '会话 JSONL',
           bridgeTurnId,
@@ -6362,6 +6390,34 @@ async function spawnCli(
   // baking it into args would drop the message that triggered the resume.
   // Finally, defer adapter-declared over-limit prompts to avoid backend command
   // string limits (tmux "command too long") while preserving short argv prompts.
+  let preparedInitialPrompt: string | undefined;
+  let promptArgPreparationChanged = false;
+  let preparedDeferredInput: {
+    content: string;
+    additionalArgs?: string[];
+    env?: Record<string, string>;
+  } | undefined;
+  if (cfg.prompt) {
+    const prepared = cliAdapter.prepareInitialPromptArg?.({
+      initialPrompt: cfg.prompt,
+      sessionId: effectiveAdapterSessionId,
+      sessionDataDir: process.env.SESSION_DATA_DIR,
+    });
+    if (prepared?.readonlyRoots?.length) {
+      piInitialPromptReadonlyRoots = [
+        ...new Set([...piInitialPromptReadonlyRoots, ...prepared.readonlyRoots]),
+      ];
+    }
+    if (prepared?.cleanupPaths?.length) {
+      piInitialPromptCleanupPaths.push(...prepared.cleanupPaths);
+    }
+    if (prepared?.cleanupDirs?.length) {
+      piInitialPromptCleanupDirs.push(...prepared.cleanupDirs);
+    }
+    preparedDeferredInput = prepared?.deferredInput;
+    preparedInitialPrompt = prepared?.initialPrompt ?? cfg.prompt;
+    promptArgPreparationChanged = preparedInitialPrompt !== cfg.prompt;
+  }
   const deferInitialPrompt = shouldDeferInitialPromptForStartup({
     hasStartupCommands: !!cfg.startupCommands?.length,
     adoptMode: cfg.adoptMode === true,
@@ -6371,11 +6427,25 @@ async function spawnCli(
     adoptMode: cfg.adoptMode === true,
     dispatchAttempt: cfg.dispatchAttempt,
   }) || (effectiveResume && cliAdapter.initialPromptArgsIgnoredOnResume === true)
-    || shouldDeferInitialPromptForArgLimit({
+    || (!promptArgPreparationChanged && shouldDeferInitialPromptForArgLimit({
       passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
       prompt: cfg.prompt,
       maxInitialPromptArgBytes: cliAdapter.maxInitialPromptArgBytes,
-    });
+    }));
+  const initialPromptDelivery = resolveInitialPromptDelivery({
+    originalPrompt: cfg.prompt,
+    preparedArg: preparedInitialPrompt,
+    preparedDeferredContent: preparedDeferredInput?.content,
+    defer: deferInitialPrompt,
+  });
+  preparedInitialPrompt = initialPromptDelivery.argvPrompt;
+  lastSpawnQueuedInitialPrompt = initialPromptDelivery.queuedContent;
+  lastSpawnQueuedInitialPromptLogicalContent = initialPromptDelivery.logicalContent;
+  if (deferInitialPrompt && preparedDeferredInput) {
+    piInitialPromptAdditionalArgs = [...(preparedDeferredInput.additionalArgs ?? [])];
+    piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
+  }
+  lastSpawnDeferInitialPrompt = deferInitialPrompt;
   kiroSessionIdCaptureArmed = cfg.cliId === 'kiro-cli' && !effectiveCliSessionId && !willReattachPersistent;
   kiroSessionIdCaptureBuffer = '';
   // Per-bot local read isolation: assemble the Seatbelt profile context (the gate
@@ -6457,7 +6527,7 @@ async function spawnCli(
     resume: effectiveResume,
     workingDir: cfg.workingDir,
     resumeSessionId: effectiveCliSessionId,
-    initialPrompt: deferInitialPrompt ? undefined : (cfg.prompt || undefined),
+    initialPrompt: preparedInitialPrompt,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,
     larkAppId: cfg.larkAppId,
@@ -6472,6 +6542,12 @@ async function spawnCli(
     remoteWsUrl,
     remoteThreadId,
   });
+  // Pi's deferred long-first-prompt command is implemented by a session-scoped
+  // extension. Keep its launch args across owned process restarts while the
+  // queued/in-flight command may still need replay.
+  if (piInitialPromptAdditionalArgs.length > 0) {
+    args.unshift(...piInitialPromptAdditionalArgs);
+  }
 
   // Extra args from env (CLI_DISABLE_DEFAULT_ARGS is removed — adapters own their defaults)
   const extra = (process.env.CLI_EXTRA_ARGS ?? '').trim();
@@ -6597,6 +6673,9 @@ async function spawnCli(
   // passthrough whitelist (BOTMUX_INJECTED_ENV_KEYS) so the tmux backend forwards
   // them past the server's global env.
   if (cliAdapter.spawnEnv) Object.assign(childEnv, cliAdapter.spawnEnv);
+  if (Object.keys(piInitialPromptEnv).length > 0) {
+    Object.assign(childEnv, piInitialPromptEnv);
+  }
 
   // v2 read isolation: point the CLI at its PER-BOT config dir (set AFTER spawnEnv
   // so it overrides any adapter default). claude → CLAUDE_CONFIG_DIR, codex →
@@ -6692,6 +6771,9 @@ async function spawnCli(
           cliId: cliAdapter.id,
           resolvedBin: canonical(cliAdapter.resolvedBin),
         }),
+        // buildV2DenyPaths masks the shared pi-initial-prompts root. Re-open
+        // only this session's private child directory for Pi's @file/extension.
+        ...piInitialPromptReadonlyRoots.map(canonical),
       ];
       finalDenyPaths = carve.finalDenyPaths.map(canonical);
       traverseDirs = carve.traverseDirs.map(canonical);
@@ -6927,6 +7009,7 @@ async function spawnCli(
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
           readonlyRoots: [
             ...(cfg.skillReadonlyRoots ?? []),
+            ...piInitialPromptReadonlyRoots,
             ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
           ],
           mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
@@ -7684,6 +7767,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   currentCliCredentialIsolated = false;
   stopSessionMcpGatewayHost();
   stopCodexRpcEngine();
+  if (!opts.preservePending) cleanupPiInitialPromptFiles();
   destroyCrashDiagnosticTerminal('killCli');
   idleDetector?.dispose();
   idleDetector = null;
@@ -9145,20 +9229,7 @@ process.on('message', async (raw: unknown) => {
         // Tier-1/Tier-2 fresh demotion, which clears the flag). Adopt spawns
         // return from spawnCli before that write — exclude them explicitly so
         // the stale module-level value can't leak in.
-        const deferInitialPrompt = shouldDeferInitialPromptForStartup({
-          hasStartupCommands: !!msg.startupCommands?.length,
-          adoptMode: msg.adoptMode === true,
-          passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
-        }) || shouldDeferArgsBakedDurablePrompt({
-          passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
-          adoptMode: msg.adoptMode === true,
-          dispatchAttempt: msg.dispatchAttempt,
-        }) || (msg.adoptMode !== true && lastSpawnEffectiveResume && cliAdapter?.initialPromptArgsIgnoredOnResume === true)
-          || shouldDeferInitialPromptForArgLimit({
-            passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
-            prompt: msg.prompt,
-            maxInitialPromptArgBytes: cliAdapter?.maxInitialPromptArgBytes,
-          });
+        const deferInitialPrompt = lastSpawnDeferInitialPrompt;
         if (msg.prompt && cliAdapter?.passesInitialPromptViaArgs && !deferInitialPrompt && codexBridgeFallbackActive()) {
           // Args-baked first prompts (notably Pi) never pass through the normal
           // 'message' IPC path, so the structured bridge would otherwise see the
@@ -9183,7 +9254,10 @@ process.on('message', async (raw: unknown) => {
           deferInitialPrompt,
         })) {
           pendingMessages.push({
-            content: msg.prompt,
+            content: lastSpawnQueuedInitialPrompt ?? msg.prompt,
+            ...(lastSpawnQueuedInitialPromptLogicalContent
+              ? { logicalContent: lastSpawnQueuedInitialPromptLogicalContent }
+              : {}),
             turnId: msg.turnId,
             dispatchAttempt: msg.dispatchAttempt,
             vcMeetingImTurnOrigin: msg.vcMeetingImTurnOrigin,
@@ -9652,6 +9726,7 @@ process.on('message', async (raw: unknown) => {
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  cleanupPiInitialPromptFiles();
   stopSessionMcpGatewayHost();
   if (tmuxRestartTimer) {
     clearTimeout(tmuxRestartTimer);

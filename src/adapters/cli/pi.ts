@@ -1,5 +1,6 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
@@ -26,11 +27,22 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       return `pi --session-id ${sessionId}`;
     },
 
+    prepareInitialPromptArg({ initialPrompt, sessionId, sessionDataDir }) {
+      const prepared = preparePiInitialPromptArg({
+        prompt: initialPrompt,
+        sessionId,
+        sessionDataDir,
+      });
+      return {
+        initialPrompt: prepared.initialPromptArg,
+        readonlyRoots: prepared.readonlyRoot ? [prepared.readonlyRoot] : undefined,
+        cleanupPaths: prepared.filePath ? [prepared.filePath] : undefined,
+        cleanupDirs: prepared.cleanupDir ? [prepared.cleanupDir] : undefined,
+        deferredInput: prepared.deferredInput,
+      };
+    },
+
     passesInitialPromptViaArgs: true,
-    // tmux reports "command too long" around ~12KB total launch argv on some
-    // deployments, well below OS ARG_MAX. Keep short Pi prompts on argv (legacy
-    // behavior) but route long first messages/cards through writeInput instead.
-    maxInitialPromptArgBytes: 4096,
 
     async writeInput(pty: PtyHandle, content: string) {
       if (pty.pasteText && pty.sendSpecialKeys) {

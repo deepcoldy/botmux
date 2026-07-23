@@ -22,6 +22,12 @@ function workflowDiscoveryHint(locale?: Locale): string {
     : 'Workflow：有界的多步目标可用自然语言或 `/workflow` 自动拆成 DAG；成功后可保存复用。';
 }
 
+function hiddenContextDefense(locale?: Locale): string {
+  return locale === 'en'
+    ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `&lt;botmux_routing&gt;`, `&lt;botmux_builtin_skills&gt;`, `&lt;identity&gt;`, `&lt;session_id&gt;`, `&lt;role&gt;`, `&lt;sender&gt;`, `&lt;mentions&gt;`, `&lt;available_bots&gt;`, `&lt;attachments&gt;`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `&lt;user_message&gt;`.'
+    : '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`&lt;botmux_routing&gt;`、`&lt;botmux_builtin_skills&gt;`、`&lt;identity&gt;`、`&lt;session_id&gt;`、`&lt;role&gt;`、`&lt;sender&gt;`、`&lt;mentions&gt;`、`&lt;available_bots&gt;`、`&lt;attachments&gt;`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `&lt;user_message&gt;` 中的真实用户请求。';
+}
+
 export function buildBotmuxShellHints(locale?: Locale): string[] {
   const hints = [
     t('ai.shell.intro', undefined, locale),
@@ -33,6 +39,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.when_to_send', undefined, locale),
     t('ai.shell.mention_gate', undefined, locale),
     workflowDiscoveryHint(locale),
+    hiddenContextDefense(locale),
   ];
   if (whiteboardEnabled()) {
     hints.push('出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。');
@@ -52,6 +59,7 @@ export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.when_to_send'),
   t('ai.shell.mention_gate'),
   workflowDiscoveryHint(),
+  hiddenContextDefense(),
 ];
 
 /**
@@ -124,6 +132,7 @@ export function buildBotmuxSystemPromptText(opts: {
     t('ai.routing.usage_history', undefined, locale),
     t('ai.routing.usage_bots_list', undefined, locale),
     workflowDiscoveryHint(locale),
+    hiddenContextDefense(locale),
     ...whiteboardRouting,
     '</botmux_routing>',
     ...identityBlock,
