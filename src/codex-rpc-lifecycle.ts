@@ -28,6 +28,27 @@ export const CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS = [
   3_000,
 ] as const;
 
+/** Monotonic fence for async app-server engagement. Worker IPC handlers are not
+ *  serialized, so restart/close can invalidate an engage while it is awaiting
+ *  /readyz, thread creation, or first-turn rollout evidence. Only the lease
+ *  returned by the latest begin() may publish process-global engine state. */
+export class RpcEngagementFence {
+  private epoch = 0;
+
+  begin(): number {
+    this.epoch += 1;
+    return this.epoch;
+  }
+
+  invalidate(): void {
+    this.epoch += 1;
+  }
+
+  isCurrent(lease: number): boolean {
+    return lease === this.epoch;
+  }
+}
+
 /** All fail-closed gates for codex-family RPC input in ONE place so the worker's
  *  pane-branching and engageCodexRpc agree. Every excluded case degrades to the
  *  normal paste path — never a silent capability/security change:

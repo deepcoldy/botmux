@@ -106,6 +106,17 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     engine.stop();
   }, 20_000);
 
+  it('keeps the first terminal buffered for an unowned native turn', () => {
+    const engine = makeEngine({ sessionId: 'unowned-first-terminal-wins' });
+    (engine as any).emitTurnTerminal('unowned-native', 'failed', 'first_failure');
+    (engine as any).emitTurnTerminal('unowned-native', 'completed');
+    expect((engine as any).deferredUnownedTerminals.get('unowned-native')).toEqual({
+      status: 'failed',
+      errorCode: 'first_failure',
+    });
+    engine.stop();
+  });
+
   it('keeps sequential resume/typeahead attempts isolated by native turn id', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({
@@ -141,7 +152,7 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
   }, 20_000);
 
-  it('lost follow-up ack with an exact native terminal resolves as accepted and does not kill the engine', async () => {
+  it('does not guess a lost follow-up response from an unowned native terminal', async () => {
     let deadCount = 0;
     const terminals: any[] = [];
     const engine = makeEngine({
@@ -158,12 +169,27 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await engine.start();
     await engine.startThread();
     await expect(engine.sendTurn('completed despite lost ack', owner('followup-proof', 4)))
-      .resolves.toEqual({ nativeTurnId: 'turn-fake-1' });
-    expect(deadCount).toBe(0);
-    expect(terminals).toEqual([expect.objectContaining({
-      identity: { turnId: 'followup-proof', dispatchAttempt: 4 },
-      status: 'completed',
-    })]);
+      .rejects.toThrow(/timed out/);
+    expect(deadCount).toBe(1);
+    expect(terminals).toEqual([]);
+    engine.stop();
+  }, 20_000);
+
+  it('does not bind an unrelated pre-response turn/started when the request response rejects', async () => {
+    const terminals: any[] = [];
+    const engine = makeEngine({
+      sessionId: 'followup-response-error-after-started',
+      env: { ...process.env, FAKE_ERROR_AFTER_STARTED: '1' },
+      onTurnTerminal: terminal => terminals.push(terminal),
+    });
+    await engine.start();
+    await engine.startThread();
+    await expect(engine.sendTurn('started before response error', owner('started-proof', 5)))
+      .rejects.toThrow(/fake response failure/);
+    expect((engine as any).turnOwners.size).toBe(0);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(terminals).toEqual([]);
+    expect((engine as any).turnOwners.size).toBe(0);
     engine.stop();
   }, 20_000);
 
@@ -232,7 +258,7 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     engine.stop();
   }, 20_000);
 
-  it('lost ack still maps native terminal exactly when started/completed broadcasts identify the sole outbound turn', async () => {
+  it('uses rollout evidence, not a sole pending request, when first-turn response is lost', async () => {
     const terminals: any[] = [];
     const engine = makeEngine({
       sessionId: 'first-lost-ack-native',
@@ -251,16 +277,12 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       owner('first-native', 3),
       async () => true,
     );
-    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: 'turn-fake-1' });
-    expect(terminals).toEqual([expect.objectContaining({
-      identity: { turnId: 'first-native', dispatchAttempt: 3 },
-      nativeTurnId: 'turn-fake-1',
-      status: 'completed',
-    })]);
+    expect(outcome).toEqual({ outcome: 'accepted', nativeTurnId: undefined });
+    expect(terminals).toEqual([]);
     engine.stop();
   }, 20_000);
 
-  it('lost first-turn ack with turn/started native ownership is accepted even before rollout evidence', async () => {
+  it('does not treat an uncorrelated turn/started as first-turn delivery evidence', async () => {
     let probed = false;
     const engine = makeEngine({
       sessionId: 'first-lost-ack-started',
@@ -279,11 +301,8 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
       owner('first-started', 5),
       async () => { probed = true; return false; },
     );
-    expect(outcome).toEqual({
-      outcome: 'accepted',
-      nativeTurnId: 'turn-fake-1',
-    });
-    expect(probed).toBe(false);
+    expect(outcome).toEqual({ outcome: 'ambiguous' });
+    expect(probed).toBe(true);
     engine.stop();
   }, 20_000);
 

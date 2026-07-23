@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, shouldQueueInitialPrompt, rolloutUserTurnMatches, decideStartupDialogAction, killAndVerifyPersistentPane, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -50,6 +50,31 @@ describe('RPC terminal rollout hydration window', () => {
       }
     }
     expect(observed).toBe(true);
+  });
+});
+
+describe('RpcEngagementFence', () => {
+  it('rejects a delayed first-turn result after restart invalidates its lease', async () => {
+    const fence = new RpcEngagementFence();
+    const lease = fence.begin();
+    let resolveProbe!: (value: 'accepted') => void;
+    const probe = new Promise<'accepted'>(resolve => { resolveProbe = resolve; });
+    let published = false;
+    let requeued = false;
+    const engage = (async () => {
+      const outcome = await probe;
+      if (!fence.isCurrent(lease)) return 'superseded';
+      published = true;
+      if (outcome !== 'accepted') requeued = true;
+      return outcome;
+    })();
+
+    fence.invalidate();
+    resolveProbe('accepted');
+
+    await expect(engage).resolves.toBe('superseded');
+    expect(published).toBe(false);
+    expect(requeued).toBe(false);
   });
 });
 

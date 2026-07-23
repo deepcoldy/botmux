@@ -298,7 +298,21 @@ describe('worker pipe initial screen ordering', () => {
       .match(/if \(spawnGeneration !== cliSpawnGeneration\) throw new CliSpawnSupersededError\(\);/g))
       .toHaveLength(2);
     expect(source).toContain('function killCli(opts: { preservePending?: boolean } = {}): void {\n  cliSpawnGeneration++;');
-    expect(source.match(/err instanceof CliSpawnSupersededError/g)).toHaveLength(3);
+    const restartHandler = source.slice(
+      source.indexOf('async function restartCliProcess('),
+      source.indexOf('// ─── HTTP + WebSocket Server'),
+    );
+    const initHandler = source.slice(
+      source.indexOf("case 'init':"),
+      source.indexOf("case 'codex_app_dispatch_persisted':"),
+    );
+    const messageHandler = source.slice(
+      source.indexOf("case 'message':"),
+      source.indexOf("case 'raw_input':"),
+    );
+    for (const handler of [restartHandler, initHandler, messageHandler]) {
+      expect(handler).toContain('if (err instanceof CliSpawnSupersededError) return;');
+    }
   });
 
   it('uses hardened locators, random endpoints, and process-lifetime publisher leases', () => {

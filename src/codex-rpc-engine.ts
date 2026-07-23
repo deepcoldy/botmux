@@ -133,11 +133,14 @@ export class CodexRpcEngine {
     timer: ReturnType<typeof setTimeout>;
     method: string;
     turnIdentity?: CodexRpcTurnIdentity;
-    nativeTurnId?: string;
   }>();
   private readonly turnOwners = new Map<string, CodexRpcTurnIdentity>();
   private readonly nativeTurnByOwner = new Map<string, string>();
   private readonly terminalNativeTurns = new Set<string>();
+  private readonly deferredUnownedTerminals = new Map<string, {
+    status: CodexRpcTurnTerminalStatus;
+    errorCode?: string;
+  }>();
   private port = 0;
   private threadId?: string;
   private closed = false;
@@ -183,25 +186,11 @@ export class CodexRpcEngine {
       this.turnOwners.set(nativeTurnId, { ...identity });
     }
     this.nativeTurnByOwner.set(ownerKey, nativeTurnId);
-  }
-
-  /** A turn notification can precede the Promise continuation for the matching
-   *  response when response + notifications arrive in one socket read. Bind an
-   *  unknown native id only while there is exactly one unresolved outbound
-   *  turn/start. The engine never permits concurrent turn/start requests, so
-   *  this is an exact protocol association, not a "latest turn" heuristic. */
-  private bindUniquePendingTurn(nativeTurnId: string): CodexRpcTurnIdentity | undefined {
-    const candidates = [...this.pending.values()].filter(p =>
-      p.method === 'turn/start' && p.turnIdentity !== undefined,
-    );
-    if (candidates.length !== 1) return undefined;
-    const pending = candidates[0];
-    if (pending.nativeTurnId && pending.nativeTurnId !== nativeTurnId) {
-      throw new Error(`turn/start notification/response id mismatch (${pending.nativeTurnId} != ${nativeTurnId})`);
+    const deferred = this.deferredUnownedTerminals.get(nativeTurnId);
+    if (deferred) {
+      this.deferredUnownedTerminals.delete(nativeTurnId);
+      this.emitTurnTerminal(nativeTurnId, deferred.status, deferred.errorCode);
     }
-    pending.nativeTurnId = nativeTurnId;
-    this.bindNativeTurn(nativeTurnId, pending.turnIdentity!);
-    return pending.turnIdentity;
   }
 
   private emitTurnTerminal(
@@ -210,15 +199,23 @@ export class CodexRpcEngine {
     errorCode?: string,
   ): void {
     if (!nativeTurnId || this.terminalNativeTurns.has(nativeTurnId)) return;
-    let identity = this.turnOwners.get(nativeTurnId);
-    if (!identity) identity = this.bindUniquePendingTurn(nativeTurnId);
+    const identity = this.turnOwners.get(nativeTurnId);
     if (!identity) {
       // An attached TUI can broadcast turns not submitted by this engine. Never
-      // guess their Botmux owner; only engine-owned turns may release rpcActive.
-      // If an ACK-loss path never exposed a native id, the worker deliberately
-      // remains fail-closed until its structured transcript terminal is visible
-      // or exact engine teardown removes that attempt's attribution mark.
-      this.log(`[codex-rpc] ignored terminal for unowned native turn ${nativeTurnId}`);
+      // guess their Botmux owner from "one pending request". Buffer the terminal
+      // by native id so a later successful turn/start response can bind and
+      // replay it exactly; a response error/timeout leaves it unowned.
+      if (!this.deferredUnownedTerminals.has(nativeTurnId)) {
+        this.deferredUnownedTerminals.set(nativeTurnId, {
+          status,
+          ...(errorCode ? { errorCode } : {}),
+        });
+      }
+      if (this.deferredUnownedTerminals.size > 1024) {
+        const oldest = this.deferredUnownedTerminals.keys().next().value as string | undefined;
+        if (oldest) this.deferredUnownedTerminals.delete(oldest);
+      }
+      this.log(`[codex-rpc] buffered terminal for unowned native turn ${nativeTurnId}`);
       return;
     }
     this.terminalNativeTurns.add(nativeTurnId);
@@ -346,15 +343,6 @@ export class CodexRpcEngine {
     try {
       await this.request('turn/start', params, opts, undefined, identity);
     } catch (err) {
-      const nativeTurnId = this.takeNativeTurnId(identity);
-      if (nativeTurnId && this.terminalNativeTurns.has(nativeTurnId)) {
-        // A native terminal is stronger delivery evidence than the missing
-        // response: the exact turn both landed and finished. Treat this as an
-        // accepted submit so the worker can install/hydrate its exact bridge
-        // mark instead of downgrading the completed delivery to ambiguous.
-        this.log(`[codex-rpc] turn/start ack lost after exact native terminal ${nativeTurnId}; accepting terminal proof`);
-        return { nativeTurnId };
-      }
       throw err;
     }
     const nativeTurnId = this.takeNativeTurnId(identity);
@@ -413,12 +401,6 @@ export class CodexRpcEngine {
       // evidence; absence is NOT proof it didn't run (it may persist >window or be
       // queued server-side), so no-evidence stays ambiguous.
       this.log(`[codex-rpc] first turn ack lost after dispatch (${(err as Error).message}); checking rollout for positive evidence`);
-      const observedNativeTurnId = this.takeNativeTurnId(identity);
-      if (observedNativeTurnId) {
-        // turn/started or a terminal notification is authoritative positive
-        // native ownership even when the JSON-RPC response itself was lost.
-        return { outcome: 'accepted', nativeTurnId: observedNativeTurnId };
-      }
       let landed = false;
       try {
         landed = await rolloutProbe(threadId);
@@ -428,9 +410,8 @@ export class CodexRpcEngine {
         // fallback: doing so could execute an already-landed first turn twice.
         this.log(`[codex-rpc] first-turn rollout probe failed (${(probeErr as Error).message}); keeping delivery ambiguous`);
       }
-      const nativeTurnId = this.takeNativeTurnId(identity);
-      return landed || nativeTurnId
-        ? { outcome: 'accepted', nativeTurnId }
+      return landed
+        ? { outcome: 'accepted', nativeTurnId: undefined }
         : { outcome: 'ambiguous' };
     }
   }
@@ -439,6 +420,7 @@ export class CodexRpcEngine {
     if (this.closed) return;
     this.closed = true;
     this.emitAllTurnTerminals('stopped', 'rpc_engine_stopped');
+    this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
     if (pid) {
@@ -569,11 +551,8 @@ export class CodexRpcEngine {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return;
-        const pendingRequest = this.pending.get(id);
-        const exactTerminalObserved = !!pendingRequest?.nativeTurnId
-          && this.terminalNativeTurns.has(pendingRequest.nativeTurnId);
         const err = new Error(`codex app-server request '${method}' timed out after ${timeoutMs}ms`);
-        if (fatalOnTimeout && !exactTerminalObserved) {
+        if (fatalOnTimeout) {
           // A connected-but-wedged app-server is FATAL for live turns: rejecting
           // just this request would leave the engine + pane alive and every later
           // turn/start would time out again. Route through failAll so ALL inflight
@@ -584,8 +563,8 @@ export class CodexRpcEngine {
           // Non-fatal (the fresh first turn): reject only THIS request and keep
           // the engine alive, so its ambiguity can be resolved against rollout
           // persistence and the viewer can still resume if the turn landed
-          // (P1-1). An exact terminal also makes an otherwise-fatal live-turn
-          // timeout non-fatal: sendTurn consumes that stronger positive proof.
+          // (P1-1). Pre-response native notifications are deliberately not
+          // correlated here because an attached TUI can start unrelated turns.
           this.pending.delete(id); reject(err);
         }
       }, timeoutMs);
@@ -633,9 +612,6 @@ export class CodexRpcEngine {
         try {
           if (p.turnIdentity) {
             const nativeTurnId = String(msg.result?.turn?.id ?? '');
-            if (p.nativeTurnId && p.nativeTurnId !== nativeTurnId) {
-              throw new Error(`turn/start notification/response id mismatch (${p.nativeTurnId} != ${nativeTurnId})`);
-            }
             this.bindNativeTurn(nativeTurnId, p.turnIdentity);
           }
           p.resolve(msg.result);
@@ -655,8 +631,11 @@ export class CodexRpcEngine {
       const params = msg.params ?? {};
       const nativeTurnId = String(params.turn?.id ?? params.turnId ?? '');
       if (msg.method === 'turn/started' && nativeTurnId && !this.turnOwners.has(nativeTurnId)) {
-        try { this.bindUniquePendingTurn(nativeTurnId); }
-        catch (err) { this.failAll(err as Error); }
+        // Pre-response start notifications are not necessarily ours: the
+        // attached TUI can start an unrelated local turn on the same thread.
+        // Only the turn/start response (or transcript evidence for the special
+        // fresh-first path) may establish Botmux ownership.
+        this.log(`[codex-rpc] observed unowned turn/started ${nativeTurnId}; awaiting exact response binding`);
         return;
       }
       if (msg.method === 'turn/completed' && nativeTurnId) {

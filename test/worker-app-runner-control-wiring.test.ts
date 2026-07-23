@@ -20,7 +20,7 @@ describe('worker app-runner control-channel wiring', () => {
     const flushEnd = workerSource.indexOf('function sendToPty', flushStart);
     const flush = workerSource.slice(flushStart, flushEnd);
     const reserveIdx = flush.indexOf('codexAppTurnDispatchQueue.reserve(');
-    const writeIdx = flush.indexOf('await cliAdapter.writeStructuredInput(');
+    const writeIdx = flush.indexOf('await writeAdapter.writeStructuredInput(');
     expect(reserveIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(reserveIdx);
     expect(flush).toContain("result.submissionDisposition === 'untouched'");
