@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
+import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
@@ -649,9 +650,13 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
     const rawAgents = herdrJson(['--session', sessionName, 'agent', 'list']);
     const discoveredPaneIds = new Set<string>();
     for (const agent of extractHerdrAgents(rawAgents)) {
-      // Managed agents can now live inside a user's shared herdr session, so
-      // session-name filtering alone no longer excludes botmux's own panes.
-      if (typeof agent?.name === 'string' && agent.name.startsWith('botmux-')) continue;
+      // Legacy managed agents embedded in a user's session stay hidden to avoid
+      // accidental duplicate bindings. The reserved machine-wide `botmux`
+      // session is different: it is the explicit rendezvous point for tasks
+      // launched from Lark/dashboard, so its agents must be visible to /adopt.
+      if (typeof agent?.name === 'string'
+        && agent.name.startsWith('botmux-')
+        && sessionName !== HerdrBackend.managedSessionName()) continue;
       const cliId = herdrAgentCliId(agent, filterCliId);
       if (!cliId) continue;
       if (filterCliId && cliId !== filterCliId) continue;
@@ -686,7 +691,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId): AdoptableSession[]
     for (const pane of extractHerdrPanes(rawPanes)) {
       const paneId = typeof pane?.pane_id === 'string' ? pane.pane_id : undefined;
       if (!paneId || discoveredPaneIds.has(paneId)) continue;
-      if (typeof pane?.name === 'string' && pane.name.startsWith('botmux-')) continue;
+      if (typeof pane?.name === 'string'
+        && pane.name.startsWith('botmux-')
+        && sessionName !== HerdrBackend.managedSessionName()) continue;
       const rawInfo = herdrJson(['--session', sessionName, 'pane', 'process-info', '--pane', paneId]);
       const process = herdrPaneCliProcess(rawInfo, filterCliId);
       if (!process) continue;

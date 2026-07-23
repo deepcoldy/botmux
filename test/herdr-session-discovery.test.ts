@@ -100,7 +100,8 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
     installHerdrFixture({
       sessions: [
         { name: 'work', running: true },
-        { name: 'bmx-deadbeef', running: true },  // must be filtered (botmux-owned)
+        { name: 'botmux', running: true },        // machine-wide rendezvous → adoptable
+        { name: 'bmx-deadbeef', running: true },  // legacy per-topic host → filtered
         { name: 'stopped', running: false },      // must be filtered (not running)
       ],
       agentsBySession: {
@@ -111,6 +112,9 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
           { name: 'botmux-deadbeef', agent: 'claude', pane_id: '1-4', cwd: '/projects/managed' },      // botmux-managed shared agent → filtered
           { name: 'no-pane', agent: 'claude', cwd: '/projects/x' },                                   // missing pane_id → filtered
         ],
+        botmux: [
+          { name: 'botmux-feed1234', agent: 'pi', pane_id: 'w1:p1', terminal_id: 't-pi', cwd: '/projects/pi' },
+        ],
         'bmx-deadbeef': [
           { name: 'botmux', agent: 'claude', pane_id: '5-5', cwd: '/projects/own' },
         ],
@@ -118,7 +122,7 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
     });
 
     const sessions = discoverAdoptableSessions();
-    expect(sessions).toHaveLength(2);
+    expect(sessions).toHaveLength(3);
     expect(sessions.every(s => s.source === 'herdr')).toBe(true);
 
     const claude = sessions.find(s => s.cliId === 'claude-code');
@@ -137,6 +141,15 @@ describe('discoverAdoptableSessions (herdr branch)', () => {
       herdrSessionName: 'work',
       herdrPaneId: '1-2',
       cwd: '/projects/web',
+    });
+
+    const pi = sessions.find(s => s.cliId === 'pi');
+    expect(pi).toMatchObject({
+      source: 'herdr',
+      herdrSessionName: 'botmux',
+      herdrPaneId: 'w1:p1',
+      herdrTerminalId: 't-pi',
+      cwd: '/projects/pi',
     });
   });
 
