@@ -846,13 +846,13 @@ export async function postPrivateSnapshotCard(
  * Deliver the write-enabled session card (the "🔑 获取操作链接" card, which carries
  * a write-token terminal URL + manage buttons) privately to a single operator.
  *
- * Prefers an in-chat "visible-to-you" ephemeral card so the operator never has
- * to leave the conversation. Feishu's ephemeral API only works in plain `group`
- * chats — topic / thread groups reject with {@link LARK_CODE_EPHEMERAL_NOT_GROUP}
- * (18053) and p2p chats are unsupported — and chatType can't distinguish a topic
- * group from a regular one (both record 'group'), so we attempt ephemeral for any
- * non-p2p chat and fall back to a private DM on ANY failure. p2p chats skip the
- * doomed ephemeral attempt and DM directly (the DM lands in that same 1:1 chat).
+ * Prefers an in-chat "visible-to-you" ephemeral card in a flat group so the
+ * operator never has to leave the conversation. Thread-scope sessions and
+ * chat-scope sessions currently folded into a thread go straight to DM:
+ * Feishu may accept their ephemeral message without rendering it in the topic
+ * panel. p2p chats also DM directly (the DM lands in that same 1:1 chat).
+ *
+ * Other group chats attempt ephemeral first and fall back to DM on ANY failure.
  *
  * Both channels are private, so the DM fallback never leaks the write token —
  * unlike the private /card snapshot (which fails closed), here we fail OVER.
@@ -865,7 +865,10 @@ export async function deliverWriteLinkCard(
   cardJson: string,
 ): Promise<'ephemeral' | 'dm' | 'failed'> {
   const who = operatorOpenId.substring(0, 8);
-  if (ds.chatType !== 'p2p') {
+  const replyTarget = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
+  const isThreaded = ds.scope === 'thread'
+    || (!!replyTarget?.rootMessageId && replyTarget.quoteOnly !== true);
+  if (ds.chatType !== 'p2p' && !isThreaded) {
     try {
       await sendEphemeralCard(ds.larkAppId, ds.chatId, operatorOpenId, cardJson);
       logger.info(`[${tag(ds)}] write link delivered via ephemeral card to ${who}…`);
