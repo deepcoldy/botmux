@@ -16,6 +16,7 @@ import type {
   MaintenanceConfig,
 } from '../global-config.js';
 import {
+  normalizeGroupNamePrefix,
   mergeDashboardConfig,
   mergeGlobalConfig,
   mergeMaintenanceConfig,
@@ -35,6 +36,7 @@ import { isValidTimeZone } from '../utils/timezone.js';
  * doesn't know how the host computes the snapshot (it just calls a closure).
  */
 export interface ResolvedDashboardSettingsView {
+  groupNamePrefix: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -135,6 +137,7 @@ export type ApplySettingsWriteResult =
  * PR2 Route B) see the same wire vocabulary they had before.
  */
 export type ApplySettingsWriteError =
+  | 'invalid_groupNamePrefix'
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_enableLocalCliOpen'
@@ -189,6 +192,19 @@ export async function applySettingsWrite(
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
+
+  let groupNamePrefixPatch: string | null | undefined;
+  if ('groupNamePrefix' in obj) {
+    if (typeof obj.groupNamePrefix !== 'string') {
+      return { ok: false, error: 'invalid_groupNamePrefix' };
+    }
+    const rawPrefix = obj.groupNamePrefix;
+    const groupNamePrefix = normalizeGroupNamePrefix(rawPrefix);
+    if (rawPrefix !== '' && !groupNamePrefix) {
+      return { ok: false, error: 'invalid_groupNamePrefix' };
+    }
+    groupNamePrefixPatch = groupNamePrefix ?? null;
+  }
 
   const patch: DashboardGlobalConfig = {};
   if ('publicReadOnly' in obj) {
@@ -259,6 +275,10 @@ export async function applySettingsWrite(
   let touched = false;
   if (Object.keys(patch).length > 0) {
     deps.mergeDashboardConfig(patch);
+    touched = true;
+  }
+  if (groupNamePrefixPatch !== undefined) {
+    deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
     touched = true;
   }
 

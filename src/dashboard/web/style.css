@@ -17910,6 +17910,11 @@ form.dashboard-toolbar > input[type="text"]:focus {
   padding: 8px 0 2px;
   min-width: 0;
 }
+.settings-page .settings-group-prefix-editor .settings-field-row {
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 8px;
+}
 .settings-page .settings-subfield-hint {
   margin: 0;
   font-size: 12px;
