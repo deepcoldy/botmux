@@ -14145,7 +14145,7 @@ async function startInitialPassthroughSession(args: {
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
   const directChatSender = chatType === 'p2p'
-    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
+    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId })
     : undefined;
   // Group cold-start passthroughs only need a stable caller identity while the
   // repo picker is pending. Avoid adding a contact lookup to every /goal start;
@@ -14528,7 +14528,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         setDirectChatDisplayNameFromSender(
           session,
           chatType,
-          await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+          await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId }),
         );
       }
       session.larkAppId = larkAppId;
@@ -14607,7 +14607,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
@@ -15086,7 +15086,9 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
-      isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
+      isForeignBot
+        ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined, messageId: parsed.messageId }
+        : { messageId: parsed.messageId },
     );
     return threadSenderCached;
   };

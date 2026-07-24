@@ -23,7 +23,7 @@ import { join, dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { larkGet } from './client.js';
+import { larkGet, getMessageDetail } from './client.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -31,7 +31,7 @@ export interface IdentityRecord {
   openId: string;
   type: IdentityType;
   name?: string;
-  source: 'sender' | 'mention' | 'contact_api' | 'bot_cross_ref' | 'bot_info';
+  source: 'sender' | 'mention' | 'contact_api' | 'message_api' | 'bot_cross_ref' | 'bot_info';
   updatedAt: number;
 }
 
@@ -245,6 +245,46 @@ async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
   }
 }
 
+/**
+ * Best-effort name resolution via `im.v1.messages.get` with `with_sender_name=true`.
+ * Unlike the contact API this covers BOTH user and bot senders and does NOT
+ * require `contact:user.base:readonly` — the server returns the display name
+ * for whoever sent the given message. Used as a last-resort fallback in the
+ * live-event path, where the event itself carries only open_id.
+ *
+ * Best-effort: any failure (network, permission, message not found, name
+ * absent) degrades silently to `undefined`. Wrapped in the same short budget
+ * as the contact path so a slow API can't stall prompt injection. On success
+ * the name is written to the cache keyed by the resolved sender's open_id, so
+ * later messages from the same sender hit the cache without a re-fetch.
+ */
+export async function resolveNameViaMessage(
+  larkAppId: string,
+  openId: string,
+  messageId: string,
+  type: 'user' | 'bot',
+): Promise<string | undefined> {
+  if (!openId || !messageId) return undefined;
+  try {
+    const detail = await withTimeout(
+      getMessageDetail(larkAppId, messageId, { userCardContent: false }),
+      RESOLVE_BUDGET_MS,
+    );
+    const sender = detail?.items?.[0]?.sender;
+    const name: unknown = sender?.sender_name;
+    if (typeof name === 'string' && name.trim()) {
+      const trimmed = name.trim();
+      recordIdentity(larkAppId, { openId, name: trimmed, type, source: 'message_api' });
+      return trimmed;
+    }
+  } catch (err: any) {
+    logger.debug(
+      `[identity] message.get sender_name for ${openId.substring(0, 12)} via ${messageId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+  }
+  return undefined;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('identity-resolve-timeout')), ms);
@@ -270,12 +310,21 @@ export interface ResolvedSender {
  * lookups, and best-effort resolve the display name. Caller-supplied hints
  * (e.g. a known foreign-bot display name from `bot-openids-${appId}.json`)
  * win over cache.
+ *
+ * Name resolution order (each step only runs if the prior didn't yield a name):
+ *   1. hint / cache — free, in-memory.
+ *   2. contact API — users only; needs `contact:user.base:readonly`.
+ *   3. message.get(`with_sender_name=true`) — fallback when `messageId` is
+ *      supplied and steps 1–2 came up empty. Covers users AND bots, and works
+ *      without the contact scope (the server names whoever sent that message).
+ *      This is what lets the live-event `<sender>` tag carry a name even when
+ *      contact is unavailable / out of visible range / the sender is a bot.
  */
 export async function resolveSender(
   larkAppId: string,
   openId: string | undefined,
   senderType: string | undefined,
-  hint?: { name?: string; type?: 'user' | 'bot' },
+  hint?: { name?: string; type?: 'user' | 'bot'; messageId?: string },
 ): Promise<ResolvedSender | undefined> {
   if (!openId) return undefined;
 
@@ -293,6 +342,12 @@ export async function resolveSender(
   let name = hint?.name ?? getIdentity(larkAppId, openId)?.name;
   if (!name && type === 'user') {
     name = await resolveName(larkAppId, openId);
+  }
+  // Last-resort fallback: server-side sender_name via message.get. Covers the
+  // gap the contact API can't (bots, missing scope, out-of-range users) but
+  // only when the caller knows which message this sender is attached to.
+  if (!name && hint?.messageId) {
+    name = await resolveNameViaMessage(larkAppId, openId, hint.messageId, type);
   }
   return { openId, type, name };
 }
