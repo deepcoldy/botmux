@@ -4119,11 +4119,12 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<void> {
 
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
 // 防止 restart 后残留命令重放进新 CLI——新增清理状态时记得同步那里。
-// barrier=true 标记该注入携带 updateWorkingDir（cwd-move，如 /cd）：markPromptReady
-// 里 barrier 注入必须先于本次 pending 用户消息落地，防止用户消息在「记录已是新
-// cwd、进程仍在旧 cwd」的窗口里被写进旧目录的 CLI。排队策略判定收敛到
-// core/inject-queue-policy.ts（shouldDeferUserFlush / shouldFlushInjectionsFirst）
-// 以获得可单测的纯函数单元——本文件只持有队列状态。
+// barrier 语义：barrier=true 的注入必须先于本次 pending 用户消息落地。历史上
+// 唯一的 barrier 来源是 cwd-move 的 /cd 注入；角色切换改为 restart respawn 后
+// 现存发送方（/slash 白名单注入）全部 barrier=false，机制保留供未来有顺序
+// 依赖的注入复用。排队策略判定收敛到 core/inject-queue-policy.ts
+// （shouldDeferUserFlush / shouldFlushInjectionsFirst）以获得可单测的纯函数
+// 单元——本文件只持有队列状态。
 const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
@@ -4649,13 +4650,11 @@ function markPromptReady(): void {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
-  // cwd-move 注入（barrier=true，如 /cd）必须先于本次 pending 用户消息落地：
-  // 用户在 bot 发完「已切换角色」确认后立刻发下一条消息是最常见路径——若
-  // flushPending 先跑，该消息会在 barrier 注入之前被写进旧 cwd 的 CLI（daemon
-  // 记录已是新目录，实际执行仍在旧目录）。跳过本次 flushPending 不会饿死用户
-  // 消息：flushPending 自身的 injectionFlushing 守卫会挡住并发写入，
-  // flushPendingInjections 的 finally 会在注入完成、CLI 重新 idle 后补踢一次
-  // flushPending 排空 pendingMessages。
+  // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
+  // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
+  // flushPending 不会饿死用户消息：flushPending 自身的 injectionFlushing 守卫
+  // 会挡住并发写入，flushPendingInjections 的 finally 会在注入完成、CLI 重新
+  // idle 后补踢一次 flushPending 排空 pendingMessages。
   if (shouldFlushInjectionsFirst(pendingInjections)) {
     void flushPendingInjections();
   } else {
@@ -7827,7 +7826,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
 
 async function restartCliProcess(
   reason: string,
-  opts: { immediate?: boolean; preservePending?: boolean } = {},
+  opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
   if (lastInitConfig?.adoptMode) {
     log(`Restart ignored in adopt mode (${reason})`);
@@ -7847,9 +7846,13 @@ async function restartCliProcess(
   revokeManagedTurnOriginForRestart();
   log(`Restart requested (${reason})`);
   // Tier-2 guard: 2nd consecutive in-worker restart forces FRESH. Tier-1
-  // adapter probing is still re-run on every spawn.
-  consecutiveInWorkerRestarts++;
-  log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  // adapter probing is still re-run on every spawn. skipRestartBudget（角色
+  // 切换的 cwd-move respawn）不计入：那是用户主动迁移不是崩溃恢复，计进去
+  // 会让「切角色 + 一次无关重启」无故触发强制 FRESH 丢上下文。
+  if (!opts.skipRestartBudget) {
+    consecutiveInWorkerRestarts++;
+    log(`Restart count: ${consecutiveInWorkerRestarts} (>=2 forces FRESH)`);
+  }
   const restart = async (): Promise<void> => {
     try {
       tmuxRestartTimer = null;
@@ -9486,7 +9489,46 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
-      await restartCliProcess('daemon request', { preservePending: true });
+      // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
+      // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
+      // 开场注入）。旧桶 transcript 由 resume 预检的跨桶迁移接住，上下文不丢。
+      if (msg.updateWorkingDir && lastInitConfig) {
+        lastInitConfig.workingDir = msg.updateWorkingDir;
+      }
+      // restart 合并：已有一轮 restart 在飞（teardown 进行中，或 tmux jitter
+      // 定时器未触发）时不叠加第二轮——叠加会 clearTimeout 吃掉首轮 teardown、
+      // 把重启预算无故烧到 tier-2 强制 FRESH（丢上下文），非 tmux 路径还会
+      // 双 spawn。workingDir 已收敛进 lastInitConfig，pending 的 spawn 展开
+      // {...lastInitConfig} 时自然拿到新目录。
+      if (cliRestartInProgress || tmuxRestartTimer) {
+        log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
+        break;
+      }
+      // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
+      // 'ambiguous' 终端回执：CLI 被中途杀掉，副作用到底发没发是**真的无法证明**
+      // （故不能报 'cancelled'），交由 daemon 的重试策略即时对账。不发的话 receipt 会
+      // 悬着，等 daemon 租约到期走 expire_durable_turn 的「无法证明 → 扣 ACK → 超时
+      // fencing teardown」慢路径（还会把刚 respawn 的新 CLI 二次 teardown）。
+      // emitTurnTerminal 自带释放（复位 durableTurnInFlight、退休 inflight input、
+      // 撤销 turn-origin relay、丢弃 bridge 尝试）并对后续 CLI-exit 终端去重；它排的
+      // flushPending 微任务会因下面 restartCliProcess 同步置位 cliRestartInProgress 而空跑。
+      if (durableTurnInFlight) {
+        if (currentBotmuxTurnId) {
+          emitTurnTerminal(currentBotmuxTurnId, 'ambiguous', undefined, currentBotmuxDispatchAttempt);
+        }
+        // 兜底：若无匹配 durable turn 可释放（emit 空操作），仍复位，避免残留 flag 卡住 respawn。
+        if (durableTurnInFlight) {
+          durableTurnInFlight = false;
+          inflightInputs.onTurnComplete();
+        }
+      }
+      await restartCliProcess(
+        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
+        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
+        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        // auto-restart 那条裸 restart 的计数兜底。
+        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir },
+      );
       break;
     }
 
@@ -9583,12 +9625,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'inject_command': {
-      // 会话内 /cd 移动后，worker 内部 respawn（claude_exit 自动重启 / IM /restart /
-      // dashboard restart）必须收敛到新目录，而不是陈旧的 lastInitConfig.workingDir。
-      if (msg.updateWorkingDir && lastInitConfig) {
-        lastInitConfig.workingDir = msg.updateWorkingDir;
-      }
-      pendingInjections.push({ command: msg.command, barrier: !!msg.updateWorkingDir });
+      // 唯一发送方是 /slash 路由的白名单 TUI 命令注入。cwd 移动不再走注入
+      // （角色切换已改为 restart+updateWorkingDir 的 respawn），这里不接受
+      // 任何 workingDir 改写——那会绕过 cd 路由的角色库硬校验。
+      pendingInjections.push({ command: msg.command, barrier: false });
       void flushPendingInjections();
       break;
     }

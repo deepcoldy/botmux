@@ -127,7 +127,6 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import type { CliId } from '../adapters/cli/types.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
@@ -506,7 +505,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
- *  → 按能力位选择 idle 注入 /cd（进程不死）或杀进程冷启动兜底。
+ *  → 活 worker 走「带 --resume 的进程重启、respawn 在新 cwd」，无活 worker 杀残留
+ *  pane 让下条消息冷启动。
+ *
+ *  为什么是 respawn 而不是向活进程注入 /cd（旧实现）：CLI 的系统上下文（CLAUDE.md、
+ *  记忆路径/索引）是开场按启动 cwd 注入一次的静态快照，/cd 只改 cwd 不重刷——注入
+ *  切换后模型仍拿着旧角色的记忆索引读写（读旧索引、写错桶）。respawn 让「开场」在
+ *  新 cwd 重新发生：新角色的 CLAUDE.md/记忆索引开场即注入，--resume 回放对话历史
+ *  保留上下文（“换角色外壳、留对话内核”）。旧桶 transcript 由 claude-code 适配器的
+ *  resume 预检跨桶迁移接住（rescueOrphanClaudeTranscript），不会探空丢上下文。
+ *
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；目录面由 validateRoleLibraryPath 硬校验承担（realpath 归一 +
  *  dev/ino 包含判断，角色库根之外一律拒）。
@@ -528,17 +536,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     return jsonRes(res, v.error === 'outside_role_library' ? 403 : 400, { ok: false, error: v.error });
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
-  const cliId = ds.session.cliId;
-  let canInject = false;
-  try { canInject = !!(cliId && createCliAdapterSync(cliId as CliId).supportsSessionCwdMove); } catch { /* unknown cli */ }
-  if (ds.worker && !ds.worker.killed && canInject) {
-    // updateWorkingDir 随 inject_command 带给 worker：会话内 /cd 后 worker 内部的
-    // respawn（claude_exit 自动重启 / IM /restart / dashboard restart）必须收敛到
-    // 新目录，而不是陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步
-    // 更新，保持与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
+  if (ds.worker && !ds.worker.killed) {
+    // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
+    // 陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步更新，保持
+    // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
     if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
     try {
-      ds.worker.send({ type: 'inject_command', command: `/cd ${v.resolvedPath}`, updateWorkingDir: v.resolvedPath } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath } as DaemonToWorker);
     } catch {
       // send() 抛异常：worker 进程实际上已经不可达（管道已断），但 above 的
       // repinSessionWorkingDir 已经把记录改成了新目录——绝不能留下「记录新、
@@ -546,7 +550,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
       killWorker(ds);
       return jsonRes(res, 200, { ok: true, mode: 'cold-restart', dir: v.resolvedPath });
     }
-    return jsonRes(res, 200, { ok: true, mode: 'inject', dir: v.resolvedPath });
+    return jsonRes(res, 200, { ok: true, mode: 'respawn-resume', dir: v.resolvedPath });
   }
   // Unconditional (no `ds.worker` guard), matching the IM `/cd` command handler
   // (src/core/command-handler.ts) — killWorker() already no-ops safely when there

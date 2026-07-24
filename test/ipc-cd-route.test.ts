@@ -199,10 +199,10 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(killSpy).not.toHaveBeenCalled();
   });
 
-  it('200 mode:inject — live worker + claude-code capability: repin FIRST, then inject /cd <resolvedPath>', async () => {
+  it('200 mode:respawn-resume — live worker: repin FIRST, then send restart carrying updateWorkingDir', async () => {
     const send = vi.fn();
     const ds = {
-      session: { sessionId: 's-inject', cliId: 'claude-code' },
+      session: { sessionId: 's-respawn', cliId: 'claude-code' },
       managedTurnOrigin: { capability: CAP },
       worker: { send, killed: false },
       adoptedFrom: undefined,
@@ -212,15 +212,16 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
     const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
 
-    const res = await postCd('s-inject', roleDir);
+    const res = await postCd('s-respawn', roleDir);
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, mode: 'inject', dir: roleDirReal });
-    // TOCTOU 契约：注入命令原样使用校验产出 resolvedPath（realpath 归一），
-    // 而非请求原始输入。updateWorkingDir 随行，供 worker 侧收敛 lastInitConfig。
-    expect(send).toHaveBeenCalledWith({ type: 'inject_command', command: `/cd ${roleDirReal}`, updateWorkingDir: roleDirReal });
+    expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
+    // TOCTOU 契约：restart 携带的 updateWorkingDir 原样使用校验产出 resolvedPath
+    // （realpath 归一），而非请求原始输入。worker 侧据此收敛 lastInitConfig 后
+    // respawn（--resume 续上下文 + 新 cwd 开场注入新角色 CLAUDE.md/记忆索引）。
+    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
-    // 落盘重钉必须先于注入（记录 = 唯一事实源；注入只是让活进程跟上）。
+    // 落盘重钉必须先于 restart（记录 = 唯一事实源；respawn 只是让活进程跟上）。
     expect(repinSpy.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0]);
     expect(killSpy).not.toHaveBeenCalled();
     // daemon 侧 ds.initConfig 同步更新，与 worker 侧收敛到同一新目录，避免下次
@@ -276,10 +277,12 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
   });
 
-  it('200 mode:cold-restart — live worker but capability-less CLI (codex): kill, never inject', async () => {
+  it('200 mode:respawn-resume — respawn 对 CLI 一视同仁（codex 等非 claude 家族同样走 restart）', async () => {
+    // 旧实现按 supportsSessionCwdMove 能力位分流（claude 注入 /cd、codex 杀进程
+    // 冷启动）。respawn 方案与 /restart 同机制、适配器无关，能力位不再进场。
     const send = vi.fn();
     const ds = {
-      session: { sessionId: 's-cold-codex', cliId: 'codex' },
+      session: { sessionId: 's-respawn-codex', cliId: 'codex' },
       managedTurnOrigin: { capability: CAP },
       worker: { send, killed: false },
       adoptedFrom: undefined,
@@ -288,31 +291,32 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
     const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
 
-    const res = await postCd('s-cold-codex', roleDir);
+    const res = await postCd('s-respawn-codex', roleDir);
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, mode: 'cold-restart', dir: roleDirReal });
-    expect(send).not.toHaveBeenCalled();
-    expect(killSpy).toHaveBeenCalledTimes(1);
-    expect(killSpy).toHaveBeenCalledWith(ds);
+    expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(killSpy).not.toHaveBeenCalled();
     expect(repinSpy).toHaveBeenCalledWith(ds, roleDirReal);
   });
 
-  it('200 mode:cold-restart — unknown cliId falls through the catch (no crash)', async () => {
+  it('200 mode:respawn-resume — unknown cliId 不再查适配器，同样 respawn（no crash）', async () => {
+    const send = vi.fn();
     const ds = {
-      session: { sessionId: 's-cold-unknown', cliId: 'no-such-cli' },
+      session: { sessionId: 's-respawn-unknown', cliId: 'no-such-cli' },
       managedTurnOrigin: { capability: CAP },
-      worker: { send: vi.fn(), killed: false },
+      worker: { send, killed: false },
       adoptedFrom: undefined,
     } as any;
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
     vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
     const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
 
-    const res = await postCd('s-cold-unknown', roleDir);
+    const res = await postCd('s-respawn-unknown', roleDir);
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, mode: 'cold-restart', dir: roleDirReal });
-    expect(killSpy).toHaveBeenCalledTimes(1);
+    expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: roleDirReal });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
+    expect(killSpy).not.toHaveBeenCalled();
   });
 });

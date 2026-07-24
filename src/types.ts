@@ -557,7 +557,11 @@ export type DaemonToWorker =
   | { type: 'rename_session'; title: string }
   | { type: 'close' }
   | { type: 'suspend' }
-  | { type: 'restart' }
+  /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
+   *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
+   *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
+   *  同时 --resume 续回对话上下文。 */
+  | { type: 'restart'; updateWorkingDir?: string }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -571,10 +575,9 @@ export type DaemonToWorker =
   // onExit so transient auto-restarted exits don't park-then-tear-down.
   | { type: 'park_diagnostic' }
   | { type: 'tui_keys'; keys: string[]; isFinal: boolean }
-  // updateWorkingDir：会话内 /cd 移动 cwd 后随附的新目录，worker 记入
-  // lastInitConfig.workingDir，使内部三条 respawn 路径（claude_exit 自动重启 /
-  // IM /restart / dashboard restart）收敛到新目录而非陈旧的初始 cwd。
-  | { type: 'inject_command'; command: string; updateWorkingDir?: string }
+  // 白名单 TUI 命令注入（/slash 路由）。cwd 移动不走注入——角色切换用
+  // restart+updateWorkingDir 的 respawn，避免绕过 cd 路由的角色库硬校验。
+  | { type: 'inject_command'; command: string }
   | { type: 'tui_text_input'; keys: string[]; text: string }
   // CoCo AskUserQuestion 作答：daemon 在 ask 结算后下发，worker 等原生 picker 渲染后
   // 用 navKeys 驱动它选择+导航。needsReviewSubmit=true（多题）时 navKeys 停在 Review

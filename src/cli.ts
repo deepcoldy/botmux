@@ -3883,9 +3883,11 @@ async function cmdCd(): Promise<void> {
   const res = await postSessionCliIpc(daemon.ipcPort, s.sessionId, 'cd', { dir });
   const body: any = await res.json().catch(() => ({}));
   if (res.ok && body?.ok) {
-    console.log(body.mode === 'inject'
-      ? `✓ 已切换到 ${body.dir}（会话空闲时生效，进程不重启）`
-      : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
+    console.log(body.mode === 'respawn-resume'
+      ? `✓ 已切换到 ${body.dir}（进程即将在新目录重启并续回上下文）`
+      : body.mode === 'inject'  // 兼容旧 daemon 的注入模式
+        ? `✓ 已切换到 ${body.dir}（会话空闲时生效，进程不重启）`
+        : `✓ 已切换到 ${body.dir}（下条消息在新目录冷启动）`);
     return;
   }
   console.error(`✗ 切换被拒绝: ${body?.error ?? `HTTP ${res.status}`}`);
