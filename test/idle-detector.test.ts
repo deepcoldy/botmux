@@ -765,3 +765,95 @@ describe('IdleDetector: CoCo readyPattern compatibility', () => {
     detector.dispose();
   });
 });
+
+// ─── readyPattern grace timer (regression: Hermes/Codex TUI redraws) ──────
+
+describe('IdleDetector: readyPattern grace timer for TUI redraws', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  // Hermes TUI redraws status-bar chars every ~1ms for 11s after ❯ appears.
+  // With the legacy code path (readySeen → 2000ms QUIESCENCE), each redraw
+  // reset the timer and idle detection took 13s. The grace timer (500ms)
+  // is armed once and NOT reset by subsequent feeds, so the post-❯ redraw
+  // storm does not delay the idle signal.
+
+  it('fires idle within 500ms of readyPattern, even with continuous TUI redraws', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('initializing...');
+    detector.feed('┊ loading skills  ┊\n');
+    detector.feed('❯ ');                             // ← readyPattern fires
+
+    // Simulate 11s of 1ms-spaced TUI redraws (status bar updates)
+    for (let i = 0; i < 11_000; i++) {
+      vi.advanceTimersByTime(1);
+      detector.feed('┊\r');
+    }
+
+    // After 11000ms of redraws + 500ms grace we should be idle exactly once.
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('arms the grace timer only once (status-bar redraws do not re-arm it)', () => {
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('❯ ');          // readyPattern → arm 500ms grace
+    vi.advanceTimersByTime(100);  // only 100ms in
+    detector.feed('┊ redraw ┊\n');
+    vi.advanceTimersByTime(100);
+    detector.feed('┊ redraw ┊\n');
+    vi.advanceTimersByTime(100);
+    detector.feed('┊ redraw ┊\n');
+    vi.advanceTimersByTime(300);  // total 600ms since readyPattern
+
+    // Even though we got 3 redraws, the grace timer is NOT reset by them —
+    // it was armed at 0ms and fires at 500ms regardless.
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('fires idle at 500ms (not 2000ms QUIESCENCE) after readyPattern without completionPattern', () => {
+    // Verify the grace window is 500ms, not the 2000ms QUIESCENCE_MS that
+    // pre-fix this path used.
+    const detector = new IdleDetector(makeCli({ readyPattern: /❯/ }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.feed('❯ ');
+
+    vi.advanceTimersByTime(499);
+    expect(cb).toHaveBeenCalledTimes(0);
+    vi.advanceTimersByTime(2);   // total 501ms
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('falls back to 2000ms QUIESCENCE when readyPattern AND completionPattern are both set', () => {
+    // Claude Code has both patterns: ❯ for input box, COMPLETION_RE for turn
+    // done. The completion pattern already has its own 500ms grace path,
+    // so the readyPattern grace path should NOT shadow it — completion
+    // pattern continues to control idle detection for turn boundaries.
+    const detector = new IdleDetector(makeCli({
+      readyPattern: /❯/,
+      completionPattern: /DONE/,
+    }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.feed('❯ ');
+    vi.advanceTimersByTime(600);  // > READY_GRACE_MS, but no completion marker
+    // No completion marker yet → still not idle (the readyPattern grace
+    // path is skipped because completionPattern is set; we are in the
+    // normal quiescence path).
+    expect(cb).toHaveBeenCalledTimes(0);
+
+    detector.feed('DONE');
+    vi.advanceTimersByTime(600);  // completion's own 500ms grace
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+});
