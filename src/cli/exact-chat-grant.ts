@@ -99,8 +99,8 @@ export function parseExactChatGrantCliArgs(args: string[]): ExactChatGrantCliPar
   if (subjectOpenIds.some(value => !value) || subjectLarkAppIds.some(value => !value)) {
     return { ok: false, error: 'subject 不能为空' };
   }
-  if (subjectLarkAppIds.length > 0 && operation !== 'grant') {
-    return { ok: false, error: '--subject-bot 仅支持 grant；revoke/readback 必须使用 --subject-open-id' };
+  if (subjectLarkAppIds.length > 0 && operation === 'revoke') {
+    return { ok: false, error: '--subject-bot 支持 grant/readback；revoke 必须使用 --subject-open-id' };
   }
 
   return {

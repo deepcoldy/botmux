@@ -7789,12 +7789,14 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
                     --subject-open-id <ou_...> [--subject-open-id <ou_...> ...]
   botmux grant chat readback --bot <receiver-ref> --chat-id <oc_...>
                     --subject-open-id <ou_...> [--subject-open-id <ou_...> ...]
+  botmux grant chat readback --bot <receiver-ref> --chat-id <oc_...>
+                    --subject-bot <larkAppId> [--subject-bot <larkAppId> ...]
 
 说明:
   - receiver-ref 支持完整 larkAppId、Bot 显示名或唯一 cliId；歧义引用会拒绝。
   - --subject-open-id 与 --subject-bot 严格二选一，均可重复传入。
   - --subject-bot 是推荐的稳定 App 身份入口，由 receiver daemon 在自己视角解析 open_id；
-    它仅支持 grant，revoke/readback 仍必须显式传 --subject-open-id。
+    它支持 grant/readback；revoke 仍必须显式传 --subject-open-id。
   - grant 只接受 receiver 视角下 Feishu /members/bots 实时返回的群内 Bot open_id；
     接口失败时 fail-closed，不使用 observed/cross-ref 历史回退。
   - revoke 不依赖实时成员查询，Bot 已退群后仍可清理旧授权。

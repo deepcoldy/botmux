@@ -81,6 +81,16 @@ describe('exact chat-grant CLI parser', () => {
     expect(parseExactChatGrantCliArgs([
       'chat', 'readback', '--bot', 'r', '--chat-id', 'oc_c', '--subject-open-id', 'ou_a',
     ])).toMatchObject({ ok: true, value: { operation: 'readback' } });
+    expect(parseExactChatGrantCliArgs([
+      'chat', 'readback', '--bot', 'r', '--chat-id', 'oc_c', '--subject-bot', 'cli_peer',
+    ])).toMatchObject({
+      ok: true,
+      value: {
+        operation: 'readback',
+        subjectOpenIds: [],
+        subjectLarkAppIds: ['cli_peer'],
+      },
+    });
   });
 
   it.each([
@@ -122,12 +132,7 @@ describe('exact chat-grant CLI parser', () => {
     {
       label: 'stable app identity on revoke',
       args: ['chat', 'revoke', '--bot', 'r', '--chat-id', 'oc_c', '--subject-bot', 'cli_peer'],
-      error: '--subject-bot 仅支持 grant',
-    },
-    {
-      label: 'stable app identity on readback',
-      args: ['chat', 'readback', '--bot', 'r', '--chat-id', 'oc_c', '--subject-bot', 'cli_peer'],
-      error: '--subject-bot 仅支持 grant',
+      error: 'revoke 必须使用 --subject-open-id',
     },
     {
       label: 'subject-bot flag followed by another flag',
@@ -287,16 +292,17 @@ describe('botmux grant chat CLI boundary', () => {
       cliId: 'codex',
     }]));
 
-    let capturedBody: any;
+    const capturedBodies: any[] = [];
     const server = createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', () => {
-        capturedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const capturedBody = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        capturedBodies.push(capturedBody);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({
           ok: true,
-          operation: 'grant',
+          operation: capturedBody.operation,
           permissionSource: 'chatGrant',
           talkOnly: true,
           receiverLarkAppId: capturedBody.receiverLarkAppId,
@@ -340,31 +346,41 @@ describe('botmux grant chat CLI boundary', () => {
         talkOnly: true,
         grantsOperate: false,
       });
-      expect(capturedBody).toEqual({
+      expect(capturedBodies).toEqual([{
         operation: 'grant',
         receiverLarkAppId: 'cli_receiver',
         chatId: 'oc_chat',
         subjectLarkAppIds: ['cli_peer_a', 'cli_peer_b'],
+      }]);
+
+      const readback = await runCli([
+        'grant', 'chat', 'readback',
+        '--bot', 'Receiver Bot',
+        '--chat-id', 'oc_chat',
+        '--subject-bot', 'cli_peer_a',
+      ], {
+        HOME: home,
+        USERPROFILE: home,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsConfig,
+      });
+
+      expect(readback.status).toBe(0);
+      expect(readback.stderr).toBe('');
+      expect(JSON.parse(readback.stdout)).toMatchObject({
+        ok: true,
+        operation: 'readback',
+        talkOnly: true,
+        grantsOperate: false,
+      });
+      expect(capturedBodies[1]).toEqual({
+        operation: 'readback',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_peer_a'],
       });
     } finally {
       await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
-  });
-
-  it('rejects subject-bot for readback at the CLI boundary', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-exact-grant-cli-'));
-    tempDirs.push(root);
-    const result = await runCli([
-      'grant', 'chat', 'readback',
-      '--bot', 'cli_receiver',
-      '--chat-id', 'oc_chat',
-      '--subject-bot', 'cli_peer',
-    ], {
-      HOME: join(root, 'home'),
-      USERPROFILE: join(root, 'home'),
-      SESSION_DATA_DIR: join(root, 'data'),
-    });
-    expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain('--subject-bot 仅支持 grant');
   });
 });

@@ -301,13 +301,14 @@ export async function applyExactChatGrantByLarkAppIds(
   input: ExactChatGrantByLarkAppIdsInput,
   deps: ExactChatGrantDeps = defaultDeps,
 ): Promise<ExactChatGrantSuccess | ExactChatGrantFailure> {
-  if (input.operation !== 'grant') {
+  if (input.operation !== 'grant' && input.operation !== 'readback') {
     return failure(
       400,
-      'subject_lark_app_ids_grant_only',
-      'subjectLarkAppIds may only be used with operation=grant',
+      'subject_lark_app_ids_operation_unsupported',
+      'subjectLarkAppIds may only be used with operation=grant or operation=readback',
     );
   }
+  const operation = input.operation;
   if (typeof input.chatId !== 'string' || !CHAT_ID_RE.test(input.chatId)) {
     return failure(400, 'invalid_chat_id', 'chatId must be a valid oc_ chat id');
   }
@@ -366,7 +367,7 @@ export async function applyExactChatGrantByLarkAppIds(
   }
   const completeMappings = subjectMappings as CurrentChatBotAppMapping[];
   const result = await applyExactChatGrant({
-    operation: 'grant',
+    operation,
     receiverLarkAppId: input.receiverLarkAppId,
     chatId: input.chatId,
     subjectOpenIds: completeMappings.map(mapping => mapping.subjectOpenId),

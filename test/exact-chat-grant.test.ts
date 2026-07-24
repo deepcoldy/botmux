@@ -234,6 +234,44 @@ describe('exact chat grant service', () => {
     });
   });
 
+  it('resolves receiver-scoped stable app identities for readback without mutating grants', async () => {
+    fixture.grants.add('ou_peer_a');
+    vi.mocked(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).mockResolvedValue({
+      ok: true,
+      mappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }],
+    });
+
+    const result = await applyExactChatGrantByLarkAppIds({
+      operation: 'readback',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    }, fixture.deps);
+
+    expect(fixture.deps.resolveCurrentChatBotOpenIdsByLarkAppIds).toHaveBeenCalledWith(
+      'cli_receiver',
+      'oc_chat',
+      ['cli_pm'],
+    );
+    expect(fixture.deps.listCurrentChatBotMembers).not.toHaveBeenCalled();
+    expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
+    expect(fixture.deps.removeChatGrant).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ok: true,
+      operation: 'readback',
+      grantsTalk: true,
+      grantsOperate: false,
+      subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_peer_a' }],
+      subjects: [{
+        subjectOpenId: 'ou_peer_a',
+        chatGrantActive: true,
+        changed: false,
+        grantsTalk: true,
+        grantsOperate: false,
+      }],
+    });
+  });
+
   it('fails closed on missing, ambiguous, or unavailable stable identity resolution', async () => {
     const failures = [
       {
@@ -277,13 +315,16 @@ describe('exact chat grant service', () => {
     expect(fixture.deps.addChatGrant).not.toHaveBeenCalled();
   });
 
-  it('allows stable app ids only for grants and validates them before resolution', async () => {
+  it('rejects stable app ids for revoke and validates them before resolution', async () => {
     expect(await applyExactChatGrantByLarkAppIds({
-      operation: 'readback',
+      operation: 'revoke',
       receiverLarkAppId: 'cli_receiver',
       chatId: 'oc_chat',
       subjectLarkAppIds: ['cli_pm'],
-    }, fixture.deps)).toMatchObject({ ok: false, error: 'subject_lark_app_ids_grant_only' });
+    }, fixture.deps)).toMatchObject({
+      ok: false,
+      error: 'subject_lark_app_ids_operation_unsupported',
+    });
 
     expect(await applyExactChatGrantByLarkAppIds({
       operation: 'grant',

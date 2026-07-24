@@ -347,7 +347,7 @@ describe('POST /api/grants/chat', () => {
   it('accepts stable subject app ids and returns the receiver-side identity mapping', async () => {
     const handler = vi.fn(async (input: any) => ({
       ok: true as const,
-      operation: 'grant' as const,
+      operation: input.operation,
       permissionSource: 'chatGrant' as const,
       talkOnly: true as const,
       receiverLarkAppId: input.receiverLarkAppId,
@@ -358,7 +358,7 @@ describe('POST /api/grants/chat', () => {
       subjects: [{
         subjectOpenId: 'ou_pm_seen_by_receiver',
         chatGrantActive: true,
-        changed: true,
+        changed: input.operation === 'grant',
         grantsTalk: true,
         grantsOperate: false as const,
       }],
@@ -392,6 +392,30 @@ describe('POST /api/grants/chat', () => {
       grantsOperate: false,
       subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_pm_seen_by_receiver' }],
     });
+
+    const readback = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'readback',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+    expect(readback.status).toBe(200);
+    expect(handler).toHaveBeenLastCalledWith({
+      operation: 'readback',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    });
+    expect(await readback.json()).toMatchObject({
+      ok: true,
+      operation: 'readback',
+      subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_pm_seen_by_receiver' }],
+      subjects: [{ chatGrantActive: true, changed: false }],
+    });
   });
 
   it('requires exactly one subject identity form before invoking the permission service', async () => {
@@ -423,7 +447,7 @@ describe('POST /api/grants/chat', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+  it('rejects stable subject app ids for revoke before invoking the service', async () => {
     const handler = vi.fn();
     setExactChatGrantHandler(handler as any);
     setLarkAppId('cli_receiver');
@@ -441,7 +465,9 @@ describe('POST /api/grants/chat', () => {
       }),
     });
     expect(res.status).toBe(400);
-    expect(await res.json()).toMatchObject({ error: 'subject_lark_app_ids_grant_only' });
+    expect(await res.json()).toMatchObject({
+      error: 'subject_lark_app_ids_operation_unsupported',
+    });
     expect(handler).not.toHaveBeenCalled();
   });
 

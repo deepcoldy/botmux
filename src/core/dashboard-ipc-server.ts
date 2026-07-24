@@ -1662,11 +1662,15 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'Provide exactly one of subjectOpenIds or subjectLarkAppIds',
     });
   }
-  if (hasSubjectLarkAppIds && body.operation !== 'grant') {
+  if (
+    hasSubjectLarkAppIds
+    && body.operation !== 'grant'
+    && body.operation !== 'readback'
+  ) {
     return jsonRes(res, 400, {
       ok: false,
-      error: 'subject_lark_app_ids_grant_only',
-      message: 'subjectLarkAppIds may only be used with operation=grant',
+      error: 'subject_lark_app_ids_operation_unsupported',
+      message: 'subjectLarkAppIds may only be used with operation=grant or operation=readback',
     });
   }
   const result = hasSubjectLarkAppIds

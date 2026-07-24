@@ -21,6 +21,7 @@ describe('botmux capabilities contract', () => {
       schemaVersion: BOTMUX_CAPABILITIES_SCHEMA_VERSION,
       capabilities: {
         exact_chat_grant_v1: true,
+        stable_app_grant_readback_v1: true,
         stable_app_dispatch_v1: true,
         stable_dispatch_acceptance_v1: true,
         managed_activation_v2: true,
