@@ -71,7 +71,7 @@ botmux 为每个受管会话使用确定性名称 `bmx-<sessionId 前 8 位>`。
 
 - ZMX 向 botmux 提供的是 `history` 的**最终一致纯文本屏幕**，不保留颜色、光标状态、OSC 或 alternate screen。采集单会话 single-flight，并在采集中出现新活动时强制补拉，避免并发 history 风暴或漏掉飞行中的尾段。
 - ZMX 后端不提供 botmux 的交互式 Web TUI，也不向 backing PTY 发送 resize。需要 raw ANSI、全屏 TUI 或尺寸协商时，请使用本机 `zmx attach`。
-- 本机 attach 的 leader 负责终端尺寸；没有本机 leader 时沿用 ZMX 会话的既有尺寸。botmux 的 `send` 不会改变它。
+- 本机 attach 的 leader 负责终端尺寸；没有本机 leader 时沿用 ZMX 会话的既有尺寸。botmux 的 `send` 不会改变它。ZMX 没有提供任何「不当 leader 也能 resize」的接口，所以 botmux 的 `resize()` 是刻意的 no-op。botmux 建会话时用的是非 TTY 客户端，落到 ZMX `getTerminalSize` 的兜底值，因此**受管会话固定跑在 120×24**，CLI 的 TUI 按 120 列折行 —— 这也是飞书侧看到的宽度。需要别的尺寸时用本机 `zmx attach` 接管 leader。
 - 上游 `send` 目前没有投递 ACK / backpressure。botmux 以 1 KiB 分片发送，并在写入任何前缀前拒绝超过 64 KiB 的单次后端输入；结果不确定时不会自动重试，以免把已经入队的输入重复提交。后端会向调用方返回失败，而不是在内部隐藏重试。
 - `zmx history` 只能恢复 ZMX / ghostty 当时仍保留的有界 scrollback；超过上游滚动缓冲预算后，较早输出会被淘汰。它构成最终一致的当前可观察状态，不是无损 transcript 或终端录屏；进程退出后才出现且未被最后一次采集命中的瞬态输出也无法补回。Workflow 的 raw PTY replay log 因此不具备 tmux 的无损语义。
 

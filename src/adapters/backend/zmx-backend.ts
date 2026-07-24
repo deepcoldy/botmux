@@ -537,7 +537,15 @@ export class ZmxBackend implements SessionBackend {
     }
   }
 
-  /** send intentionally never becomes a leader, so botmux cannot resize ZMX. */
+  /**
+   * No-op by construction: zmx exposes no leaderless resize primitive. Size is
+   * set only by an attached client's TIOCGWINSZ, and `send` deliberately never
+   * becomes that client (upstream 8ba312d7). Since `createFreshSession` creates
+   * the session with a non-TTY stdio, zmx's `getTerminalSize` fallback applies
+   * and every botmux-owned session runs at a fixed 120x24 until a local
+   * `zmx attach` takes leadership. The CLI therefore wraps its TUI at 120
+   * columns, which is the width reflected in the history screen we relay.
+   */
   resize(_cols: number, _rows: number): void {}
 
   onData(cb: (data: string) => void): void {
