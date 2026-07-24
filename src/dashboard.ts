@@ -355,8 +355,48 @@ function spawnStartBotLive(appId: string): Promise<{ ok: boolean; message?: stri
   });
 }
 
+function spawnStopBotLive(appId: string): Promise<{ ok: boolean; message?: string }> {
+  return new Promise((resolve) => {
+    let out = '';
+    let err = '';
+    let settled = false;
+    const done = (r: { ok: boolean; message?: string }) => { if (!settled) { settled = true; resolve(r); } };
+    try {
+      const child = spawn(process.execPath, [botmuxCliEntry(), 'stop-bot', appId, '--json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: process.env,
+        cwd: globalInstallUpdateCwd(),
+      });
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        done({ ok: false, message: 'stop-bot 超时（30s）' });
+      }, 30_000);
+      timer.unref?.();
+      child.stdout?.on('data', (d) => { out += String(d); });
+      child.stderr?.on('data', (d) => { err += String(d); });
+      child.on('error', (e) => {
+        clearTimeout(timer);
+        done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+      });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        let parsed: any;
+        try { parsed = JSON.parse(out.trim()); } catch { /* non-JSON */ }
+        if (code === 0) {
+          done({ ok: true, message: parsed?.processName ? `${parsed.processName} 已停止` : undefined });
+        } else {
+          done({ ok: false, message: parsed?.message || err.trim() || `stop-bot 退出码 ${code}` });
+        }
+      });
+    } catch (e) {
+      done({ ok: false, message: e instanceof Error ? e.message : String(e) });
+    }
+  });
+}
+
 const botOnboarding = new BotOnboardingManager({
   botsJsonPath: BOTS_JSON_PATH,
+  stopBotLive: spawnStopBotLive,
   startBotLive: spawnStartBotLive,
 });
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
@@ -3146,6 +3186,7 @@ const server = createServer(async (req, res) => {
         workingDir?: unknown;
         dirMode?: unknown;
         model?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
       };
       try {
         const chunks: Buffer[] = [];
@@ -3217,6 +3258,16 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'missing_expected_identity', message: '免扫码添加前必须确认当前账号与企业' });
       }
       const sessionMode = sessionModeRaw === 'reuse' ? 'reuse' as const : 'qr' as const;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
       const job = botOnboarding.start({
         appName,
         registrationMode,
@@ -3226,8 +3277,102 @@ const server = createServer(async (req, res) => {
         workingDir,
         dirMode,
         model,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
       });
       return jsonRes(res, 202, { job: botOnboarding.get(job.id) });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/bot-onboarding/recover-permissions') {
+      let parsed: {
+        workingDir?: unknown;
+        predecessorJobId?: unknown;
+        expectedAppId?: unknown;
+        priorRecoveryJobId?: unknown;
+        requireCriticalScopesBeforeActivation?: unknown;
+      };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const predecessorJobId = typeof parsed.predecessorJobId === 'string' ? parsed.predecessorJobId.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      const priorRecoveryJobId = typeof parsed.priorRecoveryJobId === 'string' ? parsed.priorRecoveryJobId.trim() : undefined;
+      if (
+        parsed.requireCriticalScopesBeforeActivation !== undefined
+        && typeof parsed.requireCriticalScopesBeforeActivation !== 'boolean'
+      ) {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'invalid_critical_scope_activation_gate',
+          message: 'requireCriticalScopesBeforeActivation 必须是 boolean',
+        });
+      }
+      if (!workingDir || !predecessorJobId || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const recovered = botOnboarding.startPermissionRecovery({
+        workingDir,
+        predecessorJobId,
+        expectedAppId,
+        priorRecoveryJobId,
+        ...(parsed.requireCriticalScopesBeforeActivation === true
+          ? { requireCriticalScopesBeforeActivation: true }
+          : {}),
+      });
+      if (!recovered.ok) {
+        const status = recovered.error === 'permission_recovery_target_missing' ? 404
+          : recovered.error === 'permission_recovery_target_ambiguous' ? 409
+            : recovered.error === 'permission_recovery_state_unavailable' ? 503
+            : 400;
+        return jsonRes(res, status, recovered);
+      }
+      return jsonRes(res, 202, { job: botOnboarding.get(recovered.job.id) });
+    }
+    let mScopePropagation: RegExpMatchArray | null;
+    if (
+      req.method === 'POST'
+      && (mScopePropagation = url.pathname.match(
+        /^\/api\/bot-onboarding\/([^/]+)\/complete-scope-propagation$/,
+      ))
+    ) {
+      const onboardingId = decodeURIComponent(mScopePropagation[1]);
+      let parsed: { workingDir?: unknown; expectedAppId?: unknown };
+      try {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8');
+        parsed = raw ? JSON.parse(raw) : {};
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const workingDir = typeof parsed.workingDir === 'string' ? parsed.workingDir.trim() : '';
+      const expectedAppId = typeof parsed.expectedAppId === 'string' ? parsed.expectedAppId.trim() : '';
+      if (!workingDir || !expectedAppId || invalidWorkingDirs({ workingDir }).length > 0) {
+        return jsonRes(res, 400, { ok: false, error: 'permission_recovery_target_invalid' });
+      }
+      const completed = await botOnboarding.completeScopePropagation({
+        jobId: onboardingId,
+        workingDir,
+        expectedAppId,
+      });
+      if (!completed.ok) {
+        const status = completed.error === 'permission_recovery_target_missing' ? 404
+          : completed.error === 'permission_recovery_target_ambiguous' ? 409
+            : completed.error === 'permission_recovery_scopes_pending' ? 425
+              : (
+                  completed.error === 'permission_recovery_state_unavailable'
+                  || completed.error === 'permission_recovery_activation_failed'
+                ) ? 503
+                : 400;
+        return jsonRes(res, status, completed);
+      }
+      return jsonRes(res, 200, { job: botOnboarding.get(onboardingId) });
     }
     let mOwner: RegExpMatchArray | null;
     if (req.method === 'POST' && (mOwner = url.pathname.match(/^\/api\/bot-onboarding\/([^/]+)\/owner$/))) {

@@ -37,6 +37,35 @@ export interface DispatchMessages {
   mentionedOpenIds: string[];
 }
 
+const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
+
+/** Compatibility protocol for legacy/cross-machine `--bot` dispatches. */
+export function appendLegacyDispatchReportProtocol(brief: string): string {
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + '干完后在本话题运行 `botmux report "子项目完成 + 产出位置/摘要"` '
+    + '把结果回报给主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
+/**
+ * Freeze the report destination into the exact dispatched turn.
+ *
+ * A regular-group resident can reuse one chat-scoped CLI session for several
+ * dispatch topics. Session-level `currentReplyTarget` is therefore mutable and
+ * cannot identify an older in-flight turn once a newer assignment arrives. The
+ * kickoff itself is immutable, so embed the seed in the command the resident is
+ * instructed to run; `botmux report` can then select the matching registry row
+ * without guessing from the session's latest alias.
+ */
+export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
+  const root = dispatchRootId.trim();
+  if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  return brief.trimEnd()
+    + '\n\n— 完成回报 —\n'
+    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
+    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+}
+
 /**
  * Parse a `--bot` spec `openId[:name[:role]]` into a {@link DispatchBot}.
  * Mirrors the `--mention "open_id:Display Name"` convention, with an optional
@@ -226,6 +255,161 @@ export function resolveReportTarget(input: {
     orchRoot: e?.orchRoot ?? '',
     orchOpenId: input.creatorOpenId ?? input.ownerOpenId ?? input.quoteTargetSenderOpenId,
   };
+}
+
+export interface DispatchRegistryEntry {
+  orchChatId?: string;
+  orchScope?: string;
+  orchRoot?: string;
+  orchAppId?: string;
+  orchSessionId?: string;
+  createdAt?: string;
+}
+
+/**
+ * Resolve the dispatch record for either a normal thread session or a
+ * regular-group chat-scope session folded from a dispatch topic.
+ *
+ * Folded sessions are keyed by chatId, while the registry is keyed by the seed
+ * message id. The seed is retained in currentReplyTarget/replyThreadAliases, so
+ * report-back must consult those aliases instead of silently falling back to a
+ * context-less top-level message.
+ */
+export function findDispatchRegistryEntry(input: {
+  registry: Record<string, DispatchRegistryEntry>;
+  dispatchRootId?: string;
+  rootMessageId?: string;
+  currentReplyTargetRootId?: string;
+  replyThreadAliases?: Record<string, { createdAt: string; lastUsedAt: string }>;
+}): { key: string; entry: DispatchRegistryEntry } | undefined {
+  if (input.dispatchRootId) {
+    const entry = input.registry[input.dispatchRootId];
+    return entry ? { key: input.dispatchRootId, entry } : undefined;
+  }
+  const ordered: string[] = [];
+  const add = (value: string | undefined) => {
+    if (value && !ordered.includes(value)) ordered.push(value);
+  };
+  add(input.currentReplyTargetRootId);
+  add(input.rootMessageId);
+  const aliases = Object.entries(input.replyThreadAliases ?? {})
+    .sort((a, b) => String(b[1]?.lastUsedAt ?? '').localeCompare(String(a[1]?.lastUsedAt ?? '')));
+  for (const [rootId] of aliases) add(rootId);
+  for (const key of ordered) {
+    const entry = input.registry[key];
+    if (entry) return { key, entry };
+  }
+  return undefined;
+}
+
+export interface DispatchAcceptanceSession {
+  larkAppId?: string;
+  chatId?: string;
+  scope?: 'thread' | 'chat';
+  pid?: number;
+  workerGeneration?: number;
+  rootMessageId?: string;
+  status?: string;
+  queued?: boolean;
+  createdAt?: string;
+  lastMessageAt?: string;
+  lastCliInput?: string;
+  currentReplyTarget?: { rootMessageId?: string; turnId?: string; updatedAt?: string };
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt?: string }>;
+  replyThreadAliases?: Record<string, { createdAt?: string; lastUsedAt?: string }>;
+  dispatchInputReceipts?: Record<string, {
+    rootMessageId?: string;
+    committedAt?: string;
+    workerGeneration?: number;
+  }>;
+}
+
+const MAX_DISPATCH_INPUT_RECEIPTS = 64;
+
+/**
+ * Persist the worker's exact input-queue commit against the immutable inbound
+ * turn and topic root. Returns false when the current session cannot prove the
+ * turn→root relation; callers must then fail closed and leave no receipt.
+ */
+export function recordDispatchInputCommit(
+  session: DispatchAcceptanceSession,
+  turnId: string,
+  workerGeneration: number,
+  committedAt = new Date().toISOString(),
+): boolean {
+  const exactTurnId = turnId.trim();
+  if (!exactTurnId) return false;
+  if (
+    !Number.isSafeInteger(workerGeneration)
+    || workerGeneration <= 0
+    || session.workerGeneration !== workerGeneration
+  ) return false;
+  const rootMessageId = session.replyTargets?.[exactTurnId]?.rootMessageId
+    ?? (session.currentReplyTarget?.turnId === exactTurnId
+      ? session.currentReplyTarget.rootMessageId
+      : undefined)
+    ?? (session.scope !== 'chat' ? session.rootMessageId : undefined);
+  if (!rootMessageId) return false;
+  const committedAtMs = Date.parse(committedAt);
+  if (!Number.isFinite(committedAtMs)) return false;
+
+  const receipts = { ...(session.dispatchInputReceipts ?? {}) };
+  receipts[exactTurnId] = { rootMessageId, committedAt, workerGeneration };
+  const ordered = Object.entries(receipts)
+    .sort((a, b) => {
+      const aMs = Date.parse(a[1].committedAt ?? '');
+      const bMs = Date.parse(b[1].committedAt ?? '');
+      return (Number.isFinite(bMs) ? bMs : Number.NEGATIVE_INFINITY)
+        - (Number.isFinite(aMs) ? aMs : Number.NEGATIVE_INFINITY);
+    })
+    .slice(0, MAX_DISPATCH_INPUT_RECEIPTS);
+  session.dispatchInputReceipts = Object.fromEntries(ordered);
+  return true;
+}
+
+/**
+ * Return the exact local Bot app identities whose persisted session state proves
+ * that a dispatch message reached the intended chat/topic after it was sent.
+ *
+ * A Lark send acknowledgement only proves transport acceptance. This second
+ * acknowledgement is deliberately based on the receiver daemon's own session
+ * store, and supports both normal thread sessions and regular-group chat-scope
+ * sessions that retain the dispatch root as a reply-thread alias.
+ */
+export function acceptedDispatchBotAppIds(input: {
+  sessions: Iterable<DispatchAcceptanceSession>;
+  targetAppIds: string[];
+  chatId: string;
+  threadRootId: string;
+  turnId: string;
+  notBeforeMs: number;
+  isWorkerAlive: (pid: number) => boolean;
+  clockSkewMs?: number;
+}): string[] {
+  const targets = [...new Set(input.targetAppIds.filter(Boolean))];
+  const accepted = new Set<string>();
+  const threshold = input.notBeforeMs - (input.clockSkewMs ?? 2_000);
+  for (const session of input.sessions) {
+    const appId = session.larkAppId;
+    if (!appId || !targets.includes(appId) || accepted.has(appId)) continue;
+    if (session.status === 'closed' || session.queued === true || session.chatId !== input.chatId) continue;
+    const workerPid = session.pid;
+    if (
+      typeof workerPid !== 'number'
+      || !Number.isSafeInteger(workerPid)
+      || workerPid <= 0
+      || !input.isWorkerAlive(workerPid)
+    ) continue;
+    const workerGeneration = session.workerGeneration;
+    if (!Number.isSafeInteger(workerGeneration) || (workerGeneration ?? 0) <= 0) continue;
+    const receipt = session.dispatchInputReceipts?.[input.turnId];
+    if (!receipt || receipt.rootMessageId !== input.threadRootId) continue;
+    if (receipt.workerGeneration !== workerGeneration) continue;
+    const committedAtMs = Date.parse(receipt.committedAt ?? '');
+    if (!Number.isFinite(committedAtMs) || committedAtMs < threshold) continue;
+    accepted.add(appId);
+  }
+  return targets.filter(appId => accepted.has(appId));
 }
 
 /**

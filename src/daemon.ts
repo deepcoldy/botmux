@@ -31,6 +31,7 @@ import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
+  loadBotConfigAtIndex,
   loadBotConfigs,
   registerBot,
   getBot,
@@ -16269,10 +16270,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Load the assigned bot (one daemon per bot)
   let botConfigs = loadBotConfigs();
   const idx = botIndex ?? 0;
-  if (idx < 0 || idx >= botConfigs.length) {
-    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} bot(s) configured`);
+  let cfg = botIndex === undefined
+    ? botConfigs[idx]
+    : loadBotConfigAtIndex(idx);
+  if (!cfg) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
   }
-  let cfg = botConfigs[idx];
   // One-time, lock-protected catalog bootstrap. This runs only after the
   // complete bots.json has parsed successfully, and the helper re-reads the
   // latest file under its lock before deciding. Explicit [] and legacy agent

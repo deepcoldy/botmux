@@ -36,12 +36,19 @@ afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
 
 describe('grant-store', () => {
   it('addChatGrant persists & syncs in-memory; only affects given chat', async () => {
-    writeConfig({ allowedUsers: ['ou_owner'] });
+    writeConfig({
+      allowedUsers: ['ou_owner'],
+      allowedChatGroups: ['oc_existing'],
+      globalGrants: ['ou_existing_global'],
+    });
     const { registry, store } = await freshModules();
     const r = await store.addChatGrant('a1', 'oc_1', 'ou_guest');
     expect(r).toEqual({ ok: true, created: true });
     expect(readConfig().chatGrants).toEqual({ oc_1: ['ou_guest'] });
     expect(registry.getBot('a1').config.chatGrants).toEqual({ oc_1: ['ou_guest'] });
+    expect(readConfig().allowedUsers).toEqual(['ou_owner']);
+    expect(readConfig().allowedChatGroups).toEqual(['oc_existing']);
+    expect(readConfig().globalGrants).toEqual(['ou_existing_global']);
     // idempotent
     expect(await store.addChatGrant('a1', 'oc_1', 'ou_guest')).toEqual({ ok: true, created: false });
   });

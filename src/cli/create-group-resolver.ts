@@ -41,6 +41,51 @@ export interface ResolvedBots {
   ambiguousWarnings: string[];
 }
 
+export interface CreateGroupCompletionStatus {
+  success: boolean;
+  chatCreated: true;
+  chatId: string;
+  collaborationReady: boolean;
+  kickoffAccepted: boolean;
+  kickoffRequested: boolean;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
+}
+
+/** Build the machine-readable terminal status for create-group. A created chat
+ * is not a successful group initialization until collaboration is ready and an
+ * explicitly requested kickoff was accepted. */
+export function createGroupCompletionStatus(input: {
+  chatId: string;
+  collaborationReady: boolean;
+  kickoffRequested: boolean;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
+}): CreateGroupCompletionStatus {
+  const kickoffAccepted = !input.kickoffRequested
+    || (!!input.kickoffMessageId && !input.kickoffError);
+  return {
+    success: input.collaborationReady && kickoffAccepted,
+    chatCreated: true,
+    chatId: input.chatId,
+    collaborationReady: input.collaborationReady,
+    kickoffAccepted,
+    kickoffRequested: input.kickoffRequested,
+    kickoffMessageId: input.kickoffMessageId,
+    kickoffError: input.kickoffError,
+  };
+}
+
+/** Preserve the long-standing stdout contract: create-group emits only the
+ * chatId by default, including partial/non-zero outcomes. Callers that can
+ * consume a second structured line must opt in explicitly. */
+export function shouldWriteCreateGroupCompletionStatus(
+  _status: CreateGroupCompletionStatus,
+  explicitJsonStatus: boolean,
+): boolean {
+  return explicitJsonStatus;
+}
+
 export function resolveBotRefs(
   refs: string[],
   botConfigs: BotConfigForResolve[],

@@ -1622,6 +1622,77 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     );
   });
 
+  it('blocks an unknown bot in an owned native topic and sends an exact grant request card', async () => {
+    // Session ownership is conversational state, not authorization. A cold bot
+    // must not be able to enter a restricted daemon merely because the target
+    // already owns the native Lark topic it @mentions into. This is the path
+    // that previously skipped the outer gate, then got silently dropped by the
+    // daemon's second evaluateTalk check (so the owner never saw a grant card).
+    setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: true });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-cold-native-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-cold-native-topic',
+      rootId: 'root-cold-native-topic',
+      threadId: 'root-cold-native-topic',
+      messageId: 'msg-cold-native-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.isSessionOwner).toHaveBeenCalledWith('root-cold-native-topic', MY_APP_ID);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-cold-native-topic',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('routes a chat-granted bot through an owned native topic', async () => {
+    // Positive control for the same native-topic + existing-session shape:
+    // an exact per-chat talk grant remains sufficient to continue the topic.
+    setupBotState({
+      allowedUsers: ['ou_owner'],
+      chatGrants: { 'chat-granted-native-topic': [OTHER_BOT_OPEN_ID] },
+      autoGrantRequestCards: true,
+    });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockReadFileSync.mockReturnValue('{}');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'root-granted-native-topic');
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      chatId: 'chat-granted-native-topic',
+      rootId: 'root-granted-native-topic',
+      threadId: 'root-granted-native-topic',
+      messageId: 'msg-granted-native-topic',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'root-granted-native-topic',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
   it('keeps the unknown external bot @blocked path silent when auto grant cards are disabled', async () => {
     setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
     mockGetOwnerOpenId.mockReturnValue('ou_owner');

@@ -246,23 +246,25 @@ The next level up from "Multi-Bot Collaboration": a lead bot (the **orchestrator
 
 > Split into sub-projects → propose a "sub-project ↔ bot" assignment → send it to you for **a single approval** (confirmable via card) → create the Lark task list → open each topic and dispatch → collect the reports → aggregate
 
-Under the hood, dispatching is done by `botmux dispatch`: it seeds a topic in the group and @-mentions the chosen bots, spawning an independent session for each.
+Under the hood, dispatching is done by `botmux dispatch`: it seeds a topic in the group and @-mentions the chosen bots, spawning an independent session for each. For local bots, pass stable app identities. The command establishes and reads back a receiver-scoped, bidirectional, talk-only `chatGrant` before sending, then waits for the target session to acknowledge the task. A brand-new “cold” group therefore does not depend on historical `/introduce` or peer caches.
 
 ```bash
 botmux dispatch --title "Implement login module" \
-  --bot "ou_xxx:Alice:coder" --bot "ou_yyy:Bob:reviewer" \
-  --repo /path/to/repo --brief-file /tmp/brief.md
+  --bot-app "cli_xxx:coder" --bot-app "cli_yyy:reviewer" \
+  --brief-file /tmp/brief.md
 ```
 
-- `--repo <dir>` — presets each sub-bot's working directory (absolute path, must exist on the sub-bot's machine), so the session spawns straight into it and **skips the "select repo" card**.
+- `--bot-app <larkAppId[:role]>` — recommended for local bots; performs exact receiver-scoped conversation authorization and real session acceptance checks. It grants no management permission and cannot be combined with `--repo`; resident bots should use their configured default working directory.
+- `--bot <open_id[:name[:role]]>` — compatibility path for external/legacy bots; the caller owns open-id scoping, authorization, and acceptance checks.
+- `--repo <dir>` — only for the legacy `--bot` path when operate trust already exists; presets each sub-bot's working directory (absolute path, must exist on the sub-bot's machine).
 - `--standby` — **must be paired with `--repo`** (and cannot be combined with `--into`): sends `/repo` once to bring the bot up in the given directory on standby without a brief; activate it later with `--into ... --brief(-file)`.
-- `--into <topic root>` — return to an existing topic and append one message (activate standby bots / add coordination); still requires `--bot`, and outside standby mode must carry `--brief` or `--brief-file`.
+- `--into <topic root>` — return to an existing topic and append one message (activate standby bots / add coordination); still requires a bot target, and outside standby mode must carry `--brief` or `--brief-file`.
 
-When a sub-bot finishes, it reports progress/completion back with `botmux report` from inside its own sub-topic. This routes the report into the orchestrator's **own** session (which still holds full context) instead of @-mentioning the orchestrator inside the sub-topic — where it has no session and the @ would spawn a fresh, context-less one. The orchestrator then aggregates the collected reports.
+When a sub-bot finishes, it reports progress/completion back with `botmux report` from inside its own sub-topic. A local-only `--bot-app` dispatch automatically injects `botmux report --dispatch-root <seed>` into each immutable task turn, so the report is delivered to the exact PM session recorded for that seed even if the same chat-scoped resident session later receives another dispatch. Legacy or mixed `--bot` dispatches keep the root-free cross-machine compatibility fallback. The orchestrator then aggregates the collected reports.
 
 **Collaboration boundaries:**
 
-- **"Own" bots in the same deployment trust each other** — the orchestrator can run operate-level commands like `/repo` directly against them (same conversation permissions as your own bots). Authorization for external bots is two-tiered: `/grant @bot` only grants "talk / be spawned by chat-scope" permission (talk-only — it does not touch `allowedUsers` and cannot run operate-level commands); to let an external bot run operate-level commands like `/repo`, add it to `allowedUsers` (or grant operate-level access later). `/introduce` only handles discovery / registering open_id and **grants no permissions**.
+- **Same deployment does not imply management trust** — `--bot-app` only installs receiver-scoped, talk-only `chatGrant` entries for that group. It does not touch `allowedUsers` and cannot run operate-level commands such as `/repo`. Management commands require an explicit allowedUsers / team / oncall operate trust path. `/introduce` only handles discovery / registering open_id and **grants no permissions**.
 - Sub-bots must already be in the group and @-mentionable (i.e. have the `im:message.group_at_msg.include_bot` permission).
 - A single topic can hold multiple bots, and they @-mention each other to collaborate within the topic (e.g. the coder @-mentions the reviewer once the code is done).
 

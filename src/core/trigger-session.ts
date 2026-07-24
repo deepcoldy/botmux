@@ -271,9 +271,13 @@ export async function triggerSessionTurn(
   const triggerId = stableTurnId || `trg_${randomUUID()}`;
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
     if (!stableTurnId || !internal?.beforeDispatch) return undefined;
+    const currentWorkerGeneration = Math.max(
+      target.workerGeneration ?? 0,
+      target.session.workerGeneration ?? 0,
+    );
     const workerGeneration = willFork
-      ? (target.workerGeneration ?? 0) + 1
-      : (target.workerGeneration ?? 1);
+      ? currentWorkerGeneration + 1
+      : Math.max(currentWorkerGeneration, 1);
     const prepared = internal.beforeDispatch({ sessionId: target.session.sessionId, workerGeneration });
     if (!prepared) return undefined;
     if (!Number.isSafeInteger(prepared.dispatchAttempt) || prepared.dispatchAttempt < 1) {

@@ -488,6 +488,128 @@ describe('session.start lifecycle integration', () => {
     expect(enforceLiveSessionCap).toHaveBeenCalledTimes(2);
   });
 
+  it('persists an exact root-bound dispatch receipt only from the live worker generation', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(sessionStore.updateSession).mockClear();
+
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff).toEqual({
+      rootMessageId: 'om_dispatch_root',
+      committedAt: expect.any(String),
+      workerGeneration: 1,
+    });
+    expect(ds.session.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+
+    const prior = ds.session.dispatchInputReceipts;
+    ds.worker = makeFakeWorker();
+    vi.mocked(sessionStore.updateSession).mockClear();
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_stale_worker' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts).toBe(prior);
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+  });
+
+  it('does not fork a worker when the generation reservation cannot be persisted', () => {
+    const ds = makeDs();
+    const currentWorker = makeFakeWorker();
+    ds.worker = currentWorker;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.cliId = 'codex';
+    ds.session.backendType = 'tmux';
+    ds.session.sandbox = false;
+    ds.session.sandboxHidePaths = [];
+    ds.session.sandboxReadonlyPaths = [];
+    ds.session.sandboxNetwork = true;
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('generation persistence failed');
+    });
+
+    expect(() => forkWorker(ds, 'hello', false)).toThrow(
+      'generation persistence failed',
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(currentWorker.send).not.toHaveBeenCalled();
+    expect(currentWorker.kill).not.toHaveBeenCalled();
+    expect(ds.worker).toBe(currentWorker);
+    expect(ds.workerGeneration).toBe(4);
+    expect(ds.session.workerGeneration).toBe(4);
+  });
+
+  it('rotates the persisted generation before replacement IPC and rejects the old worker receipt', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+
+    forkWorker(ds, 'first', false);
+    const firstWorker = forkMock.mock.results.at(-1)!.value;
+    firstWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    // A daemon restore/refork replaces the Node worker. Generation 2 is
+    // persisted immediately; the generation-1 receipt remains audit evidence
+    // but can no longer satisfy acceptance.
+    forkWorker(ds, 'replacement', { resume: true });
+    const replacementWorker = forkMock.mock.results.at(-1)!.value;
+    expect(ds.worker).toBe(replacementWorker);
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    vi.mocked(sessionStore.updateSession).mockClear();
+    firstWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    firstWorker.emit('exit', 0, null);
+    await Promise.resolve();
+    expect(ds.worker).toBe(replacementWorker);
+    expect(ds.session.workerGeneration).toBe(2);
+
+    replacementWorker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(2);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('fences the persisted generation when the ACKing worker exits before dispatch polling', async () => {
+    const ds = makeDs();
+    ds.session.scope = 'chat';
+    ds.session.rootMessageId = 'oc_chat';
+    ds.session.replyTargets = {
+      om_kickoff: { rootMessageId: 'om_dispatch_root', updatedAt: '2026-07-14T09:00:01.000Z' },
+    };
+    forkWorker(ds, 'first', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.session.pid = worker.pid;
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await Promise.resolve();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+
+    vi.mocked(sessionStore.updateSession).mockClear();
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+    expect(ds.worker).toBeNull();
+    expect(ds.workerGeneration).toBe(2);
+    expect(ds.session.workerGeneration).toBe(2);
+    expect(ds.session.pid).toBeUndefined();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff?.workerGeneration).toBe(1);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
   it('emits session.start after forkAdoptWorker spawns an adopt worker', () => {
     forkAdoptWorker(makeDs({
       adoptedFrom: {

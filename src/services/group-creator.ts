@@ -5,13 +5,13 @@
  * choosing `creatorLarkAppId`, resolving bot refs, deriving user_open_ids, etc.
  * This service only orchestrates the Lark API sequence:
  *
- *   1. createChat (bots + invited users)
- *   2. transferChatOwner (best-effort, skipped if invitee was rejected)
- *   3. send @-mention notify (best-effort, skipped if invitee was rejected)
+ *   1. createChat (creator + invited users), then synchronously announce chatId
+ *   2. add peer bots / owners and fetch the share link
+ *   3. transferChatOwner + notify + bindings/bootstrap (best-effort where noted)
  *
- * Partial failures (transfer/notify) are returned as `*Error` fields without
- * throwing — the chat already exists at that point and retrying would create
- * duplicate groups. Only createChat throwing surfaces as an exception.
+ * The progress hook is the durable side-effect boundary: once it fires, the
+ * chat exists and retrying would create a duplicate even if a later API call
+ * throws or stalls. Transfer/notify failures are returned as `*Error` fields.
  *
  * Lark open_id is app-scoped: `userOpenIds`, `transferOwnerTo`, and
  * `notifyOwnerOpenId` MUST be in `creatorLarkAppId`'s app scope. The team-group
@@ -55,6 +55,21 @@ export interface CreateGroupOpts {
    *  having to @ it. The kickoff bot must be present in `larkAppIds`. */
   kickoffBotLarkAppId?: string;
   kickoffPrompt?: string;
+  /** Authorization-grade preflight run after peer invitations settle and
+   * before any role/kickoff bot message. CLI cold-group creation uses this to
+   * establish the exact talk-only grant matrix; rejection aborts initialization
+   * while preserving the already-announced chatId for controlled recovery. */
+  ensureBotCollaboration?: (
+    chatId: string,
+    joinedBotAppIds: string[],
+    rejectedBotAppIds: string[],
+  ) => Promise<void>;
+  /** Synchronous progress hook fired immediately after chat.create returns a
+   *  chatId, before bot invites, share-link lookup, owner transfer, oncall
+   *  binding, or role bootstrap. CLI callers use this as the durable
+   *  side-effect boundary: once notified, retrying create would duplicate the
+   *  group even if a later best-effort step hangs or fails. */
+  onChatCreated?: (chatId: string) => void;
 }
 
 export interface CreateGroupResult {
@@ -129,6 +144,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     botIds: [],
     userIds: opts.userOpenIds ?? [],
   });
+  opts.onChatCreated?.(r.chatId);
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
     let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
@@ -137,6 +153,18 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       for (const id of batch) added.push(...await addBotToChat(opts.creatorLarkAppId, r.chatId, [id]));
     }
     for (const a of added) if (!a.ok) r.invalidBotIds.push(a.id);
+  }
+
+  const invalidBots = new Set(r.invalidBotIds);
+  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
+    .filter(id => !invalidBots.has(id));
+  if (opts.ensureBotCollaboration) {
+    // Strict ordering boundary: invitations must have committed before the
+    // receiver-scoped live membership probes can succeed, while role/kickoff
+    // messages must not be emitted until the exact requested membership and
+    // grant matrix are ready. The callback also sees rejected invitees so a
+    // CLI caller cannot report a partially-created group as complete.
+    await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
   }
 
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot
@@ -217,9 +245,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   }
 
   const oncallBindings: CreateGroupResult['oncallBindings'] = [];
-  const invalidBots = new Set(r.invalidBotIds);
-  const joinedBotIds = Array.from(new Set([opts.creatorLarkAppId, ...opts.larkAppIds]))
-    .filter(id => !invalidBots.has(id));
   const bindWorkingDir = opts.bindWorkingDir?.trim();
   if (bindWorkingDir) {
     // Bind the new chat for every bot that actually joined it. The creator is

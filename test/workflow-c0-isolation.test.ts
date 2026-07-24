@@ -57,6 +57,7 @@ describe('Slice C0 — chat side-effect isolation', () => {
   it.each([
     ['dispatch', '--bot', 'peer', 'task'],
     ['report', 'done'],
+    ['grant', 'chat', '--bot', 'receiver', '--chat-id', 'oc_chat', '--subject-open-id', 'ou_peer'],
     ['restart'],
     ['setup', 'list'],
     ['preset', 'export'],
