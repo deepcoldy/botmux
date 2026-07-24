@@ -13,6 +13,7 @@ vi.mock('../src/config.js', () => ({
 }));
 
 import { handleFederationApi } from '../src/dashboard/federation-api.js';
+import { prepareFederatedGroupReviewers } from '../src/dashboard/federated-group-core.js';
 import { buildFederatedRoster } from '../src/services/federation-roster.js';
 import { registerDeployment } from '../src/services/federation-store.js';
 import { ensureDefaultTeam, addMember, DEFAULT_TEAM_ID } from '../src/services/team-store.js';
@@ -20,6 +21,7 @@ import { createInvite } from '../src/services/invite-store.js';
 import { addMembership } from '../src/services/federation-membership-store.js';
 import { getDeploymentIdentity, setDeploymentOwner } from '../src/services/deployment-identity.js';
 import { setBotOwner } from '../src/services/bot-owner-store.js';
+import { listTeamGroups } from '../src/services/team-groups-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-fedapi-')); state.dataDir = dataDir; });
@@ -432,6 +434,109 @@ describe('handleFederationApi', () => {
     expect(res.statusCode).toBe(200);
     expect(json(res).invalidUserIds).toEqual(['on_owner']); // nobody could add → still invalid
     expect(tried).toEqual(['cli_x', 'cli_y']);              // exhausted all candidates
+  });
+
+  it('delegate-prepare-review authenticates, verifies local membership, records trust, and deduplicates', async () => {
+    writeBots([{ larkAppId: 'cli_reviewer', botOpenId: null, botName: 'Reviewer', cliId: 'codex' }]);
+    addMembership(dataDir, {
+      hubUrl: 'http://hub:7891',
+      teamId: 'default',
+      teamName: 'T',
+      syncToken: 'st',
+      deploymentId: 'dep_me',
+      delegationToken: 'DTOK-PREPARE',
+    });
+    const inChat = vi.fn(async (_larkAppId: string, chatId: string) => chatId === 'oc_ready');
+
+    let res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-prepare-review', {
+        chatId: 'oc_ready',
+        reviewerLarkAppIds: ['cli_reviewer'],
+        requestId: 'prepare-1',
+      }, bearer('NOPE')),
+      res,
+      new URL('http://x/api/federation/delegate-prepare-review'),
+      { dataDir, isBotInChat: inChat },
+    );
+    expect(res.statusCode).toBe(403);
+
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-prepare-review', {
+        chatId: 'oc_missing',
+        reviewerLarkAppIds: ['cli_reviewer'],
+        requestId: 'prepare-missing',
+      }, bearer('DTOK-PREPARE')),
+      res,
+      new URL('http://x/api/federation/delegate-prepare-review'),
+      { dataDir, isBotInChat: inChat },
+    );
+    expect(res.statusCode).toBe(409);
+    expect(json(res).error).toBe('reviewers_not_in_chat');
+
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-prepare-review', {
+        chatId: 'oc_ready',
+        reviewerLarkAppIds: ['cli_reviewer'],
+        requestId: 'prepare-1',
+      }, bearer('DTOK-PREPARE')),
+      res,
+      new URL('http://x/api/federation/delegate-prepare-review'),
+      { dataDir, isBotInChat: inChat },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(json(res).ready).toEqual(['cli_reviewer']);
+    expect(listTeamGroups(dataDir, 'default').map(row => row.chatId)).toContain('oc_ready');
+
+    const callsAfterSuccess = inChat.mock.calls.length;
+    res = makeRes();
+    await handleFederationApi(
+      makeReq('POST', '/api/federation/delegate-prepare-review', {
+        chatId: 'oc_ready',
+        reviewerLarkAppIds: ['cli_reviewer'],
+        requestId: 'prepare-1',
+      }, bearer('DTOK-PREPARE')),
+      res,
+      new URL('http://x/api/federation/delegate-prepare-review'),
+      { dataDir, isBotInChat: inChat },
+    );
+    expect(res.statusCode).toBe(200);
+    expect(inChat).toHaveBeenCalledTimes(callsAfterSuccess);
+  });
+
+  it('prepareFederatedGroupReviewers calls each owning deployment and reports readiness', async () => {
+    registerDeployment(dataDir, DEFAULT_TEAM_ID, {
+      deploymentId: 'dep_review',
+      name: 'Review deployment',
+      ownerUnionId: 'on_review',
+      bots: [{ larkAppId: 'cli_review', botName: 'Reviewer', cliId: 'codex', ownerUnionId: 'on_review' }],
+      callbackUrl: 'http://review:7891',
+      delegationToken: 'DT-REVIEW',
+    });
+    const fetcher = vi.fn(async (url: any, init: any) => {
+      expect(String(url)).toBe('http://review:7891/api/federation/delegate-prepare-review');
+      expect(init.headers.authorization).toBe('Bearer DT-REVIEW');
+      expect(JSON.parse(init.body)).toMatchObject({
+        chatId: 'oc_pr',
+        reviewerLarkAppIds: ['cli_review'],
+        requestId: 'room-1',
+      });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ok: true, ready: ['cli_review'] }),
+      } as any;
+    });
+    await expect(prepareFederatedGroupReviewers(
+      dataDir,
+      DEFAULT_TEAM_ID,
+      'oc_pr',
+      ['cli_review'],
+      'room-1',
+      fetcher as any,
+    )).resolves.toEqual({ ready: ['cli_review'], failed: [] });
   });
 
   it('federation/group: remote creator retries owner adds across deployments, then transfers ownership', async () => {

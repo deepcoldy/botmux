@@ -4570,6 +4570,13 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
                                        用指定 bot 起新群；详见 \`botmux create-group --help\`
+  pr-room open <PR_URL> --owner-agent <name|larkAppId>
+                                       为 PR 建作者/Owner agent 协作群；同一 PR 幂等复用
+       adopt <PR_URL> --chat-id <oc_xxx>
+                                       接管 Owner 已创建的 review 群，避免重复拉群
+       repair <PR_URL>                  修复降级的 workdir / 远端信任 / kickoff
+       finish <PR_URL>                  结束生命周期（保留群与审查记录）
+       list                             列出 PR Room
 
 预设分享（导出某 bot 的可分享配置给同事，绝不含密钥）:
   preset export <bot> [--from-chat <chatId>] [--out <file>] [--yes]
@@ -9165,6 +9172,11 @@ switch (command) {
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'create-group': await cmdCreateGroup(process.argv.slice(3)); break;
+  case 'pr-room': {
+    const { cmdPrRoom } = await import('./cli/pr-room.js');
+    await cmdPrRoom(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
   case 'bots':     await cmdBots(process.argv[3] ?? 'list', process.argv.slice(4)); break;
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
