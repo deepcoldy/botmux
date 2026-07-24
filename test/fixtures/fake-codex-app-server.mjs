@@ -20,6 +20,7 @@ const logPath = process.env.FAKE_CODEX_LOG;
 const pidPath = process.env.FAKE_CODEX_PID_PATH;
 const behavior = process.env.FAKE_CODEX_BEHAVIOR ?? 'success';
 const previewDelayReads = Number(process.env.FAKE_CODEX_PREVIEW_DELAY_READS ?? '0');
+const threadNotLoadedReads = Number(process.env.FAKE_CODEX_THREAD_NOT_LOADED_READS ?? '0');
 const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
@@ -132,6 +133,14 @@ function handle(request) {
   }
   if (request.method === 'thread/read') {
     threadReadAttempt += 1;
+    if (behavior === 'thread-read-error') {
+      reject(request.id, -32600, `thread unavailable: ${request.params.threadId}`);
+      return;
+    }
+    if (threadReadAttempt <= threadNotLoadedReads) {
+      reject(request.id, -32600, `thread not loaded: ${request.params.threadId}`);
+      return;
+    }
     respond(request.id, {
       thread: {
         id: request.params.threadId,

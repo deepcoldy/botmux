@@ -252,6 +252,69 @@ describe('setCodexAppThreadName', () => {
     expect(methods.slice(setIndex + 1)).toContain('thread/read');
   });
 
+  it('retries while a fresh thread is not loaded before setting the final title', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-load-race-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await setCodexAppThreadName({
+      threadId: 'thread-loading',
+      name: '[BotMux·Lark] 离线推荐任务',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_THREAD_NOT_LOADED_READS: '2',
+      },
+      timeoutMs: 20_000,
+      waitForExistingPreview: true,
+    });
+
+    const requests = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    const methods = requests.map(request => request.method);
+    const setIndex = methods.indexOf('thread/name/set');
+    expect(methods.slice(0, setIndex).filter(method => method === 'thread/read')).toHaveLength(3);
+    expect(requests[setIndex]).toEqual(expect.objectContaining({
+      method: 'thread/name/set',
+      params: {
+        threadId: 'thread-loading',
+        name: '[BotMux·Lark] 离线推荐任务',
+      },
+    }));
+    expect(methods.slice(setIndex + 1)).toContain('thread/read');
+  });
+
+  it('does not retry a non-transient thread read failure', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-read-error-'));
+    tempDirs.push(dir);
+    const logPath = join(dir, 'requests.jsonl');
+
+    await expect(setCodexAppThreadName({
+      threadId: 'thread-unavailable',
+      name: '[BotMux·Lark] 不应写入',
+      codexBin: FAKE_CODEX,
+      cwd: dir,
+      env: {
+        ...process.env,
+        FAKE_CODEX_LOG: logPath,
+        FAKE_CODEX_BEHAVIOR: 'thread-read-error',
+      },
+      timeoutMs: 20_000,
+      waitForExistingPreview: true,
+    })).rejects.toThrow('thread unavailable: thread-unavailable');
+
+    const methods = readFileSync(logPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line).method);
+    expect(methods.filter(method => method === 'thread/read')).toHaveLength(1);
+    expect(methods).not.toContain('thread/name/set');
+  });
+
   it('sets the final title when the first-message preview remains unavailable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-thread-title-fallback-'));
     tempDirs.push(dir);
