@@ -784,6 +784,53 @@ describe('/botconfig skills JSON text command', () => {
   });
 });
 
+describe('/botconfig canTalkDaemonCommands uses the field parser (not the passthrough one)', () => {
+  it('persists daemon commands via the text command path', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-ctdc-'));
+    const configPath = join(dir, 'bots.json');
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: 'app-1',
+      larkAppSecret: 'secret-1',
+      cliId: 'codex',
+      allowedUsers: ['ou_sender'],
+    }]));
+    const bot = {
+      botName: 'Codex',
+      config: {
+        larkAppId: 'app-1',
+        larkAppSecret: 'secret-1',
+        cliId: 'codex' as const,
+        allowedUsers: ['ou_sender'],
+        workingDir: '~/projects',
+        workingDirs: ['~/projects'],
+      },
+      resolvedAllowedUsers: ['ou_sender'],
+    };
+    vi.mocked(getBot).mockReturnValue(bot as any);
+
+    try {
+      await handleCommand(
+        '/botconfig',
+        ROOT_ID,
+        // 默认 stringList 解析器（parseCustomPassthroughInput）会拒绝一切 daemon
+        // 命令——本字段必须走 spec.parseList，否则这里被当成"空值"拒绝。
+        makeLarkMessage('/botconfig set canTalkDaemonCommands status /Help', { senderId: 'ou_sender' }),
+        makeDeps(),
+        'app-1',
+      );
+
+      const stored = JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+      expect(stored.canTalkDaemonCommands).toEqual(['/status', '/help']);
+      expect((bot.config as any).canTalkDaemonCommands).toEqual(['/status', '/help']);
+    } finally {
+      delete process.env.BOTS_CONFIG;
+      rmSync(dir, { recursive: true, force: true });
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    }
+  });
+});
+
 describe('/botconfig string field goes through coerceConfigValue (maxLen)', () => {
   it('rejects an over-long displayName and persists a valid one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-botconfig-displayname-'));

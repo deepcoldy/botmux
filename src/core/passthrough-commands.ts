@@ -74,3 +74,21 @@ export function parseCustomPassthroughInput(raw: string): string[] {
   }
   return [...new Set(out)];
 }
+
+/**
+ * Parse free-text input for `canTalkDaemonCommands` — the inverse filter of
+ * {@link parseCustomPassthroughInput}: after the same normalization (lowercase,
+ * auto `/`), keep ONLY entries that ARE daemon commands. The default stringList
+ * parser (parseCustomPassthroughInput) rejects every daemon command, so wiring
+ * it to this field would silently drop all valid input.
+ */
+export function parseCanTalkDaemonCommandsInput(raw: string): string[] {
+  const out: string[] = [];
+  for (const tok of String(raw ?? '').split(/[\s,]+/)) {
+    const trimmed = tok.trim().toLowerCase();
+    if (!trimmed) continue;
+    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+    if (DAEMON_COMMANDS.has(withSlash)) out.push(withSlash);
+  }
+  return [...new Set(out)];
+}

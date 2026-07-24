@@ -999,7 +999,11 @@ async function handleConfigCommand(
     let value: unknown;
     switch (spec.kind) {
       case 'stringList': {
-        const arr = parseCustomPassthroughInput(rawValue);
+        // 与 card/config-store 路径（bot-config-store.ts 的 coerce）同口径：优先用
+        // 字段自带的 parseList——canTalkDaemonCommands / startupCommands 的解析规则
+        // 与默认的 parseCustomPassthroughInput 相反或不同，硬编码默认解析器会把
+        // 合法输入静默滤光成"空值"。
+        const arr = (spec.parseList ?? parseCustomPassthroughInput)(rawValue);
         if (arr.length === 0) { await reply(t('cmd.config.value_required', { field: spec.key }, loc)); return; }
         value = arr;
         break;

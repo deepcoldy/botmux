@@ -1334,6 +1334,33 @@ export function canOperate(
 }
 
 /**
+ * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
+ * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
+ * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
+ *
+ * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
+ * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight /land）
+ * 不受影响——内部闸仍是最终权威（fail-closed）。
+ *
+ * chatType 省略时 p2pOpen 腿不生效（fail-closed），与 canTalk 语义一致——
+ * 私聊路径的调用点必须把 chatType 传进来。
+ */
+export function canRunDaemonCommand(
+  larkAppId: string,
+  chatId: string | undefined,
+  senderOpenId: string | undefined,
+  senderUnionId: string | undefined,
+  cmd: string,
+  memberUnionId?: string | undefined,
+  chatType?: 'p2p' | 'group',
+): boolean {
+  if (canOperate(larkAppId, chatId, senderOpenId, senderUnionId)) return true;
+  const list = getBot(larkAppId).config.canTalkDaemonCommands;
+  if (!list?.includes(cmd)) return false;
+  return canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+}
+
+/**
  * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
  */

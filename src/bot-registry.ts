@@ -11,6 +11,7 @@ import type { VoiceConfig } from './services/voice/types.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
+import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
@@ -1069,6 +1070,19 @@ export interface BotConfig {
    */
   customPassthroughCommands?: string[];
   /**
+   * Daemon 命令的权限例外名单：列出的命令把权限闸从 canOperate（仅 allowedUsers）降到
+   * canTalk（oncall 群成员 / allowedChatGroups / chatGrant / globalGrant / p2pOpen 私聊
+   * 等对话放行腿）。与 passthrough 无关——命令仍由 daemon 自己处理，只是准入门槛不同。
+   * 解析时归一化（转小写、自动补 `/`、去重），且**只接受 DAEMON_COMMANDS 内的命令**，
+   * 其余条目丢弃并 warn。带 handler 内部第二道 owner 闸的命令（/card /term /insight /land）
+   * 即使列入也仍会被内部闸拒绝（fail-closed，不视为本字段的适用对象）。
+   * ⚠️ 与 `restrictGrantCommands` 的组合：那个开关在路由里先于本名单生效——开着时
+   * chatGrant/globalGrant 被授权人发任何 slash 命令都被更早的限制闸挡下，本名单
+   * 对他们不生效（oncall / allowedChatGroups / p2pOpen 等其余 canTalk 腿不受影响）。
+   * 未配置（undefined）→ 全部 daemon 命令保持 owner-only（现状）。
+   */
+  canTalkDaemonCommands?: string[];
+  /**
    * Optional per-bot startup commands: slash-command lines the worker types into
    * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
    * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
@@ -1778,6 +1792,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (uniq.length > 0) customPassthroughCommands = uniq;
     }
 
+    // canTalkDaemonCommands：daemon 命令的权限例外名单（canOperate → canTalk）。
+    // 归一化同 customPassthroughCommands（小写、补 `/`、去重），但语义相反——
+    // **只接受 DAEMON_COMMANDS 内的命令**（这里列的是 daemon 自己处理的命令，
+    // 不是透传）；不在集合内的条目（passthrough、拼错的）丢弃并 warn——丢弃是
+    // fail-closed 安全的，但静默会让配错的 owner 以为已生效。
+    let canTalkDaemonCommands: string[] | undefined;
+    if (Array.isArray(entry.canTalkDaemonCommands)) {
+      const strs = entry.canTalkDaemonCommands
+        .filter((x: any): x is string => typeof x === 'string')
+        .map((x: string) => x.trim().toLowerCase())
+        .map((x: string) => (x.startsWith('/') ? x : `/${x}`));
+      const dropped = strs.filter((x: string) => !DAEMON_COMMANDS.has(x));
+      if (dropped.length > 0) {
+        logger.warn(`[bot-registry:${entry.larkAppId}] canTalkDaemonCommands 丢弃非 daemon 命令条目: ${[...new Set(dropped)].join(' ')}（仅接受 daemon 命令，透传命令写 customPassthroughCommands）`);
+      }
+      const uniq = [...new Set<string>(strs.filter((x: string) => DAEMON_COMMANDS.has(x)))];
+      if (uniq.length > 0) canTalkDaemonCommands = uniq;
+    }
+
     // tuiSlashAllow：botmux 通用 slash 注入通道（inject_command，见
     // core/slash-inject.ts）的 CLI 原生命令 allowlist。归一化规则与
     // customPassthroughCommands 同款：转小写、自动补前导 `/`、按
@@ -1896,6 +1929,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
       customPassthroughCommands,
+      canTalkDaemonCommands,
       tuiSlashAllow,
       startupCommands,
       env,
