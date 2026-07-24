@@ -132,80 +132,129 @@ describe('read-only web terminal wheel scrolling', () => {
     }
   });
 
-  it('server rate-limits scroll ticks per WS so a direct message flood is bounded', () => {
+  it('shared idle-reset burst: multi-WS cannot stack, sustained flood stays ≤6, reconnect never refreshes', () => {
     const MAX = 6;
     const WINDOW = 250;
-    // Faithful port of consumeReadonlyScrollTokens (WeakMap<ws> → per-connection).
-    const buckets = new Map<object, { tokens: number; last: number }>();
-    function consume(ws: object, wantTicks: number, now: number): number {
+    // Faithful port of admitReadonlyScrollTicks — a SINGLE shared burst counter,
+    // NOT per-connection. Resets only after a full idle window or a direction
+    // reversal, mirroring #577's client _fwdScroll gesture cap.
+    const burst = { ticks: 0, dir: 0, last: -Infinity };
+    function admit(dir: 'up' | 'down', wantTicks: number, now: number): number {
       if (wantTicks <= 0) return 0;
-      const refillRate = MAX / WINDOW;
-      let bucket = buckets.get(ws);
-      if (!bucket) { bucket = { tokens: MAX, last: now }; buckets.set(ws, bucket); }
-      const elapsed = Math.max(0, now - bucket.last);
-      bucket.tokens = Math.min(MAX, bucket.tokens + elapsed * refillRate);
-      bucket.last = now;
-      const granted = Math.min(wantTicks, Math.floor(bucket.tokens));
-      if (granted > 0) bucket.tokens -= granted;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst.last >= WINDOW;
+      const reversed = burst.dir !== 0 && dirSign !== burst.dir;
+      if (idle || reversed) burst.ticks = 0;
+      burst.dir = dirSign;
+      burst.last = now;
+      const remaining = MAX - burst.ticks;
+      if (remaining <= 0) return 0;
+      const granted = Math.min(wantTicks, remaining);
+      burst.ticks += granted;
       return granted;
     }
 
-    // Attack: a viewToken holder loops {lines:6} 100× at t=0 (same instant).
-    const ws = {};
-    let ticksAtT0 = 0;
-    for (let i = 0; i < 100; i++) ticksAtT0 += consume(ws, 6, 0);
-    // Only the initial bucket (6) is granted — the other 99 messages get nothing.
-    expect(ticksAtT0).toBe(6);
-
-    // After a full window the bucket refills to its cap, not beyond.
-    let ticksAfterWindow = 0;
-    for (let i = 0; i < 100; i++) ticksAfterWindow += consume(ws, 6, WINDOW);
-    expect(ticksAfterWindow).toBe(6);
-
-    // Sustained throughput over 1s of flooding is bounded to ~MAX per window,
-    // NOT the ~100× the attacker attempted. (t=0 burst + 4 refills across 1000ms.)
-    const buckets2 = new Map<object, { tokens: number; last: number }>();
-    function consume2(ws2: object, want: number, now: number): number {
-      if (want <= 0) return 0;
-      const refillRate = MAX / WINDOW;
-      let b = buckets2.get(ws2);
-      if (!b) { b = { tokens: MAX, last: now }; buckets2.set(ws2, b); }
-      const el = Math.max(0, now - b.last);
-      b.tokens = Math.min(MAX, b.tokens + el * refillRate);
-      b.last = now;
-      const g = Math.min(want, Math.floor(b.tokens));
-      if (g > 0) b.tokens -= g;
-      return g;
+    // (1) Multi-connection at the SAME instant cannot stack past 6. Simulate N=10
+    //     sockets each looping {lines:6}; the shared burst caps the total at 6.
+    let totalAtT0 = 0;
+    for (let socket = 0; socket < 10; socket++) {
+      for (let i = 0; i < 100; i++) totalAtT0 += admit('up', 6, 0);
     }
-    const ws2 = {};
-    let total = 0;
-    for (let t = 0; t <= 1000; t += 10) total += consume2(ws2, 6, t); // flood every 10ms
-    // ≈ initial 6 + 1000ms/250ms×6 = 6 + 24 = 30, far below the 606 attempted.
-    expect(total).toBeLessThanOrEqual(30);
-    expect(total).toBeGreaterThanOrEqual(24);
+    expect(totalAtT0).toBe(6); // NOT 6·N — one shared ceiling
 
-    // Two viewers each get their OWN bucket — a second socket cannot borrow the
-    // first's spent tokens, but also proves stacking is per-connection bounded.
-    const a = {}; const b = {};
-    expect(consume(a, 6, 2000)).toBe(6);
-    expect(consume(a, 6, 2000)).toBe(0); // a is now empty at this instant
-    expect(consume(b, 6, 2000)).toBe(6); // b independent, still capped at 6
+    // (2) Sustained flood over 1s from many interleaved sockets. The burst only
+    //     resets on a FULL idle window; continuous traffic never idles, so after
+    //     the first 6 nothing more is admitted for the whole second.
+    const burst2 = { ticks: 0, dir: 0, last: -Infinity };
+    function admit2(dir: 'up' | 'down', want: number, now: number): number {
+      if (want <= 0) return 0;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst2.last >= WINDOW;
+      const reversed = burst2.dir !== 0 && dirSign !== burst2.dir;
+      if (idle || reversed) burst2.ticks = 0;
+      burst2.dir = dirSign; burst2.last = now;
+      const remaining = MAX - burst2.ticks;
+      if (remaining <= 0) return 0;
+      const g = Math.min(want, remaining); burst2.ticks += g; return g;
+    }
+    let sustained = 0;
+    for (let t = 0; t <= 1000; t += 10) { // flood every 10ms — never idle for 250ms
+      for (let socket = 0; socket < 3; socket++) sustained += admit2('up', 6, t);
+    }
+    expect(sustained).toBe(6); // continuous traffic never resets → still just 6
+
+    // (3) A full idle window (everyone quiet ≥250ms) is required to reopen.
+    const burst3 = { ticks: 0, dir: 0, last: -Infinity };
+    function admit3(dir: 'up' | 'down', want: number, now: number): number {
+      if (want <= 0) return 0;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst3.last >= WINDOW;
+      const reversed = burst3.dir !== 0 && dirSign !== burst3.dir;
+      if (idle || reversed) burst3.ticks = 0;
+      burst3.dir = dirSign; burst3.last = now;
+      const remaining = MAX - burst3.ticks;
+      if (remaining <= 0) return 0;
+      const g = Math.min(want, remaining); burst3.ticks += g; return g;
+    }
+    expect(admit3('up', 6, 0)).toBe(6);        // first gesture
+    expect(admit3('up', 6, 100)).toBe(0);      // 100ms later — still same burst
+    expect(admit3('up', 6, 200)).toBe(0);      // 200ms — still not idle enough
+    expect(admit3('up', 6, 450)).toBe(6);      // 250ms after last (200) → reset, reopens
+
+    // (4) Reconnect does NOT refresh the budget — the burst is shared/global, not
+    //     tied to a socket. A "new connection" that keeps flooding within the
+    //     window sees the burst already spent.
+    const burst4 = { ticks: 0, dir: 0, last: -Infinity };
+    function admit4(dir: 'up' | 'down', want: number, now: number): number {
+      if (want <= 0) return 0;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst4.last >= WINDOW;
+      const reversed = burst4.dir !== 0 && dirSign !== burst4.dir;
+      if (idle || reversed) burst4.ticks = 0;
+      burst4.dir = dirSign; burst4.last = now;
+      const remaining = MAX - burst4.ticks;
+      if (remaining <= 0) return 0;
+      const g = Math.min(want, remaining); burst4.ticks += g; return g;
+    }
+    expect(admit4('up', 6, 0)).toBe(6);   // socket #1 spends the burst
+    // socket #1 "closes", socket #2 "opens" and floods 50ms later — no fresh 6.
+    expect(admit4('up', 6, 50)).toBe(0);
+    expect(admit4('up', 6, 100)).toBe(0);
+
+    // (5) Direction reversal starts a new gesture (matches #577 client behaviour).
+    const burst5 = { ticks: 0, dir: 0, last: -Infinity };
+    function admit5(dir: 'up' | 'down', want: number, now: number): number {
+      if (want <= 0) return 0;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst5.last >= WINDOW;
+      const reversed = burst5.dir !== 0 && dirSign !== burst5.dir;
+      if (idle || reversed) burst5.ticks = 0;
+      burst5.dir = dirSign; burst5.last = now;
+      const remaining = MAX - burst5.ticks;
+      if (remaining <= 0) return 0;
+      const g = Math.min(want, remaining); burst5.ticks += g; return g;
+    }
+    expect(admit5('up', 6, 0)).toBe(6);   // up burst exhausted
+    expect(admit5('up', 6, 10)).toBe(0);  // still up, still spent
+    expect(admit5('down', 6, 20)).toBe(6); // reversed → new gesture reopens
   });
 
-  it('the scroll handler consumes tokens BEFORE writing, and drops on empty bucket', () => {
+  it('the scroll handler admits ticks BEFORE writing, and drops on exhausted burst', () => {
     // Ordering matters: rate-limit gate must run before backend.write.
     const handler = workerSource.slice(
       workerSource.indexOf("} else if (msg.type === 'scroll') {"),
       workerSource.indexOf('backend?.write(seq);') + 'backend?.write(seq);'.length,
     );
-    expect(handler).toContain('const grantedTicks = consumeReadonlyScrollTokens(ws, wantTicks, Date.now());');
+    expect(handler).toContain('const grantedTicks = admitReadonlyScrollTicks(msg.dir, wantTicks, Date.now());');
     expect(handler).toContain('if (grantedTicks <= 0) return;');
     expect(handler).toContain('buildReadonlyWheelSequence(msg.dir, msg.lines, grantedTicks)');
-    // consume must appear before the write.
-    expect(handler.indexOf('consumeReadonlyScrollTokens'))
+    // admit must appear before the write.
+    expect(handler.indexOf('admitReadonlyScrollTicks'))
       .toBeLessThan(handler.indexOf('backend?.write(seq)'));
-    // The bucket is a WeakMap keyed on the WS (auto-GC, per-connection).
-    expect(workerSource).toContain('const readonlyScrollBuckets = new WeakMap<WebSocket');
+    // The burst is a SINGLE shared counter (not per-connection), so multiple
+    // viewers/connections cannot stack past the cap.
+    expect(workerSource).toContain('const readonlyScrollBurst = { ticks: 0, dir: 0, last: -Infinity };');
+    expect(workerSource).not.toContain('new WeakMap<WebSocket, { tokens');
     expect(workerSource).toContain('const READONLY_SCROLL_MAX_TICKS = 6;');
     expect(workerSource).toContain('const READONLY_SCROLL_WINDOW_MS = 250;');
   });

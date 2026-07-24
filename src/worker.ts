@@ -822,15 +822,20 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
-/** Per-WS token bucket bounding read-only {type:'scroll'} throughput. The
- *  client-side clamp (lines≤6) only binds the page; a viewToken holder can
- *  bypass the page and loop scroll messages directly, so the SERVER must cap the
- *  synthesized wheel-tick rate. Mirrors the client's per-gesture ceiling from
- *  #577 (6 ticks / 250ms) but enforced per connection, so multiple viewers can't
- *  stack. WeakMap → state is GC'd when the socket closes. */
-const readonlyScrollBuckets = new WeakMap<WebSocket, { tokens: number; last: number }>();
-const READONLY_SCROLL_MAX_TICKS = 6;      // bucket capacity == #577's per-gesture cap
-const READONLY_SCROLL_WINDOW_MS = 250;    // full refill window
+/** SHARED (session/backend-scoped) idle-reset burst gate for read-only
+ *  {type:'scroll'} intents. The client-side clamp (lines≤6) only binds the page;
+ *  a viewToken holder can bypass it and loop scroll messages, and can open N
+ *  connections. A PER-connection bucket would let N viewers write 6·N ticks at
+ *  once, and a refilling bucket would allow sustained ~24 tick/s — both defeat
+ *  #577's guarantee. So this is a SINGLE counter shared across every viewer,
+ *  mirroring the client's _fwdScroll gesture cap exactly: at most
+ *  READONLY_SCROLL_MAX_TICKS ticks per continuous burst, and the burst only
+ *  resets after a full READONLY_SCROLL_WINDOW_MS of idle (or a direction
+ *  reversal). Continuous flooding — from one socket or many — never exceeds 6
+ *  until everyone goes quiet for the window. */
+const readonlyScrollBurst = { ticks: 0, dir: 0, last: -Infinity };
+const READONLY_SCROLL_MAX_TICKS = 6;      // ticks per continuous burst == #577's per-gesture cap
+const READONLY_SCROLL_WINDOW_MS = 250;    // idle gap that resets the burst
 const writeToken = randomBytes(16).toString('hex');
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret.
@@ -4026,26 +4031,32 @@ function exitTmuxScrollMode(): void {
 }
 
 /**
- * Consume up to `wantTicks` from this WS's read-only-scroll token bucket, and
- * return how many ticks are actually allowed right now. A refilling bucket caps
- * sustained throughput at READONLY_SCROLL_MAX_TICKS per READONLY_SCROLL_WINDOW_MS,
- * per connection — so a viewToken holder looping scroll messages directly
- * (bypassing the page's own clamp) cannot flood the backend, and multiple viewers
- * cannot stack past each socket's own limit. Returns 0 when the bucket is empty.
+ * Admit up to `wantTicks` of read-only scroll into the SHARED idle-reset burst,
+ * returning how many ticks are allowed right now. This is not a refilling bucket
+ * — it faithfully mirrors #577's client _fwdScroll gesture cap, but server-side
+ * and shared across ALL viewers:
+ *   • a full READONLY_SCROLL_WINDOW_MS of idle (no scroll from anyone) resets the
+ *     burst to empty — only THEN can another 6 ticks flow;
+ *   • a direction reversal also resets it (a new gesture);
+ *   • otherwise continuous traffic — from one socket or N sockets interleaved —
+ *     shares the same 6-tick ceiling and cannot exceed it until things go quiet.
+ * So neither multi-connection stacking nor sustained flooding can beat the cap.
+ * Returns 0 when the current burst is already exhausted.
  */
-function consumeReadonlyScrollTokens(ws: WebSocket, wantTicks: number, now: number): number {
+function admitReadonlyScrollTicks(dir: 'up' | 'down', wantTicks: number, now: number): number {
   if (wantTicks <= 0) return 0;
-  const refillRate = READONLY_SCROLL_MAX_TICKS / READONLY_SCROLL_WINDOW_MS; // tokens per ms
-  let bucket = readonlyScrollBuckets.get(ws);
-  if (!bucket) {
-    bucket = { tokens: READONLY_SCROLL_MAX_TICKS, last: now };
-    readonlyScrollBuckets.set(ws, bucket);
+  const dirSign = dir === 'up' ? -1 : 1;
+  const idle = now - readonlyScrollBurst.last >= READONLY_SCROLL_WINDOW_MS;
+  const reversed = readonlyScrollBurst.dir !== 0 && dirSign !== readonlyScrollBurst.dir;
+  if (idle || reversed) {
+    readonlyScrollBurst.ticks = 0; // new gesture
   }
-  const elapsed = Math.max(0, now - bucket.last);
-  bucket.tokens = Math.min(READONLY_SCROLL_MAX_TICKS, bucket.tokens + elapsed * refillRate);
-  bucket.last = now;
-  const granted = Math.min(wantTicks, Math.floor(bucket.tokens));
-  if (granted > 0) bucket.tokens -= granted;
+  readonlyScrollBurst.dir = dirSign;
+  readonlyScrollBurst.last = now;
+  const remaining = READONLY_SCROLL_MAX_TICKS - readonlyScrollBurst.ticks;
+  if (remaining <= 0) return 0;
+  const granted = Math.min(wantTicks, remaining);
+  readonlyScrollBurst.ticks += granted;
   return granted;
 }
 
@@ -8262,15 +8273,18 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // so no click/drag/coordinate can be forged. Gated to adapters that
               // opted in; ignored entirely otherwise.
               if (cliAdapter?.readonlyWheelScroll !== true) return;
-              // Rate-limit per WS: the client clamp (lines≤6) only binds the page.
-              // A viewToken holder can loop scroll messages directly, so the SERVER
-              // caps sustained tick throughput (6/250ms, per connection) — this is
-              // the server-side floor that also protects Herdr's expensive path.
+              // Rate-limit: the client clamp (lines≤6) only binds the page. A
+              // viewToken holder can loop scroll messages AND open many WS. So the
+              // SERVER admits ticks through a SHARED idle-reset burst (see
+              // admitReadonlyScrollTicks) — mirroring #577's per-gesture cap across
+              // all viewers: continuous traffic (one socket or many) shares one
+              // 6-tick ceiling and only resets after a full idle window.
+              if (msg.dir !== 'up' && msg.dir !== 'down') return;
               const wantTicks = typeof msg.lines === 'number' && Number.isFinite(msg.lines)
                 ? Math.max(1, Math.min(READONLY_SCROLL_MAX_TICKS, Math.floor(msg.lines)))
                 : 1;
-              const grantedTicks = consumeReadonlyScrollTokens(ws, wantTicks, Date.now());
-              if (grantedTicks <= 0) return; // bucket empty — drop the flood
+              const grantedTicks = admitReadonlyScrollTicks(msg.dir, wantTicks, Date.now());
+              if (grantedTicks <= 0) return; // burst exhausted — drop the flood
               const seq = buildReadonlyWheelSequence(msg.dir, msg.lines, grantedTicks);
               if (!seq) return;
               if (usesHerdrSnapshotWebHistory()) {
