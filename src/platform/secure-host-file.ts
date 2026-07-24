@@ -71,6 +71,11 @@ function assertAncestorChainCannotReplace(canonicalParent: string): void {
   if (process.platform === 'win32' || !process.getuid) return;
   const uid = process.getuid();
   const trustedOwner = (owner: number) => owner === uid || owner === 0;
+  const isFilesystemRoot = (path: string, stats: import('node:fs').Stats) => {
+    const parentPath = dirname(path);
+    if (parentPath === path) return true;
+    return statSync(parentPath).dev !== stats.dev;
+  };
   let childPath = canonicalParent;
   let childStats = statSync(childPath);
 
@@ -89,7 +94,11 @@ function assertAncestorChainCannotReplace(canonicalParent: string): void {
       const stickyProtectsChild = (ancestorStats.mode & 0o1000) !== 0
         && trustedOwner(ancestorStats.uid)
         && trustedOwner(childStats.uid);
-      if (!stickyProtectsChild) {
+      const hostMountRootProtectsChild = untrustedOwnerCanWrite
+        && !groupOrOtherCanWrite
+        && isFilesystemRoot(ancestorPath, ancestorStats)
+        && trustedOwner(childStats.uid);
+      if (!stickyProtectsChild && !hostMountRootProtectsChild) {
         throw new UnsafeHostAuthorityFileError('宿主凭证目录可被不可信祖先目录替换');
       }
     }

@@ -11,6 +11,7 @@ interface RawEventData {
   sender: {
     sender_id: {
       open_id?: string;
+      app_id?: string;
       user_id?: string;
       union_id?: string;
     };
@@ -719,6 +720,22 @@ function isLegacyFormatBFooterLine(line: string): boolean {
     .test(inner);
 }
 
+function extractRenderedCardContent(rawContent: string): string | undefined {
+  const match = rawContent.match(/^\s*<card(?:\s+title="([^"]*)")?\s*>([\s\S]*)<\/card>\s*$/);
+  if (!match) return undefined;
+  const title = match[1]?.trim();
+  const body = match[2]
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => !isBotmuxFooterLine(line))
+    .join('\n')
+    .trim();
+  return [
+    title ? `[卡片: ${title}]` : '',
+    body,
+  ].filter(Boolean).join('\n') || '[卡片]';
+}
+
 /**
  * Extract human-readable text from an interactive card.
  *
@@ -728,6 +745,9 @@ function isLegacyFormatBFooterLine(line: string): boolean {
  * (header/config/elements with tag objects) for locally-cached cards.
  */
 export function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+  const rendered = extractRenderedCardContent(rawContent);
+  if (rendered !== undefined) return rendered;
+
   try {
     const card = JSON.parse(rawContent);
 

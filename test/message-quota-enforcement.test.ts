@@ -202,6 +202,23 @@ describe('message quota enforcement', () => {
     );
   });
 
+  it('allows a sender already authorized by a message listener match', async () => {
+    await expect(enforceMessageQuotaForCliInput(
+      'quota_app',
+      'oc_1',
+      undefined,
+      'om_listener',
+      'om_anchor',
+      undefined,
+      undefined,
+      'group',
+      undefined,
+      { listenerAuthorized: true },
+    )).resolves.toBe(true);
+    expect(mocks.beginCharge).not.toHaveBeenCalled();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+  });
+
   it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {
     // exhausted=true 表示「本条刚好用完额度」——依旧放行给 AI 处理，但不在此时 revoke/notify
     // （避免给用户「本条已被拒绝」的错觉）；revoke + 通知推迟到下一条被 allow=false 拦截时再做。

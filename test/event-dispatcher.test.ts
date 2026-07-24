@@ -137,7 +137,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, mentionsAnotherMember, markForwardFollowupsSessionsReady, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -796,6 +796,7 @@ function setupBotState(opts?: {
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
+	  messageListeners?: Record<string, unknown>;
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  p2pMode?: 'thread' | 'chat';
 	  summaryRange?: { limit?: number; sinceHours?: number };
@@ -808,7 +809,7 @@ function setupBotState(opts?: {
 	    topicActiveSessionTrigger?: boolean;
 	  };
 	}) {
-  mockGetBot.mockReturnValue({
+  const state = {
     config: {
       larkAppId: MY_APP_ID,
       larkAppSecret: 'secret',
@@ -824,6 +825,7 @@ function setupBotState(opts?: {
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
+	      messageListeners: opts?.messageListeners,
 	      chatReplyModes: opts?.chatReplyModes,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
@@ -831,7 +833,9 @@ function setupBotState(opts?: {
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
     resolvedAllowedUsers: opts?.allowedUsers ?? [],
-  });
+  };
+  mockGetBot.mockReturnValue(state);
+  return state;
 }
 
 	function makeHandlers(): EventHandlers & {
@@ -857,6 +861,7 @@ function setupBotState(opts?: {
 /** Build a Lark im.message.receive_v1 event data object */
 function makeBotMessageEvent(opts: {
   senderOpenId: string;
+  senderAppId?: string;
   content: string;
   rootId?: string;
   /** Pass `null` to omit thread_id (model Lark quote-bubble quirk).
@@ -866,6 +871,7 @@ function makeBotMessageEvent(opts: {
   chatId?: string;
   chatType?: string;
   messageId?: string;
+  messageType?: string;
   mentions?: TestMention[];
   /** Override `sender.sender_type`. Defaults to `'app'`. Use `'bot'` to model
    *  飞书在跨 bot 卡片消息场景实测投递的值。 */
@@ -880,12 +886,15 @@ function makeBotMessageEvent(opts: {
       thread_id: threadId,
       chat_id: opts.chatId ?? 'chat-001',
       chat_type: opts.chatType ?? 'group',
+      message_type: opts.messageType ?? 'text',
       content: opts.content,
       mentions: opts.mentions,
     },
     sender: {
       sender_type: opts.senderType ?? 'app',
-      sender_id: { open_id: opts.senderOpenId },
+      sender_id: opts.senderOpenId
+        ? { open_id: opts.senderOpenId, ...(opts.senderAppId ? { app_id: opts.senderAppId } : {}) }
+        : { app_id: opts.senderAppId },
     },
   };
 }
@@ -919,6 +928,35 @@ function makeUserMessageEvent(opts: {
     sender: {
       sender_type: 'user',
       sender_id: { open_id: opts.senderOpenId },
+    },
+  };
+}
+
+function makeHistoryMessage(opts: {
+  senderOpenId?: string;
+  senderAppId?: string;
+  senderType?: string;
+  content: string;
+  rootId?: string;
+  threadId?: string;
+  chatId?: string;
+  messageId?: string;
+  messageType?: string;
+  createTime?: string;
+}) {
+  return {
+    message_id: opts.messageId ?? 'msg-history-001',
+    root_id: opts.rootId,
+    thread_id: opts.threadId,
+    chat_id: opts.chatId ?? 'chat-001',
+    chat_type: 'group',
+    msg_type: opts.messageType ?? 'text',
+    content: opts.content,
+    create_time: opts.createTime ?? String(Date.now()),
+    sender: {
+      id: opts.senderOpenId ?? opts.senderAppId,
+      id_type: opts.senderAppId && !opts.senderOpenId ? 'app_id' : 'open_id',
+      sender_type: opts.senderType ?? (opts.senderAppId ? 'app' : 'user'),
     },
   };
 }
@@ -1493,6 +1531,119 @@ describe('im.message.receive_v1 — message_id dedupe (re-push protection)', () 
   });
 });
 
+describe('message listener polling backfill', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '只处理 Argos 告警',
+          replyCardTitle: 'Argos 告警自动分析',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [OTHER_BOT_APP_ID],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+  });
+
+  it('routes a recent top-level Argos interactive card found in chat history', async () => {
+    const card = makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-polled-argos',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'Lego插件调用 SLA 低于 95%' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat_listener', expect.objectContaining({
+      pageSize: expect.any(Number),
+      stopAfter: expect.any(Function),
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-argos' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-polled-argos',
+        messageId: 'msg-polled-argos',
+        messageListener: expect.objectContaining({
+          replyCardTitle: 'Argos 告警自动分析',
+          senderOpenId: OTHER_BOT_APP_ID,
+          senderType: 'bot',
+          msgType: 'interactive',
+        }),
+      }),
+    );
+  });
+
+  it('does not replay a polled listener message after the message_id is claimed', async () => {
+    const card = makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-polled-once',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'abase 写流量告警' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValue([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+  });
+
+  it('starts polling after a listener is enabled at runtime', async () => {
+    vi.useFakeTimers();
+    const state = setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+    });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    state.config.messageListeners = {
+      chat_listener: {
+        enabled: true,
+        prompt: '只处理 Argos 告警',
+        senderPolicy: {
+          mode: 'include_only',
+          includeSenderOpenIds: [OTHER_BOT_APP_ID],
+          includeSenderTypes: ['bot'],
+        },
+        messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+      },
+    };
+    mockListChatMessagesUntil.mockResolvedValueOnce([]);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(mockListChatMessagesUntil).toHaveBeenCalledWith(MY_APP_ID, 'chat_listener', expect.any(Object));
+    vi.useRealTimers();
+  });
+});
+
 describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
@@ -1603,6 +1754,93 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes non-mentioned bot messages through configured group listener', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '只处理告警机器人消息',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [OTHER_BOT_OPEN_ID],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: 'CPU 告警持续 5 分钟' }),
+      rootId: undefined,
+      threadId: null,
+      messageId: 'msg-listener-bot',
+      chatId: 'chat_listener',
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-listener-bot',
+      messageId: 'msg-listener-bot',
+      messageListener: expect.objectContaining({
+        prompt: '只处理告警机器人消息',
+        messageText: 'CPU 告警持续 5 分钟',
+        senderOpenId: OTHER_BOT_OPEN_ID,
+        senderType: 'bot',
+      }),
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('routes bot listener messages when Lark provides only app_id as sender id', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '只处理 Argos 告警',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [OTHER_BOT_APP_ID],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: '',
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'abase 写流量告警' }]] }),
+      rootId: undefined,
+      threadId: null,
+      messageId: 'msg-listener-app-id',
+      chatId: 'chat_listener',
+    });
+    event.message.root_id = undefined as any;
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-listener-app-id',
+      messageListener: expect.objectContaining({
+        senderOpenId: OTHER_BOT_APP_ID,
+        senderType: 'bot',
+      }),
+    }));
   });
 
   it('ignores cross-bot @mention in chat-scope from an unknown bot', async () => {

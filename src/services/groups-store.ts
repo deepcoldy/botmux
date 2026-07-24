@@ -10,7 +10,7 @@
  * proxy selection happens at the route layer.
  */
 import { getBotClient } from '../bot-registry.js';
-import { larkGet } from '../im/lark/client.js';
+import { larkGet, listChatBotMembers } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
 export interface ChatBrief {
@@ -432,4 +432,60 @@ export async function addUsersToChatByUnionId(
     }
   }
   return { invalidUserIds };
+}
+
+export interface ChatMemberDisplay {
+  openId: string;
+  name: string;
+  memberType: 'user' | 'bot' | 'unknown';
+}
+
+export async function listChatMemberDisplays(larkAppId: string, chatId: string): Promise<ChatMemberDisplay[]> {
+  const client = getBotClient(larkAppId);
+  const out: ChatMemberDisplay[] = [];
+  const seen = new Map<string, number>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const params: Record<string, string> = {
+      member_id_type: 'open_id',
+      page_size: '100',
+      with_member_name: 'true',
+    };
+    if (pageToken) params.page_token = pageToken;
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+    if (res.code !== 0 && res.code !== undefined) {
+      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+    }
+    for (const item of res.data?.items ?? []) {
+      const openId = String(item?.member_id ?? '').trim();
+      if (!openId) continue;
+      const name = String(item?.name ?? item?.member_name ?? item?.display_name ?? openId).trim() || openId;
+      const typeRaw = String(item?.member_type ?? item?.type ?? '').trim();
+      const memberType: ChatMemberDisplay['memberType'] = typeRaw === 'bot' || typeRaw === 'app'
+        ? 'bot'
+        : typeRaw === 'user' ? 'user' : 'unknown';
+      seen.set(openId, out.length);
+      out.push({ openId, name, memberType });
+    }
+    if (!res.data?.has_more || !res.data?.page_token) break;
+    pageToken = res.data.page_token;
+  }
+  try {
+    const bots = await listChatBotMembers(larkAppId, chatId);
+    for (const bot of bots) {
+      const openId = String(bot.openId ?? '').trim();
+      if (!openId) continue;
+      const name = String(bot.displayName ?? bot.name ?? openId).trim() || openId;
+      const existing = seen.get(openId);
+      if (existing === undefined) {
+        seen.set(openId, out.length);
+        out.push({ openId, name, memberType: 'bot' });
+      } else {
+        out[existing] = { openId, name, memberType: 'bot' };
+      }
+    }
+  } catch (err) {
+    logger.debug(`Failed to merge chat bot displays for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return out;
 }

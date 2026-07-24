@@ -71,7 +71,7 @@ import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessi
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
@@ -98,6 +98,15 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
+import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import {
+  MAX_MESSAGE_LISTENER_PROMPT_BYTES,
+  normalizeMessageListenerPreviewLimit,
+  previewMessageListenerMatches,
+  renderMessageListenerPrompt,
+  type MessageListenerPreviewMatch,
+} from '../services/message-listener.js';
+import { listChatMemberDisplays } from '../services/groups-store.js';
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -133,7 +142,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -2186,12 +2195,13 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
+      const hasMessageListener = getMessageListenerConfig(cachedLarkAppId, c.chatId)?.enabled === true;
       // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
       // 它识别「介绍过同团队机器人的协作群」。
       const observedBotNames = observedBotsStore
         .listObservedBots(config.session.dataDir, cachedLarkAppId, c.chatId)
         .map(b => b.name);
-      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, observedBotNames };
+      return { ...c, oncallChat: oncall ?? null, firstSeenAt: seenMap.get(c.chatId) ?? null, hasRole, hasMessageListener, observedBotNames };
     });
     jsonRes(res, 200, { chats: enriched });
   } catch (e) {
@@ -2399,6 +2409,211 @@ ipcRoute('DELETE', '/api/roles/:chatId', async (_req, res, p) => {
   const existed = deleteRoleFile(cachedLarkAppId, p.chatId);
   deleteRoleInjectMode(cachedLarkAppId, p.chatId);
   jsonRes(res, 200, { ok: true, existed });
+});
+
+ipcRoute('GET', '/api/message-listeners/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, {
+    chatId: p.chatId,
+    listener: getMessageListenerConfig(cachedLarkAppId, p.chatId),
+    maxPromptBytes: MAX_MESSAGE_LISTENER_PROMPT_BYTES,
+  });
+});
+
+ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const update = sanitizeMessageListenerUpdate(body);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
+    return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  }
+  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
+  if (!result.ok) return jsonRes(res, ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, listener: result.listener });
+});
+
+function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderTypeRaw?: string } {
+  const sender = message?.sender ?? {};
+  const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
+    ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
+  const senderIdType = sender.id_type ?? sender.sender_id_type;
+  const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (senderIdType === 'app_id' ? 'app' : undefined);
+  return {
+    senderOpenId: typeof senderId === 'string' ? senderId : undefined,
+    senderTypeRaw: typeof senderTypeRaw === 'string' ? senderTypeRaw : undefined,
+  };
+}
+
+async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
+  | { ok: true; listener: NonNullable<ReturnType<typeof sanitizeMessageListenerUpdate>>; limit: number }
+  | { ok: false; status: number; error: string }
+> {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return { ok: false, status: 400, error: 'bad_json' }; }
+  const raw = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : {};
+  const listener = sanitizeMessageListenerUpdate(raw.listener ?? raw);
+  if (!listener) return { ok: false, status: 400, error: 'invalid_listener' };
+  const validation = validateMessageListenerUpdate(listener);
+  if (!validation.ok) return { ok: false, status: 400, error: validation.reason };
+  if (listener.prompt && Buffer.byteLength(listener.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
+    return { ok: false, status: 400, error: 'prompt_too_large' };
+  }
+  return { ok: true, listener, limit: normalizeMessageListenerPreviewLimit(raw.limit) };
+}
+
+async function collectMessageListenerPreviewMatches(
+  larkAppId: string,
+  chatId: string,
+  listener: NonNullable<ReturnType<typeof sanitizeMessageListenerUpdate>>,
+  limit: number,
+): Promise<MessageListenerPreviewMatch[]> {
+  const bot = getBot(larkAppId);
+  const previewListener: MessageListenerConfig = {
+    enabled: true,
+    ...(listener.name ? { name: listener.name } : {}),
+    ...(listener.replyCardTitle ? { replyCardTitle: listener.replyCardTitle } : {}),
+    ...(listener.workingDir ? { workingDir: listener.workingDir } : {}),
+    prompt: listener.prompt,
+    ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
+    ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
+    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+  };
+  const previewBot = {
+    ...bot,
+    config: {
+      ...bot.config,
+      messageListeners: {
+        ...(bot.config.messageListeners ?? {}),
+        [chatId]: previewListener,
+      },
+    },
+  };
+  const messages = await listChatMessagesUntil(larkAppId, chatId, {
+    pageSize: 50,
+    stopAfter: (_message, seenCount) => seenCount >= Math.max(100, limit * 5),
+  });
+  return previewMessageListenerMatches({
+    bot: previewBot,
+    chatId,
+    messages,
+    limit,
+    senderForMessage: dashboardHistoryMessageSender,
+  });
+}
+
+function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<string, unknown> {
+  return {
+    messageId: match.messageId,
+    createTime: match.createTime,
+    messageText: match.messageText,
+    msgType: match.msgType,
+    senderOpenId: match.senderOpenId,
+    senderType: match.senderType,
+  };
+}
+
+ipcRoute('POST', '/api/message-listeners/:chatId/preview', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  const parsed = await readMessageListenerPreviewRequest(req);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  try {
+    const matches = await collectMessageListenerPreviewMatches(cachedLarkAppId, p.chatId, parsed.listener, parsed.limit);
+    jsonRes(res, 200, {
+      ok: true,
+      requestedLimit: parsed.limit,
+      matches: matches.map(publicMessageListenerMatch),
+    });
+  } catch (err) {
+    jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'active session registry unavailable' });
+  const parsed = await readMessageListenerPreviewRequest(req);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  try {
+    const matches = await collectMessageListenerPreviewMatches(cachedLarkAppId, p.chatId, parsed.listener, parsed.limit);
+    const results = [];
+    for (const match of matches) {
+      try {
+        const result = await triggerSessionTurn({
+          source: {
+            type: 'ui',
+            connectorId: 'message-listener-preview',
+            requestId: `listener-preview:${match.messageId}`,
+            receivedAt: new Date().toISOString(),
+          },
+          target: {
+            kind: 'turn',
+            botId: cachedLarkAppId,
+            chatId: p.chatId,
+            rootMessageId: match.messageId,
+          },
+          envelope: {
+            format: 'message_listener',
+            sourceName: match.name || 'Message Listener Preview',
+            trusted: false,
+            payload: publicMessageListenerMatch(match),
+            rawText: match.messageText,
+          },
+          instruction: renderMessageListenerPrompt(match),
+          presentation: { topicMessage: null },
+          options: { asyncReturnSessionId: true },
+        }, { larkAppId: cachedLarkAppId, activeSessions });
+        results.push({
+          messageId: match.messageId,
+          ok: result.ok,
+          action: result.action,
+          sessionId: result.target?.sessionId,
+          error: result.error,
+        });
+      } catch (err) {
+        results.push({
+          messageId: match.messageId,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    jsonRes(res, 200, {
+      ok: results.every(result => result.ok),
+      requestedLimit: parsed.limit,
+      matches: matches.map(publicMessageListenerMatch),
+      results,
+    });
+  } catch (err) {
+    jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
+  if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true });
+});
+
+ipcRoute('GET', '/api/groups/:chatId/members-display', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  try {
+    const members = await listChatMemberDisplays(cachedLarkAppId, p.chatId);
+    jsonRes(res, 200, { members });
+  } catch (err) {
+    jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 // ─── Role profile management (dashboard) ──────────────────────────────────

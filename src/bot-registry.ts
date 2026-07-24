@@ -53,6 +53,40 @@ export const DEFAULT_USAGE_DISPLAY: UsageDisplayMode = 'streaming';
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
+export type MessageListenerSenderType = 'user' | 'bot';
+
+export interface MessageListenerConfig {
+  enabled: boolean;
+  name?: string;
+  replyCardTitle?: string;
+  workingDir?: string;
+  prompt: string;
+  senderPolicy?: {
+    /**
+     * all_except_excluded: listen to all matching sender types except excluded ids.
+     * include_only: listen only to includeSenderOpenIds; empty include means none.
+     */
+    mode?: 'all_except_excluded' | 'include_only';
+    includeSenderOpenIds?: string[];
+    excludeSenderOpenIds?: string[];
+    includeSenderTypes?: MessageListenerSenderType[];
+    excludeSenderTypes?: MessageListenerSenderType[];
+    /** Default true. */
+    excludeSelf?: boolean;
+  };
+  messagePolicy?: {
+    /** Defaults to text + post. */
+    includeMsgTypes?: string[];
+    /** V1 only supports top-level group messages. */
+    scope?: 'top_level';
+  };
+  replyPolicy?: {
+    /** V1 always replies under the triggering message. */
+    mode?: 'thread';
+    /** V1 starts one session per matched message. */
+    sessionMode?: 'per_message';
+  };
+}
 
 export interface SummaryRangeConfig {
   /** 0 means no count limit; omitted defaults to 50. */
@@ -109,6 +143,12 @@ function normalizeContentTriggerScope(raw: unknown): ContentTriggerScope | undef
   if (v === 'both' || v === 'all') return 'both';
   if (v === 'topic' || v === 'thread' || v === 'topic-group' || v === 'topic_group') return 'topic';
   if (v === 'regulargroup' || v === 'regular-group' || v === 'regular_group' || v === 'group') return 'regularGroup';
+  return undefined;
+}
+
+function normalizeMessageListenerSenderType(raw: unknown): MessageListenerSenderType | undefined {
+  if (raw === 'user' || raw === 'human') return 'user';
+  if (raw === 'bot' || raw === 'app') return 'bot';
   return undefined;
 }
 
@@ -768,6 +808,76 @@ function normalizeContentTriggers(raw: unknown, botIndex: number): ContentTrigge
   return out.length > 0 ? out : undefined;
 }
 
+function normalizeMessageListenerStringList(raw: unknown): string[] | undefined {
+  const values = normalizeStringList(raw);
+  return values.length > 0 ? [...new Set(values)] : undefined;
+}
+
+function normalizeMessageListenerSenderTypes(raw: unknown): MessageListenerSenderType[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .map(normalizeMessageListenerSenderType)
+    .filter((value): value is MessageListenerSenderType => !!value);
+  return values.length > 0 ? [...new Set(values)] : undefined;
+}
+
+function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: string): MessageListenerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const entry = raw as Record<string, unknown>;
+  const prompt = normalizeNonEmptyString(entry.prompt);
+  const enabled = entry.enabled === true;
+  if (enabled && !prompt) {
+    logger.warn(`Bot config [${botIndex}] messageListeners[${chatId}] ignored: enabled listener requires prompt`);
+    return undefined;
+  }
+
+  const senderRaw = entry.senderPolicy && typeof entry.senderPolicy === 'object' && !Array.isArray(entry.senderPolicy)
+    ? entry.senderPolicy as Record<string, unknown>
+    : {};
+  const senderPolicy: NonNullable<MessageListenerConfig['senderPolicy']> = {};
+  const mode = senderRaw.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
+  const includeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.includeSenderOpenIds);
+  const excludeSenderOpenIds = normalizeMessageListenerStringList(senderRaw.excludeSenderOpenIds);
+  const includeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.includeSenderTypes);
+  const excludeSenderTypes = normalizeMessageListenerSenderTypes(senderRaw.excludeSenderTypes);
+  if (mode !== 'all_except_excluded') senderPolicy.mode = mode;
+  if (includeSenderOpenIds) senderPolicy.includeSenderOpenIds = includeSenderOpenIds;
+  if (excludeSenderOpenIds) senderPolicy.excludeSenderOpenIds = excludeSenderOpenIds;
+  if (includeSenderTypes) senderPolicy.includeSenderTypes = includeSenderTypes;
+  if (excludeSenderTypes) senderPolicy.excludeSenderTypes = excludeSenderTypes;
+  if (senderRaw.excludeSelf === false) senderPolicy.excludeSelf = false;
+
+  const messageRaw = entry.messagePolicy && typeof entry.messagePolicy === 'object' && !Array.isArray(entry.messagePolicy)
+    ? entry.messagePolicy as Record<string, unknown>
+    : {};
+  const messagePolicy: NonNullable<MessageListenerConfig['messagePolicy']> = {};
+  const includeMsgTypes = normalizeMessageListenerStringList(messageRaw.includeMsgTypes);
+  if (includeMsgTypes) messagePolicy.includeMsgTypes = includeMsgTypes;
+  messagePolicy.scope = 'top_level';
+
+  return {
+    enabled,
+    ...(normalizeNonEmptyString(entry.name) ? { name: normalizeNonEmptyString(entry.name) } : {}),
+    ...(normalizeNonEmptyString(entry.replyCardTitle) ? { replyCardTitle: normalizeNonEmptyString(entry.replyCardTitle) } : {}),
+    ...(normalizeNonEmptyString(entry.workingDir) ? { workingDir: normalizeNonEmptyString(entry.workingDir) } : {}),
+    prompt: prompt ?? '',
+    ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
+    ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
+    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+  };
+}
+
+function normalizeMessageListeners(raw: unknown, botIndex: number): Record<string, MessageListenerConfig> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, MessageListenerConfig> = {};
+  for (const [chatId, listenerRaw] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof chatId !== 'string' || !chatId.trim()) continue;
+    const listener = normalizeMessageListenerConfig(listenerRaw, botIndex, chatId.trim());
+    if (listener) out[chatId.trim()] = listener;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export interface OncallChat {
   /** Lark chat_id (oc_xxx) the bot was pulled into. */
   chatId: string;
@@ -1308,6 +1418,14 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /**
+   * Per-chat group message listener. Keyed by chat_id and bot-scoped so the
+   * dashboard can configure it from the Roles page's natural group × bot
+   * matrix. When enabled, the bot may react to non-@ top-level group messages
+   * after deterministic sender/msgType filtering. V1 always replies in a
+   * fresh thread under the triggering message.
+   */
+  messageListeners?: Record<string, MessageListenerConfig>;
   /**
    * Worktree picker mode on the repo-select card. When true, the worktree
    * control renders the multi-repo selector (pick N repos + branch) instead of
@@ -2285,6 +2403,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       : undefined;
     const summaryRange = normalizeSummaryRange(entry.summaryRange ?? entry.summary);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
+    const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
 
     // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
@@ -2431,6 +2550,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinPrompt
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      messageListeners,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
       // 连续会话；群内原生话题各自独立会话), so only the NON-default modes

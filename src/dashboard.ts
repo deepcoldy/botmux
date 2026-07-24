@@ -2154,7 +2154,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
       if (!r.ok) return;
       const j = await r.json() as { chats?: any[] };
       for (const c of j.chats ?? []) {
-        const { oncallChat, firstSeenAt, hasRole, observedBotNames, ...chatBase } = c;
+        const { oncallChat, firstSeenAt, hasRole, hasMessageListener, observedBotNames, ...chatBase } = c;
         const cur = out.get(c.chatId) ?? {
           ...chatBase,
           memberBots: [] as any[],
@@ -2171,6 +2171,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
           inChat: true,
           oncallChat: oncallChat ?? null,
           hasRole: hasRole ?? false,
+          hasMessageListener: hasMessageListener ?? false,
         });
         if (typeof firstSeenAt === 'number') {
           cur._firstSeenAt = cur._firstSeenAt === null
@@ -2185,7 +2186,7 @@ async function buildGroupsMatrix(): Promise<{ chats: any[]; bots: any[] }> {
     const present = new Set<string>(c.memberBots.map((mb: any) => mb.larkAppId));
     for (const b of onlineBots) {
       if (!present.has(b.larkAppId)) {
-        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false });
+        c.memberBots.push({ larkAppId: b.larkAppId, botName: b.botName, cliId: b.cliId, inChat: false, oncallChat: null, hasRole: false, hasMessageListener: false });
       }
     }
   }
@@ -4031,6 +4032,70 @@ const server = createServer(async (req, res) => {
         res.end(await upstream.text());
         return;
       }
+    }
+
+    // ─── Message listeners (proxy to daemon) ───────────────────────────────
+    // GET    /api/message-listeners/:larkAppId/:chatId
+    // PUT    /api/message-listeners/:larkAppId/:chatId
+    // DELETE /api/message-listeners/:larkAppId/:chatId
+    // POST   /api/message-listeners/:larkAppId/:chatId/(preview|run-preview)
+    let mMessageListener: RegExpMatchArray | null;
+    if ((mMessageListener = url.pathname.match(/^\/api\/message-listeners\/([^/]+)\/([^/]+)\/(preview|run-preview)$/))) {
+      const larkAppId = decodeURIComponent(mMessageListener[1]);
+      const chatId = decodeURIComponent(mMessageListener[2]);
+      const op = mMessageListener[3];
+      if (req.method === 'POST') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/message-listeners/${encodeURIComponent(chatId)}/${op}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+    if ((mMessageListener = url.pathname.match(/^\/api\/message-listeners\/([^/]+)\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mMessageListener[1]);
+      const chatId = decodeURIComponent(mMessageListener[2]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/message-listeners/${encodeURIComponent(chatId)}`, { method: 'GET' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'PUT') {
+        const chunks: Buffer[] = [];
+        for await (const c of req) chunks.push(c as Buffer);
+        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const upstream = await proxyToDaemon(larkAppId, `/api/message-listeners/${encodeURIComponent(chatId)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: raw,
+        });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+      if (req.method === 'DELETE') {
+        const upstream = await proxyToDaemon(larkAppId, `/api/message-listeners/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
+
+    let mGroupMembersDisplay: RegExpMatchArray | null;
+    if (req.method === 'GET' && (mGroupMembersDisplay = url.pathname.match(/^\/api\/groups\/([^/]+)\/([^/]+)\/members-display$/))) {
+      const larkAppId = decodeURIComponent(mGroupMembersDisplay[1]);
+      const chatId = decodeURIComponent(mGroupMembersDisplay[2]);
+      const upstream = await proxyToDaemon(larkAppId, `/api/groups/${encodeURIComponent(chatId)}/members-display`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
     }
 
     // ─── Profiles (aggregate/proxy to daemon) ─────────────────────────────

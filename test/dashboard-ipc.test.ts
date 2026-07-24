@@ -2204,7 +2204,9 @@ describe('GET /api/groups (Phase B)', () => {
     // dashboard can sort newly-added chats to the top. In this test the
     // store hasn't been init()'d (no daemon), so the value degrades to
     // null instead of failing the request — see chat-first-seen-store.
-    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, observedBotNames: [] }]);
+    // `hasMessageListener` lets the roles tree mark bots with active listener
+    // configs without issuing one request per chat.
+    expect(body.chats).toEqual([{ chatId: 'oc_1', name: 'team', oncallChat: null, firstSeenAt: null, hasRole: false, hasMessageListener: false, observedBotNames: [] }]);
     spy.mockRestore();
   });
 });
@@ -2456,6 +2458,67 @@ describe('POST /api/groups/transfer-owner', () => {
 });
 
 describe('role profile IPC routes', () => {
+  it('previews message listener matches from recent chat history', async () => {
+    setLarkAppId('cli_listener');
+    registerBot({
+      larkAppId: 'cli_listener',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+    });
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_ignore',
+        create_time: '1000',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'ignore' }),
+        sender: { id: 'ou_other', sender_type: 'user' },
+      },
+      {
+        message_id: 'om_match',
+        create_time: '2000',
+        message_type: 'text',
+        content: JSON.stringify({ text: 'CPU 告警' }),
+        sender: { id: 'ou_allowed', sender_type: 'user' },
+      },
+    ]);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 50,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true,
+        requestedLimit: 20,
+        matches: [{
+          messageId: 'om_match',
+          messageText: 'CPU 告警',
+          senderOpenId: 'ou_allowed',
+          senderType: 'user',
+        }],
+      });
+      expect(historySpy).toHaveBeenCalledWith('cli_listener', 'oc_alerts', expect.any(Object));
+    } finally {
+      historySpy.mockRestore();
+    }
+  });
+
   it('returns multiple role snapshots in one daemon request', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-role-batch-'));
     const prevDataDir = process.env.SESSION_DATA_DIR;

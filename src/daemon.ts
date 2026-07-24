@@ -190,6 +190,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
+import { renderMessageListenerPrompt } from './services/message-listener.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { HerdrBackend } from './adapters/backend/herdr-backend.js';
@@ -3087,7 +3088,9 @@ export async function enforceMessageQuotaForCliInput(
   memberUnionId?: string,
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
+  opts?: { listenerAuthorized?: boolean },
 ): Promise<boolean> {
+  if (opts?.listenerAuthorized) return true;
   // senderUnionId（bot-locked）让 evaluateTalk 认出跨部署团队 peer bot（teamBot 腿）；
   // memberUnionId（可为真人 union）走 teamMember 腿——否则外部闸门/群闸门放进来的
   // 团队 bot 或团队成员消息会在这里复查处被静默丢弃（#332 端到端断点，人腿同理）。
@@ -15064,7 +15067,22 @@ async function resolvePinnedWorkingDir(ctx: {
   chatId: string;
   chatType: 'group' | 'p2p';
   larkAppId: string;
+  listenerWorkingDir?: string;
 }) {
+  if (ctx.listenerWorkingDir) {
+    const resolved = expandHome(ctx.listenerWorkingDir);
+    try {
+      if (statSync(resolved).isDirectory()) {
+        return {
+          pinnedWorkingDir: resolved,
+          oncallEntry: undefined,
+          inheritedFrom: null,
+          pinnedFromBotDefault: false,
+        };
+      }
+    } catch { /* fall through to normal resolution */ }
+    logger.warn(`[message-listener:${ctx.larkAppId}] listener workingDir invalid (${resolved}); falling back to normal resolution`);
+  }
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
@@ -15415,7 +15433,7 @@ function mergeVcMeetingApplicationContext(
 }
 
 async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
-  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger } = ctx;
+  const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // scope/anchor are mutable here: `/t` / `/topic` may flip a 普通群 chat-scope
   // routing into thread-scope so the bot's first reply seeds a Lark thread.
   let scope = ctx.scope;
@@ -15508,6 +15526,12 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const isBotSenderType = data.sender?.sender_type === 'app' || data.sender?.sender_type === 'bot';
   const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
   const botCfg = getBot(larkAppId).config;
+  const listenerPrompt = messageListener ? renderMessageListenerPrompt(messageListener) : undefined;
+  if (listenerPrompt) {
+    content = listenerPrompt;
+    parsed.content = listenerPrompt;
+    cmdContent = listenerPrompt;
+  }
   logger.info(`New session: "${content.substring(0, 60)}" (scope=${scope}, anchor=${anchor.substring(0, 12)}, resources: ${resources.length}, active: ${getActiveCount()}, messageId: ${messageId}, chatId: ${chatId})`);
   emitHookEvent('topic.new', {
     larkAppId,
@@ -15738,7 +15762,9 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     }
   }
 
-  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType)) {
+  if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
+    listenerAuthorized: !!messageListener,
+  })) {
     return;
   }
 
@@ -15796,7 +15822,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Pin the working dir via the layered oncall / inherit / default lookup
   // (auto-binds a defaultOncall chat as a side effect). Shared with the
   // first-message `/repo` command branch so both paths stay consistent.
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({
+    scope,
+    anchor,
+    chatId,
+    chatType,
+    larkAppId,
+    listenerWorkingDir: messageListener?.workingDir,
+  });
   // Auto-worktree: register PENDING (router buffers concurrent msgs, no force-fork)
   // and build the worktree off the critical path (willAutoWorktree / runAutoWorktreeCommit).
   const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15811,7 +15844,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // For chat-scope, rootMessageId stores the seed message_id (audit only);
   // routing keys off chatId via sessionAnchorId(), so any value works.
   const rootIdForStore = scope === 'thread' ? anchor : messageId;
-  const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
+  const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
   const groupChatName = await groupChatNamePromise;
@@ -15871,7 +15905,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     pendingSubstituteControlCard: shouldSendSubstituteControlCard,
     pendingSender: newTopicSender,
     ownerOpenId: senderOpenId,
-    currentTurnTitle: (ctx.forwardSeedData ? followupContent : content).substring(0, 50),
+    currentTurnTitle: initialTurnTitle,
     workingDir: pinnedWorkingDir,
   };
   if (pinnedWorkingDir) {

@@ -200,6 +200,60 @@ describe('parseBotConfigsFromText — brand', () => {
     expect(mod.effectiveBotDisplayName(state)).toBe('小助手');
   });
 
+  it('normalizes per-chat messageListeners without enabling them by default', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      {
+        larkAppId: 'a',
+        larkAppSecret: 's',
+        messageListeners: {
+          oc_chat: {
+            enabled: true,
+            name: '告警监听',
+            replyCardTitle: '  告警自动分析  ',
+            prompt: '只分析告警消息',
+            senderPolicy: {
+              includeSenderOpenIds: [' ou_user ', 'ou_user'],
+              excludeSenderOpenIds: ['ou_noise'],
+              includeSenderTypes: ['user', 'app', 'junk'],
+              excludeSelf: false,
+            },
+            messagePolicy: {
+              includeMsgTypes: ['text', 'post', 'text'],
+            },
+          },
+          oc_disabled: {
+            enabled: false,
+            prompt: 'draft',
+          },
+          oc_bad: {
+            enabled: true,
+            prompt: '   ',
+          },
+        },
+      },
+    ]));
+
+    expect(cfg.messageListeners?.oc_chat).toEqual({
+      enabled: true,
+      name: '告警监听',
+      replyCardTitle: '告警自动分析',
+      prompt: '只分析告警消息',
+      senderPolicy: {
+        includeSenderOpenIds: ['ou_user'],
+        excludeSenderOpenIds: ['ou_noise'],
+        includeSenderTypes: ['user', 'bot'],
+        excludeSelf: false,
+      },
+      messagePolicy: {
+        includeMsgTypes: ['text', 'post'],
+        scope: 'top_level',
+      },
+      replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    });
+    expect(cfg.messageListeners?.oc_disabled.enabled).toBe(false);
+    expect(cfg.messageListeners?.oc_bad).toBeUndefined();
+  });
+
   it('normalizes startupCommands (adds leading /, keeps args, dedupes)', () => {
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'a', larkAppSecret: 's', startupCommands: ['effort ultracode', '/model opus', '/effort ultracode', '', 7] },
