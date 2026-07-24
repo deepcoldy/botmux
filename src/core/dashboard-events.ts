@@ -11,6 +11,7 @@ export type DashboardEvent =
   | { type: 'schedule.deleted';  body: { id: string } }
   | { type: 'schedule.fired';    body: { id: string; runAt: number; status: 'ok'|'error'; error?: string } }
   | { type: 'schedule.timezone'; body: { timezone: string } }
+  | { type: 'bots.changed';      body: { signature: string } }
   | { type: 'heartbeat';         body: { ts: number } };
 
 export type Subscriber = (event: DashboardEvent) => void;

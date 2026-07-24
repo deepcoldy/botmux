@@ -27,6 +27,10 @@ class Store {
     scheduleTimeZone: this.scheduleTimeZone,
   };
   private listeners = new Set<() => void>();
+  // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
+  // /api/bots fetch), so relay them through a dedicated listener set instead of
+  // bumping the snapshot version. Signature-deduped server-side.
+  private botsListeners = new Set<() => void>();
 
   setScheduleTimeZone(tz: string) {
     if (typeof tz === 'string' && tz && this.scheduleTimeZone !== tz) {
@@ -63,11 +67,17 @@ class Store {
       // Effective schedule timezone changed (settings save → daemon realign) —
       // re-render all schedule times in the new zone without a page reload.
       if (typeof body?.timezone === 'string' && body.timezone) this.scheduleTimeZone = body.timezone;
+    } else if (type === 'bots.changed') {
+      // Bot roster changed (bot added / removed / renamed). Notify subscribers
+      // so the Bot 配置 page re-fetches /api/bots without a manual refresh.
+      for (const fn of this.botsListeners) fn();
+      return; // no snapshot mutation — bots aren't cached here
     } else {
       return; // heartbeat / schedule.fired — no cache mutation
     }
     this.emit();
   }
+  onBotsChanged(fn: () => void) { this.botsListeners.add(fn); return () => this.botsListeners.delete(fn); }
   setOnline(v: boolean) {
     if (this.online !== v) { this.online = v; this.emit(); }
   }
@@ -101,7 +111,7 @@ export async function bootstrap() {
   const types = [
     'session.spawned', 'session.update', 'session.exited',
     'schedule.created', 'schedule.updated', 'schedule.deleted',
-    'schedule.fired', 'schedule.timezone', 'heartbeat',
+    'schedule.fired', 'schedule.timezone', 'bots.changed', 'heartbeat',
   ];
   for (const t of types) {
     es.addEventListener(t, e => {

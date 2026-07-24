@@ -17,7 +17,7 @@ import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
-import { DaemonRegistry } from './dashboard/registry.js';
+import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
@@ -4484,7 +4484,19 @@ const server = createServer(async (req, res) => {
       const hb = setInterval(() => {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
       }, 15_000);
-      res.on('close', () => { off(); clearInterval(hb); });
+      // Push a bots.changed frame whenever the online bot roster actually
+      // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
+      // page can auto-refresh without a manual reload. registry.on fires on
+      // every 15s poll and 30s heartbeat rewrite, so gate on a roster signature
+      // that ignores lastHeartbeat — otherwise we'd spam a frame every poll.
+      let lastRoster = botsRosterSignature(registry.list());
+      const offRoster = registry.on(online => {
+        const sig = botsRosterSignature(online);
+        if (sig === lastRoster) return;
+        lastRoster = sig;
+        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+      });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
       return;
     }
 
