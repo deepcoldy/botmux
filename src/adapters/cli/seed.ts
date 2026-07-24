@@ -64,6 +64,8 @@ export function createSeedAdapter(pathOverride?: string): CliAdapter {
     // Seed's model set is gateway-defined, not the
     // Anthropic aliases — skip the setup model prompt; users pick via /model.
     modelChoices: undefined,
+    // 与 Claude Code 同源，备用屏滚轮是纯滚动，只读 web 终端可安全滚动。
+    readonlyWheelScroll: true,
   }, bin);
 }
 

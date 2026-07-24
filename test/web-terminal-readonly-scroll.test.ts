@@ -20,20 +20,15 @@ function scriptBlock(startMarker: string): string {
 }
 
 describe('read-only web terminal wheel scrolling', () => {
-  it('exposes readonlyWheelScroll as an opt-in adapter capability, on for Claude only', () => {
+  it('declares readonlyWheelScroll as an opt-in adapter capability', () => {
+    // The capability field exists and is documented as opt-in. The EFFECTIVE
+    // per-adapter value (claude-code/seed on, relay + all others off) is asserted
+    // behaviourally by instantiating the real adapters in cli-adapters.test.ts —
+    // a source grep can't distinguish variants that share the Claude-family
+    // factory (relay reuses it but must NOT inherit the flag).
     expect(adapterTypesSource).toContain('readonly readonlyWheelScroll?: boolean;');
-    // Claude family (claude-code + seed share this adapter) opts in.
-    expect(claudeAdapterSource).toContain('readonlyWheelScroll: true,');
-    // No OTHER shipped adapter turns it on.
-    const others = [
-      'codex', 'gemini', 'opencode', 'cursor', 'grok', 'pi', 'copilot',
-      'kimi', 'aiden', 'coco', 'hermes', 'mira', 'mir', 'traex', 'riff',
-      'genius', 'mtr', 'antigravity', 'kiro-cli', 'oh-my-pi', 'codex-app',
-    ];
-    for (const name of others) {
-      const src = readFileSync(join(process.cwd(), `src/adapters/cli/${name}.ts`), 'utf8');
-      expect(src, `${name} must not enable readonlyWheelScroll`).not.toContain('readonlyWheelScroll');
-    }
+    // Per-variant opt-in, not a hardcoded factory default.
+    expect(claudeAdapterSource).toContain('readonlyWheelScroll: variant.readonlyWheelScroll === true,');
   });
 
   it('only enables the capability on the shared relay path (not tmux/zellij attach)', () => {
