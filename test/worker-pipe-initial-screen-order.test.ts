@@ -231,8 +231,13 @@ describe('worker pipe initial screen ordering', () => {
     const settleStart = source.indexOf('function settleBackendScreenBeforeIdle');
     const settleEnd = source.indexOf('/** Submission writes', settleStart);
     const settle = source.slice(settleStart, settleEnd);
-    const idleStart = source.indexOf('idleDetector.onIdle(async () =>');
+    // Anchor on the async onIdle handler without pinning its parameter list —
+    // upstream has already renamed/extended it once (`(evidenceSource)`), and a
+    // stale anchor silently slices an empty string instead of failing loudly.
+    const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
+    expect(idleStart).toBeGreaterThan(-1);
     const idleEnd = source.indexOf('backend.onData(onPtyData);', idleStart);
+    expect(idleEnd).toBeGreaterThan(idleStart);
     const idle = source.slice(idleStart, idleEnd);
 
     expect(settle).toContain('existing.revision >= requestedRevision');
