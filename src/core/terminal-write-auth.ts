@@ -64,6 +64,27 @@ export function deriveTerminalViewToken(secret: string, sessionId: string): stri
     .digest('base64url');
 }
 
+/**
+ * Derive a stable WRITE (operate) capability for one session. Mirrors
+ * deriveTerminalViewToken but uses a DISTINCT domain separator so the two
+ * capabilities can never collide — knowing the view token must never yield the
+ * write token (and vice versa) even for the same session+secret.
+ *
+ * Rationale: the write token used to be a per-process `randomBytes(16)`, so an
+ * already-issued 「操作链接」/write link (`?token=`) died the moment its worker
+ * restarted (a silent daemon restart re-forks every worker → new token → old
+ * link 403s). Deriving it from the host-only dashboard secret keeps the operate
+ * link valid across restarts, exactly like the read-only view token. The
+ * host-only secret is masked from sandboxed CLIs, so a sandboxed CLI still
+ * can't mint its own write link.
+ */
+export function deriveTerminalWriteToken(secret: string, sessionId: string): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-write-v1\0')
+    .update(sessionId)
+    .digest('base64url');
+}
+
 export function resolveTerminalWrite(
   { role, tokenMatches, platformBound, platformProxied }: TerminalWriteInput,
 ): { hasWrite: boolean; platformReadonly: boolean } {

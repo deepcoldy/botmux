@@ -94,6 +94,7 @@ import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
   deriveTerminalViewToken,
+  deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
@@ -823,7 +824,12 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
-const writeToken = randomBytes(16).toString('hex');
+// Standalone/test fallback. Production replaces this after init with a stable
+// per-session HMAC derived from the host-only dashboard secret, so an
+// already-issued 「操作链接」/write link survives a worker restart (a silent
+// daemon restart re-forks every worker — a per-process random token would 403
+// every previously-issued operate link).
+let writeToken = randomBytes(16).toString('hex');
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret.
 let viewToken = randomBytes(32).toString('base64url');
@@ -838,6 +844,15 @@ const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 function refreshTerminalViewToken(): void {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
+}
+
+/** Re-derive the stable write (operate) token from the host-only dashboard
+ *  secret so a restarted worker mints the SAME token — keeping already-issued
+ *  「操作链接」/write links valid across restarts. Falls back to the random
+ *  boot token when the secret is unavailable (standalone/test). */
+function refreshTerminalWriteToken(): void {
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  if (secret && sessionId) writeToken = deriveTerminalWriteToken(secret, sessionId);
 }
 
 /**
@@ -9149,6 +9164,7 @@ process.on('message', async (raw: unknown) => {
       lastInitConfig = msg;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
+      refreshTerminalWriteToken();
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
