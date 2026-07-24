@@ -29,6 +29,51 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
     expect(engine.activeThreadId).toBe('thread-fake-1');
     expect(engine.wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/);
     await engine.sendTurn('hello world'); // resolves on the ack, no throw
+    await engine.waitForThreadPreview();
+    await engine.setThreadName('[BotMux·Lark] hello world');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for a delayed first-message preview before allowing the final title write', async () => {
+    const engine = makeEngine({
+      sessionId: 'delayed-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '2' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview()).toBe('<botmux_routing> first message preview');
+    await engine.setThreadName('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('sets the final title when the first-message preview remains unavailable', async () => {
+    const engine = makeEngine({
+      sessionId: 'missing-preview',
+      env: { ...process.env, FAKE_PREVIEW_DELAY_READS: '999999' },
+    });
+    await engine.start();
+    await engine.startThread();
+    expect(await engine.waitForThreadPreview(200)).toBeUndefined();
+    await engine.setThreadName('[BotMux·Lark] final title');
+    expect((await engine.readThreadMetadata()).name).toBe('[BotMux·Lark] final title');
+    engine.stop();
+  }, 20_000);
+
+  it('waits for resumed-thread metadata to advance before restoring its title', async () => {
+    const engine = makeEngine({
+      sessionId: 'resume-title',
+      env: {
+        ...process.env,
+        FAKE_UPDATED_DELAY_READS: '2',
+        FAKE_UPDATED_BEFORE: '100',
+        FAKE_UPDATED_AFTER: '101',
+      },
+    });
+    await engine.start();
+    await engine.resumeThread('thread-resumed-title');
+    expect((await engine.readThreadMetadata()).updatedAt).toBe(100);
+    await engine.waitForThreadUpdatedAfter(100);
+    await engine.setThreadName('[BotMux·Lark] resumed title');
     engine.stop();
   }, 20_000);
 

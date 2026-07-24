@@ -1788,6 +1788,8 @@ describe('handleCommand', () => {
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'Native 同步' });
       expect(killWorker).not.toHaveBeenCalled();
       expect(ds.session.title).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitle).toBe('Native 同步');
+      expect(ds.session.nativeSessionTitleUserDefined).toBe(true);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('已向 codex 发送原生改名请求');
     });

@@ -28,7 +28,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigs,
@@ -149,6 +149,10 @@ import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './co
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './core/session-title.js';
 import { settleDeferredScheduleRun } from './core/deferred-schedule-settlement.js';
 import { sweepOrphanSandboxes } from './adapters/backend/sandbox.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
@@ -2319,6 +2323,39 @@ function setDirectChatDisplayNameFromSender(
   if (chatType !== 'p2p' || sender?.type !== 'user') return;
   const name = String(sender.name ?? '').trim();
   if (name) session.chatDisplayName = name;
+}
+
+const NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS = 800;
+
+/** 首条只有机器人 mention 时，尽力取群名作为原生会话标题兜底。 */
+async function resolveGroupChatNameForNativeTitle(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p' | undefined,
+  cliId: string,
+  rawContent: unknown,
+  mentions?: readonly { name: string }[],
+): Promise<string | undefined> {
+  if (
+    chatType !== 'group'
+    || cliId !== 'codex'
+    || extractBotmuxLarkNativeSessionTitlePrompt(rawContent, mentions)
+  ) {
+    return undefined;
+  }
+
+  let timer: number | undefined;
+  const timeout = new Promise<undefined>(resolve => {
+    timer = setTimeout(resolve, NATIVE_TITLE_CHAT_NAME_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      getChatNameAndMode(larkAppId, chatId).then(info => info.name ?? undefined),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 // Cache last /repo scan results per chat for /repo <number> fallback.
 // Bounded: this is a transient picker cache keyed by chatId (unbounded over a
@@ -14607,6 +14644,14 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a
   // short budget; subsequent calls hit the cache and are sync-fast.
+  const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+    larkAppId,
+    chatId,
+    chatType,
+    botCfg.cliId,
+    parsed.content,
+    parsed.mentions,
+  );
   const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
@@ -14632,6 +14677,8 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const session = sessionStore.createSession(chatId, rootIdForStore, parsed.content.substring(0, 50), chatType);
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
+  const groupChatName = await groupChatNamePromise;
+  if (groupChatName) session.chatDisplayName = groupChatName;
   session.larkAppId = larkAppId;
   session.ownerOpenId = senderOpenId;
   session.ownerUnionId = senderUnionId;
@@ -14645,6 +14692,11 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   session.quoteTargetSenderIsBot = parsed.senderType === 'app' || parsed.senderType === 'bot';
   session.lastMessageAt = new Date(now).toISOString();
   session.scope = scope;
+  session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+    parsed.content,
+    parsed.mentions,
+    groupChatName,
+  );
   sessionStore.updateSession(session);
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
@@ -15581,6 +15633,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const autoCreateChatId: string = ctxChatId ?? data?.message?.chat_id ?? '';
     const autoCreateChatType = ctxChatType ?? (data?.message?.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
     const botCfg = getBot(larkAppId).config;
+    const groupChatNamePromise = resolveGroupChatNameForNativeTitle(
+      larkAppId,
+      autoCreateChatId,
+      autoCreateChatType,
+      botCfg.cliId,
+      parsed.content,
+      parsed.mentions,
+    );
     logger.info(`No active session for ${scope}-scope ${anchor}, auto-creating new session...`);
     refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
     const senderOId = data.sender?.sender_id?.open_id;
@@ -15608,6 +15668,13 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     session.quoteTargetSenderIsBot = isForeignBot;
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
+    const groupChatName = await groupChatNamePromise;
+    if (groupChatName) session.chatDisplayName = groupChatName;
+    session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+      parsed.content,
+      parsed.mentions,
+      groupChatName,
+    );
     sessionStore.updateSession(session);
 
     // chat-scope only — see the handleNewTopic twin above (topic substitute

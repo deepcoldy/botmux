@@ -10,6 +10,95 @@ function caseRegion(name: string): string {
 }
 
 describe('worker native session rename queue', () => {
+  it('does not queue the automatic title as a pre-prompt slash command', () => {
+    const region = caseRegion('init');
+    expect(region).not.toContain('pendingSessionRename = msg.nativeSessionTitle');
+  });
+
+  it('waits for the first-message preview before applying the native title', () => {
+    const syncStart = workerSource.indexOf('async function applyCodexNativeSessionTitle(');
+    const syncEnd = workerSource.indexOf('/** Stand up (or re-establish)', syncStart);
+    const syncRegion = workerSource.slice(syncStart, syncEnd);
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
+    const flushRegion = workerSource.slice(flushStart, flushEnd);
+
+    expect(syncRegion).toContain('await engine.waitForThreadPreview(10_000)');
+    expect(syncRegion.indexOf('engine.waitForThreadPreview'))
+      .toBeLessThan(syncRegion.indexOf('engine.setThreadName'));
+    expect(syncRegion).toContain("waitForExistingPreview: wait === 'preview'");
+    expect(syncRegion).toContain('engine.waitForThreadUpdatedAfter(');
+    expect(syncRegion).toContain('waitForUpdatedAfter: nativeSessionTitleResumeUpdatedAt');
+    expect(syncRegion).toContain('revision !== nativeSessionTitleRevision');
+    expect(flushRegion.indexOf('await cliAdapter.writeInput'))
+      .toBeLessThan(flushRegion.indexOf('syncFreshCodexNativeSessionTitle'));
+    expect(flushRegion).toContain('syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
+  });
+
+  it('captures the resume metadata baseline without applying the title before the first append', () => {
+    const region = caseRegion('init');
+    expect(region).toContain('await prepareCodexNativeTitleGeneration(msg, codexRpcEngine)');
+    expect(region).not.toContain('syncFreshCodexNativeSessionTitle(msg.cliSessionId');
+  });
+
+  it('rebuilds title synchronization state after an in-worker CLI restart', () => {
+    const start = workerSource.indexOf('async function restartCliProcess(');
+    const end = workerSource.indexOf('// ─── HTTP + WebSocket Server', start);
+    const region = workerSource.slice(start, end);
+    expect(region).toContain('await spawnCli(restartCfg');
+    expect(region).toContain('await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine)');
+    const prepareStart = workerSource.indexOf('async function prepareCodexNativeTitleGeneration(');
+    const prepareEnd = workerSource.indexOf('/** Stand up (or re-establish)', prepareStart);
+    const prepareRegion = workerSource.slice(prepareStart, prepareEnd);
+    expect(prepareRegion).toContain('nativeSessionTitleAppliedThreadId = undefined');
+    expect(prepareRegion).toContain('nativeSessionTitleCurrentGenerationResume = lastSpawnEffectiveResume');
+    expect(prepareRegion).toContain('await captureCodexResumeTitleBaseline(threadId, engine)');
+  });
+
+  it('does not block RPC thread ownership or persistence on title sync', () => {
+    const start = workerSource.indexOf('async function engageCodexRpc(');
+    const end = workerSource.indexOf('/** RPC panes have NO terminal input path', start);
+    const region = workerSource.slice(start, end);
+    const ownershipIdx = region.indexOf('codexRpcEngine = engine');
+    const persistIdx = region.indexOf('persistCliSessionId(threadId)');
+    const titleIdx = region.indexOf('void syncFreshCodexNativeSessionTitle');
+
+    expect(ownershipIdx).toBeGreaterThanOrEqual(0);
+    expect(ownershipIdx).toBeLessThan(persistIdx);
+    expect(persistIdx).toBeLessThan(titleIdx);
+  });
+
+  it('invalidates an in-flight automatic title when a user rename arrives', () => {
+    const region = caseRegion('rename_session');
+    expect(region).toContain('nativeSessionTitleRevision += 1');
+    expect(region).toContain('lastInitConfig.nativeSessionTitle = msg.title');
+    expect(region).toContain('lastInitConfig.nativeSessionTitlePrompt = undefined');
+    expect(region).toContain('stopNativeSessionTitleSync()');
+  });
+
+  it('generates one isolated semantic title only for a fresh session', () => {
+    const start = workerSource.indexOf('async function syncFreshCodexNativeSessionTitle(');
+    const end = workerSource.indexOf('/** 在 resume 首条输入前记录', start);
+    const region = workerSource.slice(start, end);
+
+    expect(region).toContain('const sourceText = cfg.nativeSessionTitlePrompt?.trim()');
+    expect(region).toContain('cfg.nativeSessionTitlePrompt = undefined');
+    expect(region).toContain('generateCodexAppThreadTitle({');
+    expect(region).toContain('buildBotmuxLarkNativeSessionTitle(semanticCore)');
+    expect(region).toContain("send({ type: 'native_session_title_generated', title: semanticTitle })");
+  });
+
+  it('restarts title generation when the first meaningful follow-up arrives', () => {
+    const region = caseRegion('message');
+
+    expect(region).toContain('msg.nativeSessionTitlePrompt');
+    expect(region).toContain('nativeSessionTitleRevision += 1');
+    expect(region).toContain('lastInitConfig.nativeSessionTitle = msg.nativeSessionTitle');
+    expect(region).toContain('lastInitConfig.nativeSessionTitlePrompt = msg.nativeSessionTitlePrompt');
+    expect(region).toContain('stopNativeSessionTitleSync()');
+    expect(region).toContain('void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine)');
+  });
+
   it('queues rename IPC without opening a renderer or usage turn', () => {
     const region = caseRegion('rename_session');
     expect(region).toContain('pendingSessionRename = msg.title');

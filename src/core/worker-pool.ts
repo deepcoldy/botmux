@@ -94,6 +94,10 @@ import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cl
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+} from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
@@ -1858,11 +1862,35 @@ export function sendWorkerInput(
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
   const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  let nativeSessionTitlePrompt: string | undefined;
+  let nativeSessionTitle: string | undefined;
+  if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
+    const bot = getBot(ds.larkAppId);
+    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
+    if (effectiveCliId === 'codex') {
+      nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+        normalized.codexAppInput?.text ?? normalized.content,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+      );
+      if (nativeSessionTitlePrompt) {
+        nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(nativeSessionTitlePrompt);
+        ds.session.nativeSessionTitle = nativeSessionTitle;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = nativeSessionTitle;
+          ds.initConfig.nativeSessionTitlePrompt = nativeSessionTitlePrompt;
+        }
+        sessionStore.updateSession(ds.session);
+      }
+    }
+  }
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
   ds.worker.send({
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(turnId ? { turnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
     ...(vcMeetingImTurnOrigin
@@ -2018,6 +2046,49 @@ export function forkWorker(
 
   const agentCfg = sessionAgentConfig(ds, botCfg);
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
+  let nativeSessionTitle: string | undefined;
+  let nativeSessionTitlePrompt: string | undefined;
+  if (agentCfg.cliId === 'codex' && !ds.adoptedFrom) {
+    const isFreshNativeSession = !resume && !ds.session.cliSessionId;
+    const titlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      promptPayload.codexAppInput?.text ?? prompt,
+      bot.botName ? [{ name: bot.botName }] : undefined,
+    );
+    if (isFreshNativeSession && !ds.session.nativeSessionTitleUserDefined) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
+        titlePrompt ? ds.session.title : undefined,
+        bot.botName ? [{ name: bot.botName }] : undefined,
+        ds.chatType === 'group' ? ds.session.chatDisplayName : undefined,
+      );
+      ds.session.nativeSessionTitleAwaitingContent = titlePrompt ? undefined : true;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (
+      ds.session.nativeSessionTitleAwaitingContent
+      && !ds.session.nativeSessionTitleUserDefined
+      && titlePrompt
+    ) {
+      ds.session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(titlePrompt);
+      ds.session.nativeSessionTitleAwaitingContent = undefined;
+      nativeSessionTitlePrompt = titlePrompt;
+      sessionStore.updateSession(ds.session);
+    } else if (isFreshNativeSession && !ds.session.nativeSessionTitle) {
+      ds.session.nativeSessionTitle = ds.session.title;
+      sessionStore.updateSession(ds.session);
+    }
+    if (
+      isFreshNativeSession
+      || (resume && !!ds.session.cliSessionId && !!ds.session.nativeSessionTitle)
+      || (
+        resume
+        && !!ds.session.nativeSessionTitleAwaitingContent
+        && !!ds.session.nativeSessionTitle
+      )
+      || (!!nativeSessionTitlePrompt && !!ds.session.nativeSessionTitle)
+    ) {
+      nativeSessionTitle = ds.session.nativeSessionTitle;
+    }
+  }
   // Claude Code blocks on the interactive folder-trust dialog the first time
   // it runs in an untrusted workingDir; pre-accept it so the spawn doesn't hang.
   // Seed CLI (Claude Code fork) has the same dialog — drive both off the
@@ -2161,6 +2232,8 @@ export function forkWorker(
     riffParentTaskId: ds.session.riffParentTaskId,
     riffRepoDirs: ds.session.riffRepoDirs,
     deferredScheduleRun: ds.session.deferredScheduleRun,
+    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
     resume,
@@ -2692,6 +2765,20 @@ function setupWorkerHandlers(
           && isLocalCliOpenReady(ds, { cliId: effectiveCliId })) {
           scheduleLocalCliOpenReadinessPatch(ds);
         }
+        break;
+      }
+
+      case 'native_session_title_generated': {
+        if (ds.worker !== worker || ds.session.nativeSessionTitleUserDefined) break;
+        const title = msg.title.trim();
+        if (!title) break;
+        ds.session.nativeSessionTitle = title;
+        ds.session.nativeSessionTitleAwaitingContent = undefined;
+        if (ds.initConfig) {
+          ds.initConfig.nativeSessionTitle = title;
+          ds.initConfig.nativeSessionTitlePrompt = undefined;
+        }
+        sessionStore.updateSession(ds.session);
         break;
       }
 

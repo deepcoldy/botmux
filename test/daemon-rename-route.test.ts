@@ -37,6 +37,7 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+    getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -63,7 +64,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
-  return { ...actual, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
+  return {
+    ...actual,
+    replyMessage: mocks.replyMessage,
+    sendMessage: mocks.sendMessage,
+    getChatMode: mocks.getChatMode,
+    getChatNameAndMode: mocks.getChatNameAndMode,
+  };
 });
 
 vi.mock('../src/services/session-store.js', async () => {
@@ -107,6 +114,16 @@ function makeEventData(messageId: string, text: string, rootId?: string): any {
       create_time: String(Date.now()),
     },
   };
+}
+
+function makeMentionOnlyEventData(messageId: string, rootId?: string): any {
+  const data = makeEventData(messageId, '@@_user_1', rootId);
+  data.message.mentions = [{
+    key: '@_user_1',
+    name: 'TestBot',
+    id: { open_id: 'ou_bot' },
+  }];
+  return data;
 }
 
 function makeCtx(anchor: string, messageId: string): any {
@@ -213,6 +230,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
+    mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -305,6 +323,41 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toEqual({ turnId: 'om_workflow_new' });
+    const ds = activeSessions.get(sessionKey('om_workflow_new', APP));
+    expect(ds?.session.nativeSessionTitle).toBe('[BotMux·Lark] /workflow new 修复首轮授权');
+  });
+
+  it('uses the group name for mention-only sessions on both creation paths', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.getChatNameAndMode.mockResolvedValue({
+      name: 'BotMux 标题优化群',
+      mode: 'topic',
+    });
+
+    await handleNewTopic(
+      makeMentionOnlyEventData('om_group_title_new'),
+      makeCtx('om_group_title_new', 'om_group_title_new'),
+    );
+    const newTopic = activeSessions.get(sessionKey('om_group_title_new', APP));
+    expect(newTopic?.session.chatDisplayName).toBe('BotMux 标题优化群');
+    expect(newTopic?.session.nativeSessionTitle).toBe('[BotMux·Lark] BotMux 标题优化群');
+
+    activeSessions.clear();
+    await handleThreadReply(
+      makeMentionOnlyEventData('om_group_title_reply', 'om_group_title_root'),
+      makeCtx('om_group_title_root', 'om_group_title_reply'),
+    );
+    const safetyNet = activeSessions.get(sessionKey('om_group_title_root', APP));
+    expect(safetyNet?.session.chatDisplayName).toBe('BotMux 标题优化群');
+    expect(safetyNet?.session.nativeSessionTitle).toBe('[BotMux·Lark] BotMux 标题优化群');
+    expect(mocks.getChatNameAndMode).toHaveBeenCalledTimes(2);
   });
 
   it('thread safety-net: passes the accepted reply id into the first worker', async () => {

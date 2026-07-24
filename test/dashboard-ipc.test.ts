@@ -252,7 +252,7 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       session.backendType = 'tmux';
       sessionStore.updateSession(session);
 
-      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      const active = {
         session,
         worker: { killed: false, connected: true, send },
         workerPort: 1234,
@@ -265,7 +265,8 @@ describe('POST /api/sessions/:sessionId/rename', () => {
         cliVersion: '1',
         lastMessageAt: Date.now(),
         hasHistory: true,
-      } as any);
+      } as any;
+      findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
 
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
@@ -277,6 +278,8 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
       expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
+      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitle).toBe('New Title');
+      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitleUserDefined).toBe(true);
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
       expect(events).toContainEqual({
         type: 'session.update',
