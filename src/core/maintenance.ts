@@ -246,9 +246,15 @@ export function buildRestartLauncher(
 export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env = { ...inheritedEnv };
   // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
-  // fresh lifecycle CLI resolve these two settings from the file again.
-  delete env.WEB_EXTERNAL_HOST;
-  delete env.BOTMUX_DASHBOARD_EXTERNAL_HOST;
+  // fresh CLI reload these settings from the file.
+  for (const key of [
+    'WEB_EXTERNAL_HOST',
+    'BOTMUX_DASHBOARD_EXTERNAL_HOST',
+    'BOTMUX_DASHBOARD_HOST',
+    'BOTMUX_DASHBOARD_PORT',
+    'BOTMUX_DAEMON_IPC_BASE_PORT',
+    'BOTMUX_DASHBOARD_PUBLIC_READONLY',
+  ]) delete env[key];
   return env;
 }
 
