@@ -6,6 +6,39 @@ export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
 export const SESSIONS_SHOW_UNKNOWN_CHATS_STORAGE_KEY = 'botmux.dashboard.sessions.showUnknownChats';
 
+// ── 表格视图列显隐（用户可隐藏部分数据列，选择/操作列固定不可隐藏）──────────
+export const SESSIONS_TABLE_COLUMNS_STORAGE_KEY = 'botmux.dashboard.sessions.tableColumns';
+
+/** 必须存在的列：选择框 + 操作列，永远不可隐藏。 */
+export const FIXED_TABLE_COLUMNS = ['select', 'actions'] as const;
+
+/** 校验存储值：必须是字符串数组，且不包含固定列（固定列不参与持久化）。 */
+export function normalizeHiddenTableColumns(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const fixed = new Set<string>(FIXED_TABLE_COLUMNS);
+  return value
+    .filter((v): v is string => typeof v === 'string' && !fixed.has(v))
+    .filter((v, i, arr) => arr.indexOf(v) === i);
+}
+
+export function readStoredHiddenTableColumns(storage: Storage | undefined): string[] {
+  try {
+    const raw = storage?.getItem(SESSIONS_TABLE_COLUMNS_STORAGE_KEY);
+    if (!raw) return [];
+    return normalizeHiddenTableColumns(JSON.parse(raw));
+  } catch {
+    return [];
+  }
+}
+
+export function writeStoredHiddenTableColumns(storage: Storage | undefined, hidden: string[]): void {
+  try {
+    storage?.setItem(SESSIONS_TABLE_COLUMNS_STORAGE_KEY, JSON.stringify(normalizeHiddenTableColumns(hidden)));
+  } catch {
+    // localStorage 不可用时只在当前页生效
+  }
+}
+
 export function normalizeThemeMode(value: unknown): ThemeMode | null {
   return value === 'system' || value === 'light' || value === 'dark' ? value : null;
 }

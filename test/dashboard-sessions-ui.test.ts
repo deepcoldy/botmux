@@ -298,14 +298,14 @@ describe('dashboard sessions filters', () => {
 
   it('formats session location labels for group chats and direct chats', () => {
     expect(sessionLocationText({ chatType: 'group', chatId: 'oc_group' })).toBe('群聊 · oc_group');
-    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅' })).toBe('单聊 · 韩毅');
-    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm' })).toBe('单聊 · oc_dm');
+    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅', botName: 'Nil-RD' })).toBe('单聊 · 韩毅 - Nil-RD');
+    expect(sessionLocationText({ chatType: 'p2p', chatId: 'oc_dm', botName: 'Nil-RD' })).toBe('单聊 · oc_dm - Nil-RD');
     expect(sessionLocationText({})).toBe('未知聊天');
   });
 
   it('treats sessions with chatId but no resolved chat title as unknown chats', () => {
     const row = { chatType: 'group', chatId: 'oc_stale' };
-    const namedDirect = { chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅' };
+    const namedDirect = { chatType: 'p2p', chatId: 'oc_dm', chatDisplayName: '韩毅', botName: 'Nil-RD' };
 
     expect(isUnknownChatSession(row, () => null)).toBe(true);
     expect(isUnknownChatSession(row, () => 'SellerIM Agent 集中营')).toBe(false);

@@ -2042,6 +2042,104 @@ tr[data-chat]:hover { background: var(--surface-muted); cursor: pointer; }
   text-overflow: ellipsis;
 }
 
+/* ── 表格列显隐下拉菜单 ─────────────────────────────────────────────── */
+.session-table-columns-th {
+  position: relative;
+  padding: 0;
+}
+
+.session-table-columns-menu {
+  position: relative;
+  display: inline-block;
+}
+
+.session-table-columns-menu > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.session-table-columns-menu > summary:hover {
+  background: rgba(127, 90, 240, 0.12);
+}
+
+.session-table-columns-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.session-table-columns-icon svg {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.session-table-columns-dropdown {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 50;
+  min-width: 160px;
+  margin-top: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  border: 1px solid rgba(127, 90, 240, 0.2);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+.session-table-columns-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(127, 90, 240, 0.15);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.session-table-columns-reset {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(127, 90, 240, 0.25);
+  background: transparent;
+  cursor: pointer;
+}
+
+.session-table-columns-reset:hover {
+  background: rgba(127, 90, 240, 0.12);
+}
+
+.session-table-columns-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 4px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.session-table-columns-item:hover {
+  background: rgba(127, 90, 240, 0.08);
+}
+
+.session-table-columns-item input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
 button,
 .btn-link {
   min-height: 32px;
