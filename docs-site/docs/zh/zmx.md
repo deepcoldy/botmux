@@ -6,13 +6,14 @@ ZMX 是**显式 opt-in** 后端：botmux 不会自动安装 ZMX，也不会因�
 
 ## 安装与探测
 
-botmux 要求 **zmx >= 0.7.1**。这里的版本下限是一项**前置假设**：本集成将 0.7.1 视为假定包含上游 [issue #201](https://github.com/neurosnap/zmx/issues/201) / [PR #202](https://github.com/neurosnap/zmx/pull/202) 修复行为的首个发布版，即 `send` 只排队输入而不抢占 leader 或改写终端尺寸；实际安装的 0.7.1+ build 必须已包含这项修复。ZMX 官方支持 macOS 和 Linux。
-
-> **⚠️ 当前发布前置（截至 2026-07-23）**：ZMX 官方 latest release 与 Homebrew tap 仍为 0.6.0，执行下面的 `brew install` 目前会安装一个**不满足**本集成要求的版本。请等待上游发布实际包含 PR #202 行为的正式 **>= 0.7.1** build 后再启用 ZMX；不要通过伪造版本号绕过门禁。本页安装命令描述的是该正式版本发布后的目标流程。
+botmux 要求 **zmx >= 0.7.0**。这个版本下限对应上游 [issue #201](https://github.com/neurosnap/zmx/issues/201) 的修复 —— commit [`8ba312d7` *fix(send): preserve client leadership*](https://github.com/neurosnap/zmx/commit/8ba312d7)，随 [v0.7.0](https://github.com/neurosnap/zmx/releases/tag/v0.7.0)（2026-07-23）发布：`zmx send` 改用独立的 `.Send` IPC tag，只把输入排进 PTY 队列，不再抢占 leader、也不再改写终端尺寸。ZMX 官方支持 macOS 和 Linux。
 
 ```bash
-# Homebrew（macOS / Linuxbrew；等待 tap 发布包含 PR #202 的 >= 0.7.1）
+# Homebrew（macOS / Linuxbrew）
 brew install neurosnap/tap/zmx
+
+# 或 mise
+mise use -g github:neurosnap/zmx@latest
 
 # 验证 daemon 用户的 PATH 与控制面
 zmx version
@@ -23,7 +24,7 @@ zmx list
 
 每次启动新 ZMX 会话前，botmux 都会校验可执行文件、版本和 `zmx list` 控制面。任意一项失败都会 **fail closed** 并向会话返回可操作的错误；绝不会悄悄降级到 PTY。
 
-> **⚠️ 从 0.6 升级**：替换磁盘上的 `zmx` 二进制不会替换已经运行的逐会话 daemon；升级到包含 PR #202 的 0.7.1+ build 后，请手动关闭并重新创建所有 0.6 会话，再重启 botmux。botmux **不会自动冷迁移**旧会话，只运行 `botmux restart` 也不够；0.6 daemon 不认识新版 `send` 消息，可能在命令返回成功时仍静默丢弃输入。
+> **⚠️ 从 0.6 升级**：替换磁盘上的 `zmx` 二进制不会替换已经运行的逐会话 daemon；升级到 0.7.0+ 后，请手动关闭并重新创建所有 0.6 会话，再重启 botmux。botmux **不会自动冷迁移**旧会话，只运行 `botmux restart` 也不够。ZMX 的 IPC `Tag` 枚举是 non-exhaustive 的（未知 tag 走 `_` 分支被忽略），所以 0.6 daemon 收到新的 `.Send` tag 会**直接丢弃**，而 `zmx send` 仍然退出码 0 —— 表现为命令成功但输入从未送达。
 
 开发时，默认 `pnpm test` 只跑 mock / 纯函数单测，**不要求本机安装 ZMX**。会启动真实 `zmx` 的覆盖位于 `*.e2e.ts`，只在显式运行 E2E 时参与，并在 ZMX 不可用时自动跳过；这与仓库现有 tmux / Herdr E2E 的处理方式一致。
 
@@ -92,7 +93,7 @@ botmux list
 
 ## 排错
 
-1. 以运行 daemon 的同一用户执行 `zmx version` 和 `zmx list`，确认版本至少为 0.7.1、`PATH` 和 socket 目录可用。
+1. 以运行 daemon 的同一用户执行 `zmx version` 和 `zmx list`，确认版本至少为 0.7.0、`PATH` 和 socket 目录可用。
 2. 如果刚从 0.6 升级，手动关闭并重新创建旧会话 daemon；botmux 不做自动冷迁移，仅重启 botmux 不会替换它们。出现 `zmx send` 返回成功但 CLI 没收到输入，优先检查这一项。
 3. 如果显式设了 `ZMX_DIR`，确保 daemon 和本地 attach 的 shell 使用同一值。botmux 会保留 `ZMX_DIR`，但会清掉继承的 `ZMX_SESSION` / `ZMX_SESSION_PREFIX`，避免嵌套会话和名称前缀改写 `bmx-*` 目标。
 4. 查看 `botmux logs`。探测结果不确定时，botmux 会保守拒绝启动/重建，避免重复启动 CLI 或误删仍存活的会话。

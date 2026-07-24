@@ -58,7 +58,7 @@ export async function ensureBackendAvailable(
           ok: false,
           backendType,
           reason: result.reason,
-          manualCommand: '等待包含 PR #202 send 行为的 ZMX >= 0.7.1 正式版；发布后 macOS 可用 Homebrew、Linux 可用官方 release binary 安装',
+          manualCommand: '安装 ZMX >= 0.7.0：macOS 用 brew install neurosnap/tap/zmx；Linux 用官方 release binary；或 mise use -g github:neurosnap/zmx@latest',
         };
   }
 

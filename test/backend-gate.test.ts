@@ -67,11 +67,14 @@ describe('backendGateUserMessage', () => {
     expect(msg).toContain('BACKEND_TYPE=pty');
   });
 
-  it('includes the supported ZMX version and unreleased upstream prerequisite', () => {
+  it('includes the supported ZMX version floor and an actionable install hint', () => {
     const msg = backendGateUserMessage('zmx', 'zmx 二进制不在 PATH 上');
-    expect(msg).toContain('zmx >= 0.7.1');
-    expect(msg).toContain('PR #202');
-    expect(msg).toContain('官方 0.6.0 尚不满足');
+    expect(msg).toContain('zmx >= 0.7.0');
+    expect(msg).toContain('client leadership');
+    // The hint must tell the user how to actually install it, not to wait for
+    // an unreleased upstream build (0.7.0 has shipped).
+    expect(msg).toContain('brew install neurosnap/tap/zmx');
+    expect(msg).not.toContain('等待');
   });
 });
 

@@ -6,13 +6,14 @@ ZMX is an **explicit opt-in** backend. botmux does not install ZMX, and merely f
 
 ## Install and probe
 
-botmux requires **zmx >= 0.7.1**. This version floor is a **prerequisite assumption**: the integration treats 0.7.1 as the first release assumed to contain the behavior specified by upstream [issue #201](https://github.com/neurosnap/zmx/issues/201) and [PR #202](https://github.com/neurosnap/zmx/pull/202), where `send` only queues input without claiming the leader or rewriting terminal size; the installed 0.7.1+ build must actually contain that fix. ZMX officially supports macOS and Linux.
-
-> **⚠️ Current release prerequisite (as of 2026-07-23)**: ZMX's latest official release and Homebrew tap are still at 0.6.0, so running the `brew install` command below currently installs a version that **does not satisfy** this integration. Wait for an official **>= 0.7.1** build that actually contains PR #202 before enabling ZMX; do not bypass the gate by spoofing a version. The installation commands below describe the target flow after that release is available.
+botmux requires **zmx >= 0.7.0**. That floor is the fix for upstream [issue #201](https://github.com/neurosnap/zmx/issues/201) — commit [`8ba312d7` *fix(send): preserve client leadership*](https://github.com/neurosnap/zmx/commit/8ba312d7), shipped in [v0.7.0](https://github.com/neurosnap/zmx/releases/tag/v0.7.0) (2026-07-23): `zmx send` now uses a dedicated `.Send` IPC tag that only queues input into the PTY buffer, without claiming the leader or rewriting terminal size. ZMX officially supports macOS and Linux.
 
 ```bash
-# Homebrew (macOS / Linuxbrew; wait for a >= 0.7.1 tap release containing PR #202)
+# Homebrew (macOS / Linuxbrew)
 brew install neurosnap/tap/zmx
+
+# or mise
+mise use -g github:neurosnap/zmx@latest
 
 # Verify the daemon user's PATH and control plane
 zmx version
@@ -23,7 +24,7 @@ On other hosts, download the prebuilt binary for your architecture from the [off
 
 Before creating a new ZMX-backed session, botmux checks the executable, version, and `zmx list` control plane. Any failure **fails closed** with an actionable session error; botmux never silently falls back to PTY.
 
-> **⚠️ Upgrading from 0.6**: replacing the `zmx` binary on disk does not replace per-session daemons that are already running; after upgrading to a 0.7.1+ build containing PR #202, manually stop and recreate every session launched by 0.6, then restart botmux. botmux performs **no automatic cold migration**, and `botmux restart` alone is insufficient: a 0.6 daemon does not understand the new `send` message and can silently discard input even when the command exits successfully.
+> **⚠️ Upgrading from 0.6**: replacing the `zmx` binary on disk does not replace per-session daemons that are already running; after upgrading to 0.7.0+, manually stop and recreate every session launched by 0.6, then restart botmux. botmux performs **no automatic cold migration**, and `botmux restart` alone is insufficient. ZMX's IPC `Tag` enum is non-exhaustive (unknown tags fall through the `_` arm and are ignored), so a 0.6 daemon **discards** the new `.Send` tag outright while `zmx send` still exits 0 — the command reports success and the input never arrives.
 
 For contributors, the default `pnpm test` command runs mocked/pure unit tests and **does not require ZMX to be installed**. Coverage that launches a real `zmx` binary lives in `*.e2e.ts`, runs only when E2E is requested explicitly, and skips automatically when ZMX is unavailable—the same pattern already used by the tmux and Herdr E2E suites.
 
@@ -92,7 +93,7 @@ When the daemon runs on macOS, you can also explicitly enable **Native CLI openi
 
 ## Troubleshooting
 
-1. Run `zmx version` and `zmx list` as the same user that runs the daemon to verify version 0.7.1 or newer, `PATH`, and the socket directory.
+1. Run `zmx version` and `zmx list` as the same user that runs the daemon to verify version 0.7.0 or newer, `PATH`, and the socket directory.
 2. After an upgrade from 0.6, manually stop and recreate old session daemons; botmux does not cold-migrate them automatically, and restarting botmux alone does not replace them. Check this first if `zmx send` succeeds but the CLI receives nothing.
 3. If you set `ZMX_DIR`, make sure the daemon and the shell used for local attach share the same value. botmux preserves `ZMX_DIR`, but strips inherited `ZMX_SESSION` / `ZMX_SESSION_PREFIX` so nested sessions and prefixes cannot rewrite the deterministic `bmx-*` target.
 4. Inspect `botmux logs`. When a probe is inconclusive, botmux conservatively refuses to start/recreate a session so it cannot launch a duplicate CLI or delete a still-live one.

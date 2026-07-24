@@ -1,7 +1,7 @@
 /**
  * Real ZMX smoke coverage for the tail/send/history transport.
  *
- * Requires zmx >= 0.7.1 with PR #202 semantics (ordinary contributors without ZMX are skipped):
+ * Requires zmx >= 0.7.0 (send no longer claims client leadership) (ordinary contributors without ZMX are skipped):
  *   pnpm vitest run --project e2e test/zmx-backend.e2e.ts
  */
 import { createHash } from 'node:crypto';
@@ -18,7 +18,7 @@ const ZMX_AVAILABLE = ZmxBackend.isAvailable();
 
 if (process.env.BOTMUX_E2E_REQUIRE_ZMX === '1' && !ZMX_AVAILABLE) {
   throw new Error(
-    'BOTMUX_E2E_REQUIRE_ZMX=1, but a functional zmx >= 0.7.1 was not found in PATH',
+    'BOTMUX_E2E_REQUIRE_ZMX=1, but a functional zmx >= 0.7.0 was not found in PATH',
   );
 }
 

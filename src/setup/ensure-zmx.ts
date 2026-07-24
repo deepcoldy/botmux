@@ -8,6 +8,14 @@
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 
+/**
+ * Lowest zmx release whose `send` only queues input instead of taking client
+ * leadership (upstream commit 8ba312d7 "fix(send): preserve client leadership",
+ * shipped in v0.7.0). Below this floor `send` steals the leader and rewrites
+ * the terminal size, which corrupts the `history` screen botmux reads.
+ */
+export const ZMX_MIN_VERSION: [number, number, number] = [0, 7, 0];
+
 const ZMX_PATH_EXTRAS = [
   `${homedir()}/.local/share/mise/shims`,
   `${homedir()}/.local/bin`,
@@ -64,14 +72,19 @@ export function probeZmxVersion(): { ok: true; version: string } | { ok: false; 
   if (!parsedVersion) {
     return { ok: false, reason: `无法解析 zmx 版本：${version.split('\n')[0] || '(empty)'}` };
   }
-  if (compareVersion(parsedVersion, [0, 7, 1]) < 0) {
+  if (compareVersion(parsedVersion, ZMX_MIN_VERSION) < 0) {
     return {
       ok: false,
-      reason: `zmx >= 0.7.1 才受支持（当前 ${parsedVersion.join('.')}；需要包含 PR #202 的 send 行为，输出由 history 获取）`,
+      reason: `zmx >= ${ZMX_MIN_VERSION.join('.')} 才受支持（当前 ${parsedVersion.join('.')}；需要 send 不抢占 client leadership 的行为，输出由 history 获取）`,
     };
   }
 
-  return { ok: true, version };
+  // Normalise to a single "zmx x.y.z" line. `zmx version` also prints
+  // ghostty_vt / socket_dir / log_dir, and this string is surfaced verbatim by
+  // the Dashboard backend-availability API — returning the raw blob would leak
+  // local socket/log paths and render as a multi-line smear next to peers like
+  // "tmux 3.5".
+  return { ok: true, version: `zmx ${parsedVersion.join('.')}` };
 }
 
 export function probeZmxFunctional(): { ok: true; version: string } | { ok: false; reason: string } {

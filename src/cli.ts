@@ -1421,7 +1421,7 @@ async function promptEditBotConfig(
   }
 
   printInputHelp('会话后端 backendType', [
-    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.1 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
+    '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.0 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
     '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx。',
   ]);

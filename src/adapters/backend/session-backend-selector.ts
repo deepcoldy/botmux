@@ -46,7 +46,7 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
     backend === 'tmux'
       ? 'macOS: brew install tmux ｜ Debian/Ubuntu: sudo apt-get install -y tmux ｜ 其它发行版用对应包管理器安装 tmux'
       : backend === 'zmx'
-        ? '需要包含 PR #202 send 行为的 zmx >= 0.7.1；当前官方 0.6.0 尚不满足，请等待对应正式版'
+        ? '需要 zmx >= 0.7.0（send 不再抢占 client leadership）｜macOS: brew install neurosnap/tap/zmx ｜ Linux: 装官方 release binary ｜ mise: mise use -g github:neurosnap/zmx@latest'
       : `请确认 ${backend} 已正确安装并可用`;
   return [
     `⚠️ 本机 ${backend} 不可用，无法启动会话。`,

@@ -73,17 +73,21 @@ describe('zmx env/probe helpers', () => {
     execFileSyncMock.mockReturnValueOnce('zmx 0.6.99\n' as never);
     expect(probeZmxFunctional()).toEqual({
       ok: false,
-      reason: 'zmx >= 0.7.1 才受支持（当前 0.6.99；需要包含 PR #202 的 send 行为，输出由 history 获取）',
+      reason: 'zmx >= 0.7.0 才受支持（当前 0.6.99；需要 send 不抢占 client leadership 的行为，输出由 history 获取）',
     });
     expect(execFileSyncMock).toHaveBeenCalledTimes(1);
 
+    // 0.7.0 is the exact floor: upstream commit 8ba312d7 ("fix(send): preserve
+    // client leadership") shipped in that release, so it must be ACCEPTED.
     execFileSyncMock.mockReset();
-    execFileSyncMock.mockReturnValueOnce('zmx 0.7.0\n' as never);
-    expect(probeZmxFunctional()).toEqual({
-      ok: false,
-      reason: 'zmx >= 0.7.1 才受支持（当前 0.7.0；需要包含 PR #202 的 send 行为，输出由 history 获取）',
-    });
-    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+    execFileSyncMock.mockReturnValueOnce(
+      'zmx\t\t0.7.0\nghostty_vt\tdev\nsocket_dir\t/tmp/zmx-501\nlog_dir\t/tmp/zmx-501/logs\n' as never,
+    );
+    execFileSyncMock.mockReturnValueOnce('' as never);
+    // The reported version is normalised to one line: the raw `zmx version`
+    // blob would leak socket_dir/log_dir through the Dashboard API.
+    expect(probeZmxFunctional()).toEqual({ ok: true, version: 'zmx 0.7.0' });
+    expect(execFileSyncMock).toHaveBeenCalledTimes(2);
 
     execFileSyncMock.mockReset();
     execFileSyncMock.mockReturnValueOnce('garbage\n' as never);

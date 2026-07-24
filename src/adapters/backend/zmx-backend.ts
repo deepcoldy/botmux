@@ -57,9 +57,11 @@ const ZMX_HISTORY_MAX_BYTES = 16 * 1024 * 1024;
 // ZMX's daemon reads one 4096-byte IPC frame at a time and may observe HUP from
 // the short-lived `send` client in the same poll iteration. Keep header+payload
 // comfortably below that boundary so it can parse the complete message before
-// closing the client (PR #202 currently has no ACK/drain handshake).
+// closing the client (`zmx send` has no ACK/drain handshake as of v0.7.0).
 const ZMX_SEND_CHUNK_BYTES = 1024;
-// PR #202 still has a 256 KiB daemon-side input queue and no send ACK. Reject
+// v0.7.0's daemon queues send input into a 256 KiB pty_write_buf and silently
+// DROPS any payload that would overflow it (daemon-side log only, no ACK, so
+// `zmx send` still exits 0). Reject
 // one-shot payloads well below that ceiling before writing any prefix; adapters
 // that intentionally stream larger input already split and throttle their calls.
 const ZMX_SEND_MAX_BYTES = 64 * 1024;
@@ -1035,7 +1037,7 @@ export class ZmxBackend implements SessionBackend {
         historyPath = join(historyDir, 'history.txt');
         historyFd = openSync(historyPath, 'wx+', 0o600);
         // Keep transcript bytes reachable only through the open fd. A private
-        // regular file also avoids PR #202's single-write pipe truncation.
+        // regular file also avoids `zmx history`'s single-write pipe truncation.
         rmSync(historyPath);
         child = spawn('zmx', ['history', this.sessionName], {
           stdio: ['ignore', historyFd, 'pipe'],
