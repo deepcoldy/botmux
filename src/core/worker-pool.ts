@@ -3962,6 +3962,12 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   // transcript-backed CLIs.
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  // Every Herdr CLI PID is needed for `botmux send` ancestry routing, even
+  // when that CLI has no structured transcript bridge. Unlike tmux's optional
+  // PID liveness watcher, HerdrBackend already tracks exit through the agent
+  // row, so forwarding the PID here does not alter backend lifetime semantics.
+  const forwardAdoptPid = hasCliPid
+    && (adopted.source === 'herdr' || adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId);
 
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -4007,8 +4013,8 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     // the CLI pid (process.kill(pid,0)) so the worker onExit's when a user-typed
     // CLI exits back to a shell — without it, aiden/gemini/opencode/hermes would
     // fall back to pane-only liveness and keep routing input into the shell.
-    adoptCliPid: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.originalCliPid : undefined,
-    adoptCwd: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.cwd : undefined,
+    adoptCliPid: forwardAdoptPid ? adopted.originalCliPid : undefined,
+    adoptCwd: forwardAdoptPid ? adopted.cwd : undefined,
     // Restored-from-metadata: this fork is recreating an /adopt session after
     // a daemon restart, NOT a fresh /adopt command. The Lark thread already
     // has every prior turn pushed as cards, so the worker should skip the

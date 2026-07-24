@@ -150,6 +150,7 @@ vi.mock('../src/services/session-store.js', () => ({
   })),
   updateSession: vi.fn(),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
+  findActiveAdoptSessions: vi.fn(() => []),
 }));
 
 vi.mock('../src/services/schedule-store.js', () => ({
@@ -449,7 +450,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -463,7 +464,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1029,6 +1030,7 @@ describe('handleCommand', () => {
     vi.mocked(resolveDocFile).mockResolvedValue({ fileToken: 'doc_token_12345678901234567890', fileType: 'docx' });
     vi.mocked(getDocSubscription).mockReturnValue(null);
     vi.mocked(putDocSubscription).mockReturnValue({});
+    vi.mocked(sessionStore.findActiveAdoptSessions).mockReturnValue([]);
     // NOTE: vi.clearAllMocks() only clears call history — it does NOT undo
     // mockReturnValue/mockImplementation overrides set inside individual
     // tests (verified on vitest 4; resetAllMocks is what restores factory
@@ -2908,6 +2910,119 @@ describe('handleCommand', () => {
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
   describe('/adopt', () => {
+    it('persists a discovered Herdr Pi pid as originalCliPid', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+
+      await startAdoptSession({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrTarget: 'w3:p3',
+        herdrPaneId: 'w3:p3',
+        herdrAgentName: 'pi',
+        herdrTerminalId: 'term-pi',
+        cliPid: 16493,
+        cliId: 'pi',
+        cwd: '/home/testuser/project-pi',
+        paneCols: 200,
+        paneRows: 50,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toMatchObject({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w3:p3',
+        originalCliPid: 16493,
+        cliId: 'pi',
+      });
+      expect(ds.session.adoptedFrom).toEqual(ds.adoptedFrom);
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      expect(forkAdoptWorker).toHaveBeenCalledWith(ds);
+    });
+
+    it('refuses to adopt a Herdr pane already owned by another active topic', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const other = makeDaemonSession({
+        session: makeSession({
+          sessionId: 'other-session',
+          rootMessageId: 'om_other',
+          adoptedFrom: {
+            source: 'herdr',
+            herdrSessionName: 'work',
+            herdrPaneId: 'w3:p3',
+            originalCliPid: 16493,
+            cliId: 'pi',
+            cwd: '/home/testuser/project-pi',
+          },
+        }),
+        adoptedFrom: {
+          source: 'herdr',
+          herdrSessionName: 'work',
+          herdrPaneId: 'w3:p3',
+          originalCliPid: 16493,
+          cliId: 'pi',
+          cwd: '/home/testuser/project-pi',
+        },
+      });
+      deps.activeSessions.set(sessionKey('om_other', LARK_APP_ID), other);
+
+      await startAdoptSession({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrTarget: 'w3:p3',
+        herdrPaneId: 'w3:p3',
+        cliPid: 16493,
+        cliId: 'pi',
+        cwd: '/home/testuser/project-pi',
+        paneCols: 200,
+        paneRows: 50,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('另一个 Botmux 会话'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
+    it('refuses a stale picker callback when this topic became adopted after the card rendered', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: {
+          source: 'tmux',
+          tmuxTarget: 'existing:0.0',
+          originalCliPid: 16000,
+          cliId: 'codex',
+          cwd: '/existing',
+        },
+      });
+      const deps = makeDeps(ds);
+
+      await startAdoptSession({
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w3:p3',
+        cliPid: 16493,
+        cliId: 'pi',
+        cwd: '/new',
+        paneCols: 200,
+        paneRows: 50,
+      }, ds, deps, LARK_APP_ID);
+
+      expect(ds.adoptedFrom?.tmuxTarget).toBe('existing:0.0');
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('断开'),
+        undefined,
+        LARK_APP_ID,
+      );
+    });
+
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {

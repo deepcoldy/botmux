@@ -354,6 +354,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.no_sessions': '未发现可接入的 CLI 会话',
   'cmd.adopt.pane_not_found': '未找到 tmux pane {pane}',
   'cmd.adopt.target_exited': '⚠️ 目标 CLI 会话已退出',
+  'cmd.adopt.target_in_use': '⚠️ {pane} 已被另一个 Botmux 会话接入。请先在原话题断开，再从这里接入。',
   'cmd.adopt.success': '📡 已接入 {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ 已恢复 {cliName} 历史会话 · {project} —「{title}」',
   'cmd.adopt.resume_not_found': '⚠️ 该历史会话已不存在或已被占用（{id}）',
@@ -734,6 +735,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
+  'worker.adopt_pid_marker_conflict': 'CLI 进程 {pid} 已被另一个 Botmux 会话绑定，拒绝重复接入',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────

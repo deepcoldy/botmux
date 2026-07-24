@@ -507,6 +507,69 @@ describe('session.start lifecycle integration', () => {
     }));
   });
 
+  it('forwards a persisted Herdr Pi pid when restoring an adopt worker', () => {
+    const ds = makeDs({
+      adoptedFrom: {
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrTarget: 'w3:p3',
+        herdrPaneId: 'w3:p3',
+        originalCliPid: 16493,
+        cliId: 'pi',
+        cwd: '/repo/pi',
+      },
+    });
+
+    forkAdoptWorker(ds, { restoredFromMetadata: true });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      adoptMode: true,
+      adoptSource: 'herdr',
+      adoptHerdrSessionName: 'work',
+      adoptHerdrPaneId: 'w3:p3',
+      adoptCliPid: 16493,
+      adoptCwd: '/repo/pi',
+      adoptRestoredFromMetadata: true,
+    }));
+  });
+
+  it('forwards a Herdr pid for non-transcript CLIs without changing tmux pid-liveness policy', () => {
+    const herdr = makeDs({
+      adoptedFrom: {
+        source: 'herdr',
+        herdrSessionName: 'work',
+        herdrPaneId: 'w3:p4',
+        originalCliPid: 16500,
+        cliId: 'gemini',
+        cwd: '/repo/gemini',
+      },
+    });
+    forkAdoptWorker(herdr);
+    expect(forkMock.mock.results.at(-1)!.value.send).toHaveBeenCalledWith(expect.objectContaining({
+      adoptSource: 'herdr',
+      adoptCliPid: 16500,
+      adoptCwd: '/repo/gemini',
+    }));
+
+    const tmux = makeDs({
+      adoptedFrom: {
+        source: 'tmux',
+        tmuxTarget: 'external:0.1',
+        originalCliPid: 16501,
+        cliId: 'gemini',
+        cwd: '/repo/gemini',
+      },
+    });
+    forkAdoptWorker(tmux);
+    expect(forkMock.mock.results.at(-1)!.value.send).toHaveBeenCalledWith(expect.objectContaining({
+      adoptSource: 'tmux',
+      adoptCliPid: undefined,
+      adoptCwd: undefined,
+    }));
+  });
+
   it('removes GitHub tokens from the daemon→adopt-worker fork env', () => {
     vi.stubEnv('GITHUB_TOKEN', 'ghp_secret');
     vi.stubEnv('GH_TOKEN', 'ghs_secret');

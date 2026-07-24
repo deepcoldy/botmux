@@ -351,6 +351,7 @@ export const messages: Record<string, string> = {
   'cmd.adopt.no_sessions': 'No adoptable CLI session found.',
   'cmd.adopt.pane_not_found': 'tmux pane not found: {pane}',
   'cmd.adopt.target_exited': '⚠️ Target CLI session has exited.',
+  'cmd.adopt.target_in_use': '⚠️ {pane} is already adopted by another Botmux session. Disconnect it in the original topic before adopting it here.',
   'cmd.adopt.success': '📡 Adopted {cliName} · {project} ({pane})',
   'cmd.adopt.resume_success': '↩️ Resumed {cliName} session · {project} — “{title}”',
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use ({id})',
@@ -731,6 +732,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
+  'worker.adopt_pid_marker_conflict': 'CLI process {pid} is already bound to another Botmux session; refusing duplicate adoption',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────

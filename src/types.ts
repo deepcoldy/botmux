@@ -351,6 +351,9 @@ export interface Session {
     herdrAgentName?: string;
     herdrTerminalId?: string;
     originalCliPid?: number;
+    /** Process-birth identity captured at adopt time (Linux /proc start ticks,
+     * macOS ps start timestamp). */
+    originalCliProcStart?: string;
     sessionId?: string;
     cliId?: string;
     cwd: string;

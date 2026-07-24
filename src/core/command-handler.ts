@@ -93,6 +93,7 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { readProcessStartIdentity } from './session-marker.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -3416,6 +3417,58 @@ function isZellijTarget(t: AdoptableSession | ZellijAdoptableSession): t is Zell
   return 'zellijPaneId' in t;
 }
 
+type AdoptTargetIdentity = {
+  source?: 'tmux' | 'herdr' | 'zellij';
+  tmuxTarget?: string;
+  zellijSession?: string;
+  zellijPaneId?: string;
+  herdrSessionName?: string;
+  herdrTarget?: string;
+  herdrPaneId?: string;
+};
+
+/** A user pane may have only one active botmux routing owner. PID is
+ * deliberately not part of this identity: a CLI can rotate its process while
+ * the external tmux/Herdr/Zellij pane remains the same resource. */
+function sameAdoptTarget(left: AdoptTargetIdentity, right: AdoptTargetIdentity): boolean {
+  const leftHerdrPane = left.herdrPaneId ?? left.herdrTarget;
+  const rightHerdrPane = right.herdrPaneId ?? right.herdrTarget;
+  if (left.source === 'herdr' || right.source === 'herdr' || leftHerdrPane || rightHerdrPane) {
+    return !!left.herdrSessionName
+      && !!right.herdrSessionName
+      && !!leftHerdrPane
+      && left.herdrSessionName === right.herdrSessionName
+      && leftHerdrPane === rightHerdrPane;
+  }
+  if (left.zellijPaneId || right.zellijPaneId) {
+    return !!left.zellijSession
+      && !!right.zellijSession
+      && !!left.zellijPaneId
+      && left.zellijSession === right.zellijSession
+      && left.zellijPaneId === right.zellijPaneId;
+  }
+  return !!left.tmuxTarget && left.tmuxTarget === right.tmuxTarget;
+}
+
+function findAdoptTargetConflict(
+  target: AdoptableSession | ZellijAdoptableSession,
+  current: DaemonSession,
+  activeSessions: Map<string, DaemonSession>,
+): import('../types.js').Session | undefined {
+  const candidates = new Map<string, import('../types.js').Session>();
+  for (const candidate of activeSessions.values()) {
+    candidates.set(candidate.session.sessionId, candidate.session);
+  }
+  for (const candidate of sessionStore.findActiveAdoptSessions()) {
+    candidates.set(candidate.sessionId, candidate);
+  }
+  for (const candidate of candidates.values()) {
+    if (candidate.sessionId === current.session.sessionId || !candidate.adoptedFrom) continue;
+    if (sameAdoptTarget(target, candidate.adoptedFrom)) return candidate;
+  }
+  return undefined;
+}
+
 export async function startCodexAppThreadSession(
   thread: CodexAppThreadSummary,
   ds: DaemonSession,
@@ -3455,12 +3508,51 @@ export async function startAdoptSession(
     deps.sessionReply(rid, content, msgType, larkAppId);
   const loc: Locale = localeForBot(ds.larkAppId ?? larkAppId);
 
+  // Card callbacks can arrive long after their picker was rendered. Keep the
+  // invariant at the mutation boundary too (the `/adopt` text command has an
+  // earlier fast-path) so a stale card cannot silently replace a live adopt.
+  if (ds.adoptedFrom) {
+    const adopted = ds.adoptedFrom;
+    const cliName = getCliDisplayName(adopted.cliId ?? 'claude-code');
+    const project = adopted.cwd ? (adopted.cwd.split('/').pop() || adopted.cwd) : '';
+    const label = project ? `${cliName} · ${project}` : cliName;
+    await sessionReply(
+      sessionAnchorId(ds),
+      t('cmd.adopt.already_adopted', { label, pane: adoptTargetLabel(adopted) }, loc),
+    );
+    return;
+  }
+
   const zellij = isZellijTarget(target);
+  const procStartBeforeValidation = target.cliPid
+    ? readProcessStartIdentity(target.cliPid)
+    : undefined;
   const valid = zellij
     ? validateZellijAdoptTarget(target.zellijSession, target.zellijPaneId, target.cliPid, target.cliId)
     : validateAdoptTarget(target);
   if (!valid) {
     await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
+    return;
+  }
+
+  // Close the small validate -> persist race: if the PID disappeared or was
+  // reused after pane validation, do not create a marker for a different
+  // process generation. Platforms that cannot read a birth identity retain
+  // the existing pane/PID validation semantics.
+  const originalCliProcStart = target.cliPid
+    ? readProcessStartIdentity(target.cliPid)
+    : undefined;
+  if (procStartBeforeValidation && procStartBeforeValidation !== originalCliProcStart) {
+    await sessionReply(sessionAnchorId(ds), t('cmd.adopt.target_exited', undefined, loc));
+    return;
+  }
+
+  const conflict = findAdoptTargetConflict(target, ds, deps.activeSessions);
+  if (conflict) {
+    await sessionReply(
+      sessionAnchorId(ds),
+      t('cmd.adopt.target_in_use', { pane: adoptTargetLabel(target) }, loc),
+    );
     return;
   }
 
@@ -3481,6 +3573,7 @@ export async function startAdoptSession(
     herdrAgentName: zellij ? undefined : target.herdrAgentName,
     herdrTerminalId: zellij ? undefined : target.herdrTerminalId,
     originalCliPid: target.cliPid,
+    originalCliProcStart,
     sessionId: target.sessionId,
     cliId: target.cliId,
     cwd: target.cwd,

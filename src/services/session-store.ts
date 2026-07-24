@@ -284,6 +284,13 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
   return findActiveSessionsMatching(s => s.chatId === chatId && s.scope === 'chat');
 }
 
+/** Active external-adopt bindings across every bot store. `/adopt` uses this
+ * as a user-facing preflight; the worker's PID-marker claim remains the atomic
+ * cross-process fence for races between daemon processes. */
+export function findActiveAdoptSessions(): Session[] {
+  return findActiveSessionsMatching(s => !!s.adoptedFrom);
+}
+
 /**
  * Count active sessions across every bot's on-disk session file. A pure disk
  * read (no in-memory state) so it's correct at daemon startup regardless of

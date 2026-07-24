@@ -281,6 +281,9 @@ export interface DaemonSession {
     herdrAgentName?: string;
     herdrTerminalId?: string;
     originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
+    /** Process-birth identity captured at adopt time. Prevents a restored
+     * session from claiming an unrelated process after PID reuse. */
+    originalCliProcStart?: string;
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type
     cwd: string;              // CLI working directory
