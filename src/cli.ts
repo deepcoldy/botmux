@@ -4548,6 +4548,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   skill show <name>                    读取某技能的完整 SKILL.md 说明（prompt 注入模式下按需拉取内置技能全文）
 
 编排 / workflow（v3）:
+  goal run <goal> [--run-id <id>] [--bot <id|name>] [--working-dir <dir>]
+                  [--timeout <seconds>] [--json]
+                                       在现有 v3 沙箱/worker 路径运行一个 headless goal；
+                                       同一 run-id 可安全重放终态或接续崩溃运行
   workflow save [last|runId] [名称]
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
@@ -9159,6 +9163,11 @@ switch (command) {
     // real ephemeral worker pool, daemon-independent (dogfood path).
     const { cmdV3 } = await import('./workflows/v3/cli-run.js');
     await cmdV3(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'goal': {
+    const { cmdGoal } = await import('./workflows/v3/goal-cli.js');
+    process.exitCode = await cmdGoal(process.argv[3] ?? '', process.argv.slice(4));
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;

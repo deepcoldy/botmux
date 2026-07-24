@@ -380,6 +380,31 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 
 ---
 
+### One Headless Goal (local CLI)
+
+`botmux goal run` executes one real goal without starting the daemon. It is useful for local scripts, CI, and human-triggered automation. It follows the existing v3 ephemeral-worker, sandbox/enforcement, journal, worker-fence, and manifest-validation path. Its trust boundary is the same as a local operator running botmux directly; it is not a remote-execution API.
+
+```bash
+botmux goal run "inspect the repository and write release notes" \
+  --bot my-codex \
+  --working-dir ~/projects/app \
+  --run-id release-notes-2026-07-22 \
+  --timeout 900 \
+  --json
+```
+
+The goal may also come from `--goal-file <path>` or `--stdin`. `--timeout` is in seconds. SIGINT, SIGTERM, and timeouts converge the journal to a durable `cancelled` terminal before the CLI exits.
+
+In `--json` mode stdout contains exactly one terminal JSON document (`schemaVersion: "botmux.goal-run-result/v1"`); logs go to stderr. Exit codes are a stable machine contract: `0` succeeded, `10` failed, `11` blocked, `12` cancelled, `13` run-id/active-driver conflict, and `14` usage or startup error. Failures also carry structured `error.code` and `error.message` values.
+
+`--run-id` is the idempotency key. An existing terminal result is replayed without spawning a worker; a live driver is rejected with exit `13`; after a driver is killed with `kill -9`, retrying the same request and run id resumes from the v3 journal/worker fence as a new attempt rather than overwriting the old attempt. A different goal, bot, working directory, or timeout cannot reuse the run id.
+
+The JSON `artifacts` list contains only relative paths and metadata accepted by the existing manifest validator. `runDirectory.stability` is always `informative-only`: the directory is useful for local diagnosis but its private layout is not an API. When usage/cost data is unavailable, the field is omitted rather than fabricated as zero.
+
+This first slice is a local single-process CLI contract only. It does not provide a daemon/remote Host API, event stream, or cross-host fencing; those require a separate RFC and security review.
+
+---
+
 ### Per-Bot Environment Variables (run a bot on GLM / a third-party provider)
 
 Each `bots.json` entry can define its own `env` object, injected into **that bot's CLI process**. Typical use: run one bot on a GLM Coding Plan / third-party Anthropic·OpenAI-compatible provider while another keeps using official Claude — just point the former at the provider's endpoint and key:

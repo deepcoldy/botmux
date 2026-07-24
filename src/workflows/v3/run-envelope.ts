@@ -50,6 +50,7 @@ export type Sha256Digest = `sha256:${string}`;
 
 export type V3RunArtifactPath =
   | 'dag.json'
+  | 'goal.request.json'
   | 'spec.json'
   | 'bots.snapshot.json'
   | 'params.resolved.json'
@@ -143,11 +144,14 @@ const manualCliEnvelopeSchema = z.object({
   artifacts: z.object({
     dag: artifactRefSchema('dag.json'),
     botSnapshots: artifactRefSchema('bots.snapshot.json'),
+    /** Present for `botmux goal run`; absent for hand-authored `v3 run`. */
+    goalRequest: artifactRefSchema('goal.request.json').optional(),
   }).strict(),
   authorization: z.object({
     kind: z.literal('local_cli'),
     authorizedAt: timestampSchema,
     dagSha256: sha256Schema,
+    goalRequestSha256: sha256Schema.optional(),
   }).strict(),
 }).strict();
 
@@ -225,6 +229,23 @@ export const V3RunEnvelopeSchema = z.union([
         code: z.ZodIssueCode.custom,
         path: ['authorization', 'specSha256'],
         message: 'must match artifacts.spec.sha256',
+      });
+    }
+  } else if (envelope.authorization.kind === 'local_cli') {
+    const artifacts = envelope.artifacts as z.infer<typeof manualCliEnvelopeSchema>['artifacts'];
+    const requestRef = artifacts.goalRequest;
+    const requestDigest = envelope.authorization.goalRequestSha256;
+    if (requestRef && requestDigest !== requestRef.sha256) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'goalRequestSha256'],
+        message: 'must match artifacts.goalRequest.sha256 when goalRequest is present',
+      });
+    } else if (!requestRef && requestDigest !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['authorization', 'goalRequestSha256'],
+        message: 'must be absent when artifacts.goalRequest is absent',
       });
     }
   } else if (envelope.authorization.kind === 'legacy_backfill') {
@@ -529,6 +550,8 @@ export interface LoadedAuthorizedV3Run {
   botSnapshots?: unknown;
   resolvedParams?: unknown;
   definitionSnapshot?: unknown;
+  /** Exact idempotency request for `botmux goal run`, when present. */
+  goalRequest?: unknown;
   /** Exact verified bytes, for a caller that must avoid a second filesystem read. */
   bytes: {
     runEnvelope: Buffer;
@@ -537,6 +560,7 @@ export interface LoadedAuthorizedV3Run {
     botSnapshots?: Buffer;
     resolvedParams?: Buffer;
     definitionSnapshot?: Buffer;
+    goalRequest?: Buffer;
   };
 }
 
@@ -597,6 +621,7 @@ export function loadAuthorizedV3Run(
   let botSnapshots: unknown;
   let resolvedParams: unknown;
   let definitionSnapshot: unknown;
+  let goalRequest: unknown;
 
   if ('spec' in envelope.artifacts && envelope.artifacts.spec) {
     const specBytes = verifyArtifact(runDir, envelope.artifacts.spec);
@@ -635,6 +660,11 @@ export function loadAuthorizedV3Run(
     bytes.definitionSnapshot = definitionBytes;
     definitionSnapshot = parseJsonArtifact(definitionBytes, 'definition.snapshot.json');
   }
+  if ('goalRequest' in envelope.artifacts && envelope.artifacts.goalRequest) {
+    const requestBytes = verifyArtifact(runDir, envelope.artifacts.goalRequest);
+    bytes.goalRequest = requestBytes;
+    goalRequest = parseJsonArtifact(requestBytes, 'goal.request.json');
+  }
 
   if (envelope.source.kind === 'saved_definition') {
     if (!definitionSnapshot || typeof definitionSnapshot !== 'object' || Array.isArray(definitionSnapshot)) {
@@ -658,7 +688,7 @@ export function loadAuthorizedV3Run(
     }
   }
 
-  return { envelope, dag, spec, botSnapshots, resolvedParams, definitionSnapshot, bytes };
+  return { envelope, dag, spec, botSnapshots, resolvedParams, definitionSnapshot, goalRequest, bytes };
 }
 
 function canonicalize(value: unknown): unknown {
@@ -839,6 +869,9 @@ export function makeManualCliRunEnvelope(input: CommonBuilderInput & {
       kind: 'local_cli',
       authorizedAt: input.authorizedAt,
       dagSha256: input.artifacts.dag.sha256,
+      ...(input.artifacts.goalRequest
+        ? { goalRequestSha256: input.artifacts.goalRequest.sha256 }
+        : {}),
     },
   }) as V3ManualCliRunEnvelope;
 }
