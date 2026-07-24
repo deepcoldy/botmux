@@ -28,6 +28,8 @@ vi.mock('../src/bot-registry.js', () => ({
     { config: { larkAppId: 'cli_peer' } } as any,
   ]),
   getBot: vi.fn(),
+  getBotOpenId: vi.fn(),
+  getOwnerOpenId: vi.fn(),
 }));
 
 // The endpoint identifies legitimate requesters via the cross-process
@@ -52,6 +54,8 @@ vi.mock('../src/im/lark/client.js', () => ({
   replyMessage: vi.fn(),
   sendMessage: vi.fn(),
   resolveUnionIdFromOpenId: vi.fn(async () => null),
+  listCurrentChatBotMembers: vi.fn(async () => []),
+  resolveCurrentChatBotOpenIdsByLarkAppIds: vi.fn(async () => ({ ok: true, mappings: [] })),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({

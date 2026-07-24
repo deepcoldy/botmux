@@ -10,7 +10,12 @@
  *  - unresolvable refs → reported in `invalid`
  */
 import { describe, it, expect } from 'vitest';
-import { resolveBotRefs, resolveKickoff } from '../src/cli/create-group-resolver.js';
+import {
+  createGroupCompletionStatus,
+  resolveBotRefs,
+  resolveKickoff,
+  shouldWriteCreateGroupCompletionStatus,
+} from '../src/cli/create-group-resolver.js';
 
 const CFG_CLAUDE = { larkAppId: 'cli_claude_1', cliId: 'claude-code' };
 const CFG_COCO_1 = { larkAppId: 'cli_coco_1', cliId: 'claude-code' };
@@ -156,5 +161,75 @@ describe('resolveKickoff', () => {
       ok: false,
       error: '--kickoff-bot 不能是 creator（第一个 --bot）。',
     });
+  });
+});
+
+describe('createGroupCompletionStatus', () => {
+  it('does not report completion when a requested kickoff was not accepted', () => {
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: true,
+      kickoffRequested: true,
+      kickoffMessageId: null,
+      kickoffError: 'network down',
+    })).toEqual({
+      success: false,
+      chatCreated: true,
+      chatId: 'oc_created',
+      collaborationReady: true,
+      kickoffAccepted: false,
+      kickoffRequested: true,
+      kickoffMessageId: null,
+      kickoffError: 'network down',
+    });
+  });
+
+  it('reports completion only after collaboration and requested kickoff both succeed', () => {
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: true,
+      kickoffRequested: true,
+      kickoffMessageId: 'om_kickoff',
+      kickoffError: null,
+    })).toMatchObject({
+      success: true,
+      collaborationReady: true,
+      kickoffAccepted: true,
+    });
+    expect(createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: false,
+      kickoffRequested: false,
+      kickoffMessageId: null,
+      kickoffError: null,
+    })).toMatchObject({
+      success: false,
+      collaborationReady: false,
+      kickoffAccepted: true,
+    });
+  });
+
+  it('keeps successful default stdout as the historical single chatId line', () => {
+    const success = createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: true,
+      kickoffRequested: false,
+      kickoffMessageId: null,
+      kickoffError: null,
+    });
+    expect(shouldWriteCreateGroupCompletionStatus(success, false)).toBe(false);
+    expect(shouldWriteCreateGroupCompletionStatus(success, true)).toBe(true);
+
+    const partial = createGroupCompletionStatus({
+      chatId: 'oc_created',
+      collaborationReady: false,
+      kickoffRequested: false,
+      kickoffMessageId: null,
+      kickoffError: null,
+    });
+    // Legacy wrappers parse the whole stdout as ^oc_...$: even a partial
+    // non-zero result must leave stdout as the single early chatId line.
+    expect(shouldWriteCreateGroupCompletionStatus(partial, false)).toBe(false);
+    expect(shouldWriteCreateGroupCompletionStatus(partial, true)).toBe(true);
   });
 });

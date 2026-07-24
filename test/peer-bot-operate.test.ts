@@ -1,8 +1,7 @@
 /**
- * L1 sibling-bot operate trust: a same-deployment registered peer bot
- * (isKnownPeerBot — present in this app's bot-openids cross-ref) can run
- * `/` commands (canOperate) on a sibling, mirroring the talk gate. A human's
- * talk-grant still does NOT confer operate (PR#46 boundary preserved).
+ * Same-deployment peer identity is talk-only: isKnownPeerBot / cross-ref may
+ * route a sibling's prompt, but it must never confer management-command
+ * permission. Explicit operate-capable sources remain authoritative.
  *
  * Run: pnpm vitest run test/peer-bot-operate.test.ts
  */
@@ -16,11 +15,11 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   return { Client: FakeClient };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot } from '../src/bot-registry.js';
 import { canTalk, canOperate } from '../src/im/lark/event-dispatcher.js';
 import { config } from '../src/config.js';
 
-describe('sibling-bot operate trust (L1)', () => {
+describe('sibling-bot cross-ref is talk-only', () => {
   let prevDataDir: string;
   let tmp: string;
 
@@ -40,12 +39,18 @@ describe('sibling-bot operate trust (L1)', () => {
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* */ }
   });
 
-  it('a registered sibling bot can operate (run / commands)', () => {
-    expect(canOperate('op1', 'oc_1', 'ou_sibling')).toBe(true);
+  it('a registered sibling bot cannot operate management commands', () => {
+    expect(canOperate('op1', 'oc_1', 'ou_sibling')).toBe(false);
   });
 
   it('the sibling bot can also talk (parity with the talk gate)', () => {
     expect(canTalk('op1', 'oc_1', 'ou_sibling')).toBe(true);
+  });
+
+  it('known peer + exact chatGrant remains talk-only', () => {
+    getBot('op1').config.chatGrants = { oc_1: ['ou_sibling'] };
+    expect(canTalk('op1', 'oc_1', 'ou_sibling')).toBe(true);
+    expect(canOperate('op1', 'oc_1', 'ou_sibling')).toBe(false);
   });
 
   it('a human with only a chat talk-grant still cannot operate (PR#46 preserved)', () => {

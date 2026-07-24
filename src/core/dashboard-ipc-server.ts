@@ -50,6 +50,7 @@ import * as observedBotsStore from '../services/observed-bots-store.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
+import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
 import { findConfigField, applyConfigField, coerceConfigValue } from '../services/bot-config-store.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -93,6 +94,11 @@ import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
 
+let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
+/** Test seam: replace the exact-grant service without touching live Feishu/config state. */
+export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequest | null): void {
+  exactChatGrantHandler = handler ?? applyExactChatGrantRequest;
+}
 // 机器人真·改名 renamer，由 daemon 启动时注册（开放平台自动化 + daemon 侧
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
@@ -216,7 +222,7 @@ function ipcAuthSecret(): string | null {
  * secret. Workflow v3 mutations intentionally use their separate, full-request
  * protocol (`workflows/v3/daemon-ipc-auth`) and must never call this bare
  * ts:nonce verifier. */
-export function ipcHmacAuthorized(req: IncomingMessage): boolean {
+export function ipcHmacAuthorized(req: IncomingMessage, bind?: string): boolean {
   if (trustedHostRequests.has(req)) return true;
   const secret = ipcAuthSecret();
   if (!secret) return false; // fail-closed: no secret on disk → nobody can sign
@@ -224,7 +230,11 @@ export function ipcHmacAuthorized(req: IncomingMessage): boolean {
   const nonce = req.headers['x-botmux-cli-nonce'];
   const sig = req.headers['x-botmux-cli-auth'];
   if (typeof ts !== 'string' || typeof nonce !== 'string' || typeof sig !== 'string') return false;
-  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '').ok;
+  return verifyHmac(secret, { ts, nonce, sig }, req.socket.remoteAddress ?? '', bind).ok;
+}
+
+function tokenRouteAuthorized(req: IncomingMessage, bind?: string): boolean {
+  return ipcHmacAuthorized(req, bind);
 }
 
 function routeHasPublicAccess(method: string, pathname: string): boolean {
@@ -974,6 +984,27 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
+ * Dashboard「复现命令」：返回该 active session 本次冷启的**近似**可复现 CLI 调用
+ * （bin + argv + cwd + 权威注入 env），供用户粘到调试终端改参数复现。命令原样保留
+ * （含 write token / --append-system-prompt / 凭证 env），与 write-link 同一把
+ * loopback-HMAC 锁：匿名浏览器在 dashboard HTTP 边界就 401（该路径不在 allow-list），
+ * 本机知道 ipcPort 的进程也过不了 ipcHmacAuthorized。仅持管理 cookie 的写权限视图能取。
+ *
+ * 只读 active session 的**内存**字段（DaemonSession.spawnCommand）：命令含凭证，
+ * 绝不落盘，也绝不从 closed/持久化 session 取（那既无值也避免误暴露）。daemon 重启后
+ * 到 worker 再次 ready 之前返回 unavailable——可接受。warm reattach 不重算命令，此时
+ * 亦为空。riff 后端无本地 bin/args，worker 侧不产出命令，这里同样 unavailable。
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/spawn-command', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const cmd = ds.spawnCommand;
+  if (!cmd) return jsonRes(res, 404, { ok: false, error: 'spawn_command_unavailable' });
+  jsonRes(res, 200, { ok: true, command: cmd });
+});
+
+/**
  * Deliver the writable-terminal card privately to the bot's owner(s) — the
  * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
  * (which returns the URL to its single authenticated caller), this POSTs the
@@ -1582,6 +1613,80 @@ ipcRoute('POST', '/api/trigger', async (req, res) => {
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
   }
+});
+
+// ─── Exact chat grants (talk-only) ─────────────────────────────────────────
+
+/**
+ * Apply/read/revoke a receiver-scoped chatGrant. The receiver identity comes
+ * from this daemon's cached larkAppId, never from the caller. The body repeats
+ * it only as an anti-misrouting assertion (e.g. a stale daemon descriptor).
+ *
+ * This permission write is loopback-HMAC protected: a sandboxed worker that
+ * merely discovers an ipcPort must not be able to grant itself access.
+ */
+ipcRoute('POST', '/api/grants/chat', async (req, res) => {
+  const localPort = req.socket.localPort;
+  const authBind = localPort ? cliAuthBind('POST', '/api/grants/chat', localPort) : undefined;
+  if (!authBind || !tokenRouteAuthorized(req, authBind)) {
+    return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  }
+  if (!cachedLarkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  }
+  let body: {
+    operation?: unknown;
+    receiverLarkAppId?: unknown;
+    chatId?: unknown;
+    subjectOpenIds?: unknown;
+    subjectLarkAppIds?: unknown;
+  };
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (body.receiverLarkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'receiver_mismatch',
+      receiverLarkAppId: cachedLarkAppId,
+    });
+  }
+  const hasSubjectOpenIds = Object.prototype.hasOwnProperty.call(body, 'subjectOpenIds');
+  const hasSubjectLarkAppIds = Object.prototype.hasOwnProperty.call(body, 'subjectLarkAppIds');
+  if (hasSubjectOpenIds === hasSubjectLarkAppIds) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'exactly_one_subject_identity_required',
+      message: 'Provide exactly one of subjectOpenIds or subjectLarkAppIds',
+    });
+  }
+  if (hasSubjectLarkAppIds && body.operation !== 'grant') {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'subject_lark_app_ids_grant_only',
+      message: 'subjectLarkAppIds may only be used with operation=grant',
+    });
+  }
+  const result = hasSubjectLarkAppIds
+    ? await exactChatGrantHandler({
+        operation: body.operation,
+        receiverLarkAppId: cachedLarkAppId,
+        chatId: body.chatId,
+        subjectLarkAppIds: body.subjectLarkAppIds,
+      })
+    : await exactChatGrantHandler({
+        operation: body.operation,
+        receiverLarkAppId: cachedLarkAppId,
+        chatId: body.chatId,
+        subjectOpenIds: body.subjectOpenIds,
+      });
+  if (!result.ok) {
+    const { status, ...responseBody } = result;
+    return jsonRes(res, status, responseBody);
+  }
+  return jsonRes(res, 200, result);
 });
 
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────

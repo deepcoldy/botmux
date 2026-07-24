@@ -15,13 +15,18 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { findAncestorSessionContext } from '../src/core/session-marker.js';
 import {
+  acceptedDispatchBotAppIds,
+  appendDispatchReportProtocol,
+  appendLegacyDispatchReportProtocol,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
   buildReportContent,
+  findDispatchRegistryEntry,
   findSubBotTopic,
   eligibleAutoMentionAliases,
   offTopicSubBotTopic,
+  recordDispatchInputCommit,
   resolveReportTarget,
   resolveSendTarget,
 } from '../src/core/dispatch.js';
@@ -91,6 +96,27 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+});
+
+describe('appendDispatchReportProtocol', () => {
+  it('freezes a distinct exact report root into each dispatched turn', () => {
+    const first = appendDispatchReportProtocol('第一单', 'om_seed_first');
+    const second = appendDispatchReportProtocol('第二单', 'om_seed_second');
+    expect(first).toContain('botmux report --dispatch-root om_seed_first');
+    expect(first).not.toContain('om_seed_second');
+    expect(second).toContain('botmux report --dispatch-root om_seed_second');
+    expect(second).not.toContain('om_seed_first');
+  });
+
+  it('rejects a non-message root instead of injecting an ambiguous command', () => {
+    expect(() => appendDispatchReportProtocol('x', 'oc_chat')).toThrow('valid om_ root id');
+  });
+
+  it('keeps the root-free compatibility command for legacy cross-machine dispatches', () => {
+    const legacy = appendLegacyDispatchReportProtocol('跨机器任务');
+    expect(legacy).toContain('botmux report "子项目完成 + 产出位置/摘要"');
+    expect(legacy).not.toContain('--dispatch-root');
   });
 });
 
@@ -256,6 +282,265 @@ describe('resolveReportTarget', () => {
     expect(resolveReportTarget({ creatorOpenId: 'c', ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('c');
     expect(resolveReportTarget({ ownerOpenId: 'o', quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('o');
     expect(resolveReportTarget({ quoteTargetSenderOpenId: 'q' }).orchOpenId).toBe('q');
+  });
+});
+
+describe('findDispatchRegistryEntry', () => {
+  const registry = {
+    om_seed_old: { orchRoot: 'om_orch_old', orchSessionId: 's_old' },
+    om_seed_new: { orchRoot: 'om_orch_new', orchSessionId: 's_new' },
+  };
+
+  it('uses the thread root for a normal thread-scoped dispatched session', () => {
+    expect(findDispatchRegistryEntry({ registry, rootMessageId: 'om_seed_new' })).toEqual({
+      key: 'om_seed_new',
+      entry: registry.om_seed_new,
+    });
+  });
+
+  it('uses currentReplyTarget for a chat-scope session folded from a dispatch topic', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+      replyThreadAliases: {
+        om_seed_new: { createdAt: '2026-07-14T08:00:00.000Z', lastUsedAt: '2026-07-14T08:01:00.000Z' },
+      },
+    })).toEqual({ key: 'om_seed_new', entry: registry.om_seed_new });
+  });
+
+  it('prefers the immutable turn root when the chat-scope session has advanced to a newer dispatch', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      dispatchRootId: 'om_seed_old',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+      replyThreadAliases: {
+        om_seed_old: { createdAt: '2026-07-14T07:00:00.000Z', lastUsedAt: '2026-07-14T07:01:00.000Z' },
+        om_seed_new: { createdAt: '2026-07-14T08:00:00.000Z', lastUsedAt: '2026-07-14T08:01:00.000Z' },
+      },
+    })).toEqual({ key: 'om_seed_old', entry: registry.om_seed_old });
+  });
+
+  it('fails closed when an explicit turn root is absent instead of falling through to the latest alias', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      dispatchRootId: 'om_seed_missing',
+      rootMessageId: 'oc_group',
+      currentReplyTargetRootId: 'om_seed_new',
+    })).toBeUndefined();
+  });
+
+  it('falls back to the most recently used matching reply-thread alias', () => {
+    expect(findDispatchRegistryEntry({
+      registry,
+      rootMessageId: 'oc_group',
+      replyThreadAliases: {
+        om_seed_old: { createdAt: '2026-07-14T07:00:00.000Z', lastUsedAt: '2026-07-14T07:01:00.000Z' },
+        om_seed_new: { createdAt: '2026-07-14T08:00:00.000Z', lastUsedAt: '2026-07-14T08:01:00.000Z' },
+      },
+    })).toEqual({ key: 'om_seed_new', entry: registry.om_seed_new });
+  });
+});
+
+describe('acceptedDispatchBotAppIds', () => {
+  const sentAt = Date.parse('2026-07-14T09:00:00.000Z');
+  const turnId = 'om_kickoff_current';
+  const workerPid = 12345;
+  const workerGeneration = 7;
+  const isWorkerAlive = (pid: number) => pid === workerPid;
+
+  it('accepts only exact current-turn input commits for thread and chat-scope sessions', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [
+        {
+          larkAppId: 'cli_thread', chatId: 'oc_target', rootMessageId: 'om_seed',
+          status: 'active', pid: workerPid, workerGeneration,
+          dispatchInputReceipts: {
+            [turnId]: {
+              rootMessageId: 'om_seed',
+              committedAt: '2026-07-14T09:00:01.000Z',
+              workerGeneration,
+            },
+          },
+        },
+        {
+          larkAppId: 'cli_chat', chatId: 'oc_target', rootMessageId: 'oc_target',
+          status: 'active', pid: workerPid, workerGeneration,
+          dispatchInputReceipts: {
+            [turnId]: {
+              rootMessageId: 'om_seed',
+              committedAt: '2026-07-14T09:00:02.000Z',
+              workerGeneration,
+            },
+          },
+        },
+      ],
+      targetAppIds: ['cli_thread', 'cli_chat'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_thread', 'cli_chat']);
+  });
+
+  it('rejects stale, closed, wrong-chat, unrelated-root, and wrong-turn receipts', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [
+        { larkAppId: 'cli_stale', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T08:00:00.000Z', workerGeneration } } },
+        { larkAppId: 'cli_closed', chatId: 'oc_target', status: 'closed', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_chat', chatId: 'oc_other', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_root', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { [turnId]: { rootMessageId: 'om_other', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+        { larkAppId: 'cli_wrong_turn', chatId: 'oc_target', status: 'active', pid: workerPid, workerGeneration, dispatchInputReceipts: { om_old: { rootMessageId: 'om_seed', committedAt: '2026-07-14T09:00:01.000Z', workerGeneration } } },
+      ],
+      targetAppIds: ['cli_stale', 'cli_closed', 'cli_wrong_chat', 'cli_wrong_root', 'cli_wrong_turn'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('deduplicates requested app ids while preserving request order', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo', chatId: 'oc_target', rootMessageId: 'om_seed',
+        status: 'active', pid: workerPid, workerGeneration,
+        dispatchInputReceipts: {
+          [turnId]: {
+            rootMessageId: 'om_seed',
+            committedAt: '2026-07-14T09:00:00.000Z',
+            workerGeneration,
+          },
+        },
+      }],
+      targetAppIds: ['cli_repo', 'cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_repo']);
+  });
+
+  it('does not combine an old lastCliInput with a fresh alias when the current enqueue failed', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo', chatId: 'oc_target', rootMessageId: 'oc_target',
+        status: 'active', lastCliInput: 'old task', pid: workerPid, workerGeneration,
+        currentReplyTarget: {
+          rootMessageId: 'om_seed',
+          turnId,
+          updatedAt: '2026-07-14T09:00:01.000Z',
+        },
+      }],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('accepts only after the current turn is committed and rejects an unbound commit', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'oc_target',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+      replyTargets: {
+        [turnId]: { rootMessageId: 'om_seed', updatedAt: '2026-07-14T09:00:01.000Z' },
+      },
+    };
+    expect(recordDispatchInputCommit(
+      session,
+      'om_unbound',
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(true);
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual(['cli_repo']);
+  });
+
+  it('rejects a receipt from the previous worker generation after replacement', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_seed',
+      status: 'active',
+      pid: workerPid,
+      workerGeneration: 8,
+      dispatchInputReceipts: {
+        [turnId]: {
+          rootMessageId: 'om_seed',
+          committedAt: '2026-07-14T09:00:01.000Z',
+          workerGeneration: 7,
+        },
+      },
+    };
+    expect(acceptedDispatchBotAppIds({
+      sessions: [session],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive,
+    })).toEqual([]);
+  });
+
+  it('rejects an otherwise exact receipt after the persisted worker has exited', () => {
+    expect(acceptedDispatchBotAppIds({
+      sessions: [{
+        larkAppId: 'cli_repo',
+        chatId: 'oc_target',
+        status: 'active',
+        pid: workerPid,
+        workerGeneration,
+        dispatchInputReceipts: {
+          [turnId]: {
+            rootMessageId: 'om_seed',
+            committedAt: '2026-07-14T09:00:01.000Z',
+            workerGeneration,
+          },
+        },
+      }],
+      targetAppIds: ['cli_repo'],
+      chatId: 'oc_target',
+      threadRootId: 'om_seed',
+      turnId,
+      notBeforeMs: sentAt,
+      isWorkerAlive: () => false,
+    })).toEqual([]);
   });
 });
 

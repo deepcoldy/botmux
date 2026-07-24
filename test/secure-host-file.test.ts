@@ -69,15 +69,22 @@ describe('secure host authority files', () => {
     expect(() => writeSecureHostFileSync(file, 'secret')).toThrow(/其它用户写入|组内/);
   });
 
-  it('rejects a safe-looking credential directory under a replaceable ancestor', () => {
+  it('pins a safe credential directory under a replaceable ancestor on Linux', () => {
     if (process.platform === 'win32') return;
     const root = tempRoot();
     chmodSync(root, 0o777);
     const dir = join(root, '.botmux');
     mkdirSync(dir, { mode: 0o700 });
+    const file = join(dir, 'device.json');
 
-    expect(() => writeSecureHostFileSync(join(dir, 'device.json'), 'secret'))
-      .toThrow(/祖先目录替换/);
+    if (process.platform === 'linux') {
+      writeSecureHostFileSync(file, 'secret');
+      expect(readSecureHostFileSync(file)).toBe('secret');
+      expect(unlinkSecureHostFileSync(file)).toBe(true);
+      expect(readSecureHostFileSync(file)).toBeNull();
+    } else {
+      expect(() => writeSecureHostFileSync(file, 'secret')).toThrow(/祖先目录替换/);
+    }
   });
 
   it('accepts an owned child under a sticky writable ancestor', () => {

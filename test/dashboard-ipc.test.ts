@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -22,10 +22,10 @@ import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
 // ~/.botmux/.dashboard-secret existing on the box.
 const TEST_IPC_SECRET = 'test-ipc-secret-deadbeef';
-function tokenAuthHeaders(secret = TEST_IPC_SECRET): Record<string, string> {
+function tokenAuthHeaders(secret = TEST_IPC_SECRET, bind?: string): Record<string, string> {
   const ts = Math.floor(Date.now() / 1000).toString();
   const nonce = randomBytes(8).toString('hex');
-  const sig = createHmac('sha256', secret).update(`${ts}:${nonce}`).digest('base64url');
+  const sig = createHmac('sha256', secret).update(bind ? `${ts}:${nonce}:${bind}` : `${ts}:${nonce}`).digest('base64url');
   return { 'X-Botmux-Cli-Ts': ts, 'X-Botmux-Cli-Nonce': nonce, 'X-Botmux-Cli-Auth': sig };
 }
 
@@ -101,6 +101,7 @@ afterEach(async () => {
   setLarkAppId('');
   __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
+  setExactChatGrantHandler(null);
 });
 
 describe('dashboard IPC server', () => {
@@ -214,6 +215,296 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('POST /api/grants/chat', () => {
+  it('requires loopback HMAC before invoking the permission service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(401);
+
+    const bareLegacyHmac = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders() },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(bareLegacyHmac.status).toBe(401);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('returns 503 when the daemon receiver identity is not ready', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(503);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('uses the daemon identity as source-of-truth and rejects stale descriptor routing', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_actual_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_stale_descriptor',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'receiver_mismatch' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('forwards only the daemon receiver and preserves explicit talk-only output', async () => {
+    const handler = vi.fn(async (input: any) => ({
+      ok: true as const,
+      operation: 'grant' as const,
+      permissionSource: 'chatGrant' as const,
+      talkOnly: true as const,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: true,
+      grantsOperate: false as const,
+      subjects: [{
+        subjectOpenId: input.subjectOpenIds[0],
+        chatGrantActive: true,
+        changed: true,
+        grantsTalk: true,
+        grantsOperate: false as const,
+      }],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_peer'],
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(handler).toHaveBeenCalledWith({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectOpenIds: ['ou_peer'],
+    });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      talkOnly: true,
+      grantsTalk: true,
+      grantsOperate: false,
+      subjects: [{ subjectOpenId: 'ou_peer', chatGrantActive: true }],
+    });
+  });
+
+  it('accepts stable subject app ids and returns the receiver-side identity mapping', async () => {
+    const handler = vi.fn(async (input: any) => ({
+      ok: true as const,
+      operation: 'grant' as const,
+      permissionSource: 'chatGrant' as const,
+      talkOnly: true as const,
+      receiverLarkAppId: input.receiverLarkAppId,
+      chatId: input.chatId,
+      grantsTalk: true,
+      grantsOperate: false as const,
+      subjectMappings: [{ larkAppId: input.subjectLarkAppIds[0], subjectOpenId: 'ou_pm_seen_by_receiver' }],
+      subjects: [{
+        subjectOpenId: 'ou_pm_seen_by_receiver',
+        chatGrantActive: true,
+        changed: true,
+        grantsTalk: true,
+        grantsOperate: false as const,
+      }],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(handler).toHaveBeenCalledWith({
+      operation: 'grant',
+      receiverLarkAppId: 'cli_receiver',
+      chatId: 'oc_chat',
+      subjectLarkAppIds: ['cli_pm'],
+    });
+    expect(await res.json()).toMatchObject({
+      ok: true,
+      talkOnly: true,
+      grantsOperate: false,
+      subjectMappings: [{ larkAppId: 'cli_pm', subjectOpenId: 'ou_pm_seen_by_receiver' }],
+    });
+  });
+
+  it('requires exactly one subject identity form before invoking the permission service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const url = `http://127.0.0.1:${handle.port}/api/grants/chat`;
+    const bind = cliAuthBind('POST', '/api/grants/chat', handle.port);
+
+    for (const subjects of [
+      {},
+      { subjectOpenIds: ['ou_peer'], subjectLarkAppIds: ['cli_peer'] },
+    ]) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, bind) },
+        body: JSON.stringify({
+          operation: 'grant',
+          receiverLarkAppId: 'cli_receiver',
+          chatId: 'oc_chat',
+          ...subjects,
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: 'exactly_one_subject_identity_required' });
+    }
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+    const handler = vi.fn();
+    setExactChatGrantHandler(handler as any);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'revoke',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: 'subject_lark_app_ids_grant_only' });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('passes through stable identity failures without exposing the internal status field', async () => {
+    const handler = vi.fn(async () => ({
+      ok: false as const,
+      status: 409,
+      error: 'subject_lark_app_ambiguous',
+      message: 'ambiguous bot_name',
+      invalidSubjectLarkAppIds: ['cli_pm'],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectLarkAppIds: ['cli_pm'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      ok: false,
+      error: 'subject_lark_app_ambiguous',
+      invalidSubjectLarkAppIds: ['cli_pm'],
+    });
+    expect(body).not.toHaveProperty('status');
+  });
+
+  it('passes through service failure status without exposing the internal status field', async () => {
+    const handler = vi.fn(async () => ({
+      ok: false as const,
+      status: 409,
+      error: 'subject_not_current_chat_bot',
+      message: 'not current',
+      invalidSubjectOpenIds: ['ou_stale'],
+    }));
+    setExactChatGrantHandler(handler);
+    setLarkAppId('cli_receiver');
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/grants/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
+      body: JSON.stringify({
+        operation: 'grant',
+        receiverLarkAppId: 'cli_receiver',
+        chatId: 'oc_chat',
+        subjectOpenIds: ['ou_stale'],
+      }),
+    });
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({ ok: false, error: 'subject_not_current_chat_bot' });
+    expect(body).not.toHaveProperty('status');
   });
 });
 

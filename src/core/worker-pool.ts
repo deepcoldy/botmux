@@ -95,6 +95,7 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
+import { recordDispatchInputCommit } from './dispatch.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1990,6 +1991,11 @@ export function forkWorker(
     sessionStore.updateSession(ds.session);
   }
 
+  // Reserve and durably publish the replacement lifetime before killing an
+  // existing worker. A failed reservation leaves the old worker untouched;
+  // a successful reservation immediately invalidates any late old-worker ACK.
+  const workerGeneration = reserveWorkerGeneration(ds);
+
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
     logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
@@ -2207,7 +2213,7 @@ export function forkWorker(
   }
 
   // Use shared handler for IPC messages and exit
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();
@@ -2243,11 +2249,18 @@ function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
   startupState: WorkerStartupState = { ready: false, failureNotified: false },
+  reservedWorkerGeneration?: number,
 ): void {
   const cb = requireCallbacks();
   const t = tag(ds);
-  const workerGeneration = (ds.workerGeneration ?? 0) + 1;
-  ds.workerGeneration = workerGeneration;
+  const workerGeneration = reservedWorkerGeneration
+    ?? reserveWorkerGeneration(ds);
+  if (
+    ds.workerGeneration !== workerGeneration
+    || ds.session.workerGeneration !== workerGeneration
+  ) {
+    throw new Error('worker generation reservation changed before IPC setup');
+  }
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -2360,6 +2373,25 @@ function setupWorkerHandlers(
   worker.on('message', async (msg: WorkerToDaemon) => {
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'turn_input_committed': {
+        // Bind the receipt to the exact live worker generation. A late ACK
+        // from a replaced worker cannot make the replacement appear to have
+        // accepted this dispatch turn.
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
+          break;
+        }
+        if (recordDispatchInputCommit(ds.session, msg.turnId, workerGeneration)) {
+          sessionStore.updateSession(ds.session);
+        } else {
+          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+        }
+        break;
+      }
       case 'session_ready_ack': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored session_ready_ack from stale worker generation`);
@@ -2392,6 +2424,10 @@ function setupWorkerHandlers(
         ds.workerViewToken = msg.viewToken ?? null;
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
+        // Dashboard「复现命令」：worker 上报本次冷启的近似复现命令。只存内存字段、
+        // 绝不落盘（含凭证）；warm reattach 时 worker 不重算，故为空——这是有意的
+        // （reattach 不代表本次新算命令真的执行了）。worker 每次 ready 会重报。
+        ds.spawnCommand = msg.spawnCommand;
         sessionStore.updateSession(ds.session);
         const readOnlyUrl = buildTerminalUrl(ds);
         const writeUrl = buildTerminalUrl(ds, { write: true });
@@ -3402,6 +3438,20 @@ function setupWorkerHandlers(
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
+      // Fence this lifetime before a polling dispatcher can observe its last
+      // ACK. Keeping the old receipt is useful audit evidence, but the
+      // persisted current generation advances immediately so it cannot count
+      // as acceptance after the worker has died. A stale takeover worker never
+      // enters this branch and therefore cannot fence the replacement.
+      const fencedGeneration = Math.max(
+        workerGeneration,
+        ds.workerGeneration ?? 0,
+        ds.session.workerGeneration ?? 0,
+      ) + 1;
+      ds.workerGeneration = fencedGeneration;
+      ds.session.workerGeneration = fencedGeneration;
+      ds.session.pid = undefined;
+      sessionStore.updateSession(ds.session);
     }
     try {
       const notified = cb.onWorkerExit?.(ds, {
@@ -3825,6 +3875,27 @@ export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
 
+function reserveWorkerGeneration(ds: DaemonSession): number {
+  const previousDaemonGeneration = ds.workerGeneration;
+  const previousSessionGeneration = ds.session.workerGeneration;
+  const workerGeneration = Math.max(
+    previousDaemonGeneration ?? 0,
+    previousSessionGeneration ?? 0,
+  ) + 1;
+  ds.workerGeneration = workerGeneration;
+  ds.session.workerGeneration = workerGeneration;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    if (previousDaemonGeneration === undefined) delete ds.workerGeneration;
+    else ds.workerGeneration = previousDaemonGeneration;
+    if (previousSessionGeneration === undefined) delete ds.session.workerGeneration;
+    else ds.session.workerGeneration = previousSessionGeneration;
+    throw error;
+  }
+  return workerGeneration;
+}
+
 export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
@@ -3843,6 +3914,10 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     logger.warn(`[${t}] read-isolation bot: refusing to adopt existing CLI (would run unisolated); will cold-start isolated on next message`);
     return;
   }
+
+  // Reserve before replacing an existing bridge worker for the same reason as
+  // forkWorker: persistence failure must leave the old lifetime untouched.
+  const workerGeneration = reserveWorkerGeneration(ds);
 
   // Guard against double-fork
   if (ds.worker && !ds.worker.killed) {
@@ -4026,7 +4101,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   }
 
   // Use shared handler
-  setupWorkerHandlers(ds, worker, startupState);
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration);
 
   ds.worker = worker;
   ds.spawnedAt = Date.now();

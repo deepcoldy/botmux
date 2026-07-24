@@ -17,8 +17,9 @@ import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
   loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
-import { DaemonRegistry } from './dashboard/registry.js';
+import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
 import { jsonRes } from './dashboard/http.js';
@@ -271,6 +272,20 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+
+// 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
+// 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
+const debugTerminalManager = createDebugTerminalManager({
+  getActiveToken: () => activeToken,
+  defaultWorkingDirs: () => {
+    const dirs = new Set<string>();
+    for (const s of aggregator.getSessions()) {
+      const wd = (s as { workingDir?: unknown }).workingDir;
+      if (typeof wd === 'string' && wd.trim()) dirs.add(wd.trim());
+    }
+    return [...dirs];
+  },
+});
 
 /**
  * Resolve which daemon owns a schedule row. For rows with an explicit
@@ -2363,6 +2378,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 调试终端（owner-only）：HTTP 路由挂在 auth gate 之后 → 已确保是管理 token。
+    // /api/debug-terminal（创建/关闭）+ /debug-terminal/<id>（xterm 页面）。
+    // WS 升级 /debug-terminal/<id>/ws 在下方 server.on('upgrade') 里由本 manager
+    // 自行校验 cookie（upgrade 不经这段 gate）。
+    if (
+      url.pathname === '/api/debug-terminal'
+      || url.pathname.startsWith('/api/debug-terminal/')
+      || url.pathname.startsWith('/debug-terminal/')
+    ) {
+      if (debugTerminalManager.handleHttp(req, res, url)) return;
+    }
+
     if (req.method === 'GET' && url.pathname === '/api/plugins/dashboard') {
       return jsonRes(res, 200, { plugins: listDashboardPluginEntries() });
     }
@@ -3497,6 +3524,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Dashboard「复现命令」：透传到 owning daemon 取该 session 的真实 CLI 调用。
+    // 与 write-link 同样只在管理 cookie（写权限）下可达：命令含 token/凭证。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/spawn-command$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/spawn-command`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // Sandbox landing: review the clone's diff (GET) then apply/discard (POST).
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/sandbox-diff$/))) {
       const sid = decodeURIComponent(m[1]);
@@ -4590,7 +4629,19 @@ const server = createServer(async (req, res) => {
       const hb = setInterval(() => {
         res.write(`event: heartbeat\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
       }, 15_000);
-      res.on('close', () => { off(); clearInterval(hb); });
+      // Push a bots.changed frame whenever the online bot roster actually
+      // changes (bot added / removed / renamed / re-indexed) so the Bot 配置
+      // page can auto-refresh without a manual reload. registry.on fires on
+      // every 15s poll and 30s heartbeat rewrite, so gate on a roster signature
+      // that ignores lastHeartbeat — otherwise we'd spam a frame every poll.
+      let lastRoster = botsRosterSignature(registry.list());
+      const offRoster = registry.on(online => {
+        const sig = botsRosterSignature(online);
+        if (sig === lastRoster) return;
+        lastRoster = sig;
+        res.write(`event: bots.changed\ndata: ${JSON.stringify({ body: { signature: sig } })}\n\n`);
+      });
+      res.on('close', () => { off(); offRoster(); clearInterval(hb); });
       return;
     }
 
@@ -4611,6 +4662,10 @@ const server = createServer(async (req, res) => {
 server.on('upgrade', (req: IncomingMessage, clientSocket: Duplex, head: Buffer) => {
   try {
     const rawUrl = req.url ?? '/';
+    // 调试终端 WS（owner-only）：manager 内部自校验管理 cookie。命中即接管。
+    if (rawUrl.startsWith('/debug-terminal/')) {
+      if (debugTerminalManager.handleUpgrade(req, clientSocket, head)) return;
+    }
     if (!(rawUrl === '/s' || rawUrl.startsWith('/s/') || rawUrl.startsWith('/s?'))) {
       return clientSocket.destroy();
     }
@@ -4903,6 +4958,7 @@ function shutdown(): void {
   registry.stop();
   resourceMonitor.stop();
   platformTunnel?.stop();
+  debugTerminalManager.shutdown();
   server.close(() => process.exit(0));
   // Hard-exit fallback after 5s
   setTimeout(() => process.exit(0), 5_000).unref();

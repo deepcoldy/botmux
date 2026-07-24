@@ -245,6 +245,23 @@ export interface Session {
    * back to the single-slot behavior.
    */
   replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  /**
+   * Durable receiver acknowledgement keyed by the exact inbound Lark
+   * message_id. A receipt is written only after the worker has committed that
+   * turn to its CLI input queue (or an adopt backend accepted the write).
+   * Dispatch acceptance binds this turn id, its immutable topic root, and the
+   * currently persisted worker generation; fresh aliases/timestamps or a
+   * replacement worker can never reuse an older receipt.
+   */
+  dispatchInputReceipts?: Record<string, {
+    rootMessageId: string;
+    committedAt: string;
+    workerGeneration: number;
+  }>;
+  /** Monotonic worker lifetime for this session. Persisted before worker IPC is
+   * accepted so daemon restarts and replacement workers invalidate receipts
+   * emitted by an earlier lifetime. */
+  workerGeneration?: number;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /**
@@ -594,7 +611,11 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; viewToken?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; turnId?: string; dispatchAttempt?: number }
+  /** The exact inbound turn is now durably owned by this worker generation's
+   * CLI input queue. The daemon persists a root-bound receipt only after this
+   * acknowledgement; IPC arrival alone is not acceptance. */
+  | { type: 'turn_input_committed'; turnId: string }
   /** Trusted worker observation used only by the host activation transaction.
    * PID markers are child-writable diagnostics and are never security proof. */
   | {

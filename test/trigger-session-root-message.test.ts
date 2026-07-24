@@ -421,6 +421,35 @@ describe('triggerSessionTurn rootMessageId target', () => {
     );
   });
 
+  it('uses the persisted generation when a daemon-restored dormant session reforks', async () => {
+    const ds = existingDs({ scope: 'chat', workerGeneration: undefined });
+    ds.session.rootMessageId = CHAT;
+    ds.session.workerGeneration = 8;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+    const req = request({ sessionId: ds.session.sessionId, rootMessageId: undefined });
+    const beforeDispatch = vi.fn(() => ({ dispatchAttempt: 6 }));
+
+    await triggerSessionTurn(
+      req,
+      { larkAppId: APP, activeSessions },
+      { stableTurnId: 'vcd_restored_generation_delivery', beforeDispatch },
+    );
+
+    expect(beforeDispatch).toHaveBeenCalledWith({
+      sessionId: ds.session.sessionId,
+      workerGeneration: 9,
+    });
+    expect(mockForkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('follow:') }),
+      {
+        resume: true,
+        turnId: 'vcd_restored_generation_delivery',
+        dispatchAttempt: 6,
+      },
+    );
+  });
+
   it('keeps clean input and a stable durable attempt on the same dormant fork', async () => {
     mockGetBot.mockReturnValue({
       config: { larkAppId: APP, cliId: 'codex-app', codexAppCleanInput: true, workingDir: '/tmp' },

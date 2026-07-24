@@ -105,21 +105,25 @@ botmux 可以管理 CLI 无关的自定义 Skill Registry，并按 bot 配置在
 
 > 拆子项目 → 提一版「子项目 ↔ bot」分配 → 发给你**一次审批**（可用卡片确认） → 建飞书任务清单 → 逐个开话题派活 → 收齐回报 → 汇总
 
-底层派活靠 `botmux dispatch`：在群里种一条话题、把指定 bot @ 进去各起独立会话。
+底层派活靠 `botmux dispatch`：在群里种一条话题、把指定 bot @ 进去各起独立会话。同机 Bot 推荐传稳定 App 身份；命令会先在每个 receiver 视角建立并回读该群的双向 talk-only `chatGrant`，再发任务并等待目标 session 确认接单，因此新建“冷群”不依赖历史 `/introduce` / peer 缓存。
 
 ```bash
 botmux dispatch --title "实现登录模块" \
-  --bot "ou_xxx:Alice:coder" --bot "ou_yyy:Bob:reviewer" \
-  --repo /path/to/repo --brief-file /tmp/brief.md
+  --bot-app "cli_xxx:coder" --bot-app "cli_yyy:reviewer" \
+  --brief-file /tmp/brief.md
 ```
 
-- `--repo <目录>` —— 预设子 bot 的工作目录（绝对路径，需在子 bot 所在机器上存在），起会话直接进去、**免手点「选仓库」卡**。
+- `--bot-app <larkAppId[:角色]>` —— 同机 Bot 的推荐入口；自动完成 receiver-scoped 精确对话授权与实际接单确认。它不授管理命令权，不能与 `--repo` 同用，驻守 Bot 应使用自身默认工作目录。
+- `--bot <open_id[:名字[:角色]]>` —— 兼容外部/旧链路的原始 open_id 入口；调用方自行保证 receiver 作用域、权限与接单状态。
+- `--repo <目录>` —— 只适用于已经具备 operate 信任的旧 `--bot` 链路；预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）。
 - `--standby` —— **必须配 `--repo`**（且不能与 `--into` 同用）：只发一次 `/repo` 把 bot 拉起到指定目录待命、不派简报，之后用 `--into ... --brief(-file)` 激活派活。
-- `--into <话题root>` —— 回到已有话题追加一条（激活待命的 bot / 追加协调）；仍需 `--bot`，且非 standby 时必须带 `--brief` 或 `--brief-file`。
+- `--into <话题root>` —— 回到已有话题追加一条（激活待命的 bot / 追加协调）；仍需指定 bot，且非 standby 时必须带 `--brief` 或 `--brief-file`。
+
+子 Bot 完成后运行 `botmux report`。纯同机 `--bot-app` 派单会在每一轮任务中自动注入带精确 seed 的 `botmux report --dispatch-root <seed>` 命令，把回报直接注入 dispatch 时登记的原 PM session；即使同一 chat-scope 会话后来又收到新派单，也不会串到新 seed。legacy / mixed `--bot` 仍保留无精确 seed 的跨机兼容回退。
 
 **协作边界**：
 
-- **同部署的「自家」bot 之间互信** —— 编排者能直接对它们跑 `/repo` 等 operate 级命令（与自家 bot 的对话权限一致）。外部 bot 的授权分两层：`/grant @bot` 只给「对话 / 被 chat-scope 拉起」的权限（talk-only，不碰 `allowedUsers`、跑不了 operate 级命令）；要让外部 bot 跑 `/repo` 等 operate 级命令，需把它列进 `allowedUsers`（或后续 operate 级授权）。`/introduce` 只负责发现 / 登记 open_id，**不授予任何权限**。
+- **同部署不等于隐式管理互信** —— `--bot-app` 只在目标群建立双方 receiver-scoped 的 talk-only `chatGrant`，不碰 `allowedUsers`，跑不了 `/repo` 等 operate 级命令。需要管理命令时必须另有明确的 allowedUsers / team / oncall operate 信任；`/introduce` 只负责发现 / 登记 open_id，**不授予任何权限**。
 - 子 bot 须已在群里、可被 @（具备 `im:message.group_at_msg.include_bot` 权限）。
 - 一条话题可放多个 bot，它们在话题内互相 @ 协作（如 coder 写完 @ reviewer 审）。
 

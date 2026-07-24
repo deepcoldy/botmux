@@ -658,7 +658,10 @@ function shapeCardActionResult(result: any): any {
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
   if (result && (result.toast || result.card)) return result;
   if (result) return { card: { type: 'raw', data: result } };
-  return undefined;
+  // The Lark WS SDK only serializes callback `data` for truthy results. An
+  // empty object therefore means "ACK with no UI update", while undefined
+  // produces a code-only response that the client rejects as an invalid ACK.
+  return {};
 }
 
 function serializeRawCardForPatch(cardData: any): string | undefined {
@@ -703,7 +706,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     .then(shapeCardActionResult)
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
-      return undefined;
+      return {};
     });
 
   void work.then(result => {
@@ -1312,12 +1315,11 @@ export function canOperate(
   senderUnionId?: string | undefined,
 ): boolean {
   const bot = getBot(larkAppId);
-  // L1 同部署兄弟 bot 互信 operate：与 canTalk 一致——isKnownPeerBot 只认本部署
-  // bots-info.json 里注册过的自家 bot。这不重开 PR #46 的封堵：人的 talk 授权
-  // （chatGrant/globalGrant）仍不漏成 operate；这里只放行「自家 bot 之间」的 /
-  // 命令（让编排者能对子 bot 跑 /repo /cd 等）。
-  if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return true;
-  // L2 跨部署「团队 peer bot」互信 operate（与 L1 兄弟 bot 对等，覆盖编排者给
+  // 同部署 cross-ref / isKnownPeerBot 只证明「这是一个可路由的 bot 身份」，仅供
+  // evaluateTalk 的 peer 腿使用，绝不能隐式升级为管理权限。需要让编排者执行
+  // /repo /cd /restart 等命令时，必须命中下面显式支持 operate 的权限源。
+  //
+  // 跨部署「团队 peer bot」互信 operate（覆盖编排者给
   // 队友派 /repo /cd 等）。**只认租户稳定的 union_id**（isTeamBot / 平台 roster），
   // 不走 isTrustedTeamBotSender 的「团队群成员」分支——那条按 chat 放行是 sender
   // 无关的，会把「团队群里的真人」也误放进 operate，破坏 allowedUsers 边界。union_id
@@ -2258,21 +2260,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
           });
         }
-        // Regular-group foreign-bot @mention: gate to vetted botmux peers
-        // (registered in our bot-openids cross-ref). Fires for legacy chat-scope
-        // routing, the new-topic send-shape
-        // (decision.source === 'regular-group-thread'), AND a `/t` force-topic
-        // seed (forcedTopic) — so random Lark bots cannot silently spawn sessions
-        // in 普通群, whether this bot replies in threads or a stranger bot @s us
-        // with `/t`. Known Bot A → Bot B handoffs in 普通群 still work.
-        //
-        // ownsSession is read on ctx.anchor AFTER the `/t` override above. That
-        // exemption means "a foreign bot following up into a session we already
-        // own" (e.g. a chat-scope session at chatId). A `/t` rewrites the anchor
-        // to a fresh messageId where we own nothing, so an unvetted bot can NOT
-        // ride the existing chat-scope session's ownership to skip vetting — it
-        // must independently hit isKnownPeerBot / chatGrants / globalGrants (or
-        // this bot's own oncall chat).
+        // Foreign-bot @mention gate: apply the same vetted-peer/talk-only
+        // boundary to chat scope, regular-group threads, and native topic
+        // threads. Previously native topic replies skipped this outer gate and
+        // were silently dropped by daemon's second evaluateTalk check, so the
+        // owner never saw a grant card. Owning an existing session is not an
+        // authorization source; a revoked/unknown bot must still pass one of
+        // the explicit trust or grant legs below.
         //
         // 注意 isKnownPeerBot 查的是 cross-ref（bot-openids-<appId>.json），它只
         // 收录 bots-info.json 里有名字的 bot，即本机 daemon 自己配置的 bot
@@ -2300,15 +2294,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 开放模式（未配任何 allowlist：allowedUsers / allowedChatGroups /
         // globalGrants 全空）与人侧 evaluateTalk 的 `reason:'open'`（1011 行）对齐：
         // 「谁都能触发」本应人、bot 同权。过去这道 gate 漏了这一腿，导致开放模式下
-        // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session（ownsSession=true）才救活。
+        // 外部 bot @ 仍被丢弃，必须真人先 @ 一次建 session 才救活。
         // 补上 hasConfiguredAllowlist 短路后两条路径统一：一旦配了任一 allowlist，
         // 立刻恢复「限制态」设闸，安全边界不变。
-        if ((ctx.scope === 'chat' || decision.source === 'regular-group-thread' || forcedTopic)
-            && !findOncallChat(larkAppId, chatId)
+        if (!findOncallChat(larkAppId, chatId)
             && hasConfiguredAllowlist(getBot(larkAppId))) {
-          const ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false;
-          if (!ownsSession
-              && !isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
+          if (!isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)
               && !isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
               && !hasChatGrant(larkAppId, chatId, senderOpenId)
               && !hasGlobalGrant(larkAppId, senderOpenId)) {

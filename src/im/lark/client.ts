@@ -57,23 +57,48 @@ const probeLarkLogger = {
   trace: (..._msg: any[]) => { /* dropped */ },
 };
 let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<typeof Client> }> | null = null;
-function getAllBotClients() {
-  if (!allBotClients) {
-    let cfgs: Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }>;
-    try {
-      cfgs = loadBotConfigs();
-    } catch {
-      // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
-      // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
-      cfgs = getAllBots().map((b) => b.config);
+let allBotClientsFingerprint: string | null = null;
+
+function loadAllBotClientConfigs(): Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }> {
+  try {
+    return loadBotConfigs();
+  } catch {
+    // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
+    // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
+    return getAllBots().map((b) => b.config);
+  }
+}
+
+function getAllBotClients(opts: { refresh?: boolean } = {}) {
+  if (!allBotClients || opts.refresh) {
+    const cfgs = loadAllBotClientConfigs();
+    // The strict stable-App resolver is an authorization boundary and must see
+    // bots appended after this process started. Reload the controlled config on
+    // every strict resolution, while retaining Client instances when the exact
+    // credential/domain tuple is unchanged. Discovery callers keep the cheap
+    // process cache.
+    const fingerprint = JSON.stringify(cfgs.map(cfg => [
+      cfg.larkAppId,
+      cfg.cliId,
+      cfg.larkAppSecret,
+      normalizeBrand(cfg.brand as any),
+    ]));
+    if (!allBotClients || allBotClientsFingerprint !== fingerprint) {
+      allBotClients = cfgs.map((cfg) => ({
+        appId: cfg.larkAppId,
+        cliId: cfg.cliId,
+        client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
+      }));
+      allBotClientsFingerprint = fingerprint;
     }
-    allBotClients = cfgs.map((cfg) => ({
-      appId: cfg.larkAppId,
-      cliId: cfg.cliId,
-      client: new Client({ appId: cfg.larkAppId, appSecret: cfg.larkAppSecret, domain: sdkDomain(normalizeBrand(cfg.brand as any)), logger: probeLarkLogger }),
-    }));
   }
   return allBotClients;
+}
+
+/** Test seam for suites that replace the configured bot set at runtime. */
+export function __testOnly_resetAllBotClients(): void {
+  allBotClients = null;
+  allBotClientsFingerprint = null;
 }
 
 // ─── Error types ──────────────────────────────────────────────────────────────
@@ -1354,6 +1379,40 @@ type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
   | { ok: false; reason: string; cacheable: boolean };
 
+/**
+ * A bot row returned directly by Feishu's live `/members/bots` endpoint.
+ * Unlike {@link ChatBotMember}, this type deliberately carries no botmux-local
+ * identity/provenance: `openId` is exactly the observer-scoped handle returned
+ * to `larkAppId` for the current chat.
+ */
+export type CurrentChatBotMember = {
+  openId: string;
+  displayName: string;
+};
+
+/**
+ * A stable configured app identity bound to the receiver-scoped open_id that
+ * Feishu returned for that bot in the current chat.
+ */
+export type CurrentChatBotAppMapping = {
+  larkAppId: string;
+  subjectOpenId: string;
+};
+
+export type CurrentChatBotAppResolution =
+  | { ok: true; mappings: CurrentChatBotAppMapping[] }
+  | {
+      ok: false;
+      error:
+        | 'live_membership_unavailable'
+        | 'subject_lark_app_not_configured'
+        | 'subject_lark_app_name_unavailable'
+        | 'subject_lark_app_not_in_chat'
+        | 'subject_lark_app_ambiguous';
+      message: string;
+      invalidSubjectLarkAppIds?: string[];
+    };
+
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
@@ -1390,6 +1449,176 @@ async function listChatBotsViaMembersBots(
   } catch (err: any) {
     return { ok: false, reason: err?.message ?? String(err), cacheable: true };
   }
+}
+
+/**
+ * Read the current chat's bot members from Feishu and fail closed on any API
+ * error. This is the authorization-grade counterpart to
+ * {@link listChatBotMembers}: it NEVER consults the 30-day observed/cross-ref
+ * fallback and NEVER treats a cached capability failure as membership truth.
+ *
+ * Keep this separate from the user-facing discovery helper. `/members/bots`
+ * is still an undocumented endpoint, so discovery may degrade gracefully; a
+ * permission mutation must not.
+ */
+export async function listCurrentChatBotMembers(
+  larkAppId: string,
+  chatId: string,
+): Promise<CurrentChatBotMember[]> {
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const result = await listChatBotsViaMembersBots(larkAppId, chatId, timeoutMs);
+  if (!result.ok) {
+    throw new Error(`live_chat_bot_members_unavailable: ${result.reason}`);
+  }
+  return result.items.map(item => ({ openId: item.botId, displayName: item.botName }));
+}
+
+/**
+ * Resolve stable configured Lark app ids to the receiver-scoped open_ids that
+ * may be written to the receiver's exact chatGrant.
+ *
+ * This is deliberately stricter than bot discovery. Identity is accepted only
+ * when all three current signals agree: the receiver's live `/members/bots`
+ * row, the subject app's own `is_in_chat` result, and one exact, unique
+ * `bot_name` binding from bots-info.json. Cross-reference and observed-bot
+ * stores are never consulted, because either can be stale or scoped to another
+ * app.
+ */
+export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
+  receiverLarkAppId: string,
+  chatId: string,
+  subjectLarkAppIds: string[],
+): Promise<CurrentChatBotAppResolution> {
+  const timeoutMs = config.chatBotDiscovery?.listBotsApiTimeoutMs ?? 3_000;
+  const live = await listChatBotsViaMembersBots(receiverLarkAppId, chatId, timeoutMs);
+  if (!live.ok) {
+    return {
+      ok: false,
+      error: 'live_membership_unavailable',
+      message: `live_chat_bot_members_unavailable: ${live.reason}`,
+    };
+  }
+
+  const configured = getAllBotClients({ refresh: true });
+  const configuredByAppId = new Map(configured.map(entry => [entry.appId, entry]));
+  const namesByAppId = new Map<string, string[]>();
+  try {
+    const raw = JSON.parse(readFileSync(join(config.session.dataDir, 'bots-info.json'), 'utf-8'));
+    if (!Array.isArray(raw)) throw new Error('bots-info.json must contain an array');
+    for (const entry of raw) {
+      const appId = typeof entry?.larkAppId === 'string' ? entry.larkAppId.trim() : '';
+      const botName = typeof entry?.botName === 'string' ? entry.botName.trim() : '';
+      if (!appId || !botName) continue;
+      const names = namesByAppId.get(appId);
+      if (names) names.push(botName);
+      else namesByAppId.set(appId, [botName]);
+    }
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: 'subject_lark_app_name_unavailable',
+      message: `Unable to read a strict bot_name binding: ${err?.message ?? String(err)}`,
+      invalidSubjectLarkAppIds: subjectLarkAppIds,
+    };
+  }
+
+  const subjectNames = new Map<string, string>();
+  for (const subjectLarkAppId of subjectLarkAppIds) {
+    if (!configuredByAppId.has(subjectLarkAppId)) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_not_configured',
+        message: 'Every subject app must be configured in this botmux runtime',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    const names = namesByAppId.get(subjectLarkAppId) ?? [];
+    if (names.length !== 1) {
+      return {
+        ok: false,
+        error: names.length === 0 ? 'subject_lark_app_name_unavailable' : 'subject_lark_app_ambiguous',
+        message: names.length === 0
+          ? 'Every subject app must have one non-empty bot_name in bots-info.json'
+          : 'A subject app has multiple bot_name bindings in bots-info.json',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    subjectNames.set(subjectLarkAppId, names[0]);
+  }
+
+  // If multiple configured apps claim the requested name, probe every claimant.
+  // A strict name is safe only when exactly one claimant is currently in chat
+  // and it is the requested subject app.
+  const candidateAppIds = new Set<string>();
+  const requestedNames = new Set(subjectNames.values());
+  for (const entry of configured) {
+    const names = namesByAppId.get(entry.appId) ?? [];
+    if (names.length === 1 && requestedNames.has(names[0])) candidateAppIds.add(entry.appId);
+  }
+
+  const inChatByAppId = new Map<string, boolean>();
+  for (const appId of candidateAppIds) {
+    const entry = configuredByAppId.get(appId)!;
+    try {
+      const res = await promiseWithTimeout(
+        larkGet(entry.client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`),
+        timeoutMs,
+        `is_in_chat for ${appId}`,
+      );
+      if (res?.code !== 0 || typeof res?.data?.is_in_chat !== 'boolean') {
+        return {
+          ok: false,
+          error: 'live_membership_unavailable',
+          message: `is_in_chat failed for ${appId}: code=${res?.code ?? 'unknown'} msg=${res?.msg ?? ''}`,
+          invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        };
+      }
+      inChatByAppId.set(appId, res.data.is_in_chat);
+    } catch (err: any) {
+      return {
+        ok: false,
+        error: 'live_membership_unavailable',
+        message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
+        invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+      };
+    }
+  }
+
+  const mappings: CurrentChatBotAppMapping[] = [];
+  const mappedOpenIds = new Set<string>();
+  for (const subjectLarkAppId of subjectLarkAppIds) {
+    const botName = subjectNames.get(subjectLarkAppId)!;
+    if (inChatByAppId.get(subjectLarkAppId) !== true) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_not_in_chat',
+        message: 'Every subject app must independently confirm it is in the current chat',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    const configuredInChatWithName = configured.filter(entry => {
+      const names = namesByAppId.get(entry.appId) ?? [];
+      return names.length === 1 && names[0] === botName && inChatByAppId.get(entry.appId) === true;
+    });
+    const liveRows = live.items.filter(item => item.botName === botName);
+    if (
+      configuredInChatWithName.length !== 1
+      || configuredInChatWithName[0].appId !== subjectLarkAppId
+      || liveRows.length !== 1
+      || mappedOpenIds.has(liveRows[0]?.botId)
+    ) {
+      return {
+        ok: false,
+        error: 'subject_lark_app_ambiguous',
+        message: 'Stable app identity did not bind to exactly one live bot_name row',
+        invalidSubjectLarkAppIds: [subjectLarkAppId],
+      };
+    }
+    mappings.push({ larkAppId: subjectLarkAppId, subjectOpenId: liveRows[0].botId });
+    mappedOpenIds.add(liveRows[0].botId);
+  }
+
+  return { ok: true, mappings };
 }
 
 // `/members/bots` returns the observer-scoped mention handle (`bot_id`) and

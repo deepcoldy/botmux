@@ -236,6 +236,7 @@ function deferred<T>() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(deleteMessage).mockReset().mockResolvedValue(true);
   vi.mocked(getBot).mockImplementation(() => ({
     config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
@@ -253,6 +254,13 @@ beforeEach(() => {
     createdAt: new Date().toISOString(),
     chatType,
   }) as any);
+});
+
+afterEach(async () => {
+  // Repo-card withdrawal deliberately runs in the next macrotask. Drain it
+  // before the following test resets mocks so callbacks cannot leak across
+  // test boundaries and pollute another case's call history.
+  await new Promise<void>(resolve => setImmediate(resolve));
 });
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -480,7 +488,7 @@ describe('repo select card — plain switch', () => {
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.pendingRepoCommitInFlight).toBe(false);
     expect(ds.session.sessionId).toBe('uuid-old');
-    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card');
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
     expect(ds.repoCardMessageId).toBeUndefined();
   });
 
@@ -509,15 +517,14 @@ describe('repo select card — plain switch', () => {
     expect(ds.workingDir).toBeUndefined();
     expect(ds.session.workingDir).toBeUndefined();
     expect(sessionReply.mock.calls.map(c => c[1]).join()).toContain('已直接开启会话');
-    expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card');
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
   });
 
-  it('rejects a stale card click while deleteMessage is still pending (local consume mark)', async () => {
-    // Regression: deleteMessage used to be fire-and-forget after claim release.
-    // We now mark the card consumed before network awaits and hold the claim
-    // through best-effort withdraw. A second click on the still-visible card
-    // must never mid-session-switch (killWorker), whether claim is still held
-    // or Feishu withdraw hangs / returns false.
+  it('returns before pending-card withdrawal settles and still rejects stale clicks', async () => {
+    // The callback must complete before the card-withdraw request settles, or
+    // Feishu can observe a missing/late ACK after the original card disappears.
+    // The local consume mark, rather than the network request, keeps stale
+    // clicks from entering the mid-session switch path.
     const ds = makeDs({
       pendingRepo: true,
       pendingPrompt: 'hello world',
@@ -537,9 +544,10 @@ describe('repo select card — plain switch', () => {
     }) as any);
 
     const first = handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = first.then(() => !vi.mocked(deleteMessage).mock.calls.length);
     await vi.waitFor(() => expect(forkWorker).toHaveBeenCalledTimes(1));
     await vi.waitFor(() => expect(releaseDelete).toBeTruthy());
-    // Consume is local and synchronous before the hung delete.
+    // Consume is local and synchronous before the background delete.
     expect(ds.consumedRepoCardMessageIds).toContain('om_card');
     expect(ds.session.sessionId).toBe('uuid-old');
 
@@ -551,6 +559,7 @@ describe('repo select card — plain switch', () => {
 
     releaseDelete!();
     await first;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
     expect(ds.pendingRepoCommitInFlight).toBe(false);
     expect(ds.session.sessionId).toBe('uuid-old');
     expect(ds.workingDir).toBe('/repos/alpha');
@@ -563,6 +572,39 @@ describe('repo select card — plain switch', () => {
     expect(createSession).not.toHaveBeenCalled();
     expect(forkWorker).toHaveBeenCalledTimes(1);
     expect(ds.session.sessionId).toBe('uuid-old');
+  });
+
+  it('returns before a mid-session card withdrawal settles', async () => {
+    const ds = makeDs();
+    ds.session.workingDir = '/repos/gamma';
+    const { deps } = makeDeps(ds);
+    let releaseDelete: (() => void) | undefined;
+    vi.mocked(deleteMessage).mockImplementationOnce(() => new Promise<boolean>(res => {
+      releaseDelete = () => res(false);
+    }) as any);
+
+    const action = handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = action.then(() => !vi.mocked(deleteMessage).mock.calls.length);
+    await vi.waitFor(() => expect(releaseDelete).toBeTruthy());
+
+    releaseDelete!();
+    await action;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
+    expect(ds.workingDir).toBe('/repos/beta');
+    expect(ds.consumedRepoCardMessageIds).toContain('om_card');
+  });
+
+  it('defers current-repo skip-card withdrawal until the action returns', async () => {
+    const ds = makeDs();
+    const { deps } = makeDeps(ds);
+
+    const action = handleCardAction(makeSkipEvent(), deps, APP_ID);
+    const returnedBeforeWithdrawStarted = action.then(() => !vi.mocked(deleteMessage).mock.calls.length);
+
+    await action;
+    expect(await returnedBeforeWithdrawStarted).toBe(true);
+    await vi.waitFor(() => expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card'));
+    expect(ds.repoCardMessageId).toBeUndefined();
   });
 
   it('keeps the first-spawn session when confirm sessionReply throws (card still marked consumed)', async () => {
