@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
+import {
+  BRIDGE_NO_REPLY_SENTINEL,
+  shouldSuppressBridgeEmit,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 
 const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = false) =>
   ({ markTimeMs, isLocal });
@@ -14,6 +18,33 @@ const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker =
 };
 
 describe('shouldSuppressBridgeEmit', () => {
+  it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `  ${BRIDGE_NO_REPLY_SENTINEL}\n` },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: prose about staying silent is not guessed away', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: `I will stay silent instead of replying. ${BRIDGE_NO_REPLY_SENTINEL}` },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+  });
+
+  it('adopt mode does not interpret the no-reply sentinel', () => {
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: BRIDGE_NO_REPLY_SENTINEL },
+      undefined,
+      [],
+      true,
+    )).toBe(false);
+  });
+
   it('adopt mode never suppresses, even with markers in window', () => {
     const markers: BridgeSendMarker[] = [{ sentAtMs: 150 }];
     expect(shouldSuppressBridgeEmit(turn(100), 200, markers, true)).toBe(false);
