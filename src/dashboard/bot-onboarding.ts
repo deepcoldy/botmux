@@ -235,6 +235,19 @@ function managedActivationStateForSnapshot(
   return undefined;
 }
 
+function isExactActivationStartingMarker(
+  value: unknown,
+  appId: string,
+  jobId?: string,
+): boolean {
+  return !!value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).appId === appId
+    && typeof (value as Record<string, unknown>).jobId === 'string'
+    && (jobId === undefined || (value as Record<string, unknown>).jobId === jobId);
+}
+
 export interface BotOnboardingManagerOptions {
   botsJsonPath: string;
   /**
@@ -374,6 +387,7 @@ export class BotOnboardingManager {
   private readonly stopBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
   private readonly permissionRecoveryStorePath: string;
   private readonly scopePropagationFlights = new Map<string, Promise<CompleteScopePropagationResult>>();
+  private activationStartupReconciliation: Promise<void> = Promise.resolve();
   private permissionRecoveryStateError?: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
@@ -410,6 +424,10 @@ export class BotOnboardingManager {
     this.restorePendingJobs();
     this.restorePermissionRecoveryJobs();
     this.requireDurableManagedInitialJobs();
+    // A dashboard crash after PM2 has accepted the start but before the
+    // durable marker is cleared must converge to pending, never assume the
+    // daemon is safe to keep online.
+    this.activationStartupReconciliation = this.reconcileInterruptedManagedActivations();
   }
 
   /**
@@ -772,15 +790,20 @@ export class BotOnboardingManager {
   private async runLiveStart(
     id: string,
     appId: string,
+    recordOutcome = true,
   ): Promise<{ attempted: boolean; ok?: boolean; message?: string }> {
     if (!this.startBotLive) return { attempted: false };
     try {
       const r = await this.startBotLive(appId);
-      this.patch(id, { liveStarted: r.ok, liveStartMessage: r.message });
+      if (recordOutcome) {
+        this.patch(id, { liveStarted: r.ok, liveStartMessage: r.message });
+      }
       return { attempted: true, ok: r.ok, message: r.message };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.patch(id, { liveStarted: false, liveStartMessage: message });
+      if (recordOutcome) {
+        this.patch(id, { liveStarted: false, liveStartMessage: message });
+      }
       return { attempted: true, ok: false, message };
     }
   }
@@ -860,6 +883,7 @@ export class BotOnboardingManager {
       !current
       || typeof current !== 'object'
       || current.larkAppId !== appId
+      || current.activationStarting !== undefined
     ) {
       throw new Error('permission_recovery_activation_target_drift');
     }
@@ -868,39 +892,123 @@ export class BotOnboardingManager {
     if (current.activationPending !== true && !ensureLiveStart) {
       return;
     }
-    if (current.activationPending === true) {
-      const next = [...bots];
-      const ready = { ...current };
-      delete ready.activationPending;
-      next[addedBotIndex] = ready;
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
-    }
-    const live = await this.runLiveStart(id, appId);
+    this.beginManagedActivation(id, appId, addedBotIndex);
+    const live = await this.runLiveStart(id, appId, false);
     if (live.attempted && live.ok === true) {
-      this.patch(id, { activationPending: false });
-      return;
+      try {
+        this.commitManagedActivation(id, appId, addedBotIndex);
+        this.patch(id, {
+          activationPending: false,
+          liveStarted: true,
+          liveStartMessage: live.message,
+        });
+        return;
+      } catch (err) {
+        const stopped = await this.runLiveStop(id, appId);
+        if (stopped.attempted && stopped.ok === true) {
+          this.restoreManagedActivationPending(id, appId, addedBotIndex);
+        }
+        throw err;
+      }
     }
 
-    // Permission readback alone is not the activation ACK. If the exact
-    // single-bot start is unavailable or rejected, put the durable marker back
-    // so a fleet restart cannot silently make the bot runnable.
-    const afterStart = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-    const stillExact = afterStart[addedBotIndex];
-    if (
-      !stillExact
-      || typeof stillExact !== 'object'
-      || stillExact.larkAppId !== appId
-      || stillExact.activationPending === true
-    ) {
-      throw new Error('permission_recovery_activation_rollback_target_drift');
+    // An exit/timeout from start-bot is an unknown PM2 outcome. Stop and
+    // re-read the exact App before returning it to pending; otherwise a daemon
+    // could remain online while the durable config says it is blocked.
+    const stopped = await this.runLiveStop(id, appId);
+    if (!stopped.attempted || stopped.ok !== true) {
+      throw new Error(
+        `permission_recovery_activation_stop_not_acknowledged${stopped.message ? `: ${stopped.message}` : ''}`,
+      );
     }
-    const rolledBack = [...afterStart];
-    rolledBack[addedBotIndex] = { ...stillExact, activationPending: true };
-    writeBotsJsonAtomic(this.opts.botsJsonPath, rolledBack);
-    this.patch(id, { activationPending: true });
+    this.restoreManagedActivationPending(id, appId, addedBotIndex);
     throw new Error(
       `permission_recovery_activation_not_acknowledged${live.message ? `: ${live.message}` : ''}`,
     );
+  }
+
+  private beginManagedActivation(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || current.activationPending !== true
+    ) {
+      throw new Error('permission_recovery_activation_target_drift');
+    }
+    const next = [...bots];
+    const activating = { ...current, activationStarting: { appId, jobId: id } };
+    delete activating.activationPending;
+    next[addedBotIndex] = activating;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+  }
+
+  private commitManagedActivation(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || current.activationPending === true
+      || !isExactActivationStartingMarker(current.activationStarting, appId, id)
+    ) {
+      throw new Error('permission_recovery_activation_ack_target_drift');
+    }
+    const next = [...bots];
+    const ready = { ...current };
+    delete ready.activationStarting;
+    next[addedBotIndex] = ready;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+  }
+
+  private restoreManagedActivationPending(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || !isExactActivationStartingMarker(current.activationStarting, appId, id)
+    ) {
+      throw new Error('permission_recovery_activation_rollback_target_drift');
+    }
+    const next = [...bots];
+    const pending = { ...current, activationPending: true };
+    delete pending.activationStarting;
+    next[addedBotIndex] = pending;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    this.patch(id, { activationPending: true, liveStarted: false });
+  }
+
+  private async reconcileInterruptedManagedActivations(): Promise<void> {
+    const targets = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+      if (!bot || typeof bot !== 'object' || bot.activationStarting === undefined) return [];
+      const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId : '';
+      if (!isExactActivationStartingMarker(bot.activationStarting, appId)) {
+        this.permissionRecoveryStateError = 'managed activation marker is invalid';
+        return [];
+      }
+      return [{ index, appId, jobId: bot.activationStarting.jobId as string }];
+    });
+    if (this.permissionRecoveryStateError) return;
+    for (const target of targets) {
+      const stopped = await this.runLiveStop(target.jobId, target.appId);
+      if (!stopped.attempted || stopped.ok !== true) {
+        this.permissionRecoveryStateError = `managed activation stop could not be confirmed for ${target.appId}`;
+        return;
+      }
+      try {
+        this.restoreManagedActivationPending(target.jobId, target.appId, target.index);
+      } catch (err) {
+        this.permissionRecoveryStateError = `managed activation rollback failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        return;
+      }
+    }
   }
 
   private holdRecoveryActivation(id: string, appId: string, addedBotIndex: number): void {
@@ -952,7 +1060,11 @@ export class BotOnboardingManager {
     if (this.permissionRecoveryStateError) {
       return { ok: false, error: 'permission_recovery_state_unavailable' };
     }
-    const candidates = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    if (configuredBots.some((bot: any) => bot?.activationStarting !== undefined)) {
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const candidates = configuredBots.flatMap((bot: any, index) => {
       if (
         !bot
         || typeof bot !== 'object'
@@ -1045,6 +1157,7 @@ export class BotOnboardingManager {
     workingDir: string;
     expectedAppId: string;
   }): Promise<CompleteScopePropagationResult> {
+    await this.activationStartupReconciliation;
     if (this.permissionRecoveryStateError) {
       return { ok: false, error: 'permission_recovery_state_unavailable' };
     }

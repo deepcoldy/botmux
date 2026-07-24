@@ -23,6 +23,27 @@ describe('exact bot PM2 live control', () => {
     });
   });
 
+  it('preserves the generated raw slot and App identity for PM2 start ACKs', () => {
+    expect(inspectBotmuxPm2Apps(() => [{
+      name: 'botmux-3',
+      pm2_env: {
+        status: 'online',
+        env: {
+          BOTMUX_BOT_INDEX: '3',
+          BOTMUX_LARK_APP_ID: 'cli_exact_app',
+        },
+      },
+    }])).toEqual({
+      ok: true,
+      apps: [{
+        name: 'botmux-3',
+        online: true,
+        botIndex: '3',
+        larkAppId: 'cli_exact_app',
+      }],
+    });
+  });
+
   it('rejects malformed PM2 rows instead of treating them as exact absence', () => {
     expect(inspectBotmuxPm2Apps(() => [{}])).toEqual({
       ok: false,

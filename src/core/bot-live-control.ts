@@ -1,6 +1,10 @@
 export interface BotmuxPm2App {
   name: string;
   online: boolean;
+  /** Raw bots.json slot assigned by the generated PM2 ecosystem config. */
+  botIndex?: string;
+  /** Exact Feishu App identity assigned by the generated PM2 ecosystem config. */
+  larkAppId?: string;
 }
 
 export type BotmuxPm2Inspection =
@@ -64,6 +68,16 @@ export function inspectBotmuxPm2Apps(load: () => unknown[]): BotmuxPm2Inspection
           ? [{
               name: app.name,
               online: app?.pm2_env?.status === 'online',
+              botIndex: typeof app?.pm2_env?.BOTMUX_BOT_INDEX === 'string'
+                ? app.pm2_env.BOTMUX_BOT_INDEX
+                : typeof app?.pm2_env?.env?.BOTMUX_BOT_INDEX === 'string'
+                  ? app.pm2_env.env.BOTMUX_BOT_INDEX
+                  : undefined,
+              larkAppId: typeof app?.pm2_env?.BOTMUX_LARK_APP_ID === 'string'
+                ? app.pm2_env.BOTMUX_LARK_APP_ID
+                : typeof app?.pm2_env?.env?.BOTMUX_LARK_APP_ID === 'string'
+                  ? app.pm2_env.env.BOTMUX_LARK_APP_ID
+                  : undefined,
             }]
           : []
       )),

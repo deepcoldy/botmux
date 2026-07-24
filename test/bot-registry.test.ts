@@ -877,6 +877,7 @@ describe('loadBotConfigs', () => {
     fsMock.statSync.mockReturnValue({ mtimeMs: 0 });
     // Clean env
     delete process.env.BOTS_CONFIG;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
   });
 
   it('should throw when no config source is available', () => {
@@ -921,6 +922,22 @@ describe('loadBotConfigs', () => {
 
     const configs = mod.loadBotConfigs();
     expect(configs.map(config => config.larkAppId)).toEqual(['ready_app']);
+  });
+
+  it('loads an activating raw slot only for its exact managed daemon identity', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'activating_app',
+      larkAppSecret: 'activating_secret',
+      activationStarting: { appId: 'activating_app', jobId: 'bot_activation' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'activating_app';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('activating_app');
+    expect(mod.isManagedActivationStartingAtIndex(0, 'activating_app')).toBe(true);
   });
 
   it('keeps daemon slot indexes stable when an earlier bot is activation-pending', () => {

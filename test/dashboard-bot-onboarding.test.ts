@@ -1974,6 +1974,7 @@ describe('BotOnboardingManager', () => {
       allowedUsers: ['owner@example.com'],
       activationPending: true,
     }]));
+    const stopBotLive = vi.fn(async () => ({ ok: true, message: 'stopped' }));
     const manager = new BotOnboardingManager({
       botsJsonPath,
       ...immediateCriticalScopePolling,
@@ -1987,7 +1988,7 @@ describe('BotOnboardingManager', () => {
         missingCritical: [],
         missingOptional: [],
       }),
-      stopBotLive: async () => ({ ok: true, message: 'stopped' }),
+      stopBotLive,
       startBotLive: async () => ({ ok: false, message: 'pm2 unavailable' }),
     });
 
@@ -2001,6 +2002,10 @@ describe('BotOnboardingManager', () => {
     if (!started.ok) throw new Error(started.error);
     await started.job.done;
 
+    // The initial recovery stop and the post-start readback stop are both
+    // required. A timed-out `start-bot` cannot be treated as proof of absence.
+    expect(stopBotLive).toHaveBeenCalledTimes(2);
+    expect(stopBotLive).toHaveBeenLastCalledWith('cli_pending_start_failed');
     expect(manager.get(started.job.id)).toMatchObject({
       status: 'failed',
       activationPending: true,
@@ -2013,6 +2018,40 @@ describe('BotOnboardingManager', () => {
         activationPending: true,
       }),
     ]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('reconciles a crashed activating marker by stopping the exact App before restoring pending', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-activation-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_interrupted_activation',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: join(dir, 'space-agent'),
+      allowedUsers: ['owner@example.com'],
+      activationStarting: {
+        appId: 'cli_interrupted_activation',
+        jobId: 'bot_interrupted_activation',
+      },
+    }]));
+    const stopBotLive = vi.fn(async () => ({ ok: true, message: 'exact daemon stopped' }));
+
+    new BotOnboardingManager({
+      botsJsonPath,
+      stopBotLive,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(stopBotLive).toHaveBeenCalledOnce();
+    expect(stopBotLive).toHaveBeenCalledWith('cli_interrupted_activation');
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))).toEqual([
+      expect.objectContaining({
+        larkAppId: 'cli_interrupted_activation',
+        activationPending: true,
+      }),
+    ]);
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationStarting');
     rmSync(dir, { recursive: true, force: true });
   });
 

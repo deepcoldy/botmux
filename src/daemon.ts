@@ -33,6 +33,7 @@ import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-st
 import {
   loadBotConfigAtIndex,
   loadBotConfigs,
+  isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
   getAllBots,
@@ -16250,6 +16251,17 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
   }
 }
 
+async function waitForManagedActivationCommit(index: number, appId: string): Promise<void> {
+  if (process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID !== appId) return;
+  while (isManagedActivationStartingAtIndex(index, appId)) {
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+  }
+  const committed = loadBotConfigAtIndex(index);
+  if (committed.larkAppId !== appId) {
+    throw new Error(`Managed activation target drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+}
+
 export async function startDaemon(botIndex?: number): Promise<void> {
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
@@ -16276,6 +16288,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (!cfg) {
     throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
   }
+  if (botIndex !== undefined) {
+    // During managed activation PM2 may report this process online before it
+    // is allowed to register a bot or receive traffic. The dashboard clears
+    // the exact durable marker only after it has re-read the PM2 App/index ACK.
+    await waitForManagedActivationCommit(idx, cfg.larkAppId);
+    botConfigs = loadBotConfigs();
+    cfg = loadBotConfigAtIndex(idx);
+  }
   // One-time, lock-protected catalog bootstrap. This runs only after the
   // complete bots.json has parsed successfully, and the helper re-reads the
   // latest file under its lock before deciding. Explicit [] and legacy agent
@@ -16287,9 +16307,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Reload even when another concurrent daemon won the one-time write. Both
     // processes may have loaded the old file before taking the config lock;
     // the loser still needs the winner's catalog on this boot.
-    botConfigs = loadBotConfigs();
-    cfg = botConfigs.find(candidate => candidate.larkAppId === selectedAppId)
-      ?? botConfigs[idx];
+    const reloaded = botIndex === undefined
+      ? loadBotConfigs().find(candidate => candidate.larkAppId === selectedAppId)
+      : loadBotConfigAtIndex(idx);
+    if (!reloaded || reloaded.larkAppId !== selectedAppId) {
+      throw new Error(`BOTMUX_BOT_INDEX=${idx} target drifted during profile bootstrap`);
+    }
+    cfg = reloaded;
     if (profileBootstrap.seeded) {
       logger.info(
         `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `

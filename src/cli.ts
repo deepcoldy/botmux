@@ -388,7 +388,7 @@ function ensureUniqueBotProcessNames(bots: any[]): void {
   }
 }
 
-function ecosystemConfig(): string {
+function ecosystemConfig(activationAppId?: string): string {
   const daemonScript = join(PKG_ROOT, 'dist', 'index-daemon.js');
   const bots = loadBotsJson();
   ensureUniqueBotProcessNames(bots);
@@ -431,21 +431,46 @@ function ecosystemConfig(): string {
     ],
   };
 
-  const apps: any[] = bots.map((_bot: any, i: number) => ({
-    ...baseApp,
-    name: botProcessName(_bot, i, PM2_NAME),
-    error_file: join(LOG_DIR, `daemon-${i}-error.log`),
-    out_file: join(LOG_DIR, `daemon-${i}-out.log`),
-    env: {
-      ...daemonEnv,
-      SESSION_DATA_DIR: DATA_DIR,
-      BOTMUX_BOT_INDEX: String(i),
-      // Native-memory diagnostics. Default off; operator can flip it on
-      // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
-      // RSS regression — turned off in master so logs stay quiet.
-      BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
-    },
-  }));
+  const apps: any[] = bots.flatMap((_bot: any, i: number) => {
+    const appId = typeof _bot?.larkAppId === 'string' ? _bot.larkAppId : '';
+    const activationStarting = _bot?.activationStarting;
+    const hasValidActivationMarker = (
+      activationStarting
+      && typeof activationStarting === 'object'
+      && !Array.isArray(activationStarting)
+      && activationStarting.appId === appId
+      && typeof activationStarting.jobId === 'string'
+      && activationStarting.jobId
+    );
+    // A normal fleet start/restart must never resurrect an unacknowledged
+    // managed activation. `start-bot` passes its exact App ID and is the only
+    // path permitted to create its short-lived PM2 process.
+    if (
+      _bot?.activationPending === true
+      || (activationStarting !== undefined && (!hasValidActivationMarker || activationAppId !== appId))
+    ) {
+      return [];
+    }
+    return [{
+      ...baseApp,
+      name: botProcessName(_bot, i, PM2_NAME),
+      error_file: join(LOG_DIR, `daemon-${i}-error.log`),
+      out_file: join(LOG_DIR, `daemon-${i}-out.log`),
+      env: {
+        ...daemonEnv,
+        SESSION_DATA_DIR: DATA_DIR,
+        BOTMUX_BOT_INDEX: String(i),
+        BOTMUX_LARK_APP_ID: appId,
+        ...(hasValidActivationMarker
+          ? { BOTMUX_MANAGED_ACTIVATION_APP_ID: appId }
+          : {}),
+        // Native-memory diagnostics. Default off; operator can flip it on
+        // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
+        // RSS regression — turned off in master so logs stay quiet.
+        BOTMUX_MEMORY_DIAG_INTERVAL_MS: process.env.BOTMUX_MEMORY_DIAG_INTERVAL_MS ?? '0',
+      },
+    }];
+  });
 
   apps.push({
     name: 'botmux-dashboard',
@@ -2516,11 +2541,24 @@ function listBotmuxPm2Apps(): BotmuxPm2Inspection {
 
 export type StartBotLiveResult =
   | { ok: true; state: 'started' | 'already-online'; processName: string }
-  | { ok: false; reason: 'not_found' | 'fleet_down' | 'pm2_error'; message: string };
+  | { ok: false; reason: 'not_found' | 'not_ready' | 'fleet_down' | 'pm2_error'; message: string };
 
 export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
   | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
+
+function isExactPm2BotApp(
+  app: { name: string; botIndex?: string; larkAppId?: string },
+  processName: string,
+  index: number,
+  appId: string,
+): boolean {
+  return (
+    app.name === processName
+    && app.botIndex === String(index)
+    && app.larkAppId === appId
+  );
+}
 
 function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): StopBotLiveResult {
   const bots = loadBotsJson();
@@ -2529,6 +2567,18 @@ function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): 
     return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
   }
   const processName = botProcessName(bots[index], index, PM2_NAME);
+  const running = listBotmuxPm2Apps();
+  if (!running.ok) {
+    return { ok: false, reason: 'pm2_error', message: running.message };
+  }
+  const named = running.apps.filter(app => app.name === processName);
+  if (named.length > 0 && !named.some(app => isExactPm2BotApp(app, processName, index, appId))) {
+    return {
+      ok: false,
+      reason: 'pm2_error',
+      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+    };
+  }
   return stopExactPm2Process(
     processName,
     listBotmuxPm2Apps,
@@ -2565,7 +2615,11 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
   if (index < 0) {
     return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
   }
-  const processName = botProcessName(bots[index], index, PM2_NAME);
+  const bot = bots[index];
+  if (bot?.activationPending === true) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
+  }
+  const processName = botProcessName(bot, index, PM2_NAME);
 
   const running = listBotmuxPm2Apps();
   if (!running.ok) {
@@ -2574,17 +2628,38 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
   if (running.apps.length === 0) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
   }
-  if (running.apps.some(a => a.name === processName && a.online)) {
+  const named = running.apps.filter(app => app.name === processName);
+  if (named.some(app => isExactPm2BotApp(app, processName, index, appId) && app.online)) {
     return { ok: true, state: 'already-online', processName };
   }
+  if (named.length > 0) {
+    return {
+      ok: false,
+      reason: 'pm2_error',
+      message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+    };
+  }
 
-  const cfg = ecosystemConfig();
+  const cfg = ecosystemConfig(appId);
   try {
     // `--only <name>` filters the ecosystem to just this app, so pm2 starts only
     // the new bot's daemon and never restarts the already-online ones.
     runPm2(['start', cfg, '--only', processName], !opts.quiet);
   } catch (e) {
     return { ok: false, reason: 'pm2_error', message: e instanceof Error ? e.message : String(e) };
+  }
+  const acknowledged = listBotmuxPm2Apps();
+  if (!acknowledged.ok) {
+    return { ok: false, reason: 'pm2_error', message: acknowledged.message };
+  }
+  if (!acknowledged.apps.some(app => (
+    isExactPm2BotApp(app, processName, index, appId) && app.online
+  ))) {
+    return {
+      ok: false,
+      reason: 'pm2_error',
+      message: `pm2 start did not acknowledge ${processName} at bots.json slot ${index} / ${appId}`,
+    };
   }
   return { ok: true, state: 'started', processName };
 }

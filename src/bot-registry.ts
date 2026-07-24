@@ -1653,11 +1653,71 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
-  const exact = parseBotConfigsFromText(JSON.stringify([entry]));
+  const activationStarting = (entry as Record<string, unknown>).activationStarting;
+  if (activationStarting !== undefined) {
+    if (
+      !activationStarting
+      || typeof activationStarting !== 'object'
+      || Array.isArray(activationStarting)
+      || typeof (activationStarting as Record<string, unknown>).appId !== 'string'
+      || (activationStarting as Record<string, unknown>).appId !== (entry as Record<string, unknown>).larkAppId
+      || typeof (activationStarting as Record<string, unknown>).jobId !== 'string'
+      || !(activationStarting as Record<string, unknown>).jobId
+    ) {
+      throw new Error(`Bot config [${index}] has an invalid managed activation marker (file: ${filePath})`);
+    }
+    if (process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID !== (entry as Record<string, unknown>).larkAppId) {
+      throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+    }
+  }
+  const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  delete entryForDaemon.activationStarting;
+  const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
   if (exact.length !== 1) {
     throw new Error(`Bot config [${index}] could not be resolved exactly (file: ${filePath})`);
   }
   return exact[0];
+}
+
+/**
+ * Direct managed activation daemons are allowed to boot only while their
+ * exact raw config row carries a matching marker. They wait before registering
+ * until the dashboard clears that marker after the PM2 identity ACK.
+ */
+export function isManagedActivationStartingAtIndex(index: number, appId: string): boolean {
+  if (!Number.isInteger(index) || index < 0 || !appId) {
+    throw new Error('Invalid managed activation lookup');
+  }
+  const filePath = resolveBotConfigPath();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(filePath, 'utf-8'));
+  } catch (err: any) {
+    throw new Error(`Invalid JSON in bot config file (file: ${filePath}): ${err?.message ?? String(err)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Bot config file must contain a JSON array (file: ${filePath})`);
+  }
+  const entry = parsed[index];
+  if (!entry || typeof entry !== 'object') {
+    throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
+  }
+  const record = entry as Record<string, unknown>;
+  const marker = record.activationStarting;
+  if (marker === undefined) return false;
+  if (
+    record.activationPending === true
+    || !marker
+    || typeof marker !== 'object'
+    || Array.isArray(marker)
+    || record.larkAppId !== appId
+    || (marker as Record<string, unknown>).appId !== appId
+    || typeof (marker as Record<string, unknown>).jobId !== 'string'
+    || !(marker as Record<string, unknown>).jobId
+  ) {
+    throw new Error(`Bot config [${index}] managed activation marker drifted (file: ${filePath})`);
+  }
+  return true;
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
@@ -1695,7 +1755,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // MOSA-managed onboarding persists the exact App/secret/owner binding so
     // the same App can resume permission recovery, but a daemon must not load
     // it before the recovery job has read back every critical scope.
-    if (entry.activationPending === true) {
+    if (entry.activationPending === true || entry.activationStarting !== undefined) {
       continue;
     }
 
