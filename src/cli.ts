@@ -3225,6 +3225,82 @@ function adoptedCliPid(s: SessionData): number | undefined {
   return typeof pid === 'number' && pid > 0 ? pid : undefined;
 }
 
+type SessionDeleteCloseResult =
+  | { ok: true; via: 'daemon' | 'offline' }
+  | { ok: false; error: string };
+
+/** Offline-only fallback for `botmux delete`. When the owning daemon is live,
+ *  it must own the whole close transition so its activeSessions registry,
+ *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
+ *  coherent. This legacy local path is safe only when there is no daemon
+ *  process whose in-memory state could be stranded. */
+function closeSessionOffline(s: SessionData): void {
+  const originalPid = adoptedCliPid(s);
+  // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
+  if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
+    killProcess(s.pid);
+  }
+
+  // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
+  // and still need direct cleanup when no daemon exists to run killWorker().
+  if (!isAdoptedSession(s)) {
+    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+    try {
+      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+        stdio: 'ignore',
+        env: tmuxEnv(),
+      });
+    } catch { /* no tmux session */ }
+  }
+
+  s.status = 'closed';
+  s.closedAt = new Date().toISOString();
+  saveSession(s);
+}
+
+/** Close through the owning daemon whenever it is online. The IPC request is
+ *  deliberately sent BEFORE any local kill: deleting the current bmx-* tmux
+ *  first would terminate this very CLI before it can evict daemon memory.
+ *
+ *  Trusted host callers use the dashboard HMAC. A sandboxed/read-isolated CLI
+ *  can only authorize the exact current session with its rotating per-turn
+ *  capability, so `delete <other-id>` remains fail-closed. */
+async function closeSessionForDelete(
+  s: SessionData,
+  online = listOnlineDaemons(),
+): Promise<SessionDeleteCloseResult> {
+  // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
+  // writes only its own sessions-<appId>.json and silently no-ops on close
+  // (sessionStore.closeSession only touches the current file), so routing a
+  // legacy session to it yields "200 OK" with no actual state change. Keep
+  // these on the offline fallback, whose saveSession() persists to the legacy
+  // file correctly.
+  const daemon = s.larkAppId
+    ? online.find(d => d.larkAppId === s.larkAppId)
+    : undefined;
+  const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
+  const injectedPort = isCurrentSession
+    ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)
+    : undefined;
+  const ipcPort = daemon?.ipcPort ?? injectedPort;
+
+  if (ipcPort) {
+    try {
+      const res = await postSessionCliIpc(ipcPort, s.sessionId, 'close', {});
+      const body: any = await res.json().catch(() => ({}));
+      if (res.ok && body?.ok) return { ok: true, via: 'daemon' };
+      return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
+    } catch (err: any) {
+      // A fresh daemon descriptor means there may still be authoritative
+      // in-memory state. Never fall back to a partial local kill in this case.
+      return { ok: false, error: `连接 daemon 失败: ${err?.message ?? err}` };
+    }
+  }
+
+  closeSessionOffline(s);
+  return { ok: true, via: 'offline' };
+}
+
 function adoptTargetLabel(s: SessionData): string {
   if (!isAdoptedSession(s)) return '';
   const a = s.adoptedFrom;
@@ -3440,26 +3516,16 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
 
-    function deleteSession(idx: number): void {
+    let deleteInFlight = false;
+
+    async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
       const s = r.session;
-
-      // Kill botmux's worker process. For adopted sessions, never kill the
-      // user's original CLI pid if an old record stored it in `pid`.
-      const originalPid = adoptedCliPid(s);
-      if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-        killProcess(s.pid);
+      const result = await closeSessionForDelete(s);
+      if (!result.ok) {
+        flashMsg = `\x1b[31m✗ 删除失败: ${result.error}\x1b[0m`;
+        return;
       }
-
-      // Kill only botmux-owned tmux sessions. Adopted panes belong to the user.
-      if (!r.isAdopt && r.hasTmux) {
-        try { execSync(`tmux kill-session -t '${r.tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() }); } catch { /* */ }
-      }
-
-      // Mark closed & persist
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -3467,15 +3533,20 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       rows.splice(idx, 1);
 
       if (cursor >= rows.length) cursor = Math.max(0, rows.length - 1);
-      flashMsg = `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
+      flashMsg = result.via === 'daemon'
+        ? `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`
+        : `\x1b[33m✓ 已离线删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
     }
 
-    process.stdin.on('data', (key: string) => {
+    process.stdin.on('data', async (key: string) => {
+      if (deleteInFlight) return;
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
         if (key === 'y' || key === 'Y') {
-          deleteSession(cursor);
+          deleteInFlight = true;
+          try { await deleteSession(cursor); }
+          finally { deleteInFlight = false; }
         } else {
           flashMsg = '\x1b[2m取消删除\x1b[0m';
         }
@@ -3613,7 +3684,7 @@ async function cmdList(): Promise<void> {
   await interactiveSessionPicker(live);
 }
 
-function cmdDelete(): void {
+async function cmdDelete(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -3663,33 +3734,30 @@ function cmdDelete(): void {
     }
   }
 
-  for (const s of toDelete) {
-    const originalPid = adoptedCliPid(s);
-
-    // Kill botmux's worker process if running. For adopted sessions, never
-    // kill the user's original CLI pid.
-    if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-      killProcess(s.pid);
-      console.log(`  killed pid ${s.pid}`);
-    }
-
-    // Kill associated botmux-owned tmux session if it exists. Adopted panes
-    // belong to the user and must be left untouched.
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    if (!isAdoptedSession(s)) {
-      try {
-        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-        console.log(`  killed tmux ${tmuxName}`);
-      } catch { /* no tmux session */ }
-    }
-
-    // Mark session as closed
-    s.status = 'closed';
-    s.closedAt = new Date().toISOString();
-    saveSession(s);
-    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}`);
+  // A self-delete may tear down the process running this loop. Put it last so
+  // `delete all` still closes every other target before the current session.
+  const currentSessionId = process.env.BOTMUX_SESSION_ID;
+  if (currentSessionId && toDelete.length > 1) {
+    toDelete.sort((a, b) => Number(a.sessionId === currentSessionId) - Number(b.sessionId === currentSessionId));
   }
-  console.log(`\n已关闭 ${toDelete.length} 个会话`);
+
+  const online = listOnlineDaemons();
+  let closed = 0;
+  let offline = 0;
+  let failed = 0;
+  for (const s of toDelete) {
+    const result = await closeSessionForDelete(s, online);
+    if (!result.ok) {
+      console.error(`✗ ${s.sessionId.substring(0, 8)} ${s.title}: ${result.error}`);
+      failed++;
+      continue;
+    }
+    closed++;
+    if (result.via === 'offline') offline++;
+    console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}${result.via === 'offline' ? '（daemon 离线，本地收口）' : ''}`);
+  }
+  console.log(`\n已关闭 ${closed} 个会话${offline ? `（${offline} 个离线收口）` : ''}${failed ? `，${failed} 个失败` : ''}`);
+  if (failed > 0) process.exitCode = 1;
 }
 
 /**
@@ -3796,14 +3864,14 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
-/** 会话级 CLI IPC（slash/cd）的 POST：与 postAsk 同款双路径——能读 host secret
+/** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd',
+  route: 'slash' | 'cd' | 'close',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -9066,7 +9134,7 @@ switch (command) {
   case 'ls':      await cmdList(); break;
   case 'delete':
   case 'del':
-  case 'rm':      cmdDelete(); break;
+  case 'rm':      await cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;

@@ -1483,9 +1483,55 @@ export async function closeSession(
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
+    // Commit the daemon-visible close barrier before any network await below.
+    // `botmux delete` may be running inside the session being destroyed; once
+    // its worker/backing pane exits, a new IM message must not find this stale
+    // entry and resurrect the old logical session while doc cleanup is pending.
+    activeSessionsRegistry?.delete(activeSessionKey(ds));
+    killedLive = true;
+  }
+
+  // Persistence is part of the same no-await barrier as Map eviction. If the
+  // daemon crashes during best-effort doc cleanup, restart recovery must not
+  // restore a session that was already explicitly closed.
+  const stored = sessionStore.getSession(sessionId);
+  const wasOpen = !!stored && stored.status !== 'closed';
+  if (wasOpen) sessionStore.closeSession(sessionId);
+
+  if (ds) {
+    if (!ds.exitEventEmitted) {
+      ds.exitEventEmitted = true;
+      dashboardEventBus.publish({
+        type: 'session.exited',
+        body: { sessionId, reason: 'dashboard_close' },
+      });
+      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
+    }
+  }
+
+  // Preserve the existing externally-visible event order: exit first, then
+  // the final persisted-row update. Persistence itself was already committed
+  // above as part of the close barrier.
+  if (wasOpen) {
+    const after = sessionStore.getSession(sessionId);
+    dashboardEventBus.publish({
+      type: 'session.update',
+      body: {
+        sessionId,
+        patch: {
+          status: 'closed',
+          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
+          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
+        },
+      },
+    });
+  }
+
+  if (ds) {
     // 文档入口清理：会话关闭即删除其绑定。只有旧
     // /subscribe-lark-doc 记录需要调飞书逐文件退订 API；
-    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。
+    // /watch-comment 仅依赖应用级评论事件，删本地监听表即可。此段允许 await，
+    // 因为上面的内存 + 持久化关闭屏障已经提交。
     try {
       const anchor = sessionAnchorId(ds);
       const subs = listDocSubscriptionsForSession(config.session.dataDir, ds.larkAppId, anchor);
@@ -1499,35 +1545,6 @@ export async function closeSession(
     } catch (err: any) {
       logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
     }
-    activeSessionsRegistry?.delete(activeSessionKey(ds));
-    killedLive = true;
-    if (!ds.exitEventEmitted) {
-      ds.exitEventEmitted = true;
-      dashboardEventBus.publish({
-        type: 'session.exited',
-        body: { sessionId, reason: 'dashboard_close' },
-      });
-      emitSessionLifecycleHook(ds, 'session.exit', { reason: 'dashboard_close' });
-    }
-  }
-
-  // Persistence path — load → mark closed → save (delegated to sessionStore).
-  const stored = sessionStore.getSession(sessionId);
-  const wasOpen = !!stored && stored.status !== 'closed';
-  if (wasOpen) {
-    sessionStore.closeSession(sessionId);
-    const after = sessionStore.getSession(sessionId);
-    dashboardEventBus.publish({
-      type: 'session.update',
-      body: {
-        sessionId,
-        patch: {
-          status: 'closed',
-          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
-          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
-        },
-      },
-    });
   }
 
   // alreadyClosed = nothing happened on either path.
