@@ -136,15 +136,14 @@ describe('read-only web terminal wheel scrolling', () => {
     const MAX = 6;
     const WINDOW = 250;
     // Faithful port of admitReadonlyScrollTicks — a SINGLE shared burst counter,
-    // NOT per-connection. Resets only after a full idle window or a direction
-    // reversal, mirroring #577's client _fwdScroll gesture cap.
+    // NOT per-connection. Resets ONLY after a full idle window (direction reversal
+    // does NOT reset it on this untrusted read-only path — see case 5).
     const burst = { ticks: 0, dir: 0, last: -Infinity };
     function admit(dir: 'up' | 'down', wantTicks: number, now: number): number {
       if (wantTicks <= 0) return 0;
       const dirSign = dir === 'up' ? -1 : 1;
       const idle = now - burst.last >= WINDOW;
-      const reversed = burst.dir !== 0 && dirSign !== burst.dir;
-      if (idle || reversed) burst.ticks = 0;
+      if (idle) burst.ticks = 0; // ONLY idle resets (reversal never resets)
       burst.dir = dirSign;
       burst.last = now;
       const remaining = MAX - burst.ticks;
@@ -170,8 +169,7 @@ describe('read-only web terminal wheel scrolling', () => {
       if (want <= 0) return 0;
       const dirSign = dir === 'up' ? -1 : 1;
       const idle = now - burst2.last >= WINDOW;
-      const reversed = burst2.dir !== 0 && dirSign !== burst2.dir;
-      if (idle || reversed) burst2.ticks = 0;
+      if (idle) burst2.ticks = 0; // ONLY idle resets (reversal never resets)
       burst2.dir = dirSign; burst2.last = now;
       const remaining = MAX - burst2.ticks;
       if (remaining <= 0) return 0;
@@ -189,8 +187,7 @@ describe('read-only web terminal wheel scrolling', () => {
       if (want <= 0) return 0;
       const dirSign = dir === 'up' ? -1 : 1;
       const idle = now - burst3.last >= WINDOW;
-      const reversed = burst3.dir !== 0 && dirSign !== burst3.dir;
-      if (idle || reversed) burst3.ticks = 0;
+      if (idle) burst3.ticks = 0; // ONLY idle resets (reversal never resets)
       burst3.dir = dirSign; burst3.last = now;
       const remaining = MAX - burst3.ticks;
       if (remaining <= 0) return 0;
@@ -209,8 +206,7 @@ describe('read-only web terminal wheel scrolling', () => {
       if (want <= 0) return 0;
       const dirSign = dir === 'up' ? -1 : 1;
       const idle = now - burst4.last >= WINDOW;
-      const reversed = burst4.dir !== 0 && dirSign !== burst4.dir;
-      if (idle || reversed) burst4.ticks = 0;
+      if (idle) burst4.ticks = 0; // ONLY idle resets (reversal never resets)
       burst4.dir = dirSign; burst4.last = now;
       const remaining = MAX - burst4.ticks;
       if (remaining <= 0) return 0;
@@ -221,22 +217,49 @@ describe('read-only web terminal wheel scrolling', () => {
     expect(admit4('up', 6, 50)).toBe(0);
     expect(admit4('up', 6, 100)).toBe(0);
 
-    // (5) Direction reversal starts a new gesture (matches #577 client behaviour).
+    // (5) SECURITY: direction reversal must NOT reset the budget on this untrusted
+    //     read-only path. A viewToken client alternating up/down within the window
+    //     stays capped at 6 total — otherwise it could clear ticks every message
+    //     and flood without ever idling. (This intentionally DIVERGES from #577's
+    //     client behaviour, which reopens on reversal but has write capability.)
     const burst5 = { ticks: 0, dir: 0, last: -Infinity };
     function admit5(dir: 'up' | 'down', want: number, now: number): number {
       if (want <= 0) return 0;
       const dirSign = dir === 'up' ? -1 : 1;
       const idle = now - burst5.last >= WINDOW;
-      const reversed = burst5.dir !== 0 && dirSign !== burst5.dir;
-      if (idle || reversed) burst5.ticks = 0;
+      if (idle) burst5.ticks = 0; // ONLY idle resets — reversal does not
       burst5.dir = dirSign; burst5.last = now;
       const remaining = MAX - burst5.ticks;
       if (remaining <= 0) return 0;
       const g = Math.min(want, remaining); burst5.ticks += g; return g;
     }
-    expect(admit5('up', 6, 0)).toBe(6);   // up burst exhausted
-    expect(admit5('up', 6, 10)).toBe(0);  // still up, still spent
-    expect(admit5('down', 6, 20)).toBe(6); // reversed → new gesture reopens
+    expect(admit5('up', 6, 0)).toBe(6);    // up burst exhausted
+    expect(admit5('down', 6, 10)).toBe(0); // reversed within window → still 0
+    expect(admit5('up', 6, 20)).toBe(0);   // flip back → still 0
+    expect(admit5('down', 6, 30)).toBe(0); // keep alternating → still 0
+
+    // (6) Alternating-flood across MANY connections within the window: fill 6 on
+    //     one socket, then interleave up/down from several sockets — total stays 6.
+    const burst6 = { ticks: 0, dir: 0, last: -Infinity };
+    function admit6(dir: 'up' | 'down', want: number, now: number): number {
+      if (want <= 0) return 0;
+      const dirSign = dir === 'up' ? -1 : 1;
+      const idle = now - burst6.last >= WINDOW;
+      if (idle) burst6.ticks = 0;
+      burst6.dir = dirSign; burst6.last = now;
+      const remaining = MAX - burst6.ticks;
+      if (remaining <= 0) return 0;
+      const g = Math.min(want, remaining); burst6.ticks += g; return g;
+    }
+    let altTotal = admit6('up', 6, 0); // socket A fills the burst
+    for (let t = 5; t <= 240; t += 5) { // stay inside the 250ms window
+      const dir = (t / 5) % 2 === 0 ? 'up' : 'down';
+      for (let socket = 0; socket < 4; socket++) altTotal += admit6(dir, 6, t);
+    }
+    expect(altTotal).toBe(6); // alternating + multi-connection cannot beat the cap
+
+    // ...but once EVERYONE is quiet for a full window, the next burst reopens.
+    expect(admit6('up', 6, 240 + WINDOW)).toBe(6);
   });
 
   it('the scroll handler admits ticks BEFORE writing, and drops on exhausted burst', () => {

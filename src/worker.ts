@@ -4032,25 +4032,30 @@ function exitTmuxScrollMode(): void {
 
 /**
  * Admit up to `wantTicks` of read-only scroll into the SHARED idle-reset burst,
- * returning how many ticks are allowed right now. This is not a refilling bucket
- * — it faithfully mirrors #577's client _fwdScroll gesture cap, but server-side
- * and shared across ALL viewers:
- *   • a full READONLY_SCROLL_WINDOW_MS of idle (no scroll from anyone) resets the
- *     burst to empty — only THEN can another 6 ticks flow;
- *   • a direction reversal also resets it (a new gesture);
- *   • otherwise continuous traffic — from one socket or N sockets interleaved —
- *     shares the same 6-tick ceiling and cannot exceed it until things go quiet.
- * So neither multi-connection stacking nor sustained flooding can beat the cap.
- * Returns 0 when the current burst is already exhausted.
+ * returning how many ticks are allowed right now. This is not a refilling bucket.
+ * It is INSPIRED by #577's client _fwdScroll gesture cap but is a stricter SECURITY
+ * boundary, because the read-only channel is untrusted:
+ *   • ONLY a full READONLY_SCROLL_WINDOW_MS of idle (no scroll from ANY viewer)
+ *     resets the burst — only THEN can another 6 ticks flow;
+ *   • a direction reversal updates the tracked direction but does NOT reset the
+ *     budget. #577 lets a reversal reopen the burst, but that path has WRITE
+ *     capability; here a viewToken client could otherwise alternate up/down to
+ *     clear ticks on every message and flood without ever idling. So reversal is
+ *     deliberately NOT a reset condition on this path.
+ *   • otherwise continuous traffic — one socket or N interleaved, same direction
+ *     or alternating — shares the same 6-tick ceiling until everyone goes quiet.
+ * So neither multi-connection stacking, sustained flooding, nor direction-flip
+ * abuse can beat the cap. Returns 0 when the current burst is already exhausted.
  */
 function admitReadonlyScrollTicks(dir: 'up' | 'down', wantTicks: number, now: number): number {
   if (wantTicks <= 0) return 0;
   const dirSign = dir === 'up' ? -1 : 1;
   const idle = now - readonlyScrollBurst.last >= READONLY_SCROLL_WINDOW_MS;
-  const reversed = readonlyScrollBurst.dir !== 0 && dirSign !== readonlyScrollBurst.dir;
-  if (idle || reversed) {
-    readonlyScrollBurst.ticks = 0; // new gesture
+  if (idle) {
+    readonlyScrollBurst.ticks = 0; // full idle window → new burst allowed
   }
+  // Track direction for observability only; a reversal must NOT reset the budget
+  // on this untrusted path (see doc above).
   readonlyScrollBurst.dir = dirSign;
   readonlyScrollBurst.last = now;
   const remaining = READONLY_SCROLL_MAX_TICKS - readonlyScrollBurst.ticks;
@@ -4069,7 +4074,7 @@ function admitReadonlyScrollTicks(dir: 'up' | 'down', wantTicks: number, now: nu
  *   • the coordinate is the server-owned grid CENTRE (never client-supplied,
  *     never (1,1)) so zone-routed TUIs still accept it
  *   • line count is clamped to a small positive bound, then further shrunk to
- *     whatever the per-WS rate limiter granted this instant (maxTicks)
+ *     whatever the session-shared burst gate granted this instant (maxTicks)
  * A view capability therefore cannot forge any event other than a bounded
  * scroll. Returns '' if the request is malformed or maxTicks is 0.
  */
