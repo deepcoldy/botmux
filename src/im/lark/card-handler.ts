@@ -104,6 +104,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
+  codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
@@ -904,6 +906,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
+    && larkAppId
+  ) {
+    if (!operatorOpenId) {
+      logger.info(`${value.action} blocked because operator identity is missing`);
+      return { toast: { type: 'error', content: '只有机器人管理员可以操作此 Codex 任务' } };
+    }
+    if (!deps.codexNotifierCardAction) {
+      return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
+    }
+    return deps.codexNotifierCardAction(data, larkAppId);
   }
 
   if (

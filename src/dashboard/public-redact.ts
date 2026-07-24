@@ -5,11 +5,12 @@
 // be unit-tested without standing up the dashboard server (dashboard.ts starts
 // an HTTP listener on import).
 //
-// The public "watch work" board only needs NAMES + status. Two read endpoints
-// embed real filesystem / business content that an anonymous visitor must not
-// see, so each gets a redactor here:
+// The public "watch work" board only needs NAMES + status. Read endpoints can
+// embed filesystem, business, or operator-only data that an anonymous visitor
+// must not see, so each sensitive payload gets a redactor here:
 //   - /api/groups   → memberBots[].oncallChat = { chatId, workingDir }
 //   - /api/schedules → row carries `prompt` (business instructions) + `workingDir`
+//   - /api/settings → notifier carries recipient / delivery diagnostics
 // Both `workingDir`s are repo / customer-project paths; stripping them keeps
 // the board functional (name-map, timing, status) while not leaking bound dirs
 // — and keeps the "/api/bots oncall config is private" boundary honest.
@@ -57,4 +58,12 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
     const { prompt: _prompt, workingDir: _workingDir, ...rest } = s as Record<string, unknown>;
     return rest;
   });
+}
+
+/** 匿名只读面板不展示外部 Codex 活动、目标 Bot 或投递运行态。 */
+export function redactSettingsForPublic(settings: unknown): unknown {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
+  const source = settings as Record<string, unknown>;
+  const { codexNotifier: _privateNotifier, ...publicSettings } = source;
+  return publicSettings;
 }

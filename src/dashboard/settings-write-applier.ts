@@ -22,7 +22,12 @@ import {
   parseMaintenancePatch,
   readGlobalConfig,
   setGlobalLocale,
+  writeCodexNotifierConfig,
 } from '../global-config.js';
+import {
+  installCodexNotifierHook,
+  isCodexNotifierHookInstalled,
+} from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
@@ -42,6 +47,25 @@ export interface ResolvedDashboardSettingsView {
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions?: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline?: boolean;
+    pendingCount?: number;
+    workerOnline?: boolean;
+    lastError?: { at: string; message: string; retryAt: string } | null;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -83,6 +107,8 @@ export interface SettingsWriteApplierDeps {
   /** Atomic write of global-level fields (repoPickerMode / scheduleTimeZone / …).
    *  Mirrors the real `mergeGlobalConfig`: a `null` value deletes that key. */
   mergeGlobalConfig: (patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>) => void;
+  /** Replace known notifier fields while preserving future sibling keys on disk. */
+  writeCodexNotifierConfig: (config: import('../global-config.js').CodexNotifierGlobalConfig) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -103,6 +129,15 @@ export interface SettingsWriteApplierDeps {
   validateVcMeetingListenerBotAppId?: (appId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Sync per-bot meeting-listener config after validation passes or when clearing the selection. */
   syncVcMeetingListenerBotConfig?: (listenerBotAppId: string | null, previousListenerBotAppId?: string | null) => Promise<{ ok: true } | { ok: false; error: string; feishuLoginQr?: string }>;
+  /** 校验通知 Bot；保存关闭态配置时只校验静态配置，启用时再要求 daemon 与收件人就绪。 */
+  validateCodexNotifierTargetBotAppId?: (
+    appId: string,
+    options?: { requireReady?: boolean },
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /** Reconcile the stable core Hook command before enabling notification. */
+  installCodexNotifierHook?: () => void;
+  /** locked_only currently depends on macOS IORegistry. */
+  isCodexNotifierPlatformSupported?: () => boolean;
 }
 
 /** Production deps wiring — call once per dashboard process. */
@@ -114,6 +149,7 @@ export function defaultSettingsWriteApplierDeps(
     readGlobalConfig,
     mergeDashboardConfig,
     mergeGlobalConfig,
+    writeCodexNotifierConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -122,6 +158,11 @@ export function defaultSettingsWriteApplierDeps(
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
+    installCodexNotifierHook: () => {
+      installCodexNotifierHook();
+      if (!isCodexNotifierHookInstalled()) throw new Error('codex_notifier_hook_not_executable');
+    },
+    isCodexNotifierPlatformSupported: () => process.platform === 'darwin',
   };
 }
 
@@ -145,6 +186,16 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
+  | 'invalid_codexNotifier'
+  | 'invalid_codexNotifier_enabled'
+  | 'invalid_codexNotifier_targetBotAppId'
+  | 'invalid_codexNotifier_notifyWhen'
+  | 'codexNotifier_target_required'
+  | 'codexNotifier_target_unknown'
+  | 'codexNotifier_target_owner_missing'
+  | 'codexNotifier_platform_unsupported'
+  | 'codexNotifier_hook_install_failed'
+  | 'codexNotifier_mixed_patch_unsupported'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -169,6 +220,38 @@ function isValidHerdrPluginRef(value: string): boolean {
   return !value.startsWith('-') && !/[\s\0]/.test(value);
 }
 
+/** 与 daemon 实际私聊收件人选择保持一致：只要求存在首个可用 open_id。 */
+export function hasResolvedCodexNotifierRecipient(resolvedAllowedUsers: readonly string[] | undefined): boolean {
+  return resolvedAllowedUsers?.some(user => typeof user === 'string' && user.startsWith('ou_')) === true;
+}
+
+function maskCodexNotifierRecipient(value: string | undefined): string | null {
+  const normalized = value?.trim();
+  if (!normalized) return null;
+  if (normalized.length <= 12) return `${normalized.slice(0, 2)}***`;
+  return `${normalized.slice(0, 8)}…${normalized.slice(-4)}`;
+}
+
+/** 收件人提示只取 daemon 实际会私聊的首个 open_id，不能展示未解析的原始账号。 */
+export function resolveCodexNotifierRecipientView(
+  configuredAllowedUsers: readonly string[] | undefined,
+  resolvedAllowedUsers: readonly string[] | undefined,
+): {
+  recipientConfigured: boolean;
+  recipientVerified: boolean;
+  recipientHint: string | null;
+} {
+  const configured = configuredAllowedUsers?.some(user =>
+    typeof user === 'string' && !!user.trim()) === true;
+  const resolved = resolvedAllowedUsers?.find(user =>
+    typeof user === 'string' && user.startsWith('ou_'));
+  return {
+    recipientConfigured: configured,
+    recipientVerified: !!resolved,
+    recipientHint: maskCodexNotifierRecipient(resolved),
+  };
+}
+
 /**
  * Apply a parsed (object) settings patch. Returns success with the post-merge
  * snapshot, or an error code string on validation failure.
@@ -189,6 +272,12 @@ export async function applySettingsWrite(
   const obj = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown>
     : {};
+  if (
+    Object.hasOwn(obj, 'codexNotifier')
+    && Object.keys(obj).some(key => key !== 'codexNotifier')
+  ) {
+    return { ok: false, error: 'codexNotifier_mixed_patch_unsupported' };
+  }
 
   const patch: DashboardGlobalConfig = {};
   if ('publicReadOnly' in obj) {
@@ -256,12 +345,61 @@ export async function applySettingsWrite(
     patch.codexRpcInput = obj.codexRpcInput;
   }
 
+  let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;
+  if ('codexNotifier' in obj) {
+    const raw = obj.codexNotifier;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_codexNotifier' };
+    }
+    const incoming = raw as Record<string, unknown>;
+    const next = { ...(deps.readGlobalConfig().codexNotifier ?? {}) };
+    if ('enabled' in incoming) {
+      if (typeof incoming.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_codexNotifier_enabled' };
+      }
+      next.enabled = incoming.enabled;
+    }
+    if ('targetBotAppId' in incoming) {
+      if (incoming.targetBotAppId === null || incoming.targetBotAppId === '') {
+        delete next.targetBotAppId;
+      } else if (typeof incoming.targetBotAppId === 'string' && incoming.targetBotAppId.trim()) {
+        next.targetBotAppId = incoming.targetBotAppId.trim();
+      } else {
+        return { ok: false, error: 'invalid_codexNotifier_targetBotAppId' };
+      }
+    }
+    if ('notifyWhen' in incoming) {
+      if (incoming.notifyWhen !== 'locked_only' && incoming.notifyWhen !== 'always') {
+        return { ok: false, error: 'invalid_codexNotifier_notifyWhen' };
+      }
+      next.notifyWhen = incoming.notifyWhen;
+    }
+    if (!('enabled' in incoming) && !('targetBotAppId' in incoming) && !('notifyWhen' in incoming)) {
+      return { ok: false, error: 'invalid_codexNotifier' };
+    }
+    const shouldValidateCodexNotifierTarget = 'targetBotAppId' in incoming
+      || ('enabled' in incoming && incoming.enabled === true);
+    if (next.targetBotAppId && shouldValidateCodexNotifierTarget && deps.validateCodexNotifierTargetBotAppId) {
+      const validation = await deps.validateCodexNotifierTargetBotAppId(next.targetBotAppId, {
+        requireReady: next.enabled === true,
+      });
+      if (!validation.ok) return { ok: false, error: validation.error || 'codexNotifier_target_unknown' };
+    }
+    if (next.enabled === true) {
+      if (!next.targetBotAppId) return { ok: false, error: 'codexNotifier_target_required' };
+      const notifyWhen = next.notifyWhen === 'always' ? 'always' : 'locked_only';
+      if (notifyWhen === 'locked_only' && deps.isCodexNotifierPlatformSupported?.() === false) {
+        return { ok: false, error: 'codexNotifier_platform_unsupported' };
+      }
+    }
+    codexNotifierPatch = next;
+  }
+
   let touched = false;
   if (Object.keys(patch).length > 0) {
     deps.mergeDashboardConfig(patch);
     touched = true;
   }
-
   if ('repoPickerMode' in obj) {
     const v = obj.repoPickerMode;
     if (v !== 'all' && v !== 'repos') {
@@ -380,6 +518,20 @@ export async function applySettingsWrite(
     if (deps.reloadLocaleOnAllDaemons) {
       await deps.reloadLocaleOnAllDaemons();
     }
+    touched = true;
+  }
+
+  // Hook 是 notifier 唯一的外部副作用；等整份请求完成校验后再安装和持久化，
+  // 避免同一 PUT 的其他字段无效时返回失败却已经开启通知。
+  if (codexNotifierPatch) {
+    if (codexNotifierPatch.enabled === true) {
+      try {
+        deps.installCodexNotifierHook?.();
+      } catch {
+        return { ok: false, error: 'codexNotifier_hook_install_failed' };
+      }
+    }
+    deps.writeCodexNotifierConfig(codexNotifierPatch);
     touched = true;
   }
 

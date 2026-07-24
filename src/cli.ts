@@ -9358,6 +9358,7 @@ function printPluginUsage(): void {
   botmux plugin uninstall <plugin-id> [--force]
   botmux plugin enable <plugin-id> [--bot <name|index|all>]
   botmux plugin disable <plugin-id> [--bot <name|index|all>]
+  botmux plugin emit <plugin-id> --bot <process-name|app-id>  # JSON 从 stdin 读取
   botmux <plugin-command> [args...]
   botmux plugin service status
   botmux plugin service start [plugin-id|--all]
@@ -9448,6 +9449,72 @@ async function cmdPlugin(args: string[]): Promise<void> {
   }
 
   const registry = await loadPluginRegistryForCommand();
+
+  if (sub === 'emit') {
+    const pluginId = requirePluginId(args[1]);
+    assertPluginInstalled(pluginId);
+    const botSelector = findArgValue(args, '--bot');
+    if (!botSelector) {
+      console.error('❌ plugin emit 需要 --bot <process-name|app-id>。');
+      process.exitCode = 1;
+      return;
+    }
+
+    const bots = loadBotsJson();
+    const botIndex = parseBotSelection(botSelector, bots);
+    if (botIndex === undefined || typeof bots[botIndex]?.larkAppId !== 'string') {
+      console.error(`❌ 找不到 bot: ${botSelector}`);
+      process.exitCode = 1;
+      return;
+    }
+    const bot = bots[botIndex];
+    const enabledPluginIds = resolveEffectivePluginIds(bot, readGlobalConfig());
+    if (!enabledPluginIds.includes(pluginId)) {
+      console.error(`❌ 插件 ${pluginId} 未对 Bot(${botSelector}) 启用。`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const input = await readStdin();
+    if (!input.trim()) {
+      console.error('❌ plugin emit 需要从 stdin 读取 JSON 事件。');
+      process.exitCode = 1;
+      return;
+    }
+    if (Buffer.byteLength(input, 'utf8') > 64 * 1024) {
+      console.error('❌ plugin emit 事件超过 64 KiB。');
+      process.exitCode = 1;
+      return;
+    }
+    let event: unknown;
+    try {
+      event = JSON.parse(input);
+    } catch {
+      console.error('❌ plugin emit 收到的 stdin 不是合法 JSON。');
+      process.exitCode = 1;
+      return;
+    }
+
+    const daemon = findDaemon(bot.larkAppId);
+    if (!daemon) {
+      console.error(`❌ Bot(${botSelector}) daemon 未运行。`);
+      process.exitCode = 1;
+      return;
+    }
+    const response = await fetchDaemonIpc(daemon.ipcPort, '/api/plugin-events', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pluginId, targetBotAppId: bot.larkAppId, event }),
+    });
+    const responseText = await response.text();
+    if (!response.ok) {
+      console.error(`❌ 插件事件投递失败 (${response.status}): ${responseText || response.statusText}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(responseText || JSON.stringify({ ok: true, status: 'accepted' }));
+    return;
+  }
 
   if (sub === 'list' || sub === 'ls') {
     const plugins = Object.values(registry.plugins).sort((a, b) => a.id.localeCompare(b.id));
@@ -9722,6 +9789,54 @@ switch (command) {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
     await cmdHook(cliId);
+    break;
+  }
+  case 'codex-watch-hook': {
+    // 稳定兼容命令：现有 Codex Hook 已信任该字符串，迁入 core 后不改名。
+    // 尚未写入内建配置时继续交给已启用的旧插件，避免升级瞬间静默停采集。
+    if (
+      readGlobalConfig().codexNotifier === undefined
+      && await runPluginCommandByName('codex-watch-hook', process.argv.slice(3))
+    ) {
+      break;
+    }
+    const { runCodexNotifierHookCli } = await import('./features/codex-notifier/index.js');
+    await runCodexNotifierHookCli();
+    break;
+  }
+  case 'codex-watch-install-hook': {
+    const { installCodexNotifierHook } = await import('./features/codex-notifier/index.js');
+    const legacyStopOnly = readGlobalConfig().codexNotifier === undefined;
+    const result = installCodexNotifierHook({
+      mode: legacyStopOnly ? 'legacy-stop' : 'full',
+    });
+    const label = legacyStopOnly ? 'Codex 通知兼容 Stop Hook' : 'Codex 通知 Hook';
+    console.log(result.changed
+      ? `已安装 ${label}：${result.path}`
+      : `${label} 已存在：${result.path}`);
+    break;
+  }
+  case 'codex-watch-status': {
+    const {
+      isCodexNotifierHookInstalled,
+      isCodexNotifierWorkerStateFresh,
+      listCodexNotifierOutbox,
+      readCodexNotifierWorkerState,
+      resolveCodexNotifierConfig,
+    } = await import('./features/codex-notifier/index.js');
+    const dataDir = resolveDataDir();
+    const resolved = resolveCodexNotifierConfig();
+    const worker = readCodexNotifierWorkerState(dataDir);
+    console.log(JSON.stringify({
+      ...resolved,
+      hookInstalled: isCodexNotifierHookInstalled(),
+      pendingCount: listCodexNotifierOutbox(dataDir).length,
+      targetDaemonOnline: resolved.targetBotAppId
+        ? findDaemon(resolved.targetBotAppId) !== null
+        : false,
+      workerOnline: isCodexNotifierWorkerStateFresh(worker),
+      worker,
+    }, null, 2));
     break;
   }
   case 'session-ready': {

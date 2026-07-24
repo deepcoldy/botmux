@@ -15,7 +15,7 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { repoPickerScanOptions } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
@@ -107,7 +107,7 @@ import {
   getDaemonBootId,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
-import { ipcRoute, isTrustedHostIpcRequest, jsonRes, readJsonBody, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import {
   cancelSessionReadyAck,
@@ -245,6 +245,23 @@ import {
 } from './workflows/v3/daemon-ipc-body.js';
 import type { WorkflowDaemonMutation } from './workflows/v3/daemon-ipc-client.js';
 import type { SavedWorkflowActorContext } from './workflows/v3/library-service.js';
+import { resolveEffectivePluginIds } from './core/plugins/effective.js';
+import {
+  buildCodexCompletionCard,
+  buildCodexNotifierResultCard,
+  CODEX_NOTIFIER_PLUGIN_ID,
+  CodexNotifierEventStore,
+  CodexNotifierEventValidationError,
+  codexNotifierMessageUuid,
+  createCodexNotifierCardActionHandler,
+  materializeCodexNotifierOutboxEvent,
+  openCodexAppThread,
+  parseCodexNotifierEvent,
+  parseCodexNotifierPluginEvent,
+  parseCodexNotifierOutboxItem,
+  startCodexNotifierAdoptionSession,
+  type CodexTaskCompletedEvent,
+} from './features/codex-notifier/index.js';
 
 /** This daemon process's bot larkAppId (set in startDaemon).  Used to scope v3
  *  humanGate cold-attach + start to runs this bot owns (codex blocker #1). */
@@ -3660,11 +3677,261 @@ const v3GateRunner = createV3GateRunner({
 // key = larkAppId，在 startLarkEventDispatcher 调用时写入。
 const botHandlers = new Map<string, EventHandlers>();
 
+const codexNotifierStores = new Map<string, CodexNotifierEventStore>();
+const codexNotifierDeliveries = new Map<string, Promise<{ status: 'accepted'; messageId: string }>>();
+const CODEX_NOTIFIER_INGRESS_MAX_BYTES = 128 * 1024;
+const CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS = 10_000;
+const CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS = 2_200;
+const CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS = 1_200;
+
+function remainingCodexNotifierDeadline(deadlineAt: number, capMs: number): number {
+  return Math.max(1, Math.min(capMs, deadlineAt - Date.now()));
+}
+
+function codexNotifierStore(larkAppId: string): CodexNotifierEventStore {
+  const existing = codexNotifierStores.get(larkAppId);
+  if (existing) return existing;
+  const suffix = createHash('sha256').update(larkAppId).digest('hex').slice(0, 16);
+  const store = new CodexNotifierEventStore(
+    join(config.session.dataDir, 'plugin-events', `codex-notifier-${suffix}.json`),
+  );
+  codexNotifierStores.set(larkAppId, store);
+  return store;
+}
+
+function codexNotifierIngressEnabled(larkAppId: string, legacyPlugin = false): boolean {
+  const global = readGlobalConfig();
+  if (global.codexNotifier !== undefined || !legacyPlugin) {
+    return global.codexNotifier?.enabled === true;
+  }
+  try {
+    return resolveEffectivePluginIds(getBot(larkAppId).config, global)
+      .includes(CODEX_NOTIFIER_PLUGIN_ID);
+  } catch {
+    return false;
+  }
+}
+
+/** 用 Codex 原生线程名补全通知标题；失败时保留插件事件里的安全兜底信息。 */
+async function enrichCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<CodexTaskCompletedEvent> {
+  if (event.title) return event;
+  try {
+    const { readCodexAppThreadMetadata } = await import('./services/codex-app-threads.js');
+    const metadata = await readCodexAppThreadMetadata({
+      threadId: event.threadId,
+      codexBin: getBot(larkAppId).config.cliPathOverride,
+      cwd: event.cwd,
+      timeoutMs: 3_000,
+    });
+    const title = metadata.name?.trim();
+    return title ? { ...event, title: Array.from(title).slice(0, 300).join('') } : event;
+  } catch (error) {
+    logger.warn(`[codex-notifier] thread title lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    return event;
+  }
+}
+
+async function deliverCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+): Promise<{ status: 'accepted' | 'duplicate'; messageId: string }> {
+  const store = codexNotifierStore(larkAppId);
+  const enrichedEvent = store.get(event.eventId) ? event : await enrichCodexNotifierEvent(larkAppId, event);
+  const recorded = store.record(enrichedEvent);
+  const deliveryEvent = recorded.record.event;
+  if (!recorded.inserted) {
+    if (
+      deliveryEvent.type !== event.type
+      || deliveryEvent.source !== event.source
+      || deliveryEvent.threadId !== event.threadId
+      || deliveryEvent.nativeTurnId !== event.nativeTurnId
+      || deliveryEvent.status !== event.status
+    ) {
+      throw new Error('codex_notifier_event_id_conflict');
+    }
+    if (recorded.record.delivery.status === 'delivered' && recorded.record.delivery.messageId) {
+      return { status: 'duplicate', messageId: recorded.record.delivery.messageId };
+    }
+  }
+
+  const deliveryKey = `${larkAppId}:${event.eventId}`;
+  const current = codexNotifierDeliveries.get(deliveryKey);
+  if (current) return current;
+
+  const delivery = (async (): Promise<{ status: 'accepted'; messageId: string }> => {
+    const ownerOpenId = getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId);
+    if (!ownerOpenId) throw new Error('codex_notifier_owner_unavailable');
+    store.updateDelivery(event.eventId, { status: 'pending' });
+    try {
+      const messageId = await runWithAbortDeadline(
+        'codex_notifier_delivery',
+        CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+        signal => sendUserMessage(
+          larkAppId,
+          ownerOpenId,
+          buildCodexCompletionCard(deliveryEvent),
+          'interactive',
+          codexNotifierMessageUuid(event.eventId),
+          {
+            timeoutMs: CODEX_NOTIFIER_DELIVERY_TIMEOUT_MS,
+            signal,
+          },
+        ),
+      );
+      store.updateDelivery(event.eventId, { status: 'delivered', messageId, incrementAttempts: false });
+      return { status: 'accepted', messageId };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      store.updateDelivery(event.eventId, {
+        status: 'failed',
+        lastError: detail,
+        incrementAttempts: false,
+      });
+      throw error;
+    }
+  })();
+  codexNotifierDeliveries.set(deliveryKey, delivery);
+  try {
+    return await delivery;
+  } finally {
+    codexNotifierDeliveries.delete(deliveryKey);
+  }
+}
+
+async function adoptCodexNotifierEvent(
+  larkAppId: string,
+  event: CodexTaskCompletedEvent,
+  cardMessageId: string,
+  ownerOpenId: string,
+  signal: AbortSignal,
+  deadlineAt: number,
+): Promise<Record<string, unknown>> {
+  signal.throwIfAborted();
+  const chatId = await getMessageChatId(larkAppId, cardMessageId, {
+    timeoutMs: remainingCodexNotifierDeadline(
+      deadlineAt,
+      CODEX_NOTIFIER_MESSAGE_LOOKUP_TIMEOUT_MS,
+    ),
+    signal,
+  });
+  if (!chatId) throw new Error('无法定位完成通知所在的飞书私聊');
+  signal.throwIfAborted();
+
+  const botCfg = getBot(larkAppId).config;
+  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'chat' ? 'chat' : 'thread';
+  const anchor = scope === 'chat' ? chatId : cardMessageId;
+  const activeKey = sessionKey(anchor, larkAppId);
+  let ds = activeSessions.get(activeKey);
+
+  if (!ds) {
+    const fallbackTitle = event.cwd.split(/[\\/]/).filter(Boolean).pop() ?? 'Codex App';
+    const title = (event.title || `Codex App: ${fallbackTitle}`).slice(0, 50);
+    const session = sessionStore.createSession(chatId, cardMessageId, title, 'p2p');
+    const now = Date.now();
+    session.larkAppId = larkAppId;
+    session.scope = scope;
+    session.ownerOpenId = ownerOpenId;
+    session.lastCallerOpenId = ownerOpenId;
+    session.lastMessageAt = new Date(now).toISOString();
+    session.workingDir = event.cwd;
+    session.cliId = 'codex-app';
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(anchor);
+    ds = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId,
+      chatId,
+      chatType: 'p2p',
+      scope,
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: event.cwd,
+      ownerOpenId,
+    };
+    activeSessions.set(activeKey, ds);
+  }
+
+  if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
+    // 接管原生 Codex App 线程时固定为纯 codex-app 启动，不能继承通知 Bot 的
+    // wrapper/model；这些配置针对普通 CLI，会错误包装 app-server runner。
+    ds.session.cliId = 'codex-app';
+    ds.session.cliPathOverride = botCfg.cliPathOverride;
+    delete ds.session.wrapperCli;
+    delete ds.session.model;
+    ds.session.agentFrozen = true;
+    sessionStore.updateSession(ds.session);
+    ds.pendingRepo = false;
+    ds.pendingPrompt = undefined;
+    ds.pendingTurnId = undefined;
+    ds.pendingCodexAppText = undefined;
+    ds.pendingCodexAppApplicationContext = undefined;
+    ds.pendingCodexAppMessageContext = undefined;
+
+    // 完成事件已经携带恢复所需的原生 threadId/cwd。按钮回调不再额外启动一次
+    // app-server 做非必要的元数据刷新，避免子进程把飞书回调拖过截止时间。
+    const target = {
+      threadId: event.threadId,
+      name: event.title,
+      preview: event.finalPreview ?? '',
+      cwd: event.cwd,
+      status: event.status,
+    };
+
+    const { startCodexAppThreadSession } = await import('./core/command-handler.js');
+    signal.throwIfAborted();
+    await startCodexNotifierAdoptionSession(
+      startCodexAppThreadSession,
+      target,
+      ds,
+      {
+        activeSessions,
+        sessionReply,
+        getActiveCount,
+        lastRepoScan,
+      },
+      larkAppId,
+      cardMessageId,
+    );
+  }
+
+  return buildCodexNotifierResultCard(
+    '已接管 Codex App 任务',
+    scope === 'chat'
+      ? '现在可以直接在当前私聊继续发送指令；需要操作终端时，请点击会话卡内的「获取操作链接」。'
+      : '请在本卡片的话题中继续发送指令；需要操作终端时，请点击话题会话卡内的「获取操作链接」。',
+    'green',
+  );
+}
+
+const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
+  getExpectedOwnerOpenId: larkAppId =>
+    getOwnerOpenId(larkAppId) ?? resolvePrimaryOwnerOpenId(larkAppId),
+  getEventRecord: (larkAppId, eventId) => codexNotifierStore(larkAppId).get(eventId),
+  readConfig: () => readGlobalConfig().codexNotifier,
+  openAppThread: openCodexAppThread,
+  adoptEvent: adoptCodexNotifierEvent,
+  runWithAbortDeadline,
+  isAbortDeadlineError: error => error instanceof AbortDeadlineError,
+  adoptionTimeoutMs: CODEX_NOTIFIER_ADOPTION_TIMEOUT_MS,
+  logInfo: message => logger.info(message),
+  logWarn: message => logger.warn(message),
+  logError: message => logger.error(message),
+});
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
+  codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -4335,6 +4602,107 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   return jsonRes(res, 200, { ok: true });
+});
+
+async function respondCodexNotifierIngress(
+  res: import('node:http').ServerResponse,
+  larkAppId: string,
+  rawEvent: unknown,
+  pluginId?: string,
+): Promise<void> {
+  if (!codexNotifierIngressEnabled(larkAppId, pluginId === CODEX_NOTIFIER_PLUGIN_ID)) {
+    return jsonRes(res, 403, { ok: false, error: 'codex_notifier_disabled' });
+  }
+  let event: CodexTaskCompletedEvent;
+  try {
+    event = pluginId === undefined
+      ? parseCodexNotifierEvent(rawEvent)
+      : parseCodexNotifierPluginEvent(pluginId, rawEvent);
+  } catch (error) {
+    const code = error instanceof CodexNotifierEventValidationError
+      ? error.code
+      : 'invalid_event';
+    return jsonRes(res, 400, { ok: false, error: code });
+  }
+
+  try {
+    const result = await deliverCodexNotifierEvent(larkAppId, event);
+    return jsonRes(res, 200, { ok: true, status: result.status, messageId: result.messageId });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (detail === 'codex_notifier_event_id_conflict') {
+      return jsonRes(res, 409, { ok: false, error: 'event_id_conflict' });
+    }
+    logger.warn(`[codex-notifier] delivery failed event=${event.eventId.slice(0, 12)}: ${detail}`);
+    return jsonRes(res, 502, { ok: false, error: 'delivery_failed' });
+  }
+}
+
+// ─── 内建 Codex 完成事件入口 ────────────────────────────────────────────────
+// Dashboard 单例 worker 持有可靠 outbox，通过 host HMAC 投递到入队时选定的 Bot。
+ipcRoute('POST', '/api/codex-notifier/events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  let item;
+  try {
+    item = parseCodexNotifierOutboxItem(raw);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_outbox_item' });
+  }
+  if (item.targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, materializeCodexNotifierOutboxEvent(item));
+});
+
+// 旧独立插件的兼容入口保留一个迁移周期，只负责排空已经落盘的历史 outbox。
+ipcRoute('POST', '/api/plugin-events', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
+  const larkAppId = selfDaemonLarkAppId;
+  if (!larkAppId) {
+    return jsonRes(res, 503, { ok: false, error: 'daemon_not_ready' });
+  }
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req, CODEX_NOTIFIER_INGRESS_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'payload_too_large' });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!hasExactSafeJsonKeys(raw, ['pluginId', 'targetBotAppId', 'event'])) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_body' });
+  }
+  const {
+    pluginId,
+    targetBotAppId,
+    event: rawEvent,
+  } = raw;
+  if (pluginId !== CODEX_NOTIFIER_PLUGIN_ID) {
+    return jsonRes(res, 400, { ok: false, error: 'unsupported_plugin' });
+  }
+  if (targetBotAppId !== larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'target_bot_mismatch' });
+  }
+  return respondCodexNotifierIngress(res, larkAppId, rawEvent, pluginId);
 });
 
 // ─── hooks emit 转发端点 ────────────────────────────────────────────────────
