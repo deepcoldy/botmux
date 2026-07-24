@@ -2021,6 +2021,203 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('reconciles a crashed deactivating recovery by stopping the exact App before any new QR', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-deactivation-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    const jobId = 'botperm_deactivating_recovery';
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_deactivating_recovery',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationPending: true,
+      activationDeactivating: {
+        appId: 'cli_deactivating_recovery',
+        jobId,
+      },
+    }]));
+    writeFileSync(permissionRecoveryStorePath, JSON.stringify({
+      version: 1,
+      jobs: [{
+        id: jobId,
+        status: 'waiting_for_platform_scan',
+        createdAt: 1,
+        updatedAt: 1,
+        appId: 'cli_deactivating_recovery',
+        brand: 'feishu',
+        workingDir,
+        recoveryOfJobId: 'bot_original',
+        recoveryAttempt: 1,
+        criticalScopeActivationRequired: true,
+        activationPending: true,
+        activationDeactivating: true,
+      }],
+    }));
+    const stopBotLive = vi.fn(async () => ({ ok: true, message: 'exact daemon stopped' }));
+    const automateOpenPlatform = vi.fn(async () => autoOk());
+
+    new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      stopBotLive,
+      automateOpenPlatform,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(stopBotLive).toHaveBeenCalledOnce();
+    expect(stopBotLive).toHaveBeenCalledWith('cli_deactivating_recovery');
+    expect(automateOpenPlatform).not.toHaveBeenCalled();
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toEqual(
+      expect.objectContaining({
+        larkAppId: 'cli_deactivating_recovery',
+        activationPending: true,
+      }),
+    );
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationDeactivating');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('does not permit a new recovery while a crashed deactivation stop is unacknowledged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-deactivation-ack-fence-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_deactivation_ack_fence',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+    }]));
+    const firstStop = deferred<{ ok: boolean; message?: string }>();
+    const firstAutomation = vi.fn(async () => autoOk());
+    const firstManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      ...immediateCriticalScopePolling,
+      stopBotLive: () => firstStop.promise,
+      automateOpenPlatform: firstAutomation,
+    });
+    const first = firstManager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_deactivation_ack_fence',
+      requireCriticalScopesBeforeActivation: true,
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.error);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      activationPending: true,
+      activationDeactivating: {
+        appId: 'cli_deactivation_ack_fence',
+        jobId: first.job.id,
+      },
+    });
+    expect(firstAutomation).not.toHaveBeenCalled();
+
+    const restartStop = deferred<{ ok: boolean; message?: string }>();
+    const restartAutomation = vi.fn(async () => autoOk());
+    const restartedManager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      stopBotLive: () => restartStop.promise,
+      automateOpenPlatform: restartAutomation,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(restartedManager.startPermissionRecovery({
+      workingDir,
+      predecessorJobId: 'bot_original',
+      expectedAppId: 'cli_deactivation_ack_fence',
+      requireCriticalScopesBeforeActivation: true,
+    })).toEqual({ ok: false, error: 'permission_recovery_state_unavailable' });
+    expect(restartAutomation).not.toHaveBeenCalled();
+
+    restartStop.resolve({ ok: true, message: 'exact daemon stopped after restart' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toEqual(
+      expect.objectContaining({
+        larkAppId: 'cli_deactivation_ack_fence',
+        activationPending: true,
+      }),
+    );
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationDeactivating');
+
+    firstStop.resolve({ ok: true, message: 'late first stop ACK' });
+    await first.job.done;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('fails closed on a persisted activation commit by stopping and restoring pending after restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-commit-restart-'));
+    const botsJsonPath = join(dir, 'bots.json');
+    const permissionRecoveryStorePath = join(dir, 'permission-recoveries.json');
+    const workingDir = join(dir, 'space-agent');
+    const jobId = 'botperm_activation_commit';
+    writeFileSync(botsJsonPath, JSON.stringify([{
+      larkAppId: 'cli_activation_commit',
+      larkAppSecret: 'existing-secret',
+      cliId: 'traex',
+      defaultWorkingDir: workingDir,
+      allowedUsers: ['owner@example.com'],
+      activationCommitted: {
+        appId: 'cli_activation_commit',
+        jobId,
+      },
+    }]));
+    writeFileSync(permissionRecoveryStorePath, JSON.stringify({
+      version: 1,
+      jobs: [{
+        id: jobId,
+        status: 'completed',
+        createdAt: 1,
+        updatedAt: 1,
+        appId: 'cli_activation_commit',
+        brand: 'feishu',
+        workingDir,
+        recoveryOfJobId: 'bot_original',
+        recoveryAttempt: 1,
+        criticalScopeActivationRequired: true,
+        activationPending: true,
+        activationCommitting: true,
+        platformQrScanConfirmedAt: 1,
+        managedActivationState: 'activation_committing',
+        managedActivationAck: {
+          eventMode: 4,
+          verifiedEventCount: 7,
+          versionId: 'v1',
+        },
+      }],
+    }));
+    const stopBotLive = vi.fn(async () => ({ ok: true, message: 'exact daemon stopped' }));
+    const manager = new BotOnboardingManager({
+      botsJsonPath,
+      permissionRecoveryStorePath,
+      stopBotLive,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(stopBotLive).toHaveBeenCalledOnce();
+    expect(stopBotLive).toHaveBeenCalledWith('cli_activation_commit');
+    expect(manager.get(jobId)).toMatchObject({
+      status: 'completed',
+      activationPending: true,
+      activationCommitting: false,
+      liveStarted: false,
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).toMatchObject({
+      larkAppId: 'cli_activation_commit',
+      activationPending: true,
+    });
+    expect(JSON.parse(readFileSync(botsJsonPath, 'utf8'))[0]).not.toHaveProperty('activationCommitted');
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('reconciles a crashed activating marker by stopping the exact App before restoring pending', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-activation-restart-'));
     const botsJsonPath = join(dir, 'bots.json');

@@ -117,6 +117,10 @@ export interface BotOnboardingSnapshot {
    * registration until every critical scope is observable.
    */
   activationPending?: boolean;
+  /** A durable exact-daemon stop is required before recovery can proceed. */
+  activationDeactivating?: boolean;
+  /** A durable activation ledger exists but the config marker is not yet final. */
+  activationCommitting?: boolean;
   /** The caller explicitly requires the critical-scope activation gate. */
   criticalScopeActivationRequired?: boolean;
   permission?: BotOnboardingPermission;
@@ -187,6 +191,7 @@ function hasExactManagedAutomationAck(result: OpenPlatformAutomationResult): boo
 type ManagedActivationState =
   | 'initial_scope_propagation_pending'
   | 'scope_propagation_pending'
+  | 'activation_committing'
   | 'completed';
 
 function hasExactManagedPermissionAck(permission: BotOnboardingPermission | undefined): boolean {
@@ -221,6 +226,14 @@ function managedActivationStateForSnapshot(
     job.status === 'completed'
     && job.permission?.ok === true
     && job.activationPending === true
+    && job.activationCommitting === true
+  ) {
+    return 'activation_committing';
+  }
+  if (
+    job.status === 'completed'
+    && job.permission?.ok === true
+    && job.activationPending === true
   ) {
     return 'initial_scope_propagation_pending';
   }
@@ -235,7 +248,7 @@ function managedActivationStateForSnapshot(
   return undefined;
 }
 
-function isExactActivationStartingMarker(
+function isExactManagedActivationMarker(
   value: unknown,
   appId: string,
   jobId?: string,
@@ -246,6 +259,27 @@ function isExactActivationStartingMarker(
     && (value as Record<string, unknown>).appId === appId
     && typeof (value as Record<string, unknown>).jobId === 'string'
     && (jobId === undefined || (value as Record<string, unknown>).jobId === jobId);
+}
+
+function managedActivationMarker(
+  bot: unknown,
+): { phase: 'deactivating' | 'starting' | 'committed'; appId: string; jobId: string } | undefined {
+  if (!bot || typeof bot !== 'object' || Array.isArray(bot)) return undefined;
+  const record = bot as Record<string, unknown>;
+  const appId = typeof record.larkAppId === 'string' ? record.larkAppId : '';
+  const markers = ([
+    ['deactivating', record.activationDeactivating],
+    ['starting', record.activationStarting],
+    ['committed', record.activationCommitted],
+  ] as const).filter(([, value]) => value !== undefined);
+  if (markers.length !== 1) return undefined;
+  const [phase, value] = markers[0];
+  if (!isExactManagedActivationMarker(value, appId)) return undefined;
+  return {
+    phase,
+    appId,
+    jobId: (value as Record<string, unknown>).jobId as string,
+  };
 }
 
 export interface BotOnboardingManagerOptions {
@@ -513,7 +547,7 @@ export class BotOnboardingManager {
       );
       const isManagedInitial = (
         !isRecovery
-        && ['initial_scope_propagation_pending', 'completed'].includes(
+        && ['initial_scope_propagation_pending', 'activation_committing', 'completed'].includes(
           raw?.managedActivationState,
         )
       );
@@ -544,6 +578,8 @@ export class BotOnboardingManager {
         )
         || (raw.platformQrScanConfirmedAt !== undefined
           && (!Number.isInteger(raw.platformQrScanConfirmedAt) || raw.platformQrScanConfirmedAt <= 0))
+        || (raw.activationDeactivating !== undefined && raw.activationDeactivating !== true)
+        || (raw.activationCommitting !== undefined && raw.activationCommitting !== true)
       ) {
         this.permissionRecoveryStateError = 'permission recovery ledger contains an invalid record';
         return;
@@ -578,6 +614,12 @@ export class BotOnboardingManager {
           || raw.managedActivationState === 'initial_scope_propagation_pending'
           ? { activationPending: true }
           : {}),
+        ...(raw.activationDeactivating === true
+          ? { activationDeactivating: true, activationPending: true }
+          : {}),
+        ...(raw.activationCommitting === true
+          ? { activationCommitting: true, activationPending: true }
+          : {}),
         ...(Number.isInteger(raw.platformQrScanConfirmedAt)
           ? { platformQrScanConfirmedAt: raw.platformQrScanConfirmedAt }
           : {}),
@@ -597,6 +639,18 @@ export class BotOnboardingManager {
                 ok: false,
                 reason: 'scope_mapping_failed',
                 message: '关键权限发布后仍在传播，等待 botmux 精确回读并启动',
+                eventMode: raw.managedActivationAck?.eventMode,
+                verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
+                versionId: raw.managedActivationAck?.versionId,
+              },
+            }
+          : {}),
+        ...(raw.managedActivationState === 'activation_committing'
+          ? {
+              activationPending: true,
+              activationCommitting: true,
+              permission: {
+                ok: true,
                 eventMode: raw.managedActivationAck?.eventMode,
                 verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
                 versionId: raw.managedActivationAck?.versionId,
@@ -632,14 +686,14 @@ export class BotOnboardingManager {
           && ![
             'initial_scope_propagation_pending',
             'scope_propagation_pending',
+            'activation_committing',
             'completed',
           ].includes(raw.managedActivationState)
         )
         || (
           raw.managedActivationState === 'initial_scope_propagation_pending'
           && (
-            isRecovery
-            || raw.status !== 'completed'
+            raw.status !== 'completed'
             || raw.activationPending !== true
           )
         )
@@ -649,6 +703,15 @@ export class BotOnboardingManager {
             !isRecovery
             || raw.status !== 'failed'
             || raw.error !== 'permission_recovery_failed'
+          )
+        )
+        || (
+          raw.managedActivationState === 'activation_committing'
+          && (
+            raw.status !== 'completed'
+            || raw.activationPending !== true
+            || raw.activationDeactivating === true
+            || raw.activationCommitting !== true
           )
         )
         || (
@@ -735,6 +798,12 @@ export class BotOnboardingManager {
           previousRecoveryJobId: job.previousRecoveryJobId,
           criticalScopeActivationRequired: job.criticalScopeActivationRequired,
           activationPending: job.activationPending,
+          ...(job.activationDeactivating === true
+            ? { activationDeactivating: true }
+            : {}),
+          ...(job.activationCommitting === true
+            ? { activationCommitting: true }
+            : {}),
           platformQrScanConfirmedAt: job.platformQrScanConfirmedAt,
           error: job.error,
           message: job.message,
@@ -884,6 +953,8 @@ export class BotOnboardingManager {
       || typeof current !== 'object'
       || current.larkAppId !== appId
       || current.activationStarting !== undefined
+      || current.activationCommitted !== undefined
+      || current.activationCommitting !== undefined
     ) {
       throw new Error('permission_recovery_activation_target_drift');
     }
@@ -896,12 +967,15 @@ export class BotOnboardingManager {
     const live = await this.runLiveStart(id, appId, false);
     if (live.attempted && live.ok === true) {
       try {
-        this.commitManagedActivation(id, appId, addedBotIndex);
         this.patch(id, {
-          activationPending: false,
-          liveStarted: true,
+          activationPending: true,
+          activationCommitting: true,
+          liveStarted: false,
           liveStartMessage: live.message,
         });
+        this.persistPermissionRecoveryJobs();
+        this.commitManagedActivation(id, appId, addedBotIndex);
+        this.completeManagedActivation(id, appId, addedBotIndex);
         return;
       } catch (err) {
         const stopped = await this.runLiveStop(id, appId);
@@ -939,8 +1013,13 @@ export class BotOnboardingManager {
       throw new Error('permission_recovery_activation_target_drift');
     }
     const next = [...bots];
-    const activating = { ...current, activationStarting: { appId, jobId: id } };
+    const activating = {
+      ...current,
+      activationStarting: { appId, jobId: id },
+    };
     delete activating.activationPending;
+    delete activating.activationDeactivating;
+    delete activating.activationCommitting;
     next[addedBotIndex] = activating;
     writeBotsJsonAtomic(this.opts.botsJsonPath, next);
   }
@@ -953,12 +1032,12 @@ export class BotOnboardingManager {
       || typeof current !== 'object'
       || current.larkAppId !== appId
       || current.activationPending === true
-      || !isExactActivationStartingMarker(current.activationStarting, appId, id)
+      || !isExactManagedActivationMarker(current.activationStarting, appId, id)
     ) {
       throw new Error('permission_recovery_activation_ack_target_drift');
     }
     const next = [...bots];
-    const ready = { ...current };
+    const ready = { ...current, activationCommitted: { appId, jobId: id } };
     delete ready.activationStarting;
     next[addedBotIndex] = ready;
     writeBotsJsonAtomic(this.opts.botsJsonPath, next);
@@ -971,39 +1050,165 @@ export class BotOnboardingManager {
       !current
       || typeof current !== 'object'
       || current.larkAppId !== appId
-      || !isExactActivationStartingMarker(current.activationStarting, appId, id)
+      || (
+        !isExactManagedActivationMarker(current.activationStarting, appId, id)
+        && !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+        && !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+      )
     ) {
       throw new Error('permission_recovery_activation_rollback_target_drift');
     }
     const next = [...bots];
     const pending = { ...current, activationPending: true };
     delete pending.activationStarting;
+    delete pending.activationDeactivating;
+    delete pending.activationCommitted;
     next[addedBotIndex] = pending;
     writeBotsJsonAtomic(this.opts.botsJsonPath, next);
-    this.patch(id, { activationPending: true, liveStarted: false });
+    this.patch(id, {
+      activationPending: true,
+      activationDeactivating: false,
+      activationCommitting: false,
+      liveStarted: false,
+    });
+  }
+
+  private completeManagedActivation(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || current.activationPending === true
+      || current.activationStarting !== undefined
+      || current.activationDeactivating !== undefined
+      || !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+    ) {
+      throw new Error('permission_recovery_activation_completion_target_drift');
+    }
+    this.patch(id, {
+      activationPending: false,
+      activationCommitting: false,
+      liveStarted: true,
+    });
+    this.persistPermissionRecoveryJobs();
+    const next = [...bots];
+    const ready = { ...current };
+    delete ready.activationCommitted;
+    next[addedBotIndex] = ready;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+  }
+
+  private clearManagedActivationCommitted(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+    ) {
+      throw new Error('permission_recovery_activation_committed_target_drift');
+    }
+    const next = [...bots];
+    const ready = { ...current };
+    delete ready.activationCommitted;
+    next[addedBotIndex] = ready;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
   }
 
   private async reconcileInterruptedManagedActivations(): Promise<void> {
     const targets = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
-      if (!bot || typeof bot !== 'object' || bot.activationStarting === undefined) return [];
-      const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId : '';
-      if (!isExactActivationStartingMarker(bot.activationStarting, appId)) {
+      const marker = managedActivationMarker(bot);
+      if (!marker) {
+        if (
+          bot
+          && typeof bot === 'object'
+          && (
+            bot.activationDeactivating !== undefined
+            || bot.activationStarting !== undefined
+            || bot.activationCommitted !== undefined
+            || bot.activationCommitting !== undefined
+          )
+        ) {
+          this.permissionRecoveryStateError = 'managed activation marker is invalid';
+        }
+        return [];
+      }
+      if (
+        marker.phase === 'deactivating'
+        || marker.phase === 'starting'
+        || marker.phase === 'committed'
+      ) {
+        return [{ index, ...marker }];
+      }
+      if (!marker.appId) {
         this.permissionRecoveryStateError = 'managed activation marker is invalid';
         return [];
       }
-      return [{ index, appId, jobId: bot.activationStarting.jobId as string }];
+      return [];
     });
     if (this.permissionRecoveryStateError) return;
     for (const target of targets) {
-      const stopped = await this.runLiveStop(target.jobId, target.appId);
-      if (!stopped.attempted || stopped.ok !== true) {
-        this.permissionRecoveryStateError = `managed activation stop could not be confirmed for ${target.appId}`;
-        return;
-      }
       try {
+        const job = this.jobs.get(target.jobId);
+        if (
+          target.phase === 'committed'
+          && job?.status === 'completed'
+          && job.activationPending !== true
+          && job.liveStarted === true
+        ) {
+          this.clearManagedActivationCommitted(target.jobId, target.appId, target.index);
+          continue;
+        }
+        const stopped = await this.runLiveStop(target.jobId, target.appId);
+        if (!stopped.attempted || stopped.ok !== true) {
+          this.permissionRecoveryStateError = `managed activation stop could not be confirmed for ${target.appId}`;
+          return;
+        }
         this.restoreManagedActivationPending(target.jobId, target.appId, target.index);
       } catch (err) {
         this.permissionRecoveryStateError = `managed activation rollback failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        return;
+      }
+    }
+    for (const job of this.jobs.values()) {
+      if (
+        job.activationCommitting !== true
+        || job.status !== 'completed'
+        || !job.appId
+        || !job.workingDir
+      ) {
+        continue;
+      }
+      const matches = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => (
+        bot
+        && typeof bot === 'object'
+        && bot.larkAppId === job.appId
+        && bot.cliId === 'traex'
+        && bot.defaultWorkingDir === job.workingDir
+        && bot.activationPending !== true
+        && bot.activationStarting === undefined
+        && bot.activationDeactivating === undefined
+        && isExactManagedActivationMarker(
+          bot.activationCommitted,
+          job.appId!,
+          job.id,
+        )
+          ? [index]
+          : []
+      ));
+      if (matches.length !== 1) {
+        this.permissionRecoveryStateError = `managed activation commit could not be reconciled for ${job.appId}`;
+        return;
+      }
+      try {
+        this.completeManagedActivation(job.id, job.appId, matches[0]);
+      } catch (err) {
+        this.permissionRecoveryStateError = `managed activation commit reconciliation failed: ${
           err instanceof Error ? err.message : String(err)
         }`;
         return;
@@ -1021,12 +1226,44 @@ export class BotOnboardingManager {
     ) {
       throw new Error('permission_recovery_activation_target_drift');
     }
-    if (current.activationPending !== true) {
-      const next = [...bots];
-      next[addedBotIndex] = { ...current, activationPending: true };
-      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    if (
+      current.activationStarting !== undefined
+      || current.activationCommitted !== undefined
+      || (
+        current.activationDeactivating !== undefined
+        && !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+      )
+    ) {
+      throw new Error('permission_recovery_activation_target_drift');
     }
-    this.patch(id, { activationPending: true });
+    const next = [...bots];
+    next[addedBotIndex] = {
+      ...current,
+      activationPending: true,
+      activationDeactivating: { appId, jobId: id },
+    };
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    this.patch(id, { activationPending: true, activationDeactivating: true });
+    this.persistPermissionRecoveryJobs();
+  }
+
+  private markManagedDeactivated(id: string, appId: string, addedBotIndex: number): void {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+    ) {
+      throw new Error('permission_recovery_deactivation_target_drift');
+    }
+    const next = [...bots];
+    const pending = { ...current, activationPending: true };
+    delete pending.activationDeactivating;
+    next[addedBotIndex] = pending;
+    writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    this.patch(id, { activationPending: true, activationDeactivating: false });
   }
 
   start(input: BotOnboardingInput = {}): BotOnboardingJob {
@@ -1061,7 +1298,11 @@ export class BotOnboardingManager {
       return { ok: false, error: 'permission_recovery_state_unavailable' };
     }
     const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
-    if (configuredBots.some((bot: any) => bot?.activationStarting !== undefined)) {
+    if (configuredBots.some((bot: any) => (
+      bot?.activationDeactivating !== undefined
+      || bot?.activationStarting !== undefined
+      || bot?.activationCommitted !== undefined
+    ))) {
       return { ok: false, error: 'permission_recovery_state_unavailable' };
     }
     const candidates = configuredBots.flatMap((bot: any, index) => {
@@ -1194,6 +1435,7 @@ export class BotOnboardingManager {
       && job.activationPending === true
       && job.liveStarted !== true
       && job.permission?.ok === true
+      && job.activationCommitting !== true
     );
     const recoveryPropagationPending = (
       job.status === 'failed'
@@ -1269,11 +1511,6 @@ export class BotOnboardingManager {
     if (!stable.ready) {
       return { ok: false, error: 'permission_recovery_scopes_pending' };
     }
-    try {
-      await this.activateRecoveredBot(job.id, input.expectedAppId, target.index, true);
-    } catch {
-      return { ok: false, error: 'permission_recovery_activation_failed' };
-    }
     const permissionAck: OpenPlatformAutomationResult = {
       ok: true,
       sessionFile: 'permission-recovery-ledger',
@@ -1296,8 +1533,12 @@ export class BotOnboardingManager {
       permissionAck,
       'completed',
     );
+    try {
+      await this.activateRecoveredBot(job.id, input.expectedAppId, target.index, true);
+    } catch {
+      return { ok: false, error: 'permission_recovery_activation_failed' };
+    }
     this.patch(job.id, {
-      activationPending: false,
       error: undefined,
       message: undefined,
       remainingSteps: undefined,
@@ -1675,6 +1916,7 @@ export class BotOnboardingManager {
           `permission_recovery_deactivation_not_acknowledged${stopped.message ? `: ${stopped.message}` : ''}`,
         );
       }
+      this.markManagedDeactivated(id, appId, addedBotIndex);
     }
     this.patch(id, { status: 'configuring_permissions' });
     const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
@@ -1731,8 +1973,8 @@ export class BotOnboardingManager {
       this.finalizePermissions(id, appId, brand, addedBotIndex, failed, 'failed', 'permission_recovery_failed');
       return;
     }
-    await this.activateRecoveredBot(id, appId, addedBotIndex);
     this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
+    await this.activateRecoveredBot(id, appId, addedBotIndex);
   }
 
   private async runOwnerPermissionAutomation(

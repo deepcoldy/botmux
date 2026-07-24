@@ -878,6 +878,7 @@ describe('loadBotConfigs', () => {
     // Clean env
     delete process.env.BOTS_CONFIG;
     delete process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+    delete process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
   });
 
   it('should throw when no config source is available', () => {
@@ -936,8 +937,40 @@ describe('loadBotConfigs', () => {
     expect(mod.loadBotConfigs()).toEqual([]);
     expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
     process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'activating_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_activation';
     expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('activating_app');
-    expect(mod.isManagedActivationStartingAtIndex(0, 'activating_app')).toBe(true);
+    expect(mod.isManagedActivationStartingAtIndex(0, 'activating_app', 'bot_activation')).toBe(true);
+  });
+
+  it('loads a committed raw slot only for the same managed activation receipt', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'committed_app',
+      larkAppSecret: 'committed_secret',
+      activationCommitted: { appId: 'committed_app', jobId: 'bot_committed' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID = 'committed_app';
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'wrong_job';
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
+    process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID = 'bot_committed';
+    expect(mod.loadBotConfigAtIndex(0).larkAppId).toBe('committed_app');
+  });
+
+  it('rejects a deactivating slot even if a corrupted config lost activationPending', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'deactivating_app',
+      larkAppSecret: 'deactivating_secret',
+      activationDeactivating: { appId: 'deactivating_app', jobId: 'bot_deactivating' },
+    }]));
+
+    expect(mod.loadBotConfigs()).toEqual([]);
+    expect(() => mod.loadBotConfigAtIndex(0)).toThrow('activation pending');
   });
 
   it('keeps daemon slot indexes stable when an earlier bot is activation-pending', () => {

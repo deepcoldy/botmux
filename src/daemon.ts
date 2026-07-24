@@ -18,6 +18,7 @@ import {
 import { repoPickerScanOptions } from './global-config.js';
 import { buildDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles } from './core/botmux-wrapper.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
@@ -16252,8 +16253,16 @@ function dashboardUrlForReport(): { url?: string; localUrl?: string } {
 }
 
 async function waitForManagedActivationCommit(index: number, appId: string): Promise<void> {
-  if (process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID !== appId) return;
-  while (isManagedActivationStartingAtIndex(index, appId)) {
+  const activationAppId = process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID;
+  if (activationAppId === undefined) return;
+  if (activationAppId !== appId) {
+    throw new Error(`Managed activation App drifted at BOTMUX_BOT_INDEX=${index}`);
+  }
+  const activationJobId = process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID;
+  if (!activationJobId) {
+    throw new Error(`Managed activation receipt is missing at BOTMUX_BOT_INDEX=${index}`);
+  }
+  while (isManagedActivationStartingAtIndex(index, appId, activationJobId)) {
     await new Promise<void>(resolve => setTimeout(resolve, 100));
   }
   const committed = loadBotConfigAtIndex(index);
@@ -16291,7 +16300,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (botIndex !== undefined) {
     // During managed activation PM2 may report this process online before it
     // is allowed to register a bot or receive traffic. The dashboard clears
-    // the exact durable marker only after it has re-read the PM2 App/index ACK.
+    // the exact startup marker only after it has re-read the PM2 receipt ACK.
     await waitForManagedActivationCommit(idx, cfg.larkAppId);
     botConfigs = loadBotConfigs();
     cfg = loadBotConfigAtIndex(idx);
@@ -16301,19 +16310,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // latest file under its lock before deciding. Explicit [] and legacy agent
   // policy are durable opt-outs. Reload the selected config after a write so
   // this daemon exposes the seeded selection card immediately on the same boot.
-  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(cfg.larkAppId);
+  const selectedAppId = cfg.larkAppId;
+  const profileBootstrap = await bootstrapVcMeetingDefaultConsumerProfile(selectedAppId);
   if (profileBootstrap.ok) {
-    const selectedAppId = cfg.larkAppId;
-    // Reload even when another concurrent daemon won the one-time write. Both
-    // processes may have loaded the old file before taking the config lock;
-    // the loser still needs the winner's catalog on this boot.
-    const reloaded = botIndex === undefined
-      ? loadBotConfigs().find(candidate => candidate.larkAppId === selectedAppId)
-      : loadBotConfigAtIndex(idx);
-    if (!reloaded || reloaded.larkAppId !== selectedAppId) {
-      throw new Error(`BOTMUX_BOT_INDEX=${idx} target drifted during profile bootstrap`);
-    }
-    cfg = reloaded;
     if (profileBootstrap.seeded) {
       logger.info(
         `[vc-agent] seeded default meeting minutes profile listener=${selectedAppId} `
@@ -16325,6 +16324,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       `[vc-agent] default consumer profile bootstrap skipped: ${profileBootstrap.reason}`
       + `${profileBootstrap.error ? ` (${profileBootstrap.error})` : ''}`,
     );
+  }
+  // A bootstrap failure is not authority to keep an earlier in-memory config.
+  // Every explicit PM2 daemon must prove its same raw slot and App identity
+  // immediately before registerBot, regardless of the bootstrap result.
+  if (botIndex !== undefined) {
+    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;

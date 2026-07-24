@@ -1653,25 +1653,40 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
+  if ((entry as Record<string, unknown>).activationDeactivating !== undefined) {
+    throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+  }
   const activationStarting = (entry as Record<string, unknown>).activationStarting;
-  if (activationStarting !== undefined) {
+  const activationCommitted = (entry as Record<string, unknown>).activationCommitted;
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    throw new Error(`Bot config [${index}] has conflicting managed activation markers (file: ${filePath})`);
+  }
+  const managedActivation = activationStarting ?? activationCommitted;
+  if (managedActivation !== undefined) {
     if (
-      !activationStarting
-      || typeof activationStarting !== 'object'
-      || Array.isArray(activationStarting)
-      || typeof (activationStarting as Record<string, unknown>).appId !== 'string'
-      || (activationStarting as Record<string, unknown>).appId !== (entry as Record<string, unknown>).larkAppId
-      || typeof (activationStarting as Record<string, unknown>).jobId !== 'string'
-      || !(activationStarting as Record<string, unknown>).jobId
+      !managedActivation
+      || typeof managedActivation !== 'object'
+      || Array.isArray(managedActivation)
+      || typeof (managedActivation as Record<string, unknown>).appId !== 'string'
+      || (managedActivation as Record<string, unknown>).appId !== (entry as Record<string, unknown>).larkAppId
+      || typeof (managedActivation as Record<string, unknown>).jobId !== 'string'
+      || !(managedActivation as Record<string, unknown>).jobId
     ) {
       throw new Error(`Bot config [${index}] has an invalid managed activation marker (file: ${filePath})`);
     }
     if (process.env.BOTMUX_MANAGED_ACTIVATION_APP_ID !== (entry as Record<string, unknown>).larkAppId) {
       throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
     }
+    if (
+      process.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID
+      !== (managedActivation as Record<string, unknown>).jobId
+    ) {
+      throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
+    }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
   delete entryForDaemon.activationStarting;
+  delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
   if (exact.length !== 1) {
     throw new Error(`Bot config [${index}] could not be resolved exactly (file: ${filePath})`);
@@ -1681,11 +1696,15 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
 
 /**
  * Direct managed activation daemons are allowed to boot only while their
- * exact raw config row carries a matching marker. They wait before registering
- * until the dashboard clears that marker after the PM2 identity ACK.
+ * exact raw config row carries a matching startup marker. They wait before
+ * registering until the dashboard records the exact PM2 identity ACK.
  */
-export function isManagedActivationStartingAtIndex(index: number, appId: string): boolean {
-  if (!Number.isInteger(index) || index < 0 || !appId) {
+export function isManagedActivationStartingAtIndex(
+  index: number,
+  appId: string,
+  jobId: string,
+): boolean {
+  if (!Number.isInteger(index) || index < 0 || !appId || !jobId) {
     throw new Error('Invalid managed activation lookup');
   }
   const filePath = resolveBotConfigPath();
@@ -1713,7 +1732,7 @@ export function isManagedActivationStartingAtIndex(index: number, appId: string)
     || record.larkAppId !== appId
     || (marker as Record<string, unknown>).appId !== appId
     || typeof (marker as Record<string, unknown>).jobId !== 'string'
-    || !(marker as Record<string, unknown>).jobId
+    || (marker as Record<string, unknown>).jobId !== jobId
   ) {
     throw new Error(`Bot config [${index}] managed activation marker drifted (file: ${filePath})`);
   }
@@ -1755,7 +1774,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // MOSA-managed onboarding persists the exact App/secret/owner binding so
     // the same App can resume permission recovery, but a daemon must not load
     // it before the recovery job has read back every critical scope.
-    if (entry.activationPending === true || entry.activationStarting !== undefined) {
+    if (
+      entry.activationPending === true
+      || entry.activationDeactivating !== undefined
+      || entry.activationStarting !== undefined
+      || entry.activationCommitted !== undefined
+    ) {
       continue;
     }
 

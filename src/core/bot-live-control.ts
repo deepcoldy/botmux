@@ -5,6 +5,10 @@ export interface BotmuxPm2App {
   botIndex?: string;
   /** Exact Feishu App identity assigned by the generated PM2 ecosystem config. */
   larkAppId?: string;
+  /** App identity carried only by a gated managed-activation daemon. */
+  activationAppId?: string;
+  /** Durable activation receipt carried only by the exact gated PM2 process. */
+  activationJobId?: string;
 }
 
 export type BotmuxPm2Inspection =
@@ -14,6 +18,46 @@ export type BotmuxPm2Inspection =
 export type ExactPm2StopResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
   | { ok: false; reason: 'pm2_error'; message: string };
+
+export function isExactPm2BotActivationReceipt(
+  app: BotmuxPm2App,
+  processName: string,
+  index: number,
+  appId: string,
+  activationJobId?: string,
+): boolean {
+  return (
+    app.name === processName
+    && app.botIndex === String(index)
+    && app.larkAppId === appId
+    && (
+      activationJobId === undefined
+      || (
+        app.activationAppId === appId
+        && app.activationJobId === activationJobId
+      )
+    )
+  );
+}
+
+export function managedActivationPm2Disposition(
+  apps: BotmuxPm2App[],
+  processName: string,
+  index: number,
+  appId: string,
+  activationJobId: string,
+): 'acknowledged' | 'replace' | 'identity_mismatch' {
+  if (apps.some(app => (
+    isExactPm2BotActivationReceipt(app, processName, index, appId, activationJobId)
+    && app.online
+  ))) {
+    return 'acknowledged';
+  }
+  if (!apps.every(app => isExactPm2BotActivationReceipt(app, processName, index, appId))) {
+    return 'identity_mismatch';
+  }
+  return 'replace';
+}
 
 /**
  * Parse the real `pm2 jlist` transport shape. PM2 may prefix stdout with log
@@ -77,6 +121,16 @@ export function inspectBotmuxPm2Apps(load: () => unknown[]): BotmuxPm2Inspection
                 ? app.pm2_env.BOTMUX_LARK_APP_ID
                 : typeof app?.pm2_env?.env?.BOTMUX_LARK_APP_ID === 'string'
                   ? app.pm2_env.env.BOTMUX_LARK_APP_ID
+                  : undefined,
+              activationAppId: typeof app?.pm2_env?.BOTMUX_MANAGED_ACTIVATION_APP_ID === 'string'
+                ? app.pm2_env.BOTMUX_MANAGED_ACTIVATION_APP_ID
+                : typeof app?.pm2_env?.env?.BOTMUX_MANAGED_ACTIVATION_APP_ID === 'string'
+                  ? app.pm2_env.env.BOTMUX_MANAGED_ACTIVATION_APP_ID
+                  : undefined,
+              activationJobId: typeof app?.pm2_env?.BOTMUX_MANAGED_ACTIVATION_JOB_ID === 'string'
+                ? app.pm2_env.BOTMUX_MANAGED_ACTIVATION_JOB_ID
+                : typeof app?.pm2_env?.env?.BOTMUX_MANAGED_ACTIVATION_JOB_ID === 'string'
+                  ? app.pm2_env.env.BOTMUX_MANAGED_ACTIVATION_JOB_ID
                   : undefined,
             }]
           : []

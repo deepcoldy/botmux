@@ -158,6 +158,8 @@ import { authorizeV3DaemonCommand } from './workflows/v3/cli-daemon-command-auth
 import { resolveDaemonIpcPort } from './utils/daemon-discovery.js';
 import {
   inspectBotmuxPm2Apps,
+  isExactPm2BotActivationReceipt,
+  managedActivationPm2Disposition,
   parsePm2JlistOutputStrict as parsePm2JlistOutput,
   stopExactPm2Process,
   type BotmuxPm2Inspection,
@@ -434,20 +436,37 @@ function ecosystemConfig(activationAppId?: string): string {
   const apps: any[] = bots.flatMap((_bot: any, i: number) => {
     const appId = typeof _bot?.larkAppId === 'string' ? _bot.larkAppId : '';
     const activationStarting = _bot?.activationStarting;
-    const hasValidActivationMarker = (
-      activationStarting
-      && typeof activationStarting === 'object'
-      && !Array.isArray(activationStarting)
-      && activationStarting.appId === appId
-      && typeof activationStarting.jobId === 'string'
-      && activationStarting.jobId
+    const activationCommitted = _bot?.activationCommitted;
+    const activationDeactivating = _bot?.activationDeactivating;
+    const hasConflictingActivationMarkers = (
+      activationStarting !== undefined
+      && activationCommitted !== undefined
     );
+    const activationMarker = activationStarting ?? activationCommitted;
+    const hasValidActivationMarker = (
+      activationMarker
+      && typeof activationMarker === 'object'
+      && !Array.isArray(activationMarker)
+      && activationMarker.appId === appId
+      && typeof activationMarker.jobId === 'string'
+      && activationMarker.jobId
+    );
+    const activationJobId = hasValidActivationMarker
+      ? String(activationMarker.jobId)
+      : undefined;
     // A normal fleet start/restart must never resurrect an unacknowledged
     // managed activation. `start-bot` passes its exact App ID and is the only
     // path permitted to create its short-lived PM2 process.
     if (
       _bot?.activationPending === true
-      || (activationStarting !== undefined && (!hasValidActivationMarker || activationAppId !== appId))
+      || (
+        activationDeactivating !== undefined
+        || hasConflictingActivationMarkers
+        || (
+          (activationStarting !== undefined || activationCommitted !== undefined)
+          && (!hasValidActivationMarker || activationAppId !== appId)
+        )
+      )
     ) {
       return [];
     }
@@ -462,7 +481,10 @@ function ecosystemConfig(activationAppId?: string): string {
         BOTMUX_BOT_INDEX: String(i),
         BOTMUX_LARK_APP_ID: appId,
         ...(hasValidActivationMarker
-          ? { BOTMUX_MANAGED_ACTIVATION_APP_ID: appId }
+          ? {
+              BOTMUX_MANAGED_ACTIVATION_APP_ID: appId,
+              BOTMUX_MANAGED_ACTIVATION_JOB_ID: activationJobId,
+            }
           : {}),
         // Native-memory diagnostics. Default off; operator can flip it on
         // ad-hoc (e.g. `BOTMUX_MEMORY_DIAG_INTERVAL_MS=5000`) when chasing an
@@ -2547,19 +2569,6 @@ export type StopBotLiveResult =
   | { ok: true; state: 'stopped' | 'already-stopped'; processName: string }
   | { ok: false; reason: 'not_found' | 'pm2_error'; message: string };
 
-function isExactPm2BotApp(
-  app: { name: string; botIndex?: string; larkAppId?: string },
-  processName: string,
-  index: number,
-  appId: string,
-): boolean {
-  return (
-    app.name === processName
-    && app.botIndex === String(index)
-    && app.larkAppId === appId
-  );
-}
-
 function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): StopBotLiveResult {
   const bots = loadBotsJson();
   const index = bots.findIndex(b => b?.larkAppId === appId);
@@ -2572,7 +2581,7 @@ function ensureBotDaemonStopped(appId: string, opts: { quiet?: boolean } = {}): 
     return { ok: false, reason: 'pm2_error', message: running.message };
   }
   const named = running.apps.filter(app => app.name === processName);
-  if (named.length > 0 && !named.some(app => isExactPm2BotApp(app, processName, index, appId))) {
+  if (named.length > 0 && !named.some(app => isExactPm2BotActivationReceipt(app, processName, index, appId))) {
     return {
       ok: false,
       reason: 'pm2_error',
@@ -2619,6 +2628,29 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
   if (bot?.activationPending === true) {
     return { ok: false, reason: 'not_ready', message: `appId ${appId} is still activation pending` };
   }
+  const activationStarting = bot?.activationStarting;
+  const activationCommitted = bot?.activationCommitted;
+  const activationDeactivating = bot?.activationDeactivating;
+  if (activationDeactivating !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} is still deactivating` };
+  }
+  if (activationStarting !== undefined && activationCommitted !== undefined) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has conflicting activation markers` };
+  }
+  const activationMarker = activationStarting ?? activationCommitted;
+  const activationJobId = (
+    activationMarker
+    && typeof activationMarker === 'object'
+    && !Array.isArray(activationMarker)
+    && activationMarker.appId === appId
+    && typeof activationMarker.jobId === 'string'
+    && activationMarker.jobId
+  )
+    ? activationMarker.jobId
+    : undefined;
+  if (activationMarker !== undefined && !activationJobId) {
+    return { ok: false, reason: 'not_ready', message: `appId ${appId} has an invalid activation marker` };
+  }
   const processName = botProcessName(bot, index, PM2_NAME);
 
   const running = listBotmuxPm2Apps();
@@ -2629,15 +2661,48 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start' };
   }
   const named = running.apps.filter(app => app.name === processName);
-  if (named.some(app => isExactPm2BotApp(app, processName, index, appId) && app.online)) {
+  if (!activationJobId && named.some(app => (
+    isExactPm2BotActivationReceipt(app, processName, index, appId) && app.online
+  ))) {
     return { ok: true, state: 'already-online', processName };
   }
-  if (named.length > 0) {
+  if (activationJobId && named.length > 0) {
+    const disposition = managedActivationPm2Disposition(
+      named,
+      processName,
+      index,
+      appId,
+      activationJobId,
+    );
+    if (disposition === 'acknowledged') {
+      return { ok: true, state: 'already-online', processName };
+    }
+    if (disposition === 'identity_mismatch') {
+      return {
+        ok: false,
+        reason: 'pm2_error',
+        message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
+      };
+    }
+  } else if (named.length > 0) {
     return {
       ok: false,
       reason: 'pm2_error',
       message: `pm2 process ${processName} does not match bots.json slot ${index} / ${appId}`,
     };
+  }
+  if (activationJobId && named.length > 0) {
+    // A same App/index process without this durable receipt can be an old
+    // daemon already consuming Feishu traffic. Delete it and prove absence
+    // before the gated activation daemon is allowed to become the PM2 ACK.
+    const stopped = stopExactPm2Process(
+      processName,
+      listBotmuxPm2Apps,
+      exactName => runPm2(['delete', exactName], !opts.quiet),
+    );
+    if (!stopped.ok) {
+      return { ok: false, reason: 'pm2_error', message: stopped.message };
+    }
   }
 
   const cfg = ecosystemConfig(appId);
@@ -2653,7 +2718,7 @@ function ensureBotDaemonStarted(appId: string, opts: { quiet?: boolean } = {}): 
     return { ok: false, reason: 'pm2_error', message: acknowledged.message };
   }
   if (!acknowledged.apps.some(app => (
-    isExactPm2BotApp(app, processName, index, appId) && app.online
+    isExactPm2BotActivationReceipt(app, processName, index, appId, activationJobId) && app.online
   ))) {
     return {
       ok: false,
