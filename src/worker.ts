@@ -822,6 +822,20 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
+/** SHARED (session/backend-scoped) idle-reset burst gate for read-only
+ *  {type:'scroll'} intents. The client-side clamp (lines≤6) only binds the page;
+ *  a viewToken holder can bypass it and loop scroll messages, and can open N
+ *  connections. A PER-connection bucket would let N viewers write 6·N ticks at
+ *  once, and a refilling bucket would allow sustained ~24 tick/s — both defeat
+ *  #577's guarantee. So this is a SINGLE counter shared across every viewer,
+ *  mirroring the client's _fwdScroll gesture cap exactly: at most
+ *  READONLY_SCROLL_MAX_TICKS ticks per continuous burst, and the burst only
+ *  resets after a full READONLY_SCROLL_WINDOW_MS of idle (or a direction
+ *  reversal). Continuous flooding — from one socket or many — never exceeds 6
+ *  until everyone goes quiet for the window. */
+const readonlyScrollBurst = { ticks: 0, dir: 0, last: -Infinity };
+const READONLY_SCROLL_MAX_TICKS = 6;      // ticks per continuous burst == #577's per-gesture cap
+const READONLY_SCROLL_WINDOW_MS = 250;    // idle gap that resets the burst
 const writeToken = randomBytes(16).toString('hex');
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret.
@@ -4014,6 +4028,73 @@ function exitTmuxScrollMode(): void {
   if (tmuxScrolledHalfPages === 0 || !backend || !('sendCopyModeCommand' in backend)) return;
   try { (backend as any).sendCopyModeCommand('cancel'); } catch { /* benign */ }
   tmuxScrolledHalfPages = 0;
+}
+
+/**
+ * Admit up to `wantTicks` of read-only scroll into the SHARED idle-reset burst,
+ * returning how many ticks are allowed right now. This is not a refilling bucket.
+ * It is INSPIRED by #577's client _fwdScroll gesture cap but is a stricter SECURITY
+ * boundary, because the read-only channel is untrusted:
+ *   • ONLY a full READONLY_SCROLL_WINDOW_MS of idle (no scroll from ANY viewer)
+ *     resets the burst — only THEN can another 6 ticks flow;
+ *   • a direction reversal updates the tracked direction but does NOT reset the
+ *     budget. #577 lets a reversal reopen the burst, but that path has WRITE
+ *     capability; here a viewToken client could otherwise alternate up/down to
+ *     clear ticks on every message and flood without ever idling. So reversal is
+ *     deliberately NOT a reset condition on this path.
+ *   • otherwise continuous traffic — one socket or N interleaved, same direction
+ *     or alternating — shares the same 6-tick ceiling until everyone goes quiet.
+ * So neither multi-connection stacking, sustained flooding, nor direction-flip
+ * abuse can beat the cap. Returns 0 when the current burst is already exhausted.
+ */
+function admitReadonlyScrollTicks(dir: 'up' | 'down', wantTicks: number, now: number): number {
+  if (wantTicks <= 0) return 0;
+  const dirSign = dir === 'up' ? -1 : 1;
+  const idle = now - readonlyScrollBurst.last >= READONLY_SCROLL_WINDOW_MS;
+  if (idle) {
+    readonlyScrollBurst.ticks = 0; // full idle window → new burst allowed
+  }
+  // Track direction for observability only; a reversal must NOT reset the budget
+  // on this untrusted path (see doc above).
+  readonlyScrollBurst.dir = dirSign;
+  readonlyScrollBurst.last = now;
+  const remaining = READONLY_SCROLL_MAX_TICKS - readonlyScrollBurst.ticks;
+  if (remaining <= 0) return 0;
+  const granted = Math.min(wantTicks, remaining);
+  readonlyScrollBurst.ticks += granted;
+  return granted;
+}
+
+/**
+ * Server-side synthesis of a restricted mouse-wheel sequence for the READ-ONLY
+ * web terminal (see CliAdapter.readonlyWheelScroll). The read-only client sends
+ * only {dir, lines}; EVERYTHING that could encode a click, drag, release, key,
+ * or arbitrary coordinate is decided HERE, server-side:
+ *   • button is hard-coded to 64 (wheel-up) / 65 (wheel-down) — never a click
+ *   • the coordinate is the server-owned grid CENTRE (never client-supplied,
+ *     never (1,1)) so zone-routed TUIs still accept it
+ *   • line count is clamped to a small positive bound, then further shrunk to
+ *     whatever the session-shared burst gate granted this instant (maxTicks)
+ * A view capability therefore cannot forge any event other than a bounded
+ * scroll. Returns '' if the request is malformed or maxTicks is 0.
+ */
+function buildReadonlyWheelSequence(dir: unknown, lines: unknown, maxTicks = READONLY_SCROLL_MAX_TICKS): string {
+  if (dir !== 'up' && dir !== 'down') return '';
+  if (maxTicks <= 0) return '';
+  const requested = typeof lines === 'number' && Number.isFinite(lines)
+    ? Math.max(1, Math.min(READONLY_SCROLL_MAX_TICKS, Math.floor(lines)))
+    : 1;
+  const n = Math.min(requested, Math.floor(maxTicks));
+  if (n <= 0) return '';
+  const cols = renderCols || PTY_COLS;
+  const rows = renderRows || PTY_ROWS;
+  const col = (cols >> 1) + 1; // grid centre, 1-based; never (1,1)
+  const row = (rows >> 1) + 1;
+  const button = dir === 'up' ? 64 : 65;
+  const coord = `${col};${row}`;
+  let seq = '';
+  for (let i = 0; i < n; i++) seq += `\x1b[<${button};${coord}M`;
+  return seq;
 }
 
 function handleTermAction(key: TermActionKey): void {
@@ -7929,8 +8010,17 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
+      // Read-only wheel scrolling: opt-in per adapter (Claude family). Lets a
+      // viewToken client scroll the CLI's alt-screen transcript WITHOUT gaining
+      // byte-forwarding — the client sends a restricted {type:'scroll'} intent
+      // and the server synthesizes a pure wheel sequence. Off for every other
+      // CLI, so their read-only views still forward zero input. Gated to the
+      // shared relay (PtyBackend / tmux-pipe) path Claude actually runs on;
+      // tmux/zellij attach own their own copy-mode scrolling.
+      const readonlyWheelScroll = cliAdapter?.readonlyWheelScroll === true
+        && !(isTmuxMode && !isPipeMode);
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend));
+      res.end(getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend, readonlyWheelScroll));
     });
 
     wss = new WebSocketServer({
@@ -8181,6 +8271,31 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
               }
               backend?.write(msg.data);
+            } else if (msg.type === 'scroll') {
+              // RESTRICTED read-only scroll intent (see readonlyWheelScroll). Unlike
+              // 'input', this is allowed WITHOUT write capability — but the client
+              // supplied only {dir, lines}; the server synthesizes the actual bytes,
+              // so no click/drag/coordinate can be forged. Gated to adapters that
+              // opted in; ignored entirely otherwise.
+              if (cliAdapter?.readonlyWheelScroll !== true) return;
+              // Rate-limit: the client clamp (lines≤6) only binds the page. A
+              // viewToken holder can loop scroll messages AND open many WS. So the
+              // SERVER admits ticks through a SHARED idle-reset burst (see
+              // admitReadonlyScrollTicks) — mirroring #577's per-gesture cap across
+              // all viewers: continuous traffic (one socket or many) shares one
+              // 6-tick ceiling and only resets after a full idle window.
+              if (msg.dir !== 'up' && msg.dir !== 'down') return;
+              const wantTicks = typeof msg.lines === 'number' && Number.isFinite(msg.lines)
+                ? Math.max(1, Math.min(READONLY_SCROLL_MAX_TICKS, Math.floor(msg.lines)))
+                : 1;
+              const grantedTicks = admitReadonlyScrollTicks(msg.dir, wantTicks, Date.now());
+              if (grantedTicks <= 0) return; // burst exhausted — drop the flood
+              const seq = buildReadonlyWheelSequence(msg.dir, msg.lines, grantedTicks);
+              if (!seq) return;
+              if (usesHerdrSnapshotWebHistory()) {
+                herdrWebScrollDirection = msg.dir === 'up' ? 'up' : 'down';
+              }
+              backend?.write(seq);
             }
           } catch { /* ignore non-JSON or bad messages */ }
         });
@@ -8212,6 +8327,7 @@ function getTerminalHtml(
   loginUrl = '',
   forceRemoteScroll = false,
   localTerminalBackend = false,
+  readonlyWheelScroll = false,
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -8350,6 +8466,7 @@ var hasToken=${hasWrite};
 var platformReadonly=${platformReadonly};
 var remoteScroll=${forceRemoteScroll};
 var localTerminalBackend=${localTerminalBackend};
+var readonlyWheelScroll=${readonlyWheelScroll};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
   else{var _rb=document.getElementById('readonly-banner');_rb.classList.add('show');_rb.addEventListener('click',function(){_rb.classList.remove('show')});}
@@ -8634,7 +8751,17 @@ if(!${isTmuxMode && !isPipeMode}){
       return;
     }
     if(!hasToken){
-      e.preventDefault();e.stopPropagation();term.scrollLines(e.deltaY>0?3:-3);return;
+      e.preventDefault();e.stopPropagation();
+      // Alt-screen read-only: no local scrollback to move. If the CLI opted into
+      // read-only wheel scrolling, send a RESTRICTED intent (direction + a small
+      // line count only). We never send raw mouse bytes here — the server owns
+      // button/coordinate synthesis, so a view capability can't forge a click.
+      if(readonlyWheelScroll&&ws_&&ws_.readyState===1&&px){
+        var _lines=Math.max(1,Math.min(6,Math.round(Math.abs(px)/33)));
+        ws_.send(JSON.stringify({type:'scroll',dir:px<0?'up':'down',lines:_lines}));
+        return;
+      }
+      term.scrollLines(e.deltaY>0?3:-3);return;
     }
     e.preventDefault();e.stopPropagation();
     _fwdScroll(px,_cellAt(e.clientX,e.clientY)); // report the cell under the pointer

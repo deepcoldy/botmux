@@ -506,6 +506,12 @@ export interface ClaudeFamilyVariant {
   readonly authPaths?: readonly string[];
   /** Opt in only after this concrete fork passes the terminal contract. */
   readonly reliableTurnTerminal?: boolean;
+  /** Opt in to read-only web-terminal wheel scrolling (see
+   *  CliAdapter.readonlyWheelScroll). MUST be set explicitly per variant —
+   *  defaults to off — so a new fork calling this shared factory (e.g. relay)
+   *  does NOT silently inherit a security-sensitive capability. Only variants
+   *  whose alt-screen wheel is a pure scroll (claude-code, seed) enable it. */
+  readonly readonlyWheelScroll?: boolean;
 }
 
 export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
@@ -520,6 +526,8 @@ export function createClaudeCodeAdapter(pathOverride?: string): CliAdapter {
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
     stateJsonPath: join(homedir(), '.claude.json'),
+    // 备用屏滚轮是纯滚动，只读 web 终端可安全走服务端受限滚轮路径。
+    readonlyWheelScroll: true,
     // alias（opus/sonnet/haiku）会被 Claude Code 解析成当前推荐的具体版本；具体 ID 锁版本。
     modelChoices: ['opus', 'sonnet', 'haiku', 'claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'],
   }, pathOverride ?? 'claude');
@@ -933,6 +941,13 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       : undefined,
     systemHints: [],
     altScreen: false,
+    // Read-only web-terminal wheel scrolling. Per-variant opt-in (see
+    // ClaudeFamilyVariant.readonlyWheelScroll): claude-code & seed render their
+    // transcript in the alternate screen at runtime and their wheel is a pure
+    // scroll (never bound to an action), so it's safe to let the read-only
+    // viewer scroll via the server-synthesized restricted wheel path. A fork
+    // that reuses this factory without opting in (e.g. relay) stays off.
+    readonlyWheelScroll: variant.readonlyWheelScroll === true,
     // Skills are injected per-session via --plugin-dir (see buildArgs), NOT
     // installed into the global ~/.claude/skills — so they never leak into the
     // user's standalone `claude`. pluginDir is consumed by ensurePluginSkills.

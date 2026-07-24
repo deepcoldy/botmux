@@ -66,7 +66,7 @@ describe('web terminal touch scrolling', () => {
       + "        || effectiveBackendType === 'zellij';",
     );
     expect(workerSource).toContain(
-      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend)',
+      'getTerminalHtml(hasWrite, platformReadonly, loginUrl, forceRemoteScroll, localTerminalBackend',
     );
     expect(workerSource).toContain('var localTerminalBackend=${localTerminalBackend};');
     // Guard the exclusion explicitly: neither Herdr nor Riff may appear in the gate.

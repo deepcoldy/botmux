@@ -1990,3 +1990,47 @@ describe('traex/coco sandbox authPaths', () => {
     expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// readonlyWheelScroll — read-only web-terminal wheel capability (security)
+// ---------------------------------------------------------------------------
+
+describe('readonlyWheelScroll capability', () => {
+  // Instantiate the REAL adapters and assert the effective flag, rather than
+  // grepping source — the capability lives in a shared Claude-family factory, so
+  // a source search can't tell claude-code/seed (opted in) apart from relay
+  // (reuses the factory but must NOT inherit it).
+  it('is enabled for claude-code and seed only', () => {
+    expect(createCliAdapterSync('claude-code', '/bin/claude').readonlyWheelScroll).toBe(true);
+    expect(createCliAdapterSync('seed', '/bin/seed').readonlyWheelScroll).toBe(true);
+  });
+
+  it('is NOT inherited by relay, which reuses the Claude-family factory', () => {
+    // relay.ts calls createClaudeFamilyAdapter but does not opt in — the flag must
+    // default off so a fork can't silently gain a security-sensitive capability.
+    expect(createCliAdapterSync('relay', '/bin/relay').readonlyWheelScroll).not.toBe(true);
+  });
+
+  it('is off for every other shipped CLI', () => {
+    const optedIn = new Set<CliId>(['claude-code', 'seed']);
+    const everyCli: CliId[] = [
+      'claude-code', 'seed', 'relay', 'aiden', 'coco', 'codex', 'codex-app',
+      'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes',
+      'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok',
+      'kiro-cli', 'riff',
+    ];
+    for (const id of everyCli) {
+      let adapter;
+      try {
+        adapter = createCliAdapterSync(id, `/bin/${id}`);
+      } catch {
+        continue; // adapters needing richer runtime setup are covered elsewhere
+      }
+      if (optedIn.has(id)) {
+        expect(adapter.readonlyWheelScroll, `${id} should opt in`).toBe(true);
+      } else {
+        expect(adapter.readonlyWheelScroll, `${id} must NOT enable readonlyWheelScroll`).not.toBe(true);
+      }
+    }
+  });
+});
