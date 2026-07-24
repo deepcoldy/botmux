@@ -974,6 +974,27 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 });
 
 /**
+ * Dashboard「复现命令」：返回该 active session 本次冷启的**近似**可复现 CLI 调用
+ * （bin + argv + cwd + 权威注入 env），供用户粘到调试终端改参数复现。命令原样保留
+ * （含 write token / --append-system-prompt / 凭证 env），与 write-link 同一把
+ * loopback-HMAC 锁：匿名浏览器在 dashboard HTTP 边界就 401（该路径不在 allow-list），
+ * 本机知道 ipcPort 的进程也过不了 ipcHmacAuthorized。仅持管理 cookie 的写权限视图能取。
+ *
+ * 只读 active session 的**内存**字段（DaemonSession.spawnCommand）：命令含凭证，
+ * 绝不落盘，也绝不从 closed/持久化 session 取（那既无值也避免误暴露）。daemon 重启后
+ * 到 worker 再次 ready 之前返回 unavailable——可接受。warm reattach 不重算命令，此时
+ * 亦为空。riff 后端无本地 bin/args，worker 侧不产出命令，这里同样 unavailable。
+ */
+ipcRoute('GET', '/api/sessions/:sessionId/spawn-command', (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const cmd = ds.spawnCommand;
+  if (!cmd) return jsonRes(res, 404, { ok: false, error: 'spawn_command_unavailable' });
+  jsonRes(res, 200, { ok: true, command: cmd });
+});
+
+/**
  * Deliver the writable-terminal card privately to the bot's owner(s) — the
  * `botmux term-link <id>` CLI command's backend. Unlike the GET route above
  * (which returns the URL to its single authenticated caller), this POSTs the

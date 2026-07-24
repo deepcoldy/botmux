@@ -339,6 +339,17 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
   return [...dupes];
 }
 
+function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
+  if (!larkAppId || !messageId) return;
+  // Let the card-action promise resolve so the SDK can send its callback ACK
+  // before the original card disappears. A microtask is too early here: it may
+  // run before the SDK continuation that serializes and writes the ACK frame.
+  setImmediate(() => {
+    void deleteMessage(larkAppId, messageId)
+      .catch(err => logger.debug(`Repo card withdraw (post-callback) failed: ${err}`));
+  });
+}
+
 /**
  * Commit a resolved working directory onto a repo-select session: pin it, then
  * either fork the pending CLI (first selection) or close + recreate the session
@@ -519,8 +530,9 @@ export async function commitRepoSelection(
       markRepoCardConsumed(ds, cardToWithdraw);
       ds.repoCardMessageId = undefined;
 
-      // Hold the claim through confirmation + best-effort card withdraw so a
-      // concurrent in-flight select still sees pendingRepoCommitInFlight.
+      // Hold the claim through confirmation. Card withdrawal is deferred until
+      // after the callback can ACK; stale clicks are blocked by the local
+      // consume mark above rather than by the network request's lifetime.
       try {
         if (!opts?.suppressConfirmReply) {
           // A card click has no turn of its own — anchor the confirmation to the
@@ -533,9 +545,7 @@ export async function commitRepoSelection(
       } catch (e) {
         logger.warn(`[${tag(ds)}] Confirm reply after pending repo commit failed: ${e instanceof Error ? e.message : e}`);
       }
-      if (cardToWithdraw && larkAppId) {
-        try { await deleteMessage(larkAppId, cardToWithdraw); } catch { /* card may already be gone */ }
-      }
+      deferRepoCardWithdraw(larkAppId, cardToWithdraw);
     } finally {
       ds.pendingRepoCommitInFlight = false;
     }
@@ -641,10 +651,9 @@ export async function commitRepoSelection(
       }
     }
     logger.info(`[${tag(ds)}] Repo switched to ${dirPath}, new session created`);
-    // Best-effort withdraw — card already claimed above.
-    if (claimedCard && larkAppId) {
-      try { await deleteMessage(larkAppId, claimedCard); } catch { /* best-effort */ }
-    }
+    // The card was claimed locally above; withdraw it only after this callback
+    // can return its ACK so the delete request cannot race the callback frame.
+    deferRepoCardWithdraw(larkAppId, claimedCard);
   }
 }
 
@@ -2206,7 +2215,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
       } else {
         await sessionReply(rootId, t('card.action.continue_using_current_repo', { cwd: getSessionWorkingDir(ds) }, locDs));
-        if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+        deferRepoCardWithdraw(larkAppId, cardMessageId);
         ds.repoCardMessageId = undefined;
       }
     }

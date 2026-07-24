@@ -83,8 +83,13 @@ function sessionChatKindLabel(s: any): string {
 export function sessionLocationText(s: any): string {
   const chatId = String(s?.chatId ?? '').trim();
   const name = chatDisplayTitle(s);
-  if (name) return `${sessionChatKindLabel(s)} · ${name}`;
-  if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}`;
+  // 单聊(p2p)：同一个人对不同 bot 的私聊标题都是「单聊 · 申晗」，无法区分是哪个
+  // bot。附上 bot 名做后缀（单聊 · 申晗 · <bot名>），让筛选选项/定位可辨别。
+  const botSuffix = s?.chatType === 'p2p'
+    ? (() => { const b = String(s?.botName ?? '').trim(); return b ? ` · ${b}` : ''; })()
+    : '';
+  if (name) return `${sessionChatKindLabel(s)} · ${name}${botSuffix}`;
+  if (chatId) return `${sessionChatKindLabel(s)} · ${chatId}${botSuffix}`;
   return t('sessions.chatUnknown');
 }
 
@@ -239,6 +244,7 @@ export const ICON = {
   history: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.2 7.8a4.8 4.8 0 1 0 1.4-3.4"/><path d="M3.2 3.1v3.2h3.2"/><path d="M8 5.4v3l2.1 1.2"/></svg>',
   restart: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.7 6.5A4.8 4.8 0 1 0 13 9"/><path d="M12.7 3.3v3.2H9.5"/></svg>',
   feishu: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 5.2a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v3.3a2 2 0 0 1-2 2H7.1L4.3 13v-2.5H5"/><path d="M9.1 3.2h3.7v3.7"/><path d="M12.8 3.2 8.5 7.5"/></svg>',
+  copy: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7.5" height="7.5" rx="1.4"/><path d="M10.5 5.5V4.1a1.4 1.4 0 0 0-1.4-1.4H4.1a1.4 1.4 0 0 0-1.4 1.4v5a1.4 1.4 0 0 0 1.4 1.4h1.4"/></svg>',
 };
 
 export function lockActionLabel(s: any): string {
@@ -264,6 +270,38 @@ export async function openWriteLink(s: any, btn?: HTMLButtonElement): Promise<vo
   } catch (e) {
     tab?.close();
     alert(`${t('sessions.writeLinkFail')}: ${e}`);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Fetch the session's real spawn command (bin + argv + cwd + env) and copy it to
+// the clipboard, for pasting into the debug terminal to reproduce an issue. The
+// command carries credentials so the endpoint is management-token-gated (mirrors
+// write-link); only writable views expose this action.
+export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise<void> {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(`/api/sessions/${encodeURIComponent(s.sessionId)}/spawn-command`);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body?.ok === false || !body?.command) {
+      if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(body.command);
+      if (btn) {
+        const prev = btn.textContent;
+        btn.textContent = t('sessions.copyCommandDone');
+        setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
+      }
+    } catch {
+      // Clipboard API unavailable (non-secure context) — fall back to a prompt
+      // so the user can still select + copy the command manually.
+      window.prompt(t('sessions.copyCommand'), body.command);
+    }
+  } catch (e) {
+    alert(`${t('sessions.copyCommandFail')}: ${e}`);
   } finally {
     if (btn) btn.disabled = false;
   }

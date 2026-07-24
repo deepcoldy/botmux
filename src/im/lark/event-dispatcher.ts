@@ -658,7 +658,10 @@ function shapeCardActionResult(result: any): any {
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
   if (result && (result.toast || result.card)) return result;
   if (result) return { card: { type: 'raw', data: result } };
-  return undefined;
+  // The Lark WS SDK only serializes callback `data` for truthy results. An
+  // empty object therefore means "ACK with no UI update", while undefined
+  // produces a code-only response that the client rejects as an invalid ACK.
+  return {};
 }
 
 function serializeRawCardForPatch(cardData: any): string | undefined {
@@ -703,7 +706,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
     .then(shapeCardActionResult)
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
-      return undefined;
+      return {};
     });
 
   void work.then(result => {

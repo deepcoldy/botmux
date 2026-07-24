@@ -2,13 +2,16 @@
  * Strict host-authority file primitives.
  *
  * Unlike general dotfiles, machine/device credentials must never follow a
- * leaf symlink. Reads pin one inode with O_NOFOLLOW, writes canonicalize only
- * the parent and atomically replace the leaf, and the containing directory
- * must not be writable by group/other users.
+ * leaf symlink. Linux pins the containing directory while operating on the
+ * leaf; other platforms require a non-replaceable ancestor chain. All writes
+ * atomically replace the leaf, and its directory must be owned by the current
+ * user without group/other write access.
  */
+import { randomBytes } from 'node:crypto';
 import {
   closeSync,
   constants,
+  fchmodSync,
   fstatSync,
   fsyncSync,
   lstatSync,
@@ -16,8 +19,10 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -40,6 +45,16 @@ function assertOwnedByCurrentUser(stats: import('node:fs').Stats, label: string)
   if (process.platform === 'win32' || !process.getuid) return;
   if (stats.uid !== process.getuid()) {
     throw new UnsafeHostAuthorityFileError(`${label} 不属于当前用户`);
+  }
+}
+
+function assertSecureParentStats(stats: import('node:fs').Stats): void {
+  if (!stats.isDirectory()) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证目录不是普通目录');
+  }
+  assertOwnedByCurrentUser(stats, '宿主凭证目录');
+  if (process.platform !== 'win32' && (stats.mode & 0o022) !== 0) {
+    throw new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入');
   }
 }
 
@@ -84,21 +99,74 @@ function assertAncestorChainCannotReplace(canonicalParent: string): void {
   }
 }
 
-/** Create/resolve the parent without ever resolving the final path component. */
-export function secureHostFilePath(filePath: string): string {
+function canonicalSecureHostParent(filePath: string): string {
   const parent = dirname(filePath);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
   const canonicalParent = realpathSync(parent);
   const parentStats = statSync(canonicalParent);
-  if (!parentStats.isDirectory()) {
-    throw new UnsafeHostAuthorityFileError('宿主凭证目录不是普通目录');
-  }
-  assertOwnedByCurrentUser(parentStats, '宿主凭证目录');
-  if (process.platform !== 'win32' && (parentStats.mode & 0o022) !== 0) {
-    throw new UnsafeHostAuthorityFileError('宿主凭证目录可被组内或其它用户写入');
-  }
+  assertSecureParentStats(parentStats);
+  return canonicalParent;
+}
+
+/** Create/resolve the parent without ever resolving the final path component. */
+export function secureHostFilePath(filePath: string): string {
+  const canonicalParent = canonicalSecureHostParent(filePath);
   assertAncestorChainCannotReplace(canonicalParent);
   return join(canonicalParent, basename(filePath));
+}
+
+interface SecureHostParent {
+  path: string;
+  fd?: number;
+}
+
+/**
+ * Linux exposes an opened directory through /proc/self/fd. Keeping that
+ * directory descriptor open makes all leaf operations independent of later
+ * ancestor renames: an untrusted mount-point owner can still cause denial of
+ * service, but cannot redirect a credential write into a directory it reads.
+ *
+ * Other platforms retain the conservative ancestor-chain requirement until
+ * they have an equivalent descriptor-relative primitive.
+ */
+function acquireSecureHostParent(filePath: string): SecureHostParent {
+  const canonicalParent = canonicalSecureHostParent(filePath);
+  if (process.platform !== 'linux') {
+    assertAncestorChainCannotReplace(canonicalParent);
+    return { path: canonicalParent };
+  }
+
+  const fd = openSync(
+    canonicalParent,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const openedStats = fstatSync(fd);
+    assertSecureParentStats(openedStats);
+    const anchoredPath = `/proc/self/fd/${fd}`;
+    let anchoredStats: import('node:fs').Stats;
+    try {
+      anchoredStats = statSync(anchoredPath);
+    } catch {
+      // Minimal/chrooted Linux environments may not mount procfs. Preserve
+      // the old fail-closed path validation there.
+      closeSync(fd);
+      assertAncestorChainCannotReplace(canonicalParent);
+      return { path: canonicalParent };
+    }
+    if (!sameInode(openedStats, anchoredStats)) {
+      throw new UnsafeHostAuthorityFileError('宿主凭证目录句柄发生变化');
+    }
+    return { path: anchoredPath, fd };
+  } catch (error) {
+    try { closeSync(fd); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
+function releaseSecureHostParent(parent: SecureHostParent): void {
+  if (parent.fd === undefined) return;
+  closeSync(parent.fd);
 }
 
 function assertSecureFileStats(stats: import('node:fs').Stats, maxBytes: number): void {
@@ -114,15 +182,12 @@ function assertSecureFileStats(stats: import('node:fs').Stats, maxBytes: number)
   }
 }
 
-/** Return null only for a genuinely absent leaf; unsafe shapes fail closed. */
-export function readSecureHostFileSync(filePath: string, maxBytes = 64 * 1024): string | null {
-  try {
-    lstatSync(dirname(filePath));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  }
-  const resolved = secureHostFilePath(filePath);
+function readSecureHostFileFromParentSync(
+  parent: SecureHostParent,
+  leafName: string,
+  maxBytes: number,
+): string | null {
+  const resolved = join(parent.path, leafName);
   let fd: number;
   try {
     const flags = process.platform === 'win32'
@@ -160,36 +225,111 @@ export function readSecureHostFileSync(filePath: string, maxBytes = 64 * 1024): 
   }
 }
 
+/** Return null only for a genuinely absent leaf; unsafe shapes fail closed. */
+export function readSecureHostFileSync(filePath: string, maxBytes = 64 * 1024): string | null {
+  try {
+    lstatSync(dirname(filePath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const parent = acquireSecureHostParent(filePath);
+  try {
+    return readSecureHostFileFromParentSync(parent, basename(filePath), maxBytes);
+  } finally {
+    releaseSecureHostParent(parent);
+  }
+}
+
+function writePinnedSecureHostFileSync(
+  parent: SecureHostParent,
+  directoryFd: number,
+  leafName: string,
+  data: string,
+): void {
+  const resolved = join(parent.path, leafName);
+  const tmp = join(
+    parent.path,
+    `${leafName}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`,
+  );
+  let fd: number | undefined;
+  try {
+    fd = openSync(
+      tmp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(fd, data, { encoding: 'utf8' });
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, resolved);
+    fsyncSync(directoryFd);
+  } catch (error) {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    throw error;
+  }
+}
+
 /** Strict, durable atomic replace that never follows a leaf symlink. */
 export function writeSecureHostFileSync(filePath: string, data: string): void {
-  const resolved = secureHostFilePath(filePath);
-  let leafExists = false;
+  const parent = acquireSecureHostParent(filePath);
+  const leafName = basename(filePath);
+  const resolved = join(parent.path, leafName);
   try {
-    lstatSync(resolved);
-    leafExists = true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    let leafExists = false;
+    try {
+      lstatSync(resolved);
+      leafExists = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    if (leafExists) {
+      // Pin and validate the existing leaf before replacement. The final
+      // rename never follows a leaf symlink.
+      readSecureHostFileFromParentSync(parent, leafName, 64 * 1024);
+    }
+    if (parent.fd !== undefined) {
+      writePinnedSecureHostFileSync(
+        parent,
+        parent.fd,
+        leafName,
+        data,
+      );
+    } else {
+      atomicWriteFileSync(resolved, data, {
+        mode: 0o600,
+        durable: true,
+        followTargetSymlink: false,
+      });
+    }
+  } finally {
+    releaseSecureHostParent(parent);
   }
-  if (leafExists) {
-    // Pin and validate the existing leaf before replacement. The final rename
-    // never follows a leaf symlink, so a later swap cannot redirect the write.
-    readSecureHostFileSync(resolved);
-  }
-  atomicWriteFileSync(resolved, data, {
-    mode: 0o600,
-    durable: true,
-    followTargetSymlink: false,
-  });
 }
 
 /** Strict durable unlink. Returns false only if the leaf is absent. */
 export function unlinkSecureHostFileSync(filePath: string): boolean {
-  const resolved = secureHostFilePath(filePath);
-  if (readSecureHostFileSync(resolved) === null) return false;
-  unlinkSync(resolved);
-  if (process.platform !== 'win32') {
-    const fd = openSync(dirname(resolved), constants.O_RDONLY);
-    try { fsyncSync(fd); } finally { closeSync(fd); }
+  const parent = acquireSecureHostParent(filePath);
+  const leafName = basename(filePath);
+  const resolved = join(parent.path, leafName);
+  try {
+    if (readSecureHostFileFromParentSync(parent, leafName, 64 * 1024) === null) return false;
+    unlinkSync(resolved);
+    if (process.platform !== 'win32') {
+      if (parent.fd !== undefined) {
+        fsyncSync(parent.fd);
+      } else {
+        const fd = openSync(parent.path, constants.O_RDONLY);
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      }
+    }
+    return true;
+  } finally {
+    releaseSecureHostParent(parent);
   }
-  return true;
 }

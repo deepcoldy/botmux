@@ -72,6 +72,12 @@ export interface DaemonSession {
   hasHistory: boolean;   // true after CLI has run at least once for this session
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
+  /** Dashboard「复现命令」：worker 在 `ready` 时上报的、该 session 本次冷启的近似
+   *  可复现 CLI 调用（bin + argv + cwd + 权威注入 env）。**只驻内存、绝不落盘**
+   *  ——命令含 provider token / 凭证 env，写进默认 0644 的 sessions-*.json 会让同机
+   *  其他用户直接读到（绕过 dashboard cookie + loopback-HMAC）。worker 每次 ready
+   *  都会重报，daemon 重启后自愈。仅有写权限的 dashboard 视图经 spawn-command 接口取。 */
+  spawnCommand?: string;
   pendingRepo?: boolean;         // waiting for repo selection before spawning CLI
   /** One in-memory owner is preparing the pending repo's first worker. Kept
    *  separate from worktreeCreating because plain select, skip, and /repo can

@@ -5391,6 +5391,7 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     mockUpdateMessage.mockClear();
+    vi.mocked(logger.error).mockClear();
     setupBotState();
     handlers = makeHandlers();
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
@@ -5406,6 +5407,33 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     });
 
     expect(result).toEqual({ card: { type: 'raw', data: { type: 'updated-card' } } });
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('returns a valid empty ACK when a fast card handler has no payload', async () => {
+    handlers.handleCardAction.mockResolvedValue(undefined);
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-empty' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_empty_card' },
+    });
+
+    expect(result).toEqual({});
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+  });
+
+  it('still returns a valid empty ACK when a card handler rejects', async () => {
+    handlers.handleCardAction.mockRejectedValue(new Error('handler boom'));
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'repo_switch', root_id: 'root-error' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_error_card' },
+    });
+
+    expect(result).toEqual({});
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('handler boom'));
     expect(mockUpdateMessage).not.toHaveBeenCalled();
   });
 

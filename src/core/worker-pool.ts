@@ -2465,6 +2465,10 @@ function setupWorkerHandlers(
         ds.workerViewToken = msg.viewToken ?? null;
         // Persist port so it can be reused after daemon restart
         ds.session.webPort = msg.port;
+        // Dashboard「复现命令」：worker 上报本次冷启的近似复现命令。只存内存字段、
+        // 绝不落盘（含凭证）；warm reattach 时 worker 不重算，故为空——这是有意的
+        // （reattach 不代表本次新算命令真的执行了）。worker 每次 ready 会重报。
+        ds.spawnCommand = msg.spawnCommand;
         sessionStore.updateSession(ds.session);
         const readOnlyUrl = buildTerminalUrl(ds);
         const writeUrl = buildTerminalUrl(ds, { write: true });

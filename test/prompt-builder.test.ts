@@ -113,6 +113,19 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain('--content-file');
   });
 
+  it('tells non-injecting CLIs to silently obey hidden launch context and answer only user_message', () => {
+    const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    const routing = prompt.slice(prompt.indexOf('<botmux_routing>'), prompt.indexOf('</botmux_routing>'));
+
+    expect(routing).toContain('隐藏运行上下文');
+    expect(routing).toContain('&lt;botmux_builtin_skills&gt;');
+    expect(routing).toContain('&lt;identity&gt;');
+    expect(routing).toContain('&lt;available_bots&gt;');
+    expect(routing).toContain('不要回复、不要确认');
+    expect(routing).toContain('已了解/已补充/已记录');
+    expect(routing).toContain('只处理 `&lt;user_message&gt;` 中的真实用户请求');
+  });
+
   it('uses final-output routing hints for Hermes instead of normal botmux send guidance', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'hermes');
     expect(prompt).toContain('普通文字回复请直接写在 assistant final');
