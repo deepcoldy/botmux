@@ -31,7 +31,13 @@ vi.mock('node:os', () => ({
 
 import { execSync } from 'node:child_process';
 import { readFileSync, readlinkSync, existsSync, readdirSync } from 'node:fs';
-import { discoverAdoptableSessions, validateAdoptTarget, isBareShellComm, bareShellLaunchKind } from '../src/core/session-discovery.js';
+import {
+  discoverAdoptableSessions,
+  validateAdoptTarget,
+  isBareShellComm,
+  bareShellLaunchKind,
+  settleLaunchComm,
+} from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 
 describe('isBareShellComm()', () => {
@@ -66,6 +72,41 @@ describe('bareShellLaunchKind()', () => {
   });
   it('reports stuck (no confident trampoline claim) when the launch shell is unknown', () => {
     expect(bareShellLaunchKind('zsh', '')).toBe('stuck');
+  });
+});
+
+describe('settleLaunchComm()', () => {
+  it('does not classify the launch wrapper as a failed CLI when it execs shortly afterward', async () => {
+    vi.useFakeTimers();
+    try {
+      const reads = ['zsh', 'coco'];
+      const settled = settleLaunchComm(
+        () => reads.shift() ?? 'coco',
+        { timeoutMs: 2_000, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(await settled).toBe('coco');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('returns a persistent bare shell after the bounded launch grace period', async () => {
+    vi.useFakeTimers();
+    try {
+      const settled = settleLaunchComm(
+        () => 'zsh',
+        { timeoutMs: 300, pollMs: 100 },
+      );
+
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(await settled).toBe('zsh');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

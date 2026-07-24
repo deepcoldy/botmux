@@ -162,7 +162,14 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { cliUnavailableMessage } from './setup/cli-availability.js';
-import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
+import {
+  findLaunchedCliPid,
+  scheduleWrapperRealCliPid,
+  readComm,
+  isBareShellComm,
+  bareShellLaunchKind,
+  settleLaunchComm,
+} from './core/session-discovery.js';
 import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -4159,7 +4166,7 @@ async function flushPendingInjections(): Promise<void> {
       // path sends first runs the detection.
       if (!bareShellChecked) {
         bareShellChecked = true;
-        if (detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
+        if (await detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
       }
       const item = pendingInjections.shift()!;
       const cmd = item.command;
@@ -4882,15 +4889,17 @@ function scheduleSubmitFailureNotify(
  * and the pty/herdr backends (which `exec` the CLI directly — getChildPid is the
  * CLI itself, never a shell).
  *
- * Returns true when a bare-shell launch was detected (caller must NOT flush).
+ * Returns true when a persistent bare-shell launch was detected (caller must
+ * NOT flush). A transient wrapper shell gets a bounded chance to exec the CLI.
  */
-function detectBareShellLaunch(): boolean {
+async function detectBareShellLaunch(): Promise<boolean> {
   if (bareShellLaunchBlocked) return true;
   if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
   if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
-  const pid = backend?.getChildPid?.();
-  if (!pid) return false;
-  const comm = readComm(pid);
+  const comm = await settleLaunchComm(() => {
+    const pid = backend?.getChildPid?.();
+    return pid ? readComm(pid) : undefined;
+  });
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
   // Bare shell is the pane leaf → the CLI never launched. Tier the message on
@@ -5041,7 +5050,7 @@ async function flushPending(): Promise<void> {
     // doesn't get them typed into the bare shell first.
     if (!bareShellChecked) {
       bareShellChecked = true;
-      if (detectBareShellLaunch()) {
+      if (await detectBareShellLaunch()) {
         return;  // finally{} releases the mutex; pendingMessages stay queued, untouched
       }
     }
@@ -7905,7 +7914,10 @@ async function restartCliProcess(
         // intentionally held by the restart gate above. Release its raw-input
         // fence now; other backends keep it until their later markPromptReady().
         if (effectiveBackendType === 'riff' && isPromptReady) releaseRawInputRestartGate();
-        void flushPending();
+        // A local replacement process can exist before its TUI input box does.
+        // Only re-kick a prompt that became ready while the restart fence was
+        // still armed; otherwise markPromptReady() owns the first flush.
+        if (isPromptReady) void flushPending();
       }, 500);
     } catch (err) {
       cliRestartInProgress = false;

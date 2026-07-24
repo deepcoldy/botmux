@@ -61,6 +61,7 @@ describe('worker durable lease expiry ordering', () => {
       release,
     );
     const wake = restart.indexOf('void flushPending();', riffRawRelease);
+    const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);
 
     expect(restartStart).toBeGreaterThanOrEqual(0);
     expect(restartEnd).toBeGreaterThan(restartStart);
@@ -74,6 +75,12 @@ describe('worker durable lease expiry ordering', () => {
     expect(release).toBeGreaterThan(spawn);
     expect(riffRawRelease).toBeGreaterThan(release);
     expect(wake).toBeGreaterThan(riffRawRelease);
+    // A replacement CoCo/Codex process may exist before its TUI input box
+    // exists. Restart completion must not use type-ahead to flush into that
+    // startup window; only a prompt already observed during the restart fence
+    // needs an explicit wake after the fence drops.
+    expect(guardedWake).toBeGreaterThan(riffRawRelease);
+    expect(wake).toBeGreaterThan(guardedWake);
 
     const promptStart = workerSource.indexOf('function markPromptReady(): void');
     const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
