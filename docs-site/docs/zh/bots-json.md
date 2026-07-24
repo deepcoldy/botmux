@@ -138,6 +138,7 @@
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
+| `persistentStreamCard` | `true` 时，一个会话只在**首轮**发一张流式卡片，后续每轮都用 `updateMessage` **原地更新同一张卡**，不再「发新卡 + 撤回旧卡」。卡片标题跟随最新一轮。适合嫌每轮卡片被撤回重发的用户。与 `disableStreamingCard`（完全不发卡）互斥，后者优先 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
 | `receivedReactionEmoji` | 无卡片会话「已收到」reaction 的飞书 emoji_type；`undefined`=默认 `GoGoGo`（冲!）。自由字符串，填错只是静默不加表情（best-effort） |
 | `doneReactionEmoji` | 无卡片会话「已完成」reaction 的飞书 emoji_type；`undefined`=默认 `DONE`（✅）。设成与 `receivedReactionEmoji` 相同值可让完成态不翻脸——适合 idle 判定可能提前触发的 CLI（如 Pi），避免过早出现误导性的 ✅ |

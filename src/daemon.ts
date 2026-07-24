@@ -3329,6 +3329,14 @@ function getActiveCount(): number {
  * passthrough slash-command path (/model, /clear, /compact, etc.) — without
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
+ *
+ * Persistent-card mode (per-bot `persistentStreamCard`): when a live card
+ * already exists for this session, skip both the freeze-and-park step and the
+ * `streamCardPending` flag. The next screen_update then falls into the PATCH
+ * branch (`!streamCardPending && streamCardId`) and reuses the same card via
+ * `updateMessage` — so the session keeps ONE card that tracks the latest turn,
+ * instead of post-fresh + recall-previous every turn. The first turn (no card
+ * yet) still POSTs once through the normal `!streamCardId` path.
  */
 function beginNewTurn(ds: DaemonSession, title: string): void {
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
@@ -3338,9 +3346,18 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   // in. A new turn returns to the config default (noCardChats / disableStreamingCard).
   // Use `/card on` to persistently restore cards for the chat.
   ds.streamingCardForced = undefined;
+  // Persistent-card mode: reuse the existing live card (PATCH) rather than
+  // freeze+repost. Only when a real (non-sentinel) card is already live and the
+  // worker port is up; otherwise fall through to the normal fresh-card flow so
+  // the first turn still posts exactly one card.
+  const reuseExistingCard =
+    getBot(ds.larkAppId).config.persistentStreamCard === true
+    && !!ds.streamCardId
+    && ds.streamCardId !== CARD_POSTING_SENTINEL
+    && !!ds.workerPort;
   const previousUsageLimit = ds.usageLimit;
   const previousStatus = ds.lastScreenStatus === 'limited' && previousUsageLimit ? 'limited' : 'idle';
-  if (ds.streamCardId && ds.workerPort) {
+  if (!reuseExistingCard && ds.streamCardId && ds.workerPort) {
     const readUrl = buildTerminalUrl(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
@@ -3372,7 +3389,10 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
     ds.usageLimitRetryTimer = undefined;
   }
   ds.usageLimit = undefined;
-  ds.streamCardPending = true;
+  // Persistent-card reuse leaves streamCardPending false so the next
+  // screen_update PATCHes the existing card; the normal path forces a fresh
+  // card POST.
+  if (!reuseExistingCard) ds.streamCardPending = true;
   ds.currentTurnTitle = title.substring(0, 50);
   ds.currentImageKey = undefined;
   persistStreamCardState(ds);

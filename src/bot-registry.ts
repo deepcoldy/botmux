@@ -1116,6 +1116,16 @@ export interface BotConfig {
    */
   disableStreamingCard?: boolean;
   /**
+   * When true, a session POSTs its streaming card only once (on the first turn)
+   * and every subsequent turn PATCHes that same card via `updateMessage`
+   * instead of the default "post a fresh card + recall the previous one" flow.
+   * The card title tracks the latest turn. Default (undefined) keeps the
+   * per-turn fresh-card behaviour. For users who dislike the card being
+   * withdrawn and re-posted on every turn. Mutually exclusive with
+   * {@link disableStreamingCard} (no card at all takes precedence).
+   */
+  persistentStreamCard?: boolean;
+  /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
    * progress markers in card-off sessions. Missing/false preserves the current
    * card-off reaction behavior.
@@ -1908,6 +1918,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      persistentStreamCard: entry.persistentStreamCard === true || undefined,
       silentTurnReactions: entry.silentTurnReactions === true || undefined,
       receivedReactionEmoji: typeof entry.receivedReactionEmoji === 'string' && entry.receivedReactionEmoji.trim()
         ? entry.receivedReactionEmoji.trim() : undefined,
