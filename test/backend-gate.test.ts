@@ -111,28 +111,45 @@ describe('ZMX filesystem-isolation gate', () => {
 });
 
 describe('persistent backend cold-restart ordering', () => {
-  it('selects the backend only after stale persistent panes have been removed', () => {
-    const coldRestartGate = workerSource.indexOf(
-      'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
-    );
-    const backendSelection = workerSource.indexOf(
-      'const selectedBackend = selectSessionBackend({',
-    );
+  // The backend is selected once up-front and RE-selected through the
+  // `selectBackend()` thunk after any gate kills a stale pane. The invariant is
+  // no longer "select last" but "never keep a selection made against a pane that
+  // was just destroyed" — a stale `isReattach: true` would reattach the new
+  // backend to the pane the gate had removed.
+  it('re-selects the backend after every gate that kills a stale persistent pane', () => {
+    const thunk = workerSource.indexOf('const selectBackend = () => selectSessionBackend({');
+    expect(thunk).toBeGreaterThan(-1);
 
-    expect(coldRestartGate).toBeGreaterThan(-1);
-    expect(backendSelection).toBeGreaterThan(coldRestartGate);
+    // Each `killPersistentBackendTarget` / `ZmxBackend.killManagedSession` gate
+    // must be followed by a re-selection before the backend is used.
+    const gates = [
+      workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane'),
+      workerSource.indexOf('if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length'),
+    ];
+    for (const gate of gates) {
+      expect(gate).toBeGreaterThan(-1);
+      const reselect = workerSource.indexOf('selectedBackend = selectBackend();', gate);
+      expect(reselect).toBeGreaterThan(gate);
+      // ...and the re-selection must refresh the reattach decision too.
+      expect(
+        workerSource.indexOf('willReattachPersistent = selectedBackend.isReattach === true;', gate),
+      ).toBeGreaterThan(gate);
+    }
   });
 
   it('fails closed on an uncertain MCP pane and refreshes the cached ZMX probe after killing it', () => {
     const start = workerSource.indexOf(
       'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
     );
-    const end = workerSource.indexOf('const willReattachPersistent =', start);
+    const end = workerSource.indexOf('// The plugin set is stable only', start);
     const gate = workerSource.slice(start, end);
 
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    expect(gate).toContain('probePersistentSession(');
+    // ZMX ownership is verified against the frozen PID; other backends go
+    // through the exact recorded target (Herdr may own an agent, not a session).
+    expect(gate).toContain('probeOwnedZmxSession(');
+    expect(gate).toContain('probePersistentBackendTarget(');
     expect(gate).toContain("paneProbe === 'unknown'");
     expect(gate).toContain("postKillProbe !== 'missing'");
     expect(gate).toContain("effectiveBackendType === 'zmx'");
