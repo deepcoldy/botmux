@@ -19,7 +19,7 @@
 
 ## 💬 回复模式（`/reply-mode`）
 
-控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改（owner/allowedUsers 专用，需 `canOperate`；仅查看需 `canTalk`）。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
+控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改需 `canOperate`，仅查看需 `canTalk`。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
 
 **私聊（1:1 DM）**——模式对该 bot 的**所有 DM 生效**（bot 级全局配置，非 per-chat），但不同用户与该 bot 的 DM 仍各自隔离会话、互不共享。只有 `chat` / `topic` 两态（`new-topic` 是 `topic` 的兼容别名）：
 
