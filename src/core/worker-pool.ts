@@ -2052,10 +2052,6 @@ export async function closeSession(
     // crash/limited turn may never have reached an idle edge).
     recordUsageForDaemonSession(ds);
     killWorker(ds);
-    // Commit the daemon-visible close barrier before any network await below.
-    // `botmux delete` may be running inside the session being destroyed; once
-    // its worker/backing pane exits, a new IM message must not find this stale
-    // entry and resurrect the old logical session while doc cleanup is pending.
     activeSessionsRegistry?.delete(activeSessionKey(ds));
     // Mark the captured object too. Async message/card paths may already hold a
     // reference to `ds`; deleting only the registry entry would not stop one of
@@ -2090,9 +2086,12 @@ export async function closeSession(
     }
   }
 
-  // Preserve the existing externally-visible event order: exit first, then
-  // the final persisted-row update. Persistence itself was already committed
-  // above as part of the close barrier.
+  // Persistence path — load → mark closed → save (delegated to sessionStore).
+  // Mutations are bot-owner scoped. getSession() has a read-only cross-file
+  // fallback for agent CLI discovery; using it here lets the wrong daemon see
+  // another bot's active row, report a false successful close, then write only
+  // its own file (a no-op). The CLI relies on alreadyClosed to decide whether a
+  // legacy local fallback is safe, so owner proof must be real.
   if (wasOpen) {
     const after = sessionStore.getOwnedSession(sessionId);
     publishClosedSessionPatch(

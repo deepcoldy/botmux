@@ -3533,13 +3533,19 @@ function closeSessionOffline(s: SessionData): void {
   // Adopted panes belong to the user. Ordinary bmx-* sessions are botmux-owned
   // and still need direct cleanup when no daemon exists to run killWorker().
   if (!isAdoptedSession(s)) {
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    try {
-      execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
-        stdio: 'ignore',
-        env: tmuxEnv(),
-      });
-    } catch { /* no tmux session */ }
+    if (isSuspendableBackendType(s.backendType)) {
+      const name = persistentSessionName(s.backendType, s.sessionId);
+      try { killPersistentSession(s.backendType, name, s.sessionId); } catch { /* absent or unavailable */ }
+    } else {
+      // Legacy rows without backendType were historically tmux-backed.
+      const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
+      try {
+        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, {
+          stdio: 'ignore',
+          env: tmuxEnv(),
+        });
+      } catch { /* no tmux session */ }
+    }
   }
 
   s.status = 'closed';
@@ -3926,13 +3932,6 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         flashMsg = `\x1b[31m✗ 删除失败: ${result.error}\x1b[0m`;
         return;
       }
-      if (daemonClose.state === 'offline') {
-        // Offline fallback. For adopted sessions, never kill the user's
-        // original CLI pid if an old record stored it in `pid`.
-        const originalPid = adoptedCliPid(s);
-        if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-          killProcess(s.pid);
-        }
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -4074,19 +4073,11 @@ async function cmdList(): Promise<void> {
     else if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
-  const closeOffline = (s: SessionData) => {
-    s.status = 'closed';
-    s.closedAt = new Date().toISOString();
-    saveSession(s);
-  };
   const closeNow = async (arr: SessionData[], kind: 'scratch' | 'real'): Promise<number> => {
     let closed = 0;
     for (const s of arr) {
-      const daemonClose = await closeSessionViaDaemon(s);
-      if (daemonClose.state === 'closed') {
-        closed++;
-      } else if (daemonClose.state === 'offline') {
-        closeOffline(s);
+      const result = await closeSessionForDelete(s);
+      if (result.ok) {
         closed++;
       } else {
         // Keep it visible: mutating only the store while a possible owner
@@ -4094,7 +4085,7 @@ async function cmdList(): Promise<void> {
         // exactly the session auto-prune claimed to close.
         live.push(s);
         console.warn(
-          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${daemonClose.reason}`,
+          `⚠️ 未自动清理 ${kind === 'scratch' ? '占位' : '会话'} ${s.sessionId.substring(0, 8)}：${result.error}`,
         );
       }
     }
@@ -4320,7 +4311,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename',
+  route: 'slash' | 'cd' | 'close' | 'chat-rename' | 'rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };

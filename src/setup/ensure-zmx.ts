@@ -55,17 +55,61 @@ export function zmxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv 
   };
 }
 
+/**
+ * Which env var decides zmx's socket dir, in zmx's own precedence order.
+ * `zmx version` touches that dir, so a failure there is very often a socket-dir
+ * problem rather than a missing binary — surface which var is in play.
+ */
+function zmxSocketDirHint(env: NodeJS.ProcessEnv): string {
+  for (const key of ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR'] as const) {
+    const value = env[key];
+    if (value) return `，socket dir 来自 ${key}=${value}`;
+  }
+  return '，未设置 ZMX_DIR / XDG_RUNTIME_DIR / TMPDIR';
+}
+
+/**
+ * Only ENOENT proves the binary is absent. Mirrors ensure-tmux's
+ * childFailureReason: a timeout / EACCES / non-zero exit must NOT be reported as
+ * the misleading "not on PATH" diagnosis. `zmx version` is not a pure print —
+ * it resolves and touches the socket dir, so a read-only or unwritable
+ * ZMX_DIR / XDG_RUNTIME_DIR exits non-zero on an otherwise healthy install.
+ */
+function zmxProbeFailureReason(command: string, failure: any, timeoutMs: number, env: NodeJS.ProcessEnv): string {
+  const nested = failure?.error;
+  const code = failure?.code ?? nested?.code;
+  const signal = failure?.signal ?? nested?.signal;
+  const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
+
+  if (code === 'ENOENT') return 'zmx 二进制不在 PATH 上';
+  if (code === 'EACCES') return `${command} 启动失败：zmx 不可执行（EACCES）`;
+  if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
+  if (code === 'ETIMEDOUT' || signal || failure?.killed || nested?.killed) {
+    const detail = signal ? `，signal=${signal}` : '';
+    return `${command} 探测超时（${timeoutMs}ms${detail}）${zmxSocketDirHint(env)}`;
+  }
+  if (stderr) return `${command} 失败：${stderr}${zmxSocketDirHint(env)}`;
+  if (typeof failure?.status === 'number') {
+    return `${command} 失败（exit ${failure.status}）${zmxSocketDirHint(env)}`;
+  }
+  const message = nested?.message ?? failure?.message;
+  return `${command} 启动/探测失败${message ? `：${message}` : ''}`;
+}
+
 export function probeZmxVersion(): { ok: true; version: string } | { ok: false; reason: string } {
+  const env = zmxEnv();
   let version: string;
   try {
     version = execFileSync('zmx', ['version'], {
       encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      // stderr is piped, not discarded: it carries the real cause (e.g.
+      // `error: ReadOnlyFileSystem` for an unwritable socket dir).
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 3000,
-      env: zmxEnv(),
+      env,
     }).trim();
-  } catch {
-    return { ok: false, reason: 'zmx 二进制不在 PATH 上' };
+  } catch (err) {
+    return { ok: false, reason: zmxProbeFailureReason('zmx version', err, 3000, env) };
   }
 
   const parsedVersion = parseZmxVersion(version);

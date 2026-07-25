@@ -138,7 +138,7 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import { updateSessionTitle } from './session-title.js';
+import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
@@ -1001,6 +1001,11 @@ function sessionTransportDisabled(s: { chatId?: string; larkAppId?: string }): b
   let apiOnly = false;
   if (appId) { try { apiOnly = getBot(appId).config.apiOnly === true; } catch { /* unknown bot → not apiOnly */ } }
   return !larkTransportEnabled({ chatId: s.chatId ?? '', apiOnly });
+}
+
+/** Mutating IPC routes may only touch this daemon's own bot-partitioned store. */
+function findOwnedSessionRecord(sessionId: string): Session | undefined {
+  return findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId);
 }
 
 /** Four-state async lookup with durable fallback (design A).

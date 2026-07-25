@@ -10,7 +10,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
-import { forkWorker, getCurrentCliVersion, sendWorkerInput } from './worker-pool.js';
+import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import * as messageQueue from '../services/message-queue.js';

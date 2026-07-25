@@ -539,6 +539,32 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(historyChildren()).toHaveLength(capturesBefore);
   });
 
+  // zmx's `clients=` is an aggregate: a user's `zmx attach` and botmux's own
+  // `tail` are indistinguishable. The old check required the count to RISE
+  // above a pre-tail baseline, so a user detaching while our tail connected
+  // left a net delta of 0 and a healthy session failed to restore.
+  it('reattaches when a concurrent client detaches as our tail connects (net client delta 0)', () => {
+    state.exists = true;
+    state.command = '/bin/sh -c echo ready';
+    state.transport = 'tail-send-v1';
+    state.sessionId = SESSION_ID;
+    // A user is attached at probe time — this was the old baseline.
+    state.clients = 1;
+
+    const inner = childMocks.spawn.getMockImplementation()!;
+    childMocks.spawn.mockImplementation((file: string, argv: string[], options?: any) => {
+      const child = inner(file, argv, options);
+      // The user detached in the same window our tail attached: one client
+      // leaves, one joins, so the count never exceeds the baseline.
+      if (argv[0] === 'tail') state.clients = 1;
+      return child;
+    });
+
+    const backend = makeBackend({ reattach: true });
+    expect(() => spawnBackend(backend)).not.toThrow();
+    expect(tailChildren()).toHaveLength(1);
+  });
+
   it('preserves a same-name session whose complete UUID label belongs elsewhere', () => {
     state.exists = true;
     state.command = '/usr/bin/vim';

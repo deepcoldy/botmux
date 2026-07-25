@@ -34,7 +34,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
-import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
+import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';

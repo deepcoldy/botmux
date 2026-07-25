@@ -505,9 +505,8 @@ export class ZmxBackend implements SessionBackend {
     );
 
     if (this.reattaching) {
-      const baselineClients = probe.state === 'compatible' ? (probe.clients ?? 0) : 0;
       this.startTail();
-      if (!this.waitForTailClient(baselineClients)) {
+      if (!this.waitForTailClient()) {
         this.stopTailAfterLaunchFailure();
         this.preserveSessionOnDestroy = true;
         throw new Error(`ZMX tail 未能连接会话 ${this.sessionName}`);
@@ -696,9 +695,8 @@ export class ZmxBackend implements SessionBackend {
         this.preserveSessionOnDestroy = true;
         throw new Error(`ZMX 会话 ${this.sessionName} 在 release 前未通过完整身份校验`);
       }
-      const baselineClients = managed.clients ?? 0;
       this.startTail();
-      if (!this.waitForTailClient(baselineClients)) {
+      if (!this.waitForTailClient()) {
         throw new Error(`ZMX tail 未能连接会话 ${this.sessionName}`);
       }
 
@@ -808,7 +806,30 @@ export class ZmxBackend implements SessionBackend {
     return pid;
   }
 
-  private waitForTailClient(baselineClients: number): boolean {
+  /**
+   * Wait until the session reports at least one connected client.
+   *
+   * Deliberately NOT a differential against a pre-tail baseline. zmx's
+   * `clients=` is an aggregate — `main.zig` reports `clients.items.len - 1`,
+   * subtracting only the `zmx list` connection that asked. A user's
+   * `zmx attach` (which this integration actively encourages), and every
+   * transient `zmx list`/`get`/`history`/`send` botmux itself issues, are all
+   * counted identically to our `tail`. A differential therefore produces false
+   * NEGATIVES: a user detaching inside this window keeps the net delta at 0 and
+   * a perfectly healthy session fails to restore with "tail 未能连接".
+   *
+   * `>= 1` inverts the error direction. The residual false POSITIVE — someone
+   * else holds a client while our tail failed — is cheap and self-correcting:
+   * tail is only a wakeup signal (never a byte source), the authoritative
+   * screen comes from `history` polling which does not need tail at all, and
+   * `scheduleTailRecovery` reconnects a dead observer. Blocking a restore is
+   * the far more expensive mistake.
+   *
+   * Note this cannot instead watch our own child: the wait is synchronous
+   * (`sleepSync`), so the child's 'error'/'close' callbacks cannot run until it
+   * returns. Session identity is still verified below.
+   */
+  private waitForTailClient(): boolean {
     const deadline = Date.now() + TAIL_CONNECT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       const details = sessionDetails(
@@ -819,7 +840,7 @@ export class ZmxBackend implements SessionBackend {
         this.preserveSessionOnDestroy = true;
         return false;
       }
-      if (details?.clients != null && details.clients > baselineClients) return true;
+      if (details?.clients != null && details.clients >= 1) return true;
       if (!details && ZmxBackend.probeSession(
         this.sessionName,
         this.lastOpts ? zmxControlEnv(this.lastOpts) : zmxEnv(),
@@ -1420,9 +1441,8 @@ export class ZmxBackend implements SessionBackend {
       }
       try {
         logger.warn(`[zmx:${this.sessionName}] tail observer exited while session lives; reconnecting`);
-        const baselineClients = probe.clients ?? 0;
         this.startTail();
-        if (!this.waitForTailClient(baselineClients)) {
+        if (!this.waitForTailClient()) {
           throw new Error('replacement tail did not become a connected client');
         }
         this.requestHistoryCapture(0, true, true);

@@ -49,6 +49,49 @@ describe('zmx env/probe helpers', () => {
     expect(env.PATH).toContain('.local/share/mise/shims');
   });
 
+  // `zmx version` is not a pure print: it resolves and touches the socket dir.
+  // A read-only ZMX_DIR / a stale XDG_RUNTIME_DIR (systemd --user without
+  // lingering) therefore exits non-zero on a perfectly healthy install. Only
+  // ENOENT may be reported as "not on PATH" — anything else must surface the
+  // real cause, or a Linux operator reinstalls zmx forever chasing the wrong bug.
+  it('reports the real cause instead of blaming PATH when the socket dir is unusable', () => {
+    const failure: any = new Error('Command failed');
+    failure.status = 1;
+    failure.stderr = Buffer.from('error: ReadOnlyFileSystem\n');
+    execFileSyncMock.mockImplementationOnce(() => { throw failure; });
+
+    const result = probeZmxVersion();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('ReadOnlyFileSystem');
+      expect(result.reason).not.toContain('不在 PATH 上');
+      // The effective socket-dir source is actionable on a headless daemon.
+      expect(result.reason).toContain('ZMX_DIR');
+    }
+  });
+
+  it('still blames PATH only for a genuine ENOENT', () => {
+    const failure: any = new Error('spawn zmx ENOENT');
+    failure.code = 'ENOENT';
+    execFileSyncMock.mockImplementationOnce(() => { throw failure; });
+
+    expect(probeZmxVersion()).toEqual({ ok: false, reason: 'zmx 二进制不在 PATH 上' });
+  });
+
+  it('reports a probe timeout as a timeout rather than a missing binary', () => {
+    const failure: any = new Error('ETIMEDOUT');
+    failure.killed = true;
+    failure.signal = 'SIGTERM';
+    execFileSyncMock.mockImplementationOnce(() => { throw failure; });
+
+    const result = probeZmxVersion();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain('超时');
+      expect(result.reason).not.toContain('不在 PATH 上');
+    }
+  });
+
   it('requires the compatible version and a functional list command', () => {
     execFileSyncMock.mockReturnValueOnce('zmx 0.7.1\n' as never);
     execFileSyncMock.mockReturnValueOnce('' as never);
