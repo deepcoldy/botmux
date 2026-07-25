@@ -70,7 +70,10 @@ import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
+import {
+  isStructuredBridgeAdoptCli,
+  isStructuredBridgeFallbackActive,
+} from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
@@ -119,7 +122,56 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+const STRUCTURED_IDLE_HOOK_DELAY_MS = 1_500;
 const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
+
+function clearPendingIdleLifecycleHook(ds: DaemonSession): void {
+  const pending = ds.pendingIdleLifecycleHook;
+  if (!pending) return;
+  clearTimeout(pending.timer);
+  ds.pendingIdleLifecycleHook = undefined;
+}
+
+function emitPendingIdleLifecycleHook(
+  ds: DaemonSession,
+  content?: string,
+  source = 'structured_idle_timeout',
+): boolean {
+  const pending = ds.pendingIdleLifecycleHook;
+  if (!pending) return false;
+  clearPendingIdleLifecycleHook(ds);
+  return emitSessionLifecycleHook(ds, 'session.idle', {
+    prevState: pending.prevState,
+    newState: 'idle',
+    transition: 'enter',
+    source,
+    content: content ?? pending.content,
+  });
+}
+
+function schedulePendingIdleLifecycleHook(
+  ds: DaemonSession,
+  input: {
+    turnId?: string;
+    prevState?: DaemonSession['lastScreenStatus'];
+    content: string;
+    source: 'screen_update' | 'screenshot_uploaded';
+  },
+): void {
+  const previous = ds.pendingIdleLifecycleHook;
+  if (previous) {
+    if (previous.turnId === input.turnId) {
+      previous.content = input.content;
+      return;
+    }
+    emitPendingIdleLifecycleHook(ds);
+  }
+  const timer = setTimeout(() => {
+    emitPendingIdleLifecycleHook(ds);
+  }, STRUCTURED_IDLE_HOOK_DELAY_MS);
+  timer.unref?.();
+  ds.pendingIdleLifecycleHook = { ...input, timer };
+}
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -1300,6 +1352,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 
 export function killWorker(ds: DaemonSession): void {
   clearUsageLimitState(ds);
+  clearPendingIdleLifecycleHook(ds);
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
@@ -2826,6 +2879,13 @@ function setupWorkerHandlers(
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
+        if (
+          ds.pendingIdleLifecycleHook
+          && ds.pendingIdleLifecycleHook.turnId === msg.turnId
+          && ds.lastScreenStatus === 'idle'
+        ) {
+          ds.pendingIdleLifecycleHook.content = msg.content;
+        }
 
         // Dashboard: publish a patch only when status truly transitioned, so
         // SSE clients reflect real state changes (starting → working → idle)
@@ -2844,10 +2904,26 @@ function setupWorkerHandlers(
               },
             },
           });
-          emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
-            source: 'screen_update',
-            content: msg.content,
-          });
+          if (
+            ds.lastScreenStatus === 'idle'
+            && !ds.session.vcMeetingReceiver
+            && isStructuredBridgeFallbackActive(effectiveCliId, isAdopt)
+          ) {
+            schedulePendingIdleLifecycleHook(ds, {
+              turnId: msg.turnId,
+              prevState: prevStatus,
+              content: msg.content,
+              source: 'screen_update',
+            });
+          } else {
+            if (ds.lastScreenStatus !== 'idle') {
+              clearPendingIdleLifecycleHook(ds);
+            }
+            emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+              source: 'screen_update',
+              content: msg.content,
+            });
+          }
           // Usage ledger + turn reactions: idle/limited edges are turn
           // boundaries. Append the token delta, and flip this turn's pending ✋
           // reactions to ✅ (best-effort, never blocks the status pipeline).
@@ -2983,11 +3059,28 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
-        emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
-          source: 'screenshot_uploaded',
-          imageKey: msg.imageKey,
-          content: ds.lastScreenContent ?? '',
-        });
+        if (
+          ds.lastScreenStatus === 'idle'
+          && prevStatus !== 'idle'
+          && !ds.session.vcMeetingReceiver
+          && isStructuredBridgeFallbackActive(effectiveCliId, isAdopt)
+        ) {
+          schedulePendingIdleLifecycleHook(ds, {
+            turnId: msg.turnId,
+            prevState: prevStatus,
+            content: ds.lastScreenContent ?? '',
+            source: 'screenshot_uploaded',
+          });
+        } else {
+          if (ds.lastScreenStatus !== 'idle') {
+            clearPendingIdleLifecycleHook(ds);
+          }
+          emitSessionStateTransitionHook(ds, prevStatus, ds.lastScreenStatus, {
+            source: 'screenshot_uploaded',
+            imageKey: msg.imageKey,
+            content: ds.lastScreenContent ?? '',
+          });
+        }
         persistStreamCardState(ds);
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
@@ -3463,6 +3556,15 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
           break;
         }
+        if (
+          ds.pendingIdleLifecycleHook
+          && (
+            ds.pendingIdleLifecycleHook.turnId === undefined
+            || ds.pendingIdleLifecycleHook.turnId === msg.turnId
+          )
+        ) {
+          emitPendingIdleLifecycleHook(ds, msg.content, 'final_output');
+        }
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
@@ -3506,6 +3608,7 @@ function setupWorkerHandlers(
 
   worker.on('exit', (code, signal) => {
     logger.info(`[${t}] Worker process exited (code: ${code})`);
+    clearPendingIdleLifecycleHook(ds);
     // Last-resort startup guard: syntax/import crashes and abrupt exits can
     // happen before the worker sends either ready or a structured error.  Do
     // not leave the originating Lark message unanswered. Intentional close /

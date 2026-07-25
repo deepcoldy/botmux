@@ -274,6 +274,79 @@ describe('worker-pool lifecycle hook integration', () => {
     }));
   });
 
+  it('uses structured final_output when it follows the idle edge', () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, lastScreenStatus: 'working' });
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'screen_update',
+      content: 'prompt is idle before final prose',
+      status: 'idle',
+      turnId: 'turn-structured',
+    });
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.idle',
+      expect.anything(),
+    );
+
+    worker.emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: '[MOSA_WORKBOARD_OUTCOME:review_ready]\n\nfinal prose',
+      lastUuid: 'uuid-structured',
+      turnId: 'turn-structured',
+    });
+
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.idle',
+      expect.objectContaining({
+        sessionId: ds.session.sessionId,
+        transition: 'enter',
+        newState: 'idle',
+        source: 'final_output',
+        content: '[MOSA_WORKBOARD_OUTCOME:review_ready]\n\nfinal prose',
+      }),
+    );
+  });
+
+  it('falls back to the freshest idle screen when structured final_output is suppressed', () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, lastScreenStatus: 'working' });
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'screen_update',
+      content: 'incomplete',
+      status: 'idle',
+      turnId: 'turn-send',
+    });
+    worker.emit('message', {
+      type: 'screen_update',
+      content: '[MOSA_WORKBOARD_OUTCOME:review_ready]\n\nsent final prose',
+      status: 'idle',
+      turnId: 'turn-send',
+    });
+    expect(emitHookEventMock).not.toHaveBeenCalledWith(
+      'session.idle',
+      expect.anything(),
+    );
+
+    vi.advanceTimersByTime(1_501);
+
+    expect(emitHookEventMock).toHaveBeenCalledWith(
+      'session.idle',
+      expect.objectContaining({
+        source: 'structured_idle_timeout',
+        content: '[MOSA_WORKBOARD_OUTCOME:review_ready]\n\nsent final prose',
+      }),
+    );
+  });
+
   it('reuses the idle transition helper for screenshot_uploaded status edges', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({ worker, lastScreenStatus: 'working' });
