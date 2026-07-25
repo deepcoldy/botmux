@@ -129,6 +129,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { CARD_POSTING_SENTINEL, initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -195,6 +196,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
       getActiveCount: () => 1,
       closeSession: closeSessionMock,
     });
+  });
+
+  it('persists the exact shared Herdr target reported by the worker', () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'persistent_backend_target',
+      target: {
+        backendType: 'herdr',
+        sessionName: 'work',
+        agentName: 'botmux-sid-read',
+      },
+    });
+
+    expect(ds.session.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'work',
+      agentName: 'botmux-sid-read',
+    });
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {

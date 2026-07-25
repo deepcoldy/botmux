@@ -195,9 +195,142 @@ export function jsonRes(res: ServerResponse, status: number, body: unknown): voi
   res.end(JSON.stringify(body));
 }
 
-export async function readJsonBody<T = unknown>(req: IncomingMessage): Promise<T> {
+export class JsonBodyTooLargeError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`JSON request body exceeds ${maxBytes} bytes`);
+    this.name = 'JsonBodyTooLargeError';
+  }
+}
+
+export class AbortDeadlineError extends Error {
+  constructor(
+    readonly label: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'AbortDeadlineError';
+  }
+}
+
+/** 校验跨进程 JSON envelope，只接受普通对象和完整、精确的自有字段集合。 */
+export function hasExactSafeJsonKeys(
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  const keys = Object.keys(value);
+  if (keys.length !== expectedKeys.length) return false;
+  if (['__proto__', 'prototype', 'constructor'].some(key => Object.hasOwn(value, key))) {
+    return false;
+  }
+  const expected = new Set(expectedKeys);
+  return keys.every(key => expected.has(key));
+}
+
+/**
+ * 为支持 AbortSignal 的底层操作设置硬截止时间。Promise.race 保证调用方按时释放
+ * in-flight 状态，AbortController 同时取消仍在执行的网络或子进程操作。
+ */
+export async function runWithAbortDeadline<T>(
+  label: string,
+  timeoutMs: number,
+  task: (signal: AbortSignal, deadlineAt: number) => Promise<T>,
+): Promise<T> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new RangeError('timeoutMs must be a positive safe integer');
+  }
+  const controller = new AbortController();
+  const deadlineAt = Date.now() + timeoutMs;
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new AbortDeadlineError(label, timeoutMs);
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([task(controller.signal, deadlineAt), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function readJsonBody<T = unknown>(
+  req: IncomingMessage,
+  maxBytes?: number,
+): Promise<T> {
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+    throw new RangeError('maxBytes must be a positive safe integer');
+  }
+  if (maxBytes !== undefined) {
+    const declared = req.headers?.['content-length'];
+    const declaredBytes = typeof declared === 'string' && /^\d+$/.test(declared)
+      ? Number(declared)
+      : undefined;
+    if (declaredBytes !== undefined && declaredBytes > maxBytes) {
+      req.once('error', () => {});
+      req.resume();
+      throw new JsonBodyTooLargeError(maxBytes);
+    }
+
+    const body = await new Promise<Buffer>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      let settled = false;
+      const cleanup = () => {
+        req.off('data', onData);
+        req.off('end', onEnd);
+        req.off('error', onError);
+        req.off('aborted', onAborted);
+      };
+      const rejectOnce = (error: Error, drain = false) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (drain) {
+          // 不销毁 keep-alive socket，只丢弃剩余正文，让调用方仍能返回 413。
+          req.once('error', () => {});
+          req.resume();
+        }
+        reject(error);
+      };
+      const onData = (raw: Buffer | string) => {
+        if (settled) return;
+        const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+        totalBytes += chunk.byteLength;
+        if (totalBytes > maxBytes) {
+          chunks.length = 0;
+          rejectOnce(new JsonBodyTooLargeError(maxBytes), true);
+          return;
+        }
+        chunks.push(chunk);
+      };
+      const onEnd = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(Buffer.concat(chunks, totalBytes));
+      };
+      const onError = (error: Error) => rejectOnce(error);
+      const onAborted = () => rejectOnce(new Error('request aborted'));
+      req.on('data', onData);
+      req.once('end', onEnd);
+      req.once('error', onError);
+      req.once('aborted', onAborted);
+    });
+    if (body.byteLength === 0) return {} as T;
+    return JSON.parse(body.toString('utf8'));
+  }
+
   const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
+  for await (const c of req) {
+    const chunk = Buffer.isBuffer(c) ? c : Buffer.from(c);
+    chunks.push(chunk);
+  }
   if (chunks.length === 0) return {} as T;
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }

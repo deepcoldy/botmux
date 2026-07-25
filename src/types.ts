@@ -1,4 +1,4 @@
-import type { BackendType } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
 import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
@@ -344,6 +344,8 @@ export interface Session {
    * conservatively (see getSessionPersistentBackendType).
    */
   backendType?: BackendType;
+  /** Exact persistent host/agent selected by the worker for restore and cleanup. */
+  persistentBackendTarget?: PersistentBackendTarget;
   /**
    * Sandbox decision RECORDED AT SESSION CREATION (overlay file-isolation). The
    * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
@@ -564,7 +566,7 @@ export interface CliTurnPayload {
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean }
   | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -616,7 +618,8 @@ export type DaemonToWorker =
 
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
-  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'ready'; port: number; token: string; viewToken?: string; spawnCommand?: string; replyAlreadySent?: boolean; turnId?: string; dispatchAttempt?: number }
+  | { type: 'persistent_backend_target'; target?: PersistentBackendTarget }
   /** The exact inbound turn is now durably owned by this worker generation's
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */

@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { deriveTerminalViewToken } from '../src/core/terminal-write-auth.js';
+import { deriveTerminalViewToken, deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -136,6 +136,10 @@ setInterval(() => {}, 1_000);
     const ready = await waitForReady(child, logs);
 
     expect(ready.viewToken).toBe(deriveTerminalViewToken(secret, sessionId));
+    // The operate/write link must also be the stable HMAC (not the random boot
+    // token), so an already-issued 「操作链接」survives a worker restart that
+    // re-runs init → refreshTerminalWriteToken → ready.
+    expect(ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
     const base = `http://127.0.0.1:${ready.port}`;
 
     const scanner = await fetch(`${base}/`);

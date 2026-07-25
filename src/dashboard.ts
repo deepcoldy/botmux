@@ -33,7 +33,11 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
-import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
+import {
+  redactGroupsForPublic,
+  redactSchedulesForPublic,
+  redactSettingsForPublic,
+} from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, autoBindOwnerIfUnambiguous, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
@@ -93,6 +97,8 @@ import { spawn } from 'node:child_process';
 import {
   applySettingsWrite,
   defaultSettingsWriteApplierDeps,
+  hasResolvedCodexNotifierRecipient,
+  resolveCodexNotifierRecipientView,
 } from './dashboard/settings-write-applier.js';
 import {
   addBotsToGroup,
@@ -120,6 +126,17 @@ import {
 import { redactGitUrlCredentials } from './core/skills/sources.js';
 import { effectiveDefaultWorkingDir, getBot, loadBotConfigs, parseBotConfigsFromText, type BotConfig, type VcMeetingAgentConfig } from './bot-registry.js';
 import { findEntryIndex, readRawConfig, requireConfigPath, writeRawConfigAtomic } from './services/config-store.js';
+import {
+  emitCodexNotifierOutboxItem,
+  installCodexNotifierHook,
+  isCodexNotifierWorkerStateFresh,
+  isCodexNotifierHookInstalled,
+  listCodexNotifierOutbox,
+  readCodexNotifierWorkerState,
+  resolveCodexNotifierConfig,
+  runCodexSideConversationMonitor,
+  runCodexNotifierWorkerSupervisor,
+} from './features/codex-notifier/index.js';
 import type { BotSkillPolicy, SkillPackage } from './core/skills/types.js';
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
@@ -417,6 +434,25 @@ interface ResolvedDashboardSettings {
    *  source the SPA can offer as a one-click fill; never persisted unless picked. */
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+    pendingCount: number;
+    workerOnline: boolean;
+    lastError: { at: string; message: string; retryAt: string } | null;
+  };
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -485,6 +521,51 @@ async function validateVcMeetingListenerBotAppId(appId: string): Promise<{ ok: t
   const bot = bots.find(b => b.larkAppId === appId);
   if (!bot) return { ok: false, error: 'vcMeetingAgent_listenerBot_unknown' };
   return { ok: true };
+}
+
+async function validateCodexNotifierTargetBotAppId(
+  appId: string,
+  options: { requireReady?: boolean } = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const bot = loadBotConfigs().find(candidate => candidate.larkAppId === appId);
+    if (!bot) return { ok: false, error: 'codexNotifier_target_unknown' };
+    if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') {
+      return { ok: false, error: 'codexNotifier_target_cli_unsupported' };
+    }
+    if (!(bot.allowedUsers ?? []).some(user => typeof user === 'string' && user.trim())) {
+      return { ok: false, error: 'codexNotifier_target_owner_missing' };
+    }
+    if (options.requireReady !== true) return { ok: true };
+    const daemon = registry.list().find(candidate => candidate.larkAppId === appId);
+    if (!daemon) return { ok: false, error: 'codexNotifier_target_daemon_offline' };
+    const resolvedOwners = daemon.resolvedAllowedUsers ?? [];
+    if (!hasResolvedCodexNotifierRecipient(resolvedOwners)) {
+      return { ok: false, error: 'codexNotifier_target_owner_unverified' };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: 'codexNotifier_target_unknown' };
+  }
+}
+
+function codexNotifierBotOptions(): ResolvedDashboardSettings['codexNotifier']['botOptions'] {
+  try {
+    const onlineByAppId = new Map(registry.list().map(bot => [bot.larkAppId, bot] as const));
+    return loadBotConfigs()
+      .filter(bot => bot.cliId === 'codex' || bot.cliId === 'codex-app')
+      .map(bot => {
+        const resolvedOwners = onlineByAppId.get(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+        return {
+          larkAppId: bot.larkAppId,
+          botName: bot.displayName ?? onlineByAppId.get(bot.larkAppId)?.botName ?? bot.name ?? null,
+          cliId: onlineByAppId.get(bot.larkAppId)?.cliId ?? bot.cliId,
+          ...resolveCodexNotifierRecipientView(bot.allowedUsers, resolvedOwners),
+        };
+      });
+  } catch {
+    return [];
+  }
 }
 
 function normalizeVcMeetingAgentRecord(raw: unknown): Record<string, unknown> {
@@ -858,6 +939,9 @@ async function syncVcMeetingListenerBotConfig(listenerBotAppId: string | null, p
 function resolveDashboardSettings(): ResolvedDashboardSettings {
   const global = readGlobalConfig();
   const dashboard = global.dashboard ?? {};
+  const codexNotifier = resolveCodexNotifierConfig();
+  const codexNotifierBots = codexNotifierBotOptions();
+  const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
@@ -873,6 +957,19 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       recommendedRef: TRAEX_RECOMMENDED_REF,
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
+    codexNotifier: {
+      enabled: codexNotifier.enabled,
+      targetBotAppId: codexNotifier.targetBotAppId ?? null,
+      notifyWhen: codexNotifier.notifyWhen,
+      platformSupported: process.platform === 'darwin',
+      hookInstalled: isCodexNotifierHookInstalled(),
+      botOptions: codexNotifierBots,
+      targetDaemonOnline: !!codexNotifier.targetBotAppId
+        && registry.list().some(bot => bot.larkAppId === codexNotifier.targetBotAppId),
+      pendingCount: listCodexNotifierOutbox(config.session.dataDir).length,
+      workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
+      lastError: codexNotifierState?.lastError ?? null,
+    },
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -904,6 +1001,7 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
 const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
 settingsWriteApplierDeps.syncVcMeetingListenerBotConfig = syncVcMeetingListenerBotConfig;
 settingsWriteApplierDeps.validateVcMeetingListenerBotAppId = validateVcMeetingListenerBotAppId;
+settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 
 /** Helper to render a {status, body} HandlerResult through `res`. */
 function writeHandlerResult(res: import('node:http').ServerResponse, result: GroupsHandlerResult): void {
@@ -1143,6 +1241,29 @@ registry.on(syncSubscriptions);
 // Initial attach for every daemon already known. Run in parallel so a slow
 // daemon doesn't block the others.
 await Promise.all(registry.list().map(attachDaemon));
+
+const codexNotifierAbort = new AbortController();
+if (resolveCodexNotifierConfig().enabled) {
+  try {
+    installCodexNotifierHook();
+  } catch (error) {
+    logger.warn(`[codex-notifier] Hook reconcile failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+void runCodexNotifierWorkerSupervisor({
+  dataDir: config.session.dataDir,
+  signal: codexNotifierAbort.signal,
+  emit: item => emitCodexNotifierOutboxItem(item, { signal: codexNotifierAbort.signal }),
+  runProducer: signal => runCodexSideConversationMonitor({
+    dataDir: config.session.dataDir,
+    signal,
+    logger,
+  }),
+  logger,
+  onLeaseUnavailable: path => {
+    logger.warn(`[codex-notifier] outbox worker 已由另一 Dashboard 持有，等待接管：${path}`);
+  },
+});
 
 const resourceMonitor = createResourceMonitorService({
   intervalMs: 10_000,
@@ -2318,14 +2439,15 @@ const server = createServer(async (req, res) => {
     }
 
     const presentedToken = authedToken(req, url);
-    const dashboardSettings = resolveDashboardSettings();
+    const globalDashboardConfig = readGlobalConfig().dashboard;
     const decision = decideDashboardAuth({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
       presentedToken,
       activeToken: activeToken ?? '',
-      publicReadOnly: dashboardSettings.publicReadOnly,
+      publicReadOnly: globalDashboardConfig?.publicReadOnly
+        ?? config.dashboard.publicReadOnly,
     });
     // `authed` is consumed by route handlers that distinguish the public-read
     // carve-out from a valid management cookie (notably v3 run details).
@@ -2551,6 +2673,7 @@ const server = createServer(async (req, res) => {
       return jsonRes(res, 200, { schedules, timezone: scheduleTimeZone() });
     }
     if (req.method === 'GET' && url.pathname === '/api/settings') {
+      const dashboardSettings = resolveDashboardSettings();
       // `authed` lets the Settings page disable toggles for read-only
       // visitors up front, instead of letting them flip a switch that
       // 401s + rolls back on save.
@@ -2560,7 +2683,7 @@ const server = createServer(async (req, res) => {
       // `bound` reflects central-platform binding; the Settings UI only shows the
       // 远程访问 toggle when bound (the central URLs are meaningless otherwise).
       return jsonRes(res, 200, {
-        settings: dashboardSettings,
+        settings: authed ? dashboardSettings : redactSettingsForPublic(dashboardSettings),
         lang: readGlobalConfig().lang ?? null,
         authed,
         bound: readPlatformBinding() !== null,
@@ -4953,6 +5076,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 
 // Graceful shutdown
 function shutdown(): void {
+  codexNotifierAbort.abort();
   for (const off of subs.values()) off();
   subs.clear();
   registry.stop();

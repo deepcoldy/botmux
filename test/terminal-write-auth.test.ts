@@ -17,6 +17,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveTerminalViewToken,
+  deriveTerminalWriteToken,
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
   resolveTerminalWrite,
@@ -69,6 +70,23 @@ describe('terminal view capability', () => {
       platformBound: false,
       platformProxied: false,
     })).toEqual({ hasRead: true, hasWrite: true, platformReadonly: false });
+  });
+});
+
+describe('terminal write capability', () => {
+  it('is stable for one session, domain-bound to the session, and secret-bound', () => {
+    // Stability across derivations is what keeps an issued operate link valid
+    // after a worker restart re-derives the token.
+    const a = deriveTerminalWriteToken('host-secret', 'session-a');
+    expect(a).toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(a).not.toBe(deriveTerminalWriteToken('host-secret', 'session-b'));
+    expect(a).not.toBe(deriveTerminalWriteToken('other-secret', 'session-a'));
+  });
+
+  it('is distinct from the view token for the same session + secret (domain separation)', () => {
+    // Knowing the read-only view token must never yield the write token.
+    expect(deriveTerminalWriteToken('host-secret', 'session-a'))
+      .not.toBe(deriveTerminalViewToken('host-secret', 'session-a'));
   });
 });
 

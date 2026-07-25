@@ -140,6 +140,27 @@ describe('local-cli-opener', () => {
     expect(adapterFactory).not.toHaveBeenCalled();
   });
 
+  it('attach mode opens the exact managed agent inside a shared Herdr session', () => {
+    const result = buildLocalCliOpenCommand(ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'herdr',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'work',
+          agentName: 'botmux-abcdef12',
+        },
+        cliSessionId: undefined,
+      },
+    }), { mode: 'attach' });
+
+    expect(result).toEqual({
+      ok: true,
+      command: "herdr --session 'work' agent attach 'botmux-abcdef12'",
+    });
+  });
+
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
     const result = buildLocalCliOpenCommand(ds({
       adoptedFrom: { source: 'herdr', herdrSessionName: 'dev', herdrTerminalId: 'terminal_1', cwd: '/repo' },

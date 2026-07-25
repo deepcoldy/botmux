@@ -16,7 +16,13 @@ function safeSessionFileStem(sessionId: string): string {
 }
 
 export function piInitialPromptNeedsFile(prompt: string | undefined): boolean {
-  return !!prompt && Buffer.byteLength(prompt, 'utf8') > PI_INITIAL_PROMPT_ARG_BYTE_LIMIT;
+  return !!prompt && (
+    Buffer.byteLength(prompt, 'utf8') > PI_INITIAL_PROMPT_ARG_BYTE_LIMIT
+    // Herdr 0.7.5 rejects control characters in managed-agent argv. Its macOS
+    // integration can also bypass the PATH launcher, so even short routed
+    // Botmux prompts must use Pi's safe @file positional form.
+    || /[\x00-\x1f\x7f]/.test(prompt)
+  );
 }
 
 export function piInitialPromptRootDir(sessionDataDir: string): string {

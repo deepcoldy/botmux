@@ -13,7 +13,7 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 
 describe('worker backend exit crash ordering', () => {
   it('fences a delayed old-backend exit before it can clear the replacement backend or durable turn', () => {
-    const start = workerSource.indexOf('const observedBackend = backend;');
+    const start = workerSource.indexOf('backend.onExit((code, signal) => {\n    const intentionalRestart = intentionalRestartBackend === observedBackend;');
     const end = workerSource.indexOf('\n\n  if (isPipeMode', start);
 
     expect(start).toBeGreaterThanOrEqual(0);
@@ -38,7 +38,7 @@ describe('worker backend exit crash ordering', () => {
   });
 
   it('drains a persisted reliable terminal before claiming cli_exit ambiguous', () => {
-    const start = workerSource.indexOf('const observedBackend = backend;');
+    const start = workerSource.indexOf('backend.onExit((code, signal) => {\n    const intentionalRestart = intentionalRestartBackend === observedBackend;');
     const end = workerSource.indexOf('\n\n  if (isPipeMode', start);
     const callback = workerSource.slice(start, end);
 

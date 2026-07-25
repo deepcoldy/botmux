@@ -18,9 +18,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 
-const { tmuxKill, herdrKill, zellijKill, getBotMock } = vi.hoisted(() => ({
+const { tmuxKill, herdrKill, herdrKillAgent, zellijKill, getBotMock } = vi.hoisted(() => ({
   tmuxKill: vi.fn(),
   herdrKill: vi.fn(),
+  herdrKillAgent: vi.fn(),
   zellijKill: vi.fn(),
   getBotMock: vi.fn(() => ({ resolvedAllowedUsers: [], config: {} })),
 }));
@@ -29,7 +30,11 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
   TmuxBackend: { sessionName: (id: string) => `bmx-${id.slice(0, 8)}`, killSession: tmuxKill },
 }));
 vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
-  HerdrBackend: { sessionName: (id: string) => `bmx-${id.slice(0, 8)}`, killSession: herdrKill },
+  HerdrBackend: {
+    sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
+    killSession: herdrKill,
+    killAgent: herdrKillAgent,
+  },
 }));
 vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
   ZellijBackend: { sessionName: (id: string) => `bmx-${id.slice(0, 8)}`, killSession: zellijKill },
@@ -96,6 +101,25 @@ describe('killWorker — orphaned backing session teardown (no live worker)', ()
     killWorker(ds({}, { backendType: 'herdr' }));
     expect(herdrKill).toHaveBeenCalledWith(EXPECTED_NAME);
     expect(tmuxKill).not.toHaveBeenCalled();
+  });
+
+  it('closes only the recorded managed agent for a shared Herdr session', () => {
+    const d = ds({
+      session: {
+        sessionId: SID,
+        backendType: 'herdr',
+        persistentBackendTarget: {
+          backendType: 'herdr',
+          sessionName: 'work',
+          agentName: 'botmux-abcd1234',
+        },
+      } as any,
+    }, { backendType: 'herdr' });
+
+    killWorker(d);
+
+    expect(herdrKillAgent).toHaveBeenCalledWith('work', 'botmux-abcd1234');
+    expect(herdrKill).not.toHaveBeenCalled();
   });
 
   it('destroys the zellij backing session', () => {

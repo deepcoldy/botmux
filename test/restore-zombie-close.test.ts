@@ -36,6 +36,7 @@ const probe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'un
 // Mutable tmux-SERVER liveness the mocked TmuxBackend returns this test run.
 // Default 'running' so a bare 'missing' is read as a solo zombie (server up).
 const server = vi.hoisted(() => ({ state: 'running' as 'running' | 'down' | 'unknown' }));
+const herdrProbe = vi.hoisted(() => ({ result: 'exists' as 'exists' | 'missing' | 'unknown' }));
 // Mutable bot-side wrapperCli for the wrapper-axis mismatch tests.
 const bot = vi.hoisted(() => ({
   cliId: 'claude-code' as import('../src/adapters/cli/types.js').CliId,
@@ -140,6 +141,16 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
   },
 }));
 
+vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
+  HerdrBackend: {
+    sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
+    probeSession: vi.fn(() => herdrProbe.result),
+    probeAgent: vi.fn(() => herdrProbe.result),
+    killSession: vi.fn(),
+    killAgent: vi.fn(),
+  },
+}));
+
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
   validateAdoptTargetState: vi.fn(() => 'alive'),
@@ -153,6 +164,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 
 import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/core/session-manager.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { forkWorker, closeSession } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -165,6 +177,7 @@ beforeEach(() => {
   wp.registry = null;
   probe.result = 'exists';
   server.state = 'running';
+  herdrProbe.result = 'exists';
   bot.cliId = 'claude-code';
   bot.wrapperCli = undefined;
   vi.mocked(closeSession).mockClear();
@@ -192,6 +205,29 @@ function makeActivePersistentSession(rootMessageId: string) {
 }
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('shared Herdr restore probes the recorded managed agent, not a derived bmx-* session', async () => {
+    const s = makeActivePersistentSession('om_shared_herdr');
+    s.backendType = 'herdr';
+    s.persistentBackendTarget = {
+      backendType: 'herdr',
+      sessionName: 'work',
+      agentName: `botmux-${s.sessionId.slice(0, 8)}`,
+    };
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(HerdrBackend.probeAgent).toHaveBeenCalledWith(
+      'work',
+      `botmux-${s.sessionId.slice(0, 8)}`,
+    );
+    expect(HerdrBackend.probeSession).not.toHaveBeenCalled();
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: s }), '', true);
+  });
+
   it('"missing" → closes the zombie (Map eviction + store closed), does not fork', async () => {
     probe.result = 'missing';
     const s = makeActivePersistentSession('om_missing');

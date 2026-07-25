@@ -17917,6 +17917,12 @@ form.dashboard-toolbar > input[type="text"]:focus {
   line-height: 1.5;
   word-break: break-all;
 }
+.settings-page .settings-codex-notifier-details {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 4px 0 2px;
+}
 .settings-page .settings-inline-link {
   border: 0;
   background: none;

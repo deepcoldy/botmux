@@ -210,6 +210,28 @@ beforeEach(() => {
   });
 });
 
+describe('persistent backend target handoff', () => {
+  it('passes the recorded shared Herdr target back to a replacement worker', () => {
+    const target = {
+      backendType: 'herdr' as const,
+      sessionName: 'original-work',
+      agentName: 'botmux-sid-star',
+    };
+    const ds = makeDs();
+    ds.session.backendType = 'herdr';
+    ds.session.persistentBackendTarget = target;
+
+    forkWorker(ds, 'resume', true);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      backendType: 'herdr',
+      persistentBackendTarget: target,
+    }));
+  });
+});
+
 describe('Codex App clean-input feature gate', () => {
   const payload = {
     content: '<user_message>legacy</user_message>',

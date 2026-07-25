@@ -3,6 +3,25 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 describe('worker pipe initial screen ordering', () => {
+  it('suppresses a starting card when botmux send completed before worker ready', () => {
+    const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const poolSource = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
+    const readyPayload = workerSource.slice(
+      workerSource.indexOf("type: 'ready'"),
+      workerSource.indexOf("case 'message':", workerSource.indexOf("type: 'ready'")),
+    );
+    const readyHandler = poolSource.slice(
+      poolSource.indexOf("case 'ready':"),
+      poolSource.indexOf("case 'cli_session_id':", poolSource.indexOf("case 'ready':")),
+    );
+
+    expect(readyPayload).toContain('replyAlreadySent: readSendMarkers().some');
+    expect(readyHandler).toContain('if (msg.replyAlreadySent)');
+    expect(readyHandler.indexOf('if (msg.replyAlreadySent)')).toBeLessThan(
+      readyHandler.indexOf('ds.streamCardId = CARD_POSTING_SENTINEL'),
+    );
+  });
+
   it('captures pipe initial screen after idle detector is registered', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     // The inline `const initial = backend.captureCurrentScreen()` was refactored
@@ -224,6 +243,41 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).toContain('if (!cliAdapter?.busyPattern || (!be.captureCurrentScreen && !be.captureViewport)) return;');
     expect(helper).toContain('if (backend !== be || !awaitingFirstPrompt || isPromptReady) return;');
     expect(helper).not.toContain('pendingMessages.length > 0');
+  });
+
+  it('flushes an initial prompt queued after a fast backend became ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const queueIdx = source.indexOf('if (shouldQueueInitialPrompt({');
+    const readyFlushIdx = source.indexOf('if (isPromptReady && pendingMessages.length > 0)', queueIdx);
+    const readySendIdx = source.indexOf("type: 'ready',", queueIdx);
+
+    expect(queueIdx).toBeGreaterThan(-1);
+    expect(readyFlushIdx).toBeGreaterThan(queueIdx);
+    expect(readyFlushIdx).toBeLessThan(readySendIdx);
+    expect(source.slice(readyFlushIdx, readySendIdx)).toContain('flushPending();');
+  });
+
+  it('uses authoritative Herdr settled status to release queued Pi input', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const hookStart = source.indexOf('observedBackend.onAgentStatus((status) => {');
+    const hookEnd = source.indexOf('backend.onAccessUrl?.', hookStart);
+    const hook = source.slice(hookStart, hookEnd);
+
+    expect(hookStart).toBeGreaterThan(-1);
+    expect(hook).toContain("status === 'idle' || status === 'done'");
+    expect(hook).toContain("drainBridgesThenMarkReady('structured');");
+    expect(hook).toContain("status === 'working'");
+    expect(hook).toContain('isPromptReady = false;');
+
+    const helperStart = source.indexOf("const drainBridgesThenMarkReady = (");
+    const helperEnd = source.indexOf('// Set up idle detection.', helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    const claudeDrain = helper.indexOf('bridgeDrainAndMaybeEmit();');
+    const structuredDrain = helper.indexOf('codexBridgeDrainAndMaybeEmit();');
+    const ready = helper.indexOf('markPromptReady();');
+    expect(claudeDrain).toBeGreaterThan(-1);
+    expect(structuredDrain).toBeGreaterThan(claudeDrain);
+    expect(ready).toBeGreaterThan(structuredDrain);
   });
 
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {

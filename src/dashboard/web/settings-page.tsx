@@ -23,6 +23,25 @@ interface DashboardSettings {
     recommendedRef: string;
   };
   codexRpcInput: boolean;
+  codexNotifier: {
+    enabled: boolean;
+    targetBotAppId: string | null;
+    notifyWhen: 'locked_only' | 'always';
+    platformSupported: boolean;
+    hookInstalled: boolean;
+    botOptions: Array<{
+      larkAppId: string;
+      botName: string | null;
+      cliId: string;
+      recipientConfigured: boolean;
+      recipientVerified: boolean;
+      recipientHint: string | null;
+    }>;
+    targetDaemonOnline: boolean;
+    pendingCount: number;
+    workerOnline: boolean;
+    lastError: { at: string; message: string; retryAt: string } | null;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -118,6 +137,25 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
+    codexNotifier: {
+      enabled: s?.codexNotifier?.enabled === true,
+      targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
+        ? s.codexNotifier.targetBotAppId
+        : null,
+      notifyWhen: s?.codexNotifier?.notifyWhen === 'always' ? 'always' : 'locked_only',
+      platformSupported: s?.codexNotifier?.platformSupported === true,
+      hookInstalled: s?.codexNotifier?.hookInstalled === true,
+      botOptions: Array.isArray(s?.codexNotifier?.botOptions) ? s.codexNotifier.botOptions : [],
+      targetDaemonOnline: s?.codexNotifier?.targetDaemonOnline === true,
+      pendingCount: Number.isSafeInteger(s?.codexNotifier?.pendingCount)
+        ? Math.max(0, s.codexNotifier.pendingCount)
+        : 0,
+      workerOnline: s?.codexNotifier?.workerOnline === true,
+      lastError: s?.codexNotifier?.lastError
+        && typeof s.codexNotifier.lastError.message === 'string'
+        ? s.codexNotifier.lastError
+        : null,
+    },
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -525,6 +563,13 @@ function SettingsBody(props: {
       s => ({ ...s, herdrTraexPlugin: { ...s.herdrTraexPlugin, ...patch } }),
     );
   };
+  const saveCodexNotifier = (patch: Partial<Pick<DashboardSettings['codexNotifier'], 'enabled' | 'targetBotAppId' | 'notifyWhen'>>) => {
+    return props.onSave(
+      'codexNotifier',
+      { codexNotifier: patch },
+      s => ({ ...s, codexNotifier: { ...s.codexNotifier, ...patch } }),
+    );
+  };
   const repoModeOptions = useMemo(() => [
     { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
     { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
@@ -546,7 +591,6 @@ function SettingsBody(props: {
       return { value: bot.larkAppId, label: `${label}${detail}${suffix}` };
     }),
   ], [settings.vcMeetingAgent.listenerBotOptions, tr]);
-
   return (
     <div className="settings-layout">
       {canWrite ? null : (
@@ -631,6 +675,12 @@ function SettingsBody(props: {
             checked={settings.codexRpcInput}
             disabled={dis || savingKey === 'codexRpcInput'}
             onChange={value => saveBoolean('codexRpcInput', value)}
+          />
+          <CodexNotifierSettingsEditor
+            value={settings.codexNotifier}
+            disabled={dis}
+            saving={savingKey === 'codexNotifier'}
+            onSave={saveCodexNotifier}
           />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
@@ -848,6 +898,154 @@ function SettingsBlock(props: {
         {props.children}
       </article>
     </section>
+  );
+}
+
+export function CodexNotifierSettingsEditor(props: {
+  value: DashboardSettings['codexNotifier'];
+  disabled: boolean;
+  saving: boolean;
+  onSave(
+    patch: Partial<Pick<DashboardSettings['codexNotifier'], 'enabled' | 'targetBotAppId' | 'notifyWhen'>>,
+  ): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [enableRequested, setEnableRequested] = useState(false);
+  const autoEnableStartedRef = useRef(false);
+  const botOptions = useMemo(() => [
+    { value: '', label: tr('settings.codexNotifierTargetPlaceholder') },
+    ...props.value.botOptions.map(bot => ({
+      value: bot.larkAppId,
+      label: [
+        bot.botName || bot.larkAppId,
+        bot.cliId,
+      ].filter(Boolean).join(' · '),
+    })),
+  ], [props.value.botOptions, tr]);
+  const timingOptions = useMemo(() => [
+    { value: 'locked_only' as const, label: tr('settings.codexNotifierLockedOnly') },
+    { value: 'always' as const, label: tr('settings.codexNotifierAlways') },
+  ], [tr]);
+  const selectedBot = props.value.botOptions
+    .find(bot => bot.larkAppId === props.value.targetBotAppId);
+  const enableBlocked = !props.value.targetBotAppId
+    || selectedBot?.recipientConfigured !== true
+    || selectedBot?.recipientVerified !== true
+    || !props.value.targetDaemonOnline
+    || (!props.value.platformSupported && props.value.notifyWhen === 'locked_only');
+  const showDetails = props.value.enabled || enableRequested;
+  const controlsDisabled = props.disabled || props.saving;
+
+  useEffect(() => {
+    if (!enableRequested || props.value.enabled || enableBlocked) {
+      autoEnableStartedRef.current = false;
+      return;
+    }
+    if (controlsDisabled || autoEnableStartedRef.current) return;
+    autoEnableStartedRef.current = true;
+    void props.onSave({ enabled: true });
+  }, [
+    controlsDisabled,
+    enableBlocked,
+    enableRequested,
+    props.onSave,
+    props.value.enabled,
+  ]);
+
+  useEffect(() => {
+    if (props.value.enabled && enableRequested) setEnableRequested(false);
+  }, [enableRequested, props.value.enabled]);
+
+  const setEnabled = (enabled: boolean) => {
+    if (!enabled) {
+      autoEnableStartedRef.current = false;
+      setEnableRequested(false);
+      if (props.value.enabled) void props.onSave({ enabled: false });
+      return;
+    }
+    if (enableBlocked) {
+      setEnableRequested(true);
+      return;
+    }
+    void props.onSave({ enabled: true });
+  };
+
+  return (
+    <>
+      <ToggleRow
+        title={tr('settings.codexNotifier')}
+        help={tr('settings.codexNotifierHelp')}
+        checked={props.value.enabled || enableRequested}
+        disabled={controlsDisabled}
+        onChange={setEnabled}
+      />
+      {showDetails ? (
+        <div className="settings-codex-notifier-details">
+          {!props.value.enabled ? (
+            <p className="settings-subfield-hint">{tr('settings.codexNotifierEnablePending')}</p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.codexNotifierTargetHelp')}>{tr('settings.codexNotifierTarget')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.codexNotifierTarget')}
+              disabled={controlsDisabled}
+              searchable
+              value={props.value.targetBotAppId ?? ''}
+              label={dropdownLabel(botOptions, props.value.targetBotAppId ?? '')}
+              options={botOptions}
+              onChange={value => { void props.onSave({ targetBotAppId: value || null }); }}
+            />
+          </div>
+          {selectedBot?.recipientHint ? (
+            <p className="settings-subfield-hint">
+              {tr('settings.codexNotifierRecipient', { recipient: selectedBot.recipientHint })}
+            </p>
+          ) : null}
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.codexNotifierNotifyWhenHelp')}>{tr('settings.codexNotifierNotifyWhen')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.codexNotifierNotifyWhen')}
+              disabled={controlsDisabled}
+              value={props.value.notifyWhen}
+              label={dropdownLabel(timingOptions, props.value.notifyWhen)}
+              options={timingOptions}
+              onChange={value => { void props.onSave({ notifyWhen: value }); }}
+            />
+          </div>
+          {!props.value.targetBotAppId ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierTargetRequired')}</p>
+          ) : selectedBot?.recipientConfigured !== true ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierRecipientMissing')}</p>
+          ) : !props.value.targetDaemonOnline ? (
+            <p className="hint-warn-inline">
+              {tr(props.value.enabled
+                ? 'settings.codexNotifierDaemonOffline'
+                : 'settings.codexNotifierTargetOffline')}
+            </p>
+          ) : selectedBot?.recipientVerified !== true ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierRecipientUnverified')}</p>
+          ) : !props.value.platformSupported && props.value.notifyWhen === 'locked_only' ? (
+            <p className="hint-warn-inline">{tr('settings.codexNotifierUnsupported')}</p>
+          ) : props.value.enabled ? (
+            !props.value.hookInstalled ? (
+              <p className="hint-warn-inline">{tr('settings.codexNotifierHookPending')}</p>
+            ) : !props.value.workerOnline ? (
+              <p className="hint-warn-inline">{tr('settings.codexNotifierWorkerPending')}</p>
+            ) : props.value.lastError ? (
+              <p className="hint-warn-inline">
+                {tr('settings.codexNotifierLastError', { error: props.value.lastError.message })}
+              </p>
+            ) : props.value.pendingCount > 0 ? (
+              <p className="hint-warn-inline">
+                {tr('settings.codexNotifierPending', { count: props.value.pendingCount })}
+              </p>
+            ) : null
+          ) : null}
+        </div>
+      ) : null}
+    </>
   );
 }
 

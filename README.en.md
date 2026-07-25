@@ -349,6 +349,7 @@ Gemini / OpenCode / Antigravity / GitHub Copilot), with no MCP protocol support 
 - Add a bot with the same one-scan Feishu flow: optional stable name, AI CLI and working-directory choices, fail-closed administrator confirmation, and an explicit compatibility fallback
 - Create a new group with auto owner-transfer + @-mention notification
 - Disband or leave a chat (associated sessions auto-closed)
+- **Standalone Codex completion notifications (experimental, off by default)**: while macOS is locked, the selected Bot privately sends the final Codex App/CLI reply, including Codex App Side Chats. Regular App threads can be opened on the Mac running BotMux or adopted into Feishu; ephemeral Side Chats are result-only. Choose the Bot and notification timing under Settings → Experimental ([design and maintenance notes](docs/design/codex-notifier.md))
 - **Session Insights** (owner-only, read-only): parse each session's transcript to view action spans / work timeline / context curve / failure aggregates + diagnostic suggestions; send `/insight` in chat for the current session's summary card
 - **Workflows console**:
   - v3 Run List and Run Detail show the DAG, node states, decisions, and attempt terminal logs, and stop polling at terminal state

@@ -40,7 +40,7 @@ import {
   type IsolationCapability,
   type V2IsolationContext,
 } from './adapters/cli/read-isolation.js';
-import { killPersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
+import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -94,6 +94,7 @@ import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
 import {
   deriveTerminalViewToken,
+  deriveTerminalWriteToken,
   resolveTerminalAccessForRequest,
   safeTerminalTokenEqual,
   type TerminalAccessDecision,
@@ -1037,7 +1038,12 @@ const authedClients = new WeakSet<WebSocket>();
 const clientPtys = new Map<WebSocket, pty.IPty>();
 /** Managed-Herdr viewers survive an in-worker /restart while backend changes. */
 const herdrWebBindings = new Map<WebSocket, HerdrWebTerminalBinding>();
-const writeToken = randomBytes(16).toString('hex');
+// Standalone/test fallback. Production replaces this after init with a stable
+// per-session HMAC derived from the host-only dashboard secret, so an
+// already-issued 「操作链接」/write link survives a worker restart (a silent
+// daemon restart re-forks every worker — a per-process random token would 403
+// every previously-issued operate link).
+let writeToken = randomBytes(16).toString('hex');
 // Standalone/test fallback. Production replaces this after init with a stable
 // per-session HMAC derived from the host-only dashboard secret.
 let viewToken = randomBytes(32).toString('base64url');
@@ -1052,6 +1058,15 @@ const DASHBOARD_SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 function refreshTerminalViewToken(): void {
   const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
   if (secret && sessionId) viewToken = deriveTerminalViewToken(secret, sessionId);
+}
+
+/** Re-derive the stable write (operate) token from the host-only dashboard
+ *  secret so a restarted worker mints the SAME token — keeping already-issued
+ *  「操作链接」/write links valid across restarts. Falls back to the random
+ *  boot token when the secret is unavailable (standalone/test). */
+function refreshTerminalWriteToken(): void {
+  const secret = loadDashboardSecret(DASHBOARD_SECRET_PATH);
+  if (secret && sessionId) writeToken = deriveTerminalWriteToken(secret, sessionId);
 }
 
 /**
@@ -6201,11 +6216,6 @@ async function spawnCli(
     }
   }
 
-  const selectedBackend = selectSessionBackend({ sessionId: cfg.sessionId, backendType: effectiveBackend, backendConfig: riffBackendConfig });
-  isTmuxMode = selectedBackend.isTmuxMode;
-  isPipeMode = selectedBackend.isPipeMode;
-  isZellijMode = selectedBackend.isZellijMode;
-  backend = selectedBackend.backend;
   const adapterSessionId = cfg.resume
     ? (cfg.originalSessionId ?? cfg.sessionId)
     : cfg.sessionId;
@@ -6346,6 +6356,30 @@ async function spawnCli(
   currentCliCredentialIsolated = appliedIsolationCapabilities.includes('credential');
   const isolationRuntimeDataDir = process.env.SESSION_DATA_DIR
     ?? join(defaultBotmuxHome, 'data');
+
+  let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
+    cfg.sessionId,
+    config.session.dataDir,
+  );
+  const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
+  const selectBackend = () => selectSessionBackend({
+    sessionId: cfg.sessionId,
+    backendType: effectiveBackend,
+    backendConfig: riffBackendConfig,
+    persistentBackendTarget: cfg.persistentBackendTarget,
+    // Old builds could place managed agents in a user's shared Herdr session.
+    // Preserve that recorded target for compatibility unless this incarnation
+    // requires an isolation/MCP boundary that only a Botmux-owned session can
+    // safely provide. Fresh tasks use distinct agents in one machine-wide host.
+    reuseRecordedHerdrTarget: !willReadIsolate
+      && !willWriteSandbox
+      && !hasMcpRuntimeEntries,
+  });
+  let selectedBackend = selectBackend();
+  isTmuxMode = selectedBackend.isTmuxMode;
+  isPipeMode = selectedBackend.isPipeMode;
+  isZellijMode = selectedBackend.isZellijMode;
+  backend = selectedBackend.backend;
   // Every bot — isolated OR not — gets its own BOT_HOME dir as a ready-made private-
   // storage slot. An isolated sibling denies this path regardless of whether the owner
   // is isolated (deny uses the full bots.json), so a non-isolated bot can drop private
@@ -6408,13 +6442,7 @@ async function spawnCli(
   // on EVERY restart, e.g. for a sandboxed session whose transcript lives in
   // an ephemeral overlay upper that the probe can't see). Computed here (not at
   // the spawn site below) so the pre-flight can short-circuit on it.
-  const persistentSessionName = effectiveBackendType === 'tmux'
-    ? TmuxBackend.sessionName(cfg.sessionId)
-    : effectiveBackendType === 'herdr'
-      ? HerdrBackend.sessionName(cfg.sessionId)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.sessionName(cfg.sessionId)
-      : undefined;
+  let persistentSessionName = selectedBackend.persistentSessionName;
   // [read-isolation] Before we decide to reattach a persistent pane: a pane can
   // survive a daemon restart still running a CLI that may NOT be isolated (e.g.
   // spawned before isolation was enabled, or by an old build). Isolation is only
@@ -6425,11 +6453,10 @@ async function spawnCli(
   // policy pane survives daemon restarts and suspend→resume safely because the
   // confinement remains attached to the live process.
   if (appliedIsolationCapabilities.length > 0 && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
+    const persistentTarget = selectedBackend.persistentBackendTarget;
+    const paneLive = persistentTarget
+      ? probePersistentBackendTarget(persistentTarget) === 'exists'
+      : false;
     if (paneLive) {
       let marker: string | null = null;
       marker = readRegularHostFileNoFollow(
@@ -6445,38 +6472,44 @@ async function spawnCli(
         // obsolete permissions. Kill it before publishing any new capability.
         log(`[read-isolation] legacy/unmarked persistent pane for ${cfg.sessionId} — killing + cold-spawning with current policy`);
         try {
-          killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+          const persistentTarget = selectedBackend.persistentBackendTarget;
+          if (persistentTarget) killPersistentBackendTarget(persistentTarget);
+          else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+          selectedBackend = selectBackend();
+          isTmuxMode = selectedBackend.isTmuxMode;
+          isPipeMode = selectedBackend.isPipeMode;
+          isZellijMode = selectedBackend.isZellijMode;
+          backend = selectedBackend.backend;
+          persistentSessionName = selectedBackend.persistentSessionName;
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
         }
       }
     }
   }
-  let mcpRuntimeManifest: SessionMcpRuntimeManifest | null = readSessionMcpRuntimeManifest(
-    cfg.sessionId,
-    config.session.dataDir,
-  );
+  let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
-    const paneLive = effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName);
+    const persistentTarget = selectedBackend.persistentBackendTarget;
+    const paneLive = persistentTarget
+      ? probePersistentBackendTarget(persistentTarget) === 'exists'
+      : false;
     if (paneLive) {
       // The trusted Gateway host belongs to the worker and cannot survive a
       // worker/daemon replacement. Cold-resume the CLI so its MCP client gets a
       // fresh relay socket instead of reattaching to a dead connection.
       log(`[mcp-gateway] persistent pane ${cfg.sessionId} has plugin MCP state — cold-resuming with a fresh host`);
-      killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      const persistentTarget = selectedBackend.persistentBackendTarget;
+      if (persistentTarget) killPersistentBackendTarget(persistentTarget);
+      else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName);
+      selectedBackend = selectBackend();
+      isTmuxMode = selectedBackend.isTmuxMode;
+      isPipeMode = selectedBackend.isPipeMode;
+      isZellijMode = selectedBackend.isZellijMode;
+      backend = selectedBackend.backend;
+      persistentSessionName = selectedBackend.persistentSessionName;
+      willReattachPersistent = selectedBackend.isReattach === true;
     }
   }
-  const willReattachPersistent = persistentSessionName
-    ? effectiveBackendType === 'tmux'
-      ? TmuxBackend.hasSession(persistentSessionName)
-      : effectiveBackendType === 'zellij'
-        ? ZellijBackend.hasSession(persistentSessionName)
-        : HerdrBackend.hasSession(persistentSessionName)
-    : false;
 
   // The plugin set is stable only for the lifetime of one real CLI process.
   // A warm worker reattach keeps the existing Gateway and catalog untouched;
@@ -7325,6 +7358,20 @@ async function spawnCli(
     }
   }
 
+  // Publish the exact selected resource BEFORE spawn. This both restores host
+  // affinity for later in-worker restarts and closes the crash window where a
+  // shared Herdr agent could be created but the daemon still knew only bmx-*.
+  // A failed spawn leaving an intent stamp is safe: lifecycle probes see the
+  // missing agent and close/cold-resume instead of leaking an untracked pane.
+  cfg.persistentBackendTarget = selectedBackend.persistentBackendTarget;
+  if (lastInitConfig) {
+    lastInitConfig.persistentBackendTarget = selectedBackend.persistentBackendTarget;
+  }
+  send({
+    type: 'persistent_backend_target',
+    target: selectedBackend.persistentBackendTarget,
+  });
+
   // Mandatory credential-only confinement is the OUTERMOST launch wrapper so
   // wrapperCli and every descendant it starts inherit the boundary. Full
   // Seatbelt/bwrap sessions were already wrapped above and never enter these
@@ -7493,6 +7540,14 @@ async function spawnCli(
     injectEnv: perBotInjectKeys.length ? perBotInjectEnv : undefined,
     launchShell: lastInitConfig?.launchShell,
   });
+
+  if (selectedBackend.createdHerdrSessionName) {
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      message: `已创建 Botmux 专属 Herdr 会话：\`${selectedBackend.createdHerdrSessionName}\``,
+    });
+  }
 
   // Write CLI PID marker so agent-facing subcommands (`botmux send`, etc.)
   // can verify they were spawned inside a botmux session by walking the
@@ -7771,34 +7826,47 @@ async function spawnCli(
     readySignalTimer.unref?.();
   }
 
+  // A settled signal is a turn boundary. Drain structured transcripts before
+  // markPromptReady(): that call may synchronously flush a type-ahead turn and
+  // advance bridge attribution. Both screen-idle and authoritative Herdr status
+  // must preserve this ordering.
+  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+    if (bridgeJsonlPath) {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+    }
+    if (codexBridgeFallbackActive()) {
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    }
+    if (evidenceSource === 'screen') markPromptReadyFromPty();
+    else markPromptReady();
+  };
+
   // Set up idle detection. Riff (remote HTTP backend) has no PTY output and
   // is marked ready immediately after spawn (see below), so the idle detector
   // is unnecessary — and without a readyPattern it would fire on every
   // quiescence, repeatedly triggering markPromptReady() and duplicate cards.
   if (effectiveBackendType !== 'riff') {
     idleDetector = new IdleDetector(cliAdapter);
-    idleDetector.onIdle(async (evidenceSource) => {
+    idleDetector.onIdle((evidenceSource) => {
       log('Prompt detected (idle)');
-      // Bridge drain MUST run before markPromptReady() — the latter calls
-      // flushPending() which can immediately fire the next queued message
-      // (type-ahead adapters), shifting bridgeQueue's notion of "current
-      // turn" before we've had a chance to emit the previous one.
-      if (bridgeJsonlPath) {
-        try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-      }
-      if (codexBridgeFallbackActive()) {
-        try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
-      }
-      if (evidenceSource === 'screen') {
-        markPromptReadyFromPty();
-      } else {
-        markPromptReady();
-      }
+      drainBridgesThenMarkReady(evidenceSource);
     });
   }
 
   backend.onData(onPtyData);
   const observedBackend = backend;
+  if (observedBackend instanceof HerdrBackend) {
+    observedBackend.onAgentStatus((status) => {
+      if (backend !== observedBackend) return;
+      if (status === 'idle' || status === 'done') {
+        log(`Herdr agent ${status} — draining bridges before marking prompt ready`);
+        drainBridgesThenMarkReady('structured');
+      } else if (status === 'working') {
+        isPromptReady = false;
+        idleDetector?.reset();
+      }
+    });
+  }
   backend.onAccessUrl?.((url) => {
     send({
       type: 'riff_access_url',
@@ -9387,10 +9455,12 @@ process.on('message', async (raw: unknown) => {
 
   switch (msg.type) {
     case 'init': {
+      const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
+      refreshTerminalWriteToken();
       if (msg.ownerOpenId) process.env.__OWNER_OPEN_ID = msg.ownerOpenId;
       // Pin this worker's i18n locale early so every t() call below resolves
       // against the bot's chosen language without each callsite needing to
@@ -9533,12 +9603,13 @@ process.on('message', async (raw: unknown) => {
         }
         if (initialInputCommitted) acknowledgeTurnInputCommitted(msg.turnId);
 
-        // Riff (remote HTTP backends): spawnCli already marked the prompt ready
-        // (no local boot → isPromptReady=true immediately), but the initial prompt
-        // was queued AFTER spawnCli returned, so flushPending() ran on an empty
-        // queue. Flush now that the prompt is enqueued. isPromptReady is already
-        // true so the flush gates all pass.
-        if (effectiveBackendType === 'riff' && pendingMessages.length > 0) {
+        // A backend may become prompt-ready before spawnCli() returns. The
+        // initial prompt is queued only afterwards, so the earlier
+        // markPromptReady() necessarily flushed an empty queue. This is normal
+        // for riff (ready immediately) and can also happen when Herdr reports a
+        // fast-starting TUI as idle during spawn. Flush again after enqueueing;
+        // the ready flag keeps booting/busy backends gated.
+        if (isPromptReady && pendingMessages.length > 0) {
           flushPending();
         }
 
@@ -9548,6 +9619,10 @@ process.on('message', async (raw: unknown) => {
           token: writeToken,
           viewToken,
           ...(capturedSpawnCommand ? { spawnCommand: capturedSpawnCommand } : {}),
+          // A fast initial turn can complete via `botmux send` before Herdr
+          // reports idle and this ready IPC is emitted. Tell the daemon not to
+          // post a stale Starting card after the final reply is already visible.
+          replyAlreadySent: readSendMarkers().some(marker => marker.sentAtMs >= initStartedAtMs),
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });

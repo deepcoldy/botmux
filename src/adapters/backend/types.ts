@@ -1,6 +1,18 @@
 export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
 
 /**
+ * Durable identity of the backing resource owned by one Botmux session.
+ *
+ * Most persistent backends own the whole mux session. Herdr can instead place
+ * a managed agent inside a user's existing session; in that case `agentName`
+ * identifies the pane Botmux owns and the surrounding session must be left
+ * untouched on restore/close paths that run without a live worker.
+ */
+export type PersistentBackendTarget =
+  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  | { backendType: 'herdr'; sessionName: string; agentName?: string };
+
+/**
  * Tri-state result of probing whether a named backing session exists.
  *
  *   - 'exists'  — the probe command succeeded and confirmed a live session.

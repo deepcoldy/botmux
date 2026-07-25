@@ -104,6 +104,8 @@ export interface CardHandlerDeps {
   /** VC meeting invite/consumer card actions. Implemented in daemon to
    *  keep meeting sessions, tombstones, and listener-group state single-owned. */
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
+  codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
 }
@@ -904,6 +906,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data);
+  }
+
+  if (
+    (value?.action === 'codex_notifier_continue' || value?.action === 'codex_notifier_open_app')
+    && larkAppId
+  ) {
+    if (!operatorOpenId) {
+      logger.info(`${value.action} blocked because operator identity is missing`);
+      return { toast: { type: 'error', content: '只有机器人管理员可以操作此 Codex 任务' } };
+    }
+    if (!deps.codexNotifierCardAction) {
+      return { toast: { type: 'error', content: 'Codex 完成通知处理器未启用' } };
+    }
+    return deps.codexNotifierCardAction(data, larkAppId);
   }
 
   if (
@@ -2390,8 +2406,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
     try { selected = JSON.parse(option); } catch { return; }
 
-    // Re-discover to get full session info and validate. Backend determines
-    // which discovery to run (re-confirms the pane + pid are still alive).
+    // Re-discover to get full session info and validate. Keep the same CLI
+    // filter used to build the card so a stale/tampered option cannot switch
+    // this bot to a different agent implementation.
     const botCfg = getBot(ds.larkAppId).config;
     let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
     async function resolveAdoptTarget() {
@@ -2405,9 +2422,20 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, adoptTargetKey } = await import('../../core/session-discovery.js');
-      return discoverAdoptableSessions(botCfg.cliId)
-        .find(s => selected.key
+      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+        const target = active.session.persistentBackendTarget;
+        return active.session.status === 'active'
+          && !active.adoptedFrom
+          && target?.backendType === 'herdr'
+          && !!target.agentName
+          ? [{ sessionName: target.sessionName, agentName: target.agentName }]
+          : [];
+      });
+      return excludeOwnedHerdrAdoptTargets(
+        discoverAdoptableSessions(botCfg.cliId),
+        ownedHerdrTargets,
+      ).find(s => selected.key
           ? adoptTargetKey(s) === selected.key
           : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
     }

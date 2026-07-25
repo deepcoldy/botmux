@@ -4,7 +4,7 @@ import { RiffBackend, type RiffBackendConfig } from './riff-backend.js';
 import { TmuxBackend } from './tmux-backend.js';
 import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
-import type { BackendType, SessionBackend } from './types.js';
+import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
 
 export type BackendGateDecision =
   | { action: 'spawn' }
@@ -63,9 +63,22 @@ export interface SelectedSessionBackend {
    *  like the non-tmux (pty) path — screenshots via the headless renderer, web
    *  terminal via relay — but it owns a persistent zellij session internally. */
   isZellijMode: boolean;
+  persistentSessionName?: string;
+  /** Exact resource owned by this Botmux session; persisted by the daemon. */
+  persistentBackendTarget?: PersistentBackendTarget;
+  isReattach?: boolean;
+  /** Set when this spawn creates its deterministic Botmux-owned Herdr session. */
+  createdHerdrSessionName?: string;
 }
 
-export function selectSessionBackend(opts: { sessionId: string; backendType: BackendType; backendConfig?: RiffBackendConfig }): SelectedSessionBackend {
+export function selectSessionBackend(opts: {
+  sessionId: string;
+  backendType: BackendType;
+  backendConfig?: RiffBackendConfig;
+  /** Migration compatibility for sessions previously placed in a shared user host. */
+  reuseRecordedHerdrTarget?: boolean;
+  persistentBackendTarget?: PersistentBackendTarget;
+}): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
       throw new Error('riff backend requires backendConfig (baseUrl, etc.)');
@@ -86,6 +99,9 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isTmuxMode: false,
       isPipeMode: false,
       isZellijMode: true,
+      persistentSessionName: sessionName,
+      persistentBackendTarget: { backendType: 'zellij', sessionName },
+      isReattach: reattach,
     };
   }
 
@@ -99,21 +115,82 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
   }
 
   if (opts.backendType === 'herdr') {
-    const sessionName = HerdrBackend.sessionName(opts.sessionId);
-    if (HerdrBackend.hasSession(sessionName)) {
+    const ownedSessionName = HerdrBackend.sessionName(opts.sessionId);
+    // A restarted worker must reattach to the SAME shared host selected by the
+    // prior generation. Re-selecting from UI current/default state could pick a
+    // different workspace, start a duplicate CLI there, and orphan
+    // the still-live managed agent in the recorded host. Isolation/MCP callers
+    // explicitly disable shared reuse, so they intentionally ignore this stamp
+    // and converge back to the machine-wide Botmux-managed session.
+    const recorded = opts.reuseRecordedHerdrTarget === false
+      ? undefined
+      : opts.persistentBackendTarget?.backendType === 'herdr'
+        && opts.persistentBackendTarget.agentName
+        ? opts.persistentBackendTarget
+        : undefined;
+    if (recorded) {
+      const hostProbe = HerdrBackend.probeSession(recorded.sessionName);
+      if (hostProbe === 'unknown') {
+        throw new Error(`recorded herdr session ${recorded.sessionName} probe inconclusive`);
+      }
+      if (hostProbe === 'exists') {
+        const agentProbe = HerdrBackend.probeAgent(recorded.sessionName, recorded.agentName!);
+        if (agentProbe === 'unknown') {
+          throw new Error(`recorded herdr agent ${recorded.sessionName}/${recorded.agentName} probe inconclusive`);
+        }
+        const reattach = agentProbe === 'exists';
+        return {
+          backend: new HerdrBackend(recorded.sessionName, {
+            agentName: recorded.agentName,
+            isReattach: reattach,
+            ownsSession: false,
+            ownsAgent: true,
+          }),
+          isTmuxMode: false,
+          isPipeMode: true,
+          isZellijMode: false,
+          persistentSessionName: recorded.sessionName,
+          persistentBackendTarget: recorded,
+          isReattach: reattach,
+        };
+      }
+    }
+
+    if (HerdrBackend.hasSession(ownedSessionName)) {
       return {
-        backend: new HerdrBackend(sessionName, { isReattach: true }),
+        backend: new HerdrBackend(ownedSessionName, { isReattach: true }),
         isTmuxMode: false,
         isPipeMode: true,
         isZellijMode: false,
+        persistentSessionName: ownedSessionName,
+        persistentBackendTarget: { backendType: 'herdr', sessionName: ownedSessionName },
+        isReattach: true,
       };
     }
 
+    // Every fresh agent actively launched by this machine's Botmux shares the
+    // reserved `botmux` Herdr host, regardless of which Lark bot, dashboard, or
+    // other Botmux entry point requested it. Topics remain isolated as distinct
+    // managed agents/panes. /adopt stays bound to its explicit user session.
+    const hostSessionName = HerdrBackend.managedSessionName();
+    const agentName = `botmux-${opts.sessionId.slice(0, 8)}`;
+    const hostExists = HerdrBackend.hasSession(hostSessionName);
+    const reattach = hostExists && HerdrBackend.hasAgent(hostSessionName, agentName);
     return {
-      backend: new HerdrBackend(sessionName, { createSession: true }),
+      backend: new HerdrBackend(hostSessionName, {
+        createSession: !hostExists,
+        agentName,
+        isReattach: reattach,
+        ownsSession: false,
+        ownsAgent: true,
+      }),
       isTmuxMode: false,
       isPipeMode: true,
       isZellijMode: false,
+      persistentSessionName: hostSessionName,
+      persistentBackendTarget: { backendType: 'herdr', sessionName: hostSessionName, agentName },
+      isReattach: reattach,
+      createdHerdrSessionName: hostExists ? undefined : hostSessionName,
     };
   }
 
@@ -124,6 +201,9 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
       isTmuxMode: true,
       isPipeMode: true,
       isZellijMode: false,
+      persistentSessionName: sessionName,
+      persistentBackendTarget: { backendType: 'tmux', sessionName },
+      isReattach: true,
     };
   }
 
@@ -132,5 +212,8 @@ export function selectSessionBackend(opts: { sessionId: string; backendType: Bac
     isTmuxMode: true,
     isPipeMode: true,
     isZellijMode: false,
+    persistentSessionName: sessionName,
+    persistentBackendTarget: { backendType: 'tmux', sessionName },
+    isReattach: false,
   };
 }

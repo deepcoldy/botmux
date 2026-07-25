@@ -50,6 +50,23 @@ describe('Pi initial prompt @file delivery', () => {
     expect(result.readonlyRoot).toBeUndefined();
   });
 
+  it('writes short multiline prompts to @file so Herdr can forward control-free argv on resume', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
+    try {
+      const prompt = '<user_message>\nresume message\n</user_message>';
+      const result = preparePiInitialPromptArg({
+        prompt,
+        sessionId: 'sess-resume',
+        sessionDataDir: dataDir,
+      });
+
+      expect(result.initialPromptArg).toBe(`@${result.filePath}`);
+      expect(readFileSync(result.filePath!, 'utf-8')).toBe(prompt);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('writes long first prompts to a session-lifetime UTF-8 file and passes @file', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-prompt-'));
     try {

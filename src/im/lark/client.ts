@@ -16,6 +16,26 @@ import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.j
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
+export interface LarkRequestOptions {
+  /** Axios 层的真实请求超时；不设置时保持 SDK 原有行为。 */
+  timeoutMs?: number;
+  /** 透传给 Axios，用于在上层截止时间到达时主动取消网络请求。 */
+  signal?: AbortSignal;
+}
+
+function larkRequestDeadline(options?: LarkRequestOptions): {
+  timeout?: number;
+  signal?: AbortSignal;
+} {
+  const timeout = options?.timeoutMs;
+  return {
+    ...(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+      ? { timeout: Math.max(1, Math.floor(timeout)) }
+      : {}),
+    ...(options?.signal ? { signal: options.signal } : {}),
+  };
+}
+
 /**
  * Call a Feishu GET endpoint without a request body.
  *
@@ -31,8 +51,18 @@ type LarkRequestParams = Record<string, string | number | boolean | undefined>;
  * already be interpolated by the caller. Returns the parsed JSON body
  * (`{ code, msg, data }`), identical to the generated method's resolved value.
  */
-export async function larkGet(c: any, url: string, params: LarkRequestParams = {}): Promise<any> {
-  return c.request({ method: 'GET', url, params });
+export async function larkGet(
+  c: any,
+  url: string,
+  params: LarkRequestParams = {},
+  options?: LarkRequestOptions,
+): Promise<any> {
+  return c.request({
+    method: 'GET',
+    url,
+    params,
+    ...larkRequestDeadline(options),
+  });
 }
 
 // Cached lightweight Lark clients for all configured bots (for isInChat checks).
@@ -444,18 +474,35 @@ export async function isHumanOpenId(larkAppId: string, openId: string): Promise<
   }
 }
 
-export async function sendUserMessage(larkAppId: string, openId: string, content: string, msgType: string = 'text'): Promise<string> {
+export async function sendUserMessage(
+  larkAppId: string,
+  openId: string,
+  content: string,
+  msgType: string = 'text',
+  uuid?: string,
+  requestOptions?: LarkRequestOptions,
+): Promise<string> {
   const c = getBotClient(larkAppId);
   const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const data = {
+    receive_id: openId,
+    msg_type: msgType as any,
+    content: body,
+    ...(uuid ? { uuid } : {}),
+  };
 
-  const res = await c.im.v1.message.create({
-    params: { receive_id_type: 'open_id' },
-    data: {
-      receive_id: openId,
-      msg_type: msgType as any,
-      content: body,
-    },
-  });
+  const res = requestOptions
+    ? await c.request({
+      method: 'POST',
+      url: '/open-apis/im/v1/messages',
+      params: { receive_id_type: 'open_id' },
+      data,
+      ...larkRequestDeadline(requestOptions),
+    })
+    : await c.im.v1.message.create({
+      params: { receive_id_type: 'open_id' },
+      data,
+    });
 
   if (res.code !== 0) {
     throw new Error(`Failed to send user message: ${res.msg} (code: ${res.code})`);
@@ -766,7 +813,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } = {},
+  options: { userCardContent?: boolean } & LarkRequestOptions = {},
 ): Promise<any> {
   const c = getBotClient(larkAppId);
   // card_msg_content_type=user_card_content returns the original card JSON
@@ -783,16 +830,23 @@ export async function getMessageDetail(
     // user AND bot senders); without it the server omits them. Matters here for
     // merge_forward sub-messages, whose senders appear nowhere else.
     with_sender_name: 'true',
-  });
+  }, options);
   if (res.code !== 0) {
     throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
   }
   return res.data;
 }
 
-export async function getMessageChatId(larkAppId: string, messageId: string): Promise<string | null> {
+export async function getMessageChatId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
   try {
-    const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
+    const detail = await getMessageDetail(larkAppId, messageId, {
+      userCardContent: false,
+      ...options,
+    });
     const candidates = [
       detail?.items?.[0]?.chat_id,
       detail?.chat_id,
@@ -803,6 +857,9 @@ export async function getMessageChatId(larkAppId: string, messageId: string): Pr
     }
     return null;
   } catch (err) {
+    if (options?.signal?.aborted) {
+      throw options.signal.reason instanceof Error ? options.signal.reason : err;
+    }
     logger.debug(`[message] failed to resolve chat_id for ${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
     return null;
   }

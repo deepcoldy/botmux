@@ -16,6 +16,7 @@ import {
   buildRepoSelectCard,
   buildSessionClosedCard,
   buildRelayPickerCard,
+  buildAdoptSelectCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
   getCliDisplayName,
@@ -66,6 +67,23 @@ function allActions(card: any): any[] {
     .filter((e: any) => e.tag === 'action')
     .flatMap((e: any) => e.actions ?? []);
 }
+
+describe('buildAdoptSelectCard', () => {
+  it('shows the backend instead of repeating the cwd basename', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'herdr',
+      herdrSessionName: 'collie',
+      herdrPaneId: 'w3:p1',
+      cliId: 'pi',
+      cwd: '/Users/test/botmux',
+      paneCols: 200,
+      paneRows: 50,
+    }], 'om_root', 'en'));
+    const option = card.elements[1].actions[0].options[0].text.content;
+    expect(option).toContain('Pi · herdr · collie:w3:p1');
+    expect(option).not.toContain('· botmux ·');
+  });
+});
 
 function expectSidebarUrl(actual: string, targetUrl: string): void {
   const u = new URL(actual);

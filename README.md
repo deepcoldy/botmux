@@ -200,6 +200,7 @@ CLI 进入 botmux 会话时自动获得 `~/.botmux/bin` 在 PATH 中，以及一
 - 添加机器人对齐 Feishu 单次扫码主路径：名称可选且全程冻结，支持 AI CLI / 工作目录选择、管理员 fail-closed 补填与显式兼容模式
 - 拉新群、自动转让群主、@ 提醒
 - 解散群聊、bot 退群（关联会话自动清理）
+- **Codex 独立任务完成通知（实验性、默认关闭）**：macOS 锁屏时由所选 Bot 私聊同步 Codex App/CLI 最终回复，也覆盖 Codex App Side Chat；普通 App 会话可通过飞书回调请求运行 BotMux 的 Mac 打开原会话，或在飞书中接管继续处理，临时 Side Chat 只同步结果。在「设置 → 实验性配置」选择 Bot 与通知时机（[设计与维护说明](docs/design/codex-notifier.md)）
 - **会话洞察**（owner-only，只读）：解析各会话 transcript，看动作 span / 工作时序 / 上下文曲线 / 失败聚合 + 诊断建议；聊天里发 `/insight` 可取当前会话摘要卡
 - **Workflows 管控面**：
   - v3 Run List 与 Run Detail 展示 DAG、节点状态、决策记录和 attempt 终端日志，到 terminal 自动停轮询
