@@ -19,19 +19,19 @@
 
 ## 💬 回复模式（`/reply-mode`）
 
-控制 bot 在当前聊天里被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改（owner 专用）。多 bot 群里需 @ 具体 bot 才生效。
+控制 bot 被 @ 触发时如何开会话。无参数（或 `status`）查看当前模式；带参数修改（owner/allowedUsers 专用，需 `canOperate`；仅查看需 `canTalk`）。群聊中均需 @ 目标 bot 才生效，多 bot 群须 @ 到具体 bot。仅普通群与 1:1 私聊支持；话题群无需设置（本就是话题），命令会被拒绝。
 
-**私聊（1:1 DM）**——只有 `chat` / `topic` 两态：
+**私聊（1:1 DM）**——模式对该 bot 的**所有 DM 生效**（bot 级全局配置，非 per-chat），但不同用户与该 bot 的 DM 仍各自隔离会话、互不共享。只有 `chat` / `topic` 两态（`new-topic` 是 `topic` 的兼容别名）：
 
 | 命令 | 说明 |
 |------|------|
 | `/reply-mode` `/reply-mode status` | 查看当前私聊会话模式 |
-| `/reply-mode chat` | 扁平连续 DM 会话（同一 bot 的 DM 消息共用一个会话） |
-| `/reply-mode topic` | 每条 DM 独立会话/线程（默认） |
+| `/reply-mode chat` | 每个 1:1 私聊内部扁平连续会话（同一 DM 的消息共用一个会话） |
+| `/reply-mode topic` `/reply-mode new-topic` | 每条**顶层** DM 开独立会话/线程（默认）；同一已有 thread 内的回复继续该 thread 会话 |
 
 `shared` / `chat-topic` 依赖群内原生话题，私聊不支持，会被拒绝。
 
-**普通群**——顶层 @ 的开会话方式：
+**普通群**——顶层 @ 的开会话方式（per-chat 覆盖，优先级高于 dashboard 默认值）：
 
 | 命令 | 说明 |
 |------|------|
