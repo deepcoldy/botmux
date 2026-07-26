@@ -24,6 +24,7 @@ import {
 import {
   __testOnly_resetBotTurnMutationGates,
   withBotTurnAdmission,
+  withBotTurnMutation,
 } from '../src/core/bot-turn-mutation-gate.js';
 
 function ds(sessionId: string, backendType: string, lastMessageAt: number, worker = {}) {
@@ -255,6 +256,50 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     expect(suspended.map(entry => entry.sessionId)).toEqual(['b']);
     expect(a.worker).not.toBe(null);
     expect(b.worker).toBe(null);
+  });
+
+  it('queues a Codex App cap sweep behind a same-admission mutation and preserves its durable owner', async () => {
+    const appId = 'cli_same_admission';
+    const owned = ds('owned', 'tmux', now - 90 * 60_000);
+    owned.session.codexAppDispatchLedger = [
+      { dispatchId: 'd-owned', turnId: 't-owned', state: 'accepted', content: 'owned' },
+    ];
+    const next = ds('next', 'tmux', now - 80 * 60_000);
+    const newest = ds('newest', 'tmux', now - 10 * 60_000);
+    const activeSessions = new Map<string, any>([
+      ['owned', owned],
+      ['next', next],
+      ['newest', newest],
+    ]);
+    let releaseFirst!: () => void;
+    const holdFirst = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let firstStarted!: () => void;
+    const started = new Promise<void>(resolve => { firstStarted = resolve; });
+
+    const admitted = withBotTurnAdmission(appId, async () => {
+      const firstMutation = withBotTurnMutation(appId, async () => {
+        firstStarted();
+        await holdFirst;
+      });
+      const sweep = sweepIdleWorkersAfterTurnDrain(appId, activeSessions, {
+        maxLiveWorkers: 2,
+        mutationAcquireTimeoutMs: 1_000,
+      });
+      const [, suspended] = await Promise.all([firstMutation, sweep]);
+      return suspended;
+    });
+
+    await started;
+    await Promise.resolve();
+    const stayedLiveWhileQueued = next.worker !== null;
+    releaseFirst();
+    expect(stayedLiveWhileQueued).toBe(true);
+
+    await expect(admitted).resolves.toEqual([
+      { sessionId: 'next', reason: 'live_worker_cap' },
+    ]);
+    expect(owned.worker).not.toBe(null);
+    expect(next.worker).toBe(null);
   });
 
   it('skips a sweep after a bounded wait instead of freezing the bot mutation gate', async () => {
