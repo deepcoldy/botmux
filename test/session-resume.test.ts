@@ -144,7 +144,7 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
+import { restoreActiveSessions, resumeSession, retryQuarantinedActivationTailPromotion } from '../src/core/session-manager.js';
 import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker, promoteQueuedActivationTail } from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -828,11 +828,13 @@ describe('resumeSession', () => {
       expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalled();
       // On-disk row stays active (retained for inspection/retry, not closed away).
       expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
-      // SELF-HEAL enabler: initialStartPending must be false so the next inbound
-      // can claim the cold owner (tryAcquireInitialStartClaim bails when it is
-      // true) → fork → retry promotion. Left true, the session would wedge on
-      // the admission gate (append-tail-and-return) forever until /close.
-      expect(ds!.initialStartPending).toBe(false);
+      // Gate MUST stay up (initialStartPending true) — the old tail head must not
+      // be overtaken by a later turn. The retry happens at the next fork boundary
+      // (toReattach blank fork / daemon inbound refork), not by clearing the gate.
+      expect(ds!.initialStartPending).toBe(true);
+      // Marked for fork-boundary retry so a blank fork retries promotion first
+      // and skips forking if it still fails (never live-worker + unpromoted tail).
+      expect(ds!.quarantinedActivationTailPromotion).toBe(true);
     });
 
     it('leaves initialStartPending TRUE for a normal (non-quarantine) tail promotion at restore', async () => {
@@ -864,5 +866,46 @@ describe('resumeSession', () => {
       // Gate stays up: a real tokened activation is in flight.
       expect(ds!.initialStartPending).toBe(true);
     });
+  });
+});
+
+describe('retryQuarantinedActivationTailPromotion (fork-boundary retry)', () => {
+  beforeEach(() => {
+    vi.mocked(promoteQueuedActivationTail).mockReset();
+    vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
+  });
+
+  function quarantinedDs(): DaemonSession {
+    return {
+      session: {
+        sessionId: 'sid-q', chatId: 'oc', rootMessageId: 'om', status: 'active',
+        queuedActivationTail: [{ id: 't1', order: 1, userPrompt: 'p', cliInput: { content: 'p' }, turnId: 'turn-1' }],
+      },
+      worker: null, larkAppId: 'app_test', quarantinedActivationTailPromotion: true,
+    } as unknown as DaemonSession;
+  }
+
+  it('returns true and clears the flag when the retry promotion SUCCEEDS (safe to fork the promoted head)', () => {
+    const ds = quarantinedDs();
+    vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
+    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(true);
+    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+    expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalledWith(ds, { send: false });
+  });
+
+  it('returns FALSE and keeps the flag when the retry promotion still FAILS (caller must skip the fork)', () => {
+    const ds = quarantinedDs();
+    vi.mocked(promoteQueuedActivationTail).mockReturnValue(false);
+    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(false);
+    // Still quarantined so a later boundary retries; NEVER fork now (avoids a
+    // live worker beside an unpromoted tail).
+    expect(ds.quarantinedActivationTailPromotion).toBe(true);
+  });
+
+  it('is a no-op (returns true) for a non-quarantined session — never touches promotion', () => {
+    const ds = quarantinedDs();
+    ds.quarantinedActivationTailPromotion = undefined;
+    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(true);
+    expect(vi.mocked(promoteQueuedActivationTail)).not.toHaveBeenCalled();
   });
 });

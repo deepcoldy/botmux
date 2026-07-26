@@ -88,6 +88,13 @@ export interface DaemonSession {
    * reached the first fork yet. Same-anchor turns must buffer into the opening
    * input instead of reforking worker:null and overtaking it. In-memory only. */
   initialStartPending?: boolean;
+  /** Restore quarantine: a durable activation-tail promotion failed transiently
+   * during restoreActiveSessions, so the row was registered with its tail
+   * un-promoted. The next fork boundary (toReattach blank fork / daemon inbound
+   * refork) must retry the promotion BEFORE forking and skip a blank fork if it
+   * still fails — never leave a live worker beside an unpromoted tail. Cleared
+   * once promotion succeeds. In-memory only. */
+  quarantinedActivationTailPromotion?: boolean;
   /** Generation token for the handler that atomically reserved a worker:null
    * refork. Later same-anchor handlers may prepare concurrently, but only this
    * owner may cross the fork boundary; followers buffer behind its gate. */

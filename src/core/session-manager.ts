@@ -1300,6 +1300,35 @@ export function shouldAutoForkOnRestore(backendType: BackendType): boolean {
   return backendType !== 'pty';
 }
 
+/**
+ * Fork-boundary retry for a tail-only quarantine (a restore-time durable
+ * activation-tail promotion that failed transiently, leaving the tail
+ * un-promoted with the gate held). MUST be called before any blank / opening
+ * fork of such a session.
+ *
+ * Returns true when it is now safe to fork: either the session was not
+ * quarantined, or the retry promoted the old head into the tokened journal (so
+ * a subsequent fork carries the promoted head, never a later turn). Returns
+ * false when the retry still failed — the caller MUST skip the fork and keep the
+ * worker:null quarantined owner, so a blank fork never leaves a live worker
+ * beside an unpromoted tail (which would permanently wedge the admission gate).
+ *
+ * Idempotent: `promoteQueuedActivationTail` short-circuits true once the head is
+ * already pending, and the quarantine flag is cleared on success.
+ */
+export function retryQuarantinedActivationTailPromotion(ds: DaemonSession): boolean {
+  if (!ds.quarantinedActivationTailPromotion) return true;
+  if (!promoteQueuedActivationTail(ds, { send: false })) {
+    logger.warn(
+      `[${ds.session.sessionId.substring(0, 8)}] Quarantined activation-tail promotion still failing at `
+      + `fork boundary; keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
+    );
+    return false;
+  }
+  ds.quarantinedActivationTailPromotion = undefined;
+  return true;
+}
+
 const RECOVERY_FORK_BATCH_SIZE = config.daemon.recoveryForkBatchSize ?? 5;
 const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
 
@@ -1686,11 +1715,20 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       logger.warn(
         `[${session.sessionId.substring(0, 8)}] Deferred durable activation-tail promotion `
         + `(transient persistence failure); registering as a quarantined owner so `
-        + `it stays visible/closeable and retries promotion on next activation`,
+        + `it stays visible/closeable and retries promotion at the next fork boundary`,
       );
     }
     const anchor = sessionAnchorId(ds);
-    if (quarantinedActivationTailPromotion) ds.initialStartPending = false;
+    // A tail-only quarantine (promotion failed above) must NOT clear its gate:
+    // the invariant is "retry the old head's promotion at the next fork boundary;
+    // on failure keep owning the gate; never let a later turn overtake". The
+    // eager `toReattach` blank fork and the daemon inbound refork are the two
+    // fork boundaries; both retry `promoteQueuedActivationTail` before forking
+    // (see the toReattach callback below and daemon's activation path). Mark the
+    // runtime so the toReattach fork retries first and skips the blank fork if it
+    // still fails — a blank fork here would leave a live worker beside an
+    // unpromoted tail, permanently wedging the gate.
+    if (quarantinedActivationTailPromotion) ds.quarantinedActivationTailPromotion = true;
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
@@ -1839,6 +1877,12 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   await staggeredRecoveryFork(
     toReattach,
     (ds) => {
+      // Quarantined tail-only owner: retry its failed promotion BEFORE the blank
+      // fork. If the retry still fails, skip forking entirely and keep the
+      // worker:null owner — a blank fork here would leave a LIVE worker beside an
+      // unpromoted tail, and the daemon inbound path (seeing a live worker) would
+      // then only append later turns to the tail, never retrying → permanent wedge.
+      if (!retryQuarantinedActivationTailPromotion(ds)) return;
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;

@@ -171,6 +171,7 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
   closeCliMismatchedSessionsForBot,
+  retryQuarantinedActivationTailPromotion,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import {
@@ -16929,6 +16930,29 @@ async function handleThreadReplyAdmitted(data: any, ctx: RoutingContext): Promis
       `[${tag(ds)}] buffered same-anchor turn ${parsed.messageId.substring(0, 12)} `
       + 'behind queued activation submission ACK',
     );
+    // Quarantined tail-only owner (restore promotion failed transiently): the
+    // current turn is now safely appended BEHIND the retained tail via its
+    // reservation, so retry the old head's promotion. On success, promote the
+    // exact old head into the tokened journal and cold-fork THAT (never the
+    // current turn — the invariant is the old head must not be overtaken). On
+    // failure keep the current turn in the tail and stay quarantined for a later
+    // retry. Only worker:null owners reach here (a live worker would have skipped
+    // this gate); the toReattach path handles the eager-fork case.
+    if (ds.quarantinedActivationTailPromotion && (!ds.worker || ds.worker.killed)) {
+      // The current turn is now safely appended BEHIND the retained tail (via its
+      // reservation above), so retry the old head's promotion. On success, the
+      // old head is in the tokened journal and we cold-fork THAT (never the
+      // current turn — the old head must not be overtaken). On failure the current
+      // turn stays parked in the tail and the session stays quarantined.
+      if (retryQuarantinedActivationTailPromotion(ds)) {
+        ds.initialStartPending = true;
+        const availableBots = await getAvailableBots(larkAppId, ctxChatId ?? data?.message?.chat_id);
+        forkReservedInitialSession(ds, availableBots);
+        logger.info(`[${tag(ds)}] Quarantined activation-tail promotion recovered on inbound; cold-forked promoted head`);
+      } else {
+        logger.warn(`[${tag(ds)}] Quarantined activation-tail promotion still failing on inbound; current turn parked behind old tail, staying quarantined`);
+      }
+    }
     return;
   }
   if (ds?.pendingRepo || initialStartPending) {
