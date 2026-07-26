@@ -35,10 +35,66 @@ export type {
  * hold a bot-turn admission or maintenance mutation indefinitely. */
 export const LARK_REQUEST_TIMEOUT_MS = 15_000;
 
+/** Media uploads (image/file) ride the same official-SDK path but move real
+ * bytes: a 30 MB video on a modest uplink legitimately exceeds the interactive
+ * request bound. They also run in the `botmux send` CLI subprocess, which holds
+ * no daemon admission/mutation lock, so the interactive timeout's protective
+ * purpose does not apply to them. Give uploads a far looser ceiling. */
+export const LARK_UPLOAD_TIMEOUT_MS = 120_000;
+
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
     ?.httpInstance?.defaults;
   if (defaults) defaults.timeout = LARK_REQUEST_TIMEOUT_MS;
+}
+
+/**
+ * A dedicated SDK http instance for media uploads. The official SDK shares ONE
+ * module-level axios singleton across every `Client` (verified: two clients
+ * report the same `httpInstance`), and its typed `image.create`/`file.create`
+ * expose no per-request timeout hook — so the only knob for uploads is a
+ * separate instance. `defaultHttpInstance.create()` yields an independent axios
+ * (its own `defaults`, not the shared one); we copy the SDK's own request UA and
+ * response-unwrap interceptors so upload responses (`res.data` → `image_key`)
+ * behave identically. Falls back to leaving the client on the shared instance
+ * if the SDK ever stops exporting `defaultHttpInstance`, so a future SDK bump
+ * degrades to "uploads keep the interactive timeout" rather than breaking.
+ */
+let cachedLarkUploadHttpInstance: unknown;
+export function larkUploadHttpInstance(): unknown {
+  if (cachedLarkUploadHttpInstance !== undefined) return cachedLarkUploadHttpInstance;
+  let base: any;
+  try {
+    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
+  } catch {
+    // A stripped/mocked SDK namespace may throw on accessing an absent export.
+    base = undefined;
+  }
+  if (!base || typeof base.create !== 'function') {
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  const instance = base.create({ timeout: LARK_UPLOAD_TIMEOUT_MS });
+  try {
+    for (const handler of base.interceptors?.request?.handlers ?? []) {
+      if (handler) {
+        instance.interceptors.request.use(handler.fulfilled, handler.rejected, {
+          synchronous: handler.synchronous,
+        });
+      }
+    }
+    for (const handler of base.interceptors?.response?.handlers ?? []) {
+      if (handler) instance.interceptors.response.use(handler.fulfilled, handler.rejected);
+    }
+  } catch {
+    // A shape change in the SDK's interceptor registry must not brick uploads;
+    // an instance without the response-unwrap interceptor would misread
+    // responses, so fall back to the shared instance (interactive timeout).
+    cachedLarkUploadHttpInstance = null;
+    return cachedLarkUploadHttpInstance;
+  }
+  cachedLarkUploadHttpInstance = instance;
+  return cachedLarkUploadHttpInstance;
 }
 
 export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
@@ -1307,6 +1363,9 @@ export interface BotConfig {
 export interface BotState {
   config: BotConfig;
   client: Lark.Client;
+  /** Same credentials/domain as `client`, but bound to a dedicated http
+   * instance with the looser upload timeout. Only media uploads use it. */
+  uploadClient: Lark.Client;
   botOpenId?: string;
   botName?: string;       // Lark app display name (from /bot/v3/info)
   botAvatarUrl?: string;  // Lark app avatar URL (from /bot/v3/info)
@@ -1322,6 +1381,7 @@ export function __testOnly_resetBotRegistry(): void {
   loadedConfigPath = undefined;
   oncallChatCache = null;
   brandLabelCache = null;
+  cachedLarkUploadHttpInstance = undefined;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1408,18 +1468,27 @@ const larkLogger = {
 };
 
 export function registerBot(cfg: BotConfig): BotState {
-  const client = new Lark.Client({
+  const clientParams = {
     appId: cfg.larkAppId,
     appSecret: cfg.larkAppSecret,
     // brand → SDK domain。缺省走 feishu，国际版租户走 larksuite.com。
     // 这一行同时修好了所有经由 SDK 的调用（发消息 / 文件 / contact 等）。
     domain: sdkDomain(normalizeBrand(cfg.brand)),
     logger: larkLogger,
-  });
+  };
+  const client = new Lark.Client(clientParams);
   configureLarkClientHttpTimeout(client);
+  // Media uploads reuse the same credentials/domain but ride a dedicated http
+  // instance with the looser upload timeout. When the SDK no longer exposes a
+  // separable instance, fall back to the interactive client (uploads keep 15s).
+  const uploadHttpInstance = larkUploadHttpInstance();
+  const uploadClient = uploadHttpInstance
+    ? new Lark.Client({ ...clientParams, httpInstance: uploadHttpInstance as any })
+    : client;
   const state: BotState = {
     config: cfg,
     client,
+    uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
   };
@@ -1443,6 +1512,12 @@ export function getBot(larkAppId: string): BotState {
 
 export function getBotClient(larkAppId: string): Lark.Client {
   return getBot(larkAppId).client;
+}
+
+/** Client bound to the looser upload timeout. Use only for media uploads
+ * (image/file); every other call uses `getBotClient` and its interactive bound. */
+export function getBotUploadClient(larkAppId: string): Lark.Client {
+  return getBot(larkAppId).uploadClient;
 }
 
 /** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */

@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
+import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent } from '../../services/hook-runner.js';
@@ -957,7 +957,7 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 };
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
-  const c = getBotClient(larkAppId);
+  const c = getBotUploadClient(larkAppId);
   const buf = readFileSync(imagePath);
   // SDK returns { image_key } directly (not wrapped in { code, data })
   const res = await c.im.v1.image.create({
@@ -970,7 +970,7 @@ export async function uploadImage(larkAppId: string, imagePath: string): Promise
 }
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
-  const c = getBotClient(larkAppId);
+  const c = getBotUploadClient(larkAppId);
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
   const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';

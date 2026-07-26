@@ -54,6 +54,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
+  // Default: promotion succeeds. A specific test overrides this to false to
+  // exercise the restore-time transient-failure quarantine path.
+  promoteQueuedActivationTail: vi.fn(() => true),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   // Faithful: mirror the real setActiveSessionSafe — if a DIFFERENT entry
   // already holds the key, evict it (close) before setting, instead of a
@@ -142,7 +145,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
-import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker } from '../src/core/worker-pool.js';
+import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker, promoteQueuedActivationTail } from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
@@ -155,6 +158,8 @@ beforeEach(() => {
   sessionStore.init();
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(promoteQueuedActivationTail).mockReset();
+  vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -782,6 +787,47 @@ describe('resumeSession', () => {
       expect(r.ds.session.cliId).toBe('codex');
       expect(r.ds.workingDir).toBe('/srv/app');
       expect(r.ds.ownerOpenId).toBe('ou_owner');
+    });
+
+    it('registers a visible quarantined owner (not an invisible orphan) when restore-time activation-tail promotion fails transiently', async () => {
+      // Regression for the P2 fix: a transient durable-write failure during
+      // restore must NOT throw the row into the isolation catch unregistered.
+      // Before the fix, the row stayed active-on-disk but absent from the Map,
+      // so IM `/close` could not reach it and a later inbound to the same anchor
+      // minted a second active row while this one's tail dangled.
+      const s = sessionStore.createSession('oc_chatQ', 'om_quarantine', 'Quarantine Topic', 'group');
+      s.larkAppId = 'app_test';
+      s.workingDir = '/tmp/proj';
+      s.cliId = 'codex-app';
+      s.scope = 'thread';
+      s.status = 'active';
+      s.hasHistory = true;
+      s.queuedActivationTail = [{
+        id: 'tail-1',
+        order: 1,
+        userPrompt: 'held follow-up',
+        cliInput: { content: 'held follow-up' },
+        turnId: 'turn-held',
+      }] as any;
+      s.queuedActivationTailNextOrder = 1;
+      sessionStore.updateSession(s);
+
+      // Simulate the transient persistence failure inside promotion.
+      vi.mocked(promoteQueuedActivationTail).mockReturnValue(false);
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      // The row is registered (visible + anchor-occupied + closeable), NOT dropped.
+      const ds = map.get(sessionKey('om_quarantine', 'app_test'));
+      expect(ds).toBeDefined();
+      expect(ds!.session.sessionId).toBe(s.sessionId);
+      // Its unpromoted tail is retained for a later retry.
+      expect(ds!.session.queuedActivationTail?.length).toBe(1);
+      // Promotion was attempted (send:false, worker-null restore path).
+      expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalled();
+      // On-disk row stays active (retained for inspection/retry, not closed away).
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
     });
   });
 });

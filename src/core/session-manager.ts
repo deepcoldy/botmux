@@ -1660,7 +1660,20 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     if (!ds.session.queuedActivationPending
       && (ds.session.queuedActivationTail?.length ?? 0) > 0
       && !promoteQueuedActivationTail(ds, { send: false })) {
-      throw new Error(`failed to promote durable activation tail for ${session.sessionId}`);
+      // Promotion here only fails on a transient durable-write error (send:false
+      // skips the worker-liveness gate, and the caller already checked a non-empty
+      // tail). Throwing would drop to the isolation catch below WITHOUT registering
+      // the row — leaving it active-on-disk but invisible to activeSessions, so IM
+      // `/close` cannot reach it and a later inbound to the same anchor mints a
+      // second active row while this one's tail dangles. Instead register it as a
+      // visible quarantined owner: the unpromoted tail keeps protected ownership
+      // (occupies the anchor, blocks a duplicate, stays closeable), and the normal
+      // activation path retries the promotion once the durable store recovers.
+      logger.warn(
+        `[${session.sessionId.substring(0, 8)}] Deferred durable activation-tail promotion `
+        + `(transient persistence failure); registering as a quarantined owner so `
+        + `it stays visible/closeable and retries on next activation`,
+      );
     }
     const anchor = sessionAnchorId(ds);
     messageQueue.ensureQueue(anchor);
