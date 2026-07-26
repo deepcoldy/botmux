@@ -302,6 +302,10 @@ import {
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 import { sendWorkerIpc } from './worker-ipc.js';
+import {
+  managedOriginCapabilityPath,
+  replaceManagedOriginCapabilityFile,
+} from './managed-origin-capability.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -7916,8 +7920,47 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Dropped managed_turn_origin with mismatched sessionId`);
           break;
         }
+        // macOS uses one stable per-session pathname visible inside Seatbelt.
+        // Only the daemon handler for the CURRENT ChildProcess generation may
+        // replace it. Stale workers can still emit IPC, but the identity guard
+        // above drops them before filesystem mutation, so they cannot overwrite
+        // a successor capability (or unlink it during teardown).
+        if (process.platform === 'darwin' && msg.originChannelId) {
+          if (!/^[a-f0-9]{64}$/.test(msg.originChannelId)) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Refused managed origin publication with an invalid pane channel`);
+            break;
+          }
+          try {
+            const ipcPort = Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+            replaceManagedOriginCapabilityFile(
+              managedOriginCapabilityPath(
+                config.session.dataDir,
+                msg.sessionId,
+                msg.originChannelId,
+              ),
+              JSON.stringify({
+                sessionId: msg.sessionId,
+                channelId: msg.originChannelId,
+                capability: msg.capability,
+                ...(Number.isSafeInteger(ipcPort) && ipcPort > 0 && ipcPort <= 65_535
+                  ? { ipcPort }
+                  : {}),
+                ...(msg.turnId ? { turnId: msg.turnId } : {}),
+                ...(msg.dispatchAttempt !== undefined
+                  ? { dispatchAttempt: msg.dispatchAttempt }
+                  : {}),
+              }),
+            );
+          } catch (err) {
+            ds.managedTurnOrigin = undefined;
+            logger.error(`[${t}] Failed to publish daemon-owned managed origin capability: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          }
+        }
         ds.managedTurnOrigin = {
           capability: msg.capability,
+          ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
@@ -7941,6 +7984,12 @@ function setupWorkerHandlers(
           && ds.managedTurnOrigin?.capability
           && ds.managedTurnOrigin.capability !== msg.capability) {
           logger.warn(`[${t}] Ignored stale managed turn origin revoke after capability rotation`);
+          break;
+        }
+        if (msg.originChannelId
+          && ds.managedTurnOrigin?.originChannelId
+          && ds.managedTurnOrigin.originChannelId !== msg.originChannelId) {
+          logger.warn(`[${t}] Ignored managed_turn_origin_revoked for a different pane channel`);
           break;
         }
         if (!msg.capability && ds.managedTurnOrigin

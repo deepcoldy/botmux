@@ -1,7 +1,7 @@
 // src/core/dashboard-ipc-server.ts
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
@@ -10,6 +10,12 @@ import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-aut
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
+import {
+  MANAGED_ORIGIN_ATTEST_ROUTE,
+  MANAGED_ORIGIN_PROOF_DOMAIN,
+  MANAGED_ORIGIN_PROOF_TTL_MS,
+  writeManagedOriginAttestationProof,
+} from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -24,6 +30,7 @@ import * as backendTypeStore from '../services/backend-type-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
+import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -577,6 +584,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
+  // macOS read-isolated `botmux send` presents a rotating worker capability;
+  // the handler writes the authoritative tuple into a host-owned read-only
+  // proof sidecar, so loopback response spoofing cannot confer authority.
+  if (method === 'POST' && pathname === MANAGED_ORIGIN_ATTEST_ROUTE) return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
   // protocol (request signature over method/path/exact body with nonce
   // anti-replay + boot audience, signed response), keyed on the same host
@@ -644,6 +655,168 @@ ipcRoute('GET', '/healthz', (_req, res) => {
     return jsonRes(res, 503, { ok: false, status: 'starting' });
   }
   jsonRes(res, 200, { ok: true });
+});
+
+const MANAGED_ORIGIN_ATTEST_BODY_MAX_BYTES = 2 * 1024;
+const MANAGED_ORIGIN_ATTEST_BODY_TIMEOUT_MS = 1_000;
+const MANAGED_ORIGIN_ATTEST_MAX_PREAUTH_IN_FLIGHT = 128;
+const MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION = 64;
+const managedOriginOutstandingProofs = new Map<string, number>();
+let managedOriginPreauthInFlight = 0;
+
+async function handleManagedOriginAttestation(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  let body: {
+    sessionId?: unknown;
+    originChannelId?: unknown;
+    channelId?: unknown;
+    originCapability?: unknown;
+    nonce?: unknown;
+  };
+  try {
+    body = await readBoundedJsonBody(
+      req,
+      MANAGED_ORIGIN_ATTEST_BODY_MAX_BYTES,
+      MANAGED_ORIGIN_ATTEST_BODY_TIMEOUT_MS,
+    );
+  }
+  catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(
+      res,
+      err instanceof IpcBodyTooLargeError
+        ? 413
+        : err instanceof IpcBodyTimeoutError
+          ? 408
+          : 400,
+      {
+        ok: false,
+        error: err instanceof IpcBodyTooLargeError
+          ? 'body_too_large'
+          : err instanceof IpcBodyTimeoutError
+            ? 'body_timeout'
+            : 'bad_json',
+      },
+    );
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_attestation_request' });
+  }
+  const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
+    ? body.sessionId
+    : '';
+  const capability = typeof body.originCapability === 'string'
+    && /^[a-f0-9]{32,128}$/i.test(body.originCapability)
+    ? body.originCapability
+    : '';
+  const channelId = typeof (body.originChannelId ?? body.channelId) === 'string'
+    && /^[a-f0-9]{64}$/.test((body.originChannelId ?? body.channelId) as string)
+    ? (body.originChannelId ?? body.channelId) as string
+    : '';
+  const nonce = typeof body.nonce === 'string' && /^[a-f0-9]{64}$/.test(body.nonce)
+    ? body.nonce
+    : '';
+  if (!sessionId || !channelId || !capability || !nonce) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_attestation_request' });
+  }
+  const ds = findActiveBySessionId(sessionId);
+  const worker = ds?.worker;
+  let workerPidLive = false;
+  if (worker && Number.isSafeInteger(worker.pid) && (worker.pid ?? 0) > 0) {
+    try {
+      process.kill(worker.pid!, 0);
+      workerPidLive = true;
+    } catch { /* ESRCH/EPERM/invalid pid all fail closed */ }
+  }
+  const workerLive = !!worker
+    && worker.connected === true
+    && !worker.killed
+    && worker.exitCode === null
+    && worker.signalCode === null
+    && workerPidLive;
+  const liveTurnId = ds?.managedTurnOrigin?.turnId;
+  const verified = authorizeSessionScopedIpc({
+    trustedHost: false,
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: true,
+    sessionId,
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: capability,
+  });
+  if (!verified.ok || !ds?.managedTurnOrigin || !liveTurnId || !workerLive) {
+    return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+  }
+  const origin = ds.managedTurnOrigin;
+  if (!origin.originChannelId || !/^[a-f0-9]{64}$/.test(origin.originChannelId)) {
+    return jsonRes(res, 403, { ok: false, error: 'origin_channel_unproven' });
+  }
+  if (channelId !== origin.originChannelId) {
+    return jsonRes(res, 403, { ok: false, error: 'origin_channel_unproven' });
+  }
+  const codexDecision = validateCodexAppManagedSendOrigin(
+    ds.session.codexAppDispatchLedger,
+    origin,
+    ds.initConfig?.cliId === 'codex-app' || ds.session.cliId === 'codex-app',
+  );
+  if (!codexDecision.ok) {
+    return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+  }
+  const outstanding = managedOriginOutstandingProofs.get(sessionId) ?? 0;
+  if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
+    return jsonRes(res, 429, { ok: false, error: 'too_many_attestations' });
+  }
+  let proofPath: string;
+  try {
+    proofPath = writeManagedOriginAttestationProof({
+      dataDir: config.session.dataDir,
+      proof: {
+        domain: MANAGED_ORIGIN_PROOF_DOMAIN,
+        version: 1,
+        nonce,
+        channelId: origin.originChannelId,
+        sessionId,
+        turnId: liveTurnId,
+        ...(origin.dispatchAttempt !== undefined
+          ? { dispatchAttempt: origin.dispatchAttempt }
+          : {}),
+        requiresCodexAppLedger: codexDecision.requiresLedger,
+        issuedAtMs: Date.now(),
+      },
+    });
+  } catch (err) {
+    logger.warn(`[managed-origin] could not write attestation proof: ${err}`);
+    return jsonRes(res, 409, { ok: false, error: 'proof_unavailable' });
+  }
+  managedOriginOutstandingProofs.set(sessionId, outstanding + 1);
+  const cleanupTimer = setTimeout(() => {
+    try { unlinkSync(proofPath); } catch { /* expired/already gone */ }
+    const remaining = (managedOriginOutstandingProofs.get(sessionId) ?? 1) - 1;
+    if (remaining > 0) managedOriginOutstandingProofs.set(sessionId, remaining);
+    else managedOriginOutstandingProofs.delete(sessionId);
+  }, MANAGED_ORIGIN_PROOF_TTL_MS + 1_000);
+  cleanupTimer.unref?.();
+  return jsonRes(res, 200, { ok: true });
+}
+
+ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
+  // This counter is acquired before parsing or capability lookup.  Per-session
+  // proof quotas cannot protect the unauthenticated slow-body phase because a
+  // session id is not trustworthy until the complete request has been read.
+  if (managedOriginPreauthInFlight >= MANAGED_ORIGIN_ATTEST_MAX_PREAUTH_IN_FLIGHT) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 429, { ok: false, error: 'too_many_attestation_requests' });
+  }
+  managedOriginPreauthInFlight += 1;
+  try {
+    await handleManagedOriginAttestation(req, res);
+  } finally {
+    managedOriginPreauthInFlight -= 1;
+  }
 });
 
 // ─── Session list / detail ─────────────────────────────────────────────────
@@ -4063,26 +4236,104 @@ ipcRoute('PUT', '/api/bot-sandbox-paths', async (req, res) => {
 // unreadable). The macOS counterpart of the file sandbox above.
 ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const larkAppId = cachedLarkAppId;
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
   const enable = body.enabled === true;
-  // The worker FAIL-CLOSES (refuses to start the session) for a configured
-  // readIsolation that can't be enforced: non-darwin, an adapter without
-  // supportsReadIsolation, or a wrapperCli gateway. Reject enabling it in exactly
-  // those cases so the toggle can never brick the bot's next session. (Turning it
-  // OFF is always allowed — recovers a flag that became unenforceable.)
-  if (enable && !readIsolationEnforceable(cachedLarkAppId)) {
-    return jsonRes(res, 400, { ok: false, error: 'read_isolation_unenforceable' });
-  }
-  const r = await sandboxStore.updateBotReadIsolation(cachedLarkAppId, enable);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  // Read isolation only takes effect at COLD spawn (provisionIsolatedBotHome +
-  // Seatbelt wrapper run then). Suspend this bot's active sessions so the next
-  // message cold-restarts under the new state — otherwise close+resume would keep
-  // running the old, un-provisioned state and the toggle would silently no-op.
-  const suspendedSessions = await suspendActiveSessionsForBot(cachedLarkAppId);
-  jsonRes(res, 200, { ok: true, readIsolation: r.readIsolation, suspendedSessions });
+  return withBotTurnMutation(larkAppId, async () => {
+    // An idempotent request changes neither the durable policy nor any pane.
+    // Return before pending/active/teardown guards so a dashboard refresh that
+    // repeats the authoritative value cannot be rejected merely because the
+    // bot is doing work.
+    if (sandboxStore.getBotReadIsolation(larkAppId) === enable) {
+      return jsonRes(res, 200, {
+        ok: true,
+        readIsolation: enable,
+        suspendedSessions: 0,
+        changed: false,
+      });
+    }
+    // Close admission first and drain handlers that may already be awaiting
+    // downloads/noteTurnReceived. Ledger preflight alone cannot see those
+    // pre-accept turns; draining prevents a post-sweep send into a killed ds.
+    const activeBotSessions = listActiveSessions().filter(ds => ds.larkAppId === larkAppId);
+    // Registry state alone is insufficient: partial restore, an anchor
+    // collision, or a failed staggered reattach can omit a durable active row
+    // while its persistent pane still survives. Consult the same persisted
+    // session source a restart will hydrate. Legacy unscoped active rows are
+    // conservatively treated as this daemon's until explicitly closed.
+    const persistedBotSessions = sessionStore.listSessions().filter(session =>
+      session.larkAppId === larkAppId || !session.larkAppId,
+    );
+    const persistedActiveBotSessions = persistedBotSessions.filter(session =>
+      session.status === 'active',
+    );
+    if (rejectProtectedSessionMutation(res, [
+      ...activeBotSessions,
+      ...persistedActiveBotSessions,
+    ])) return;
+    // Crash-transactional safety boundary: bots.json is the restart source of
+    // truth, while a live tmux/herdr/zellij pane retains its old in-memory
+    // Seatbelt profile. Persisting the new flag before tearing those panes down
+    // creates an unrecoverable crash window because the restart path cannot
+    // prove which exact read/write isolation profile a surviving pane runs.
+    // Require explicit close first; with no active logical session there is no
+    // owned pane a restart can reattach under the newly persisted policy.
+    if (activeBotSessions.length > 0 || persistedActiveBotSessions.length > 0) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: 'read_isolation_active_sessions',
+      });
+    }
+    // `/close` intentionally returns after sending worker close IPC and marking
+    // the row closed; persistent-pane destruction can lag. A closed row's pid
+    // is deliberately not probed: PID alone has no birth identity and may have
+    // been reused by an unrelated process. closeSession clears it atomically.
+    // For current rows, the stamped persistent backend is the teardown proof.
+    // Pre-stamp closed rows are not synchronously probed across three CLIs here:
+    // that legacy shell fan-out blocks the daemon event loop, while any active
+    // legacy row has already failed the active-session guard above.
+    for (const session of persistedBotSessions) {
+      if (session.adoptedFrom || session.title?.startsWith('Adopt:')) continue;
+      const backendTypes: persistentBackend.PersistentBackendType[] =
+        persistentBackend.isSuspendableBackendType(session.backendType)
+          ? [session.backendType]
+          : [];
+      for (const backendType of backendTypes) {
+        const backingName = persistentBackend.persistentSessionName(
+          backendType,
+          session.sessionId,
+        );
+        if (persistentBackend.probePersistentSession(backendType, backingName) !== 'missing') {
+          return jsonRes(res, 409, {
+            ok: false,
+            error: 'read_isolation_teardown_unverified',
+          });
+        }
+      }
+    }
+    // The worker FAIL-CLOSES (refuses to start the session) for a configured
+    // readIsolation that cannot be enforced. Check this after the active-session
+    // safety boundary so even an unsupported enable cannot obscure a surviving
+    // old-policy pane with a less important validation error.
+    if (enable && !readIsolationEnforceable(larkAppId)) {
+      return jsonRes(res, 400, { ok: false, error: 'read_isolation_unenforceable' });
+    }
+    // With the gate closed and no active logical session, persistence is the
+    // only mutation. updateBotReadIsolation writes bots.json atomically and
+    // then publishes the same value to the daemon runtime before resolving.
+    // A crash at any point can only lead to a cold spawn under the old or new
+    // durable policy; there is no owned pane to reattach.
+    const r = await sandboxStore.updateBotReadIsolation(larkAppId, enable);
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    jsonRes(res, 200, {
+      ok: true,
+      readIsolation: r.readIsolation,
+      suspendedSessions: 0,
+      changed: true,
+    });
+  });
 });
 
 // Per-bot session backend override (pty | tmux | herdr | zellij | zmx), or clear it

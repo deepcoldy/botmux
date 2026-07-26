@@ -25,13 +25,17 @@ import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renam
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
-import { resolveSessionContext } from './core/session-marker.js';
+import {
+  findAncestorSessionContext as findLiveAncestorSessionContext,
+  resolveSessionContext,
+} from './core/session-marker.js';
+import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
@@ -78,6 +82,9 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
+import {
+  validateCodexAppManagedSendOrigin,
+} from './utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
@@ -123,7 +130,19 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
-import { readManagedOriginCapability } from './core/managed-origin-capability.js';
+import {
+  hasManagedOriginIsolationMarker,
+  managedOriginDataRootProbeAccess,
+  managedOriginIsolationSentinelAccess,
+  managedOriginLegacyIsolationProbeAccess,
+  readManagedOriginRootLocator,
+  readManagedOriginCapability,
+} from './core/managed-origin-capability.js';
+import {
+  attestManagedOrigin,
+  type ManagedOriginAttestation,
+  type ManagedOriginAttestationContext,
+} from './core/managed-origin-attestation.js';
 import { rejectLikelyWindowsStdinMojibake, decodeStdinBytes } from './cli/stdin-encoding.js';
 import {
   formatBotInfoEntriesForCli,
@@ -6914,6 +6933,7 @@ async function relaySend(
     resolveDataDir(),
     sid,
     relayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   // Structured request: the daemon-side watcher rebuilds the argv from these
   // validated fields (it NEVER executes raw argv — see buildRelayHostArgs).
@@ -7296,14 +7316,100 @@ async function cmdSend(rest: string[]): Promise<void> {
   // central session-capability gate — same hard door every Feishu-touching CLI
   // command consults.
   assertTurnTransportOrExit('send');
-  // Managed output attribution must come from the live process-tree marker,
-  // whose turn/attempt is refreshed by the worker. BOTMUX_TURN_ID is a
-  // spawn-time fallback and can be stale in a detached child after a later
-  // delivery starts, so it is never authority for receiver policy.
-  const liveMarkerCtx = resolveSessionContext(
-    resolveDataDir(),
-    process.env.BOTMUX_SESSION_ID,
-  );
+  // Resolve isolation marker-first. A visible host marker always wins over a
+  // leftover capability. Linux bwrap keeps its host-execution outbox; macOS
+  // read isolation instead challenges the owning daemon and trusts only the
+  // matching host-written read-only proof sidecar. The capability file itself
+  // may survive worker SIGKILL and is never direct-send authority.
+  let sendDataDir = resolveDataDir();
+  let liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  const relayDir = process.env.BOTMUX_SEND_RELAY;
+  const sessionIdArg = argValue(rest, '--session-id');
+  const inheritedSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+  const inheritedOriginChannelId = process.env.BOTMUX_ORIGIN_CHANNEL_ID?.trim();
+  const isolationSessionCandidates = [...new Set([
+    inheritedSessionId,
+    ancestorCtx?.sessionId,
+    sessionIdArg,
+  ].filter((value): value is string => !!value))];
+  const isolationMarkerPresent = isolationSessionCandidates
+    .some(sessionId => !!inheritedOriginChannelId
+      && hasManagedOriginIsolationMarker(
+        sendDataDir,
+        sessionId,
+        inheritedOriginChannelId,
+      ));
+  let osUserHomeDir: string;
+  try { osUserHomeDir = userInfo().homedir; }
+  catch {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  if (!osUserHomeDir) {
+    console.error('botmux send refused: OS account home unavailable for isolation classification');
+    process.exit(2);
+  }
+  const kernelReadIsolationDetected = managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
+    === 'sandbox_denied'
+    || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  const isolatedSendRequired = !relayDir
+    && (kernelReadIsolationDetected
+      || process.env.BOTMUX_READ_ISOLATED === '1'
+      || (!liveMarkerCtx?.sessionId && isolationMarkerPresent));
+  let isolatedBoundSessionId: string | undefined;
+  if (isolatedSendRequired) {
+    if (!inheritedOriginChannelId || !/^[a-f0-9]{64}$/.test(inheritedOriginChannelId)) {
+      console.error('botmux send refused: read-isolated pane authority channel is missing or invalid');
+      process.exit(2);
+    }
+    const locators = isolationSessionCandidates.flatMap(sessionId => {
+      const locator = readManagedOriginRootLocator(osUserHomeDir, sessionId);
+      return locator ? [locator] : [];
+    });
+    if (locators.length !== 1) {
+      console.error('botmux send refused: read-isolated owning data-root locator is missing or ambiguous');
+      process.exit(2);
+    }
+    const locator = locators[0]!;
+    if ((sessionIdArg && sessionIdArg !== locator.sessionId)
+      || (inheritedSessionId && inheritedSessionId !== locator.sessionId)) {
+      console.error('botmux send refused: read-isolated session does not match the owning data-root locator');
+      process.exit(2);
+    }
+    isolatedBoundSessionId = locator.sessionId;
+    sendDataDir = locator.dataDir;
+    // A locator is data, not authority. Require the kernel to deny the probe
+    // under the locator-selected *actual* Botmux root. Legacy Seatbelt profiles
+    // already denied this dashboard-secret basename class at their real root;
+    // a child-forged fake root remains readable and is therefore rejected.
+    if (managedOriginDataRootProbeAccess(sendDataDir, locator.sessionId)
+      !== 'sandbox_denied') {
+      console.error('botmux send refused: locator-selected data root is not protected by the active sandbox');
+      process.exit(2);
+    }
+    // All later session/credential/marker reads in this short-lived command
+    // must use the host-bound root, never the child's mutable inherited value.
+    process.env.SESSION_DATA_DIR = sendDataDir;
+    liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
+  }
+  const isolatedCapabilityCtx = !isolatedSendRequired && liveMarkerCtx?.sessionId
+    ? null
+    : readWorkflowSessionRelayContext({
+        env: process.env,
+        dataDir: sendDataDir,
+        // Keep one marker snapshot for the whole decision. In particular, do
+        // not let resolveSessionContext's protected-capability fallback get
+        // mislabeled as a live process marker.
+        findMarker: () => isolatedSendRequired ? null : liveMarkerCtx,
+      });
+  if (isolatedSendRequired
+    && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
+      || isolatedCapabilityCtx?.originChannelId !== inheritedOriginChannelId)) {
+    console.error('botmux send refused: read-isolated capability is not bound to this session');
+    process.exit(2);
+  }
+  let isolatedAttestationContext: ManagedOriginAttestationContext | undefined;
+  let isolatedManagedOriginCtx: ManagedOriginAttestation | undefined;
   const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';
   const trustedRelayAttemptRaw = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
   const trustedRelayCandidate = trustedHostRelay && process.env.BOTMUX_SESSION_ID
@@ -7315,14 +7421,53 @@ async function cmdSend(rest: string[]): Promise<void> {
           : undefined,
       }
     : undefined;
-  const sessionIdArg = argValue(rest, '--session-id');
   // Inside bwrap the PID namespace makes host marker traversal impossible.
   // The relay watcher therefore binds a short-lived host-issued capability to
   // the worker's live turn and performs the authoritative policy check.
-  const relayDir = process.env.BOTMUX_SEND_RELAY;
-  if (relayDir) {
+  if (relayDir && isolatedCapabilityCtx) {
     await relaySend(rest, relayDir);
     return;
+  }
+  if (relayDir && !liveMarkerCtx?.sessionId) {
+    // The child may delete or replace its writable outbox capability, while
+    // the immutable default snapshot remains visible. That snapshot is only a
+    // routing hint and can survive worker death; never fall through to direct
+    // Lark send when the live relay token is absent.
+    console.error('botmux send refused: managed host relay capability is stale or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedSendRequired && !isolatedCapabilityCtx) {
+    // Isolation classification must not depend on successfully parsing the
+    // rotating token. A missing/corrupt/revoked capability is an authorization
+    // failure, never permission to downgrade into the ordinary direct path.
+    console.error('botmux send refused: read-isolated managed origin capability is stale, corrupt, or missing');
+    process.exit(2);
+  }
+  if (!relayDir && isolatedCapabilityCtx) {
+    isolatedAttestationContext = {
+      sessionId: isolatedCapabilityCtx.sessionId,
+      channelId: isolatedCapabilityCtx.originChannelId!,
+      capability: isolatedCapabilityCtx.capability,
+      dataDir: sendDataDir,
+      ...(isolatedCapabilityCtx.larkAppId
+        ? { larkAppId: isolatedCapabilityCtx.larkAppId }
+        : {}),
+      ...(isolatedCapabilityCtx.ipcPortFallback !== undefined
+        ? { ipcPortFallback: isolatedCapabilityCtx.ipcPortFallback }
+        : {}),
+    };
+    try {
+      isolatedManagedOriginCtx = await attestManagedOrigin({
+        context: isolatedAttestationContext,
+        resolveIpcPort: (larkAppId) => {
+          try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+          catch { return undefined; }
+        },
+      });
+    } catch (err) {
+      console.error(`botmux send refused: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(2);
+    }
   }
   // Silent is an execution policy, not a prompt suggestion. During a durable
   // meeting turn, refuse botmux-mediated sends before either the direct-Lark or
@@ -7352,11 +7497,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   // marker/protected-capability tuple can authorize a durable dispatch.
   const originSessionId = trustedRelayCtx?.sessionId
     ?? liveMarkerCtx?.sessionId
+    ?? isolatedManagedOriginCtx?.sessionId
     ?? ancestorCtx?.sessionId
     ?? process.env.BOTMUX_SESSION_ID;
   const authoritativeOriginTurnCtx = trustedRelayCtx
     ? (trustedRelayCtx.turnId ? trustedRelayCtx : undefined)
-    : (liveMarkerCtx?.turnId ? liveMarkerCtx : undefined);
+    : (liveMarkerCtx?.turnId
+        ? liveMarkerCtx
+        : isolatedManagedOriginCtx?.turnId
+          ? isolatedManagedOriginCtx
+          : undefined);
   const originTurnId = authoritativeOriginTurnCtx?.turnId;
   const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
   const originSession = originSessionId
@@ -7369,7 +7519,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // managed-output policy or provider setup: terminal settlement can win the
   // race between watcher authorization and this host child loading the store,
   // and must never downgrade the send into an ordinary Lark message.
-  if (hostRelayRequiresCodexAppLedger
+  if ((hostRelayRequiresCodexAppLedger || isolatedManagedOriginCtx?.requiresCodexAppLedger)
     && (originSession?.codexAppDispatchLedger?.length ?? 0) === 0) {
     console.error(
       `botmux send refused: authorized Codex App origin ${originSessionId}/${originTurnId} is no longer unsettled`,
@@ -7670,6 +7820,70 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  // A proof is a point-in-time liveness check, not a five-second send lease.
+  // Re-challenge immediately before observable provider effects so lengthy
+  // local parsing/card preparation cannot carry an old capability across a
+  // worker restart, turn rotation, or Codex ledger settlement.
+  const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
+    const fresh = await attestManagedOrigin({
+      context: isolatedAttestationContext,
+      resolveIpcPort: (larkAppId) => {
+        try { return larkAppId ? findDaemon(larkAppId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+    if (fresh.sessionId !== isolatedManagedOriginCtx.sessionId
+      || fresh.turnId !== isolatedManagedOriginCtx.turnId
+      || fresh.dispatchAttempt !== isolatedManagedOriginCtx.dispatchAttempt
+      || fresh.requiresCodexAppLedger !== isolatedManagedOriginCtx.requiresCodexAppLedger) {
+      throw new Error('managed origin changed before provider effect');
+    }
+    const currentOriginSession = loadSessions().get(fresh.sessionId);
+    const ledgerDecision = validateCodexAppManagedSendOrigin(
+      currentOriginSession?.codexAppDispatchLedger,
+      fresh,
+      fresh.requiresCodexAppLedger,
+    );
+    if (!ledgerDecision.ok
+      || ledgerDecision.requiresLedger !== fresh.requiresCodexAppLedger) {
+      throw new Error(
+        `managed origin ledger changed before provider effect${ledgerDecision.ok ? '' : `: ${ledgerDecision.error}`}`,
+      );
+    }
+    return fresh;
+  };
+  const fenceIsolatedOriginBeforeEffect = async (): Promise<void> => {
+    await revalidateIsolatedOriginBeforeEffect();
+  };
+  const isolatedHookOrigin = isolatedAttestationContext?.ipcPortFallback
+    && isolatedManagedOriginCtx
+    ? {
+        ipcPort: isolatedAttestationContext.ipcPortFallback,
+        sessionId: isolatedManagedOriginCtx.sessionId,
+        capability: isolatedAttestationContext.capability,
+        turnId: isolatedManagedOriginCtx.turnId,
+        ...(isolatedManagedOriginCtx.dispatchAttempt !== undefined
+          ? { dispatchAttempt: isolatedManagedOriginCtx.dispatchAttempt }
+          : {}),
+      }
+    : undefined;
+  // Outbound hooks are a distinct post-provider effect. Preserve normal hook
+  // behavior, but bind it to a fresh challenge of this command's original
+  // protected claim. The Lark client treats fence failure as hook-only loss so
+  // an already-delivered primary is never reported failed and duplicated.
+  const outboundMessageOptions = (suppressHook = false) =>
+    suppressHook
+      ? { suppressHook: true as const }
+      : isolatedAttestationContext
+        ? isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : { suppressHook: true as const }
+        : undefined;
+
   // A document-comment turn has exactly one supported observable effect: a
   // plain text reply to its frozen origin target.  Validate the complete shape
   // before reading stdin/content/card files and before any TTS, upload, or Lark
@@ -7808,8 +8022,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     const targetChatId = overrideChatId ?? s.chatId;
     let dir: string | undefined;
     try {
-      const out = await synthesizeVoiceOpus(appId, content);
+      await revalidateIsolatedOriginBeforeEffect();
+      const out = await synthesizeVoiceOpus(appId, content, {
+        beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+      });
       dir = out.dir;
+      await revalidateIsolatedOriginBeforeEffect();
       const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
       const sentAtMs = Date.now();
       const proposedOutput = {
@@ -7833,9 +8051,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         messageId = prepared.messageId;
       } else {
         revalidateVcMeetingManagedSend();
-        const managedProviderOptions = prepared
-          ? { suppressHook: true }
-          : undefined;
+        const managedProviderOptions = outboundMessageOptions(!!prepared);
         const deferred = !sendInto && (!overrideChatId || overrideChatId === s.chatId)
           ? await dispatchDeferredTopicSend({
               dataDir: resolveDataDir(),
@@ -7846,9 +8062,18 @@ async function cmdSend(rest: string[]): Promise<void> {
               content: canonicalOutput.content,
               msgType: canonicalOutput.msgType,
               uuid: prepared?.providerKey,
-              sendRoot: (body, type, uuid) => sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions),
-              sendTitleSeed: (title, uuid) => sendMessage(appId, targetChatId, title, 'text', uuid),
-              replyRoot: (root, body, type, uuid) => replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions),
+              sendRoot: async (body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
+              },
+              sendTitleSeed: async (title, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return sendMessage(appId, targetChatId, title, 'text', uuid);
+              },
+              replyRoot: async (root, body, type, uuid) => {
+                await revalidateIsolatedOriginBeforeEffect();
+                return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
+              },
             })
           : { handled: false };
         if (deferred.handled && deferred.messageId) {
@@ -7869,6 +8094,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                 replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                 currentTurnId,
               });
+          await revalidateIsolatedOriginBeforeEffect();
           messageId = canonicalTarget.mode === 'plain'
             ? await sendMessage(
                 appId,
@@ -7960,13 +8186,15 @@ async function cmdSend(rest: string[]): Promise<void> {
           exactDocTarget.commentId,
           chunks[i],
           i === 0 ? docMentionOpenId : undefined,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect },
         );
       }
       // 清理 "Typing" reaction（bot 已回复完毕）。
       if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
           { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
-          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId);
+          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId,
+          { beforeProviderEffect: fenceIsolatedOriginBeforeEffect });
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
@@ -8214,7 +8442,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   // `reachabilityTarget` above so both paths agree about the effective root.
   // (sendTarget itself is defined once above, carrying #597's frozen per-turn
   // reply-target override.)
-  const dispatch = async (
+  const dispatchAfterOriginGate = async (
     content: string,
     msgType: string,
     uuid?: string,
@@ -8233,20 +8461,28 @@ async function cmdSend(rest: string[]): Promise<void> {
         content,
         msgType,
         uuid,
-        sendRoot: (body, type, rootUuid) => sendMessage(
+        sendRoot: async (body, type, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(
             appId,
             targetChatId,
             body,
             type,
             rootUuid,
             hookContext,
-            suppressHook ? { suppressHook: true } : undefined,
-          ),
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
         // The optional title is the root seed and the actual alert follows as
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
-        sendTitleSeed: (title, rootUuid) => sendMessage(appId, targetChatId, title, 'text', rootUuid),
-        replyRoot: (root, body, type, replyUuid) => replyMessage(
+        sendTitleSeed: async (title, rootUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+        },
+        replyRoot: async (root, body, type, replyUuid) => {
+          await revalidateIsolatedOriginBeforeEffect();
+          return replyMessage(
             appId,
             root,
             body,
@@ -8254,8 +8490,9 @@ async function cmdSend(rest: string[]): Promise<void> {
             true,
             replyUuid,
             hookContext,
-            suppressHook ? { suppressHook: true } : undefined,
-          ),
+            outboundMessageOptions(!!suppressHook),
+          );
+        },
       });
       if (deferred.handled && deferred.messageId) {
         deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
@@ -8263,17 +8500,18 @@ async function cmdSend(rest: string[]): Promise<void> {
         return deferred.messageId;
       }
     }
+    await revalidateIsolatedOriginBeforeEffect();
     return sendTarget.mode === 'plain'
-      ? sendMessage(
+      ? await sendMessage(
           appId,
           sendTarget.chatId,
           content,
           msgType,
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         )
-      : replyMessage(
+      : await replyMessage(
           appId,
           sendTarget.rootMessageId,
           content,
@@ -8281,8 +8519,17 @@ async function cmdSend(rest: string[]): Promise<void> {
           sendTarget.mode === 'thread',
           uuid,
           hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
+          outboundMessageOptions(!!suppressHook),
         );
+  };
+  const dispatch = async (
+    content: string,
+    msgType: string,
+    uuid?: string,
+    suppressHook?: boolean,
+  ): Promise<string> => {
+    await revalidateIsolatedOriginBeforeEffect();
+    return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
     try {
@@ -8313,7 +8560,11 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
-  const dispatchPrimary = async (content: string, msgType: string): Promise<string> => {
+  const dispatchPrimary = async (
+    content: string,
+    msgType: string,
+    originAlreadyRevalidated = false,
+  ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
     revalidateVcMeetingManagedSend();
@@ -8362,6 +8613,12 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(prepared ? { suppressHook: true } : {}),
         hookContext,
         MessageWithdrawnError,
+        ...(isolatedHookOrigin
+          ? {
+              beforeHook: fenceIsolatedOriginBeforeEffect,
+              hookOrigin: isolatedHookOrigin,
+            }
+          : {}),
         // Explicit VC IM --into is rejected above, so an unquoted first send
         // retains the normal chat-scope dispatch semantics. On a mismatch the
         // frozen canonical target remains authoritative.
@@ -8375,11 +8632,17 @@ async function cmdSend(rest: string[]): Promise<void> {
                 type,
                 uuid,
                 hookContext,
-                suppressHook ? { suppressHook: true } : undefined,
+                outboundMessageOptions(!!suppressHook),
               );
             }
-          : dispatch,
-        beforeQuoteFallback: revalidateVcMeetingManagedSend,
+          : dispatchAfterOriginGate,
+        beforeEffect: originAlreadyRevalidated
+          ? undefined
+          : fenceIsolatedOriginBeforeEffect,
+        beforeQuoteFallback: async () => {
+          revalidateVcMeetingManagedSend();
+          await revalidateIsolatedOriginBeforeEffect();
+        },
         onQuoteWithdrawn: (id) => {
           console.error(`引用目标 ${id} 已撤回，改为普通发送`);
         },
@@ -8426,8 +8689,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // managed side-effect gate above.
     const imageKeys: string[] = [];
     if (images.length > 0) {
-      const results = await Promise.all(images.map(p => uploadImage(appId, p)));
-      imageKeys.push(...results);
+      for (const imagePath of images) {
+        await revalidateIsolatedOriginBeforeEffect();
+        imageKeys.push(await uploadImage(appId, imagePath));
+      }
     }
 
     // Auto-detect @BotName in text and inject as mentions, using the sender
@@ -8593,8 +8858,9 @@ async function cmdSend(rest: string[]): Promise<void> {
         {
           uploadFile,
           uploadImage,
-          dispatch,
-          primaryDispatch: dispatchPrimary,
+          dispatch: dispatchAfterOriginGate,
+          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          beforeEffect: fenceIsolatedOriginBeforeEffect,
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
         appId,
@@ -8735,10 +9001,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // surface as command failure.
     if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
       ({ failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch }, appId, files,
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
       ));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
     }
@@ -8769,13 +9035,29 @@ async function cmdSend(rest: string[]): Promise<void> {
     let attentionError: string | undefined;
     if (attention.requested) {
       try {
-        const daemon = findDaemon(appId);
-        if (!daemon) throw new Error(`找不到 daemon (larkAppId=${appId})`);
-        const originCapability = readManagedOriginCapability(
-          resolveDataDir(),
-          sid,
-          process.env.BOTMUX_SEND_RELAY,
-        )?.capability;
+        // Raising attention is a second externally visible effect after the
+        // awaited Lark send.  Bind it to a fresh proof of the same original
+        // turn instead of re-reading a stable path that may now belong to a
+        // successor worker generation.
+        const freshIsolatedOrigin = await revalidateIsolatedOriginBeforeEffect();
+        const attentionOrigin = freshIsolatedOrigin ?? liveMarkerCtx;
+        const daemon = freshIsolatedOrigin ? undefined : findDaemon(appId);
+        const attentionPort = freshIsolatedOrigin
+          ? isolatedAttestationContext?.ipcPortFallback
+          : daemon?.ipcPort;
+        if (!attentionPort) {
+          throw new Error(freshIsolatedOrigin
+            ? '受保护的 managed-origin claim 未提供 owning daemon 端口'
+            : `找不到 daemon (larkAppId=${appId})`);
+        }
+        const originCapability = freshIsolatedOrigin
+          ? isolatedAttestationContext?.capability
+          : readManagedOriginCapability(
+              resolveDataDir(),
+              sid,
+              process.env.BOTMUX_SEND_RELAY,
+              process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+            )?.capability;
         const request = {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -8786,15 +9068,15 @@ async function cmdSend(rest: string[]): Promise<void> {
             kind: attention.kind,
             reason: text.trim(),
             originCapability,
-            originTurnId: liveMarkerCtx?.turnId,
-            originDispatchAttempt: liveMarkerCtx?.dispatchAttempt,
+            originTurnId: attentionOrigin?.turnId,
+            originDispatchAttempt: attentionOrigin?.dispatchAttempt,
           }),
         } satisfies RequestInit;
         let secret: string | undefined;
         try { secret = loadDaemonIpcSecret(); } catch { /* Seatbelt/read-isolated CLI */ }
         const res = secret
-          ? await fetchDaemonIpc(daemon.ipcPort, '/api/attention', request, secret)
-          : await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/attention`, request);
+          ? await fetchDaemonIpc(attentionPort, '/api/attention', request, secret)
+          : await fetch(`http://127.0.0.1:${attentionPort}/api/attention`, request);
         if (!res.ok) throw new Error(`daemon HTTP ${res.status}`);
         attentionRaised = true;
         console.error(`🙋 已举手：本会话已进 dashboard「需要你」列（用户回复后自动撤下）`);
@@ -9925,6 +10207,7 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
         resolveDataDir(),
         sessionId,
         process.env.BOTMUX_SEND_RELAY,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       );
       if (claim) requestBody.originCapability = claim.capability;
     }
@@ -10042,6 +10325,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     resolveDataDir(),
     askSessionId,
     askRelayDir,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   const body = {
     sessionId: askSessionId,
@@ -10363,6 +10647,7 @@ async function cmdSessionReady(): Promise<void> {
         resolveDataDir(),
         sessionId,
         relayDir,
+        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
       )?.capability;
       const liveOrigin = resolveSessionContext(resolveDataDir(), sessionId);
       const envAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
