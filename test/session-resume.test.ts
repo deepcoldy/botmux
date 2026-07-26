@@ -828,6 +828,41 @@ describe('resumeSession', () => {
       expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalled();
       // On-disk row stays active (retained for inspection/retry, not closed away).
       expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      // SELF-HEAL enabler: initialStartPending must be false so the next inbound
+      // can claim the cold owner (tryAcquireInitialStartClaim bails when it is
+      // true) → fork → retry promotion. Left true, the session would wedge on
+      // the admission gate (append-tail-and-return) forever until /close.
+      expect(ds!.initialStartPending).toBe(false);
+    });
+
+    it('leaves initialStartPending TRUE for a normal (non-quarantine) tail promotion at restore', async () => {
+      // Guard against the self-heal fix over-reaching: when promotion SUCCEEDS,
+      // the tokened activation is genuinely in flight, so the gate must stay up.
+      const s = sessionStore.createSession('oc_chatOk', 'om_ok', 'OK Topic', 'group');
+      s.larkAppId = 'app_test';
+      s.workingDir = '/tmp/proj';
+      s.cliId = 'codex-app';
+      s.scope = 'thread';
+      s.status = 'active';
+      s.hasHistory = true;
+      s.queuedActivationTail = [{
+        id: 'tail-ok',
+        order: 1,
+        userPrompt: 'held',
+        cliInput: { content: 'held' },
+        turnId: 'turn-ok',
+      }] as any;
+      s.queuedActivationTailNextOrder = 1;
+      sessionStore.updateSession(s);
+
+      // Promotion succeeds (default mock returns true).
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      const ds = map.get(sessionKey('om_ok', 'app_test'));
+      expect(ds).toBeDefined();
+      // Gate stays up: a real tokened activation is in flight.
+      expect(ds!.initialStartPending).toBe(true);
     });
   });
 });

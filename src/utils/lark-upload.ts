@@ -3,7 +3,8 @@
  * Worker doesn't load bot-registry — it gets larkAppId/larkAppSecret/brand from
  * the daemon's init message (see worker-pool.ts forkWorker / worker.ts init).
  */
-import { Client, LoggerLevel, defaultHttpInstance } from '@larksuiteoapi/node-sdk';
+import { Client, LoggerLevel } from '@larksuiteoapi/node-sdk';
+import * as Lark from '@larksuiteoapi/node-sdk';
 import { type Brand, sdkDomain } from '../im/lark/lark-hosts.js';
 
 /** Screenshot/media uploads move real bytes and must not inherit an interactive
@@ -15,7 +16,14 @@ const UPLOAD_TIMEOUT_MS = 120_000;
 let cachedUploadHttpInstance: any;
 function uploadHttpInstance(): any {
   if (cachedUploadHttpInstance !== undefined) return cachedUploadHttpInstance;
-  const base: any = defaultHttpInstance;
+  let base: any;
+  try {
+    // Namespace access (not a named import): a stripped/mocked SDK that omits
+    // this export must yield undefined here, not throw before the guard below.
+    base = (Lark as unknown as { defaultHttpInstance?: any }).defaultHttpInstance;
+  } catch {
+    base = undefined;
+  }
   if (!base || typeof base.create !== 'function') {
     cachedUploadHttpInstance = null;
     return cachedUploadHttpInstance;

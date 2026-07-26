@@ -1360,6 +1360,9 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
 
   for (const session of active) {
     try {
+    // True when this row's durable activation-tail promotion failed transiently
+    // and it was registered as a quarantined owner (see the promotion block).
+    let quarantinedActivationTailPromotion = false;
     // Restored sessions persisted before the scope field was added default to
     // 'thread' — that matches the legacy thread-only behaviour.
     const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
@@ -1667,15 +1670,27 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // `/close` cannot reach it and a later inbound to the same anchor mints a
       // second active row while this one's tail dangles. Instead register it as a
       // visible quarantined owner: the unpromoted tail keeps protected ownership
-      // (occupies the anchor, blocks a duplicate, stays closeable), and the normal
-      // activation path retries the promotion once the durable store recovers.
+      // (occupies the anchor, blocks a duplicate, stays closeable).
+      //
+      // CRUCIAL for self-healing: `initialStartPending` is computed true below
+      // from the non-empty tail, but no activation is actually in flight here —
+      // the promotion FAILED. Left true, `tryAcquireInitialStartClaim` refuses
+      // to claim the cold owner and every later inbound only appends to the tail
+      // and returns, so promotion is never retried and the session wedges until
+      // `/close`. Force it false: the next inbound then claims the worker:null
+      // owner, forks, and `forkReservedInitialSession` re-derives the gate + calls
+      // `releaseQueuedActivationReservation` → `promoteQueuedActivationTail`,
+      // draining the retained tail in FIFO order (the new message reserves order
+      // behind it). Persistent-backend restore also re-forks it via `toReattach`.
+      quarantinedActivationTailPromotion = true;
       logger.warn(
         `[${session.sessionId.substring(0, 8)}] Deferred durable activation-tail promotion `
         + `(transient persistence failure); registering as a quarantined owner so `
-        + `it stays visible/closeable and retries on next activation`,
+        + `it stays visible/closeable and retries promotion on next activation`,
       );
     }
     const anchor = sessionAnchorId(ds);
+    if (quarantinedActivationTailPromotion) ds.initialStartPending = false;
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
