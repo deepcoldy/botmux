@@ -2587,12 +2587,22 @@ function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: stri
   return out;
 }
 
-async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string): Promise<LocalGoalWorkerHealth[]> {
+type GoalWorkerHealthProbe = {
+  /** True only when the owning daemon actually answered. A false here means the
+   *  daemon is offline OR the IPC timed out / errored — it is NOT evidence that
+   *  the worker session is gone. The reassign path must treat this as unknown,
+   *  never as a dead worker, or a momentarily-slow daemon triggers a wrongful
+   *  reassign (and burns the human-escalation budget). */
+  probeOk: boolean;
+  entries: LocalGoalWorkerHealth[];
+};
+
+async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string): Promise<GoalWorkerHealthProbe> {
   if (workerLarkAppId === currentDaemonLarkAppId) {
-    return collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId);
+    return { probeOk: true, entries: collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId) };
   }
   const daemon = findOnlineDaemon(workerLarkAppId);
-  if (!daemon) return [];
+  if (!daemon) return { probeOk: false, entries: [] };
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 1_500);
   try {
@@ -2602,11 +2612,11 @@ async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string
       body: JSON.stringify({ goalChatId, workerLarkAppId }),
       signal: ctrl.signal,
     });
-    if (!res.ok) return [];
+    if (!res.ok) return { probeOk: false, entries: [] };
     const body = await res.json().catch(() => null) as { entries?: LocalGoalWorkerHealth[] } | null;
-    return Array.isArray(body?.entries) ? body.entries : [];
+    return { probeOk: true, entries: Array.isArray(body?.entries) ? body.entries : [] };
   } catch {
-    return [];
+    return { probeOk: false, entries: [] };
   } finally {
     clearTimeout(timer);
   }
@@ -2635,16 +2645,20 @@ async function buildWorkerHealthFacts(task: TaskView, goalChatId: string): Promi
         ?? roster.find((m) => m.displayName === workerName || m.name === workerName));
     const workerLarkAppId = task.workerLarkAppIds?.[index] || member?.larkAppId || '';
     let health: LocalGoalWorkerHealth | undefined;
+    let probeOk = true;
     if (workerLarkAppId) {
-      const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
-      health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
+      const probe = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+      probeOk = probe.probeOk;
+      health = probe.entries.find((entry) => entry.larkAppId === workerLarkAppId);
     }
-    const sessionState = health?.session ?? (workerLarkAppId ? 'missing' : 'unknown');
-    const workerProcess = health?.workerProcess ?? (workerLarkAppId ? 'unknown' : 'unknown');
+    const sessionState = health?.session ?? (!probeOk ? 'unknown' : (workerLarkAppId ? 'missing' : 'unknown'));
+    const workerProcess = health?.workerProcess ?? 'unknown';
     const hardFact = workerLarkAppId
       ? (health
         ? `已解析到 ${workerName}(${workerLarkAppId}) 的 goal 群 chat-scope 会话，session=${sessionState}，workerProcess=${workerProcess}。`
-        : `已解析到 ${workerName}(${workerLarkAppId})，但该 bot daemon 当前没有这个 goal 群的 chat-scope worker 会话。`)
+        : (probeOk
+          ? `已解析到 ${workerName}(${workerLarkAppId})，但该 bot daemon 当前没有这个 goal 群的 chat-scope worker 会话。`
+          : `无法探测 ${workerName}(${workerLarkAppId}) 的会话状态：该 bot daemon 离线或探测超时/失败——这不代表 worker 已死，请勿据此重派。`))
       : `无法把账本 workerOpenId 解析到本机配置 bot；可能是外部 bot、未 /introduce，或 open_id 视角不匹配。`;
     facts.push([
       '[worker-health]',
@@ -2682,7 +2696,13 @@ async function resolveWorkerReassignCandidate(task: TaskView, goalChatId: string
     if (!daemon && workerLarkAppId !== currentDaemonLarkAppId) {
       continue;
     }
-    const entries = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+    const probe = await fetchGoalWorkerHealth(goalChatId, workerLarkAppId);
+    // A failed probe (daemon offline / IPC timeout / error) is NOT proof the
+    // worker is gone. Treating it as `session_missing` here would reassign a
+    // healthy-but-slow worker and burn the escalation budget. Skip this worker
+    // on an inconclusive probe; the next watchdog tick re-checks.
+    if (!probe.probeOk) continue;
+    const entries = probe.entries;
     const health = entries.find((entry) => entry.larkAppId === workerLarkAppId);
     if (!health) {
       return { index, workerOpenId, workerName, workerLarkAppId, workerCliId, deadReason: 'session_missing' };
@@ -5256,7 +5276,23 @@ async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetr
   return { sent: false, error: lastError ?? 'no_sender_available' };
 }
 
+let goalNotificationRetryInFlight = false;
 async function processGoalNotificationRetries(): Promise<void> {
+  // Three callers can race here: the 60s interval, the startup tick, and the
+  // `/api/goal-notification-retries/process` IPC route. The store read →
+  // await sendMessage → mark-sent window is not atomic, so overlapping runs
+  // would both see the same record as `pending` and deliver the SAME human
+  // card twice. A single in-flight guard serializes them; a due record skipped
+  // by the busy run is picked up on the next tick.
+  if (goalNotificationRetryInFlight) return;
+  goalNotificationRetryInFlight = true;
+  try {
+    await processGoalNotificationRetriesInner();
+  } finally {
+    goalNotificationRetryInFlight = false;
+  }
+}
+async function processGoalNotificationRetriesInner(): Promise<void> {
   const due = listDueGoalNotificationRetries(currentDaemonLarkAppId);
   if (due.length === 0) return;
   for (const record of due) {
@@ -18437,6 +18473,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(idleWorkerSweepTimer);
     if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
     clearInterval(goalReleaseTimer);
+    clearInterval(goalNotificationRetryTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     ipcHandle.close().catch(() => { /* swallow */ });
@@ -18514,6 +18551,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(docCommentPollTimer);
     if (goalWatchdogTimer) clearInterval(goalWatchdogTimer);
     clearInterval(goalReleaseTimer);
+    clearInterval(goalNotificationRetryTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     removeDaemonDescriptor(cfg.larkAppId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

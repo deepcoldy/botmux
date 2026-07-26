@@ -497,8 +497,18 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       continue;
     }
     const prompt = buildGoalWatchdogPrompt(goalChatId, legacyTasks, inspectionFacts);
-    await inject(ds, prompt);
+    // Claim the rate-limit slot BEFORE awaiting inject. The periodic tick and
+    // the event-driven runGoalWatchdogForGoal share this map and can run
+    // concurrently; if we set `last` only after the await, both pass the gate
+    // above and double-inject the same watchdog turn into one supervisor. Roll
+    // back on failure so a throw doesn't rate-limit out the next legitimate run.
     lastInjectedAt.set(goalChatId, now);
+    try {
+      await inject(ds, prompt);
+    } catch (err) {
+      if (last > 0) lastInjectedAt.set(goalChatId, last); else lastInjectedAt.delete(goalChatId);
+      throw err;
+    }
     results.push({ goalChatId, status: 'injected', pendingTaskIds, sessionId: ds.session.sessionId });
   }
 

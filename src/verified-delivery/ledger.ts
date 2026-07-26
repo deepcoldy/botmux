@@ -7,12 +7,13 @@
  *
  * This is deliberately tiny — see types.ts for why it is not the collab board.
  */
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, openSync, closeSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import type {
   Evidence,
   LedgerEvent,
@@ -154,7 +155,6 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
   const dir = rootDir(opts.baseDir);
   const ledgerPath = join(dir, 'ledger.ndjson');
   const blobsDir = join(dir, 'blobs');
-  const lockPath = join(dir, 'ledger.lock');
 
   function ensureDirs(): void {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -173,32 +173,33 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     return out;
   }
 
-  /** Exclusive-create spinlock — read-check-append must be serialized for
-   *  idempotency to hold under concurrent CLI processes across daemons. */
+  /** Cross-process serialization for the read-check-append. Uses the shared
+   *  PID-aware file lock so a holder that is SIGKILL'd / power-lost (the very
+   *  "survive a restart" scenario this ledger targets) does not leave an orphan
+   *  lock that wedges every future append forever — a dead holder's lock is
+   *  detected and broken. The helper also sleeps (Atomics.wait) between attempts
+   *  instead of burning a CPU busy-wait while a peer holds the lock. */
   function withLock<T>(fn: () => T): T {
     ensureDirs();
-    let fd: number | undefined;
-    for (let i = 0; i < 200; i++) {
-      try { fd = openSync(lockPath, 'wx'); break; } catch { /* held */ }
-      // busy-wait a touch; appends are sub-ms so contention windows are tiny
-      const until = Date.now() + 15;
-      while (Date.now() < until) { /* spin */ }
-    }
-    // NEVER fall through to an unlocked write — that would defeat the
-    // read-check-append serialization (dup seq / broken idempotency). Make the
-    // caller retry instead.
-    if (fd === undefined) throw new Error('verified-delivery ledger lock timeout');
-    try {
-      return fn();
-    } finally {
-      closeSync(fd);
-      try { unlinkSync(lockPath); } catch { /* */ }
-    }
+    return withFileLockSync(ledgerPath, fn);
   }
 
   function appendUnlocked(existing: LedgerEvent[], draft: LedgerEventDraft): LedgerEvent {
     const seq = existing.length + 1;
     const event: LedgerEvent = { ...draft, eventId: String(seq), seq };
+    // Self-heal a torn prior append: if the file exists but does not end in a
+    // newline, a previous writer died mid-line. Appending directly would glue
+    // this event onto that fragment, so BOTH lines become one unparseable token
+    // that read() silently drops — losing a committed event. Terminate the
+    // fragment first so only the already-torn line is skipped, not this one.
+    if (existsSync(ledgerPath)) {
+      try {
+        if (statSync(ledgerPath).size > 0) {
+          const tail = readFileSync(ledgerPath, 'utf-8').slice(-1);
+          if (tail !== '\n') appendFileSync(ledgerPath, '\n');
+        }
+      } catch { /* best-effort; a read error here just falls through to append */ }
+    }
     appendFileSync(ledgerPath, JSON.stringify(event) + '\n');
     return event;
   }
@@ -733,7 +734,15 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     const bytes = Buffer.byteLength(content, 'utf-8');
     const ref = createHash('sha256').update(content).digest('hex').slice(0, 16);
     const blobPath = join(blobsDir, ref);
-    if (!existsSync(blobPath)) writeFileSync(blobPath, content);
+    // Write atomically (temp + rename) so a crash mid-write cannot leave a
+    // truncated blob that existsSync() later treats as complete — the content
+    // is addressed by hash, so a short blob would be silently trusted forever.
+    if (!existsSync(blobPath)) {
+      const tmpPath = `${blobPath}.tmp-${process.pid}`;
+      writeFileSync(tmpPath, content);
+      try { renameSync(tmpPath, blobPath); }
+      catch { if (!existsSync(blobPath)) throw new Error(`inline evidence blob write failed: ${ref}`); }
+    }
     const preview = content.length > 200 ? content.slice(0, 200) + '…' : content;
     return { kind: 'inline', ref, name, bytes, preview };
   }

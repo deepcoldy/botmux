@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -687,5 +687,31 @@ describe('verified-delivery ledger', () => {
     led.append(draft({ type: 'TaskDispatched', taskId: 't-b', chatId: 'oc_2', idempotencyKey: 'dispatched:t-b', payload: { taskId: 't-b' } }));
     expect(led.tasks('oc_1').map((t) => t.taskId)).toEqual(['t-a']);
     expect(led.tasks()).toHaveLength(2);
+  });
+
+  // ── durability: a crash mid-append leaves a line with no trailing newline.
+  // The next append must not glue onto that fragment (which would make BOTH
+  // lines one unparseable token that read() silently drops → lost committed
+  // event). It self-heals by terminating the fragment first.
+  it('a torn (newline-less) trailing line does not swallow the next append', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 't-good', chatId: 'oc_x', idempotencyKey: 'dispatched:t-good', payload: { taskId: 't-good' } }));
+    // Simulate a crash mid-write: append a partial JSON line WITHOUT a newline.
+    const ledgerPath = join(baseDir, 'ledger.ndjson');
+    appendFileSync(ledgerPath, '{"type":"TaskDispatched","taskId":"t-torn","seq":');
+    // A fresh handle (as a new CLI process would open) must still append cleanly.
+    const led2 = openLedger({ baseDir });
+    led2.append(draft({ type: 'TaskDispatched', taskId: 't-after', chatId: 'oc_x', idempotencyKey: 'dispatched:t-after', payload: { taskId: 't-after' } }));
+    const board = led2.tasks().map((t) => t.taskId).sort();
+    // The torn fragment is dropped, but the good and the post-crash events survive.
+    expect(board).toContain('t-good');
+    expect(board).toContain('t-after');
+    expect(board).not.toContain('t-torn');
+    // The fragment stays isolated on its own line: exactly one line is
+    // unparseable (the fragment), and the last line — the healed append — parses.
+    const lines = readFileSync(ledgerPath, 'utf-8').split('\n').filter((l) => l.trim());
+    const unparseable = lines.filter((l) => { try { JSON.parse(l); return false; } catch { return true; } });
+    expect(unparseable).toHaveLength(1);
+    expect(() => JSON.parse(lines[lines.length - 1]!)).not.toThrow();
   });
 });
