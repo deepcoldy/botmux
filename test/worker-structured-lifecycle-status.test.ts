@@ -115,11 +115,13 @@ describe('worker structured-turn status wiring', () => {
     expect(attach).toContain('idleDetector?.fireIdle()');
   });
 
-  it('settles empty normal/abort terminals without publishing a fake final response', () => {
+  it('settles terminals after optional output and preserves the empty-completed fallback', () => {
     const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
-    const outputGuard = emit.indexOf('if (!content) continue;');
-    const terminalLoop = emit.indexOf('for (const turn of ready)', outputGuard + 1);
-    expect(outputGuard).toBeGreaterThanOrEqual(0);
+    const emptyFallback = emit.indexOf('shouldEmitEmptyCompletedBridgeFallback');
+    const outputGuard = emit.indexOf('if (!content) continue;', emptyFallback);
+    const terminalLoop = emit.indexOf('for (const turn of ready)', outputGuard);
+    expect(emptyFallback).toBeGreaterThanOrEqual(0);
+    expect(outputGuard).toBeGreaterThan(emptyFallback);
     expect(terminalLoop).toBeGreaterThan(outputGuard);
     expect(emit.slice(terminalLoop)).toContain("turn.terminalStatus ?? 'completed'");
     expect(emit.slice(terminalLoop)).toContain('turn.dispatchAttempt');
