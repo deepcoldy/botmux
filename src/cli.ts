@@ -3272,12 +3272,20 @@ async function closeSessionForDelete(
   // Legacy sessions without larkAppId live in sessions.json. A per-bot daemon
   // writes only its own sessions-<appId>.json and silently no-ops on close
   // (sessionStore.closeSession only touches the current file), so routing a
-  // legacy session to it yields "200 OK" with no actual state change. Keep
-  // these on the offline fallback, whose saveSession() persists to the legacy
-  // file correctly.
-  const daemon = s.larkAppId
-    ? online.find(d => d.larkAppId === s.larkAppId)
-    : undefined;
+  // legacy session to it yields "200 OK" with no actual state change. This must
+  // hold on BOTH ways a daemon port is discovered — the descriptor lookup AND
+  // the injected-port current-session fallback below — so gate the whole daemon
+  // path on larkAppId with one authoritative guard. A live daemon-spawned
+  // session always carries larkAppId, so this never diverts the legitimate
+  // sandboxed current-session close (which reaches its daemon via the injected
+  // port); it only keeps larkAppId-less legacy records on the offline fallback,
+  // whose saveSession() persists to the legacy file correctly.
+  if (!s.larkAppId) {
+    closeSessionOffline(s);
+    return { ok: true, via: 'offline' };
+  }
+
+  const daemon = online.find(d => d.larkAppId === s.larkAppId);
   const isCurrentSession = process.env.BOTMUX_SESSION_ID === s.sessionId;
   const injectedPort = isCurrentSession
     ? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT)

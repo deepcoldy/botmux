@@ -322,4 +322,47 @@ describe('botmux delete — daemon-first close', () => {
       });
     }
   });
+
+  it('closes a legacy current session locally even with an injected daemon port', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-legacy-cur-data-'));
+    tempDirs.push(dataDir);
+    // A larkAppId-less session that is ALSO the current session: the injected
+    // BOTMUX_DAEMON_IPC_PORT reaches a daemon even with no online descriptor.
+    // The daemon still writes only its own sessions-<appId>.json and would
+    // no-op the legacy close, so the larkAppId guard must divert this to the
+    // offline path too — the injected port is not a second door around it.
+    const session = makeSession('sess-delete-legacy-cur', { larkAppId: undefined });
+    const sessionsPath = writeLegacySessions(dataDir, [session]);
+
+    const seen: string[] = [];
+    const server = createServer(async (req, res) => {
+      seen.push(req.url ?? '');
+      await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"alreadyClosed":false}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: undefined,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+      });
+
+      // Injected port must not route a legacy session to the daemon.
+      expect(seen).toEqual([]);
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('daemon 离线，本地收口');
+      const stored = JSON.parse(readFileSync(sessionsPath, 'utf8'));
+      expect(stored[session.sessionId].status).toBe('closed');
+      expect(stored[session.sessionId].closedAt).toBeTruthy();
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
 });
