@@ -401,7 +401,6 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
     const graceTaskIds: string[] = [];
     const reassignedTaskIds: string[] = [];
     let reconciled = false;
-    const last = lastInjectedAt.get(goalChatId) ?? 0;
     for (const task of tasks) {
       if (task.status === 'dispatched' && deps.reassignDeadWorker) {
         const dispatchAt = latestDispatchAt.get(task.taskId);
@@ -453,6 +452,11 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
         legacyTasks.push(task);
       } else if (reconcile.action === 'escalated') {
         continue;
+      } else if (reconcile.action === 'stale') {
+        // The task changed while its criteria were being checked. Do not
+        // narrate a verdict for the superseded report; the next trigger/tick
+        // reconciles the new current state.
+        continue;
       } else if ((reconcile.action === 'accepted' || reconcile.action === 'rejected') && !reconcile.deduped) {
         reconciled = true;
         try {
@@ -492,7 +496,11 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
       results.push({ goalChatId, status: 'busy', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
     }
-    if (last > 0 && now - last < intervalMs) {
+    // Re-read at the injection gate. The task loop above intentionally awaits
+    // worker probes / notifications, so a concurrent watchdog run may have
+    // claimed this goal after this run began.
+    const latestInjectedAt = lastInjectedAt.get(goalChatId) ?? 0;
+    if (latestInjectedAt > 0 && now - latestInjectedAt < intervalMs) {
       results.push({ goalChatId, status: 'rate-limited', pendingTaskIds, sessionId: ds.session.sessionId });
       continue;
     }
@@ -506,7 +514,12 @@ export async function runGoalWatchdogOnce(deps: GoalWatchdogDeps): Promise<GoalW
     try {
       await inject(ds, prompt);
     } catch (err) {
-      if (last > 0) lastInjectedAt.set(goalChatId, last); else lastInjectedAt.delete(goalChatId);
+      // Do not clobber a newer claim if another run legitimately advanced the
+      // timestamp while this injection was in flight.
+      if (lastInjectedAt.get(goalChatId) === now) {
+        if (latestInjectedAt > 0) lastInjectedAt.set(goalChatId, latestInjectedAt);
+        else lastInjectedAt.delete(goalChatId);
+      }
       throw err;
     }
     results.push({ goalChatId, status: 'injected', pendingTaskIds, sessionId: ds.session.sessionId });

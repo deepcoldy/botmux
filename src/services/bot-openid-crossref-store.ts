@@ -1,7 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isMentionableBotOpenId } from '../core/a2a-readiness.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface BotOpenIdCrossRefEntry {
   name: string;
@@ -27,20 +28,24 @@ export function mergeBotOpenIdCrossRef(
   larkAppId: string,
   entries: BotOpenIdCrossRefEntry[],
 ): boolean {
-  const current = readBotOpenIdCrossRefRecord(dataDir, larkAppId);
-  const existingKeyByName = new Map(Object.keys(current).map((name) => [name.trim().toLowerCase(), name]));
-  let changed = false;
-  for (const entry of entries) {
-    const name = entry.name.trim();
-    const openId = entry.openId.trim();
-    if (!name || !isMentionableBotOpenId(openId)) continue;
-    const key = existingKeyByName.get(name.toLowerCase()) ?? name;
-    if (current[key] === openId) continue;
-    current[key] = openId;
-    existingKeyByName.set(name.toLowerCase(), key);
-    changed = true;
-  }
-  if (!changed) return false;
-  atomicWriteFileSync(join(dataDir, `bot-openids-${larkAppId}.json`), JSON.stringify(current, null, 2));
-  return true;
+  mkdirSync(dataDir, { recursive: true });
+  const path = join(dataDir, `bot-openids-${larkAppId}.json`);
+  return withFileLockSync(path, () => {
+    const current = readBotOpenIdCrossRefRecord(dataDir, larkAppId);
+    const existingKeyByName = new Map(Object.keys(current).map((name) => [name.trim().toLowerCase(), name]));
+    let changed = false;
+    for (const entry of entries) {
+      const name = entry.name.trim();
+      const openId = entry.openId.trim();
+      if (!name || !isMentionableBotOpenId(openId)) continue;
+      const key = existingKeyByName.get(name.toLowerCase()) ?? name;
+      if (current[key] === openId) continue;
+      current[key] = openId;
+      existingKeyByName.set(name.toLowerCase(), key);
+      changed = true;
+    }
+    if (!changed) return false;
+    atomicWriteFileSync(path, JSON.stringify(current, null, 2));
+    return true;
+  });
 }

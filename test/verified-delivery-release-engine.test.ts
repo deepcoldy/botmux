@@ -392,7 +392,7 @@ describe('dependency release engine', () => {
     expect(send).toHaveBeenCalledWith(expect.objectContaining({ uuid: frozen!.intent.releaseId, recovery: true }));
   });
 
-  it('lets two recovery processes race safely on the same provider uuid and ledger key', async () => {
+  it('coalesces concurrent recovery callers for the same pending release before provider send', async () => {
     const frozen = buildTaskReleaseClaim({ ledger, taskId: 'downstream', attempt: 0, releasedBy: deps.releasedBy })!;
     ledger.claimReadyPlan({
       taskId: 'downstream', expectedPlanEventId: frozen.expectedPlanEventId,
@@ -409,9 +409,33 @@ describe('dependency release engine', () => {
     ]);
     expect(a[0]?.outcome).toBe('dispatched');
     expect(b[0]?.outcome).toBe('dispatched');
-    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(1);
     expect(new Set(send.mock.calls.map((call) => call[0].uuid))).toEqual(new Set([frozen.intent.releaseId]));
     expect(ledger.read().filter((event) => event.type === 'TaskDispatched' && event.taskId === 'downstream')).toHaveLength(1);
+  });
+
+  it('clears the release execution claim after a failed send so a later recovery can retry', async () => {
+    const frozen = buildTaskReleaseClaim({ ledger, taskId: 'downstream', attempt: 0, releasedBy: deps.releasedBy })!;
+    ledger.claimReadyPlan({
+      taskId: 'downstream', expectedPlanEventId: frozen.expectedPlanEventId,
+      expectedAcceptedEventIds: frozen.expectedAcceptedEventIds, ts: now, intent: frozen.intent,
+    });
+    send.mockRejectedValueOnce(Object.assign(new Error('network error'), { code: 'ERR_NETWORK' }));
+
+    const [first, second] = await Promise.all([
+      runGoalReleaseCheck({ goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'recovery', deps }),
+      runGoalReleaseCheck({ goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'recovery', deps }),
+    ]);
+    expect(first[0]?.outcome).toBe('failed-ambiguous');
+    expect(second[0]?.outcome).toBe('failed-ambiguous');
+    expect(send).toHaveBeenCalledTimes(1);
+
+    send.mockResolvedValueOnce('om_recovered_after_failure');
+    const recovered = await runGoalReleaseCheck({
+      goalChatId: 'oc_goal', ownerLarkAppId: 'cli_supervisor', mode: 'recovery', deps,
+    });
+    expect(recovered[0]?.outcome).toBe('dispatched');
+    expect(send).toHaveBeenCalledTimes(2);
   });
 
   it('recovers with the same uuid when the process dies after send but before TaskDispatched append', async () => {
@@ -603,9 +627,22 @@ describe('dependency release engine', () => {
     expect(classifyReleaseSendFailure({ response: { status: 503, data: { code: 999 } }, message: 'gateway' })).toMatchObject({
       failureClass: 'ambiguous', code: 'http:503',
     });
+    expect(classifyReleaseSendFailure({ response: { status: 408 }, message: 'request timeout' })).toMatchObject({
+      failureClass: 'ambiguous', code: 'http:408',
+    });
     expect(classifyReleaseSendFailure(Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }))).toMatchObject({
       failureClass: 'ambiguous', code: 'net:timeout',
     });
+    for (const [code, message, expectedCode] of [
+      ['ECONNABORTED', 'request aborted', 'net:timeout'],
+      ['ABORT_ERR', 'operation aborted', 'net:timeout'],
+      ['ERR_NETWORK', 'network error', 'net:unknown'],
+      ['ENOTFOUND', 'dns lookup failed', 'net:unknown'],
+    ] as const) {
+      expect(classifyReleaseSendFailure(Object.assign(new Error(message), { code }))).toMatchObject({
+        failureClass: 'ambiguous', code: expectedCode,
+      });
+    }
     expect(classifyReleaseSendFailure(new Error('Failed to send message: invalid chat (code: 230001)'))).toMatchObject({
       failureClass: 'definite', code: 'lark:230001',
     });

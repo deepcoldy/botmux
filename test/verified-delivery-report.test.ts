@@ -31,7 +31,7 @@ describe('verified-delivery report (worker side)', () => {
     expect(reportId).toMatch(/^task-1-r[0-9a-f]{8}$/);
     expect(evidence[0]).toEqual({ kind: 'path', path: '/tmp/out.json' });
     expect(evidence[1].kind).toBe('inline');
-    expect(draft).toMatchObject({ type: 'TaskReported', actor: 'worker', taskId: 'task-1', idempotencyKey: `reported:${reportId}` });
+    expect(draft).toMatchObject({ type: 'TaskReported', actor: 'worker', taskId: 'task-1', idempotencyKey: `reported:task-1:${reportId}` });
 
     led.append(draft);
     const t = led.task('task-1')!;

@@ -19,6 +19,7 @@ import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { recordObservedBotUnionId } from '../../services/observed-bot-union-ids-store.js';
+import { mergeBotOpenIdCrossRef } from '../../services/bot-openid-crossref-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMemberChat } from '../../services/platform-team-store.js';
@@ -848,30 +849,21 @@ export function updateBotOpenIdCrossRef(
   } catch { /* ignore */ }
   if (knownBotNames.size === 0) return;
 
-  // Read existing cross-reference
-  const fp = join(dataDir, `bot-openids-${larkAppId}.json`);
-  let existing: Record<string, string> = {};
-  try {
-    if (existsSync(fp)) existing = JSON.parse(readFileSync(fp, 'utf-8'));
-  } catch { /* ignore */ }
-
   // Update with new mentions that match known bot names
-  let changed = false;
+  const entries: Array<{ name: string; openId: string }> = [];
   for (const m of mentionsList) {
     const name = m.name;
     const openId = mentionOpenId(m);
     if (!name || !openId) continue;
     if (!knownBotNames.has(name.toLowerCase())) continue;
-    if (existing[name] === openId) continue;
-    existing[name] = openId;
-    changed = true;
+    entries.push({ name, openId });
   }
 
-  if (changed) {
+  if (entries.length > 0) {
     try {
-      if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-      atomicWriteFileSync(fp, JSON.stringify(existing, null, 2) + '\n');
-      logger.debug(`Updated bot open_id cross-ref for ${larkAppId}: ${JSON.stringify(existing)}`);
+      if (mergeBotOpenIdCrossRef(dataDir, larkAppId, entries)) {
+        logger.debug(`Updated bot open_id cross-ref for ${larkAppId}`);
+      }
     } catch (err) {
       logger.debug(`Failed to write bot open_id cross-ref: ${err}`);
     }

@@ -31,22 +31,29 @@ describe('observed-bot-union-ids-store', () => {
     expect(existsSync(join(dir, 'observed-bot-union-ids.json'))).toBe(false);
   });
 
-  it('keeps firstSeenAt while refreshing the observed identity', () => {
+  it('fails closed when one display name is observed with different union ids', () => {
     recordObservedBotUnionId(dir, 'bot', 'on_old', 'ou_1', 1000);
     expect(recordObservedBotUnionId(dir, 'bot', 'on_new', 'ou_2', 5000)).toBe(true);
     const data = JSON.parse(readFileSync(join(dir, 'observed-bot-union-ids.json'), 'utf-8'));
     expect(data.byName.bot).toMatchObject({
       unionId: 'on_new',
+      observedUnionIds: ['on_old', 'on_new'],
       lastOpenId: 'ou_2',
       firstSeenAt: 1000,
       lastSeenAt: 5000,
     });
+    expect(getBotUnionIdByName(dir, 'bot')).toBeUndefined();
+    expect(listBotUnionIds(dir)).toEqual({});
   });
 
   it('skips recent duplicate observations and refreshes stale ones', () => {
     recordObservedBotUnionId(dir, 'bot', 'on_x', 'ou_1', 1000);
     expect(recordObservedBotUnionId(dir, 'bot', 'on_x', 'ou_1', 61_000)).toBe(false);
     expect(recordObservedBotUnionId(dir, 'bot', 'on_x', 'ou_1', 661_000)).toBe(true);
+    expect(getBotUnionIdByName(dir, 'bot')).toBe('on_x');
+    expect(listBotUnionIds(dir)).toEqual({ bot: 'on_x' });
+    const data = JSON.parse(readFileSync(join(dir, 'observed-bot-union-ids.json'), 'utf-8'));
+    expect(data.byName.bot.observedUnionIds).toBeUndefined();
   });
 
   it('lists all learned names in normalized form', () => {

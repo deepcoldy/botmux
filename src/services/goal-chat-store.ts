@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 
 export interface GoalChatRecord {
@@ -48,6 +49,8 @@ export interface RegisterGoalChatInput {
   supervisorCreatedAt?: string;
   lastReviveAt?: string;
   reviveAttempts?: string[];
+  /** Explicit user-start only: clear a prior cleanup tombstone. */
+  reopen?: boolean;
 }
 
 export interface CloseGoalChatInput {
@@ -55,8 +58,12 @@ export interface CloseGoalChatInput {
   closedBy?: string;
 }
 
+export type ClaimGoalReviveResult =
+  | { ok: true; record: GoalChatRecord; claimedAt: string }
+  | { ok: false; errorCode: string; error: string };
+
 let loadedFrom: string | null = null;
-let loadedMtimeMs = -1;
+let loadedStatKey = '';
 let goalChats = new Map<string, GoalChatRecord>();
 let testOverride = false;
 
@@ -90,17 +97,20 @@ function readFile(path: string): GoalChatFile {
 function loadIfNeeded(): void {
   if (testOverride) return;
   const path = storePath();
-  let mtimeMs = -1;
+  let statKey = 'missing';
   try {
-    if (existsSync(path)) mtimeMs = statSync(path).mtimeMs;
+    if (existsSync(path)) {
+      const stat = statSync(path);
+      statKey = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
+    }
   } catch {
-    mtimeMs = -1;
+    statKey = 'unreadable';
   }
-  if (loadedFrom === path && loadedMtimeMs === mtimeMs) return;
+  if (loadedFrom === path && loadedStatKey === statKey) return;
   const file = readFile(path);
   goalChats = new Map(file.goals.map((g) => [g.chatId, g]));
   loadedFrom = path;
-  loadedMtimeMs = mtimeMs;
+  loadedStatKey = statKey;
 }
 
 function writeFile(next: Map<string, GoalChatRecord>): void {
@@ -111,60 +121,135 @@ function writeFile(next: Map<string, GoalChatRecord>): void {
   loadIfNeeded();
 }
 
-function persist(next: Map<string, GoalChatRecord>): void {
+function mutateGoalChats<T>(fn: (current: Map<string, GoalChatRecord>) => { next: Map<string, GoalChatRecord>; result: T }): T {
   if (testOverride) {
-    goalChats = next;
-    return;
+    const mutation = fn(new Map(goalChats));
+    goalChats = mutation.next;
+    return mutation.result;
   }
-  writeFile(next);
+  const path = storePath();
+  mkdirSync(join(config.session.dataDir, 'verified-delivery'), { recursive: true });
+  return withFileLockSync(path, () => {
+    const current = new Map(readFile(path).goals.map((record) => [record.chatId, record]));
+    const mutation = fn(current);
+    if (mutation.next !== current) {
+      writeFile(mutation.next);
+    } else {
+      goalChats = current;
+      loadedFrom = null;
+      loadedStatKey = '';
+    }
+    return mutation.result;
+  });
 }
 
 export function registerGoalChat(chatId: string, input: RegisterGoalChatInput = {}): GoalChatRecord {
   testOverride = false;
   const id = chatId.trim();
   if (!id) throw new Error('goal chatId is required');
-  loadIfNeeded();
-  const nowIso = new Date(input.now ?? Date.now()).toISOString();
-  const prev = goalChats.get(id);
-  const rec: GoalChatRecord = {
-    chatId: id,
-    title: input.title?.trim() || prev?.title,
-    brief: input.brief ?? prev?.brief,
-    larkAppId: input.larkAppId ?? prev?.larkAppId,
-    parentChatId: input.parentChatId ?? prev?.parentChatId,
-    parentRoot: input.parentRoot ?? prev?.parentRoot,
-    parentSessionId: input.parentSessionId ?? prev?.parentSessionId,
-    workingDir: input.workingDir ?? prev?.workingDir,
-    supervisorSessionId: input.supervisorSessionId ?? prev?.supervisorSessionId,
-    supervisorCreatedAt: input.supervisorCreatedAt ?? prev?.supervisorCreatedAt,
-    lastReviveAt: input.lastReviveAt ?? prev?.lastReviveAt,
-    reviveAttempts: input.reviveAttempts ?? prev?.reviveAttempts,
-    createdAt: prev?.createdAt ?? nowIso,
-    updatedAt: nowIso,
-  };
-  const next = new Map(goalChats);
-  next.set(id, rec);
-  writeFile(next);
-  return rec;
+  return mutateGoalChats((current) => {
+    const nowIso = new Date(input.now ?? Date.now()).toISOString();
+    const prev = current.get(id);
+    const rec: GoalChatRecord = {
+      chatId: id,
+      title: input.title?.trim() || prev?.title,
+      brief: input.brief ?? prev?.brief,
+      larkAppId: input.larkAppId ?? prev?.larkAppId,
+      parentChatId: input.parentChatId ?? prev?.parentChatId,
+      parentRoot: input.parentRoot ?? prev?.parentRoot,
+      parentSessionId: input.parentSessionId ?? prev?.parentSessionId,
+      workingDir: input.workingDir ?? prev?.workingDir,
+      supervisorSessionId: input.supervisorSessionId ?? prev?.supervisorSessionId,
+      supervisorCreatedAt: input.supervisorCreatedAt ?? prev?.supervisorCreatedAt,
+      lastReviveAt: input.lastReviveAt ?? prev?.lastReviveAt,
+      reviveAttempts: input.reviveAttempts ?? prev?.reviveAttempts,
+      closedAt: input.reopen ? undefined : prev?.closedAt,
+      closedBy: input.reopen ? undefined : prev?.closedBy,
+      createdAt: prev?.createdAt ?? nowIso,
+      updatedAt: nowIso,
+    };
+    const next = new Map(current);
+    next.set(id, rec);
+    return { next, result: rec };
+  });
 }
 
 export function closeGoalChat(chatId: string | undefined, input: CloseGoalChatInput = {}): GoalChatRecord | undefined {
   const id = chatId?.trim();
   if (!id) return undefined;
-  loadIfNeeded();
-  const prev = goalChats.get(id);
-  if (!prev) return undefined;
-  const nowIso = new Date(input.now ?? Date.now()).toISOString();
-  const rec: GoalChatRecord = {
-    ...prev,
-    closedAt: nowIso,
-    closedBy: input.closedBy?.trim() || prev.closedBy,
-    updatedAt: nowIso,
-  };
-  const next = new Map(goalChats);
-  next.set(id, rec);
-  persist(next);
-  return rec;
+  return mutateGoalChats((current) => {
+    const prev = current.get(id);
+    if (!prev) return { next: current, result: undefined };
+    const nowIso = new Date(input.now ?? Date.now()).toISOString();
+    const rec: GoalChatRecord = {
+      ...prev,
+      closedAt: nowIso,
+      closedBy: input.closedBy?.trim() || prev.closedBy,
+      updatedAt: nowIso,
+    };
+    const next = new Map(current);
+    next.set(id, rec);
+    return { next, result: rec };
+  });
+}
+
+export function claimGoalChatRevive(input: {
+  chatId: string;
+  larkAppId: string;
+  now: number;
+  cooldownMs: number;
+  windowMs: number;
+  maxAttempts: number;
+}): ClaimGoalReviveResult {
+  const id = input.chatId.trim();
+  if (!id) return { ok: false, errorCode: 'goal_not_registered', error: 'goal chat is not registered' };
+  return mutateGoalChats<ClaimGoalReviveResult>((current) => {
+    const prev = current.get(id);
+    if (!prev) {
+      return { next: current, result: { ok: false, errorCode: 'goal_not_registered', error: 'goal chat is not registered' } };
+    }
+    if (prev.closedAt) {
+      return { next: current, result: { ok: false, errorCode: 'goal_closed', error: `goal chat was closed at ${prev.closedAt}` } };
+    }
+    if (prev.larkAppId && prev.larkAppId !== input.larkAppId) {
+      return { next: current, result: { ok: false, errorCode: 'not_owner_daemon', error: `goal is owned by ${prev.larkAppId}` } };
+    }
+    if (!prev.parentChatId) {
+      return { next: current, result: { ok: false, errorCode: 'incomplete_goal_record', error: 'goal registry has no parentChatId' } };
+    }
+    const recent = (prev.reviveAttempts ?? []).filter((value) => {
+      const at = Date.parse(value);
+      return Number.isFinite(at) && input.now - at < input.windowMs;
+    });
+    const lastRevive = prev.lastReviveAt ? Date.parse(prev.lastReviveAt) : undefined;
+    if (lastRevive !== undefined && Number.isFinite(lastRevive) && input.now - lastRevive < input.cooldownMs) {
+      return {
+        next: current,
+        result: { ok: false, errorCode: 'revive_cooldown', error: `last revive was ${input.now - lastRevive}ms ago` },
+      };
+    }
+    if (recent.length >= input.maxAttempts) {
+      return {
+        next: current,
+        result: {
+          ok: false,
+          errorCode: 'revive_budget_exhausted',
+          error: `goal supervisor revived ${recent.length} time(s) in ${input.windowMs}ms`,
+        },
+      };
+    }
+    const claimedAt = new Date(input.now).toISOString();
+    const record: GoalChatRecord = {
+      ...prev,
+      larkAppId: prev.larkAppId ?? input.larkAppId,
+      lastReviveAt: claimedAt,
+      reviveAttempts: [...recent, claimedAt],
+      updatedAt: claimedAt,
+    };
+    const next = new Map(current);
+    next.set(id, record);
+    return { next, result: { ok: true, record, claimedAt } };
+  });
 }
 
 export function getGoalChat(chatId: string | undefined): GoalChatRecord | undefined {
@@ -187,6 +272,6 @@ export function listGoalChats(): GoalChatRecord[] {
 export function _resetGoalChatStoreForTest(records: GoalChatRecord[] = []): void {
   testOverride = true;
   loadedFrom = null;
-  loadedMtimeMs = -1;
+  loadedStatKey = '';
   goalChats = new Map(records.map((r) => [r.chatId, r]));
 }

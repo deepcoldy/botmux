@@ -1,9 +1,10 @@
 // 团队协作群绑定：dashboard 团队页发起建群成功后记录 teamId↔chatId。
 // 看板的团队筛选用它识别「dashboard 发起的协作群」（另一半靠 /introduce
 // 记录 + 团队 roster 名字匹配识别手动协作群）。
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface TeamGroupBinding {
   teamId: string;
@@ -28,10 +29,13 @@ export function listTeamGroups(dataDir: string, teamId?: string): TeamGroupBindi
 
 export function recordTeamGroup(dataDir: string, teamId: string, chatId: string, now: number = Date.now()): void {
   if (!teamId || !chatId) return;
-  const all = listTeamGroups(dataDir);
-  if (all.some(b => b.teamId === teamId && b.chatId === chatId)) return;
-  all.push({ teamId, chatId, createdAt: now });
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(all, null, 2) + '\n');
+  mkdirSync(dataDir, { recursive: true });
+  withFileLockSync(filePath(dataDir), () => {
+    const all = listTeamGroups(dataDir);
+    if (all.some(b => b.teamId === teamId && b.chatId === chatId)) return;
+    all.push({ teamId, chatId, createdAt: now });
+    atomicWriteFileSync(filePath(dataDir), JSON.stringify(all, null, 2) + '\n');
+  });
 }
 
 /**
@@ -49,18 +53,21 @@ export function replaceTeamGroupsByPrefix(
   now: number = Date.now(),
 ): void {
   if (!prefix) return;
-  const all = listTeamGroups(dataDir);
-  const kept = all.filter(b => !b.teamId.startsWith(prefix));
-  const prior = new Map(all.filter(b => b.teamId.startsWith(prefix)).map(b => [`${b.teamId}\u0000${b.chatId}`, b]));
-  const seen = new Set<string>();
-  for (const g of groups) {
-    if (!g.teamId.startsWith(prefix) || !g.chatId) continue; // caller must pre-prefix — never let platform data shadow legacy ids
-    const key = `${g.teamId}\u0000${g.chatId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    kept.push(prior.get(key) ?? { teamId: g.teamId, chatId: g.chatId, createdAt: now });
-  }
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(kept, null, 2) + '\n');
+  mkdirSync(dataDir, { recursive: true });
+  withFileLockSync(filePath(dataDir), () => {
+    const all = listTeamGroups(dataDir);
+    const kept = all.filter(b => !b.teamId.startsWith(prefix));
+    const prior = new Map(all.filter(b => b.teamId.startsWith(prefix)).map(b => [`${b.teamId}\u0000${b.chatId}`, b]));
+    const seen = new Set<string>();
+    for (const g of groups) {
+      if (!g.teamId.startsWith(prefix) || !g.chatId) continue; // caller must pre-prefix — never let platform data shadow legacy ids
+      const key = `${g.teamId}\u0000${g.chatId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      kept.push(prior.get(key) ?? { teamId: g.teamId, chatId: g.chatId, createdAt: now });
+    }
+    atomicWriteFileSync(filePath(dataDir), JSON.stringify(kept, null, 2) + '\n');
+  });
 }
 
 /** Is `chatId` a team-assembled (拉群) group of ANY team? This is the TRUST ROOT

@@ -27,7 +27,12 @@ import {
   stopCliRuntimeUpdateMonitor,
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
-import { classifyGoalWorkerHealth, type GoalWorkerProcessState, type GoalWorkerSessionState } from './core/goal-worker-health.js';
+import {
+  classifyGoalWorkerHealth,
+  parseGoalWorkerHealthProbe,
+  type GoalWorkerHealthEntry,
+  type GoalWorkerHealthProbe,
+} from './core/goal-worker-health.js';
 import { countGoalWorkerReassignAttempts, DEFAULT_GOAL_WORKER_REASSIGN_MAX_ATTEMPTS, latestTaskDispatchEvent } from './core/goal-reassign-budget.js';
 import { statSync } from 'node:fs';
 import { addReaction, getChatMode, getMessageChatId, listChatBotMembers, listChatMemberOpenIds, MessageWithdrawnError, probeChatBotMembership, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
@@ -65,10 +70,10 @@ import { getGoalChat } from './services/goal-chat-store.js';
 import {
   listDueGoalNotificationRetries,
   listGoalNotificationRetries,
+  goalNotificationProviderUuid,
   markGoalNotificationRetryAttempt,
   markGoalNotificationRetryDead,
   markGoalNotificationRetrySent,
-  removeGoalNotificationRetry,
   upsertGoalNotificationRetry,
   type GoalNotificationRetryRecord,
 } from './services/goal-notification-retry-store.js';
@@ -276,6 +281,7 @@ import { emitGoalNarration } from './verified-delivery/narration.js';
 import { openLedger } from './verified-delivery/ledger.js';
 import {
   confirmTaskRelease,
+  classifyReleaseSendFailure,
   retryTaskRelease,
   runGoalReleaseCheck,
   type ReleaseEngineDeps,
@@ -2548,14 +2554,7 @@ async function handleGoalReviveFailure(event: GoalWatchdogReviveFailureEvent): P
   logger.warn(`[goal-watchdog] revive budget exhausted goal=${event.goalChatId}; human attention failed: ${lastError ?? 'no_sender_available'}`);
 }
 
-type LocalGoalWorkerHealth = {
-  larkAppId: string;
-  sessionId?: string;
-  session: GoalWorkerSessionState;
-  workerProcess: GoalWorkerProcessState;
-  lastActivityAt?: string;
-  title?: string;
-};
+type LocalGoalWorkerHealth = GoalWorkerHealthEntry;
 
 const GOAL_WORKER_REASSIGN_COOLDOWN_MS = 15 * 60_000;
 
@@ -2587,16 +2586,6 @@ function collectLocalGoalWorkerHealth(goalChatId: string, workerLarkAppId?: stri
   return out;
 }
 
-type GoalWorkerHealthProbe = {
-  /** True only when the owning daemon actually answered. A false here means the
-   *  daemon is offline OR the IPC timed out / errored — it is NOT evidence that
-   *  the worker session is gone. The reassign path must treat this as unknown,
-   *  never as a dead worker, or a momentarily-slow daemon triggers a wrongful
-   *  reassign (and burns the human-escalation budget). */
-  probeOk: boolean;
-  entries: LocalGoalWorkerHealth[];
-};
-
 async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string): Promise<GoalWorkerHealthProbe> {
   if (workerLarkAppId === currentDaemonLarkAppId) {
     return { probeOk: true, entries: collectLocalGoalWorkerHealth(goalChatId, workerLarkAppId) };
@@ -2613,8 +2602,8 @@ async function fetchGoalWorkerHealth(goalChatId: string, workerLarkAppId: string
       signal: ctrl.signal,
     });
     if (!res.ok) return { probeOk: false, entries: [] };
-    const body = await res.json().catch(() => null) as { entries?: LocalGoalWorkerHealth[] } | null;
-    return { probeOk: true, entries: Array.isArray(body?.entries) ? body.entries : [] };
+    const body = await res.json().catch(() => null);
+    return parseGoalWorkerHealthProbe(body, workerLarkAppId);
   } catch {
     return { probeOk: false, entries: [] };
   } finally {
@@ -4877,6 +4866,7 @@ ipcRoute('POST', '/api/goal/supervise', async (req, res) => {
     brief: typeof raw.brief === 'string' && raw.brief.trim() ? raw.brief : undefined,
     workingDir: typeof raw.workingDir === 'string' && raw.workingDir.trim() ? raw.workingDir.trim() : undefined,
     parentSessionId: typeof raw.parentSessionId === 'string' && raw.parentSessionId.trim() ? raw.parentSessionId.trim() : undefined,
+    reopenClosed: true,
   }, { larkAppId: targetLarkAppId, activeSessions });
   if (!result.ok) {
     const status = result.errorCode === 'bot_not_in_chat' ? 404 : 400;
@@ -5038,6 +5028,7 @@ function retryRecordFromCompletion(input: {
 
 async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
   let lastError: string | undefined;
+  const providerUuid = goalNotificationProviderUuid(record.id, record.parentChatId);
   for (const larkAppId of record.candidates) {
     const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
     const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
@@ -5059,7 +5050,7 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
       supervisorSessionId: record.supervisorSessionId,
     });
     try {
-      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive', providerUuid);
       if (messageId) {
         rememberGoalParentNotification({
           messageId,
@@ -5084,6 +5075,10 @@ async function sendGoalHumanAttentionRecord(record: GoalNotificationRetryRecord)
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       logger.warn(`[goal-human-attention] send via ${larkAppId} failed: ${lastError}`);
+      // A transport error may happen after Feishu accepted the request. Do not
+      // fail over to another bot app (provider UUID scope is per sender); queue
+      // a retry on the same ordered candidate list and UUID instead.
+      if (classifyReleaseSendFailure(err).failureClass === 'ambiguous') break;
     }
   }
   return { sent: false, error: lastError ?? 'no_sender_available' };
@@ -5106,7 +5101,9 @@ async function sendGoalHumanAttention(input: {
     upsertGoalNotificationRetry({ ...record, lastError: result.error });
     logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
   } else {
-    removeGoalNotificationRetry(record.id);
+    // No-op when there was never a queued record; otherwise retain a sent
+    // tombstone so a stale overlapping retry process cannot recreate it.
+    markGoalNotificationRetrySent(record.id);
   }
   return result;
 }
@@ -5232,13 +5229,14 @@ async function sendGoalCompletionConfirmation(input: {
     upsertGoalNotificationRetry({ ...record, lastError: result.error });
     logger.warn(`[goal-notification-retry] queued ${record.kind} id=${record.id} goal=${record.goalChatId}: ${result.error}`);
   } else {
-    removeGoalNotificationRetry(record.id);
+    markGoalNotificationRetrySent(record.id);
   }
   return result;
 }
 
 async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetryRecord): Promise<{ sent: boolean; error?: string }> {
   let lastError: string | undefined;
+  const providerUuid = goalNotificationProviderUuid(record.id, record.parentChatId);
   for (const larkAppId of record.candidates) {
     const goalLink = chatAppLink(record.goalChatId, getBotBrand(larkAppId));
     const ownerOpenId = getOwnerOpenId(larkAppId) ?? record.ownerOpenId;
@@ -5251,7 +5249,7 @@ async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetr
       supervisorSessionId: record.supervisorSessionId,
     });
     try {
-      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive');
+      const messageId = await sendMessage(larkAppId, record.parentChatId, card, 'interactive', providerUuid);
       if (messageId) {
         rememberGoalParentNotification({
           messageId,
@@ -5271,6 +5269,7 @@ async function sendGoalCompletionConfirmationRecord(record: GoalNotificationRetr
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
       logger.warn(`[goal-completion-confirm] send via ${larkAppId} failed: ${lastError}`);
+      if (classifyReleaseSendFailure(err).failureClass === 'ambiguous') break;
     }
   }
   return { sent: false, error: lastError ?? 'no_sender_available' };
@@ -5306,8 +5305,11 @@ async function processGoalNotificationRetriesInner(): Promise<void> {
       ? await sendGoalHumanAttentionRecord(record)
       : await sendGoalCompletionConfirmationRecord(record);
     if (result.sent) {
-      if (record.retainOnSuccess) markGoalNotificationRetrySent(record.id);
-      else removeGoalNotificationRetry(record.id);
+      // Always leave a sent tombstone for a queued retry. During a rolling
+      // restart another process may have listed the same pending row before
+      // this send completed; terminal-preserving upserts make its late failure
+      // a no-op instead of resurrecting the delivery after provider UUID TTL.
+      markGoalNotificationRetrySent(record.id);
       logger.info(`[goal-notification-retry] delivered ${record.kind} id=${record.id} goal=${record.goalChatId}`);
       continue;
     }

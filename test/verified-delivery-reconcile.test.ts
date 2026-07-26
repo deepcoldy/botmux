@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { openLedger } from '../src/verified-delivery/ledger.js';
+import { openLedger, type LedgerHandle } from '../src/verified-delivery/ledger.js';
 import { verifyAcceptanceCriteria, reconcileTaskByCriteria, type AcceptanceVerifyResult } from '../src/verified-delivery/reconcile.js';
 import type { AcceptanceCriteria, LedgerEventDraft } from '../src/verified-delivery/types.js';
 
@@ -161,6 +161,40 @@ describe('reconcileTaskByCriteria — verify → ledger events', () => {
     expect(task.reports[0].verdict).toBe('rejected');
     expect(task.reports[0].reason).toBe('check_failed');
     expect(task.reports[0].verdictVia).toBe('reconcile');
+  });
+
+  it('does not write or narrate a stale verdict when a new report arrives during verification', () => {
+    for (const [taskId, verify] of [['t-race-pass', pass], ['t-race-fail', fail]] as const) {
+      const led = dispatched(taskId);
+      led.append(draft({
+        type: 'TaskReported', actor: 'worker', taskId, chatId: 'oc_g', idempotencyKey: `reported:${taskId}:r1`,
+        payload: { taskId, reportId: 'r1', summary: 'first attempt', evidence: [{ kind: 'path', path: '/tmp/vd-demo/first.txt' }] },
+      }));
+      let raced = false;
+      const racingLedger: LedgerHandle = {
+        ...led,
+        appendCurrentReportVerdict: (verdict) => {
+          if (!raced) {
+            raced = true;
+            led.append(draft({
+              type: 'TaskReported', actor: 'worker', taskId, chatId: 'oc_g', idempotencyKey: `reported:${taskId}:r2`,
+              payload: { taskId, reportId: 'r2', summary: 'new attempt', evidence: [{ kind: 'path', path: '/tmp/vd-demo/new.txt' }] },
+            }));
+          }
+          return led.appendCurrentReportVerdict(verdict);
+        },
+      };
+      const onAccepted = vi.fn();
+
+      const result = reconcileTaskByCriteria(racingLedger, taskId, { checkedBy: 'sup', now: TS, verify, onAccepted });
+
+      expect(result).toMatchObject({ action: 'stale', reportId: 'r1' });
+      expect(onAccepted).not.toHaveBeenCalled();
+      const current = led.task(taskId)!;
+      expect(current.status).toBe('reported');
+      expect(current.latestReportId).toBe('r2');
+      expect(current.reports.find((report) => report.reportId === 'r1')?.verdict).toBeUndefined();
+    }
   });
 
   it('idempotent: re-running an accepted task does nothing', () => {

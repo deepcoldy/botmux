@@ -8,7 +8,7 @@ import { buildFollowUpContent, buildNewTopicPrompt, getAvailableBots, rememberLa
 import { forkWorker, getCurrentCliVersion } from './worker-pool.js';
 import { sessionKey, type DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
-import { getGoalChat, registerGoalChat } from '../services/goal-chat-store.js';
+import { claimGoalChatRevive, getGoalChat, registerGoalChat } from '../services/goal-chat-store.js';
 
 export interface GoalSuperviseRequest {
   chatId: string;
@@ -18,6 +18,8 @@ export interface GoalSuperviseRequest {
   brief?: string;
   workingDir?: string;
   parentSessionId?: string;
+  /** Explicit L1 start may reopen a goal that a prior cleanup closed. */
+  reopenClosed?: boolean;
 }
 
 export interface GoalSuperviseResponse {
@@ -228,7 +230,7 @@ function resolveWorkingDir(req: GoalSuperviseRequest, larkAppId: string, parent?
   return { ok: true, workingDir: v.resolvedPath };
 }
 
-export async function startGoalSupervisor(
+async function startGoalSupervisorInner(
   req: GoalSuperviseRequest,
   deps: GoalSupervisorDeps,
 ): Promise<GoalSuperviseResponse | GoalSuperviseError> {
@@ -237,6 +239,29 @@ export async function startGoalSupervisor(
   const parentChatId = req.parentChatId.trim();
   if (!chatId) return { ok: false, errorCode: 'missing_chatId', error: 'chatId is required' };
   if (!parentChatId) return { ok: false, errorCode: 'missing_parentChatId', error: 'parentChatId is required' };
+
+  const existing = findGoalSupervisorByGoal(deps.activeSessions, larkAppId, chatId);
+  if (existing?.session.goalSupervisor) {
+    if (req.reopenClosed) {
+      registerGoalChat(chatId, {
+        reopen: true,
+        larkAppId,
+        parentChatId: existing.session.goalSupervisor.parentChatId,
+        parentRoot: existing.session.goalSupervisor.parentRoot,
+        parentSessionId: existing.session.goalSupervisor.parentSessionId,
+        supervisorSessionId: existing.session.sessionId,
+      });
+    }
+    return {
+      ok: true,
+      goalChatId: chatId,
+      supervisorSessionId: existing.session.sessionId,
+      parent: {
+        chatId: existing.session.goalSupervisor.parentChatId,
+        rootMessageId: existing.session.goalSupervisor.parentRoot,
+      },
+    };
+  }
 
   const inChat = await groupsStore.isInChat(larkAppId, chatId);
   if (!inChat) {
@@ -258,6 +283,7 @@ export async function startGoalSupervisor(
       parentRoot: req.parentRoot,
       parentSessionId: req.parentSessionId,
       workingDir: wd.workingDir,
+      reopen: req.reopenClosed,
     });
   } catch (err) {
     return {
@@ -295,6 +321,7 @@ export async function startGoalSupervisor(
     workingDir: wd.workingDir,
     supervisorSessionId: session.sessionId,
     supervisorCreatedAt: session.createdAt,
+    reopen: req.reopenClosed,
   });
 
   messageQueue.ensureQueue(anchor);
@@ -331,6 +358,16 @@ export async function startGoalSupervisor(
     { larkAppId, chatId },
   );
 
+  // Cleanup can race an auto-revive while the start path awaits membership /
+  // prompt facts. Re-check the durable tombstone immediately before exposing
+  // or forking the revived session; an explicit L1 start uses reopenClosed and
+  // intentionally cleared that tombstone earlier.
+  if (!req.reopenClosed && getGoalChat(chatId)?.closedAt) {
+    session.status = 'closed';
+    sessionStore.updateSession(session);
+    return { ok: false, errorCode: 'goal_closed', error: 'goal was closed while supervisor revival was starting' };
+  }
+
   deps.activeSessions.set(sessionKey(anchor, larkAppId), ds);
   rememberLastCliInput(ds, userPrompt, cliInput);
   forkWorker(ds, cliInput);
@@ -343,11 +380,20 @@ export async function startGoalSupervisor(
   };
 }
 
-function recentReviveAttempts(attempts: string[] | undefined, now: number, windowMs: number): string[] {
-  return (attempts ?? []).filter((ts) => {
-    const t = Date.parse(ts);
-    return Number.isFinite(t) && now - t < windowMs;
+const goalSupervisorStarts = new Map<string, Promise<GoalSuperviseResponse | GoalSuperviseError>>();
+
+export function startGoalSupervisor(
+  req: GoalSuperviseRequest,
+  deps: GoalSupervisorDeps,
+): Promise<GoalSuperviseResponse | GoalSuperviseError> {
+  const key = `${deps.larkAppId}\0${req.chatId.trim()}`;
+  const inFlight = goalSupervisorStarts.get(key);
+  if (inFlight) return inFlight;
+  const start = startGoalSupervisorInner(req, deps).finally(() => {
+    if (goalSupervisorStarts.get(key) === start) goalSupervisorStarts.delete(key);
   });
+  goalSupervisorStarts.set(key, start);
+  return start;
 }
 
 export async function ensureGoalSupervisorFromRegistry(
@@ -384,42 +430,38 @@ export async function ensureGoalSupervisorFromRegistry(
   const cooldownMs = opts.cooldownMs ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_COOLDOWN_MS;
   const windowMs = opts.windowMs ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_WINDOW_MS;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_GOAL_SUPERVISOR_REVIVE_MAX_ATTEMPTS;
-  const recent = recentReviveAttempts(rec.reviveAttempts, now, windowMs);
-  const lastRevive = rec.lastReviveAt ? Date.parse(rec.lastReviveAt) : undefined;
-  if (lastRevive !== undefined && Number.isFinite(lastRevive) && now - lastRevive < cooldownMs) {
-    return { ok: false, goalChatId, errorCode: 'revive_cooldown', error: `last revive was ${now - lastRevive}ms ago` };
+  const claim = claimGoalChatRevive({
+    chatId: goalChatId,
+    larkAppId: deps.larkAppId,
+    now,
+    cooldownMs,
+    windowMs,
+    maxAttempts,
+  });
+  if (!claim.ok) {
+    return { ok: false, goalChatId, errorCode: claim.errorCode, error: claim.error };
   }
-  if (recent.length >= maxAttempts) {
-    return {
-      ok: false,
-      goalChatId,
-      errorCode: 'revive_budget_exhausted',
-      error: `goal supervisor revived ${recent.length} time(s) in ${windowMs}ms`,
-    };
-  }
+  const claimed = claim.record;
 
   const revived = await startGoalSupervisor({
-    chatId: rec.chatId,
-    parentChatId: rec.parentChatId,
-    parentRoot: rec.parentRoot,
-    parentSessionId: rec.parentSessionId,
-    title: rec.title ?? rec.chatId,
-    brief: rec.brief
-      ? `${rec.brief}\n\n[auto-revive] 你是被 goal-watchdog 自动恢复的 L2；先查 goal charter 和 delivery ledger，继续处理未完成任务。`
+    chatId: claimed.chatId,
+    parentChatId: claimed.parentChatId!,
+    parentRoot: claimed.parentRoot,
+    parentSessionId: claimed.parentSessionId,
+    title: claimed.title ?? claimed.chatId,
+    brief: claimed.brief
+      ? `${claimed.brief}\n\n[auto-revive] 你是被 goal-watchdog 自动恢复的 L2；先查 goal charter 和 delivery ledger，继续处理未完成任务。`
       : '[auto-revive] 你是被 goal-watchdog 自动恢复的 L2；先查 goal charter 和 delivery ledger，继续处理未完成任务。',
-    workingDir: rec.workingDir,
+    workingDir: claimed.workingDir,
   }, deps);
 
   if (!revived.ok) {
     return { ok: false, goalChatId, errorCode: revived.errorCode, error: revived.error };
   }
 
-  const at = new Date(now).toISOString();
   registerGoalChat(goalChatId, {
-    lastReviveAt: at,
-    reviveAttempts: [...recent, at],
     supervisorSessionId: revived.supervisorSessionId,
-    supervisorCreatedAt: at,
+    supervisorCreatedAt: claim.claimedAt,
   });
 
   return {

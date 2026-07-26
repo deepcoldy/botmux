@@ -191,18 +191,30 @@ export function classifyReleaseSendFailure(error: unknown): {
   const status = Number(err?.response?.status);
   const responseCode = err?.response?.data?.code;
   const messageCode = detail.match(/\(code:\s*([^\s)]+)\)/i)?.[1];
-  const code = responseCode ?? messageCode ?? err?.code;
+  if (status === 408 || status === 499) {
+    return { failureClass: 'ambiguous', code: `http:${status}`, detail };
+  }
   if (Number.isFinite(status) && status >= 400 && status < 500) {
     return { failureClass: 'definite', code: `http:${status}`, detail };
   }
   if (Number.isFinite(status) && status >= 500) {
     return { failureClass: 'ambiguous', code: `http:${status}`, detail };
   }
-  if (code !== undefined && code !== '' && !String(code).match(/^(?:ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN)$/i)) {
-    return { failureClass: 'definite', code: `lark:${String(code)}`, detail };
+  // Lark business codes are numeric. Generic string `error.code` values come
+  // from the transport stack (ECONNABORTED, ABORT_ERR, ERR_NETWORK, ENOTFOUND,
+  // undici codes, ...); treating an unrecognised one as a provider rejection
+  // is unsafe because the request may already have been accepted remotely.
+  const providerCode = responseCode ?? messageCode;
+  if (providerCode !== undefined && /^\d+$/.test(String(providerCode))) {
+    return { failureClass: 'definite', code: `lark:${String(providerCode)}`, detail };
   }
-  const normalizedCode = String(code ?? '').toLowerCase();
-  const timeout = normalizedCode.includes('timeout') || /timeout|timed out|abort/i.test(detail);
+  if (typeof err?.code === 'number' || (typeof err?.code === 'string' && /^\d+$/.test(err.code))) {
+    return { failureClass: 'definite', code: `lark:${String(err.code)}`, detail };
+  }
+  const normalizedCode = String(err?.code ?? '').toLowerCase();
+  const timeout = normalizedCode.includes('timeout')
+    || normalizedCode.includes('abort')
+    || /timeout|timed out|abort/i.test(detail);
   return {
     failureClass: 'ambiguous',
     code: timeout ? 'net:timeout' : 'net:unknown',
@@ -346,6 +358,24 @@ async function executePendingRelease(input: {
   return { taskId: task.taskId, outcome: 'dispatched', releaseId: pending.releaseId };
 }
 
+const pendingReleaseExecutions = new Map<string, Promise<TaskReleaseResult>>();
+
+function executePendingReleaseOnce(input: {
+  task: TaskView;
+  pending: TaskPendingReleaseView;
+  recovery: boolean;
+  deps: ReleaseEngineDeps;
+}): Promise<TaskReleaseResult> {
+  const key = `${input.task.taskId}\0${input.pending.releaseId}`;
+  const inFlight = pendingReleaseExecutions.get(key);
+  if (inFlight) return inFlight;
+  const execution = executePendingRelease(input).finally(() => {
+    if (pendingReleaseExecutions.get(key) === execution) pendingReleaseExecutions.delete(key);
+  });
+  pendingReleaseExecutions.set(key, execution);
+  return execution;
+}
+
 function shouldRecoverPending(pending: TaskPendingReleaseView, now: number): boolean {
   if (pending.failure?.failureClass === 'definite') return false;
   return now - pending.intentAt < TASK_RELEASE_AUTO_RETRY_WINDOW_MS;
@@ -369,7 +399,7 @@ export async function runGoalReleaseCheck(input: {
       } else if (!shouldRecoverPending(initial.pendingRelease, deps.now())) {
         results.push({ taskId: initial.taskId, outcome: 'waiting-human', releaseId: initial.pendingRelease.releaseId });
       } else {
-        results.push(await executePendingRelease({ task: initial, pending: initial.pendingRelease, recovery: true, deps }));
+        results.push(await executePendingReleaseOnce({ task: initial, pending: initial.pendingRelease, recovery: true, deps }));
       }
       continue;
     }
@@ -413,7 +443,7 @@ export async function runGoalReleaseCheck(input: {
       if (!current?.pendingRelease) {
         results.push({ taskId: initial.taskId, outcome: 'stale' });
       } else {
-        results.push(await executePendingRelease({ task: current, pending: current.pendingRelease, recovery: false, deps }));
+        results.push(await executePendingReleaseOnce({ task: current, pending: current.pendingRelease, recovery: false, deps }));
       }
       completed = true;
     }
@@ -452,7 +482,7 @@ export async function retryTaskRelease(input: {
   }
   const current = input.deps.ledger.task(input.taskId);
   if (!current?.pendingRelease) return { taskId: input.taskId, outcome: 'stale' };
-  return executePendingRelease({ task: current, pending: current.pendingRelease, recovery: false, deps: input.deps });
+  return executePendingReleaseOnce({ task: current, pending: current.pendingRelease, recovery: false, deps: input.deps });
 }
 
 export function confirmTaskRelease(input: {

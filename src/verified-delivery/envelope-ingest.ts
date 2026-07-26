@@ -69,7 +69,7 @@ export function ingestParsedDeliveryEnvelope(input: {
       taskId: envelope.taskId,
       chatId: goalChatId,
       ts: input.now,
-      idempotencyKey: envelope.reportId?.trim() ? `reported:${reportId}` : `reported:msg:${messageId}`,
+      idempotencyKey: `reported:${envelope.taskId}:${reportId}`,
       payload: {
         taskId: envelope.taskId,
         reportId,

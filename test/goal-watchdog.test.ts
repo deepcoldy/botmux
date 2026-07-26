@@ -30,6 +30,7 @@ function ledger(tasks: TaskView[]): LedgerHandle {
     read: () => [],
     task: (taskId: string) => tasks.find((t) => t.taskId === taskId),
     append: (() => { throw new Error('not used'); }) as LedgerHandle['append'],
+    appendCurrentReportVerdict: (() => { throw new Error('not used'); }) as LedgerHandle['appendCurrentReportVerdict'],
     writeInlineEvidence: (() => { throw new Error('not used'); }) as LedgerHandle['writeInlineEvidence'],
     readInlineEvidence: (() => { throw new Error('not used'); }) as LedgerHandle['readInlineEvidence'],
   };
@@ -748,6 +749,42 @@ describe('goal watchdog', () => {
     } finally {
       rmSync(baseDir, { recursive: true, force: true });
     }
+  });
+
+  it('re-checks the per-goal gate after awaited health probes so concurrent runs inject only once', async () => {
+    const activeSessions = new Map<string, DaemonSession>();
+    activeSessions.set(sessionKey('oc_goal', 'cli_main'), ds({ chatId: 'oc_goal', larkAppId: 'cli_main' }));
+    const lastInjectedAt = new Map<string, number>();
+    const inject = vi.fn();
+    let probesEntered = 0;
+    let releaseProbes!: () => void;
+    const probesMayFinish = new Promise<void>((resolve) => { releaseProbes = resolve; });
+    const workerHealthFacts = vi.fn(async () => {
+      probesEntered += 1;
+      if (probesEntered === 2) releaseProbes();
+      await probesMayFinish;
+      return [];
+    });
+    const deps = {
+      larkAppId: 'cli_main',
+      activeSessions,
+      ledger: ledger([task('t-race', 'oc_goal', 'dispatched')]),
+      now: 10_000,
+      intervalMs: 30_000,
+      lastInjectedAt,
+      workerHealthFacts,
+      inject,
+      notify: vi.fn(),
+    };
+
+    const [first, second] = await Promise.all([
+      runGoalWatchdogOnce(deps),
+      runGoalWatchdogOnce(deps),
+    ]);
+
+    expect(workerHealthFacts).toHaveBeenCalledTimes(2);
+    expect(inject).toHaveBeenCalledTimes(1);
+    expect([first[0]?.status, second[0]?.status].sort()).toEqual(['injected', 'rate-limited']);
   });
 
   it('deterministically reassigns stale dispatched tasks before prompting L2', async () => {

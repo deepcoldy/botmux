@@ -7,7 +7,19 @@
  *
  * This is deliberately tiny — see types.ts for why it is not the collab board.
  */
-import { existsSync, mkdirSync, readFileSync, appendFileSync, writeFileSync, statSync, renameSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
@@ -22,9 +34,12 @@ import type {
   TaskDispatchIntentPayload,
   TaskDispatchedPayload,
   TaskPlannedPayload,
+  TaskAcceptedPayload,
+  TaskRejectedPayload,
   TaskReleaseDependency,
   TaskView,
   TaskReportView,
+  TaskReportedPayload,
 } from './types.js';
 import { validateLedgerEventDraft } from './invariants.js';
 
@@ -58,9 +73,17 @@ export type ClaimRetryReleaseResult =
   | { result: 'not-retryable' }
   | { result: 'stale' };
 
+export type AppendCurrentReportVerdictResult =
+  | { result: 'appended'; event: LedgerEvent }
+  | { result: 'deduped'; event: LedgerEvent }
+  | { result: 'stale' };
+
 export interface LedgerHandle {
   /** Append an event; same idempotencyKey twice ⇒ second is a no-op. */
   append(draft: LedgerEventDraft): { event: LedgerEvent; deduped: boolean };
+  /** Append a reconcile verdict only while its report is still the current,
+   *  pending delivery. This closes verify→append races with re-report/cancel. */
+  appendCurrentReportVerdict(draft: LedgerEventDraft): AppendCurrentReportVerdictResult;
   /** All events in append order. */
   read(): LedgerEvent[];
   /** Current state of one task, or undefined if never dispatched/reported. */
@@ -181,7 +204,10 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
    *  instead of burning a CPU busy-wait while a peer holds the lock. */
   function withLock<T>(fn: () => T): T {
     ensureDirs();
-    return withFileLockSync(ledgerPath, fn);
+    // Keep the historical lock pathname (`ledger.lock`) during rolling
+    // upgrades. Passing ledgerPath here would create `ledger.ndjson.lock`, so
+    // an old CLI and a new CLI could both believe they owned the append lock.
+    return withFileLockSync(join(dir, 'ledger'), fn);
   }
 
   function appendUnlocked(existing: LedgerEvent[], draft: LedgerEventDraft): LedgerEvent {
@@ -192,15 +218,26 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     // this event onto that fragment, so BOTH lines become one unparseable token
     // that read() silently drops — losing a committed event. Terminate the
     // fragment first so only the already-torn line is skipped, not this one.
+    let prefix = '';
     if (existsSync(ledgerPath)) {
+      const fd = openSync(ledgerPath, 'r');
       try {
-        if (statSync(ledgerPath).size > 0) {
-          const tail = readFileSync(ledgerPath, 'utf-8').slice(-1);
-          if (tail !== '\n') appendFileSync(ledgerPath, '\n');
+        const size = fstatSync(fd).size;
+        if (size > 0) {
+          const tail = Buffer.allocUnsafe(1);
+          if (readSync(fd, tail, 0, 1, size - 1) !== 1) {
+            throw new Error('verified-delivery ledger tail read was incomplete');
+          }
+          if (tail[0] !== 0x0a) prefix = '\n';
         }
-      } catch { /* best-effort; a read error here just falls through to append */ }
+      } finally {
+        closeSync(fd);
+      }
     }
-    appendFileSync(ledgerPath, JSON.stringify(event) + '\n');
+    // Write the healing newline and the committed event in one append call.
+    // If tail inspection fails, fail closed instead of risking another glued
+    // line. Reading one byte also keeps append cost O(1) as the ledger grows.
+    appendFileSync(ledgerPath, prefix + JSON.stringify(event) + '\n');
     return event;
   }
 
@@ -294,21 +331,90 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     return undefined;
   }
 
+  function canonicalizeDraft(draft: LedgerEventDraft): LedgerEventDraft {
+    if (draft.type !== 'TaskReported') return draft;
+    const reportId = (draft.payload as TaskReportedPayload).reportId;
+    // Old clients used a ledger-global `reported:<reportId>` key. Normalize
+    // that exact legacy form at the storage boundary so a rolling-upgrade peer
+    // cannot let one task's chosen reportId suppress another task's delivery.
+    if (draft.idempotencyKey !== `reported:${reportId}`) return draft;
+    return { ...draft, idempotencyKey: `reported:${draft.taskId}:${reportId}` };
+  }
+
+  function findDuplicate(existing: LedgerEvent[], draft: LedgerEventDraft): LedgerEvent | undefined {
+    if (draft.type === 'TaskReported') {
+      const reportId = (draft.payload as TaskReportedPayload).reportId;
+      const sameReport = existing.find((event) =>
+        event.type === 'TaskReported'
+        && event.taskId === draft.taskId
+        && (event.payload as TaskReportedPayload).reportId === reportId);
+      if (sameReport) return sameReport;
+    }
+    const duplicate = existing.find((event) => event.idempotencyKey === draft.idempotencyKey);
+    if (duplicate && (duplicate.type !== draft.type || duplicate.taskId !== draft.taskId)) {
+      throw new Error(
+        `verified-delivery ledger idempotency collision: ${draft.idempotencyKey} already belongs to ${duplicate.type}/${duplicate.taskId}`,
+      );
+    }
+    return duplicate;
+  }
+
   function append(draft: LedgerEventDraft): { event: LedgerEvent; deduped: boolean } {
+    const canonicalDraft = canonicalizeDraft(draft);
+    const invariant = validateLedgerEventDraft(canonicalDraft);
+    if (invariant.errors.length > 0) {
+      throw new Error(`verified-delivery ledger invariant violation: ${invariant.errors.join('; ')}`);
+    }
+    return withLock(() => {
+      const existing = read();
+      const dup = findDuplicate(existing, canonicalDraft);
+      if (dup) return { event: dup, deduped: true };
+      const stateError = transitionError(existing, canonicalDraft);
+      if (stateError) {
+        throw new Error(`verified-delivery ledger invariant violation: ${stateError}`);
+      }
+      const event = appendUnlocked(existing, canonicalDraft);
+      return { event, deduped: false };
+    });
+  }
+
+  function appendCurrentReportVerdict(draft: LedgerEventDraft): AppendCurrentReportVerdictResult {
+    if (draft.type !== 'TaskAccepted' && draft.type !== 'TaskRejected') {
+      throw new Error('appendCurrentReportVerdict only accepts TaskAccepted/TaskRejected');
+    }
     const invariant = validateLedgerEventDraft(draft);
     if (invariant.errors.length > 0) {
       throw new Error(`verified-delivery ledger invariant violation: ${invariant.errors.join('; ')}`);
     }
     return withLock(() => {
       const existing = read();
-      const dup = existing.find((e) => e.idempotencyKey === draft.idempotencyKey);
-      if (dup) return { event: dup, deduped: true };
+      const current = materialize(existing).get(draft.taskId);
+      const reportId = (draft.payload as TaskAcceptedPayload | TaskRejectedPayload).reportId;
+      const report = current?.reports.find((candidate) => candidate.reportId === reportId);
+      const dup = findDuplicate(existing, draft);
+      if (dup) {
+        const expectedVerdict = draft.type === 'TaskAccepted' ? 'accepted' : 'rejected';
+        // A concurrent identical verdict is idempotent only while it still
+        // describes the latest delivery. If a new report/help/cancel arrived
+        // after that verdict, returning the old event as a successful dedupe
+        // would resurrect stale narration/release side effects.
+        if (
+          current?.status !== expectedVerdict
+          || current.latestReportId !== reportId
+          || report?.verdict !== expectedVerdict
+        ) {
+          return { result: 'stale' };
+        }
+        return { result: 'deduped', event: dup };
+      }
+      if (current?.status !== 'reported' || current.latestReportId !== reportId || !report || report.verdict) {
+        return { result: 'stale' };
+      }
       const stateError = transitionError(existing, draft);
       if (stateError) {
         throw new Error(`verified-delivery ledger invariant violation: ${stateError}`);
       }
-      const event = appendUnlocked(existing, draft);
-      return { event, deduped: false };
+      return { result: 'appended', event: appendUnlocked(existing, draft) };
     });
   }
 
@@ -729,19 +835,44 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
     });
   }
 
+  function inlineBlobRef(content: string): string {
+    return createHash('sha256').update(content).digest('hex').slice(0, 16);
+  }
+
+  function installInlineBlob(blobPath: string, content: string): void {
+    const tmpPath = `${blobPath}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, content);
+    try {
+      renameSync(tmpPath, blobPath);
+    } catch (err) {
+      // On platforms where rename cannot replace a destination that won the
+      // race, identical content means the operation already succeeded.
+      try { unlinkSync(tmpPath); } catch { /* already moved / cleanup best effort */ }
+      if (existsSync(blobPath) && readFileSync(blobPath, 'utf-8') === content) return;
+      throw err;
+    }
+  }
+
   function writeInlineEvidence(content: string, name?: string): Extract<Evidence, { kind: 'inline' }> {
     ensureDirs();
     const bytes = Buffer.byteLength(content, 'utf-8');
-    const ref = createHash('sha256').update(content).digest('hex').slice(0, 16);
+    const ref = inlineBlobRef(content);
     const blobPath = join(blobsDir, ref);
     // Write atomically (temp + rename) so a crash mid-write cannot leave a
     // truncated blob that existsSync() later treats as complete — the content
     // is addressed by hash, so a short blob would be silently trusted forever.
     if (!existsSync(blobPath)) {
-      const tmpPath = `${blobPath}.tmp-${process.pid}`;
-      writeFileSync(tmpPath, content);
-      try { renameSync(tmpPath, blobPath); }
-      catch { if (!existsSync(blobPath)) throw new Error(`inline evidence blob write failed: ${ref}`); }
+      installInlineBlob(blobPath, content);
+    } else {
+      const existing = readFileSync(blobPath, 'utf-8');
+      if (existing !== content) {
+        if (inlineBlobRef(existing) === ref) {
+          throw new Error(`inline evidence blob hash collision: ${ref}`);
+        }
+        // Repair a truncated blob left by the pre-atomic writer. A mismatching
+        // hash proves the existing bytes cannot be the content addressed by ref.
+        installInlineBlob(blobPath, content);
+      }
     }
     const preview = content.length > 200 ? content.slice(0, 200) + '…' : content;
     return { kind: 'inline', ref, name, bytes, preview };
@@ -750,11 +881,16 @@ export function openLedger(opts: { baseDir?: string } = {}): LedgerHandle {
   function readInlineEvidence(ref: string): string {
     const blobPath = join(blobsDir, ref);
     if (!existsSync(blobPath)) throw new Error(`inline evidence blob not found: ${ref}`);
-    return readFileSync(blobPath, 'utf-8');
+    const content = readFileSync(blobPath, 'utf-8');
+    if (inlineBlobRef(content) !== ref) {
+      throw new Error(`inline evidence blob is corrupt: ${ref}`);
+    }
+    return content;
   }
 
   return {
     append,
+    appendCurrentReportVerdict,
     read,
     task: (taskId) => materialize(read()).get(taskId),
     tasks: (chatId) => {

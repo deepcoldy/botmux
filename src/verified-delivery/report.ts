@@ -77,7 +77,7 @@ export function buildReport(input: BuildReportInput, led: LedgerHandle): BuiltRe
     actor: 'worker',
     taskId: input.taskId,
     chatId: input.chatId,
-    idempotencyKey: `reported:${reportId}`,
+    idempotencyKey: `reported:${input.taskId}:${reportId}`,
     ts: input.ts,
     payload,
   };

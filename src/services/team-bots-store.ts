@@ -27,9 +27,10 @@
  * Storage: `{dataDir}/team-bots.json`, deployment-wide (not per-chat: trust in a
  * teammate is global once established). Atomic writes via the shared helper.
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 /** Learned-teammate entries older than this (by lastSeenAt) are ignored by
  *  isTeamBot / listTeamBots — the bot hasn't shown up in a team context for a
@@ -80,13 +81,16 @@ export function recordTeamBot(
   const unionId = (bot.unionId ?? '').trim();
   if (!unionId) return false;
   const name = (bot.name ?? '').trim();
-  const data = readFile(dataDir);
-  const prior = data[unionId];
-  data[unionId] = prior
-    ? { ...prior, name: name || prior.name, lastSeenAt: now }
-    : { name, firstSeenAt: now, lastSeenAt: now };
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
-  return true;
+  mkdirSync(dataDir, { recursive: true });
+  return withFileLockSync(filePath(dataDir), () => {
+    const data = readFile(dataDir);
+    const prior = data[unionId];
+    data[unionId] = prior
+      ? { ...prior, name: name || prior.name, lastSeenAt: now }
+      : { name, firstSeenAt: now, lastSeenAt: now };
+    atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
+    return true;
+  });
 }
 
 /** Is `unionId` a known (non-expired) teammate bot? The auth gate's predicate.
@@ -123,9 +127,12 @@ export function listTeamBots(
 export function removeTeamBot(dataDir: string, unionId: string | undefined): boolean {
   const id = (unionId ?? '').trim();
   if (!id) return false;
-  const data = readFile(dataDir);
-  if (!(id in data)) return false;
-  delete data[id];
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
-  return true;
+  mkdirSync(dataDir, { recursive: true });
+  return withFileLockSync(filePath(dataDir), () => {
+    const data = readFile(dataDir);
+    if (!(id in data)) return false;
+    delete data[id];
+    atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
+    return true;
+  });
 }

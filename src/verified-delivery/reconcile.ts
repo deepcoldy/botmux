@@ -170,6 +170,9 @@ export type ReconcileAction =
   /** Supervisor escalated to a human (status=escalated) — parked, awaiting the
    *  human; the caller must NOT re-verify or nag. */
   | 'escalated'
+  /** The task changed after verification (new report/help/cancel/verdict), so
+   *  the checked report was not mutated and the next watchdog pass must retry. */
+  | 'stale'
   /** taskId not present in the ledger. */
   | 'unknown-task';
 
@@ -259,7 +262,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
     // deterministic confirmation of a real delivery, not an ownerless completion call.
     if (pendingReport) {
       const reportId = pendingReport.reportId;
-      const res = ledger.append({
+      const res = ledger.appendCurrentReportVerdict({
         type: 'TaskAccepted', actor: 'orchestrator', taskId, chatId: task.chatId,
         idempotencyKey: `accepted:${taskId}:${reportId}`, ts: opts.now,
         payload: {
@@ -269,14 +272,22 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
           ranCommands: verify.ranCommands.length ? verify.ranCommands : undefined,
         },
       });
-      if (!res.deduped) {
+      if (res.result === 'stale') return { taskId, action: 'stale', verify, reportId };
+      if (res.result === 'appended') {
         try {
           opts.onAccepted?.({ taskId, goalChatId: task.chatId, acceptedEventId: res.event.eventId });
         } catch {
           // Best effort only; the periodic release scan repairs missed triggers.
         }
       }
-      return { taskId, action: 'accepted', verify, reportId, deduped: res.deduped, eventId: res.event.eventId };
+      return {
+        taskId,
+        action: 'accepted',
+        verify,
+        reportId,
+        deduped: res.result === 'deduped',
+        eventId: res.event.eventId,
+      };
     }
     // Artifacts satisfy the criteria but the worker NEVER filed a report. The
     // mechanical layer must not fabricate a completion (the bug 老滕 caught: a
@@ -295,7 +306,7 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
 
   if (pendingReport) {
     const reportId = pendingReport.reportId;
-    const res = ledger.append({
+    const res = ledger.appendCurrentReportVerdict({
       type: 'TaskRejected', actor: 'orchestrator', taskId, chatId: task.chatId,
       idempotencyKey: `rejected:${taskId}:${reportId}`, ts: opts.now,
       payload: {
@@ -304,7 +315,15 @@ export function reconcileTaskByCriteria(ledger: LedgerHandle, taskId: string, op
         retryBrief: `对账核验未通过：${verifySummary(verify)}`,
       },
     });
-    return { taskId, action: 'rejected', verify, reportId, deduped: res.deduped, eventId: res.event.eventId };
+    if (res.result === 'stale') return { taskId, action: 'stale', verify, reportId };
+    return {
+      taskId,
+      action: 'rejected',
+      verify,
+      reportId,
+      deduped: res.result === 'deduped',
+      eventId: res.event.eventId,
+    };
   }
 
   // Verify failed and there is no pending report to reject. We do NOT fabricate a

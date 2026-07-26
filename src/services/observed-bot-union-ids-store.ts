@@ -11,9 +11,13 @@
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export interface BotUnionIdEntry {
   unionId: string;
+  /** More than one observed union_id for this display name means the name is
+   *  ambiguous. Readers fail closed and do not use it for delivery authz. */
+  observedUnionIds?: string[];
   /** Diagnostic only; open_id is scoped to the observing app. */
   lastOpenId?: string;
   firstSeenAt: number;
@@ -46,6 +50,15 @@ function writeFile(dataDir: string, data: FileShape): void {
   atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
 }
 
+function observedUnionIdsOf(entry: BotUnionIdEntry | undefined): string[] {
+  const values = Array.isArray(entry?.observedUnionIds)
+    ? entry.observedUnionIds
+    : entry?.unionId ? [entry.unionId] : [];
+  return values
+    .filter((value): value is string => typeof value === 'string' && !!value.trim())
+    .map((value) => value.trim());
+}
+
 export function recordObservedBotUnionId(
   dataDir: string,
   name: string,
@@ -56,36 +69,49 @@ export function recordObservedBotUnionId(
   const normalizedName = name?.trim().toLowerCase();
   const normalizedUnionId = unionId?.trim();
   if (!normalizedName || !normalizedUnionId) return false;
-  const data = readFile(dataDir);
-  const prior = data.byName[normalizedName];
-  if (
-    prior
-    && prior.unionId === normalizedUnionId
-    && prior.lastOpenId === (openId ?? prior.lastOpenId)
-    && now - prior.lastSeenAt < 10 * 60 * 1000
-  ) {
-    return false;
-  }
-  data.byName[normalizedName] = {
-    unionId: normalizedUnionId,
-    lastOpenId: openId ?? prior?.lastOpenId,
-    firstSeenAt: prior?.firstSeenAt ?? now,
-    lastSeenAt: now,
-  };
-  writeFile(dataDir, data);
-  return true;
+  if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
+  return withFileLockSync(filePath(dataDir), () => {
+    const data = readFile(dataDir);
+    const prior = data.byName[normalizedName];
+    if (
+      prior
+      && prior.unionId === normalizedUnionId
+      && prior.lastOpenId === (openId ?? prior.lastOpenId)
+      && now - prior.lastSeenAt < 10 * 60 * 1000
+    ) {
+      return false;
+    }
+    const observedUnionIds = new Set(observedUnionIdsOf(prior));
+    observedUnionIds.add(normalizedUnionId);
+    data.byName[normalizedName] = {
+      unionId: normalizedUnionId,
+      ...(observedUnionIds.size > 1 ? { observedUnionIds: [...observedUnionIds] } : {}),
+      lastOpenId: openId ?? (prior?.unionId === normalizedUnionId ? prior.lastOpenId : undefined),
+      firstSeenAt: prior?.firstSeenAt ?? now,
+      lastSeenAt: now,
+    };
+    writeFile(dataDir, data);
+    return true;
+  });
+}
+
+function resolvedUnionId(entry: BotUnionIdEntry | undefined): string | undefined {
+  if (!entry?.unionId?.trim()) return undefined;
+  const observed = new Set(observedUnionIdsOf(entry));
+  return observed.size === 1 ? [...observed][0] : undefined;
 }
 
 export function getBotUnionIdByName(dataDir: string, name: string): string | undefined {
   const normalizedName = name?.trim().toLowerCase();
   if (!normalizedName) return undefined;
-  return readFile(dataDir).byName[normalizedName]?.unionId;
+  return resolvedUnionId(readFile(dataDir).byName[normalizedName]);
 }
 
 export function listBotUnionIds(dataDir: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, entry] of Object.entries(readFile(dataDir).byName)) {
-    out[name] = entry.unionId;
+    const unionId = resolvedUnionId(entry);
+    if (unionId) out[name] = unionId;
   }
   return out;
 }

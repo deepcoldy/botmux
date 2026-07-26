@@ -3,7 +3,7 @@
  * (replace-by-prefix that must never touch legacy federation entries).
  * Run: pnpm vitest run test/platform-team-store.test.ts
  */
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
@@ -104,6 +104,14 @@ describe('applyPlatformTeamSync', () => {
     expect(isTeamGroupChat(dataDir, 'oc_hall2')).toBe(false);
     expect(isPlatformTeamBot(dataDir, 'on_b')).toBe(false);
     expect(isPlatformTeamBot(dataDir, 'on_a')).toBe(true);
+  });
+
+  it('publishes the new rev only after the team-group trust mirror succeeds', () => {
+    // Force the mirror write to fail. The rev is the heartbeat commit marker;
+    // it must stay old/empty so the platform retries the full snapshot.
+    mkdirSync(join(dataDir, 'team-groups.json'));
+    expect(() => applyPlatformTeamSync(dataDir, payload('rev1', [team('t1', ['oc_hall'], [])]))).toThrow();
+    expect(getPlatformTeamSyncRev(dataDir)).toBe('');
   });
 
   it('never touches legacy federation team-groups entries', () => {

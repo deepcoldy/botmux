@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
@@ -130,6 +130,18 @@ describe('verified-delivery ledger', () => {
     expect(led.readInlineEvidence(inline.ref)).toBe('PASS: all good\n');
   });
 
+  it('detects and repairs a truncated legacy inline blob before trusting it', () => {
+    const led = openLedger({ baseDir });
+    const content = 'complete inline evidence\n';
+    const inline = led.writeInlineEvidence(content, 'proof');
+    const blobPath = join(baseDir, 'blobs', inline.ref);
+    writeFileSync(blobPath, 'truncated');
+
+    expect(() => led.readInlineEvidence(inline.ref)).toThrow(/blob is corrupt/);
+    expect(led.writeInlineEvidence(content, 'proof')).toMatchObject({ ref: inline.ref });
+    expect(led.readInlineEvidence(inline.ref)).toBe(content);
+  });
+
   it('reject then re-report flips status back to reported (same task, new attempt)', () => {
     const led = openLedger({ baseDir });
     led.append(draft({ type: 'TaskDispatched', taskId: 'task-2', idempotencyKey: 'dispatched:task-2', payload: { taskId: 'task-2' } }));
@@ -228,6 +240,27 @@ describe('verified-delivery ledger', () => {
     expect(t.status).toBe('reported');       // still on r2, NOT dragged to accepted
     expect(t.latestReportId).toBe('r2');
     expect(t.reports.find((r) => r.reportId === 'r1')!.verdict).toBe('accepted'); // r1 still records its (late) verdict
+  });
+
+  it('dedupes a current report verdict but treats the same old verdict as stale after cancellation', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-verdict', idempotencyKey: 'dispatched:task-verdict', payload: { taskId: 'task-verdict' } }));
+    led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'task-verdict', idempotencyKey: 'reported:task-verdict:r1',
+      payload: { taskId: 'task-verdict', reportId: 'r1', summary: 'attempt', evidence: [{ kind: 'path', path: '/tmp/a' }] },
+    }));
+    const verdict = draft({
+      type: 'TaskRejected', taskId: 'task-verdict', idempotencyKey: 'rejected:task-verdict:r1',
+      payload: { taskId: 'task-verdict', reportId: 'r1', reason: 'check_failed' },
+    });
+
+    expect(led.appendCurrentReportVerdict(verdict).result).toBe('appended');
+    expect(led.appendCurrentReportVerdict(verdict).result).toBe('deduped');
+    led.append(draft({
+      type: 'TaskCancelled', taskId: 'task-verdict', idempotencyKey: 'cancelled:task-verdict',
+      payload: { taskId: 'task-verdict', reason: 'stop after rejection' },
+    }));
+    expect(led.appendCurrentReportVerdict(verdict)).toEqual({ result: 'stale' });
   });
 
   it('TaskReported with no evidence is refused at the seam', () => {
@@ -356,6 +389,61 @@ describe('verified-delivery ledger', () => {
     expect(b.deduped).toBe(true);
     expect(b.event.seq).toBe(a.event.seq);
     expect(led.read()).toHaveLength(1);
+  });
+
+  it('scopes legacy report idempotency keys by task so one worker cannot suppress another task report', () => {
+    const led = openLedger({ baseDir });
+    for (const taskId of ['task-a', 'task-b']) {
+      led.append(draft({
+        type: 'TaskDispatched', taskId, idempotencyKey: `dispatched:${taskId}`, payload: { taskId },
+      }));
+    }
+    const first = led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'task-a', idempotencyKey: 'reported:shared-report',
+      payload: { taskId: 'task-a', reportId: 'shared-report', summary: 'A done', evidence: [{ kind: 'path', path: '/tmp/a' }] },
+    }));
+    const second = led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'task-b', idempotencyKey: 'reported:shared-report',
+      payload: { taskId: 'task-b', reportId: 'shared-report', summary: 'B done', evidence: [{ kind: 'path', path: '/tmp/b' }] },
+    }));
+
+    expect(first.deduped).toBe(false);
+    expect(second.deduped).toBe(false);
+    expect(led.task('task-a')?.latestReportId).toBe('shared-report');
+    expect(led.task('task-b')?.latestReportId).toBe('shared-report');
+    expect(led.read().filter((event) => event.type === 'TaskReported').map((event) => event.idempotencyKey))
+      .toEqual(['reported:task-a:shared-report', 'reported:task-b:shared-report']);
+  });
+
+  it('dedupes a task/report retry across legacy and task-scoped key formats', () => {
+    const rows = [
+      { type: 'TaskDispatched', actor: 'orchestrator', taskId: 'task-a', ts: TS, idempotencyKey: 'dispatched:task-a', payload: { taskId: 'task-a' }, eventId: '1', seq: 1 },
+      { type: 'TaskReported', actor: 'worker', taskId: 'task-a', ts: TS + 1, idempotencyKey: 'reported:shared-report', payload: { taskId: 'task-a', reportId: 'shared-report', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/a' }] }, eventId: '2', seq: 2 },
+    ];
+    writeFileSync(join(baseDir, 'ledger.ndjson'), rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const led = openLedger({ baseDir });
+
+    const retried = led.append(draft({
+      type: 'TaskReported', actor: 'worker', taskId: 'task-a', idempotencyKey: 'reported:task-a:shared-report',
+      payload: { taskId: 'task-a', reportId: 'shared-report', summary: 'done', evidence: [{ kind: 'path', path: '/tmp/a' }] },
+    }));
+
+    expect(retried.deduped).toBe(true);
+    expect(retried.event.eventId).toBe('2');
+    expect(led.read()).toHaveLength(2);
+    expect(led.task('task-a')).toMatchObject({
+      status: 'reported',
+      latestReportId: 'shared-report',
+      reports: [{ reportId: 'shared-report', summary: 'done' }],
+    });
+  });
+
+  it('fails loudly when an unrelated task reuses an arbitrary global idempotency key', () => {
+    const led = openLedger({ baseDir });
+    led.append(draft({ type: 'TaskDispatched', taskId: 'task-a', idempotencyKey: 'global-key', payload: { taskId: 'task-a' } }));
+    expect(() => led.append(draft({
+      type: 'TaskDispatched', taskId: 'task-b', idempotencyKey: 'global-key', payload: { taskId: 'task-b' },
+    }))).toThrow(/idempotency collision/);
   });
 
   it('materializes a dependency-gated plan and rejects early lifecycle events', () => {
@@ -713,5 +801,24 @@ describe('verified-delivery ledger', () => {
     const unparseable = lines.filter((l) => { try { JSON.parse(l); return false; } catch { return true; } });
     expect(unparseable).toHaveLength(1);
     expect(() => JSON.parse(lines[lines.length - 1]!)).not.toThrow();
+  });
+
+  it('keeps using the legacy ledger.lock path and reclaims a dead holder', () => {
+    const lockPath = join(baseDir, 'ledger.lock');
+    // The pre-file-lock implementation created an empty O_EXCL lock file.
+    writeFileSync(lockPath, '');
+    const staleAt = new Date(Date.now() - 10_000);
+    utimesSync(lockPath, staleAt, staleAt);
+
+    const led = openLedger({ baseDir });
+    const result = led.append(draft({
+      type: 'TaskDispatched', taskId: 't-after-stale-lock', chatId: 'oc_x',
+      idempotencyKey: 'dispatched:t-after-stale-lock', payload: { taskId: 't-after-stale-lock' },
+    }));
+
+    expect(result.deduped).toBe(false);
+    expect(led.task('t-after-stale-lock')?.status).toBe('dispatched');
+    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(join(baseDir, 'ledger.ndjson.lock'))).toBe(false);
   });
 });

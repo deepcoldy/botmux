@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 import type { GoalDecisionOption } from './goal-decision-options.js';
 
@@ -34,6 +35,11 @@ function ensureDir(): void {
   mkdirSync(config.session.dataDir, { recursive: true });
 }
 
+function withStoreLock<T>(fn: (all: Record<string, GoalParentNotificationRecord>) => T): T {
+  ensureDir();
+  return withFileLockSync(storePath(), () => fn(loadAll()));
+}
+
 function loadAll(): Record<string, GoalParentNotificationRecord> {
   const fp = storePath();
   if (!existsSync(fp)) return {};
@@ -56,9 +62,10 @@ function saveAll(records: Record<string, GoalParentNotificationRecord>): void {
 }
 
 export function rememberGoalParentNotification(record: GoalParentNotificationRecord): void {
-  const all = loadAll();
-  all[record.messageId] = record;
-  saveAll(all);
+  withStoreLock((all) => {
+    all[record.messageId] = record;
+    saveAll(all);
+  });
 }
 
 export function getGoalParentNotification(messageId: string | undefined): GoalParentNotificationRecord | undefined {

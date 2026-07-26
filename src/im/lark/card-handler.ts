@@ -1525,6 +1525,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (!goalChatId) {
       return { toast: { type: 'error', content: '缺少 goal_chat_id，无法清理。' } };
     }
+    // Publish the durable tombstone BEFORE the async fanout. Otherwise the
+    // watchdog can auto-revive a supervisor while cleanup is waiting on peer
+    // daemons; if this daemon's cleanup-local call already ran, that new
+    // session survives the fanout and keeps working after the UI says closed.
+    const closedRegistry = closeGoalChat(goalChatId, { closedBy: operatorOpenId });
     // Fan out to EVERY online daemon (self included): each closes its own
     // chat-scope sessions bound to this goal. A goal group hosts workers from
     // several bots, and each bot's sessions live in its own daemon process —
@@ -1549,7 +1554,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       }
     }));
     const closed = perDaemon.reduce((a, b) => a + b, 0);
-    const closedRegistry = closeGoalChat(goalChatId, { closedBy: operatorOpenId });
     logger.info(`[goal-cleanup] ${operatorOpenId ?? '?'} closed ${closed} chat-scope sessions across daemons for goal=${goalChatId}; registryClosed=${Boolean(closedRegistry)}`);
     // Narrate into the goal group so observers see the cleanup actually fired —
     // the sessions are gone, but the card is sent by the bot directly (not via a

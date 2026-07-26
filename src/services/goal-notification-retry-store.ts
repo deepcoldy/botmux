@@ -1,7 +1,9 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
 import type { GoalDecisionOption } from './goal-decision-options.js';
 
@@ -45,6 +47,16 @@ function storePath(): string {
   return join(config.session.dataDir, 'goal-notification-retries.json');
 }
 
+/** Stable Feishu provider idempotency key (≤50 chars, one-hour provider TTL). */
+export function goalNotificationProviderUuid(recordId: string, parentChatId: string): string {
+  return `gnt_${createHash('sha256').update(`${recordId}\0${parentChatId}`).digest('hex').slice(0, 40)}`;
+}
+
+function withStoreLock<T>(fn: (all: Record<string, GoalNotificationRetryRecord>) => T): T {
+  mkdirSync(config.session.dataDir, { recursive: true });
+  return withFileLockSync(storePath(), () => fn(loadAll()));
+}
+
 function loadAll(): Record<string, GoalNotificationRetryRecord> {
   const fp = storePath();
   if (!existsSync(fp)) return {};
@@ -74,27 +86,33 @@ function saveAll(records: Record<string, GoalNotificationRetryRecord>): void {
 }
 
 export function upsertGoalNotificationRetry(record: Omit<GoalNotificationRetryRecord, 'attempts' | 'createdAt' | 'updatedAt'> & Partial<Pick<GoalNotificationRetryRecord, 'attempts' | 'createdAt' | 'updatedAt'>>): GoalNotificationRetryRecord {
-  const all = loadAll();
-  const now = Date.now();
-  const prev = all[record.id];
-  const next: GoalNotificationRetryRecord = {
-    ...prev,
-    ...record,
-    status: record.status ?? (prev?.status === 'dead' || prev?.status === 'sent' ? prev.status : 'pending'),
-    attempts: record.attempts ?? prev?.attempts ?? 0,
-    createdAt: record.createdAt ?? prev?.createdAt ?? now,
-    updatedAt: record.updatedAt ?? now,
-  };
-  all[next.id] = next;
-  saveAll(all);
-  return next;
+  return withStoreLock((all) => {
+    const now = Date.now();
+    const prev = all[record.id];
+    const priorTerminal = prev?.status === 'dead' || prev?.status === 'sent';
+    const requestedStatus = record.status;
+    const next: GoalNotificationRetryRecord = {
+      ...prev,
+      ...record,
+      // A stale sender may finish after another process recorded sent/dead.
+      // Only retryGoalNotification is allowed to reopen terminal records.
+      status: priorTerminal ? prev.status : requestedStatus ?? prev?.status ?? 'pending',
+      attempts: Math.max(prev?.attempts ?? 0, record.attempts ?? 0),
+      createdAt: prev?.createdAt ?? record.createdAt ?? now,
+      updatedAt: Math.max(now, record.updatedAt ?? 0),
+    };
+    all[next.id] = next;
+    saveAll(all);
+    return next;
+  });
 }
 
 export function removeGoalNotificationRetry(id: string): void {
-  const all = loadAll();
-  if (!all[id]) return;
-  delete all[id];
-  saveAll(all);
+  withStoreLock((all) => {
+    if (!all[id]) return;
+    delete all[id];
+    saveAll(all);
+  });
 }
 
 export function listDueGoalNotificationRetries(ownerLarkAppId: string, now = Date.now()): GoalNotificationRetryRecord[] {
@@ -104,18 +122,19 @@ export function listDueGoalNotificationRetries(ownerLarkAppId: string, now = Dat
 }
 
 export function markGoalNotificationRetrySent(id: string, now = Date.now()): GoalNotificationRetryRecord | null {
-  const all = loadAll();
-  const prev = all[id];
-  if (!prev) return null;
-  const next: GoalNotificationRetryRecord = {
-    ...prev,
-    status: 'sent',
-    sentAt: now,
-    updatedAt: now,
-  };
-  all[id] = next;
-  saveAll(all);
-  return next;
+  return withStoreLock((all) => {
+    const prev = all[id];
+    if (!prev) return null;
+    const next: GoalNotificationRetryRecord = {
+      ...prev,
+      status: 'sent',
+      sentAt: now,
+      updatedAt: now,
+    };
+    all[id] = next;
+    saveAll(all);
+    return next;
+  });
 }
 
 export function listGoalNotificationRetries(): GoalNotificationRetryRecord[] {
@@ -124,53 +143,58 @@ export function listGoalNotificationRetries(): GoalNotificationRetryRecord[] {
 }
 
 export function markGoalNotificationRetryAttempt(id: string, input: { attempts: number; nextAttemptAt: number; lastError?: string }): void {
-  const all = loadAll();
-  const prev = all[id];
-  if (!prev) return;
-  all[id] = {
-    ...prev,
-    status: 'pending',
-    attempts: input.attempts,
-    nextAttemptAt: input.nextAttemptAt,
-    lastError: input.lastError,
-    updatedAt: Date.now(),
-  };
-  saveAll(all);
+  withStoreLock((all) => {
+    const prev = all[id];
+    if (!prev) return;
+    if ((prev.status ?? 'pending') !== 'pending' || input.attempts <= prev.attempts) return;
+    all[id] = {
+      ...prev,
+      status: 'pending',
+      attempts: input.attempts,
+      nextAttemptAt: input.nextAttemptAt,
+      lastError: input.lastError,
+      updatedAt: Date.now(),
+    };
+    saveAll(all);
+  });
 }
 
 export function markGoalNotificationRetryDead(id: string, input: { reason: string; lastError?: string; now?: number }): GoalNotificationRetryRecord | null {
-  const all = loadAll();
-  const prev = all[id];
-  if (!prev) return null;
-  const now = input.now ?? Date.now();
-  const next: GoalNotificationRetryRecord = {
-    ...prev,
-    status: 'dead',
-    deadAt: now,
-    deadReason: input.reason,
-    lastError: input.lastError ?? prev.lastError,
-    updatedAt: now,
-  };
-  all[id] = next;
-  saveAll(all);
-  return next;
+  return withStoreLock((all) => {
+    const prev = all[id];
+    if (!prev) return null;
+    if (prev.status === 'sent') return prev;
+    const now = input.now ?? Date.now();
+    const next: GoalNotificationRetryRecord = {
+      ...prev,
+      status: 'dead',
+      deadAt: now,
+      deadReason: input.reason,
+      lastError: input.lastError ?? prev.lastError,
+      updatedAt: now,
+    };
+    all[id] = next;
+    saveAll(all);
+    return next;
+  });
 }
 
 export function retryGoalNotification(id: string, now = Date.now()): GoalNotificationRetryRecord | null {
-  const all = loadAll();
-  const prev = all[id];
-  if (!prev) return null;
-  const next: GoalNotificationRetryRecord = {
-    ...prev,
-    status: 'pending',
-    attempts: 0,
-    nextAttemptAt: now,
-    deadAt: undefined,
-    deadReason: undefined,
-    sentAt: undefined,
-    updatedAt: now,
-  };
-  all[id] = next;
-  saveAll(all);
-  return next;
+  return withStoreLock((all) => {
+    const prev = all[id];
+    if (!prev) return null;
+    const next: GoalNotificationRetryRecord = {
+      ...prev,
+      status: 'pending',
+      attempts: 0,
+      nextAttemptAt: now,
+      deadAt: undefined,
+      deadReason: undefined,
+      sentAt: undefined,
+      updatedAt: now,
+    };
+    all[id] = next;
+    saveAll(all);
+    return next;
+  });
 }
