@@ -19,7 +19,7 @@ import {
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
-import { listTeamGroups } from '../services/team-groups-store.js';
+import { listTeamGroups, recordTeamGroup } from '../services/team-groups-store.js';
 import {
   listTeamReports,
   readTeamBoard,
@@ -36,7 +36,7 @@ import {
   type TeamGroupCreateResult,
   type TeamGroupOwnerTransferResult,
 } from './federated-group-core.js';
-import { addUsersToChatByUnionId } from '../services/groups-store.js';
+import { addUsersToChatByUnionId, isInChat } from '../services/groups-store.js';
 import { loadBotConfigs, registerBot, getBot } from '../bot-registry.js';
 
 /** Ensure a Lark client exists for larkAppId in THIS (dashboard) process, which
@@ -145,6 +145,8 @@ export interface FederationApiDeps {
   /** Add owners to an existing chat via one of OUR local bots (defaults to
    *  ensure-client + addUsersToChatByUnionId). Test seam. Returns the rejected ids. */
   addOwners?: (viaLarkAppId: string, chatId: string, ownerUnionIds: string[]) => Promise<{ invalidUserIds: string[] }>;
+  /** Test seam for authenticated PR-review group preparation. */
+  isBotInChat?: (larkAppId: string, chatId: string) => Promise<boolean>;
 }
 
 export async function handleFederationApi(
@@ -462,6 +464,67 @@ export async function handleFederationApi(
       remaining = remaining.filter(u => invalid.has(u));
     }
     const result = { status: 200, body: { ok: true, invalidUserIds: [...notOurs, ...remaining] } };
+    idemSet(idemKey, result);
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
+
+  // Hub asks THIS spoke to trust a newly created/adopted review group before a
+  // remote reviewer is @mentioned there. Periodic federation sync eventually
+  // mirrors team groups, but an immediate kickoff would otherwise hit the
+  // inbound bot-to-bot auth gate first. The authenticated membership determines
+  // the team; every requested reviewer must be one of OUR bots and in the chat.
+  if (path === '/api/federation/delegate-prepare-review' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    const membership = findMembershipByDelegationToken(dataDir, token);
+    if (!membership) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const requestId = String(body?.requestId ?? '').trim();
+    if (!requestId) { jsonRes(res, 400, { ok: false, error: 'request_id_required' }); return true; }
+    const idemKey = `prepare-review:${token}:${requestId}`;
+    const cached = idemGet(idemKey) as { status: number; body: any } | undefined;
+    if (cached) { jsonRes(res, cached.status, cached.body); return true; }
+
+    const chatId = String(body?.chatId ?? '').trim();
+    const reviewerLarkAppIds: string[] = Array.from(new Set(
+      (Array.isArray(body?.reviewerLarkAppIds) ? body.reviewerLarkAppIds : [])
+        .filter((id: unknown): id is string => typeof id === 'string')
+        .map((id: string) => id.trim())
+        .filter(Boolean),
+    ));
+    if (!chatId || reviewerLarkAppIds.length === 0) {
+      jsonRes(res, 400, { ok: false, error: 'bad_request' });
+      return true;
+    }
+    if (reviewerLarkAppIds.length > MAX_BOTS) {
+      jsonRes(res, 400, { ok: false, error: 'too_many' });
+      return true;
+    }
+    const localIds = new Set(
+      buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.()).bots.map(bot => bot.larkAppId),
+    );
+    const notLocal = reviewerLarkAppIds.filter(id => !localIds.has(id));
+    if (notLocal.length > 0) {
+      jsonRes(res, 400, { ok: false, error: 'reviewer_not_local', reviewerIds: notLocal });
+      return true;
+    }
+
+    const check = deps.isBotInChat ?? (async (larkAppId: string, targetChatId: string) => {
+      if (!ensureLocalClient(larkAppId)) return false;
+      return isInChat(larkAppId, targetChatId);
+    });
+    const present = await Promise.all(
+      reviewerLarkAppIds.map(async id => ({ id, present: await check(id, chatId) })),
+    );
+    const missing = present.filter(row => !row.present).map(row => row.id);
+    if (missing.length > 0) {
+      jsonRes(res, 409, { ok: false, error: 'reviewers_not_in_chat', reviewerIds: missing });
+      return true;
+    }
+
+    recordTeamGroup(dataDir, membership.teamId, chatId);
+    const result = { status: 200, body: { ok: true, ready: reviewerLarkAppIds } };
     idemSet(idemKey, result);
     jsonRes(res, result.status, result.body);
     return true;

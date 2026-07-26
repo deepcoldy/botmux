@@ -91,6 +91,89 @@ export interface OrchestrateGroupArgs {
   teamId?: string;
 }
 
+export interface PreparedFederatedReviewers {
+  ready: string[];
+  failed: Array<{ deploymentId: string; deploymentName: string; reviewerIds: string[]; error: string }>;
+}
+
+/**
+ * Push a newly created/adopted team-group trust binding to every deployment
+ * that owns a selected reviewer before the author @mentions it. Periodic sync
+ * eventually mirrors the same binding, but review kickoff cannot wait for it.
+ */
+export async function prepareFederatedGroupReviewers(
+  dataDir: string,
+  teamId: string,
+  chatId: string,
+  reviewerIds: string[],
+  requestId: string,
+  fetcher: Fetcher = fetch,
+): Promise<PreparedFederatedReviewers> {
+  const requested = new Set(reviewerIds);
+  const ready: string[] = [];
+  const failed: PreparedFederatedReviewers['failed'] = [];
+
+  for (const dep of listFederatedDeployments(dataDir, teamId)) {
+    const mine = dep.bots.map(bot => bot.larkAppId).filter(id => requested.has(id));
+    if (mine.length === 0) continue;
+    if (!dep.callbackUrl || !dep.delegationToken) {
+      failed.push({
+        deploymentId: dep.deploymentId,
+        deploymentName: dep.name,
+        reviewerIds: mine,
+        error: 'deployment_callback_unavailable',
+      });
+      continue;
+    }
+    try {
+      const response = await fetchWithTimeout(
+        fetcher,
+        `${dep.callbackUrl}/api/federation/delegate-prepare-review`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${dep.delegationToken}`,
+          },
+          body: JSON.stringify({ chatId, reviewerLarkAppIds: mine, requestId }),
+        },
+      );
+      const body = await response.json().catch(() => ({} as any));
+      if (response.ok && body?.ok) {
+        const acknowledged = new Set(
+          (Array.isArray(body.ready) ? body.ready : []).filter((id: unknown): id is string => typeof id === 'string'),
+        );
+        ready.push(...mine.filter(id => acknowledged.has(id)));
+        const missing = mine.filter(id => !acknowledged.has(id));
+        if (missing.length > 0) {
+          failed.push({
+            deploymentId: dep.deploymentId,
+            deploymentName: dep.name,
+            reviewerIds: missing,
+            error: 'reviewer_not_acknowledged',
+          });
+        }
+      } else {
+        failed.push({
+          deploymentId: dep.deploymentId,
+          deploymentName: dep.name,
+          reviewerIds: mine,
+          error: body?.error || `prepare_review_http_${response.status}`,
+        });
+      }
+    } catch (error) {
+      failed.push({
+        deploymentId: dep.deploymentId,
+        deploymentName: dep.name,
+        reviewerIds: mine,
+        error: hubError(error).error,
+      });
+    }
+  }
+
+  return { ready: Array.from(new Set(ready)), failed };
+}
+
 /**
  * Validate selection against the team's aggregated roster, collect invitees
  * (operator + selected bots' owners), then create locally if a local online bot

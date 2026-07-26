@@ -18,3 +18,30 @@ export function firstPositional(args: string[], flagsWithValue: string[]): strin
   }
   return undefined;
 }
+
+/** Collect values from repeatable `--flag value` / `--flag=value` options. */
+export function argValues(args: string[], ...flags: string[]): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const equalsFlag = flags.find(flag => arg.startsWith(`${flag}=`));
+    if (equalsFlag) {
+      const value = arg.slice(equalsFlag.length + 1).trim();
+      if (value) values.push(value);
+      continue;
+    }
+    if (!flags.includes(arg)) continue;
+    const value = args[i + 1];
+    if (value !== undefined && !value.startsWith('--')) {
+      const trimmed = value.trim();
+      if (trimmed) values.push(trimmed);
+      i++;
+    }
+  }
+  return values;
+}
+
+/** Pick the first value from a set of equivalent option names. */
+export function argValue(args: string[], ...flags: string[]): string | undefined {
+  return argValues(args, ...flags)[0];
+}

@@ -6,7 +6,7 @@
  * Run:  pnpm vitest run test/cli-arg-utils.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { firstPositional } from '../src/cli/arg-utils.js';
+import { argValue, argValues, firstPositional } from '../src/cli/arg-utils.js';
 
 describe('firstPositional', () => {
   it('returns the first non-flag token in a plain positional list', () => {
@@ -32,5 +32,32 @@ describe('firstPositional', () => {
   it('returns undefined when no positional is present', () => {
     expect(firstPositional(['--session-id', 'uuid-1'], ['--session-id'])).toBeUndefined();
     expect(firstPositional([], ['--session-id'])).toBeUndefined();
+  });
+});
+
+describe('argValues', () => {
+  it('collects repeated flags in argv order across aliases', () => {
+    expect(argValues(
+      ['--owner-agent', 'alice', '--reviewer-agent=bob', '--owner-agent', 'carol'],
+      '--owner-agent',
+      '--reviewer-agent',
+    )).toEqual(['alice', 'bob', 'carol']);
+  });
+
+  it('ignores missing and blank values without consuming the next flag', () => {
+    expect(argValues(
+      ['--owner-agent', '--team', 'default', '--owner-agent='],
+      '--owner-agent',
+    )).toEqual([]);
+  });
+});
+
+describe('argValue', () => {
+  it('returns the first matching alias value', () => {
+    expect(argValue(
+      ['--reviewer-agent=bob', '--owner-agent', 'alice'],
+      '--owner-agent',
+      '--reviewer-agent',
+    )).toBe('bob');
   });
 });
