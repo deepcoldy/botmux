@@ -256,6 +256,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
   return {
     ...bot,
     disableStreamingCard: body.disableStreamingCard,
+    persistentStreamCard: body.persistentStreamCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
@@ -1942,6 +1943,7 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   const tr = useT();
   const { bot, putCardPref } = props;
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
+  const [persistentCard, setPersistentCard] = useState(bot.persistentStreamCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
@@ -1950,10 +1952,11 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
 
   useEffect(() => {
     setDisableStreaming(bot.disableStreamingCard === true);
+    setPersistentCard(bot.persistentStreamCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.disableStreamingCard, bot.persistentStreamCard, bot.privateCard, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
     setBusy(key);
@@ -1981,6 +1984,17 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
           onChange={checked => {
             setDisableStreaming(checked);
             void savePatch({ disableStreamingCard: checked }, 'streaming');
+          }}
+        />
+        <ToggleRow
+          checked={persistentCard}
+          disabled={disableStreaming || busy === 'persistent'}
+          dataAction="toggle-persistent-card"
+          title={tr('botDefaults.persistentCard')}
+          help={disableStreaming ? tr('botDefaults.writableLinkMoot') : tr('botDefaults.persistentCardHelp')}
+          onChange={checked => {
+            setPersistentCard(checked);
+            void savePatch({ persistentStreamCard: checked }, 'persistent');
           }}
         />
         <ToggleRow
