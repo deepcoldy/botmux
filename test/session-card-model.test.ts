@@ -53,6 +53,14 @@ describe('session-card-model · composeEntries / statusToDot', () => {
     const dot = statusToDot('dormant');
     expect(dot).toEqual({ tone: 'neutral', pulse: false, label: 'sessions.status.dormant' });
   });
+
+  it('maps stalled Codex App turns to a non-pulsing danger dot', () => {
+    expect(statusToDot('stalled')).toEqual({
+      tone: 'danger',
+      pulse: false,
+      label: 'sessions.status.stalled',
+    });
+  });
 });
 
 describe('session-card-model · filters', () => {

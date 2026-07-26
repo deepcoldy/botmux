@@ -74,6 +74,7 @@ describe('deriveKanbanColumn', () => {
     expect(deriveKanbanColumn({ status: 'idle', tuiPromptActive: true })).toBe('in_review');
     expect(deriveKanbanColumn({ status: 'idle', agentAttention: { kind: 'x', reason: 'y', at: 1 } })).toBe('in_review');
     expect(deriveKanbanColumn({ status: 'limited' })).toBe('in_review');
+    expect(deriveKanbanColumn({ status: 'stalled' })).toBe('in_review');
   });
 
   it('maps runtime states to default columns', () => {

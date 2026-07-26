@@ -18,7 +18,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
@@ -37,6 +37,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
@@ -74,8 +75,37 @@ import type { CliId } from '../adapters/cli/types.js';
 import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.js';
 import { resolveEffectivePluginIds } from './plugins/effective.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
-import type { CliTurnPayload, CodexAppTurnInput, DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { activeSessionKey, sessionKey, sessionAnchorId, isDocNativeSession, type DaemonSession } from './types.js';
+import type {
+  CliTurnPayload,
+  CodexAppDeliverySink,
+  CodexAppDispatchLedgerEntry,
+  CodexAppGenerationCommit,
+  CodexAppTurnInput,
+  FrozenSessionReplyTarget,
+  DaemonToWorker,
+  WorkerToDaemon,
+  Session,
+  DisplayMode,
+  QueuedActivationTailEntry,
+} from '../types.js';
+import {
+  appendAcceptedCodexAppDispatch,
+  cancelCodexAppDispatch,
+  committedCodexAppSequence,
+  hasUnsettledCodexAppDispatch,
+  prepareCodexAppDispatch,
+  retryPreparedCodexAppDispatch,
+  retainFreshCodexAppGeneration,
+  settleCodexAppDispatch,
+} from '../utils/codex-app-dispatch-ledger.js';
+import {
+  activeSessionKey,
+  sessionKey,
+  sessionAnchorId,
+  isDocNativeSession,
+  type DaemonSession,
+} from './types.js';
+import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { prependBotmuxBin } from './botmux-wrapper.js';
@@ -141,6 +171,8 @@ export interface WorkerSessionReplyOptions {
    * share a visible chat anchor with ordinary sessions, so the anchor alone
    * cannot identify the transcript/lifecycle owner. */
   sourceSessionId?: string;
+  /** Exact daemon-frozen destination for a durable turn. */
+  replyTarget?: FrozenSessionReplyTarget;
 }
 
 export interface WorkerPoolCallbacks {
@@ -154,8 +186,11 @@ export interface WorkerPoolCallbacks {
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
-  /** Close a stale session (message withdrawn, etc.) */
-  closeSession: (ds: DaemonSession) => void;
+  /** Close a stale session (message withdrawn, etc.). `false` means the
+   * authoritative close failed and the active owner must remain retryable.
+   * `void` is retained for older embedders/tests that implement a synchronous
+   * best-effort close; the production daemon always returns an exact boolean. */
+  closeSession: (ds: DaemonSession) => boolean | void | Promise<boolean | void>;
   /** Re-check the per-bot resident-session cap after a process starts or an
    * over-cap busy session becomes idle. Optional for unit-test callers. */
   enforceLiveSessionCap?: () => void;
@@ -204,6 +239,19 @@ export interface WorkerPoolCallbacks {
       disposition: 'queued_removed' | 'cli_fenced';
     },
   ) => void;
+  /** Called only after a durable ledger mutation was persisted and its worker
+   * ACK was attempted. Runtime CLI-mismatch cleanup may now close the old
+   * generation without abandoning a FIFO entry. */
+  onCodexAppLedgerDrained?: (ds: DaemonSession) => void | Promise<void>;
+  /** The exact queued opening crossed the adapter submission boundary. The
+   * daemon may now release its runtime route reservation and flush follow-ups. */
+  /** Return false only when a buffered follow-up was not accepted and should
+   * be retried. Once accepted, later presentation persistence is best-effort
+   * and must not request a delivery retry. */
+  onQueuedActivationSubmitted?: (
+    ds: DaemonSession,
+    activationToken: string,
+  ) => boolean | void | Promise<boolean | void>;
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
@@ -1142,6 +1190,36 @@ function flushCardPatch(ds: DaemonSession): void {
     });
 }
 
+/** Root withdrawal is not an explicit abandon boundary. Preserve a Codex App
+ * owner (including its live worker) while any durable FIFO entry is unsettled;
+ * only ledger-empty sessions retain the historical stale-root auto-close. */
+async function closeWithdrawnSessionIfLedgerEmpty(
+  ds: DaemonSession,
+  context: string,
+): Promise<boolean> {
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    logger.warn(`[${tag(ds)}] ${context}; preserving session because Codex App dispatch is unsettled`);
+    return false;
+  }
+  logger.warn(`[${tag(ds)}] ${context}; closing ledger-empty stale session`);
+  // The callback routes through the authoritative async closeSession helper;
+  // never pre-kill a worker before that helper settles its backend boundary.
+  try {
+    const closed = await requireCallbacks().closeSession(ds);
+    if (closed === false) {
+      logger.warn(`[${tag(ds)}] ${context}; authoritative close failed, session retained for retry`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.warn(
+      `[${tag(ds)}] ${context}; authoritative close threw, session retained for retry: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+}
+
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
 export const restartCounts = new Map<string, { count: number; lastAt: number }>();
@@ -1403,6 +1481,10 @@ function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
+    return false;
+  }
   if (!ds.worker || ds.worker.killed) {
     // There is no live generation that can still own this capability.
     ds.managedTurnOrigin = undefined;
@@ -1578,20 +1660,189 @@ export async function closeSession(
  *
  * Setting the same `ds` at its own key is a no-op (no close).
  */
+export type SetActiveSessionResult =
+  | { accepted: true; closedSessionId?: string }
+  | {
+      accepted: false;
+      reason: 'kept_pending_owner';
+      keptSessionId: string;
+      closedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'both_pending';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+    }
+  | {
+      accepted: false;
+      reason: 'cleanup_failed';
+      keptSessionId: string;
+      preservedIncomingSessionId: string;
+      cleanupSessionId: string;
+      error: string;
+    };
+
+const activeSessionKeyLocks = new WeakMap<
+  Map<string, DaemonSession>,
+  Map<string, Promise<void>>
+>();
+
+/** Serialize asynchronous ownership decisions for one registry key. Ordinary
+ * bot turn admissions are intentionally concurrent, so a read/await/set helper
+ * is not a CAS unless every contender shares this lock. */
+export async function withActiveSessionKeyLock<T>(
+  map: Map<string, DaemonSession>,
+  key: string,
+  action: () => Promise<T> | T,
+): Promise<T> {
+  let locks = activeSessionKeyLocks.get(map);
+  if (!locks) {
+    locks = new Map();
+    activeSessionKeyLocks.set(map, locks);
+  }
+  const previous = locks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const hold = new Promise<void>(resolve => { release = resolve; });
+  const tail = previous.catch(() => { /* predecessor errors do not poison the lock */ }).then(() => hold);
+  locks.set(key, tail);
+  await previous.catch(() => { /* predecessor already reported its own error */ });
+  try {
+    return await action();
+  } finally {
+    release();
+    if (locks.get(key) === tail) locks.delete(key);
+  }
+}
+
+async function closeUnregisteredCollisionLoser(
+  map: Map<string, DaemonSession>,
+  loser: DaemonSession,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  // Operate on exact object identity in the caller's registry. Looking up by
+  // session id through the daemon-global registry can conflate a non-global
+  // restore map (or a stale duplicate object) with an unrelated canonical
+  // owner and close the wrong generation.
+  const sameIdDifferentOwner = [...map.values()].some(candidate =>
+    candidate !== loser && candidate.session.sessionId === loser.session.sessionId)
+    || (!!activeSessionsRegistry && activeSessionsRegistry !== map
+      && [...activeSessionsRegistry.values()].some(candidate =>
+        candidate !== loser && candidate.session.sessionId === loser.session.sessionId));
+  if (sameIdDifferentOwner) {
+    logger.error(
+      `[setActiveSessionSafe] refusing persistence close for ambiguous session id `
+      + `${loser.session.sessionId}; preserving every owner`,
+    );
+    return { ok: false, error: 'ambiguous_session_id' };
+  }
+
+  const stored = sessionStore.getSession(loser.session.sessionId);
+  try {
+    if (stored?.status !== 'closed') {
+      sessionStore.closeSession(loser.session.sessionId);
+    }
+  } catch (err) {
+    logger.error(
+      `[setActiveSessionSafe] durable loser close failed for ${loser.session.sessionId}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { ok: false, error: 'durable_close_failed' };
+  }
+
+  killWorker(loser);
+  for (const [registeredKey, candidate] of map) {
+    if (candidate === loser) map.delete(registeredKey);
+  }
+  return { ok: true };
+}
+
 export async function setActiveSessionSafe(
   map: Map<string, DaemonSession>,
   key: string,
   ds: DaemonSession,
-): Promise<void> {
-  const prev = map.get(key);
-  if (prev && prev !== ds) {
-    logger.warn(
-      `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
-      `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+): Promise<SetActiveSessionResult> {
+  const canonicalKey = activeSessionKey(ds);
+  if (canonicalKey !== key) {
+    throw new Error(
+      `refusing noncanonical active-session registration: requested=${key} canonical=${canonicalKey}`,
     );
-    await closeSession(prev.session.sessionId);
   }
-  map.set(key, ds);
+  return withActiveSessionKeyLock(map, key, async () => {
+    const prev = map.get(key);
+    if (prev && prev !== ds) {
+      if (prev.session.sessionId === ds.session.sessionId) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between distinct owners of session id `
+          + `${prev.session.sessionId}; preserving both objects and the durable row`,
+        );
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: 'ambiguous_session_id',
+        };
+      }
+      const prevPending = hasProtectedSessionMutationOwnership(prev);
+      const incomingPending = hasProtectedSessionMutationOwnership(ds);
+      if (prevPending && incomingPending) {
+        logger.error(
+          `[setActiveSessionSafe] refusing collision between two unsettled Codex App owners `
+          + `${prev.session.sessionId} and ${ds.session.sessionId}; preserving both rows/panes`,
+        );
+        return {
+          accepted: false,
+          reason: 'both_pending',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      if (prevPending) {
+        logger.warn(
+          `[setActiveSessionSafe] keeping unsettled owner ${prev.session.sessionId.substring(0, 8)}; `
+          + `closing ledger-empty incoming ${ds.session.sessionId.substring(0, 8)}`,
+        );
+        const cleanup = await closeUnregisteredCollisionLoser(map, ds);
+        if (!cleanup.ok) {
+          return {
+            accepted: false,
+            reason: 'cleanup_failed',
+            keptSessionId: prev.session.sessionId,
+            preservedIncomingSessionId: ds.session.sessionId,
+            cleanupSessionId: ds.session.sessionId,
+            error: cleanup.error,
+          };
+        }
+        return {
+          accepted: false,
+          reason: 'kept_pending_owner',
+          keptSessionId: prev.session.sessionId,
+          closedIncomingSessionId: ds.session.sessionId,
+        };
+      }
+      logger.warn(
+        `[setActiveSessionSafe] key already occupied by ${prev.session.sessionId.substring(0, 8)} ` +
+        `(worker=${prev.worker ? 'live' : 'null'}); closing it before set`,
+      );
+      const cleanup = await closeUnregisteredCollisionLoser(map, prev);
+      if (!cleanup.ok) {
+        return {
+          accepted: false,
+          reason: 'cleanup_failed',
+          keptSessionId: prev.session.sessionId,
+          preservedIncomingSessionId: ds.session.sessionId,
+          cleanupSessionId: prev.session.sessionId,
+          error: cleanup.error,
+        };
+      }
+    }
+    map.set(key, ds);
+    return {
+      accepted: true,
+      ...(prev && prev !== ds ? { closedSessionId: prev.session.sessionId } : {}),
+    };
+  });
 }
 
 // ─── Session transfer (cross-chat relay) ────────────────────────────────────
@@ -1664,6 +1915,8 @@ export async function transferSession(
     forkWorkerImpl?: typeof forkWorker;
     /** @internal Override for tests — mirror of forkWorkerImpl for killWorker. */
     killWorkerImpl?: typeof killWorker;
+    /** @internal Recursive marker: the bot-wide transfer mutation is held. */
+    mutationHeld?: boolean;
   },
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   // Depth defense — unreachable per TS narrowing above, but guards against
@@ -1671,9 +1924,28 @@ export async function transferSession(
   if ((targetChatType as string) !== 'group' && (targetChatType as string) !== 'p2p') {
     return { ok: false, error: 'target_chat_type_unsupported' };
   }
+  const initial = findActiveBySessionId(sessionId);
+  if (!initial) return { ok: false, error: 'session_not_active' };
+  if (!opts?.mutationHeld) {
+    // Transfer rewrites both the source and target routing identities and may
+    // await scratch cleanup.  Drain every admitted turn for this bot first so
+    // no source prompt can become durable mid-transfer and no target creator
+    // can slip into the cleanup window.
+    return withBotTurnMutation(initial.larkAppId, () => transferSession(
+      sessionId,
+      targetChatId,
+      targetRootMessageId,
+      targetChatType,
+      targetScope,
+      { ...opts, mutationHeld: true },
+    ));
+  }
   const ds = findActiveBySessionId(sessionId);
-  if (!ds) return { ok: false, error: 'session_not_active' };
+  if (!ds || ds.session.status !== 'active') return { ok: false, error: 'session_not_active' };
   if (ds.session.vcMeetingReceiver) return { ok: false, error: 'vc_receiver_not_relayable' };
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    return { ok: false, error: 'codex_app_dispatch_pending' };
+  }
   // Anchor-based identity. A thread-scope session in the SAME chat (different
   // root) is a legitimate cross-topic move, so we refuse only when the target
   // anchor equals the source anchor (relaying a session onto itself). Replaces
@@ -1730,21 +2002,55 @@ export async function transferSession(
   // Anchor-based: chat-scope anchors on chatId, thread-scope on rootMessageId.
   // Only a session at the target anchor collides — same-chat other-topic
   // sessions have a different anchor and are fine (enables同群话题间搬运).
+  const targetKey = sessionKey(targetAnchor, ds.larkAppId);
+  const sourceKey = activeSessionKey(ds);
   const scratchesToClose: string[] = [];
   if (activeSessionsRegistry) {
     for (const existing of activeSessionsRegistry.values()) {
       if (existing === ds) continue;
       if (existing.larkAppId !== ds.larkAppId) continue;
-      if (sessionAnchorId(existing) !== targetAnchor) continue;
-      if (!existing.worker) {
-        scratchesToClose.push(existing.session.sessionId);
-        continue;
+      // VC receivers intentionally share visible output routes while occupying
+      // an immutable `vc-receiver:<sessionId>` registry key. Only an owner of
+      // the ordinary target key can collide with this transfer.
+      if (activeSessionKey(existing) !== targetKey) continue;
+      if (isRelayableRealSession(existing)
+        || existing.pendingRepo
+        || existing.session.queued
+        || hasProtectedSessionMutationOwnership(existing)) {
+        return { ok: false, error: 'target_chat_has_session' };
       }
-      return { ok: false, error: 'target_chat_has_session' };
+      // The only disposable occupant is a proven command scratch: no worker,
+      // no persisted CLI markers, no pending picker/backlog, and no ledger.
+      scratchesToClose.push(existing.session.sessionId);
     }
   }
   for (const sid of scratchesToClose) {
     await closeSession(sid);
+  }
+  // A partially hydrated daemon can have an active target row absent from the
+  // runtime map. Durable ownership makes that row a real conflict even when it
+  // has worker:null and no legacy CLI markers; only proven ledger-empty
+  // scratch rows may be retired.
+  const runtimeIds = new Set(activeSessionsRegistry
+    ? [...activeSessionsRegistry.values()].map(item => item.session.sessionId)
+    : []);
+  const persistedTargetConflicts = sessionStore.listSessions().filter(item =>
+    item.sessionId !== ds.session.sessionId
+    && item.status === 'active'
+    && (!item.larkAppId || item.larkAppId === ds.larkAppId)
+    && !item.vcMeetingReceiver
+    && (item.scope === 'chat' ? item.chatId : item.rootMessageId) === targetAnchor
+    && !runtimeIds.has(item.sessionId),
+  );
+  if (persistedTargetConflicts.some(item =>
+    hasProtectedSessionMutationOwnership(item)
+    || !!item.cliId
+    || !!item.lastCliInput
+    || item.queued === true)) {
+    return { ok: false, error: 'target_chat_has_session' };
+  }
+  for (const scratch of persistedTargetConflicts) {
+    await closeSession(scratch.sessionId);
   }
 
   const fkw = opts?.forkWorkerImpl ?? forkWorker;
@@ -1753,36 +2059,40 @@ export async function transferSession(
   const tagPrefix = sessionId.substring(0, 8);
   const oldAnchor = sessionAnchorId(ds);
   const oldChatId = ds.chatId;
+  const oldStreamCardId = ds.streamCardId;
+  const oldCurrentImageKey = ds.currentImageKey;
 
-  // Freeze the source-chat streaming card BEFORE we kill the worker (and
-  // before we clear streamCardId below). The live card's action buttons
-  // (close / toggle / get write link) carry `session_id` in their value, so
-  // clicks AFTER relay still reach the now-relocated session — closing it,
-  // toggling its display mode, etc. — with feedback landing on the NEW
-  // card in the target chat. PATCH the source-chat card to an inert
-  // snapshot so the user sees clearly it's historical, and so the buttons
-  // are gone. Best-effort: on PATCH failure (card withdrawn, expired) we
-  // log and continue; the relay itself must not depend on this.
-  if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
-    try {
-      const cliId = (ds.session.cliId as CliId | undefined)
-        ?? (() => { try { return getBot(ds.larkAppId).config.cliId; } catch { return undefined; } })();
-      const frozenJson = buildRelayedFrozenCard(
-        ds.currentTurnTitle || ds.session.title || '',
-        cliId,
-        ds.currentImageKey,
-        localeForBot(ds.larkAppId),
-      );
-      await updateMessage(ds.larkAppId, ds.streamCardId, frozenJson);
-    } catch (err) {
-      logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
-    }
+  // Scratch/store cleanup above awaited.  Re-resolve BOTH identities before
+  // the final synchronous move.  A close/replace from a detached lifecycle
+  // path must win without letting this stale transfer kill/fork its successor.
+  if (ds.session.status !== 'active'
+    || findActiveBySessionId(sessionId) !== ds
+    || activeSessionsRegistry?.get(sourceKey) !== ds) {
+    return { ok: false, error: 'session_not_active' };
+  }
+  // No await is allowed between this final reservation check and the map set
+  // below. A target session that arrived during the earlier scratch cleanup
+  // wins; the source is still live and untouched at this point.
+  const lateTarget = activeSessionsRegistry?.get(targetKey);
+  if (lateTarget && lateTarget !== ds) {
+    return { ok: false, error: 'target_chat_has_session' };
+  }
+  // Scratch/store cleanup above awaited. A fresh source turn may have been
+  // admitted during that window; recheck in the same synchronous section as
+  // the final target claim so transfer never kills newly durable work.
+  if (hasProtectedSessionMutationOwnership(ds)) {
+    return { ok: false, error: 'codex_app_dispatch_pending' };
+  }
+  if (ds.worker && !ds.worker.killed
+    && ds.lastScreenStatus !== 'idle'
+    && ds.lastScreenStatus !== 'limited') {
+    return { ok: false, error: 'worker_busy' };
   }
 
   // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
   // the CLI process and its rolling jsonl continue running.
   kw(ds);
-  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+  activeSessionsRegistry?.delete(sourceKey);
 
   // Rewrite routing fields per the requested target scope.
   //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
@@ -1815,7 +2125,36 @@ export async function transferSession(
 
   const newAnchor = sessionAnchorId(ds);
   if (activeSessionsRegistry) {
-    await setActiveSessionSafe(activeSessionsRegistry, sessionKey(newAnchor, ds.larkAppId), ds);
+    // targetKey was checked immediately before the synchronous kill/rewrite;
+    // direct publication avoids an awaited registration/rollback window where
+    // a stale transfer could overwrite a newly-created source successor.
+    activeSessionsRegistry.set(sessionKey(newAnchor, ds.larkAppId), ds);
+  }
+
+  // Re-attach while the routing move is still one synchronous ownership
+  // commit. The source-card PATCH below awaits Lark and a detached close may
+  // legitimately win during that wait; deferring this fork until afterward
+  // would resurrect the stale transferred object after its route was removed.
+  fkw(ds, '', /*resume*/true);
+
+  // Routing/store ownership is now committed. Only now freeze the old card:
+  // if a target arrived during an earlier await we returned with the source
+  // fully untouched, rather than irreversibly disabling its live controls.
+  // The old identifiers were captured before the target fields were cleared.
+  if (oldStreamCardId && oldStreamCardId !== CARD_POSTING_SENTINEL) {
+    try {
+      const cliId = (ds.session.cliId as CliId | undefined)
+        ?? (() => { try { return getBot(ds.larkAppId).config.cliId; } catch { return undefined; } })();
+      const frozenJson = buildRelayedFrozenCard(
+        ds.currentTurnTitle || ds.session.title || '',
+        cliId,
+        oldCurrentImageKey,
+        localeForBot(ds.larkAppId),
+      );
+      await updateMessage(ds.larkAppId, oldStreamCardId, frozenJson);
+    } catch (err) {
+      logger.warn(`[${tagPrefix}] freeze source-chat card failed: ${err instanceof Error ? err.message : err}`);
+    }
   }
 
   dashboardEventBus.publish({
@@ -1830,10 +2169,6 @@ export async function transferSession(
       },
     },
   });
-
-  // forkWorker with resume=true — TmuxBackend.spawn detects the surviving
-  // `bmx-<sessionId>` session and re-attaches instead of creating a new one.
-  fkw(ds, '', /*resume*/true);
 
   logger.info(
     `[${tagPrefix}] transferred ${oldChatId} → ${targetChatId} ` +
@@ -1853,18 +2188,372 @@ function resolvesToHome(p: string): boolean {
   catch { return p === homedir(); }
 }
 
+export function codexAppCleanInputAcceptedForSession(ds: DaemonSession): boolean {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
+    return effectiveCliId === 'codex-app'
+      && botCfg.codexAppCleanInput === true
+      && !ds.adoptedFrom;
+  } catch {
+    // Admission metadata is optional for every other CLI. If bot config is
+    // temporarily unavailable, fail closed instead of leaking a clean sidecar.
+    return false;
+  }
+}
+
+function cloneFrozenCodexAppInput(
+  input: CodexAppTurnInput | undefined,
+  turnId?: string,
+): CodexAppTurnInput | undefined {
+  if (!input) return undefined;
+  const cloned = structuredClone(input);
+  if (turnId && !cloned.clientUserMessageId) cloned.clientUserMessageId = turnId;
+  return cloned;
+}
+
 function codexAppInputForSession(
   ds: DaemonSession,
   input: CodexAppTurnInput | undefined,
   turnId?: string,
 ): CodexAppTurnInput | undefined {
   if (!input) return undefined;
+  if (!codexAppCleanInputAcceptedForSession(ds)) return undefined;
+  return cloneFrozenCodexAppInput(input, turnId);
+}
+
+function codexAppDeliverySinkForTurn(
+  ds: DaemonSession,
+  turnId: string,
+  dispatchAttempt: number | undefined,
+): CodexAppDeliverySink {
+  const armedThrough = ds.suppressedFinalOutputTurns?.get(turnId);
+  if (dispatchAttempt !== undefined
+    && armedThrough !== undefined
+    && dispatchAttempt <= armedThrough) return 'suppressed';
+  if (ds.session.docCommentTargets?.[turnId] || ds.docCommentTurns?.has(turnId)) {
+    return 'doc_comment';
+  }
+  if (ds.pendingWaitPromises?.has(turnId)) return 'http_wait';
+  if (ds.asyncTriggerResults?.has(turnId)) return 'http_async';
+  return 'lark';
+}
+
+/** A recovered transient/non-IM sink has no safe provider to replay into.
+ * Treat it as consumed so the runner can advance, but never fall through to a
+ * Lark card. Doc-comment replay also fails closed: chunk posting has no durable
+ * per-chunk effect journal yet, so blind crash replay could duplicate comments. */
+function codexAppDeliveryMustFailClosed(
+  ds: DaemonSession,
+  entry: CodexAppDispatchLedgerEntry,
+): boolean {
+  const sink = entry.deliverySink
+    ?? (ds.session.docCommentTargets?.[entry.turnId]
+      ? 'doc_comment'
+      : ds.chatId.startsWith('http_wait_')
+        ? 'http_wait'
+        : ds.chatId.startsWith('http_async_')
+          ? 'http_async'
+          : 'lark');
+  if (sink === 'suppressed') return true;
+  if (sink === 'doc_comment') return !ds.docCommentTurns?.has(entry.turnId);
+  if (sink === 'http_wait') return !ds.pendingWaitPromises?.has(entry.turnId);
+  if (sink === 'http_async') return !ds.asyncTriggerResults?.has(entry.turnId);
+  return false;
+}
+
+function acceptCodexAppDispatch(
+  ds: DaemonSession,
+  payload: {
+    content: string;
+    codexAppInput?: CodexAppTurnInput;
+    replyTurnId?: string;
+    replyTarget?: FrozenSessionReplyTarget;
+    quoteTargetId?: string;
+    replyTargetSenderOpenId?: string;
+    replyTargetSenderIsBot?: boolean;
+    queuedActivationToken?: string;
+  },
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  vcMeetingImTurnOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>,
+  opts: { persist?: boolean } = {},
+): string | undefined {
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = ds.session.cliId ?? botCfg.cliId;
-  if (effectiveCliId !== 'codex-app' || botCfg.codexAppCleanInput !== true || ds.adoptedFrom) return undefined;
-  return turnId && !input.clientUserMessageId
-    ? { ...input, clientUserMessageId: turnId }
-    : input;
+  if (effectiveCliId !== 'codex-app' || !turnId) return undefined;
+  const dispatchId = randomUUID();
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  ds.session.codexAppDispatchLedger = appendAcceptedCodexAppDispatch(
+    ds.session.codexAppDispatchLedger ?? [],
+    {
+      dispatchId,
+      turnId,
+      ...(payload.queuedActivationToken
+        ? { queuedActivationToken: payload.queuedActivationToken }
+        : {}),
+      ...(payload.replyTurnId ? { replyTurnId: payload.replyTurnId } : {}),
+      ...(payload.replyTarget ? { replyTarget: payload.replyTarget } : {}),
+      ...(payload.quoteTargetId ? { quoteTargetId: payload.quoteTargetId } : {}),
+      ...(payload.replyTargetSenderOpenId
+        ? { replyTargetSenderOpenId: payload.replyTargetSenderOpenId }
+        : {}),
+      ...(payload.replyTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: payload.replyTargetSenderIsBot }
+        : {}),
+      deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      content: payload.content,
+      ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
+      ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
+    },
+  );
+  if (opts.persist !== false) {
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      ds.session.codexAppDispatchLedger = priorLedger;
+      throw err;
+    }
+  }
+  return dispatchId;
+}
+
+function rollbackAcceptedCodexAppDispatch(
+  ds: DaemonSession,
+  dispatchId: string | undefined,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+): void {
+  if (!dispatchId || !turnId) return;
+  const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
+    dispatchId,
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  });
+  if (!cancelled.ok) return;
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  ds.session.codexAppDispatchLedger = cancelled.ledger;
+  try {
+    sessionStore.updateSession(ds.session);
+    if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+      void Promise.resolve(callbacks?.onCodexAppLedgerDrained?.(ds)).catch(err => {
+        logger.error(
+          `[${ds.session.sessionId.slice(0, 8)}] post-rollback ledger-drain cleanup failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } catch {
+    ds.session.codexAppDispatchLedger = priorLedger;
+  }
+}
+
+type QueuedWorkerForkSnapshot = {
+  queued: true;
+  queuedPrompt: Session['queuedPrompt'];
+  queuedCodexAppText: Session['queuedCodexAppText'];
+  queuedCodexAppMessageContext: Session['queuedCodexAppMessageContext'];
+  queuedActivationPending: Session['queuedActivationPending'];
+  queuedActivationToken: Session['queuedActivationToken'];
+  queuedActivationInput: Session['queuedActivationInput'];
+  queuedActivationTurnId: Session['queuedActivationTurnId'];
+  queuedActivationDispatchAttempt: Session['queuedActivationDispatchAttempt'];
+  queuedActivationResume: Session['queuedActivationResume'];
+  initialStartPending: DaemonSession['initialStartPending'];
+};
+
+type QueuedActivationJournalSnapshot = Pick<
+  Session,
+  | 'queuedActivationPending'
+  | 'queuedActivationToken'
+  | 'queuedActivationInput'
+  | 'queuedActivationTurnId'
+  | 'queuedActivationDispatchAttempt'
+  | 'queuedActivationResume'
+  | 'queuedPrompt'
+  | 'queuedCodexAppText'
+  | 'queuedCodexAppMessageContext'
+  | 'pendingRepoSetup'
+>;
+
+function snapshotQueuedActivationJournal(session: Session): QueuedActivationJournalSnapshot {
+  return {
+    queuedActivationPending: session.queuedActivationPending,
+    queuedActivationToken: session.queuedActivationToken,
+    queuedActivationInput: session.queuedActivationInput,
+    queuedActivationTurnId: session.queuedActivationTurnId,
+    queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
+    queuedActivationResume: session.queuedActivationResume,
+    queuedPrompt: session.queuedPrompt,
+    queuedCodexAppText: session.queuedCodexAppText,
+    queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
+    pendingRepoSetup: session.pendingRepoSetup
+      ? structuredClone(session.pendingRepoSetup)
+      : undefined,
+  };
+}
+
+function restoreQueuedActivationJournal(
+  session: Session,
+  snapshot: QueuedActivationJournalSnapshot,
+): void {
+  Object.assign(session, snapshot);
+}
+
+function clearQueuedActivationJournal(session: Session): void {
+  session.queuedActivationPending = undefined;
+  session.queuedActivationToken = undefined;
+  session.queuedActivationInput = undefined;
+  session.queuedActivationTurnId = undefined;
+  session.queuedActivationDispatchAttempt = undefined;
+  session.queuedActivationResume = undefined;
+  session.queuedPrompt = undefined;
+  session.queuedCodexAppText = undefined;
+  session.queuedCodexAppMessageContext = undefined;
+  session.pendingRepoSetup = undefined;
+}
+
+/** A worker disappeared before the exact activation ACK. Re-park non-Codex
+ * work from the retained exact input; ACK loss may duplicate, but N can never
+ * be silently replaced by a later inbound turn in the same daemon lifetime. */
+function reparkUnsubmittedQueuedActivation(ds: DaemonSession, reason: string): boolean {
+  if (!ds.session.queuedActivationPending
+    || !ds.session.queuedActivationToken
+    || ds.session.cliId === 'codex-app') return false;
+  ds.session.queued = true;
+  ds.session.queuedActivationPending = undefined;
+  ds.session.queuedActivationToken = undefined;
+  ds.initialStartPending = false;
+  ds.initialStartClaimToken = undefined;
+  ds.pendingPrompt ??= ds.session.queuedPrompt;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    // Memory remains explicitly parked while the old durable marker still
+    // provides restart recovery on disk.
+    logger.error(
+      `[${tag(ds)}] Failed to persist queued activation re-park after ${reason}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logger.warn(`[${tag(ds)}] Re-parked unacknowledged queued activation after ${reason}`);
+  return true;
+}
+
+/** The opening activation was ACKed, but one of the turns held behind its
+ * runtime reservation was not accepted before that worker exited. Promote the
+ * exact FIFO head into a new durable queued activation so the next inbound or
+ * Dashboard activation reforks it before every remaining tail item. */
+function reparkQueuedActivationFollowUpTail(ds: DaemonSession, reason: string): boolean {
+  if (!ds.initialStartPending || ds.session.queuedActivationPending) return false;
+  const next = ds.pendingQueuedActivationFollowUps?.[0];
+  if (!next) return false;
+  const matchingCodexEntries = ds.session.cliId === 'codex-app'
+    ? (ds.session.codexAppDispatchLedger ?? []).filter(entry =>
+      (entry.state === 'accepted' || entry.state === 'prepared')
+      && entry.turnId === next.turnId
+      && entry.dispatchAttempt === next.dispatchAttempt)
+    : [];
+  if (matchingCodexEntries.length > 1) {
+    logger.error(
+      `[${tag(ds)}] Cannot re-park queued follow-up after ${reason}: `
+      + `${matchingCodexEntries.length} Codex entries match turn ${next.turnId}`,
+    );
+    return false;
+  }
+  const retainedCodexEntry = matchingCodexEntries[0];
+  const retainedCodexToken = retainedCodexEntry
+    ? (retainedCodexEntry.queuedActivationToken ?? randomUUID())
+    : undefined;
+  // A failed daemon→worker IPC normally rolls its newly accepted Codex entry
+  // back. If that rollback persistence itself failed, the durable FIFO remains
+  // authoritative: recover it through a tokened ACK journal instead of
+  // creating an invalid queued+unsettled hybrid.
+  ds.session.queued = !retainedCodexEntry;
+  ds.session.queuedPrompt = next.cliInput.content;
+  ds.session.queuedCodexAppText = next.cliInput.codexAppInput?.text;
+  ds.session.queuedCodexAppMessageContext = undefined;
+  ds.session.queuedActivationInput = next.cliInput;
+  ds.session.queuedActivationTurnId = next.turnId;
+  ds.session.queuedActivationDispatchAttempt = next.dispatchAttempt;
+  ds.session.queuedActivationPending = retainedCodexEntry ? true : undefined;
+  ds.session.queuedActivationToken = retainedCodexToken;
+  if (retainedCodexEntry && retainedCodexToken) {
+    retainedCodexEntry.queuedActivationToken = retainedCodexToken;
+  }
+  ds.pendingQueuedActivationFollowUps!.shift();
+  if (ds.pendingQueuedActivationFollowUps!.length === 0) {
+    ds.pendingQueuedActivationFollowUps = undefined;
+  }
+  ds.pendingPrompt = next.cliInput.content;
+  ds.initialStartPending = false;
+  ds.initialStartClaimToken = undefined;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    // Keep the exact head parked in memory. The caller has already fenced the
+    // dead worker, so a later inbound can safely retry this owner even if the
+    // durable projection is temporarily unavailable.
+    logger.error(
+      `[${tag(ds)}] Failed to persist queued follow-up re-park after ${reason}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logger.warn(`[${tag(ds)}] Re-parked unaccepted queued activation follow-up after ${reason}`);
+  return true;
+}
+
+export const __testOnly_reparkQueuedActivationFollowUpTail = reparkQueuedActivationFollowUpTail;
+
+type AcceptedWorkerForkDispatch = {
+  dispatchId: string;
+  turnId: string;
+  dispatchAttempt?: number;
+};
+
+/** Compensate only the durable mutations made before a worker accepts its init
+ * IPC. This is one synchronous call stack, so removing the exact dispatch that
+ * this fork appended cannot race a later worker transition or damage the FIFO
+ * that existed before the attempt. Persist the queued payload and ledger in one
+ * write so a daemon crash cannot observe only half of the compensation. */
+function rollbackWorkerForkPreInit(
+  ds: DaemonSession,
+  queuedSnapshot: QueuedWorkerForkSnapshot | undefined,
+  acceptedDispatch: AcceptedWorkerForkDispatch | undefined,
+): void {
+  const exactActivationInput = ds.session.queuedActivationInput;
+  const exactActivationTurnId = ds.session.queuedActivationTurnId;
+  const exactActivationDispatchAttempt = ds.session.queuedActivationDispatchAttempt;
+  const exactActivationResume = ds.session.queuedActivationResume;
+  let changed = false;
+  if (acceptedDispatch) {
+    const cancelled = cancelCodexAppDispatch(
+      ds.session.codexAppDispatchLedger ?? [],
+      acceptedDispatch,
+    );
+    if (!cancelled.ok) {
+      throw new Error(`failed to cancel pre-init Codex App dispatch: ${cancelled.error}`);
+    }
+    ds.session.codexAppDispatchLedger = cancelled.ledger;
+    changed = true;
+  }
+  if (queuedSnapshot) {
+    ds.session.queued = queuedSnapshot.queued;
+    restoreQueuedActivationJournal(ds.session, queuedSnapshot);
+    // The activation may have folded a triggering group reply into the final
+    // init payload. Retain that exact retry body even though the in-flight
+    // marker/token are rolled back with the fenced child.
+    ds.session.queuedActivationPending = undefined;
+    ds.session.queuedActivationToken = undefined;
+    ds.session.queuedActivationInput = exactActivationInput;
+    ds.session.queuedActivationTurnId = exactActivationTurnId;
+    ds.session.queuedActivationDispatchAttempt = exactActivationDispatchAttempt;
+    ds.session.queuedActivationResume = exactActivationResume;
+    ds.initialStartPending = queuedSnapshot.initialStartPending;
+    changed = true;
+  }
+  if (changed) sessionStore.updateSession(ds.session);
 }
 
 /** Send one normal (non-raw) worker turn while applying the per-bot Codex App
@@ -1880,12 +2569,18 @@ export function sendWorkerInput(
 ): boolean {
   if (!ds.worker || ds.worker.killed) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
-  const codexAppInput = codexAppInputForSession(ds, normalized.codexAppInput, turnId);
+  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
+    ? `codex-app-dispatch-${randomUUID()}`
+    : undefined);
+  const replyTurnId = turnId ? undefined : ds.currentReplyTarget?.turnId;
+  const routingTurnId = turnId ?? replyTurnId;
+  const replyContext = frozenReplyContextForTurn(ds, routingTurnId);
+  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, routingTurnId);
   let nativeSessionTitlePrompt: string | undefined;
   let nativeSessionTitle: string | undefined;
   if (ds.session.nativeSessionTitleAwaitingContent && !ds.session.nativeSessionTitleUserDefined && !ds.adoptedFrom) {
     const bot = getBot(ds.larkAppId);
-    const effectiveCliId = ds.session.cliId ?? bot.config.cliId;
     if (effectiveCliId === 'codex') {
       nativeSessionTitlePrompt = extractBotmuxLarkNativeSessionTitlePrompt(
         normalized.codexAppInput?.text ?? normalized.content,
@@ -1903,20 +2598,281 @@ export function sendWorkerInput(
       }
     }
   }
-  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, turnId);
-  ds.worker.send({
-    type: 'message',
-    content: normalized.content,
-    ...(codexAppInput ? { codexAppInput } : {}),
-    ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
-    ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
-    ...(turnId ? { turnId } : {}),
-    ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
-    ...(vcMeetingImTurnOrigin
-      ? { vcMeetingImTurnOrigin }
-      : {}),
-  } as DaemonToWorker);
+
+  if (hasQueuedActivationAdmissionGate(ds)) {
+    const queuedTurnId = effectiveTurnId
+      ?? routingTurnId
+      ?? `queued-activation-followup-${randomUUID()}`;
+    try {
+      admitQueuedActivationTail(ds, {
+        userPrompt: normalized.content,
+        cliInput: {
+          content: normalized.content,
+          ...(normalized.codexAppInput
+            ? { codexAppInput: normalized.codexAppInput }
+            : {}),
+        },
+        turnId: queuedTurnId,
+        ...(opts.dispatchAttempt !== undefined
+          ? { dispatchAttempt: opts.dispatchAttempt }
+          : {}),
+      });
+      logger.info(
+        `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
+      );
+      return true;
+    } catch (err) {
+      logger.error(
+        `[${tag(ds)}] Failed to durably stage turn ${queuedTurnId} behind activation: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  const codexAppInput = codexAppInputForSession(
+    ds,
+    normalized.codexAppInput,
+    effectiveTurnId,
+  );
+  const codexAppDispatchId = acceptCodexAppDispatch(
+    ds,
+    {
+      content: normalized.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      ...(replyTurnId ? { replyTurnId } : {}),
+      replyTarget: replyContext.target,
+      ...(replyContext.quoteTargetId ? { quoteTargetId: replyContext.quoteTargetId } : {}),
+      ...(replyContext.replyTargetSenderOpenId
+        ? { replyTargetSenderOpenId: replyContext.replyTargetSenderOpenId }
+        : {}),
+      ...(replyContext.replyTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
+        : {}),
+    },
+    effectiveTurnId,
+    opts.dispatchAttempt,
+    vcMeetingImTurnOrigin,
+  );
+  try {
+    ds.worker.send({
+      type: 'message',
+      content: normalized.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
+      ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
+      ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
+      ...(replyTurnId ? { replyTurnId } : {}),
+      ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+      ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+      ...(vcMeetingImTurnOrigin
+        ? { vcMeetingImTurnOrigin }
+        : {}),
+    } as DaemonToWorker);
+  } catch {
+    rollbackAcceptedCodexAppDispatch(
+      ds,
+      codexAppDispatchId,
+      effectiveTurnId,
+      opts.dispatchAttempt,
+    );
+    return false;
+  }
   return true;
+}
+
+/** Promote the oldest durable activation successor into a fresh tokened
+ * journal and (for Codex App) its single accepted-ledger owner in one store
+ * update, then hand it to the current worker. The tail is never shifted merely
+ * because ChildProcess.send returned: the promoted journal survives until the
+ * adapter ACK carrying this token arrives. */
+export function promoteQueuedActivationTail(
+  ds: DaemonSession,
+  opts: { send?: boolean } = {},
+): boolean {
+  if (ds.session.queuedActivationPending) return true;
+  if (opts.send !== false
+    && (!ds.worker || ds.worker.killed)) return false;
+  const ordered = [...(ds.session.queuedActivationTail ?? [])]
+    .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  const head = ordered[0];
+  if (!head) return false;
+
+  const priorJournal = snapshotQueuedActivationJournal(ds.session);
+  const priorTail = ds.session.queuedActivationTail?.map(entry => ({
+    ...entry,
+    cliInput: {
+      ...entry.cliInput,
+      ...(entry.cliInput.codexAppInput
+        ? { codexAppInput: structuredClone(entry.cliInput.codexAppInput) }
+        : {}),
+    },
+  }));
+  const priorLedger = ds.session.codexAppDispatchLedger?.map(entry => ({ ...entry }));
+  const priorPendingPrompt = ds.pendingPrompt;
+  const token = randomUUID();
+  const replyContext = frozenReplyContextForTurn(ds, head.turnId);
+  // The tail entry crossed its admission boundary with the clean-input gate
+  // already frozen. Do not re-run that immediate bot-config gate at promotion:
+  // a true→false toggle between N+1 admission and N's ACK would otherwise
+  // discard N+1's exact sidecar/hidden context. Only fill the deterministic id
+  // for legacy entries persisted before admission began stamping it.
+  const codexAppInput = cloneFrozenCodexAppInput(
+    head.cliInput.codexAppInput,
+    head.turnId,
+  );
+  const exactInput: CliTurnPayload = {
+    content: head.cliInput.content,
+    ...(codexAppInput ? { codexAppInput } : {}),
+  };
+  const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
+
+  ds.session.queued = false;
+  ds.session.queuedActivationPending = true;
+  ds.session.queuedActivationToken = token;
+  ds.session.queuedActivationInput = exactInput;
+  ds.session.queuedActivationTurnId = head.turnId;
+  ds.session.queuedActivationDispatchAttempt = head.dispatchAttempt;
+  ds.session.queuedActivationResume = ds.hasHistory;
+  ds.session.queuedActivationTail = ordered.slice(1);
+  if (ds.session.queuedActivationTail.length === 0) {
+    ds.session.queuedActivationTail = undefined;
+  }
+  ds.pendingPrompt = exactInput.content;
+  ds.initialStartPending = true;
+
+  let codexAppDispatchId: string | undefined;
+  try {
+    codexAppDispatchId = acceptCodexAppDispatch(
+      ds,
+      {
+        content: exactInput.content,
+        ...(codexAppInput ? { codexAppInput } : {}),
+        queuedActivationToken: token,
+        replyTarget: replyContext.target,
+        ...(replyContext.quoteTargetId ? { quoteTargetId: replyContext.quoteTargetId } : {}),
+        ...(replyContext.replyTargetSenderOpenId
+          ? { replyTargetSenderOpenId: replyContext.replyTargetSenderOpenId }
+          : {}),
+        ...(replyContext.replyTargetSenderIsBot !== undefined
+          ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
+          : {}),
+      },
+      head.turnId,
+      head.dispatchAttempt,
+      vcMeetingImTurnOrigin,
+      { persist: false },
+    );
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    restoreQueuedActivationJournal(ds.session, priorJournal);
+    ds.session.queuedActivationTail = priorTail;
+    ds.session.codexAppDispatchLedger = priorLedger;
+    ds.pendingPrompt = priorPendingPrompt;
+    logger.error(
+      `[${tag(ds)}] Failed to atomically promote queued activation tail ${head.id}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+
+  if (opts.send === false) return true;
+  try {
+    ds.worker!.send({
+      type: 'message',
+      content: exactInput.content,
+      ...(codexAppInput ? { codexAppInput } : {}),
+      turnId: head.turnId,
+      ...(head.dispatchAttempt !== undefined
+        ? { dispatchAttempt: head.dispatchAttempt }
+        : {}),
+      ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+      queuedActivationToken: token,
+      ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
+    } as DaemonToWorker);
+  } catch (err) {
+    // Durable ownership already moved to the journal (and Codex ledger). Never
+    // append another owner on retry; fence this IPC generation and let recovery
+    // replay the exact tokened head.
+    logger.error(
+      `[${tag(ds)}] Worker IPC rejected promoted activation ${head.id}; retaining journal: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    try { ds.worker!.kill(); } catch { /* exit/error path will fence runtime */ }
+  }
+  return true;
+}
+
+export type QueuedActivationTailReservation = Pick<QueuedActivationTailEntry, 'id' | 'order'> & {
+  /** Clean-input decision captured synchronously with FIFO order, before any
+   * caller-specific async prompt construction. This field is runtime-only. */
+  codexAppInputAccepted?: boolean;
+};
+
+/** Reserve arrival order synchronously, before any caller-specific prompt
+ * rendering may await. Gaps are harmless; reusing an order after a failed
+ * durable admission would not be. */
+export function reserveQueuedActivationTailAdmission(
+  ds: DaemonSession,
+): QueuedActivationTailReservation {
+  const order = (ds.session.queuedActivationTailNextOrder ?? 0) + 1;
+  ds.session.queuedActivationTailNextOrder = order;
+  return {
+    id: randomUUID(),
+    order,
+    codexAppInputAccepted: codexAppCleanInputAcceptedForSession(ds),
+  };
+}
+
+/** Admit one exact successor behind a queued activation. The response boundary
+ * is the session-store write: callers must not report acceptance or use live
+ * worker IPC unless this returns. `reservation` lets routes reserve FIFO order
+ * before asynchronous prompt construction without duplicating persistence
+ * logic. */
+export function admitQueuedActivationTail(
+  ds: DaemonSession,
+  entry: Omit<QueuedActivationTailEntry, 'id' | 'order'>,
+  reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
+  opts: { codexAppInputGateFrozen?: boolean } = {},
+): QueuedActivationTailEntry {
+  const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
+    ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+    : reservation.codexAppInputAccepted === true
+      ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+      : undefined;
+  const admitted: QueuedActivationTailEntry = {
+    id: reservation.id,
+    order: reservation.order,
+    ...entry,
+    cliInput: {
+      content: entry.cliInput.content,
+      ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+    },
+  };
+  const priorTail = ds.session.queuedActivationTail;
+  const next = [...(priorTail ?? [])];
+  if (!next.some(candidate => candidate.id === admitted.id)) next.push(admitted);
+  next.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+  ds.session.queuedActivationTail = next;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    ds.session.queuedActivationTail = priorTail;
+    throw err;
+  }
+  return admitted;
+}
+
+/** True while a live worker's opening activation still owns submission order.
+ * Every ingress that sees this state must use admitQueuedActivationTail rather
+ * than ordinary worker IPC. */
+export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
+  return ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || (ds.queuedActivationTailAdmissionsOutstanding ?? 0) > 0
+    || ds.queuedActivationTailReleasePending !== undefined
+    || (ds.initialStartPending === true
+      && ds.session.queuedActivationInput !== undefined);
 }
 
 export function forkWorker(
@@ -1926,6 +2882,9 @@ export function forkWorker(
     resume?: boolean;
     turnId?: string;
     dispatchAttempt?: number;
+    /** The payload is an exact retained activation journal. Do not re-read the
+     * live clean-input feature flag on retry/replay. */
+    codexAppInputGateFrozen?: boolean;
   } = false,
 ): void {
   // Device enrollment briefly freezes every daemon before the one-way host
@@ -1941,45 +2900,132 @@ export function forkWorker(
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
     return;
   }
-  const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
-  const botCfg = bot.config;
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const prompt = promptPayload.content;
-  // 不变式：一旦真正起 CLI，会话就不再是「待办池(queued)」parked 态。无论由哪条
-  // 路径触发（激活按钮 / 拖到进行中 / 群里来消息抢先起会话），都在此清掉 queued
-  // 标记并落盘——否则重启后会被当 parked 恢复成 hasHistory:false 而丢掉真历史。
-  if (ds.session.queued) {
-    ds.session.queued = false;
-    ds.session.queuedPrompt = undefined;
-    ds.session.queuedCodexAppText = undefined;
-    ds.session.queuedCodexAppMessageContext = undefined;
-    sessionStore.updateSession(ds.session);
-  }
-  // worker.js lives in the same directory as daemon.js (src/)
-  const workerPath = join(__dirname, '..', 'worker.js');
-  const t = tag(ds);
-  ds.localProcessAttestation = undefined;
-
   let resume = false;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
   } else {
     resume = resumeOrTurnId;
   }
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationResume !== undefined) {
+    resume = ds.session.queuedActivationResume;
+  }
+
+  // Central double-fork guard. A live worker with durable ownership must never
+  // be killed and replaced: empty reforks are rejected, while a real follow-up
+  // is appended through the existing worker's ordinary durable FIFO. Keep this
+  // before queued/cwd/sandbox mutations so a rejected refork is side-effect free.
+  if (ds.worker && !ds.worker.killed
+    && hasProtectedSessionMutationOwnership(ds)) {
+    if (prompt.length === 0) {
+      logger.warn(`[${tag(ds)}] Refused empty worker refork while durable activation ownership is non-empty`);
+      return;
+    }
+    if (hasQueuedActivationAdmissionGate(ds)) {
+      const turnId = initTurnId
+        ?? ds.currentReplyTarget?.turnId
+        ?? `queued-activation-followup-${randomUUID()}`;
+      admitQueuedActivationTail(ds, {
+        userPrompt: prompt,
+        cliInput: {
+          content: prompt,
+          ...(promptPayload.codexAppInput
+            ? { codexAppInput: promptPayload.codexAppInput }
+            : {}),
+        },
+        turnId,
+        ...(initDispatchAttempt !== undefined
+          ? { dispatchAttempt: initDispatchAttempt }
+          : {}),
+      });
+      logger.info(
+        `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
+        + `(turn=${turnId})`,
+      );
+      return;
+    }
+    const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
+      ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+    });
+    logger[routed ? 'info' : 'warn'](
+      `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,
+    );
+    return;
+  }
+
+  const cb = requireCallbacks();
+  const bot = getBot(ds.larkAppId);
+  const botCfg = bot.config;
+  // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
+  // model turn. Starting its CLI with an empty prompt must not mint a queued
+  // activation token: the worker has nothing to submit and could never ACK it.
+  // Real raw openings and clean Codex sidecars remain tokened.
+  if (ds.session.queued
+    && ds.session.pendingRepoSetup
+    && prompt.length === 0
+    && !promptPayload.codexAppInput
+    && !ds.pendingRawInput
+    && (ds.session.queuedActivationTail?.length ?? 0) === 0) {
+    const priorJournal = snapshotQueuedActivationJournal(ds.session);
+    ds.session.queued = false;
+    clearQueuedActivationJournal(ds.session);
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (err) {
+      ds.session.queued = true;
+      restoreQueuedActivationJournal(ds.session, priorJournal);
+      throw err;
+    }
+  }
+  const queuedForkSnapshot: QueuedWorkerForkSnapshot | undefined = ds.session.queued
+    ? {
+        queued: true,
+        queuedPrompt: ds.session.queuedPrompt,
+        queuedCodexAppText: ds.session.queuedCodexAppText,
+        queuedCodexAppMessageContext: ds.session.queuedCodexAppMessageContext,
+        queuedActivationPending: ds.session.queuedActivationPending,
+        queuedActivationToken: ds.session.queuedActivationToken,
+        queuedActivationInput: ds.session.queuedActivationInput,
+        queuedActivationTurnId: ds.session.queuedActivationTurnId,
+        queuedActivationDispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+        queuedActivationResume: ds.session.queuedActivationResume,
+        initialStartPending: ds.initialStartPending,
+      }
+    : undefined;
+  let acceptedForkDispatch: AcceptedWorkerForkDispatch | undefined;
+  let spawnedWorker: ChildProcess | undefined;
+  let worker!: ChildProcess;
+  let startupState!: WorkerStartupState;
+  let initMsg!: DaemonToWorker;
+  let agentCfg!: ReturnType<typeof sessionAgentConfig>;
+  const t = tag(ds);
+  ds.localProcessAttestation = undefined;
+  try {
+  // worker.js lives in the same directory as daemon.js (src/)
+  const workerPath = join(__dirname, '..', 'worker.js');
 
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
   // scheduler, card retry and other system starts stay unattributed. Falling
   // back to currentReplyTarget here would let a later system prompt reuse an
   // older human turn after a worker replacement.
-  const initAttributionTurnId = initTurnId;
+  let initAttributionTurnId = initTurnId
+    ?? (queuedForkSnapshot ? ds.session.pendingRepoSetup?.turnId : undefined);
+  // Reply routing is frozen only from the same explicitly accepted turn. A
+  // system prompt must not borrow an older mutable currentReplyTarget.
+  const initReplyTurnId = initTurnId;
+  const initReplyContext = prompt.length > 0
+    ? frozenReplyContextForTurn(ds, initReplyTurnId)
+    : undefined;
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -2046,7 +3092,9 @@ export function forkWorker(
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
     logger.warn(`[${t}] Worker already running (pid: ${ds.worker.pid}), killing before re-fork`);
-    try { ds.worker.send({ type: 'close' } as DaemonToWorker); } catch { /* ignore */ }
+    try {
+      ds.worker.send({ type: 'close' } as DaemonToWorker);
+    } catch { /* ignore */ }
     try { ds.worker.kill(); } catch { /* ignore */ }
     ds.worker = null;
     ds.workerPort = null;
@@ -2069,7 +3117,10 @@ export function forkWorker(
   // real bmx-<sid>; without this, bmx-diag-<sid> + its .ansi file would leak.
   if (!ds.initConfig?.adoptMode && !ds.adoptedFrom) reclaimParkedCrashDiagnostic(ds);
 
-  const agentCfg = sessionAgentConfig(ds, botCfg);
+  agentCfg = sessionAgentConfig(ds, botCfg);
+  if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
+    initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
+  }
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride);
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -2121,6 +3172,17 @@ export function forkWorker(
   // (`~/.claude.json` for claude, `.claude-runtime/.claude.json` for seed).
   const familyAdapter = createCliAdapterSync(agentCfg.cliId, agentCfg.cliPathOverride);
   if (familyAdapter.claudeStateJsonPath) ensureClaudeFolderTrust(cwd, familyAdapter.claudeStateJsonPath);
+  const resolvedBackendType = resolvePairedSpawnBackendType(
+    agentCfg.cliId,
+    ds.session.backendType,
+    botCfg.backendType,
+    config.daemon.backendType,
+  );
+  if (ds.session.cliId !== agentCfg.cliId || ds.session.backendType !== resolvedBackendType) {
+    ds.session.cliId = agentCfg.cliId;
+    ds.session.backendType = resolvedBackendType;
+    sessionStore.updateSession(ds.session);
+  }
 
   // Prepend ~/.botmux/bin to PATH so CLIs can call `botmux send` etc.
   // The wrapper script there is written by the daemon at startup.
@@ -2128,7 +3190,103 @@ export function forkWorker(
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
   const forkEnv = workerForkEnv(process.env);
-  const worker = fork(workerPath, [], {
+  // Dequeue only after every earlier launch-preparation write has finished.
+  // The exact input remains journaled until the worker confirms its adapter
+  // submission boundary; daemon send/ready are intentionally too early.
+  const recoveredActivationLedgerEntry = ds.session.queuedActivationPending
+    ? [...(ds.session.codexAppDispatchLedger ?? [])]
+      .reverse()
+      .find(entry => entry.state === 'accepted' || entry.state === 'prepared')
+    : undefined;
+  const queuedActivationToken = queuedForkSnapshot
+    ? randomUUID()
+    : ds.session.queuedActivationPending
+      ? (ds.session.queuedActivationToken
+        ?? recoveredActivationLedgerEntry?.queuedActivationToken
+        ?? randomUUID())
+      : undefined;
+  if (queuedForkSnapshot) {
+    ds.session.queued = false;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = queuedActivationToken;
+    ds.session.queuedActivationResume = resume;
+    ds.initialStartPending = true;
+  } else if (ds.session.queuedActivationPending && queuedActivationToken) {
+    // Migrate journals written before the token/ACK protocol. The queued
+    // activation is the newest unsettled FIFO entry; stamp the same token onto
+    // both journal and entry before the recovery worker can submit it.
+    let migrated = ds.session.queuedActivationToken !== queuedActivationToken;
+    ds.session.queuedActivationToken = queuedActivationToken;
+    ds.initialStartPending = true;
+    if (recoveredActivationLedgerEntry
+      && recoveredActivationLedgerEntry.queuedActivationToken !== queuedActivationToken) {
+      recoveredActivationLedgerEntry.queuedActivationToken = queuedActivationToken;
+      migrated = true;
+    }
+    if (migrated) sessionStore.updateSession(ds.session);
+  }
+
+  // Snapshot the prior durable FIFO before accepting this fork's new prompt.
+  // A pure reattach receives the full snapshot; a refork carrying N+1 restores
+  // old N first and reserves N+1 through the normal worker write path.
+  const codexAppRecoveredDispatches = agentCfg.cliId === 'codex-app'
+    ? (ds.session.codexAppDispatchLedger ?? []).map(entry => ({ ...entry }))
+    : [];
+  const promptCodexAppInput = initCodexAppInputGateFrozen
+    ? cloneFrozenCodexAppInput(promptPayload.codexAppInput, initAttributionTurnId)
+    : codexAppInputForSession(ds, promptPayload.codexAppInput, initAttributionTurnId);
+  if (queuedForkSnapshot) {
+    ds.session.queuedActivationInput = {
+      content: prompt,
+      ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+    };
+    ds.session.queuedActivationTurnId = initAttributionTurnId;
+    ds.session.queuedActivationDispatchAttempt = initDispatchAttempt;
+  }
+  const initVcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(
+    ds.session,
+    initTurnId ?? initReplyTurnId,
+  );
+  const codexAppDispatchId = prompt.length > 0
+    ? acceptCodexAppDispatch(
+        ds,
+        {
+          content: prompt,
+          ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+          ...(queuedActivationToken ? { queuedActivationToken } : {}),
+          ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
+          ...(initReplyContext ? {
+            replyTarget: initReplyContext.target,
+            ...(initReplyContext.quoteTargetId
+              ? { quoteTargetId: initReplyContext.quoteTargetId }
+              : {}),
+            ...(initReplyContext.replyTargetSenderOpenId
+              ? { replyTargetSenderOpenId: initReplyContext.replyTargetSenderOpenId }
+              : {}),
+            ...(initReplyContext.replyTargetSenderIsBot !== undefined
+              ? { replyTargetSenderIsBot: initReplyContext.replyTargetSenderIsBot }
+              : {}),
+          } : {}),
+        },
+        initAttributionTurnId,
+        initDispatchAttempt,
+        initVcMeetingImTurnOrigin,
+      )
+    : undefined;
+  if (codexAppDispatchId && initAttributionTurnId) {
+    acceptedForkDispatch = {
+      dispatchId: codexAppDispatchId,
+      turnId: initAttributionTurnId,
+      ...(initDispatchAttempt !== undefined
+        ? { dispatchAttempt: initDispatchAttempt }
+        : {}),
+    };
+  }
+  if (queuedForkSnapshot && !codexAppDispatchId) {
+    sessionStore.updateSession(ds.session);
+  }
+
+  worker = fork(workerPath, [], {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
@@ -2143,7 +3301,8 @@ export function forkWorker(
       LARK_APP_SECRET: botCfg.larkAppSecret,
     },
   } as WindowsForkOptions);
-  const startupState: WorkerStartupState = {
+  spawnedWorker = worker;
+  startupState = {
     ready: false, failureNotified: false,
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
@@ -2155,6 +3314,23 @@ export function forkWorker(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (ds.worker === worker) {
+      if (ds.session.queuedActivationPending) {
+        // The durable opening journal remains authoritative until the adapter
+        // proves submission. A failed child must release only its runtime
+        // claim so the next generation can replay that exact head.
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      } else {
+        reparkQueuedActivationFollowUpTail(ds, 'worker error during activation follow-up handoff');
+      }
+      ds.worker = null;
+      ds.workerPort = null;
+      ds.workerToken = null;
+      ds.workerViewToken = null;
+      ds.managedTurnOrigin = undefined;
+      try { worker.kill(); } catch { /* best-effort failed-child fence */ }
+    }
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
@@ -2204,12 +3380,7 @@ export function forkWorker(
   });
 
   // Send init config — use per-bot settings
-  const promptCodexAppInput = codexAppInputForSession(
-    ds,
-    promptPayload.codexAppInput,
-    initAttributionTurnId,
-  );
-  const initMsg: DaemonToWorker = {
+  initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
@@ -2265,6 +3436,7 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
@@ -2276,11 +3448,16 @@ export function forkWorker(
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: initAttributionTurnId,
+    ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
-    vcMeetingImTurnOrigin: resolveVcMeetingImTurnOrigin(
-      ds.session,
-      initAttributionTurnId,
-    ),
+    ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
+    ...(codexAppRecoveredDispatches.length > 0
+      ? { codexAppRecoveredDispatches }
+      : {}),
+    ...((ds.session.codexAppGenerationCommits?.length ?? 0) > 0
+      ? { codexAppGenerationCommits: ds.session.codexAppGenerationCommits }
+      : {}),
+    vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
   };
@@ -2314,29 +3491,84 @@ export function forkWorker(
   ds.worker = worker;
   ds.spawnedAt = Date.now();
   ds.cliVersion = currentCliVersion;
-  sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  worker.send(initMsg);
+  // A later child 'error' event is ambiguous: init may already be executing,
+  // so only synchronous failures before this point are safe to compensate.
+  spawnedWorker = undefined;
+  } catch (err) {
+    if (ds.worker === spawnedWorker) {
+      ds.worker = null;
+      ds.workerPort = null;
+      ds.workerToken = null;
+      ds.workerViewToken = null;
+    }
+    if (spawnedWorker) {
+      try { spawnedWorker.kill(); } catch { /* best-effort pre-init child fence */ }
+    }
+    try {
+      rollbackWorkerForkPreInit(ds, queuedForkSnapshot, acceptedForkDispatch);
+    } catch (rollbackErr) {
+      logger.error(
+        `[${tag(ds)}] Worker pre-init failure could not durably restore queued/FIFO state: `
+        + `${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
+      );
+      throw new AggregateError(
+        [err, rollbackErr],
+        `Worker pre-init failed and durable rollback failed for ${ds.session.sessionId}`,
+      );
+    }
+    throw err;
+  }
+  ds.initConfig = initMsg;
+  try {
+    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+  } catch (err) {
+    // Init may already be executing. PID bookkeeping failure must not turn an
+    // accepted activation into a retryable error or orphan the attached child.
+    logger.error(`[${t}] Failed to persist attached worker pid: ${err instanceof Error ? err.message : String(err)}`);
+  }
   logger.info(`[${t}] Worker forked (pid: ${worker.pid}, active: ${cb.getActiveCount()})`);
 
   // Reset the exit-emit flag for the freshly spawned worker so a subsequent
   // exit publishes again (the previous lifecycle's flag would otherwise mask it).
   ds.exitEventEmitted = false;
   // Notify dashboard SSE subscribers a new session is live.
-  dashboardEventBus.publish({
-    type: 'session.spawned',
-    body: { session: composeRowFromActive(ds) },
-  });
-  cb.enforceLiveSessionCap?.();
-  emitSessionLifecycleHook(ds, 'session.start', {
-    reason: resume ? 'resume' : 'worker_spawn',
-    pid: worker.pid ?? null,
-  });
+  try {
+    dashboardEventBus.publish({
+      type: 'session.spawned',
+      body: { session: composeRowFromActive(ds) },
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to publish attached worker state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    cb.enforceLiveSessionCap?.();
+  } catch (err) {
+    logger.error(`[${t}] Failed to enforce live-session cap after attach: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    emitSessionLifecycleHook(ds, 'session.start', {
+      reason: resume ? 'resume' : 'worker_spawn',
+      pid: worker.pid ?? null,
+    });
+  } catch (err) {
+    logger.error(`[${t}] Failed to emit attached worker lifecycle hook: ${err instanceof Error ? err.message : String(err)}`);
+  }
   // Usage ledger: fresh spawns anchor the baseline so pre-existing transcript
   // history is never billed. Restores reconcile instead — an in-flight turn
   // may have completed inside tmux while the daemon was down, and that work
   // was submitted by botmux (anchoring would swallow it).
-  if (resume) reconcileUsageForDaemonSession(ds);
-  else anchorUsageForDaemonSession(ds);
-  recordOwnershipForDaemonSession(ds);
+  try {
+    if (resume) reconcileUsageForDaemonSession(ds);
+    else anchorUsageForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize attached worker usage state: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    recordOwnershipForDaemonSession(ds);
+  } catch (err) {
+    logger.error(`[${t}] Failed to record attached worker ownership: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────
@@ -2563,6 +3795,69 @@ function setupWorkerHandlers(
         };
         break;
       }
+      case 'queued_activation_submitted': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) break;
+        if (!ds.session.queuedActivationPending
+          || !ds.session.queuedActivationToken
+          || ds.session.queuedActivationToken !== msg.activationToken) {
+          logger.warn(`[${t}] Ignored stale queued activation ACK ${msg.activationToken.substring(0, 8)}`);
+          break;
+        }
+        const releaseReservation = async (attempt: number): Promise<void> => {
+          if (ds.worker !== worker || !ds.initialStartPending) return;
+          try {
+            if (cb.onQueuedActivationSubmitted) {
+              const released = await cb.onQueuedActivationSubmitted(ds, msg.activationToken);
+              if (released === false && ds.worker === worker && ds.initialStartPending) {
+                const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+                logger.warn(
+                  `[${t}] Queued activation follow-up was not accepted (attempt ${attempt + 1}); `
+                  + `retrying in ${delayMs}ms`,
+                );
+                const timer = setTimeout(() => { void releaseReservation(attempt + 1); }, delayMs);
+                timer.unref?.();
+              }
+            } else {
+              ds.initialStartPending = false;
+              ds.initialStartClaimToken = undefined;
+            }
+          } catch (err) {
+            logger.error(
+              `[${t}] Queued activation follow-up release failed unexpectedly; `
+              + `delivery was not retried because acceptance is unknown: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        };
+
+        const journal = snapshotQueuedActivationJournal(ds.session);
+        const persistActivationAck = async (attempt: number): Promise<void> => {
+          if (ds.worker !== worker
+            || !ds.session.queuedActivationPending
+            || ds.session.queuedActivationToken !== msg.activationToken) return;
+          clearQueuedActivationJournal(ds.session);
+          try {
+            sessionStore.updateSession(ds.session);
+          } catch (err) {
+            restoreQueuedActivationJournal(ds.session, journal);
+            const delayMs = Math.min(100 * (2 ** Math.min(attempt, 6)), 5_000);
+            logger.error(
+              `[${t}] Failed to persist queued activation ACK; retained journal and `
+              + `will retry in ${delayMs}ms: ${err instanceof Error ? err.message : String(err)}`,
+            );
+            const timer = setTimeout(() => { void persistActivationAck(attempt + 1); }, delayMs);
+            timer.unref?.();
+            return;
+          }
+          // Crossing the adapter boundary means this session now owns CLI
+          // history even if the worker dies before it can publish a session id.
+          ds.hasHistory = true;
+          await releaseReservation(0);
+        };
+        await persistActivationAck(0);
+        break;
+      }
+
       case 'ready': {
         startupState.ready = true;
         ds.workerPort = msg.port;
@@ -2765,9 +4060,7 @@ function setupWorkerHandlers(
           flushPendingRiffUrlPatch(ds);
         } catch (err) {
           if (err instanceof MessageWithdrawnError) {
-            logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-            killWorker(ds);
-            cb.closeSession(ds);
+            await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating worker-ready card');
             break;
           }
           logger.warn(`[${t}] Failed to send streaming card, falling back to static card: ${err}`);
@@ -2811,9 +4104,7 @@ function setupWorkerHandlers(
             }
           } catch (fallbackErr) {
             if (fallbackErr instanceof MessageWithdrawnError) {
-              logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-              killWorker(ds);
-              cb.closeSession(ds);
+              await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
             throw fallbackErr;
@@ -2855,10 +4146,15 @@ function setupWorkerHandlers(
           ds.worker.send({
             type: 'raw_input',
             content: rawInput,
-            ...(rawTurnId ? { turnId: rawTurnId } : {}),
+            ...((ds.session.queuedActivationTurnId ?? rawTurnId)
+              ? { turnId: ds.session.queuedActivationTurnId ?? rawTurnId }
+              : {}),
             followUpContent: followUp?.cliInput,
             ...(followUp?.turnId ? { followUpTurnId: followUp.turnId } : {}),
             ...(followUpCodexAppInput ? { followUpCodexAppInput } : {}),
+            ...(ds.session.queuedActivationToken
+              ? { queuedActivationToken: ds.session.queuedActivationToken }
+              : {}),
           } as DaemonToWorker);
           logger.info(`[${t}] Sent pending raw input after prompt_ready: ${rawInput.substring(0, 80)}${followUp ? ` (+follow-up ${followUp.cliInput.length} chars)` : ''}`);
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
@@ -3024,11 +4320,9 @@ function setupWorkerHandlers(
               flushPendingLocalCliOpenReadinessPatch(ds);
           flushPendingRiffUrlPatch(ds);
             })
-            .catch(err => {
+            .catch(async err => {
               if (err instanceof MessageWithdrawnError) {
-                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-                killWorker(ds);
-                cb.closeSession(ds);
+                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating streaming card');
                 return;
               }
               logger.debug(`[${t}] Failed to create streaming card: ${err}`);
@@ -3436,8 +4730,7 @@ function setupWorkerHandlers(
               await scopedReply(parts.join('\n\n'), 'text', undefined);
             } catch (replyErr) {
               if (replyErr instanceof MessageWithdrawnError) {
-                logger.warn(`[${t}] Root message withdrawn, closing stale session`);
-                cb.closeSession(ds);
+                await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while sending crash diagnostic');
               }
             }
           }
@@ -3447,7 +4740,7 @@ function setupWorkerHandlers(
         // Auto-restart CLI within the same worker
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${getCliDisplayName(effectiveCliId)}...`);
-          ds.worker.send({ type: 'restart' } as DaemonToWorker);
+          ds.worker.send({ type: 'restart', reason: 'cli_crash' } as DaemonToWorker);
         }
         break;
       }
@@ -3679,7 +4972,235 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_app_dispatch_transition': {
+        const acknowledge = (ok: boolean, error?: string): void => {
+          try {
+            worker.send({
+              type: 'codex_app_dispatch_persisted',
+              requestId: msg.requestId,
+              ok,
+              ...(error ? { error } : {}),
+            } as DaemonToWorker);
+          } catch { /* worker exit makes the prepared/final state replayable */ }
+        };
+        if (ds.worker !== worker) {
+          acknowledge(false, 'stale_worker_generation');
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          acknowledge(false, 'session_mismatch');
+          break;
+        }
+        const ledger = ds.session.codexAppDispatchLedger ?? [];
+        let next: { ok: true; ledger: CodexAppDispatchLedgerEntry[] } | { ok: false; error: string };
+        if (msg.operation === 'submit') {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'submit_requires_one_entry');
+            break;
+          }
+          next = prepareCodexAppDispatch(ledger, msg.entries[0]);
+        } else if (msg.operation === 'retry') {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'retry_requires_one_entry');
+            break;
+          }
+          next = retryPreparedCodexAppDispatch(ledger, msg.entries[0]);
+        } else {
+          if (msg.entries.length !== 1) {
+            acknowledge(false, 'cancel_requires_one_entry');
+            break;
+          }
+          next = cancelCodexAppDispatch(ledger, msg.entries[0]);
+        }
+        if (!next.ok) {
+          acknowledge(false, next.error);
+          break;
+        }
+        const priorLedger = ds.session.codexAppDispatchLedger;
+        ds.session.codexAppDispatchLedger = next.ledger;
+        let persisted = false;
+        try {
+          sessionStore.updateSession(ds.session);
+          persisted = true;
+          acknowledge(true);
+        } catch (err: any) {
+          ds.session.codexAppDispatchLedger = priorLedger;
+          acknowledge(false, err?.message ?? 'session_store_write_failed');
+        }
+        if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+          try { await cb.onCodexAppLedgerDrained?.(ds); }
+          catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+        }
+        break;
+      }
+
+      case 'codex_app_generation_active': {
+        if (ds.worker !== worker || msg.sessionId !== ds.session.sessionId) break;
+        if (!msg.fresh) break;
+        const priorCommits = ds.session.codexAppGenerationCommits;
+        ds.session.codexAppGenerationCommits = retainFreshCodexAppGeneration(
+          ds.session.codexAppGenerationCommits ?? [],
+          msg.generation,
+        );
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          ds.session.codexAppGenerationCommits = priorCommits;
+          logger.error(`[${t}] Failed to persist fresh Codex App generation: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+
       case 'final_output': {
+        if (msg.codexAppSettlement) {
+          const settlement = msg.codexAppSettlement;
+          const acknowledge = (ok: boolean, error?: string): void => {
+            try {
+              worker.send({
+                type: 'codex_app_dispatch_persisted',
+                requestId: settlement.requestId,
+                ok,
+                ...(error ? { error } : {}),
+              } as DaemonToWorker);
+            } catch { /* runner keeps the final unacknowledged for replacement */ }
+          };
+          if (ds.worker !== worker) {
+            acknowledge(false, 'stale_worker_generation');
+            break;
+          }
+          if (msg.sessionId !== ds.session.sessionId) {
+            acknowledge(false, 'session_mismatch');
+            break;
+          }
+          if (committedCodexAppSequence(
+            ds.session.codexAppGenerationCommits ?? [],
+            settlement.generation,
+            settlement.seq,
+          )) {
+            acknowledge(true);
+            if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+              try { await cb.onCodexAppLedgerDrained?.(ds); }
+              catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+            }
+            break;
+          }
+          const identity = {
+            dispatchId: settlement.dispatchId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          };
+          const preview = settleCodexAppDispatch(
+            ds.session.codexAppDispatchLedger ?? [],
+            ds.session.codexAppGenerationCommits ?? [],
+            identity,
+            settlement.generation,
+            settlement.seq,
+          );
+          if (!preview.ok) {
+            acknowledge(false, preview.error);
+            break;
+          }
+          const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          let inFlight = codexAppFinalSettlementInFlight.get(key);
+          if (!inFlight) {
+            inFlight = (async () => {
+              const unavailableSinkFailClosed = codexAppDeliveryMustFailClosed(
+                ds,
+                preview.settledEntry,
+              );
+              const deliverySuppressed = msg.suppressDelivery === true
+                || managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)
+                || unavailableSinkFailClosed;
+              if (unavailableSinkFailClosed
+                && preview.settledEntry.deliverySink !== 'suppressed'
+                && msg.suppressDelivery !== true) {
+                logger.warn(
+                  `[${t}] Codex App recovery suppressed unavailable `
+                  + `${preview.settledEntry.deliverySink ?? 'legacy non-Lark'} sink `
+                  + `(turn ${msg.turnId.substring(0, 8)})`,
+                );
+              }
+              const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
+              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
+                ? true
+                : await new Promise<boolean>(resolve => {
+                    deliverFinalOutput(
+                      ds,
+                      msg,
+                      t,
+                      0,
+                      resolve,
+                      () => ds.worker === worker
+                        && ds.session.sessionId === msg.sessionId,
+                      preview.settledEntry.replyTarget,
+                    );
+                  });
+              if (!owned) return false;
+
+              // Re-read after the asynchronous external delivery. A concurrent
+              // replacement may already have committed this signed sequence;
+              // that is idempotent success, never a second FIFO pop.
+              if (committedCodexAppSequence(
+                ds.session.codexAppGenerationCommits ?? [],
+                settlement.generation,
+                settlement.seq,
+              )) return true;
+              const committed = settleCodexAppDispatch(
+                ds.session.codexAppDispatchLedger ?? [],
+                ds.session.codexAppGenerationCommits ?? [],
+                identity,
+                settlement.generation,
+                settlement.seq,
+              );
+              if (!committed.ok) return false;
+              if (msg.dispatchAttempt !== undefined) {
+                try {
+                  // Durable receivers must not depend on the worker surviving
+                  // the daemon ACK long enough to emit a later terminal IPC.
+                  // Persist the exact completed attempt first; the worker's
+                  // ordered duplicate terminal remains idempotent.
+                  await cb.onTurnTerminal?.(ds, {
+                    type: 'turn_terminal',
+                    sessionId: ds.session.sessionId,
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    status: 'completed',
+                  }, { workerGeneration });
+                } catch (err) {
+                  logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
+                  return false;
+                }
+              }
+              const priorLedger = ds.session.codexAppDispatchLedger;
+              const priorCommits = ds.session.codexAppGenerationCommits;
+              ds.session.codexAppDispatchLedger = committed.ledger;
+              ds.session.codexAppGenerationCommits = committed.commits;
+              try {
+                // One atomic sessions-file replacement owns both the exact FIFO
+                // pop and cumulative runner ACK boundary. Only after this write
+                // may the worker acknowledge final-end to the runner.
+                sessionStore.updateSession(ds.session);
+                return true;
+              } catch (err) {
+                ds.session.codexAppDispatchLedger = priorLedger;
+                ds.session.codexAppGenerationCommits = priorCommits;
+                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
+                return false;
+              }
+            })().finally(() => codexAppFinalSettlementInFlight.delete(key));
+            codexAppFinalSettlementInFlight.set(key, inFlight);
+          }
+          const persisted = await inFlight;
+          acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+            try { await cb.onCodexAppLedgerDrained?.(ds); }
+            catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+          }
+          break;
+        }
+
         // Adopt-bridge: worker harvested the assistant turn from Claude Code's
         // transcript JSONL and forwarded it to us. Dedup with a session-scoped
         // key so a re-drain can't re-send the same answer or cross-suppress
@@ -3702,7 +5223,15 @@ function setupWorkerHandlers(
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
-        deliverFinalOutput(ds, msg, t, 0);
+        deliverFinalOutput(
+          ds,
+          msg,
+          t,
+          0,
+          undefined,
+          () => ds.worker === worker
+            && (!msg.sessionId || ds.session.sessionId === msg.sessionId),
+        );
         break;
       }
 
@@ -3758,6 +5287,14 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
+      if (ds.session.queuedActivationPending) {
+        // Journal ownership is backend-independent. The next worker replays
+        // this exact head with queuedActivationResume before durable tail N+1.
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+      } else {
+        reparkQueuedActivationFollowUpTail(ds, 'worker exit during activation follow-up handoff');
+      }
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;
@@ -3815,6 +5352,7 @@ function setupWorkerHandlers(
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
 function finalOutputDedupeKey(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): string {
   return `${msg.sessionId ?? ds.session.sessionId}:${msg.lastUuid || msg.turnId}`;
@@ -3898,9 +5436,9 @@ async function finishTurnReactions(ds: DaemonSession): Promise<void> {
   }
 }
 
-/** Deliver a bridge `final_output` to Lark. The worker emits each turn
- *  exactly once (it pops the turn off its queue at emit time), so the
- *  daemon owns retries on transient failures. After 3 attempts we log
+/** Deliver a bridge `final_output` to Lark. The current worker generation pops
+ *  the turn at emit time, while replacement recovery may replay it with the
+ *  same provider key; the daemon owns bounded transient retries. After 3 attempts we log
  *  and give up — the user's answer is lost; better than leaking memory
  *  via an unbounded retry loop. */
 function deliverFinalOutput(
@@ -3908,7 +5446,14 @@ function deliverFinalOutput(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   t: string,
   attempt: number,
+  onComplete?: (owned: boolean) => void,
+  isStillOwned: () => boolean = () => true,
+  frozenReplyTarget?: FrozenSessionReplyTarget,
 ): void {
+  if (!isStillOwned()) {
+    onComplete?.(false);
+    return;
+  }
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   // Wait Mode / HTTP Sync Override:
   // If this turn is being waited for by an HTTP webhook request, intercept the
@@ -3920,6 +5465,7 @@ function deliverFinalOutput(
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    onComplete?.(true);
     return;
   }
 
@@ -3930,6 +5476,7 @@ function deliverFinalOutput(
     asyncResult.completedAt = Date.now();
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    onComplete?.(true);
     return;
   }
   const cb = requireCallbacks();
@@ -3950,11 +5497,17 @@ function deliverFinalOutput(
       : opts,
   );
   setTimeout(async () => {
+    if (!isStillOwned()) {
+      logger.info(`[${t}] Bridge final_output abandoned — worker/session ownership changed`);
+      onComplete?.(false);
+      return;
+    }
     // Guard: if the user closed the session (or it was torn down for any
     // other reason) between attempts, don't post a stale final answer to
     // a closed thread.
     if (ds.session.status === 'closed') {
       logger.info(`[${t}] Bridge final_output abandoned — session closed (turn ${msg.turnId.substring(0, 8)})`);
+      onComplete?.(true);
       return;
     }
     try {
@@ -3982,6 +5535,7 @@ function deliverFinalOutput(
         }
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        onComplete?.(true);
         return;
       }
 
@@ -4015,6 +5569,7 @@ function deliverFinalOutput(
           `[${t}] VC final_output lost current membership authority `
           + `(${managedDecision.errorCode}) turn=${msg.turnId.substring(0, 8)}`,
         );
+        onComplete?.(true);
         return;
       }
       const revalidateManagedSend = (): void => {
@@ -4096,12 +5651,25 @@ function deliverFinalOutput(
           }, proposedOutput)
         : undefined;
       const preparedListenerReply = preparedImReply ?? preparedDeliveryReply;
+      // Codex App final settlement is delivery-before-commit. If the daemon
+      // dies after Lark accepts the reply but before the FIFO/sequence commit,
+      // the replacement must retry with the same provider key. Keep the key
+      // dispatch-stable (not generation/seq-stable), so the user-visible Lark
+      // message is idempotent across crash reconciliation. The existing
+      // outbound-hook contract remains unchanged; it is a separate best-effort
+      // side effect and is not covered by the provider UUID.
+      const codexAppSettlementReply = msg.codexAppSettlement
+        ? {
+            uuid: `ca_${msg.codexAppSettlement.dispatchId}`.slice(0, 50),
+          }
+        : undefined;
       if (preparedListenerReply?.kind === 'conflict') {
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         logger.error(
           `[${t}] VC listener fallback suppressed (${preparedListenerReply.reason}) `
           + `turn=${msg.turnId.substring(0, 8)}: ${preparedListenerReply.detail}`,
         );
+        onComplete?.(true);
         return;
       }
       const canonicalOutput = preparedListenerReply?.canonicalOutput ?? proposedOutput;
@@ -4140,6 +5708,7 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        onComplete?.(true);
         return;
       }
 
@@ -4147,21 +5716,28 @@ function deliverFinalOutput(
       // place. message.patch is silent (no Feishu notification / unread), which
       // used to swallow the answer; a brand-new message always pings.
       revalidateManagedSend();
+      if (!isStillOwned()) {
+        onComplete?.(false);
+        return;
+      }
+      const deliveryReplyOptions = preparedListenerReply
+        ? {
+            uuid: preparedListenerReply.providerKey,
+            quoteMessageId: canonicalOutput.quoteTargetId,
+            beforeQuoteFallback: revalidateManagedSend,
+            // Managed output has one audited external effect (the Lark
+            // provider call). Never fan meeting content out to user hooks,
+            // including the first attempt and crash reconciliation replay.
+            suppressHook: true,
+          }
+        : codexAppSettlementReply;
       const messageId = await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
-        msg.turnId,
-        preparedListenerReply
-          ? {
-              uuid: preparedListenerReply.providerKey,
-              quoteMessageId: canonicalOutput.quoteTargetId,
-              beforeQuoteFallback: revalidateManagedSend,
-              // Managed output has one audited external effect (the Lark
-              // provider call). Never fan meeting content out to user hooks,
-              // including the first attempt and crash reconciliation replay.
-              suppressHook: true,
-            }
-          : undefined,
+        msg.replyTurnId ?? msg.turnId,
+        frozenReplyTarget && !managedReceiver
+          ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
+          : deliveryReplyOptions,
       );
       recordPrimaryOutput(messageId);
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
@@ -4169,13 +5745,21 @@ function deliverFinalOutput(
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       logger.info(`[${t}] Bridge final_output forwarded (turn ${msg.turnId.substring(0, 8)}, ${msg.content.length} chars, kind=${msg.kind ?? 'bridge'}, attempt ${attempt + 1})`);
+      onComplete?.(true);
     } catch (err: any) {
       if (err instanceof MessageWithdrawnError) {
-        // Root message gone — no point retrying. Mark as emitted so any
-        // duplicate IPC is correctly deduped, and tear the session down.
-        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-        logger.warn(`[${t}] Root message withdrawn while forwarding final_output, closing session`);
-        cb.closeSession(ds);
+        // Withdrawal is permanent for this target, but it is not explicit
+        // abandon. Keep an unsettled FIFO owner recoverable; only ledger-empty
+        // sessions may commit the dedupe marker and auto-close.
+        if (await closeWithdrawnSessionIfLedgerEmpty(
+          ds,
+          'Root message withdrawn while forwarding final_output',
+        )) {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          onComplete?.(true);
+        } else {
+          onComplete?.(false);
+        }
         return;
       }
       const next = attempt + 1;
@@ -4183,10 +5767,11 @@ function deliverFinalOutput(
         logger.error(`[${t}] Bridge final_output gave up after ${next} attempts (turn ${msg.turnId.substring(0, 8)}): ${err.message}`);
         // Don't commit the dedup marker — leave room for any future
         // retransmit (e.g. daemon restart that re-fires the IPC).
+        onComplete?.(false);
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -4636,11 +6221,20 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr', activeS
   let lastCliId: string | undefined;
   try { lastCliId = readFileSync(cliIdFile, 'utf-8').trim(); } catch { /* first run */ }
   const currentCliId = config.daemon.cliId;
+  const unsettledNames = new Set(
+    activeSessions_
+      .filter(hasProtectedSessionMutationOwnership)
+      .map(session => backend.sessionName(session.sessionId)),
+  );
 
   if (!multiBot && lastCliId && lastCliId !== currentCliId) {
     logger.info(`CLI_ID changed (${lastCliId} → ${currentCliId}), killing all ${backendType} sessions`);
     // Legacy per-topic hosts are still enumerable by bmx-* name.
     for (const name of backend.listBotmuxSessions()) {
+      if (unsettledNames.has(name)) {
+        logger.warn(`Preserving ${backendType} ${name}: unsettled Codex App dispatch must reconcile first`);
+        continue;
+      }
       backend.killSession(name);
     }
     // Machine-wide Herdr agents are not separate bmx-* sessions. Tear down

@@ -92,6 +92,13 @@ import { validateTriggerRequest, type TriggerResponse } from '../services/trigge
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
+import {
+  validateCodexAppManagedSendOrigin,
+} from '../utils/codex-app-dispatch-ledger.js';
+import { withBotTurnAdmission, withBotTurnMutation } from './bot-turn-mutation-gate.js';
+import {
+  protectedSessionMutationReasons,
+} from './session-mutation-guard.js';
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -192,6 +199,43 @@ export function jsonRes(res: ServerResponse, status: number, body: unknown): voi
   res.end(JSON.stringify(body));
 }
 
+function rejectProtectedSessionMutation(
+  res: ServerResponse,
+  values: readonly (DaemonSession | Session)[],
+): boolean {
+  const bySessionId = new Map<string, {
+    sessionId: string;
+    cliId?: string;
+    reasons: ReturnType<typeof protectedSessionMutationReasons>;
+  }>();
+  for (const value of values) {
+    const session = 'session' in value ? value.session : value;
+    const reasons = protectedSessionMutationReasons(value);
+    if (reasons.length === 0) continue;
+    const existing = bySessionId.get(session.sessionId);
+    if (existing) {
+      existing.reasons = [...new Set([...existing.reasons, ...reasons])];
+      continue;
+    }
+    bySessionId.set(session.sessionId, {
+      sessionId: session.sessionId,
+      ...(session.cliId ? { cliId: session.cliId } : {}),
+      reasons,
+    });
+  }
+  const blockingSessions = [...bySessionId.values()];
+  if (blockingSessions.length === 0) return false;
+  const codexDispatchOnly = blockingSessions.every(blocker =>
+    blocker.reasons.every(reason => reason === 'codex_app_dispatch'));
+  jsonRes(res, 409, {
+    ok: false,
+    error: codexDispatchOnly
+      ? 'codex_app_dispatch_pending'
+      : 'session_mutation_pending',
+    blockingSessions,
+  });
+  return true;
+}
 export class JsonBodyTooLargeError extends Error {
   constructor(readonly maxBytes: number) {
     super(`JSON request body exceeds ${maxBytes} bytes`);
@@ -330,6 +374,86 @@ export async function readJsonBody<T = unknown>(
   }
   if (chunks.length === 0) return {} as T;
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
+
+class IpcBodyTooLargeError extends Error {}
+class IpcBodyTimeoutError extends Error {}
+
+/** Strict reader for the one unauthenticated capability challenge route. The
+ * generic IPC reader intentionally has no cap for trusted-host endpoints; a
+ * loopback-confined process must not be able to buffer arbitrary chunked input
+ * before its capability is checked. */
+async function readBoundedJsonBody<T = unknown>(
+  req: IncomingMessage,
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<T> {
+  const contentLength = req.headers['content-length'];
+  if (typeof contentLength === 'string') {
+    if (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes) {
+      throw new IpcBodyTooLargeError('request body too large');
+    }
+  }
+  return await new Promise<T>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('aborted', onAborted);
+    };
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      req.pause();
+      cleanup();
+      reject(err);
+    };
+    const onData = (raw: Buffer | string) => {
+      const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+      total += chunk.length;
+      if (total > maxBytes) {
+        fail(new IpcBodyTooLargeError('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        resolve(chunks.length === 0
+          ? {} as T
+          : JSON.parse(Buffer.concat(chunks, total).toString('utf8')) as T);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    const onError = (err: Error) => fail(err);
+    const onAborted = () => fail(new Error('request aborted'));
+    const timer = setTimeout(
+      () => fail(new IpcBodyTimeoutError('request body timed out')),
+      timeoutMs,
+    );
+    timer.unref?.();
+    req.on('data', onData);
+    req.once('end', onEnd);
+    req.once('error', onError);
+    req.once('aborted', onAborted);
+  });
+}
+
+function closeUntrustedRequestAfterResponse(req: IncomingMessage, res: ServerResponse): void {
+  res.setHeader('connection', 'close');
+  res.once('finish', () => req.destroy());
+  // Drain whatever is already buffered until the response has been flushed;
+  // the finish hook then closes a partial/slow body instead of reusing it as a
+  // keep-alive request.
+  req.resume();
 }
 
 // ─── Trusted-host auth (loopback + route-bound HMAC) ────────────────────────
@@ -501,8 +625,38 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/close', async (_req, res, params) => {
-  const r = await closeSession(params.sessionId);
-  jsonRes(res, 200, r);
+  const initial = findSessionRecord(params.sessionId);
+  if (!initial) return jsonRes(res, 200, { ok: true, alreadyClosed: true });
+  const larkAppId = initial.larkAppId || cachedLarkAppId;
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  return withBotTurnMutation(larkAppId, async () => {
+    // Re-resolve only after every earlier admitted turn has drained. Explicit
+    // close is the abandon boundary and may clear accepted FIFO, but it must
+    // never clear a stale pre-drain snapshot while a turn is still preparing.
+    const current = findSessionRecord(params.sessionId);
+    if (!current || current.status === 'closed') {
+      return jsonRes(res, 200, { ok: true, alreadyClosed: true });
+    }
+    const r = await closeSession(params.sessionId);
+    jsonRes(res, r.ok ? 200 : 502, r);
+  });
+});
+
+// `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
+// against inbound admission and refuse if any backend-neutral durable owner
+// became unsettled after the CLI took its liveness snapshot.
+ipcRoute('POST', '/api/sessions/:sessionId/prune', async (_req, res, params) => {
+  const initial = findSessionRecord(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const larkAppId = initial.larkAppId || cachedLarkAppId;
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  return withBotTurnMutation(larkAppId, async () => {
+    const current = findSessionRecord(params.sessionId);
+    if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+    if (rejectProtectedSessionMutation(res, [current])) return;
+    const r = await closeSession(params.sessionId);
+    jsonRes(res, r.ok ? 200 : 502, r);
+  });
 });
 
 /** Post a scope-aware "restarting" notice into the session's Lark thread/chat,
@@ -531,7 +685,10 @@ function postRestartNotice(ds: DaemonSession, fresh: boolean): void {
   }
 }
 
-ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/restart', async (_req, res, params) => {
+  const initial = findActiveBySessionId(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  return withBotTurnMutation(initial.larkAppId, () => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   // Adopt/observed sessions: botmux never owned the CLI — restarting would kill
@@ -539,11 +696,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_restart_unsupported' });
   }
+  if (rejectProtectedSessionMutation(res, [ds])) return;
   const cliId = ds.session.cliId ?? 'unknown';
   if (ds.worker && !ds.worker.killed) {
     // Live worker → in-place CLI restart (kills the CLI, respawns with --resume).
     try {
-      ds.worker.send({ type: 'restart' } as DaemonToWorker);
+      ds.worker.send({ type: 'restart', reason: 'operator' } as DaemonToWorker);
     } catch (err) {
       return jsonRes(res, 502, { ok: false, error: String(err) });
     }
@@ -558,6 +716,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
   forkWorker(ds, '', ds.hasHistory);
   postRestartNotice(ds, true);
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, cliId, revived: true });
+  });
 });
 
 /** Manually suspend one active session: kill the worker + CLI/pane, session
@@ -565,7 +724,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/restart', (_req, res, params) => {
  *  the same semantics the idle-worker sweeper applies over the live cap.
  *  Primary use: `botmux suspend --isolated` after a credential rotation, so
  *  isolated bots' next cold spawn re-provisions the freshest creds. */
-ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) => {
+  const initial = findActiveBySessionId(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  return withBotTurnMutation(initial.larkAppId, () => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   // Adopt/observed sessions: botmux never owned the CLI — suspending would kill
@@ -573,6 +735,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_suspend_unsupported' });
   }
+  if (rejectProtectedSessionMutation(res, [ds])) return;
   if (!ds.worker || ds.worker.killed) {
     // Worker already gone (idle-suspended / crash-stopped) — the goal state is
     // already reached, so report idempotent success without a live kill.
@@ -584,6 +747,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, suspended: true });
+  });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
@@ -759,41 +923,89 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
   if (!column && position === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const larkAppId = session.larkAppId || cachedLarkAppId;
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  return withBotTurnAdmission(larkAppId, async () => {
+  const currentSession = findSessionRecord(params.sessionId);
+  if (!currentSession) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   // 待办池(queued)会话被拖到「进行中」= 激活：把暂存内容当首轮发给 CLI 开跑。
   // activateQueuedSession 内部会清 queued + 把列设成 in_progress + forkWorker。
   const activeDs = findActiveBySessionId(params.sessionId);
+  let activationTransferred = false;
   if (column === 'in_progress' && activeDs?.session.queued) {
-    await activateQueuedSession(activeDs);
+    const activated = await activateQueuedSession(activeDs);
+    if (!activated.ok) return jsonRes(res, 500, activated);
+    activationTransferred = true;
   } else if (column) {
-    session.kanbanColumn = column;
+    currentSession.kanbanColumn = column;
   }
-  if (position !== null) session.kanbanPosition = position;
-  sessionStore.updateSession(session);
+  if (position !== null) currentSession.kanbanPosition = position;
+  try {
+    sessionStore.updateSession(currentSession);
+  } catch (err) {
+    if (!activationTransferred) throw err;
+    logger.error(
+      `[dashboard] board metadata persistence failed after queued activation ownership transferred: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
       sessionId: params.sessionId,
       // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
       // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
-      patch: { kanbanColumn: session.kanbanColumn, kanbanPosition: session.kanbanPosition, queued: !!session.queued },
+      patch: { kanbanColumn: currentSession.kanbanColumn, kanbanPosition: currentSession.kanbanPosition, queued: !!currentSession.queued },
     },
   });
   jsonRes(res, 200, { ok: true });
+  });
+});
+
+// Narrow CLI whiteboard binding mutation. Keeping this daemon-side avoids a
+// short-lived `botmux whiteboard` process rewriting a stale whole Session row
+// over a concurrent Codex App FIFO transition.
+ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params) => {
+  let body: { whiteboardId?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.whiteboardId !== 'string'
+    || body.whiteboardId.length === 0
+    || body.whiteboardId.length > 256) {
+    return jsonRes(res, 400, { ok: false, error: 'bad_whiteboard_id' });
+  }
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const larkAppId = session.larkAppId || cachedLarkAppId;
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  return withBotTurnAdmission(larkAppId, async () => {
+    const current = findSessionRecord(params.sessionId);
+    if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+    current.whiteboardId = body.whiteboardId as string;
+    sessionStore.updateSession(current);
+    jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId });
+  });
 });
 
 // 待办池会话「开始」：把 parked 会话激活（发首轮、起 CLI），与拖到「进行中」同义。
 ipcRoute('POST', '/api/sessions/:sessionId/start', async (_req, res, params) => {
+  const initial = findActiveBySessionId(params.sessionId);
+  if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  return withBotTurnAdmission(initial.larkAppId, async () => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
   if (!ds.session.queued) return jsonRes(res, 409, { ok: false, error: 'not_queued' });
   const r = await activateQueuedSession(ds);
   if (!r.ok) return jsonRes(res, 500, r);
-  sessionStore.updateSession(ds.session);
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId: params.sessionId, patch: { kanbanColumn: ds.session.kanbanColumn, queued: false } },
+    body: {
+      sessionId: params.sessionId,
+      patch: { kanbanColumn: ds.session.kanbanColumn, queued: !!ds.session.queued },
+    },
   });
   jsonRes(res, 200, { ok: true });
+  });
 });
 
 // Dashboard「创建会话」spawn：在新建的群里为本 daemon 的 bot 拉起/暂存一条 chat-scope
@@ -807,6 +1019,7 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
   const parsed = parseSpawnRequest(body);
   if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.error });
   const postBanner = !!(body as any).postBanner;
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
   let attachments;
   try {
     attachments = materializeDashboardImages(cachedLarkAppId, parsed.value.images);
@@ -832,6 +1045,7 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
     return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
   }
   jsonRes(res, 200, r);
+  });
 });
 
 ipcRoute('POST', '/api/chat-reply-mode', async (req, res) => {
@@ -1172,6 +1386,13 @@ function workingDirForSession(sessionId: string): string | undefined {
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
   const sessionId = params.sessionId;
+  const sourceSession = findSessionRecord(sessionId);
+  if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  // Legacy persisted sessions may carry an empty larkAppId and are hydrated
+  // with this daemon's identity by resumeSession. Use the same fallback for
+  // admission instead of rejecting an otherwise valid recovery record.
+  const larkAppId = sourceSession.larkAppId || cachedLarkAppId || '__legacy_unbound__';
+  return withBotTurnAdmission(larkAppId, async () => {
   const reg = getActiveSessionsRegistry();
   if (!reg) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
   const result = await resumeSession(sessionId, reg);
@@ -1237,6 +1458,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     rootMessageId: ds.session.rootMessageId,
     workingDir: ds.session.workingDir,
     cliId,
+  });
   });
 });
 
@@ -2521,6 +2743,7 @@ ipcRoute('PUT', '/api/bot-avatar', async (req, res) => {
 // path; this covers the hot-switch path).
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const larkAppId = cachedLarkAppId;
   let body: { cliId?: unknown; model?: unknown };
   try { body = await readJsonBody<{ cliId?: unknown; model?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -2534,7 +2757,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     return jsonRes(res, 400, { ok: false, error: 'invalid_cli', message: err?.message ?? String(err) });
   }
   const model = typeof body.model === 'string' ? body.model.trim() : '';
-  const currentBotConfig = getBot(cachedLarkAppId).config;
+  const currentBotConfig = getBot(larkAppId).config;
   const availability = checkCliAvailability({
     cliId: selected.cliId,
     wrapperCli: selected.wrapperCli,
@@ -2547,12 +2770,28 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     ? undefined
     : `配置已保存，但所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。请先在 daemon 所在机器安装或修正 PATH / CLI 路径。`;
 
-  // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
-  // auto-clear the flag here so the next session doesn't fail-close on it. (The
-  // read-isolation toggle validates at enable time; changing the agent afterwards
-  // is the other way a bot could end up configured-but-unenforceable.)
-  let readIsolationCleared = false;
-  const r = await rmwBotEntry(cachedLarkAppId, (entry) => {
+  return withBotTurnMutation(larkAppId, async () => {
+    // Agent selection can replace every live worker generation and may also
+    // auto-clear readIsolation. Close admission and drain in-flight acceptance
+    // before inspecting both the registry and restart source of truth. A
+    // settings mutation is not an explicit abandon boundary: an unsettled
+    // Codex App FIFO must survive unchanged for recovery.
+    const activeBotSessions = listActiveSessions().filter(ds => ds.larkAppId === larkAppId);
+    const persistedActiveBotSessions = sessionStore.listSessions().filter(session =>
+      session.status === 'active'
+      && (session.larkAppId === larkAppId || !session.larkAppId),
+    );
+    if (rejectProtectedSessionMutation(res, [
+      ...activeBotSessions,
+      ...persistedActiveBotSessions,
+    ])) return;
+
+    // If the new CLI/wrapper can no longer enforce a currently-on read isolation,
+    // auto-clear the flag here so the next session doesn't fail-close on it. (The
+    // read-isolation toggle validates at enable time; changing the agent afterwards
+    // is the other way a bot could end up configured-but-unenforceable.)
+    let readIsolationCleared = false;
+    const r = await rmwBotEntry(larkAppId, (entry) => {
     entry.cliId = selected.cliId;
     if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
     else delete entry.wrapperCli;
@@ -2573,42 +2812,43 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       delete entry.backendType;
     }
     return { write: true, result: null };
-  });
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    });
+    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
 
-  const bot = getBot(cachedLarkAppId);
-  bot.config.cliId = selected.cliId;
-  if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
-  else bot.config.wrapperCli = undefined;
-  bot.config.model = model || undefined;
-  if (readIsolationCleared) bot.config.readIsolation = false;
-  if (selected.cliId === 'riff') {
-    bot.config.backendType = 'riff';
-  } else if (bot.config.backendType === 'riff') {
-    bot.config.backendType = undefined;
-  }
+    const bot = getBot(larkAppId);
+    bot.config.cliId = selected.cliId;
+    if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
+    else bot.config.wrapperCli = undefined;
+    bot.config.model = model || undefined;
+    if (readIsolationCleared) bot.config.readIsolation = false;
+    if (selected.cliId === 'riff') {
+      bot.config.backendType = 'riff';
+    } else if (bot.config.backendType === 'riff') {
+      bot.config.backendType = undefined;
+    }
 
-  // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
-  // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
-  const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(cachedLarkAppId);
+    // 热切后立刻清掉本 bot 名下失配的存量会话——否则它们冻结的旧 CLI 会被下一条
+    // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
+    const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
 
-  const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
-  jsonRes(res, 200, {
-    ok: true,
-    cliId: selected.cliId,
-    wrapperCli: selected.wrapperCli ?? null,
-    model: model || null,
-    selectionKey,
-    closedMismatchedSessions,
-    // Report the (possibly auto-cleared) read-isolation state + whether the new
-    // agent can still enforce it, so the dashboard updates its toggle immediately
-    // instead of showing a stale enabled/supported state until a full refetch.
-    readIsolation: bot.config.readIsolation === true,
-    readIsolationSupported: readIsolationEnforceableFor(bot.config),
-    readIsolationCleared,
-    agentAvailable: availability.available,
-    availabilityWarning,
-    requiredCommand: availability.command,
+    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
+    jsonRes(res, 200, {
+      ok: true,
+      cliId: selected.cliId,
+      wrapperCli: selected.wrapperCli ?? null,
+      model: model || null,
+      selectionKey,
+      closedMismatchedSessions,
+      // Report the (possibly auto-cleared) read-isolation state + whether the new
+      // agent can still enforce it, so the dashboard updates its toggle immediately
+      // instead of showing a stale enabled/supported state until a full refetch.
+      readIsolation: bot.config.readIsolation === true,
+      readIsolationSupported: readIsolationEnforceableFor(bot.config),
+      readIsolationCleared,
+      agentAvailable: availability.available,
+      availabilityWarning,
+      requiredCommand: availability.command,
+    });
   });
 });
 
@@ -2864,6 +3104,9 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  // File-sandbox policy is frozen onto each Session at creation and reused on
+  // restore; this toggle is intentionally next-session-only and cannot mutate
+  // a live pane's profile.
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
@@ -3260,6 +3503,10 @@ export function startIpcServer(opts: {
    * deliberate secret repair cannot strand a daemon on a stale cached key.
    * Tests that omit this option retain the lightweight in-process server. */
   authRequired?: boolean;
+  /** Daemon restore barrier.  The socket/health route may come up early so its
+   * descriptor is discoverable, but every state-bearing route waits until all
+   * durable session owners have been registered. */
+  ready?: Promise<void>;
 }): Promise<IpcServerHandle> {
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
@@ -3279,6 +3526,7 @@ export function startIpcServer(opts: {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }
       }
+      if (!publicRoute && opts.ready) await opts.ready;
       for (const r of routes) {
         if (r.method !== req.method) continue;
         const m = r.pattern.exec(url.pathname);

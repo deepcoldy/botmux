@@ -61,6 +61,7 @@ import {
   getSession,
   listSessions,
   closeSession,
+  reactivateClosedSession,
   updateSession,
   updateSessionPid,
   findActiveSessionsByRoot,
@@ -385,6 +386,39 @@ describe('closeSession()', () => {
     // closedAt gets updated on second close
     expect(secondClosedAt).toBeDefined();
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+});
+
+describe('reactivateClosedSession()', () => {
+  it('sanitizes queued/setup state left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Queue');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.queued = true;
+    legacy.queuedPrompt = 'legacy backlog';
+    legacy.pendingRepoSetup = { mode: 'picker', prompt: 'legacy picker' };
+    legacy.queuedActivationPending = true;
+    legacy.queuedActivationToken = 'legacy-token';
+    legacy.queuedActivationInput = { content: 'legacy head' };
+    legacy.queuedActivationTail = [{
+      id: 'legacy-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'legacy tail' }, turnId: 'tail-turn',
+    }];
+    legacy.queuedActivationTailNextOrder = 2;
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init();
+
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.queued).toBeUndefined();
+    expect(reloaded.pendingRepoSetup).toBeUndefined();
+    expect(reloaded.queuedActivationPending).toBeUndefined();
+    expect(reloaded.queuedActivationToken).toBeUndefined();
+    expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationTail).toBeUndefined();
   });
 });
 

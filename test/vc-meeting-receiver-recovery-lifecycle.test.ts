@@ -116,6 +116,40 @@ describe('VC meeting receiver boot-recovery lifecycle', () => {
     expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
   });
 
+  it('keeps the boot fence until exact dispatch retirement persists after backing is missing', async () => {
+    recovery.setBackingMissingProbe(() => true);
+    let retirementWorks = false;
+    const retired: Array<[string, string, number]> = [];
+    recovery.setDispatchRetirement((sessionId, turnId, dispatchAttempt) => {
+      retired.push([sessionId, turnId, dispatchAttempt]);
+      return retirementWorks;
+    });
+    const key = recovery.start('sess_retire', 'delivery_retire', 5, {
+      memberId: 'member_retire',
+    });
+    recovery.finishScheduling();
+
+    recovery.acknowledge('sess_retire', 'delivery_retire', 5);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: false, pending: true, timerArmed: true });
+    expect(retired).toEqual([['sess_retire', 'delivery_retire', 5]]);
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: false, pending: true, timerArmed: true });
+    expect(retired).toEqual([
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+    ]);
+
+    retirementWorks = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(retired).toEqual([
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+    ]);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
+  });
+
   it('keeps the boot gate pending when reset IPC send throws', () => {
     const failureLog = daemonSource.indexOf('failed to fence boot-ambiguous receiver');
     expect(failureLog).toBeGreaterThanOrEqual(0);

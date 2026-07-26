@@ -13,7 +13,7 @@ import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -116,6 +116,40 @@ describe('dashboard IPC server', () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/nope`);
     expect(res.status).toBe(404);
+  });
+
+  it('binds and serves health early but holds authenticated state routes behind readiness', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    let releaseReady!: () => void;
+    const ready = new Promise<void>(resolve => { releaseReady = resolve; });
+    let mutations = 0;
+    const path = '/api/test-startup-readiness-mutation';
+    ipcRoute('POST', path, (_req, res) => {
+      mutations += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    handle = await startIpcServer({
+      port: 0,
+      host: '127.0.0.1',
+      authRequired: true,
+      ready,
+    });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const health = await fetch(`${base}/__health`);
+    expect(health.status).toBe(200);
+    const pending = fetch(`${base}${path}`, {
+      method: 'POST',
+      headers: trustedHostHeaders('POST', path, handle.port),
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(mutations).toBe(0);
+
+    releaseReady();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(mutations).toBe(1);
   });
 
   it('denies sandbox-like loopback reads and mutations but accepts route-bound trusted-host calls', async () => {
@@ -655,6 +689,97 @@ describe('POST /api/sessions/:sessionId/lock', () => {
   });
 });
 
+describe('POST /api/sessions/:sessionId/board queued activation', () => {
+  it('returns the activation failure without publishing a false in-progress success', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-board-activation-'));
+    const previousDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const appId = 'test-board-activation-app';
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
+    try {
+      config.session.dataDir = dataDir;
+      registerBot({
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+        defaultWorkingDir: '/tmp',
+        workingDir: '/tmp',
+        workingDirs: ['/tmp'],
+      } as any);
+      setLarkAppId(appId);
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_board', 'om_board', 'queued board task', 'group');
+      Object.assign(session, {
+        larkAppId: appId,
+        scope: 'thread',
+        workingDir: '/tmp',
+        queued: true,
+        queuedPrompt: 'queued board payload',
+        kanbanColumn: 'backlog',
+      });
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        larkAppId: appId,
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: false,
+        workingDir: '/tmp',
+        pendingPrompt: session.queuedPrompt,
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[sessionKey(session.rootMessageId, appId), ds]]));
+      workerPool.initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => { throw new Error('forced pre-init failure'); },
+        getActiveCount: () => 1,
+        closeSession: vi.fn(),
+      });
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/board`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ column: 'in_progress', position: 7 }),
+        },
+      );
+
+      expect(res.status).toBe(500);
+      expect(await res.json()).toEqual({ ok: false, error: 'forced pre-init failure' });
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        queued: true,
+        queuedPrompt: 'queued board payload',
+        kanbanColumn: 'backlog',
+      });
+      expect(events).not.toContainEqual(expect.objectContaining({
+        type: 'session.update',
+        body: expect.objectContaining({ sessionId: session.sessionId }),
+      }));
+    } finally {
+      off();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+      workerPool.initWorkerPool({
+        sessionReply: vi.fn(async () => 'om_reply'),
+        getSessionWorkingDir: () => '/tmp',
+        getActiveCount: () => 0,
+        closeSession: vi.fn(),
+      });
+      sessionStore.init();
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/sessions/:sessionId/restart', () => {
   it('sends a restart IPC message to the live worker', async () => {
     const send = vi.fn();
@@ -669,7 +794,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
-    expect(send).toHaveBeenCalledWith({ type: 'restart' });
+    expect(send).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
     findSpy.mockRestore();
   });
 
@@ -772,6 +897,31 @@ describe('POST /api/sessions/:sessionId/suspend', () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toMatchObject({ ok: false, error: 'session_not_active' });
     findSpy.mockRestore();
+  });
+
+  it('409s before suspension while durable Codex App dispatch ownership is non-empty', async () => {
+    const ds = {
+      session: {
+        sessionId: 's-owned',
+        cliId: 'codex-app',
+        codexAppDispatchLedger: [
+          { dispatchId: 'd-1', turnId: 't-1', state: 'prepared', content: 'owned' },
+        ],
+      },
+      worker: { send: vi.fn(), killed: false },
+      adoptedFrom: undefined,
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-owned/suspend`, { method: 'POST' });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'codex_app_dispatch_pending' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+    findSpy.mockRestore();
+    suspendSpy.mockRestore();
   });
 
   it('rejects adopt/observed sessions (suspending would kill the user pane)', async () => {
@@ -1405,6 +1555,196 @@ describe('PUT /api/bot-agent', () => {
         model: 'kimi-k2.5',
       });
     } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-pending-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        model: 'old-model',
+        readIsolation: true,
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_pending', 'om_pending', 'Pending', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'codex-app';
+      session.codexAppDispatchLedger = [{
+        dispatchId: 'dispatch-pending', turnId: 'turn-pending',
+        state: 'prepared', content: 'prompt', deliverySink: 'lark',
+      }];
+      sessionStore.updateSession(session);
+      const send = vi.fn();
+      const registry = new Map([[sessionKey(session.rootMessageId, appId), {
+        session,
+        worker: { killed: false, send },
+        workerPort: 1,
+        workerToken: 'token',
+        larkAppId: appId,
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const beforeFile = readFileSync(configPath, 'utf8');
+      const beforeLive = structuredClone(getBot(appId).config);
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'ttadk-x-codex', model: 'new-model' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'codex_app_dispatch_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'codex-app',
+          reasons: ['codex_app_dispatch'],
+        }],
+      });
+      expect(readFileSync(configPath, 'utf8')).toBe(beforeFile);
+      expect(getBot(appId).config).toEqual(beforeLive);
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        status: 'active',
+        codexAppDispatchLedger: [{ dispatchId: 'dispatch-pending' }],
+      });
+      expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(true);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports non-Codex pending work with a backend-neutral error and actionable sessions', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-generic-pending-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-generic-pending-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession(
+        'oc_generic_pending',
+        'om_generic_pending',
+        'Generic pending',
+        'group',
+      );
+      session.larkAppId = appId;
+      session.cliId = 'traex';
+      session.queued = true;
+      session.pendingRepoSetup = { mode: 'picker', prompt: 'OPENING_N' };
+      sessionStore.updateSession(session);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        ok: false,
+        error: 'session_mutation_pending',
+        blockingSessions: [{
+          sessionId: session.sessionId,
+          cliId: 'traex',
+          reasons: ['queued_todo', 'repository_setup'],
+        }],
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliId).toBe('traex');
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the hot-switch mismatch close after a settled Codex App ledger', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-settled-ipc-'));
+    const dataDir = join(dir, 'data');
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-settled-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = config.session.dataDir;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      config.session.dataDir = dataDir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex-app',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      sessionStore.init(appId);
+      const session = sessionStore.createSession('oc_settled', 'om_settled', 'Settled', 'group');
+      session.larkAppId = appId;
+      session.cliId = 'codex-app';
+      session.codexAppDispatchLedger = [];
+      sessionStore.updateSession(session);
+      const registry = new Map([[sessionKey(session.rootMessageId, appId), {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: appId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), cliVersion: 'test', lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any]]);
+      workerPool.setActiveSessionsRegistry(registry);
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'codex', model: '' }),
+      });
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, closedMismatchedSessions: 1 });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(registry.has(sessionKey(session.rootMessageId, appId))).toBe(false);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevDataDir;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });

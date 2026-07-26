@@ -72,6 +72,12 @@ describe('registerBot', () => {
     expect(client.opts.appSecret).toBe('secret_001');
   });
 
+  it('bounds the SDK HTTP transport timeout when the client exposes axios defaults', () => {
+    const client = { httpInstance: { defaults: { timeout: 0 } } };
+    mod.configureLarkClientHttpTimeout(client);
+    expect(client.httpInstance.defaults.timeout).toBe(mod.LARK_REQUEST_TIMEOUT_MS);
+  });
+
   it('should default the SDK Client domain to feishu when brand is unset', () => {
     const state = mod.registerBot(makeCfg());
     const client = state.client as unknown as { opts: Record<string, unknown> };

@@ -637,7 +637,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
 const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', limited: 'red', retry_ready: 'green',
+  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green',
 } as const;
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
@@ -648,6 +648,7 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'working': return t('card.status.working', undefined, locale);
     case 'idle': return t('card.status.idle', undefined, locale);
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
+    case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
       ? t('card.status.retry_ready', undefined, locale)
       : t('card.status.limited', undefined, locale);

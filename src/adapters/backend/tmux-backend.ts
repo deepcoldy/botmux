@@ -370,8 +370,10 @@ export class TmuxBackend implements SessionBackend {
    *  file's cwd field so a recycled PID can't mislead the resolver. */
   cliCwd?: string;
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   /**

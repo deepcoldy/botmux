@@ -10,7 +10,7 @@
  *
  * Run: pnpm vitest run test/anchor-serializer.test.ts
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { serializeByAnchor, __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
 
 const delayPush = (order: string[], label: string, ms: number) => () =>
@@ -83,5 +83,39 @@ describe('serializeByAnchor — wait cap (head-of-line-blocking guard)', () => {
     const p2 = serializeByAnchor('A', mk('2', 1), 1000);
     await Promise.all([p1, p2]);
     expect(order).toEqual(['s:1', 'e:1', 's:2', 'e:2']);
+  });
+
+  it('keeps strict admission ordered past five seconds when cap=0', async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      let releaseFirst!: () => void;
+      const first = serializeByAnchor('strict', () => new Promise<void>(resolve => {
+        order.push('start:1');
+        releaseFirst = () => {
+          order.push('end:1');
+          resolve();
+        };
+      }), 0);
+      const second = serializeByAnchor('strict', async () => {
+        order.push('start:2');
+      }, 0);
+
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(order).toEqual(['start:1']);
+
+      // The ordinary serializer deliberately escapes after 5s. A raw inbound
+      // admission lane must not: concurrent cold-session handlers can reorder
+      // or drop accepted turns even when the first await is merely slow.
+      await vi.advanceTimersByTimeAsync(5_100);
+      expect(order).toEqual(['start:1']);
+
+      releaseFirst();
+      await Promise.all([first, second]);
+      expect(order).toEqual(['start:1', 'end:1', 'start:2']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

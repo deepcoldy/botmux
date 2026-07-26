@@ -130,6 +130,12 @@ describe('buildOverviewCard', () => {
     ])).toEqual({ active: 1, idle: 1, closed: 1 });
   });
 
+  it('does not count a stalled turn as idle in the overview', () => {
+    expect(countSessions([
+      sessionRow({ sessionId: 's1', status: 'stalled' }),
+    ])).toEqual({ active: 1, idle: 0, closed: 0 });
+  });
+
   it('zh overview localizes all module sections and folder buttons', () => {
     const json = buildOverviewCard(
       { sessions: [], schedules: [], settings: makeSettings() },

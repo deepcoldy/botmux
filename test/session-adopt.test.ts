@@ -46,6 +46,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -57,6 +58,7 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -89,6 +91,7 @@ vi.mock('../src/core/session-manager.js', () => ({
     ds.lastUserPrompt = userPrompt;
     ds.lastCliInput = cliInput;
   }),
+  persistStreamCardState: vi.fn(),
 }));
 
 vi.mock('../src/services/frozen-card-store.js', () => ({
@@ -106,7 +109,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { killWorker, forkWorker } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { deleteMessage } from '../src/im/lark/client.js';
 import { getBot } from '../src/bot-registry.js';
@@ -132,7 +135,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       pid: null,
       chatType: 'group',
     },
-    worker: { killed: false, send: vi.fn() } as any,
+    worker: { killed: false, send: vi.fn(), once: vi.fn() } as any,
     workerPort: 8080,
     workerToken: 'tok_secret',
     larkAppId: APP_ID,
@@ -222,18 +225,25 @@ describe('Adopt card actions', () => {
       const sKey = sessionKey(ROOT_ID, APP_ID);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
+      const worker = ds.worker as any;
+      vi.mocked(sessionStore.getSession).mockReturnValue(ds.session);
+      setActiveSessionsRegistry(sessions);
 
-      await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
+      try {
+        await handleCardAction(makeDisconnectEvent(ROOT_ID), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('uuid-adopt-test');
-      expect(sessions.has(sKey)).toBe(false);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('断开'),
-        undefined,
-        APP_ID,
-      );
+        expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+        expect(sessionStore.closeSession).toHaveBeenCalledWith('uuid-adopt-test');
+        expect(sessions.has(sKey)).toBe(false);
+        expect(deps.sessionReply).toHaveBeenCalledWith(
+          ROOT_ID,
+          expect.stringContaining('断开'),
+          undefined,
+          APP_ID,
+        );
+      } finally {
+        setActiveSessionsRegistry(new Map());
+      }
     });
 
     it('should be a no-op when session does not exist', async () => {

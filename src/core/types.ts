@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
+  CliTurnPayload,
   Session,
   DaemonToWorker,
   LarkAttachment,
@@ -83,6 +84,25 @@ export interface DaemonSession {
    *  separate from worktreeCreating because plain select, skip, and /repo can
    *  also await prompt context before the fork. */
   pendingRepoCommitInFlight?: boolean;
+  /** A fresh live-route owner has been published but its opening input has not
+   * reached the first fork yet. Same-anchor turns must buffer into the opening
+   * input instead of reforking worker:null and overtaking it. In-memory only. */
+  initialStartPending?: boolean;
+  /** Generation token for the handler that atomically reserved a worker:null
+   * refork. Later same-anchor handlers may prepare concurrently, but only this
+   * owner may cross the fork boundary; followers buffer behind its gate. */
+  initialStartClaimToken?: string;
+  /** Number of activation-tail arrivals that reserved FIFO order before an
+   * asynchronous prompt/sender build and have not yet durably admitted or
+   * failed. An opening ACK must not clear the route while this is non-zero. */
+  queuedActivationTailAdmissionsOutstanding?: number;
+  /** An opening ACK (or ordinary cold-start handoff) observed while an
+   * asynchronous tail admission was outstanding. The final settler replays
+   * this release so a late durable successor cannot be stranded. */
+  queuedActivationTailReleasePending?: { acknowledgedToken?: string };
+  /** Retry timer for an ordinary cold-start handoff whose durable promotion
+   * failed after all asynchronous admissions had settled. */
+  queuedActivationTailReleaseRetryTimer?: ReturnType<typeof setTimeout>;
   repoCardMessageId?: string;    // message_id of the repo selection card — for withdrawal
   /**
    * Repo-select card message ids already consumed by a successful pending→worker
@@ -144,8 +164,25 @@ export interface DaemonSession {
   /** Exact turn for a same-caller pendingRawInput follow-up batch. Cleared on
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
+  pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
+  /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.
+   * Used only when a literal raw cold start must fold followers onto the same
+   * text→Enter IPC boundary. */
+  pendingCodexAppFollowUpGateAccepted?: boolean[];
+  /** Exact turns that arrived while a previously attempted queued activation
+   * was re-parked. They remain separate FIFO items behind the retained opening
+   * payload and advance only after worker acceptance. In-memory only. */
+  pendingQueuedActivationFollowUps?: Array<{
+    userPrompt: string;
+    cliInput: CliTurnPayload;
+    turnId: string;
+    dispatchAttempt?: number;
+    /** Legacy volatile entries already crossed the clean-input gate when they
+     * were staged. Migration must preserve that exact sidecar decision. */
+    codexAppInputGateFrozen?: true;
+  }>;
   ownerOpenId?: string;          // topic creator's open_id — receives write-enabled terminal link via DM
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card

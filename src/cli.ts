@@ -76,7 +76,10 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
+import type { CodexAppDispatchLedgerEntry } from './types.js';
+import { hasProtectedSessionMutationOwnership } from './core/session-mutation-guard.js';
 import { logger } from './utils/logger.js';
+import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import { scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
@@ -88,7 +91,6 @@ import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
 import { buildPm2SpawnCommand } from './cli/pm2-command.js';
 import { callDashboard, type DashboardEndpoint, type DashboardResult } from './cli/dashboard-endpoint.js';
 import { globalInstallUpdateLockTargetIn, installLatestBotmuxSync } from './core/maintenance.js';
-import { withFileLockSync } from './utils/file-lock.js';
 import {
   formatGlobalInstallCommand,
   resolveGlobalInstallPlan,
@@ -3072,8 +3074,13 @@ interface SessionData {
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
-  /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
   replyTargets?: Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+  codexAppGenerationCommits?: unknown;
+  queued?: boolean;
+  queuedActivationPending?: boolean;
+  queuedActivationTail?: import('./types.js').QueuedActivationTailEntry[];
+  pendingRepoSetup?: import('./types.js').PendingRepoSetup;
   /** Current persisted worker lifetime and its exact input-queue receipts. */
   workerGeneration?: number;
   dispatchInputReceipts?: Record<string, {
@@ -3154,85 +3161,226 @@ function loadSessions(): Map<string, SessionData> {
     if (process.env.BOTMUX_LARK_APP_ID) loadPerBot(process.env.BOTMUX_LARK_APP_ID);
   }
 
-  // Migrate: remove sessions from legacy file if they have larkAppId (belong in per-bot files)
-  let legacyDirty = false;
-  for (const [k, v] of Object.entries(legacyData)) {
-    const s = v as SessionData;
-    if (s.larkAppId) {
-      delete legacyData[k];
-      legacyDirty = true;
-      // Ensure the session exists in its per-bot file
-      const perBotFp = join(dataDir, `sessions-${s.larkAppId}.json`);
-      let perBotData: Record<string, SessionData> = {};
-      if (existsSync(perBotFp)) {
-        try { perBotData = JSON.parse(readFileSync(perBotFp, 'utf-8')); } catch { /* */ }
-      }
-      // Only write if per-bot file doesn't already have this session
-      if (!perBotData[k]) {
-        perBotData[k] = s;
-        const tmpFp = perBotFp + '.tmp';
-        writeFileSync(tmpFp, JSON.stringify(perBotData, null, 2), 'utf-8');
-        renameSync(tmpFp, perBotFp);
-      }
-    }
-  }
-  if (legacyDirty) {
-    const tmpFp = legacyFp + '.tmp';
-    writeFileSync(tmpFp, JSON.stringify(legacyData, null, 2), 'utf-8');
-    renameSync(tmpFp, legacyFp);
-  }
+  // Deliberately read-only. Older CLIs opportunistically migrated legacy rows
+  // here, which made even `botmux list` a whole-file writer capable of racing a
+  // daemon ledger save. Durable migration belongs to daemon startup under the
+  // session-store lock; this generic discovery path only composes snapshots.
 
   return sessions;
 }
 
-/** Save a single session back to its appropriate file based on larkAppId. */
-function loadSessionFresh(session: SessionData): SessionData | undefined {
-  return loadSessions().get(session.sessionId);
-}
-
-function saveSession(session: SessionData): void {
+/** Offline-only narrow session mutation. Callers must prefer the owning daemon
+ * while it is available; rereading the exact row here prevents stale CLI
+ * snapshots from copying FIFO fields during offline maintenance. */
+function mutateSessionOffline(
+  session: SessionData,
+  mutate: (current: SessionData) => boolean,
+): SessionData | undefined {
   const dataDir = resolveDataDir();
   const fileName = session.larkAppId ? `sessions-${session.larkAppId}.json` : 'sessions.json';
   const fp = join(dataDir, fileName);
-
-  // Read current file, update session, write back
-  let data: Record<string, SessionData> = {};
-  if (existsSync(fp)) {
-    try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
-  }
-  data[session.sessionId] = session;
-
-  // Clean up entries where file key doesn't match the entry's sessionId (data
-  // corruption), and strip legacy placeholder-card fields so the file converges
-  // to clean (see stripLegacyPendingCardFields in services/session-store).
-  for (const [key, val] of Object.entries(data)) {
-    if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
-      delete data[key];
-      continue;
+  return withFileLockSync(fp, () => {
+    // The owning daemon uses the same session-file lock for every save. Check
+    // absence while holding it so two CLIs cannot race each other and an
+    // already-published daemon cannot be bypassed by the offline fallback.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
     }
-    if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
-  }
+    let data: Record<string, SessionData> = {};
+    if (existsSync(fp)) {
+      try { data = JSON.parse(readFileSync(fp, 'utf-8')); } catch { /* start fresh */ }
+    }
+    const current = data[session.sessionId];
+    if (!current || !mutate(current)) return current;
+    data[session.sessionId] = current;
 
-  const tmpFp = fp + '.tmp';
-  writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
+    // Clean up entries where file key doesn't match the entry's sessionId
+    // (data corruption), and strip removed placeholder-card fields.
+    for (const [key, val] of Object.entries(data)) {
+      if (val && typeof val === 'object' && 'sessionId' in val && (val as SessionData).sessionId !== key) {
+        delete data[key];
+        continue;
+      }
+      if (val && typeof val === 'object') stripLegacyPendingCardFields(val as unknown as Record<string, unknown>);
+    }
 
-  // Remove duplicate from legacy file if session moved to per-bot file (or vice versa)
-  const otherFile = session.larkAppId ? 'sessions.json' : null;
-  if (otherFile) {
-    const otherFp = join(dataDir, otherFile);
-    if (existsSync(otherFp)) {
+    // Recheck immediately before publication. A daemon that appears during
+    // the read/decision phase becomes authoritative; leave the file untouched.
+    if (session.larkAppId) {
+      try { if (findDaemon(session.larkAppId)) return undefined; } catch { /* offline */ }
+    }
+    const tmpFp = `${fp}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+    writeFileSync(tmpFp, JSON.stringify(data, null, 2), 'utf-8');
+    renameSync(tmpFp, fp);
+    return current;
+  });
+}
+
+type OfflineAbandonResult =
+  | { ok: true; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error: string };
+
+/** Offline explicit abandon stops the exact Botmux-owned worker, then closes
+ * the newest durable row under the shared session-file lock. Provider-specific
+ * backing cleanup remains owned by the dedicated backend lifecycle changes. */
+async function abandonSessionOffline(session: SessionData): Promise<OfflineAbandonResult> {
+  let current = mutateSessionOffline(session, () => false);
+  if (!current) return { ok: false, error: 'owning_daemon_became_available' };
+
+  const originalPid = adoptedCliPid(current);
+  const ownedWorkerPid = current.pid && current.pid !== originalPid ? current.pid : undefined;
+  if (ownedWorkerPid) {
+    // Narrow the unavoidable descriptor race: do not signal a worker after an
+    // owning daemon has become visible. The locked write below repeats this.
+    if (current.larkAppId) {
       try {
-        const otherData: Record<string, SessionData> = JSON.parse(readFileSync(otherFp, 'utf-8'));
-        if (otherData[session.sessionId]) {
-          delete otherData[session.sessionId];
-          const otherTmp = otherFp + '.tmp';
-          writeFileSync(otherTmp, JSON.stringify(otherData, null, 2), 'utf-8');
-          renameSync(otherTmp, otherFp);
+        if (findDaemon(current.larkAppId)) {
+          return { ok: false, error: 'owning_daemon_became_available' };
         }
-      } catch { /* ignore */ }
+      } catch { /* still offline */ }
     }
+    if (isProcessAlive(ownedWorkerPid)) {
+      const signalled = killProcess(ownedWorkerPid);
+      if ((!signalled && isProcessAlive(ownedWorkerPid))
+        || !(await waitForProcessExit(ownedWorkerPid))) {
+        return { ok: false, error: `worker_pid_kill_failed:${ownedWorkerPid}` };
+      }
+    }
+
+    // Persist worker-less state without touching FIFO authority. If a new
+    // daemon/generation changed the row while SIGTERM settled, fail closed.
+    let workerCleared = false;
+    const afterStop = mutateSessionOffline(current, latest => {
+      if (latest.pid !== ownedWorkerPid
+        || isAdoptedSession(latest) !== isAdoptedSession(current!)) return false;
+      delete latest.pid;
+      workerCleared = true;
+      return true;
+    });
+    if (!afterStop || !workerCleared) {
+      return { ok: false, error: 'session_changed_while_stopping_worker' };
+    }
+    current = afterStop;
+  } else {
+    // Even without a Botmux worker pid, re-read after the first authority check
+    // so the cleanup inputs are the newest locked backend/task lineage.
+    const refreshed = mutateSessionOffline(current, () => false);
+    if (!refreshed) return { ok: false, error: 'owning_daemon_became_available' };
+    current = refreshed;
   }
+
+  let applied = false;
+  const published = mutateSessionOffline(current, latest => {
+    if (isAdoptedSession(latest) !== isAdoptedSession(current)) return false;
+    if (latest.status === 'closed') {
+      applied = true;
+      return false;
+    }
+    latest.status = 'closed';
+    latest.closedAt = new Date().toISOString();
+    delete latest.codexAppDispatchLedger;
+    delete latest.codexAppGenerationCommits;
+    delete latest.queuedActivationPending;
+    delete latest.queuedActivationTail;
+    delete latest.pendingRepoSetup;
+    applied = true;
+    return true;
+  });
+  if (!published || !applied) {
+    return { ok: false, error: 'session_changed_during_offline_cleanup' };
+  }
+
+  return { ok: true, current: published };
+}
+
+function pruneSessionOfflineIfLedgerEmpty(session: SessionData): boolean {
+  let pruned = false;
+  mutateSessionOffline(session, current => {
+    if (hasProtectedSessionMutationOwnership(current)) return false;
+    current.status = 'closed';
+    current.closedAt = new Date().toISOString();
+    delete current.codexAppDispatchLedger;
+    delete current.codexAppGenerationCommits;
+    pruned = true;
+    return true;
+  });
+  return pruned;
+}
+
+function patchSessionWhiteboardOffline(session: SessionData, whiteboardId: string): boolean {
+  return !!mutateSessionOffline(session, current => {
+    current.whiteboardId = whiteboardId;
+    return true;
+  });
+}
+
+async function postOwningDaemonSessionMutation(
+  session: SessionData,
+  suffix: 'close' | 'prune' | 'whiteboard',
+  body?: Record<string, unknown>,
+): Promise<'applied' | 'refused' | 'unavailable'> {
+  if (!session.larkAppId) return 'unavailable';
+  let daemon: ReturnType<typeof findDaemon>;
+  try { daemon = findDaemon(session.larkAppId); } catch { return 'unavailable'; }
+  if (!daemon) return 'unavailable';
+  let secret: string;
+  try { secret = loadDaemonIpcSecret(); } catch { return 'unavailable'; }
+  const res = await fetchDaemonIpc(
+    daemon.ipcPort,
+    `/api/sessions/${encodeURIComponent(session.sessionId)}/${suffix}`,
+    {
+      method: 'POST',
+      ...(body
+        ? {
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+        : {}),
+    },
+    secret,
+  );
+  if (suffix === 'prune' && res.status === 409) return 'refused';
+  if (!res.ok) {
+    throw new Error(`owning daemon ${suffix} mutation failed: HTTP ${res.status}`);
+  }
+  return 'applied';
+}
+
+type AuthoritativeAbandonResult =
+  | { ok: true; mode: 'daemon' }
+  | { ok: true; mode: 'offline'; current: SessionData; cleanedBacking?: string }
+  | { ok: false; error?: string };
+
+async function abandonSessionAuthoritatively(session: SessionData): Promise<AuthoritativeAbandonResult> {
+  const result = await postOwningDaemonSessionMutation(session, 'close');
+  if (result === 'applied') return { ok: true, mode: 'daemon' };
+  if (result === 'refused') return { ok: false };
+  const offline = await abandonSessionOffline(session);
+  return offline.ok
+    ? {
+        ok: true,
+        mode: 'offline',
+        current: offline.current,
+        ...(offline.cleanedBacking ? { cleanedBacking: offline.cleanedBacking } : {}),
+      }
+    : { ok: false, error: offline.error };
+}
+
+async function pruneSessionAuthoritatively(session: SessionData): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'prune');
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return pruneSessionOfflineIfLedgerEmpty(session);
+}
+
+async function patchSessionWhiteboardAuthoritatively(
+  session: SessionData,
+  whiteboardId: string,
+): Promise<boolean> {
+  const result = await postOwningDaemonSessionMutation(session, 'whiteboard', { whiteboardId });
+  if (result === 'applied') return true;
+  if (result === 'refused') return false;
+  return patchSessionWhiteboardOffline(session, whiteboardId);
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -3251,6 +3399,15 @@ function killProcess(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 2_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !isProcessAlive(pid);
 }
 
 function formatDuration(ms: number): string {
@@ -3628,26 +3785,21 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       process.stdout.write('\x1b[?1049l'); // leave alt screen
     }
 
-    function deleteSession(idx: number): void {
+    async function deleteSession(idx: number): Promise<void> {
       const r = rows[idx];
       const s = r.session;
 
-      // Kill botmux's worker process. For adopted sessions, never kill the
-      // user's original CLI pid if an old record stored it in `pid`.
-      const originalPid = adoptedCliPid(s);
-      if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-        killProcess(s.pid);
+      // Explicit delete is the abandon boundary. Prefer the owning daemon so
+      // its current in-memory FIFO is cleared atomically with close; offline
+      // fallback rereads the exact row and clears the latest ledger/commits.
+      const result = await abandonSessionAuthoritatively(s);
+      if (!result.ok) {
+        flashMsg = `\x1b[31m删除失败 ${s.sessionId.substring(0, 8)}${result.error ? `：${result.error}` : ''}；会话保持活跃，可重试\x1b[0m`;
+        return;
       }
-
-      // Kill only botmux-owned tmux sessions. Adopted panes belong to the user.
-      if (!r.isAdopt && r.hasTmux) {
-        try { execSync(`tmux kill-session -t '${r.tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() }); } catch { /* */ }
-      }
-
-      // Mark closed & persist
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
+      // A live daemon owns process/pane teardown and has re-resolved the latest
+      // generation. Only the locked offline path may clean up resources, using
+      // the freshly-read row rather than this TUI's stale snapshot.
 
       // Remove from active list and TUI rows
       const activeIdx = active.indexOf(s);
@@ -3658,12 +3810,12 @@ function interactiveSessionPicker(active: SessionData[]): Promise<void> {
       flashMsg = `\x1b[32m✓ 已删除 ${s.sessionId.substring(0, 8)}\x1b[0m`;
     }
 
-    process.stdin.on('data', (key: string) => {
+    process.stdin.on('data', async (key: string) => {
       // Delete confirmation mode
       if (confirmDelete) {
         confirmDelete = false;
         if (key === 'y' || key === 'Y') {
-          deleteSession(cursor);
+          await deleteSession(cursor);
         } else {
           flashMsg = '\x1b[2m取消删除\x1b[0m';
         }
@@ -3769,18 +3921,26 @@ async function cmdList(): Promise<void> {
     else if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
-  const closeNow = (arr: SessionData[]) => {
+  const closeNow = async (arr: SessionData[]): Promise<number> => {
+    let closed = 0;
     for (const s of arr) {
-      s.status = 'closed';
-      s.closedAt = new Date().toISOString();
-      saveSession(s);
+      if (await pruneSessionAuthoritatively(s)) {
+        closed++;
+      } else {
+        // The owning daemon observed a newly unsettled FIFO after this CLI's
+        // liveness snapshot. Keep the owner visible instead of abandoning it.
+        live.push(s);
+      }
     }
+    return closed;
   };
   // Scratches: close silently — they were placeholders, not dead sessions.
-  closeNow(prunedScratch);
+  await closeNow(prunedScratch);
   if (pruned.length > 0) {
-    closeNow(pruned);
-    console.log(`已自动清理 ${pruned.length} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    const prunedCount = await closeNow(pruned);
+    if (prunedCount > 0) {
+      console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
+    }
   }
 
   // Sort by creation time, newest first
@@ -3801,7 +3961,7 @@ async function cmdList(): Promise<void> {
   await interactiveSessionPicker(live);
 }
 
-function cmdDelete(): void {
+async function cmdDelete(): Promise<void> {
   const target = process.argv[3];
   if (!target) {
     console.error('用法: botmux delete <session-id|all>');
@@ -3852,29 +4012,13 @@ function cmdDelete(): void {
   }
 
   for (const s of toDelete) {
-    const originalPid = adoptedCliPid(s);
-
-    // Kill botmux's worker process if running. For adopted sessions, never
-    // kill the user's original CLI pid.
-    if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
-      killProcess(s.pid);
-      console.log(`  killed pid ${s.pid}`);
+    const result = await abandonSessionAuthoritatively(s);
+    if (!result.ok) {
+      throw new Error(`failed to close session ${s.sessionId}${result.error ? `: ${result.error}` : ''}`);
     }
-
-    // Kill associated botmux-owned tmux session if it exists. Adopted panes
-    // belong to the user and must be left untouched.
-    const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
-    if (!isAdoptedSession(s)) {
-      try {
-        execSync(`tmux kill-session -t '${tmuxName}' 2>/dev/null`, { stdio: 'ignore', env: tmuxEnv() });
-        console.log(`  killed tmux ${tmuxName}`);
-      } catch { /* no tmux session */ }
+    if (result.mode === 'offline') {
+      if (result.cleanedBacking) console.log(`  killed ${result.cleanedBacking}`);
     }
-
-    // Mark session as closed
-    s.status = 'closed';
-    s.closedAt = new Date().toISOString();
-    saveSession(s);
     console.log(`✓ ${s.sessionId.substring(0, 8)} ${s.title}`);
   }
   console.log(`\n已关闭 ${toDelete.length} 个会话`);
@@ -5079,7 +5223,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     let meta = ctx.session?.whiteboardId ? getWhiteboard(ctx.session.whiteboardId) : undefined;
     if (!meta && argFlag(rest, '--create')) {
       meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-      if (ctx.session) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+      if (ctx.session) {
+        await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+        ctx.session.whiteboardId = meta.id;
+      }
     }
     if (!meta) {
       console.log(JSON.stringify({ enabled: true, current: null, hint: 'Run `botmux whiteboard current --create` to ensure the default board.' }, null, 2));
@@ -5093,7 +5240,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     requireWhiteboardEnabled();
     const ctx = currentWhiteboardContext(rest);
     const meta = createWhiteboard({ id: argValue(rest, '--id'), title: argValue(rest, '--title'), larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
-    if (ctx.session && !ctx.session.whiteboardId) { ctx.session.whiteboardId = meta.id; saveSession(ctx.session); }
+    if (ctx.session && !ctx.session.whiteboardId) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, meta.id);
+      ctx.session.whiteboardId = meta.id;
+    }
     console.log(JSON.stringify({ board: meta, path: whiteboardPath(meta.id) }, null, 2));
     return;
   }
@@ -5114,7 +5264,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   if (!id && whiteboardEnabled() && action === 'update') {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
-    if (ctx.session) { ctx.session.whiteboardId = id; saveSession(ctx.session); }
+    if (ctx.session) {
+      await patchSessionWhiteboardAuthoritatively(ctx.session, id);
+      ctx.session.whiteboardId = id;
+    }
   }
   if (!id) { console.error('No whiteboard id. Pass --id or run `botmux whiteboard current --create`.'); process.exit(1); }
 
@@ -6034,10 +6187,40 @@ async function cmdSend(rest: string[]): Promise<void> {
   )
     ? trustedRelayCandidate
     : undefined;
+  // Keep origin authority independent from the requested destination.  In
+  // particular, `--session-id <other>` may select where an ordinary Lark turn
+  // is sent, but it must never replace the session whose durable delivery sink
+  // governs this process.  Session identity may fall back to the inherited env
+  // for detached commands; the turn tuple may not. `ancestorCtx` deliberately
+  // adds spawn-time BOTMUX_TURN_ID/ATTEMPT compatibility fallbacks, which can be
+  // stale after a later turn, so only a parent-bound host relay or a fresh
+  // marker/protected-capability tuple can authorize a durable dispatch.
   const originSessionId = trustedRelayCtx?.sessionId
-    || liveMarkerCtx?.sessionId
-    || ancestorCtx?.sessionId
-    || sessionIdArg;
+    ?? liveMarkerCtx?.sessionId
+    ?? ancestorCtx?.sessionId
+    ?? process.env.BOTMUX_SESSION_ID;
+  const authoritativeOriginTurnCtx = trustedRelayCtx
+    ? (trustedRelayCtx.turnId ? trustedRelayCtx : undefined)
+    : (liveMarkerCtx?.turnId ? liveMarkerCtx : undefined);
+  const originTurnId = authoritativeOriginTurnCtx?.turnId;
+  const originDispatchAttempt = authoritativeOriginTurnCtx?.dispatchAttempt;
+  const originSession = originSessionId
+    ? sessionsForOrigin.get(originSessionId)
+    : undefined;
+  const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
+    && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
+  // The live worker authorizes a Codex App relay only while an exact durable
+  // dispatch remains unsettled. Recheck that prerequisite before any other
+  // managed-output policy or provider setup: terminal settlement can win the
+  // race between watcher authorization and this host child loading the store,
+  // and must never downgrade the send into an ordinary Lark message.
+  if (hostRelayRequiresCodexAppLedger
+    && (originSession?.codexAppDispatchLedger?.length ?? 0) === 0) {
+    console.error(
+      `botmux send refused: authorized Codex App origin ${originSessionId}/${originTurnId} is no longer unsettled`,
+    );
+    process.exit(2);
+  }
   let explicitVcMeetingImOrigin: ReturnType<typeof resolveVcMeetingImTurnOrigin>;
   let vcMeetingListenerOutputOwner: { listenerAppId: string; meetingId: string } | undefined;
   let vcMeetingManagedSendOrigin: VcMeetingManagedSendOrigin | undefined;
@@ -6047,14 +6230,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     dispatchAttempt: number;
   } | undefined;
   if (originSessionId) {
-    const originSession = sessionsForOrigin.get(originSessionId);
-    const originTurnId = trustedRelayCtx?.turnId ?? liveMarkerCtx?.turnId;
     const imOrigin = resolveVcMeetingImTurnOrigin(originSession, originTurnId);
     const managedOrigin: VcMeetingManagedSendOrigin = {
       receiverSessionId: originSessionId,
       receiverSession: !!originSession?.vcMeetingReceiver,
       turnId: originTurnId,
-      dispatchAttempt: trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt,
+      dispatchAttempt: originDispatchAttempt,
       currentImTurnOrigin: imOrigin,
     };
     const decision = evaluateVcMeetingManagedSend(resolveDataDir(), managedOrigin);
@@ -6076,7 +6257,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       }
     }
     if (decision.kind === 'listener_thread'
-      && (trustedRelayCtx?.dispatchAttempt ?? liveMarkerCtx?.dispatchAttempt) === undefined) {
+      && originDispatchAttempt === undefined) {
       explicitVcMeetingImOrigin = imOrigin;
     }
   }
@@ -6238,7 +6419,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   const sessions = loadSessions();
-  const currentTurnId = ancestorCtx?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const currentTurnId = originTurnId;
   let s = sessions.get(sid);
 
   // Riff (remote backend) sandbox: no local daemon/sessions.json/bots.json.
@@ -6269,9 +6450,102 @@ async function cmdSend(rest: string[]): Promise<void> {
   let deferredMaterializedByThisCommand = false;
   let deferredTopicRootMessageIdForOutput: string | undefined;
 
-  // 本轮的回复锚点：优先按 turnId 精确取 per-turn 落点（排队/并发轮次不再被
-  // 后到轮次覆盖 currentReplyTarget 而塌成群顶层 plain），无记录再退回单槽。
+  // Prefer the exact per-turn reply anchor; the latest single slot is only a
+  // compatibility fallback for sessions persisted before replyTargets.
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+
+  const exactOriginDispatch = (() => {
+    const unsettledOriginDispatches = originSession?.codexAppDispatchLedger ?? [];
+    // The live worker authorized this host re-exec against an exact unsettled
+    // Codex App entry. If terminal settlement/revocation won the race before
+    // this child reloaded the store, never degrade into an ordinary Lark send
+    // against mutable session state.
+    if (unsettledOriginDispatches.length === 0) {
+      return undefined;
+    }
+    // A detached/backgrounded command can still inherit the correct session id
+    // but only a spawn-time (and now stale) turn env.  If this session has any
+    // unsettled durable output, absence of a fresh marker/capability tuple must
+    // fail closed rather than silently falling through to ordinary Lark IM.
+    if (!originTurnId) {
+      console.error(
+        `botmux send refused: origin session ${originSessionId} has unsettled durable output but no fresh authoritative dispatch identity`,
+      );
+      process.exit(2);
+    }
+    const turnMatches = unsettledOriginDispatches
+      .filter(entry => entry.turnId === originTurnId);
+    const exactMatches = originDispatchAttempt === undefined
+      ? turnMatches
+      : turnMatches.filter(entry => entry.dispatchAttempt === originDispatchAttempt);
+    // Once a durable turn exists, a supplied attempt must match it exactly.
+    // Falling back to another attempt would let a stale/replayed process select
+    // the wrong sink.  With no attempt, multiple entries are equally unsafe.
+    if (exactMatches.length !== 1) {
+      const detail = originDispatchAttempt === undefined
+        ? `${turnMatches.length} ledger entries share the turn id`
+        : `${exactMatches.length} ledger entries match attempt ${originDispatchAttempt}`;
+      console.error(
+        `botmux send refused: origin dispatch ${originSessionId}/${originTurnId} is ambiguous (${detail})`,
+      );
+      process.exit(2);
+    }
+    return exactMatches[0];
+  })();
+
+  // Frozen reply routing applies only when the selected destination is the
+  // trusted origin session.  A cross-session publish must not accidentally
+  // reuse a coincidentally-equal turn id from the destination ledger.
+  const frozenTurnDispatch = originSessionId === sid
+    ? exactOriginDispatch
+    : undefined;
+  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  if (exactOriginDispatch?.deliverySink === 'http_wait'
+    || exactOriginDispatch?.deliverySink === 'http_async'
+    || exactOriginDispatch?.deliverySink === 'suppressed') {
+    console.error(
+      `botmux send refused: origin turn ${originTurnId} is bound to the `
+      + `${exactOriginDispatch.deliverySink} host sink`,
+    );
+    process.exit(2);
+  }
+
+  // A document-comment turn has exactly one supported observable effect: a
+  // plain text reply to its frozen origin target.  Validate the complete shape
+  // before reading stdin/content/card files and before any TTS, upload, or Lark
+  // provider call.  In particular, an explicit destination session is not an
+  // escape hatch from the origin sink.
+  const docTarget = originTurnId
+    ? originSession?.docCommentTargets?.[originTurnId]
+    : undefined;
+  // Codex App turns are governed exclusively by their exact dispatch ledger:
+  // a settled/missing ledger entry must never fall back to mutable session
+  // state. Other CLI adapters predate that ledger, so their frozen per-turn
+  // docCommentTargets entry remains the authoritative origin sink.
+  const isOriginDocCommentTurn = exactOriginDispatch?.deliverySink === 'doc_comment'
+    || (!exactOriginDispatch && originSession?.cliId !== 'codex-app' && !!docTarget);
+  if (isOriginDocCommentTurn) {
+    if (!docTarget || !originSession?.larkAppId) {
+      console.error('botmux send refused: this turn is bound to a document comment, but its exact origin target is no longer available');
+      process.exit(2);
+    }
+    if (sid !== originSessionId
+      || sendTopLevel
+      || !!overrideChatId
+      || !!sendInto
+      || asVoice
+      || images.length > 0
+      || files.length > 0
+      || videoAttachments.length > 0
+      || videoCovers.length > 0
+      || customCardRequested
+      || attention.requested
+      || explicitQuote !== undefined
+      || noQuote) {
+      console.error('botmux send refused: a document-comment turn supports only its exact plain-text comment reply');
+      process.exit(2);
+    }
+  }
 
   // Read content from: --content-file > positional arg > stdin
   let content = '';
@@ -6422,17 +6696,19 @@ async function cmdSend(rest: string[]): Promise<void> {
           deferredTopicRootMessageIdForOutput = deferred.rootMessageId;
           messageId = deferred.messageId;
         } else {
-          const canonicalTarget = resolveSendTarget({
-            into: sendInto,
-            topLevel: sendTopLevel,
-            chatScope: s.scope === 'chat',
-            chatId: canonicalOutput.targetChatId,
-            rootMessageId: s.rootMessageId,
-            replyTargetRootId: turnReplyTarget?.rootMessageId,
-            replyTargetTurnId: turnReplyTarget?.turnId,
-            replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
-            currentTurnId,
-          });
+          const canonicalTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+            ? frozenTurnReplyTarget
+            : resolveSendTarget({
+                into: sendInto,
+                topLevel: sendTopLevel,
+                chatScope: s.scope === 'chat',
+                chatId: canonicalOutput.targetChatId,
+                rootMessageId: s.rootMessageId,
+                replyTargetRootId: turnReplyTarget?.rootMessageId,
+                replyTargetTurnId: turnReplyTarget?.turnId,
+                replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
+                currentTurnId,
+              });
           messageId = canonicalTarget.mode === 'plain'
             ? await sendMessage(
                 appId,
@@ -6491,28 +6767,22 @@ async function cmdSend(rest: string[]): Promise<void> {
   }
 
   // ── 文档评论入口分流（/watch-comment / /subscribe-lark-doc）─────────────────
-  // 本轮若由飞书文档评论触发（daemon 已把落点写进 session.docCommentTargets[turnId]），
-  // 把用户可见回复发表为飞书文档评论，而非发回飞书会话。绕过 @ 硬门（评论不 @ 飞书
-  // 用户）。显式改路由（--top-level / --chat-id / --into）时不分流，让模型仍能主动
-  // 用 BOTMUX_TURN_ID 从 per-turn map 取本轮落点；非文档轮的 turnId 不会命中 map，
-  // 天然不会误投。per-turn map 设计：并发评论之间互不覆盖，不会串线。
-  const docTarget = currentTurnId ? s.docCommentTargets?.[currentTurnId] : undefined;
-  if (docTarget && !sendTopLevel && !overrideChatId && !sendInto) {
-    if (customCardRequested) {
-      console.error('botmux send: 文档评论回复不支持 --card-file/--card-json；请改用普通文本，或显式 --top-level/--chat-id 发到飞书群');
-      process.exit(2);
-    }
+  // The authority and payload-shape checks ran before content/provider work.
+  // Use only the trusted origin session here; `--session-id` is a destination
+  // selector for ordinary Lark turns and cannot retarget a document turn.
+  if (isOriginDocCommentTurn) {
+    const exactDocTarget = docTarget!;
+    const exactDocSession = originSession!;
     const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
     try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { replyToDocComment, chunkCommentText, removeCommentReaction } = await import('./im/lark/doc-comment.js');
-    const appId = s.larkAppId!;
-    const loc = localeForBot(appId);
+    const appId = exactDocSession.larkAppId!;
     try {
       // @ 落点：--mention-back → 回 @ 原评论人；--mention <open_id[:name]> → @ 指定人；
       // 否则（--no-mention / 无）不 @。文档评论里靠 person 元素渲染 @，仅首块加。
       let docMentionOpenId: string | undefined;
-      if (mentionBack) docMentionOpenId = docTarget.replyToOpenId;
+      if (mentionBack) docMentionOpenId = exactDocTarget.replyToOpenId;
       else if (mentionArgs.length > 0) {
         const first = mentionArgs[0];
         const idx = first.indexOf(':');
@@ -6521,27 +6791,31 @@ async function cmdSend(rest: string[]): Promise<void> {
       // 嵌套回复到用户那条评论 thread（已挂其下，无需 ↪ 前缀）。
       const chunks = chunkCommentText(content);
       for (let i = 0; i < chunks.length; i++) {
-        await replyToDocComment(appId, { fileToken: docTarget.fileToken, fileType: docTarget.fileType }, docTarget.commentId, chunks[i], i === 0 ? docMentionOpenId : undefined);
+        await replyToDocComment(
+          appId,
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId,
+          chunks[i],
+          i === 0 ? docMentionOpenId : undefined,
+        );
       }
       // 清理 "Typing" reaction（bot 已回复完毕）。
-      if (docTarget.reactionId && docTarget.replyId) {
+      if (exactDocTarget.reactionId && exactDocTarget.replyId) {
         await removeCommentReaction(appId,
-          { fileToken: docTarget.fileToken, fileType: docTarget.fileType },
-          docTarget.commentId, docTarget.replyId, docTarget.reactionId);
+          { fileToken: exactDocTarget.fileToken, fileType: exactDocTarget.fileType },
+          exactDocTarget.commentId, exactDocTarget.replyId, exactDocTarget.reactionId);
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       try {
         const markerDir = join(resolveDataDir(), 'turn-sends');
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
+        appendFileSync(join(markerDir, `${originSessionId}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${exactDocTarget.commentId}`, contentLength: content.length }) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
-      // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
-      if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {
-        delete s.docCommentTargets[currentTurnId];
-        try { saveSession(s); } catch { /* best-effort */ }
-      }
-      console.error(`✓ 已回复文档评论 ${docTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
-      console.log(JSON.stringify({ success: true, commentId: docTarget.commentId, sessionId: sid, kind: 'doc-comment', chunks: chunks.length }));
+      // Do not write this startup snapshot back after the async provider calls:
+      // the daemon may have advanced the dispatch ledger or accepted another
+      // turn in the meantime.  Daemon settlement owns exact target retirement.
+      console.error(`✓ 已回复文档评论 ${exactDocTarget.commentId.slice(0, 12)}（${chunks.length} 条）`);
+      console.log(JSON.stringify({ success: true, commentId: exactDocTarget.commentId, sessionId: originSessionId, kind: 'doc-comment', chunks: chunks.length }));
     } catch (e: any) {
       console.error(`文档评论发送失败：${e?.message ?? e}`);
       process.exit(1);
@@ -6563,6 +6837,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+    ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? s.quoteTargetSenderOpenId;
 
   // @ hard-gate (config.send.requireMentionDecision, default on): force the
@@ -6663,7 +6938,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   };
   // Dispatch helper: top-level / chat-scope send vs reply-in-thread, single
   // decision point. Used for file attachments (always plain in chat scope).
-  const sendTarget = resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
+  const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget
+    ? frozenTurnReplyTarget
+    : resolveSendTarget({ into: sendInto, topLevel: sendTopLevel, chatScope: isChatScope, chatId: targetChatId, rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId, replyTargetTurnId: turnReplyTarget?.turnId, replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId });
   const dispatch = async (
     content: string,
     msgType: string,
@@ -6684,28 +6961,28 @@ async function cmdSend(rest: string[]): Promise<void> {
         msgType,
         uuid,
         sendRoot: (body, type, rootUuid) => sendMessage(
-          appId,
-          targetChatId,
-          body,
-          type,
-          rootUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+            appId,
+            targetChatId,
+            body,
+            type,
+            rootUuid,
+            hookContext,
+            suppressHook ? { suppressHook: true } : undefined,
+          ),
         // The optional title is the root seed and the actual alert follows as
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
         sendTitleSeed: (title, rootUuid) => sendMessage(appId, targetChatId, title, 'text', rootUuid),
         replyRoot: (root, body, type, replyUuid) => replyMessage(
-          appId,
-          root,
-          body,
-          type,
-          true,
-          replyUuid,
-          hookContext,
-          suppressHook ? { suppressHook: true } : undefined,
-        ),
+            appId,
+            root,
+            body,
+            type,
+            true,
+            replyUuid,
+            hookContext,
+            suppressHook ? { suppressHook: true } : undefined,
+          ),
       });
       if (deferred.handled && deferred.messageId) {
         deferredMaterializedByThisCommand ||= deferred.materializedNow === true;
@@ -6757,7 +7034,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     // belong to another queued IM turn and is not part of the delivery action.
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
-      : explicitVcMeetingImOrigin?.larkMessageId ?? s.quoteTargetId,
+      : explicitVcMeetingImOrigin?.larkMessageId
+        ?? frozenTurnDispatch?.quoteTargetId
+        ?? s.quoteTargetId,
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
@@ -6814,7 +7093,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         // retains the normal chat-scope dispatch semantics. On a mismatch the
         // frozen canonical target remains authoritative.
         dispatch: prepared?.outputMismatch
-          ? (body, type, uuid, suppressHook) => {
+          ? async (body, type, uuid, suppressHook) => {
               revalidateVcMeetingManagedSend();
               return sendMessage(
                 appId,
@@ -6980,11 +7259,18 @@ async function cmdSend(rest: string[]): Promise<void> {
     // --no-mention 显式不 @ 任何人 → 连 footer 的"发送给/cc"寻址 <at> 也清空，
     // 否则 footer 仍会 @ 人，与 --no-mention 语义和"未@任何人"输出自相矛盾
     // （Codex review P2）。--top-level 同样无特定收件人。
+    const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
+      ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
+      : frozenTurnDispatch?.replyTargetSenderOpenId
+        ? {
+            ...s,
+            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+          }
+        : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
-      : buildFooterAddressing(explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-        : s, {
+      : buildFooterAddressing(frozenFooterAddressingSource, {
           isOncall: !!oncallEntry,
           isSubstitute: turnReplyTarget?.turnId === currentTurnId && turnReplyTarget?.substitute === true,
           hasExplicitBotMention: explicitKnownBotMention,
@@ -9748,7 +10034,7 @@ switch (command) {
   case 'ls':      await cmdList(); break;
   case 'delete':
   case 'del':
-  case 'rm':      cmdDelete(); break;
+  case 'rm':      await cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
   case 'slash':   await cmdSlash(); break;

@@ -6,6 +6,14 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { writeRunnerInput } from './runner-input.js';
 
 function runnerPath(): string {
+  // Source-level worker integration tests execute through tsx and need the
+  // matching source runner rather than a possibly absent/stale ignored dist
+  // tree. Keep the override strictly test-scoped so production launch
+  // resolution remains canonical and cannot be redirected by ambient env.
+  const testOverride = process.env.NODE_ENV === 'test'
+    ? process.env.BOTMUX_TEST_CODEX_APP_RUNNER_PATH
+    : undefined;
+  if (testOverride) return resolve(testOverride);
   const here = dirname(fileURLToPath(import.meta.url));
   const compiledSibling = resolve(here, '..', '..', 'codex-app-runner.js');
   if (existsSync(compiledSibling)) return compiledSibling;

@@ -36,12 +36,13 @@ function fakeTmuxPty(opts: { failTextAt?: number; failEnter?: boolean } = {}) {
 }
 
 /** Fake raw-PTY handle (no tmux send methods): exercises the write() fallback. */
-function fakeRawPty(opts: { throwOnWrite?: boolean } = {}) {
+function fakeRawPty(opts: { throwOnWrite?: boolean; rejectWrite?: boolean } = {}) {
   const writes: string[] = [];
   const pty: PtyHandle = {
     write(data: string) {
       if (opts.throwOnWrite) throw new Error('pty gone');
       writes.push(data);
+      return opts.rejectWrite ? false : undefined;
     },
   };
   return { pty, writes };
@@ -123,7 +124,7 @@ describe('writeRunnerInput — tmux mode', () => {
 
     const res = await writeRunnerInput(pty, MARKER, big);
 
-    expect(res).toEqual({ submitted: true });
+    expect(res).toEqual({ submitted: true, submissionDisposition: 'submitted' });
     expect(textChunks.length).toBeGreaterThan(1);
     for (const c of textChunks) expect(c.length).toBeLessThanOrEqual(RUNNER_INPUT_CHUNK_BYTES);
     // pre-flush Enter + submit Enter on the happy path.
@@ -177,7 +178,7 @@ describe('writeRunnerInput — tmux mode', () => {
 
     const res = await writeRunnerInput(pty, MARKER, big);
 
-    expect(res).toEqual({ submitted: false });
+    expect(res).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
     // Chunks 0 and 1 landed; chunk 2 failed and we bailed.
     expect(textChunks).toHaveLength(2);
     // pre-flush Enter + flush-on-failure Enter — the partial line gets terminated.
@@ -187,10 +188,36 @@ describe('writeRunnerInput — tmux mode', () => {
   it('pre-flush gate: when every Enter is dropped, bail submitted:false WITHOUT writing any chunk', async () => {
     const { pty, textChunks } = fakeTmuxPty({ failEnter: true });
     const res = await writeRunnerInput(pty, MARKER, 'short message');
-    expect(res).toEqual({ submitted: false });
+    expect(res).toEqual({ submitted: false, submissionDisposition: 'untouched' });
     // The pre-flush Enter never lands, so we must not write the control line
     // onto a possibly-dirty buffer.
     expect(textChunks).toHaveLength(0);
+  });
+
+  it('treats a false last-chunk result as dirty even when bytes landed and cleanup submits it', async () => {
+    const runner = makeRunnerSim();
+    const content = 'last chunk ambiguity ' + 'x'.repeat(2_000);
+    const chunkCount = chunkAscii(
+      MARKER + encodeRunnerInput(content),
+      RUNNER_INPUT_CHUNK_BYTES,
+    ).length;
+    let textCall = 0;
+    const pty: PtyHandle = {
+      write() { throw new Error('unused'); },
+      sendText(text: string) {
+        runner.feed(text);
+        return textCall++ === chunkCount - 1 ? false : true;
+      },
+      sendSpecialKeys() {
+        runner.feed('\r');
+        return true;
+      },
+    };
+
+    const result = await writeRunnerInput(pty, MARKER, content);
+
+    expect(result).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
+    expect(runner.enqueued).toEqual([content]);
   });
 });
 
@@ -199,14 +226,21 @@ describe('writeRunnerInput — raw PTY fallback', () => {
     const content = 'fallback path';
     const { pty, writes } = fakeRawPty();
     const res = await writeRunnerInput(pty, MARKER, content);
-    expect(res).toEqual({ submitted: true });
+    expect(res).toEqual({ submitted: true, submissionDisposition: 'submitted' });
     expect(writes).toEqual([MARKER + encodeRunnerInput(content) + '\r']);
   });
 
   it('reports submitted:false when the raw write throws (pane gone)', async () => {
     const { pty } = fakeRawPty({ throwOnWrite: true });
     const res = await writeRunnerInput(pty, MARKER, 'x');
-    expect(res).toEqual({ submitted: false });
+    expect(res).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
+  });
+
+  it('does not promote a raw PTY false return to submitted:true', async () => {
+    const { pty, writes } = fakeRawPty({ rejectWrite: true });
+    const res = await writeRunnerInput(pty, MARKER, 'rejected');
+    expect(res).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
+    expect(writes).toHaveLength(1);
   });
 });
 
@@ -218,7 +252,7 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
     // Message A: drop chunk 2 mid-stream.
     const big = 'A'.repeat(15_000);
     const resA = await writeRunnerInput(fakeRunnerPty(runner, { dropTextAt: 2 }), MARKER, big);
-    expect(resA).toEqual({ submitted: false });
+    expect(resA).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
     // A never enqueues intact; its partial got flushed (discarded as bad input),
     // so the runner buffer is empty — nothing left to prepend to the next line.
     expect(runner.enqueued).not.toContain(big);
@@ -226,7 +260,7 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
 
     // Message B through the SAME runner: must arrive intact, not merged with A.
     const resB = await writeRunnerInput(fakeRunnerPty(runner), MARKER, 'clean message B');
-    expect(resB).toEqual({ submitted: true });
+    expect(resB).toEqual({ submitted: true, submissionDisposition: 'submitted' });
     expect(runner.enqueued).toContain('clean message B');
   });
 
@@ -266,7 +300,7 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
     dropText.add(aChunks.length - 1);
     dropEnter.add(1); dropEnter.add(2); dropEnter.add(3);
     const a = await writeRunnerInput(pty, MARKER, aContent);
-    expect(a).toEqual({ submitted: false });
+    expect(a).toEqual({ submitted: false, submissionDisposition: 'dirty_unknown' });
     expect(runner.buf).not.toBe('');            // A's partial is stuck in the buffer
 
     // Message B: drop ALL of B's pre-flush Enter retries (enters 4,5,6). The gate
@@ -274,7 +308,7 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
     dropEnter.add(4); dropEnter.add(5); dropEnter.add(6);
     const textBefore = textIdx;
     const b = await writeRunnerInput(pty, MARKER, 'message B');
-    expect(b).toEqual({ submitted: false });    // NOT a false success
+    expect(b).toEqual({ submitted: false, submissionDisposition: 'untouched' }); // NOT a false success
     expect(textIdx).toBe(textBefore);           // zero chunks written for B
     expect(runner.enqueued).not.toContain('message B');
     expect(runner.bad).not.toContain('shape');  // no merged bad line attributed as submitted
@@ -283,7 +317,7 @@ describe('writeRunnerInput — runner buffer hygiene (no cross-message contamina
     // (discarded as bad), then enqueues intact.
     const cleanRunnerPty = fakeRunnerPty(runner); // fresh counters, no drops
     const bb = await writeRunnerInput(cleanRunnerPty, MARKER, 'message B prime');
-    expect(bb).toEqual({ submitted: true });
+    expect(bb).toEqual({ submitted: true, submissionDisposition: 'submitted' });
     expect(runner.enqueued).toContain('message B prime');
     expect(runner.enqueued).not.toContain('message B');
   });

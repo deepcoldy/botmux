@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
+import type { FrozenSessionReplyContext, Session } from '../types.js';
 
 export type SessionReplyTarget =
   | { mode: 'plain'; chatId: string }
@@ -114,6 +114,34 @@ export function beginReplyTargetTurn(
   nowIso = new Date().toISOString(),
   opts?: { quoteOnly?: boolean; substitute?: boolean },
 ): void {
+  const exactTarget: SessionReplyTarget = ds.scope === 'chat'
+    ? replyRootId
+      ? opts?.quoteOnly
+        ? { mode: 'quote', rootMessageId: replyRootId }
+        : { mode: 'thread', rootMessageId: replyRootId }
+      : { mode: 'plain', chatId: ds.chatId }
+    : { mode: 'thread', rootMessageId: ds.session.rootMessageId };
+  const exactContexts = { ...(ds.session.turnReplyContexts ?? {}) };
+  // Re-insertion keeps the newest turn at the end for deterministic bounding.
+  delete exactContexts[turnId];
+  exactContexts[turnId] = {
+    target: exactTarget,
+    ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(ds.session.quoteTargetSenderOpenId
+      ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
+      : {}),
+    ...(ds.session.quoteTargetSenderIsBot !== undefined
+      ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
+      : {}),
+  };
+  const overflow = Object.keys(exactContexts).length - 256;
+  if (overflow > 0) {
+    for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
+      delete exactContexts[staleTurnId];
+    }
+  }
+  ds.session.turnReplyContexts = exactContexts;
+
   if (ds.scope !== 'chat') return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
@@ -144,6 +172,16 @@ export function beginReplyTargetTurn(
   }
   ds.currentReplyTarget = undefined;
   ds.session.currentReplyTarget = undefined;
+}
+
+/** Resolve a turn's immutable inbound destination, falling back only for
+ * legacy/non-Lark turns that predate the bounded registry. */
+export function frozenReplyContextForTurn(
+  ds: Pick<DaemonSession, 'scope' | 'chatId' | 'session' | 'currentReplyTarget'>,
+  turnId?: string,
+): FrozenSessionReplyContext {
+  const frozen = turnId ? ds.session.turnReplyContexts?.[turnId] : undefined;
+  return frozen ?? { target: resolveSessionReplyTarget(ds, turnId) };
 }
 
 /**

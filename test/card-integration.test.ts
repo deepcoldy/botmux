@@ -162,9 +162,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { scheduleCardPatch } from '../src/core/worker-pool.js';
-import { killWorker, forkWorker } from '../src/core/worker-pool.js';
-import { sessionKey } from '../src/core/types.js';
+import { scheduleCardPatch, forkWorker, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 
@@ -189,7 +188,14 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       chatType: 'group',
       scope: 'chat',
     },
-    worker: { killed: false, send: vi.fn() } as any,
+    worker: {
+      killed: false,
+      send: vi.fn(),
+      kill: vi.fn(),
+      once: vi.fn(),
+      exitCode: null,
+      signalCode: null,
+    } as any,
     workerPort: 8080,
     workerToken: 'tok_secret',
     larkAppId: APP_ID,
@@ -214,6 +220,10 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
 
 function makeDeps(activeSessions: Map<string, DaemonSession>): CardHandlerDeps {
   sessionReplyCallIndex = 0;
+  // closeSession is intentionally real in this partial worker-pool mock; point
+  // its authoritative registry at the integration fixture so close-card tests
+  // exercise the same identity-safe eviction contract as production.
+  setActiveSessionsRegistry(activeSessions);
   return {
     activeSessions,
     sessionReply: vi.fn(async () => {
@@ -471,7 +481,7 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(workerSend).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
       // The confirmation is delivered ephemeral to the clicker (group chat + an
       // operator open_id), not as a visible group reply.
       expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
@@ -491,17 +501,16 @@ describe('Card integration: full event flow', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
     });
 
-    it('close should kill worker and remove session', async () => {
+    it('close should remove session and deliver the closed card', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession();
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_user', undefined, ds.session.sessionId), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessions.has(sKey)).toBe(false);
       // Closed reply is an interactive card with a Resume button, delivered
       // ephemeral to the clicker (group chat + operator open_id); the mocked
@@ -525,13 +534,16 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', undefined, ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
-        expect(killWorker).toHaveBeenCalledWith(ds);
         expect(sessions.has(sKey)).toBe(false);
         // Closed card goes ephemeral to the owner …
         expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
@@ -566,13 +578,16 @@ describe('Card integration: full event flow', () => {
       try {
         const ds = makeDaemonSession();
         const sessions = new Map<string, DaemonSession>();
-        const sKey = sessionKey(ROOT_ID, APP_ID);
+        const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
         const deps = makeDeps(sessions);
 
-        await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
+        await handleCardAction(
+          makeCloseEvent(ROOT_ID, 'ou_owner', 'private', ds.session.sessionId),
+          deps,
+          APP_ID,
+        );
 
-        expect(killWorker).toHaveBeenCalledWith(ds);
         // Closed card still goes ephemeral to the owner …
         expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
           APP_ID, ds.chatId, 'ou_owner', expect.stringContaining('"type":"closed"'),
@@ -788,7 +803,7 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(workerSend).toHaveBeenCalledWith({ type: 'restart', reason: 'operator' });
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
@@ -799,13 +814,12 @@ describe('Card integration: full event flow', () => {
       const clientMod = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({ scope: 'thread' });
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
+      const sKey = activeSessionKey(ds);
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
       await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessions.has(sKey)).toBe(false);
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
@@ -1137,6 +1151,7 @@ describe('Card integration: full event flow', () => {
       // sessionReply was used to surface the rejection message.
       expect(deps.sessionReply).toHaveBeenCalled();
     });
+
   });
 
   describe('Scenario 8: usage-limit retry action', () => {

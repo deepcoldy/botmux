@@ -45,8 +45,10 @@ export class PtyBackend implements SessionBackend {
     logger.debug(`[pty] spawned pid=${this.process.pid}`);
   }
 
-  write(data: string): void {
-    this.process?.write(data);
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
   }
 
   resize(cols: number, rows: number): void {

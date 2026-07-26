@@ -247,9 +247,9 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
-  write(data: string): void {
+  write(data: string): boolean {
     // No PTY to write to — interpret as a literal send-keys.
-    this.sendText(data);
+    return this.sendText(data);
   }
 
   sendText(text: string): boolean {

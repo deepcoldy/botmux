@@ -18,7 +18,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 
-const { tmuxKill, herdrKill, herdrKillAgent, zellijKill, getBotMock } = vi.hoisted(() => ({
+const {
+  tmuxKill,
+  herdrKill,
+  herdrKillAgent,
+  zellijKill,
+  getBotMock,
+} = vi.hoisted(() => ({
   tmuxKill: vi.fn(),
   herdrKill: vi.fn(),
   herdrKillAgent: vi.fn(),
@@ -42,6 +48,7 @@ vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: getBotMock,
+  getBotBrand: vi.fn(() => 'feishu'),
   getAllBots: vi.fn(() => []),
   resolveBrandLabel: vi.fn(() => undefined),
 }));
@@ -58,6 +65,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),
+  deleteFrozenCards: vi.fn(),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -168,4 +176,5 @@ describe('killWorker — with a live worker (unchanged path)', () => {
     expect(d.worker).toBeNull();
     expect(d.managedTurnOrigin).toBeUndefined();
   });
+
 });

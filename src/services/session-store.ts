@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import type { Session } from '../types.js';
@@ -78,54 +79,58 @@ function load(): void {
   if (loaded) return;
   ensureDir();
   const fp = getFilePath();
-  if (existsSync(fp)) {
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8'));
-      sessions = new Map(Object.entries(data));
-    } catch (err) {
-      logger.error(`Failed to load sessions: ${err}`);
-      sessions = new Map();
-      loaded = true;
-      return;
-    }
-    const repaired = repairMissingChatScopes();
-    if (repaired > 0) {
+  withFileLockSync(fp, () => {
+    if (existsSync(fp)) {
       try {
-        save();
-        logger.info(`Repaired ${repaired} scope-less chat session(s) in ${fp}`);
-      } catch (err) {
-        // Loading succeeded, so keep the in-memory sessions available even if
-        // this best-effort migration cannot be persisted yet (ENOSPC/EACCES).
-        logger.error(`Failed to persist repaired chat session scopes: ${err}`);
-      }
-    }
-    logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
-  } else if (currentAppId) {
-    // Per-bot file doesn't exist — migrate matching sessions from legacy sessions.json
-    const legacyFp = join(config.session.dataDir, 'sessions.json');
-    if (existsSync(legacyFp)) {
-      try {
-        const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
-        sessions = new Map();
-        for (const [k, v] of Object.entries(data)) {
-          if (v.larkAppId === currentAppId) {
-            sessions.set(k, v);
+        const data = JSON.parse(readFileSync(fp, 'utf-8'));
+        sessions = new Map(Object.entries(data));
+        const repaired = repairMissingChatScopes();
+        if (repaired > 0) {
+          try {
+            const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+            writeFileSync(tmpFp, JSON.stringify(Object.fromEntries(sessions), null, 2), 'utf-8');
+            renameSync(tmpFp, fp);
+            logger.info(`Repaired ${repaired} scope-less chat session(s) in ${fp}`);
+          } catch (err) {
+            // Loading succeeded, so keep the in-memory sessions available even
+            // if the best-effort repair cannot be persisted yet.
+            logger.error(`Failed to persist repaired chat session scopes: ${err}`);
           }
         }
-        if (sessions.size > 0) {
-          const repaired = repairMissingChatScopes();
-          save();
-          logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
-          if (repaired > 0) {
-            logger.info(`Repaired ${repaired} scope-less chat session(s) during migration`);
-          }
-        }
+        logger.info(`Loaded ${sessions.size} sessions from ${fp}`);
       } catch (err) {
-        logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+        logger.error(`Failed to load sessions: ${err}`);
         sessions = new Map();
       }
+    } else if (currentAppId) {
+      // Per-bot file doesn't exist — migrate matching legacy rows while still
+      // holding the same lock used by daemon saves and offline CLI mutations.
+      const legacyFp = join(config.session.dataDir, 'sessions.json');
+      if (existsSync(legacyFp)) {
+        try {
+          const data: Record<string, Session> = JSON.parse(readFileSync(legacyFp, 'utf-8'));
+          sessions = new Map();
+          for (const [k, v] of Object.entries(data)) {
+            if (v.larkAppId === currentAppId) sessions.set(k, v);
+          }
+          if (sessions.size > 0) {
+            const repaired = repairMissingChatScopes();
+            const obj = Object.fromEntries(sessions);
+            const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+            writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
+            renameSync(tmpFp, fp);
+            logger.info(`Migrated ${sessions.size} sessions from sessions.json to ${fp}`);
+            if (repaired > 0) {
+              logger.info(`Repaired ${repaired} scope-less chat session(s) during migration`);
+            }
+          }
+        } catch (err) {
+          logger.error(`Failed to migrate sessions from legacy file: ${err}`);
+          sessions = new Map();
+        }
+      }
     }
-  }
+  });
   loaded = true;
 }
 
@@ -142,23 +147,23 @@ function readExistingSessionsFromDisk(fp: string): { raw: string; parsed: Record
 function save(): void {
   ensureDir();
   const fp = getFilePath();
-  const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
-  const obj: Record<string, Session> = {};
-  for (const [k, v] of sessions) {
-    stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
-    obj[k] = v;
-  }
-  const json = JSON.stringify(obj, null, 2);
-  // The daemon fires several updateSession()/save() calls per inbound message
-  // (activity bump, pid, stream-card state, …) and many leave the serialized
-  // file byte-identical. Skipping the temp-file write + rename in that case
-  // elides the bulk of the redundant disk I/O — and writing identical bytes is
-  // a guaranteed no-op, so this can't drop state or race a concurrent writer
-  // (we compare against what's actually on disk right now).
-  if (json === existingRaw) return;
-  const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmpFp, json, 'utf-8');
-  renameSync(tmpFp, fp);
+  withFileLockSync(fp, () => {
+    const { raw: existingRaw } = readExistingSessionsFromDisk(fp);
+    const obj: Record<string, Session> = {};
+    for (const [k, v] of sessions) {
+      stripLegacyPendingCardFields(v as unknown as Record<string, unknown>);
+      obj[k] = v;
+    }
+    const json = JSON.stringify(obj, null, 2);
+    // The daemon fires several updateSession()/save() calls per inbound message
+    // (activity bump, pid, stream-card state, …) and many leave the serialized
+    // file byte-identical. Skipping the temp-file write + rename in that case
+    // elides the bulk of the redundant disk I/O.
+    if (json === existingRaw) return;
+    const tmpFp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
+    writeFileSync(tmpFp, json, 'utf-8');
+    renameSync(tmpFp, fp);
+  });
 }
 
 export function createSession(
@@ -188,6 +193,21 @@ export function createSession(
 export function getSession(sessionId: string): Session | undefined {
   load();
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
+}
+
+/** Cross-process fresh read ordered after daemon/CLI writes by the shared lock. */
+export function getSessionFresh(sessionId: string): Session | undefined {
+  ensureDir();
+  const fp = getFilePath();
+  return withFileLockSync(fp, () => {
+    if (!existsSync(fp)) return undefined;
+    try {
+      const data = JSON.parse(readFileSync(fp, 'utf-8')) as Record<string, Session>;
+      return data[sessionId];
+    } catch {
+      return undefined;
+    }
+  });
 }
 
 /**
@@ -234,6 +254,71 @@ export function closeSession(sessionId: string): void {
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
+}
+
+/**
+ * Reactivate one explicitly closed row and discard every queued/setup owner in
+ * the same durable file replacement.  The close path has cleared these fields
+ * since 2026-07, but older closed rows can still contain prepared input.  A
+ * generic resume is an explicit new lifecycle and must never revive that
+ * abandoned FIFO.
+ */
+export function reactivateClosedSession(
+  sessionId: string,
+): { ok: true; session: Session }
+| { ok: false; error: 'not_found' | 'not_closed' } {
+  load();
+  const session = sessions.get(sessionId);
+  if (!session) return { ok: false, error: 'not_found' };
+  if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+
+  const prior = {
+    status: session.status,
+    closedAt: session.closedAt,
+    lastMessageAt: session.lastMessageAt,
+    codexAppDispatchLedger: session.codexAppDispatchLedger,
+    codexAppGenerationCommits: session.codexAppGenerationCommits,
+    queued: session.queued,
+    queuedPrompt: session.queuedPrompt,
+    queuedCodexAppText: session.queuedCodexAppText,
+    queuedCodexAppMessageContext: session.queuedCodexAppMessageContext,
+    queuedActivationPending: session.queuedActivationPending,
+    queuedActivationToken: session.queuedActivationToken,
+    queuedActivationInput: session.queuedActivationInput,
+    queuedActivationTurnId: session.queuedActivationTurnId,
+    queuedActivationDispatchAttempt: session.queuedActivationDispatchAttempt,
+    queuedActivationResume: session.queuedActivationResume,
+    queuedActivationTail: session.queuedActivationTail,
+    queuedActivationTailNextOrder: session.queuedActivationTailNextOrder,
+    pendingRepoSetup: session.pendingRepoSetup,
+  };
+
+  session.status = 'active';
+  session.closedAt = undefined;
+  session.lastMessageAt = new Date().toISOString();
+  session.codexAppDispatchLedger = undefined;
+  session.codexAppGenerationCommits = undefined;
+  session.queued = undefined;
+  session.queuedPrompt = undefined;
+  session.queuedCodexAppText = undefined;
+  session.queuedCodexAppMessageContext = undefined;
+  session.queuedActivationPending = undefined;
+  session.queuedActivationToken = undefined;
+  session.queuedActivationInput = undefined;
+  session.queuedActivationTurnId = undefined;
+  session.queuedActivationDispatchAttempt = undefined;
+  session.queuedActivationResume = undefined;
+  session.queuedActivationTail = undefined;
+  session.queuedActivationTailNextOrder = undefined;
+  session.pendingRepoSetup = undefined;
+
+  try {
+    save();
+  } catch (err) {
+    Object.assign(session, prior);
+    throw err;
+  }
+  return { ok: true, session };
 }
 
 export function updateSessionPid(sessionId: string, pid: number | null): void {
