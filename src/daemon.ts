@@ -2,6 +2,7 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
@@ -29,7 +30,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage } from './im/lark/client.js';
+import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -43,6 +44,8 @@ import {
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
   resolveVcMeetingConsumerProfiles,
+  setResolvedAllowedUsersRepublishHook,
+  setAllowedUsersResolveRetryHook,
   type BotConfig,
   type BotState,
   type OncallChat,
@@ -65,6 +68,7 @@ import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { logger } from './utils/logger.js';
+import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
 import { withFileLock } from './utils/file-lock.js';
 import {
   hasUnsettledCodexAppDispatch,
@@ -300,6 +304,25 @@ let selfV3BootInstanceId: string | undefined;
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+/**
+ * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
+ * the deferred allowedUsers resolve retry (a detached setTimeout that has no
+ * `desc` in scope) can patch `resolvedAllowedUsers` and republish coherently —
+ * and so the 30s heartbeat, which rewrites this same object, never clobbers a
+ * healed value back to stale. One daemon per bot, so a single ref is correct.
+ */
+let selfDaemonDescriptor: DaemonDescriptor | undefined;
+
+/**
+ * Patch the live descriptor's `resolvedAllowedUsers` (ou_ only) and rewrite it.
+ * Safe to call from the deferred resolve retry. Best-effort.
+ */
+function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): void {
+  const desc = selfDaemonDescriptor;
+  if (!desc || desc.larkAppId !== larkAppId) return;
+  desc.resolvedAllowedUsers = resolved.filter(u => u.startsWith('ou_'));
+  try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
+}
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
 import { isBotMentioned, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, grantCommandRestriction, isKnownPeerBot, checkRequiredScopes, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { getDocSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, putDocSubscription, removeDocSubscription, setDocCommentPollCursor, type DocSubscription } from './services/doc-subs-store.js';
@@ -3138,6 +3161,142 @@ function removeDaemonDescriptor(larkAppId: string): void {
   if (existsSync(fp)) {
     try { unlinkSync(fp); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Persistent last-known-good `raw entry → ou_` cache for allowedUsers. The
+ * read/write primitives live in utils/allowed-users-cache.ts so the runtime
+ * set/revoke paths (services layer) write through the same sidecar and it never
+ * diverges from the live allowlist. These thin wrappers bind the data dir.
+ */
+function readAllowedUsersCache(larkAppId: string): Record<string, string> {
+  return readAllowedUsersResolveCache(config.session.dataDir, larkAppId);
+}
+function writeAllowedUsersCache(
+  larkAppId: string,
+  map: Map<string, string>,
+  opts: { deleteEntries?: Iterable<string>; retainKeys?: Iterable<string> } = {},
+): void {
+  writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, { map, ...opts });
+}
+
+/** Raw entries the resolver flagged as definitively gone (safe to prune from cache). */
+function definitiveEntriesOf(entryStatus?: Map<string, EntryResolveStatus>): string[] {
+  if (!entryStatus) return [];
+  const out: string[] = [];
+  for (const [entry, status] of entryStatus.entries()) {
+    if (status === 'definitive') out.push(entry);
+  }
+  return out;
+}
+
+function notifyAllowedUsersResolveFailure(
+  larkAppId: string,
+  notice: string,
+  recipients: string[],
+): void {
+  logger.error(`[${larkAppId}] ${notice}`);
+  const unique = [...new Set(recipients.filter(u => typeof u === 'string' && u.startsWith('ou_')))];
+  if (unique.length === 0) {
+    logger.error(
+      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM; ` +
+      `check daemon logs and Feishu contact API, then restart this bot.`,
+    );
+    return;
+  }
+  // Fire-and-forget: the owner DM must NOT block daemon startup. sendUserMessage
+  // uses an untimed SDK path; awaiting it on the boot-critical path (before the
+  // WS listener starts) would stall the bot coming online during the very
+  // contact/network partition that triggered this notice. Bound each attempt
+  // with a deadline and detach.
+  void (async () => {
+    for (const openId of unique.slice(0, 5)) {
+      try {
+        await sendUserMessage(
+          larkAppId,
+          openId,
+          `⚠️ Botmux allowedUsers 解析告警\n\n${notice}`,
+          'text',
+          undefined,
+          { timeoutMs: 10_000 },
+        );
+      } catch (err: any) {
+        logger.warn(
+          `[${larkAppId}] failed to DM allowedUsers resolve notice to ${openId.slice(0, 12)}: ${err?.message ?? err}`,
+        );
+      }
+    }
+  })();
+}
+
+function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
+  if (attempt > 3) return;
+  const delayMs = attempt === 1 ? 30_000 : attempt === 2 ? 120_000 : 300_000;
+  const timer = setTimeout(() => {
+    void (async () => {
+      let bot: BotState;
+      try {
+        bot = getBot(larkAppId);
+      } catch {
+        return;
+      }
+      const configured = bot.config.allowedUsers ?? [];
+      if (configured.length === 0) return;
+      // Fingerprint the config we resolve against. A /revoke or `set allowedUsers`
+      // can land during the cross-network resolve await below; without this fence
+      // the stale retry result would clobber the newer runtime/cache/descriptor —
+      // reviving a just-revoked guest, or forking runtime from the persisted
+      // config until the next restart. If the config changed, drop this result
+      // (the mutation path already wrote through, and if it needs a retry it
+      // schedules its own).
+      const fingerprint = JSON.stringify(configured);
+      try {
+        const resolveResult = await resolveAllowedUsersWithMap(larkAppId, configured);
+        let liveBot: BotState;
+        try { liveBot = getBot(larkAppId); } catch { return; }
+        if (JSON.stringify(liveBot.config.allowedUsers ?? []) !== fingerprint) {
+          logger.info(
+            `[${larkAppId}] allowedUsers resolve retry #${attempt} discarded: config changed during resolve`,
+          );
+          return;
+        }
+        const applied = applyAllowedUsersResolve({
+          rawEntries: configured,
+          previousResolvedMap: readAllowedUsersCache(larkAppId),
+          resolveResult,
+        });
+        liveBot.resolvedAllowedUsers = applied.resolved;
+        liveBot.rawAllowedUserResolution = applied.map;
+        // Persist the recovered map + republish the descriptor so the dashboard
+        // (create-group creator picker) and the next boot both see the healed
+        // open_ids — otherwise a successful retry only heals in-memory state.
+        // Prune definitively-gone entries + keys no longer configured so a stale
+        // owner can't be revived later.
+        writeAllowedUsersCache(larkAppId, applied.map, {
+          deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+          retainKeys: configured,
+        });
+        republishResolvedAllowedUsers(larkAppId, applied.resolved);
+        if (!applied.failed) {
+          logger.info(
+            `[${larkAppId}] allowedUsers resolve retry succeeded: ${applied.resolved.join(', ') || '(empty — entries definitively gone)'}`,
+          );
+          return;
+        }
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} still degraded` +
+          `${applied.usedFallback ? ' (on cache)' : applied.resolved.length ? '' : ' (allowlist empty)'}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      } catch (err: any) {
+        logger.warn(
+          `[${larkAppId}] allowedUsers resolve retry #${attempt} threw: ${err?.message ?? err}`,
+        );
+        scheduleAllowedUsersResolveRetry(larkAppId, attempt + 1);
+      }
+    })();
+  }, delayMs);
+  timer.unref?.();
 }
 
 // ─── Version tracking ────────────────────────────────────────────────────────
@@ -15256,7 +15415,7 @@ async function startInitialPassthroughSession(args: {
   const botCfg = getBot(larkAppId).config;
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
   const directChatSender = chatType === 'p2p'
-    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType)
+    ? await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId })
     : undefined;
   // Group cold-start passthroughs only need a stable caller identity while the
   // repo picker is pending. Avoid adding a contact lookup to every /goal start;
@@ -15669,7 +15828,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         setDirectChatDisplayNameFromSender(
           session,
           chatType,
-          await resolveSender(larkAppId, senderOpenId, parsed.senderType),
+          await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId }),
         );
       }
       session.larkAppId = larkAppId;
@@ -15765,7 +15924,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     parsed.content,
     parsed.mentions,
   );
-  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType);
+  const newTopicSender = await resolveSender(larkAppId, senderOpenId, parsed.senderType, { messageId });
 
   refreshCliVersion(botCfg.cliId, botCfg.cliPathOverride);
 
@@ -16286,7 +16445,9 @@ async function handleThreadReplyAdmitted(data: any, ctx: RoutingContext): Promis
       larkAppId,
       senderOpenIdForPrefix,
       parsed.senderType,
-      isForeignBot ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined } : undefined,
+      isForeignBot
+        ? { type: 'bot', name: foreignBotName !== 'Bot' ? foreignBotName : undefined, messageId: parsed.messageId }
+        : { messageId: parsed.messageId },
     );
     return threadSenderCached;
   };
@@ -18160,6 +18321,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // briefly sees an unusable on_/email (the resolution below rewrites this field).
     resolvedAllowedUsers: getBot(cfg.larkAppId).resolvedAllowedUsers.filter(u => u.startsWith('ou_')),
   };
+  // Expose the live descriptor module-level so the deferred allowedUsers resolve
+  // retry can republish healed open_ids coherently (see republishResolvedAllowedUsers).
+  selfDaemonDescriptor = desc;
+  // Let runtime allowedUsers mutations (set / revoke, in the services layer)
+  // republish the descriptor through the same path without importing daemon
+  // internals. Registered once per daemon; one daemon per bot.
+  setResolvedAllowedUsersRepublishHook(republishResolvedAllowedUsers);
+  // And let a mutation that hit a transient contact failure schedule the same
+  // background resolve-retry the startup path uses (heal-when-API-recovers).
+  setAllowedUsersResolveRetryHook((appId) => scheduleAllowedUsersResolveRetry(appId));
   // 名称状态刷新：displayName 或飞书真名变化后，用有效展示名刷新 descriptor +
   // SessionRow.botName，无需重启 daemon。displayName 路径经 bot-config-store 的
   // 钩子触发；真·改名路径在下面的 renamer 里直接调用。
@@ -18479,21 +18650,70 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     refreshCliVersion(cfg.cliId, cfg.cliPathOverride);
 
     // Resolve allowed users per bot
-    if (bot.resolvedAllowedUsers.length > 0) {
+    if ((bot.config.allowedUsers?.length ?? 0) > 0 || bot.resolvedAllowedUsers.length > 0) {
       // 含邮箱或 union_id(on_) 都要重解析成本 app 的 open_id —— 否则 canTalk/canOperate
       // 拿 sender 的 ou_ 对不上 on_，owner 会被自己的 bot 锁死（PR#72）。
       // literal ou_ 也走 best-effort 校验，用于诊断把其他 app 视角 open_id
       // 误填到本 bot 的配置。
-      const needsResolve = bot.resolvedAllowedUsers.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+      //
+      // Transient contact failures must NOT blank the runtime list: an empty
+      // resolved allowlist under a configured allowedUsers is fail-closed and
+      // silently drops even the real owner (@ with no group reply). Reuse the
+      // last-known-good `raw → ou_` cache PER ENTRY (only for still-configured,
+      // transient-failed entries), log loudly, DM owners (fire-and-forget), and
+      // schedule retries. The cache is a persistent sidecar — NOT the dashboard
+      // descriptor, which is overwritten early in boot and deleted on shutdown.
+      const configured = bot.config.allowedUsers ?? bot.resolvedAllowedUsers;
+      const needsResolve = configured.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
       if (needsResolve) {
+        const previousResolvedMap = readAllowedUsersCache(cfg.larkAppId);
         try {
-          // 同时拿到 raw→open_id 映射，供 /revoke 反查删除 email 形式的 raw 条目（R2#2）。
-          const { resolved, map } = await resolveAllowedUsersWithMap(cfg.larkAppId, bot.resolvedAllowedUsers);
-          bot.resolvedAllowedUsers = resolved;
-          bot.rawAllowedUserResolution = map;
-          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ')}`);
+          // 同时拿到 raw→open_id 映射,供 /revoke 反查删除 email 形式的 raw 条目(R2#2)。
+          const resolveResult = await resolveAllowedUsersWithMap(cfg.larkAppId, configured);
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedMap,
+            resolveResult,
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
+          // Persist the fresh/recovered map so the next boot (and a clean
+          // restart, which deletes the descriptor) can fall back per-entry.
+          // Prune definitively-gone entries + keys no longer configured.
+          writeAllowedUsersCache(cfg.larkAppId, applied.map, {
+            deleteEntries: definitiveEntriesOf(resolveResult.entryStatus),
+            retainKeys: configured,
+          });
+          logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
+          if (applied.failed && applied.notice) {
+            notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            scheduleAllowedUsersResolveRetry(cfg.larkAppId);
+          }
         } catch (err: any) {
-          logger.warn(`[${cfg.larkAppId}] Failed to resolve allowedUsers: ${err.message}`);
+          // A full throw is a transient outage: mark every contact-resolvable
+          // entry transient so the pure fn can recover each from cache.
+          const throwStatus = new Map<string, EntryResolveStatus>();
+          for (const e of configured) {
+            if (e.includes('@') || e.startsWith('on_') || e.startsWith('ou_')) throwStatus.set(e, 'transient');
+          }
+          const applied = applyAllowedUsersResolve({
+            rawEntries: configured,
+            previousResolvedMap,
+            resolveResult: { resolved: [], map: new Map(), errored: true, entryStatus: throwStatus },
+          });
+          bot.resolvedAllowedUsers = applied.resolved;
+          bot.rawAllowedUserResolution = applied.map;
+          if (applied.usedFallback) {
+            writeAllowedUsersCache(cfg.larkAppId, applied.map, { retainKeys: configured });
+          }
+          const notice = applied.notice
+            ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
+          notifyAllowedUsersResolveFailure(
+            cfg.larkAppId,
+            `${notice} (throw: ${err?.message ?? err})`,
+            applied.resolved,
+          );
+          scheduleAllowedUsersResolveRetry(cfg.larkAppId);
         }
       }
       // Republish the descriptor with the post-resolution open_ids so the

@@ -78,7 +78,24 @@ export async function queryTriggerResult(
       errorCode: 'trigger_failed',
     };
   }
-  return { status: upstream.status, body: parsed };
+  // Legacy-consumer adapter: the daemon's four-state trigger-result returns
+  // `ok:true` + HTTP 200 for terminal `failed`/`not_found` (task state lives in
+  // `.state`). Existing webhook async pollers + audit logging predate `.state`
+  // and branch on BOTH `ok` AND the HTTP status — the pre-four-state baseline was
+  // `404 + ok:false` for a missing session. Leaving `200 + ok:true` here would
+  // record a failed/lost task as `completed` AND break clients that switch on
+  // status. So for THIS webhook path we restore the legacy shape: `ok:false` plus
+  // a non-200 status (not_found→404, matching the old session_not_found; failed→
+  // 404 too, since to a legacy poller "terminated with no output" is equally "no
+  // result to fetch"). `.state` is preserved for consumers that have adopted it.
+  // The new four-state contract (raw dashboard proxy → task-runner callers) does
+  // NOT pass through queryTriggerResult and is therefore unaffected.
+  let status = upstream.status;
+  if (parsed.ok && (parsed.state === 'failed' || parsed.state === 'not_found')) {
+    parsed = { ...parsed, ok: false };
+    if (status === 200) status = 404;
+  }
+  return { status, body: parsed };
 }
 
 export async function dispatchTriggerRequest(

@@ -167,6 +167,194 @@ describe('per-bot turn mutation gate', () => {
     expect(events).toEqual(['mutated', 'outer-finished']);
   });
 
+  it('serializes concurrent mutations that share one admission lease', async () => {
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const events: string[] = [];
+    let activeMutations = 0;
+    let maxActiveMutations = 0;
+
+    const outer = withBotTurnAdmission('app-a', async () => {
+      await Promise.all([
+        withBotTurnMutation('app-a', async () => {
+          activeMutations++;
+          maxActiveMutations = Math.max(maxActiveMutations, activeMutations);
+          events.push('first-start');
+          firstEntered.resolve();
+          await releaseFirst.promise;
+          events.push('first-end');
+          activeMutations--;
+        }),
+        withBotTurnMutation('app-a', () => {
+          activeMutations++;
+          maxActiveMutations = Math.max(maxActiveMutations, activeMutations);
+          events.push('second');
+          activeMutations--;
+        }),
+      ]);
+      events.push('outer-done');
+    });
+
+    await firstEntered.promise;
+    expect(events).toEqual(['first-start']);
+    releaseFirst.resolve();
+    await outer;
+    expect(events).toEqual(['first-start', 'first-end', 'second', 'outer-done']);
+    expect(maxActiveMutations).toBe(1);
+
+    await withBotTurnAdmission('app-a', () => events.push('later-admission'));
+    await withBotTurnMutation('app-a', () => events.push('later-mutation'));
+    expect(events.slice(-2)).toEqual(['later-admission', 'later-mutation']);
+  });
+
+  it('lets a bounded sibling acquire after an earlier same-lease mutation', async () => {
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const boundedAction = vi.fn(() => 'bounded-value');
+
+    const outer = withBotTurnAdmission('app-a', async () => {
+      const first = withBotTurnMutation('app-a', async () => {
+        firstEntered.resolve();
+        await releaseFirst.promise;
+      });
+      const bounded = tryWithBotTurnMutation('app-a', 1_000, boundedAction);
+      const [, result] = await Promise.all([first, bounded]);
+      return result;
+    });
+
+    await firstEntered.promise;
+    expect(boundedAction).not.toHaveBeenCalled();
+    releaseFirst.resolve();
+
+    await expect(outer).resolves.toEqual({ acquired: true, value: 'bounded-value' });
+    expect(boundedAction).toHaveBeenCalledOnce();
+  });
+
+  it('times out a bounded same-lease sibling without running it later', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const staleAction = vi.fn();
+    const thirdAction = vi.fn();
+
+    const outer = withBotTurnAdmission('app-a', async () => {
+      const first = withBotTurnMutation('app-a', async () => {
+        firstEntered.resolve();
+        await releaseFirst.promise;
+      });
+      const bounded = tryWithBotTurnMutation('app-a', 10, staleAction);
+      const third = withBotTurnMutation('app-a', thirdAction);
+      const [, result] = await Promise.all([first, bounded, third]);
+      return result;
+    });
+
+    await firstEntered.promise;
+    await vi.advanceTimersByTimeAsync(11);
+    expect(staleAction).not.toHaveBeenCalled();
+    expect(thirdAction).not.toHaveBeenCalled();
+    releaseFirst.resolve();
+
+    await expect(outer).resolves.toEqual({ acquired: false, reason: 'timeout' });
+    await vi.runAllTimersAsync();
+    expect(staleAction).not.toHaveBeenCalled();
+    expect(thirdAction).toHaveBeenCalledOnce();
+
+    const later = vi.fn();
+    await withBotTurnMutation('app-a', later);
+    expect(later).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an overdue same-lease queue handoff before its timer callback', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000);
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const staleAction = vi.fn();
+
+    const outer = withBotTurnAdmission('app-a', async () => {
+      const first = withBotTurnMutation('app-a', async () => {
+        firstEntered.resolve();
+        await releaseFirst.promise;
+      });
+      const bounded = tryWithBotTurnMutation('app-a', 10, staleAction);
+      const [, result] = await Promise.all([first, bounded]);
+      return result;
+    });
+
+    await firstEntered.promise;
+    // Move wall time past the deadline without running the timer. Direct queue
+    // handoff wins this race, but the expired owner must only release its slot.
+    vi.setSystemTime(1_020);
+    releaseFirst.resolve();
+
+    await expect(outer).resolves.toEqual({ acquired: false, reason: 'timeout' });
+    expect(staleAction).not.toHaveBeenCalled();
+    await vi.runAllTimersAsync();
+    expect(staleAction).not.toHaveBeenCalled();
+
+    const later = vi.fn();
+    await withBotTurnMutation('app-a', later);
+    expect(later).toHaveBeenCalledOnce();
+  });
+
+  it.each(['first', 'second'] as const)(
+    'continues a same-lease mutation queue when the %s action throws',
+    async failingAction => {
+      const events: string[] = [];
+      const error = new Error(`${failingAction}-failed`);
+
+      const results = await withBotTurnAdmission('app-a', () => Promise.allSettled([
+        withBotTurnMutation('app-a', () => {
+          events.push('first');
+          if (failingAction === 'first') throw error;
+          return 'first-value';
+        }),
+        withBotTurnMutation('app-a', () => {
+          events.push('second');
+          if (failingAction === 'second') throw error;
+          return 'second-value';
+        }),
+      ]));
+
+      expect(events).toEqual(['first', 'second']);
+      expect(results[0].status).toBe(failingAction === 'first' ? 'rejected' : 'fulfilled');
+      expect(results[1].status).toBe(failingAction === 'second' ? 'rejected' : 'fulfilled');
+
+      const recovered = vi.fn();
+      await withBotTurnAdmission('app-a', recovered);
+      await withBotTurnMutation('app-a', recovered);
+      expect(recovered).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('does not restore a ghost admission when a queued upgrade outlives its owner', async () => {
+    const releaseFirst = deferred();
+    const firstEntered = deferred();
+    const events: string[] = [];
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+
+    await withBotTurnAdmission('app-a', () => {
+      first = withBotTurnMutation('app-a', async () => {
+        events.push('first-start');
+        firstEntered.resolve();
+        await releaseFirst.promise;
+        events.push('first-end');
+      });
+      second = withBotTurnMutation('app-a', () => events.push('second'));
+    });
+
+    await firstEntered.promise;
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    expect(events).toEqual(['first-start', 'first-end', 'second']);
+
+    const laterMutation = vi.fn();
+    await withBotTurnMutation('app-a', laterMutation);
+    expect(laterMutation).toHaveBeenCalledOnce();
+  });
+
   it('an upgraded mutation drains peer admissions and blocks later turns', async () => {
     const letPeerFinish = deferred();
     const letCloseFinish = deferred();

@@ -68,12 +68,27 @@ export type TriggerErrorCode =
   | 'target_required'
   | 'trigger_failed'
   | 'wait_timeout'
+  | 'no_output'
   | 'workflow_trigger_not_implemented';
+
+/** Four-state async lifecycle for `GET /api/sessions/:id/trigger-result`.
+ *  Programmatic callers (task runners) branch on this instead of ok/action:
+ *  - running:   turn still in flight — keep polling
+ *  - completed: final output captured (see output.content)
+ *  - failed:    session terminated without a captured output (soft terminal —
+ *               may be a genuine failure OR a caller-initiated close/cancel)
+ *  - not_found: no session record on disk (never existed / invalid id) */
+export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found';
 
 export interface TriggerResponse {
   ok: boolean;
   triggerId?: string;
   action?: TriggerAction;
+  /** Four-state async lifecycle. Present on trigger-result (async polling)
+   *  responses; absent on synchronous turn/workflow dispatch responses. */
+  state?: AsyncTriggerState;
+  /** ISO8601 completion/termination time. Present on completed/failed states. */
+  finishedAt?: string;
   target?: {
     kind: TriggerTargetKind;
     sessionId?: string;

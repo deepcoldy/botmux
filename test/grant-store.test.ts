@@ -31,8 +31,9 @@ beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-store-'));
   configPath = join(dir, 'bots.json');
   process.env.BOTS_CONFIG = configPath;
+  process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
 });
-afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
 describe('grant-store', () => {
   it('addChatGrant persists & syncs in-memory; only affects given chat', async () => {

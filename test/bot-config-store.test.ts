@@ -25,14 +25,16 @@ vi.mock('../src/im/lark/client.js', () => ({
   resolveAllowedUsersWithMap: async (_appId: string, raw: string[]) => {
     const map = new Map<string, string>();
     const resolved: string[] = [];
+    const entryStatus = new Map<string, 'resolved' | 'transient' | 'definitive'>();
     for (const v of raw) {
       let id: string | undefined;
       if (v.startsWith('ou_')) id = v;
       else if (v.startsWith('on_')) id = 'ou_' + v.slice(3);
       else if (v.includes('@')) id = 'ou_' + v.split('@')[0];
-      if (id) { resolved.push(id); map.set(v, id); }
+      if (id) { resolved.push(id); map.set(v, id); entryStatus.set(v, 'resolved'); }
+      else entryStatus.set(v, 'definitive');
     }
-    return { resolved, map };
+    return { resolved, map, entryStatus };
   },
 }));
 
@@ -50,8 +52,11 @@ describe('bot-config store', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-cfgstore-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    // Isolate the allowedUsers sidecar (setBotAllowedUsers writes it) into the
+    // same tmp dir so tests don't pollute the real ~/.botmux/data.
+    process.env.SESSION_DATA_DIR = dir;
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; });
 
   function writeConfig(entry: Record<string, unknown> = {}) {
     writeFileSync(configPath, JSON.stringify([{

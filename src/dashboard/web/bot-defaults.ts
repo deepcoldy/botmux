@@ -76,6 +76,8 @@ export type BotDefaultsRow = {
   residentSessionCount?: number;
   dormantSessionCount?: number;
   startupCommands?: string;
+  customPassthroughCommands?: string;
+  canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;

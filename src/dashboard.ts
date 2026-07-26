@@ -3664,6 +3664,35 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // 单会话元信息（状态/标题/cli/工作目录等）。dashboard 之前只代理了
+    // GET /api/sessions（列表），没有单会话 :id 路由，编程式调用方（如任务
+    // 编排器的「任务详情」面板）走 getMeta 会落到最底的 404 not_found_yet。
+    // owner-only；ownerOf 对已关闭会话仍可解析。放在 trigger-result 之后，
+    // 避免把 /trigger-result、/insight 等子路径吞进这个单段匹配。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // 异步 trigger 结果轮询（asyncReturnSessionId 模式的权威查询端点）。
+    // 四态 running/completed/failed/not_found，daemon 重启后从持久化结果兜底
+    // 重建 completed。owner-only（写权限 cookie），代理到 owner daemon 同名 IPC。
+    // ownerOf 对已关闭会话仍可解析（aggregator 的 /api/sessions 含 closed）。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trigger-result$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
@@ -4226,6 +4255,42 @@ const server = createServer(async (req, res) => {
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8') || '{}';
       const upstream = await proxyToDaemon(appId, `/api/bot-startup-commands`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/custom-passthrough — proxy to that bot's daemon. Body
+    // `{ customPassthroughCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotPassthrough: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPassthrough = url.pathname.match(/^\/api\/bots\/([^/]+)\/custom-passthrough$/))) {
+      const appId = decodeURIComponent(mBotPassthrough[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-custom-passthrough`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/cantalk-daemon-commands — proxy to that bot's daemon. Body
+    // `{ canTalkDaemonCommands: string }` (raw text, comma/space separated; '' = clear).
+    let mBotCanTalk: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotCanTalk = url.pathname.match(/^\/api\/bots\/([^/]+)\/cantalk-daemon-commands$/))) {
+      const appId = decodeURIComponent(mBotCanTalk[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-cantalk-daemon-commands`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

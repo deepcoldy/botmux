@@ -52,6 +52,9 @@ export interface BridgeGateInput {
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
+  /** Explicit transcript terminal semantics. Undefined preserves the
+   * historical "assistant_final means completed" behavior. */
+  terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
 export function buildBridgeSendMarkerContent(content: string): Pick<BridgeSendMarker, 'contentLength'> | undefined {
@@ -101,4 +104,45 @@ export function shouldSuppressBridgeEmit(
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
   return markerSetCoversFinal(markersInWindow, turn.finalText);
+}
+
+/** Some structured CLIs can report a durable completed turn while their
+ * terminal event carries no final text. If there was no explicit `botmux send`
+ * in that turn window, silently completing leaves the Lark thread with no
+ * visible outcome. Emit a diagnostic fallback only for that narrow case.
+ *
+ * Scope note (shared path): this gate feeds worker.ts:emitReadyCodexTurns,
+ * which is shared by every structured-bridge CLI (Codex / Traex / Cursor / Pi /
+ * Grok / Hermes / Mtr / Coco). In practice only two of them can produce an
+ * empty-finalText `assistant_final` that reaches here:
+ *   - Traex — `task_complete` with an empty `last_agent_message`
+ *     (terminalStatus undefined → treated as completed below);
+ *   - Grok  — `turn_completed` + stop_reason `end_turn` where the post-tool
+ *     buffer is empty (terminalStatus 'completed').
+ * The other six drainers drop empty text before enqueue (`if (!text) continue`),
+ * so the fallback is unreachable for them.
+ *
+ * terminalStatus dependency: `undefined` is admitted as "completed" for
+ * back-compat with legacy assistant_final events. This relies on Traex encoding
+ * a cancel/abort as `turn_aborted` (terminalStatus 'ambiguous', excluded here)
+ * rather than as an empty `task_complete`. If that fork contract ever changes,
+ * a cancelled turn could surface a spurious "completed but empty" diagnostic.
+ *
+ * Marker caveat: `shouldSuppressBridgeEmit` only sees `botmux send` markers, and
+ * detoured sends (`--top-level` / `--into` / `--override-chat`) intentionally
+ * write no marker (cli.ts shouldRecordBridgeMarker). A turn whose only visible
+ * reply went out via such a send therefore still trips this diagnostic; the
+ * user-facing string (i18n `worker.empty_final_completed`) is worded to account
+ * for that case rather than asserting no send happened. */
+export function shouldEmitEmptyCompletedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
+  if ((turn.finalText ?? '').trim().length > 0) return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }

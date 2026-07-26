@@ -1005,21 +1005,41 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
  * (matched case-insensitively against the API's returned email) so the map key
  * always equals what's in `allowedUsers`. Unresolvable emails are dropped.
  */
+/**
+ * Per-raw-entry outcome of an allowedUsers resolve:
+ *  - `resolved`   — turned into an ou_ this pass (or a literal ou_ kept as-is).
+ *  - `transient`  — contact API transiently failed (throw / rate limit / 5xx);
+ *                   a last-known-good cache MAY be reused for this entry.
+ *  - `definitive` — id invalid / not visible / not found (DEFINITIVE codes) or
+ *                   a code-0 batch that simply didn't return this email; the
+ *                   entry is genuinely gone and MUST NOT be revived from cache.
+ */
+export type EntryResolveStatus = 'resolved' | 'transient' | 'definitive';
+
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
-): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean }> {
+): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
   // requested item — the caller can then say "resolution failed, retry" instead
   // of the misleading "this identifier does not exist". Definitive failures
   // (id invalid / not visible: DEFINITIVE_CONTACT_ERROR_CODES) don't set it.
   let errored = false;
+  // Per-raw-entry outcome so callers can fall back to a last-known-good cache
+  // ONLY for entries that transient-failed AND are still configured — never for
+  // definitively-removed users (revives ex-owners) or entries no longer in
+  // config (revives a swapped-out owner). See allowed-users-apply.ts. Any entry
+  // not explicitly set below stays absent → treated as 'definitive' (drop).
+  const entryStatus = new Map<string, EntryResolveStatus>();
   const openIds: string[] = [];
   const emails: string[] = [];
   const unionIds: string[] = [];
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       map.set(v, v);
+      // Literal ou_ is app-scoped and kept as-is (never dropped, mirrors
+      // pre-existing behavior); the diagnostic GET below does not change this.
+      entryStatus.set(v, 'resolved');
       openIds.push(v);
     } else if (v.startsWith('on_')) {
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
@@ -1056,13 +1076,25 @@ export async function resolveAllowedUsersWithMap(
         const oid = res?.data?.user?.open_id as string | undefined;
         if (res.code === 0 && oid) {
           map.set(uid, oid);
+          entryStatus.set(uid, 'resolved');
           logger.info(`Resolved ${uid} → ${oid}`);
         } else {
-          if (!classifyContactErrorCode(res?.code)) errored = true;
+          // code-0 with no open_id is a DEFINITIVE miss (union user outside this
+          // app's contact visibility → tenant returns an empty code-0 shell
+          // rather than 41050), mirroring the email-batch not-in-list case above
+          // and getUserProfileStrict's `code===0 ? 'not_visible'` rule. Bucketing
+          // it 'transient' would (a) spin the never-converging retry/DM chain and
+          // (b) revive a now-invisible owner from a stale cache. Only a non-zero
+          // non-definitive code (network/5xx/rate-limit) is transient.
+          const definitive = res?.code === 0 ? true : !!classifyContactErrorCode(res?.code);
+          if (!definitive) errored = true;
+          entryStatus.set(uid, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
       } catch (err: any) {
-        if (!classifyContactErrorCode(getLarkErrorCode(err))) errored = true;
+        const definitive = !!classifyContactErrorCode(getLarkErrorCode(err));
+        if (!definitive) errored = true;
+        entryStatus.set(uid, definitive ? 'definitive' : 'transient');
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
     }
@@ -1074,7 +1106,16 @@ export async function resolveAllowedUsersWithMap(
           data: { emails, include_resigned: false },
         });
         if (res.code !== 0) {
+          // A non-zero batchGetId code is a WHOLE-REQUEST failure, not a
+          // per-email identity verdict — even a permanent 4xx like 40001
+          // (invalid argument) tells us nothing about whether any individual
+          // owner still exists. Treating it as per-email definitive would
+          // silently prune an email-only owner's last-known-good cache and
+          // fail-closed lock them out. So mark every requested email TRANSIENT
+          // (retry-eligible, cache-fallback-eligible). Only a code-0 response
+          // that omits a specific email (below) is a per-entry definitive miss.
           errored = true;
+          for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
           const userList: any[] = res.data?.user_list ?? [];
@@ -1089,12 +1130,23 @@ export async function resolveAllowedUsersWithMap(
             const uid = byNorm.get(rawEmail.toLowerCase());
             if (uid) {
               map.set(rawEmail, uid);
+              entryStatus.set(rawEmail, 'resolved');
               logger.info(`Resolved ${rawEmail} → ${uid}`);
+            } else {
+              // Batch call itself succeeded (code 0) but this email is not in
+              // the returned user_list → definitive miss (no such user / not
+              // visible), NOT a transient failure. Do not fall back to cache.
+              entryStatus.set(rawEmail, 'definitive');
             }
           }
         }
       } catch (err: any) {
+        // A throw is a whole-request failure (network / timeout / 5xx / even a
+        // thrown 4xx) — same reasoning as the non-zero-code branch above: it is
+        // NOT a per-email identity verdict, so every requested email is
+        // transient (retry + cache-fallback eligible), never definitive.
         errored = true;
+        for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
     }
@@ -1113,7 +1165,7 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored };
+  return { resolved, map, errored, entryStatus };
 }
 
 /**

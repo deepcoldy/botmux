@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { resolveAllowedUsersWithMap } from '../src/im/lark/client.js';
+import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
 import { registerBot } from '../src/bot-registry.js';
 import { logger } from '../src/utils/logger.js';
 
@@ -85,5 +86,161 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
     expect(map.get('ou_other_app')).toBe('ou_other_app');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('open_id ou_other_app belongs to another app'));
     warn.mockRestore();
+  });
+});
+
+// PR #590 fix: per-entry resolve status drives the last-known-good cache
+// fallback. Only 'transient' entries may be recovered from cache; 'definitive'
+// misses (removed / not-visible / invalid) must NOT be, or a stale owner gets
+// revived. errored must stay in lockstep with 'transient'.
+describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', () => {
+  it('union_id resolved → resolved; errored stays false', async () => {
+    stubClient(async ({ path }: any) =>
+      ({ code: 0, data: { user: { open_id: 'ou_ok', union_id: path.user_id, name: 'X' } } }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_ok']);
+    expect(entryStatus.get('on_ok')).toBe('resolved');
+    expect(errored).toBeFalsy();
+  });
+
+  it('union_id code-0 with NO open_id → definitive (NOT transient); does not flag errored', async () => {
+    // Union user outside this app's contact visibility → tenant returns a code-0
+    // empty shell rather than 41050. Must be definitive so the never-converging
+    // retry chain is not armed and a stale cached ou_ is not revived.
+    stubClient(async ({ path }: any) => ({ code: 0, data: { user: { union_id: path.user_id } } }));
+    const { entryStatus, errored, resolved } = await resolveAllowedUsersWithMap(APP, ['on_ghost']);
+    expect(entryStatus.get('on_ghost')).toBe('definitive');
+    expect(errored).toBeFalsy();
+    expect(resolved).toEqual([]);
+  });
+
+  it('union_id definitive contact code (41050 not_visible) → definitive; not errored', async () => {
+    stubClient(async () => ({ code: 41050, msg: 'not visible' }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_hidden']);
+    expect(entryStatus.get('on_hidden')).toBe('definitive');
+    expect(errored).toBeFalsy();
+  });
+
+  it('union_id transient failure (throw) → transient + errored', async () => {
+    stubClient(async () => { throw new Error('ECONNRESET'); });
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_flaky']);
+    expect(entryStatus.get('on_flaky')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+
+  it('union_id non-definitive non-zero code (server error) → transient + errored', async () => {
+    stubClient(async () => ({ code: 500, msg: 'internal' }));
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['on_5xx']);
+    expect(entryStatus.get('on_5xx')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+
+  it('literal ou_ is always resolved (never dropped/transient)', async () => {
+    stubClient(async () => ({ code: 0, data: { user: {} } }));
+    const { entryStatus } = await resolveAllowedUsersWithMap(APP, ['ou_literal']);
+    expect(entryStatus.get('ou_literal')).toBe('resolved');
+  });
+
+  it('email not returned by a code-0 batch → definitive (not transient)', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 0, data: { user_list: [] } }), // batch OK but empty
+    );
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['ghost@corp.com']);
+    expect(entryStatus.get('ghost@corp.com')).toBe('definitive');
+    expect(errored).toBeFalsy();
+  });
+
+  it('email batch call fails (code!=0) → transient + errored for every requested email', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 500, msg: 'batch down' }),
+    );
+    const { entryStatus, errored } = await resolveAllowedUsersWithMap(APP, ['a@corp.com', 'b@corp.com']);
+    expect(entryStatus.get('a@corp.com')).toBe('transient');
+    expect(entryStatus.get('b@corp.com')).toBe('transient');
+    expect(errored).toBe(true);
+  });
+
+  it('email batch permanent 4xx (40001) is a WHOLE-REQUEST error → transient, NOT per-email definitive', async () => {
+    // codex 2nd delta: 40001 is an invalid-argument error for the whole batch
+    // request, not a per-email identity verdict. Marking each email definitive
+    // would silently prune an email-only owner's LKG cache and lock them out.
+    // Must be transient so fallback + retry + DM all fire.
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 40001, msg: 'invalid argument' }),
+    );
+    const { entryStatus, errored, resolved } = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(entryStatus.get('owner@corp.com')).toBe('transient');
+    expect(errored).toBe(true);
+    expect(resolved).toEqual([]); // no cache in this stub → empty, but retry-eligible
+  });
+
+  it('email batch throw (any error, incl thrown 4xx) → transient for every requested email', async () => {
+    // A throw is a whole-request failure — same reasoning as a non-zero code.
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { const e: any = new Error('not visible'); e.response = { data: { code: 41050 } }; throw e; },
+    );
+    const thrown4xx = await resolveAllowedUsersWithMap(APP, ['hidden@corp.com']);
+    expect(thrown4xx.entryStatus.get('hidden@corp.com')).toBe('transient');
+    expect(thrown4xx.errored).toBe(true);
+
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { throw new Error('ECONNRESET'); },
+    );
+    const network = await resolveAllowedUsersWithMap(APP, ['flaky@corp.com']);
+    expect(network.entryStatus.get('flaky@corp.com')).toBe('transient');
+    expect(network.errored).toBe(true);
+  });
+});
+
+// End-to-end: resolver → applyAllowedUsersResolve → cache decision, for the exact
+// scenario codex flagged — an email-only owner + a batch-wide error (incl 40001)
+// must NOT be locked out. The whole-request error is transient, so the pure fn
+// recovers the owner from the last-known-good cache and never prunes it.
+describe('resolve → apply end-to-end: email-only owner + batch error keeps owner (PR#590)', () => {
+  it('batch 40001 with a cached owner → owner recovered from cache, marked failed (retry), not pruned', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 40001, msg: 'invalid argument' }),
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    // resolver: whole-request failure → transient, errored, nothing resolved.
+    expect(resolveResult.entryStatus.get('owner@corp.com')).toBe('transient');
+    expect(resolveResult.errored).toBe(true);
+    expect(resolveResult.resolved).toEqual([]);
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_owner' }, // last-known-good
+      resolveResult,
+    });
+    // owner kept alive from cache; flagged failed so a retry is armed; the cache
+    // key is NOT in the definitive set, so a caller pruning definitives keeps it.
+    expect(applied.resolved).toEqual(['ou_owner']);
+    expect(applied.usedFallback).toBe(true);
+    expect(applied.failed).toBe(true);
+    expect(applied.map.get('owner@corp.com')).toBe('ou_owner');
+    const definitives = [...resolveResult.entryStatus.entries()]
+      .filter(([, s]) => s === 'definitive').map(([e]) => e);
+    expect(definitives).toEqual([]); // nothing to prune → cached owner survives
+  });
+
+  it('batch 40001 with NO cache → empty runtime but failed=true so fallback/DM/retry still fire', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => ({ code: 40001, msg: 'invalid argument' }),
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: {},
+      resolveResult,
+    });
+    expect(applied.resolved).toEqual([]);
+    expect(applied.failed).toBe(true); // NOT a silent success — owner-lockout is surfaced + retried
+    expect(applied.notice).toBeTruthy();
   });
 });

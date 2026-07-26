@@ -5,7 +5,7 @@ vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
-import { dispatchTriggerRequest } from '../src/dashboard/trigger-api.js';
+import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
 
 function request(): TriggerRequest {
   return {
@@ -118,6 +118,26 @@ describe('trigger request contract', () => {
     expect(prompt.startsWith('External event received')).toBe(true);
   });
 
+  it('async/wait modes emit a response-mode block that suppresses preamble/meta-commentary', () => {
+    const req = request();
+    (req as any).instruction = 'Introduce yourself.';
+    (req.options as any) = { asyncReturnSessionId: true };
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).toContain('<botmux_http_response_mode');
+    expect(prompt).toContain('Output ONLY the final answer');
+    // guards the specific leak riff observed: model narrating the routing header
+    expect(prompt.toLowerCase()).toContain('routing header');
+    expect(prompt).toContain('Do not call botmux send');
+  });
+
+  it('no response-mode block without wait/async options (plain webhook delivery)', () => {
+    const req = request();
+    (req as any).instruction = 'Do a thing.';
+    (req.options as any) = {};
+    const prompt = buildUntrustedEventPrompt(req, 'trg_1');
+    expect(prompt).not.toContain('<botmux_http_response_mode');
+  });
+
   it('renders vc_meeting events compactly with rawText outside the JSON body', () => {
     const req = request();
     (req.source as any).type = 'vc_meeting';
@@ -180,5 +200,54 @@ describe('dispatchTriggerRequest', () => {
     const res = await dispatchTriggerRequest(workflowReq('app1'), { proxyToDaemon });
     expect(res.status).toBe(502);
     expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_offline', error: 'connect ECONNREFUSED' });
+  });
+});
+
+// P1-3: the daemon's four-state trigger-result returns ok:true for terminal
+// failed/not_found. The legacy webhook async consumer (queryTriggerResult →
+// audit) derives outcome from `ok`, so this adapter must translate those two
+// terminal-miss states back to ok:false, while leaving completed/running as-is.
+describe('queryTriggerResult — legacy ok translation for webhook consumers', () => {
+  const proxyReturning = (body: unknown, status = 200) =>
+    vi.fn(async () => ({ status, text: async () => JSON.stringify(body) }) as unknown as Response);
+
+  it('failed(ok:true) is translated to ok:false + status 404, state preserved', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'failed', errorCode: 'no_output' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.body.state).toBe('failed');
+    expect(res.body.errorCode).toBe('no_output');
+  });
+
+  it('not_found(ok:true) is translated to ok:false + status 404', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'not_found', errorCode: 'session_not_found' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(404);
+    expect(res.body.state).toBe('not_found');
+  });
+
+  it('completed(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'completed', output: { content: 'X' } }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body.output?.content).toBe('X');
+  });
+
+  it('running(ok:true) is left untouched, status 200', async () => {
+    const proxyToDaemon = proxyReturning({ ok: true, state: 'running' }, 200);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body.state).toBe('running');
+  });
+
+  it('bad_request precise-miss (already ok:false, non-200) is passed through unchanged', async () => {
+    const proxyToDaemon = proxyReturning({ ok: false, errorCode: 'bad_request' }, 400);
+    const res = await queryTriggerResult('app1', 'sess1', { proxyToDaemon });
+    expect(res.body.ok).toBe(false);
+    expect(res.status).toBe(400);
   });
 });

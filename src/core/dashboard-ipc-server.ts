@@ -10,6 +10,8 @@ import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-re
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
@@ -872,45 +874,65 @@ function findSessionRecord(sessionId: string): Session | undefined {
   return findActiveBySessionId(sessionId)?.session ?? sessionStore.getSession(sessionId);
 }
 
+/** Four-state async lookup with durable fallback (design A).
+ *
+ *  In-memory `asyncTriggerResults` lives only on the active DaemonSession and is
+ *  lost on daemon restart / idle-suspend. To keep a poller from misreading an
+ *  already-completed turn as `not_found`, this resolves against BOTH the live
+ *  session and the on-disk stores:
+ *   - completed (mem or disk)          → completed + output.content + finishedAt
+ *   - pending in mem / session active  → running
+ *   - session record closed, no output → failed (no_output; soft terminal —
+ *                                         may be a real failure OR a caller close)
+ *   - no session record AND no result  → not_found (never existed / invalid id)
+ *
+ *  Legacy `action`/`async` fields are still populated so existing webhook
+ *  consumers keep working; new callers branch on `state`. */
 function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
-  if (!ds) {
-    return { ok: false, errorCode: 'session_not_found', error: `active session not found: ${sessionId}` };
-  }
-  const resolvedTriggerId = triggerId || ds.latestAsyncTriggerId;
-  if (!resolvedTriggerId) {
-    return { ok: false, errorCode: 'bad_request', error: 'no async trigger recorded for this session' };
-  }
-  const state = ds.asyncTriggerResults?.get(resolvedTriggerId);
-  if (!state) {
-    return { ok: false, errorCode: 'bad_request', error: `async trigger not found for session: ${resolvedTriggerId}` };
-  }
-  if (state.status === 'completed') {
+  const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
+  const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
+
+  // Cross-bot isolation (fail-closed / positive-proof) — see decideAsyncOwnership.
+  // Both sessionStore.getSession() (cross-scans every bot's sessions-*.json) and
+  // the async store (machine-wide shared dir) can surface another bot's data for
+  // a sessionId routed to THIS daemon; keep only sources positively proven ours.
+  const decision = decideAsyncOwnership({
+    owner: cachedLarkAppId,
+    liveDs: !!ds,
+    storedOwner: storedRaw?.larkAppId,
+    storedExists: !!storedRaw,
+    persistedOwner: persistedRaw?.ownerLarkAppId,
+    persistedExists: !!persistedRaw,
+  });
+  const stored = decision.keepStored ? storedRaw : undefined;
+  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+
+  if (decision.foreignLeak) {
     return {
       ok: true,
-      triggerId: resolvedTriggerId,
-      action: 'completed',
-      target: { kind: 'turn', sessionId, chatId: ds.chatId },
-      output: state.content ? { content: state.content } : undefined,
-      async: {
-        status: 'completed',
-        sessionId,
-        completedAt: state.completedAt ? new Date(state.completedAt).toISOString() : undefined,
-      },
-      message: 'async trigger completed',
+      state: 'not_found',
+      triggerId,
+      errorCode: 'session_not_found',
+      error: `no session record for: ${sessionId}`,
+      message: 'no session found',
     };
   }
-  return {
-    ok: true,
-    triggerId: resolvedTriggerId,
-    action: 'queued',
-    target: { kind: 'turn', sessionId, chatId: ds.chatId },
-    async: {
-      status: 'pending',
-      sessionId,
-    },
-    message: 'async trigger pending',
-  };
+
+  const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
+  const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
+
+  return resolveAsyncTriggerState({
+    sessionId,
+    liveActive: !!ds,
+    chatId: ds?.chatId ?? stored?.chatId,
+    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt } : undefined,
+    memTriggerId: memResult ? memTriggerId : undefined,
+    persisted,
+    storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
+    closedAt: stored?.closedAt,
+    requestedTriggerId: triggerId,
+  });
 }
 
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。
@@ -1146,12 +1168,10 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   const url = new URL(req.url ?? '/', 'http://localhost');
   const triggerId = url.searchParams.get('triggerId') ?? undefined;
   const result = buildAsyncTriggerLookupResponse(params.sessionId, triggerId);
-  const status = result.ok
-    ? 200
-    : result.errorCode === 'session_not_found'
-      ? 404
-      : 400;
-  jsonRes(res, status, result);
+  // Four-state semantics: the query itself succeeds (HTTP 200) for every
+  // resolved state including not_found — task state lives in `result.state`,
+  // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
+  jsonRes(res, result.ok ? 200 : 400, result);
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
@@ -2410,6 +2430,19 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     const sc = getBot(cachedLarkAppId).config.startupCommands;
     if (Array.isArray(sc) && sc.length) startupCommands = sc.join('\n');
   } catch { /* none */ }
+  // customPassthroughCommands / canTalkDaemonCommands → space-joined for the
+  // dashboard slash-command editors. Empty string = not configured (回默认).
+  let customPassthroughCommands = '';
+  let canTalkDaemonCommands = '';
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    if (Array.isArray(cfg.customPassthroughCommands) && cfg.customPassthroughCommands.length) {
+      customPassthroughCommands = cfg.customPassthroughCommands.join(' ');
+    }
+    if (Array.isArray(cfg.canTalkDaemonCommands) && cfg.canTalkDaemonCommands.length) {
+      canTalkDaemonCommands = cfg.canTalkDaemonCommands.join(' ');
+    }
+  } catch { /* none */ }
   // Per-bot env → pretty JSON for the dashboard textarea. The dashboard is
   // owner-authenticated, so showing the real values here is acceptable (same
   // as editing bots.json directly); the chat-facing /config get masks them.
@@ -2485,6 +2518,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     residentSessionCount,
     dormantSessionCount,
     startupCommands,
+    customPassthroughCommands,
+    canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
@@ -2915,6 +2950,58 @@ ipcRoute('PUT', '/api/bot-startup-commands', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, startupCommands: (value ?? []).join('\n') });
+});
+
+// Per-bot 透传 slash 命令 customPassthroughCommands。Body `{ customPassthroughCommands: string }`
+// （原始文本，逗号/空格分隔；空白＝清除→回仅内置白名单）。走 stringList 的
+// coerceConfigValue（用字段自带 parseList，与 /botconfig 同口径）+ applyConfigField
+// （写盘 + 内存热更新），immediate 生效。回包 space-joined 供输入框回填。
+ipcRoute('PUT', '/api/bot-custom-passthrough', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { customPassthroughCommands?: unknown };
+  try { body = await readJsonBody<{ customPassthroughCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('customPassthroughCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.customPassthroughCommands === 'string' ? body.customPassthroughCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回仅内置白名单
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, customPassthroughCommands: (value ?? []).join(' ') });
+});
+
+// Per-bot daemon 命令降权名单 canTalkDaemonCommands。Body
+// `{ canTalkDaemonCommands: string }`（原始文本，逗号/空格分隔；空白＝清除→回全部
+// 仅管理员）。走 stringList 的 coerceConfigValue（字段自带 parseList 只认 daemon
+// 命令，透传/拼错条目被滤掉）+ applyConfigField（写盘 + 内存热更新），immediate 生效。
+ipcRoute('PUT', '/api/bot-cantalk-daemon-commands', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { canTalkDaemonCommands?: unknown };
+  try { body = await readJsonBody<{ canTalkDaemonCommands?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('canTalkDaemonCommands');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const raw = typeof body.canTalkDaemonCommands === 'string' ? body.canTalkDaemonCommands : '';
+  let value: string[] | null;
+  if (!raw.trim()) {
+    value = null;  // 清除 → 回全部仅管理员
+  } else {
+    const coerced = coerceConfigValue(spec, raw);
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason });
+    value = coerced.value as string[];
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, canTalkDaemonCommands: (value ?? []).join(' ') });
 });
 
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：

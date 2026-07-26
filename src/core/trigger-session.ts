@@ -1,4 +1,5 @@
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as groupsStore from '../services/groups-store.js';
 import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
@@ -94,7 +95,10 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
     if (lines.length > 0) lines.push('');
     lines.push(
       '<botmux_http_response_mode trusted="true">',
-      'Return the final answer as plain assistant text. Do not call botmux send, do not post to Feishu/Lark.',
+      'Your entire reply is returned verbatim to a program as the task result — not shown in a chat.',
+      'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
+      'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
+      'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
       '</botmux_http_response_mode>',
     );
   }
@@ -210,12 +214,18 @@ function waitForSessionFinalOutput(
 }
 
 function beginAsyncTrigger(ds: DaemonSession, triggerId: string): void {
+  const createdAt = Date.now();
   ds.asyncTriggerResults ??= new Map();
   ds.asyncTriggerResults.set(triggerId, {
     status: 'pending',
-    createdAt: Date.now(),
+    createdAt,
   });
   ds.latestAsyncTriggerId = triggerId;
+  // Durably record the pending trigger so a poller can still resolve this
+  // session after a daemon restart (the in-memory Map above does not survive
+  // one). Stamp the owning bot for cross-bot isolation. Best-effort — a failed
+  // write only forfeits restart recovery.
+  asyncTriggerStore.recordPending(ds.session.sessionId, triggerId, createdAt, ds.larkAppId);
 }
 
 function buildAsyncQueuedResponse(

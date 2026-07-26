@@ -17,6 +17,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import * as sessionStore from '../services/session-store.js';
+import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
@@ -5471,9 +5472,14 @@ function deliverFinalOutput(
 
   const asyncResult = managedReceiver ? undefined : ds.asyncTriggerResults?.get(msg.turnId);
   if (asyncResult) {
+    const completedAt = Date.now();
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
-    asyncResult.completedAt = Date.now();
+    asyncResult.completedAt = completedAt;
+    // Durably persist the outcome so trigger-result can rebuild `completed`
+    // (with content) after a daemon restart drops the in-memory Map. Stamp the
+    // owning bot for cross-bot isolation.
+    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     onComplete?.(true);

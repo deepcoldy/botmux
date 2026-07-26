@@ -3,7 +3,10 @@
  * 写路径走 config-store 的跨进程锁；撤销在单个 RMW 内同删 chat+global（原子）。
  */
 import { getBot, getOwnerOpenId } from '../bot-registry.js';
+import { republishResolvedAllowedUsersDescriptor } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
+import { config } from '../config.js';
+import { writeAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { logger } from '../utils/logger.js';
 
 type Fail = { ok: false; reason: string };
@@ -319,6 +322,19 @@ export async function revokeGrant(
       bot.rawAllowedUserResolution.delete(rawEntry);
     }
     bot.resolvedAllowedUsers = bot.resolvedAllowedUsers.filter(u => u !== openId);
+    // Keep the last-known-good sidecar + dashboard descriptor in lockstep with
+    // the revoke. Drop the revoked raw key from the cache (retainKeys = the
+    // post-revoke config) so a later restart during an API blip cannot revive
+    // the just-revoked user from a stale cache. republish so create-group's
+    // creator picker doesn't keep offering the removed open_id.
+    if (rawEntry) {
+      writeAllowedUsersResolveCache(config.session.dataDir, larkAppId, {
+        map: {},
+        deleteEntries: [rawEntry],
+        retainKeys: bot.config.allowedUsers ?? [],
+      });
+    }
+    republishResolvedAllowedUsersDescriptor(larkAppId, bot.resolvedAllowedUsers);
   }
   if (r.result.globalTalk) {
     const next = (bot.config.globalGrants ?? []).filter(u => u !== openId);

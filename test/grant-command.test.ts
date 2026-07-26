@@ -450,6 +450,7 @@ describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', 
     const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-co-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
     writeFileSync(configPath, JSON.stringify([
       { larkAppId: 'bco', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
     ], null, 2), 'utf-8');
@@ -458,7 +459,7 @@ describe('tryHandleGrantCommand two bots co-addressed (@Claude @Codex /grant)', 
     bot.botOpenId = 'ou_bot';
     bot.resolvedAllowedUsers = ['ou_owner'];
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
   it('owner: does NOT grant the other bot — no per-target card, no chatGrants entry', async () => {
     const handled = await tryHandleGrantCommand('bco', coAddressedMsg(), 'ou_owner');
@@ -482,6 +483,7 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     const dir = mkdtempSync(join(tmpdir(), 'botmux-grant-cmd-'));
     configPath = join(dir, 'bots.json');
     process.env.BOTS_CONFIG = configPath;
+    process.env.SESSION_DATA_DIR = dir; // isolate allowedUsers sidecar (revokeGrant writes it)
     writeFileSync(configPath, JSON.stringify([
       { larkAppId: 'b2', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] },
     ], null, 2), 'utf-8');
@@ -490,7 +492,7 @@ describe('tryHandleGrantCommand whole-chat grant (@bot /grant, no target)', () =
     bot.botOpenId = 'ou_bot';
     bot.resolvedAllowedUsers = ['ou_owner'];
   });
-  afterEach(() => { delete process.env.BOTS_CONFIG; vi.restoreAllMocks(); });
+  afterEach(() => { delete process.env.BOTS_CONFIG; delete process.env.SESSION_DATA_DIR; vi.restoreAllMocks(); });
 
   // only the bot is @mentioned, no human target → whole-chat grant
   const bareMsg = (text: string, chatId = 'oc_room') => ({
