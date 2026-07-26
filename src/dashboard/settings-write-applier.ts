@@ -416,11 +416,6 @@ export async function applySettingsWrite(
     deps.mergeDashboardConfig(patch);
     touched = true;
   }
-  if (groupNamePrefixPatch !== undefined) {
-    deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
-    touched = true;
-  }
-
   if ('repoPickerMode' in obj) {
     const v = obj.repoPickerMode;
     if (v !== 'all' && v !== 'repos') {
@@ -539,6 +534,13 @@ export async function applySettingsWrite(
     if (deps.reloadLocaleOnAllDaemons) {
       await deps.reloadLocaleOnAllDaemons();
     }
+    touched = true;
+  }
+
+  // 群名前缀等整份请求校验通过后再落盘，避免同一 PUT 的后续字段非法时
+  // 返回失败却已经改变了 `/group` 的建群命名。
+  if (groupNamePrefixPatch !== undefined) {
+    deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
     touched = true;
   }
 

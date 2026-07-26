@@ -120,6 +120,9 @@ describe('global dashboard config', () => {
       42,
       '   ',
       'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
       'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
     ]) {
       writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));

@@ -37,7 +37,8 @@ export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   const value = raw;
   if (!value.trim()) return undefined;
   if (value.length > GROUP_NAME_PREFIX_MAX_LENGTH) return undefined;
-  if (/[\u0000-\u001f\u007f]/u.test(value)) return undefined;
+  // 覆盖 C0(U+0000–001F) + DEL(U+007F) + C1(U+0080–009F) 全部控制字符。
+  if (/\p{Cc}/u.test(value)) return undefined;
   return value;
 }
 

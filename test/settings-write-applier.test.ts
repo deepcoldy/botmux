@@ -345,6 +345,9 @@ describe('applySettingsWrite — validation errors', () => {
       42,
       '   ',
       'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
       'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
     ]) {
       const deps = makeDeps();
@@ -360,6 +363,15 @@ describe('applySettingsWrite — validation errors', () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ groupNamePrefix: 'AI讨论·', publicReadOnly: 'yes' }, deps);
     expect(r.ok).toBe(false);
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('does not persist a valid prefix when a later global field is invalid', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ groupNamePrefix: '[AI] ', repoPickerMode: 'invalid' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_repoPickerMode');
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
