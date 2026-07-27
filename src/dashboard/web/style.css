@@ -8375,6 +8375,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 /* ── 数字生命球（bot avatar，全站统一）──────────────────────────────────── */
 .orb-avatar {
   position: relative;
+  /* inline-flex 让球在任意容器（含 grid/inline 上下文）都占满自身尺寸——
+     只写 width/height 而不定 display 时，裸 <span> 会退回 inline，宽高被忽略，
+     父级 grid 列量成 0 宽，头像整个塌掉（话题/状态板卡片即如此）。 */
+  display: inline-flex;
+  vertical-align: middle;
   width: 42px;
   height: 42px;
   border-radius: 50%;
