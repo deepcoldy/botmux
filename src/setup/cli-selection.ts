@@ -255,6 +255,8 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
+    || value === 'service_tier="default"'
+    || value === 'service_tier="fast"'
   );
 }
 
@@ -276,7 +278,7 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
 /**
  * 剥掉 aiden `aiden x <cli>` 网关拒收的、**botmux 注入的**底层 CLI config 覆盖参数：
  *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
- *   - botmux 自己注入的 Codex `-c`（session 环境，以及关闭启动更新选择器）；
+ *   - botmux 自己注入的 Codex `-c`（session 环境、关闭启动更新选择器、Session Fast Mode）；
  *     aiden 1.8.38+ 会直接报错拒收 `aiden x codex` 透传的 `-c`/`--config`。
  * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders

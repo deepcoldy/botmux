@@ -1518,6 +1518,20 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
+  it('passes the persisted Session Fast Mode into the Codex worker', () => {
+    const ds = makeDs();
+    ds.session.fastMode = true;
+
+    forkWorker(ds, 'hello', false);
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'codex',
+      fastMode: true,
+    }));
+  });
+
   it('fills wrapper and model on fresh sessions that already stamped cliId', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;

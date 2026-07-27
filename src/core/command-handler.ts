@@ -1892,6 +1892,62 @@ export async function handleCommand(
         break;
       }
 
+      case '/fast': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        const botConfig = getBot(ds.larkAppId).config;
+        const sessionCliId = ds.session.cliId ?? botConfig.cliId;
+        const wrapperCli = ds.session.agentFrozen
+          ? ds.session.wrapperCli
+          : (ds.session.wrapperCli ?? botConfig.wrapperCli);
+        // Aiden rejects every Codex config override, so Botmux cannot pin the
+        // service tier on cold start and therefore cannot uphold Session-local
+        // semantics. Other known wrappers either rewrite or pass the override.
+        const isAidenWrapped = wrapperCli?.trim().split(/\s+/)[0] === 'aiden';
+        if (sessionCliId !== 'codex' || ds.adoptedFrom || isAidenWrapped) {
+          await sessionReply(rootId, t('cmd.fast.unsupported', undefined, loc));
+          break;
+        }
+
+        const action = message.content.replace(/^\/fast(?:\s+)?/i, '').trim().toLowerCase();
+        if (action && action !== 'on' && action !== 'off' && action !== 'status') {
+          await sessionReply(rootId, t('cmd.fast.usage', undefined, loc));
+          break;
+        }
+
+        const current = ds.session.fastMode === true;
+        if (action === 'status') {
+          await sessionReply(rootId, t(current ? 'cmd.fast.on' : 'cmd.fast.off', undefined, loc));
+          break;
+        }
+
+        const enabled = action === 'on' || (!action && !current);
+        if (enabled !== current) {
+          ds.session.fastMode = enabled;
+          sessionStore.updateSession(ds.session);
+          if (ds.worker && !ds.worker.killed) {
+            // Codex 0.145 exposes only a bare native /fast toggle. Botmux owns
+            // on/off/status semantics and sends the toggle only on a real state
+            // transition, so repeated `/fast on` is deterministic.
+            ds.worker.send({
+              type: 'raw_input',
+              content: '/fast',
+              turnId: message.messageId,
+            } as DaemonToWorker);
+          }
+        } else if (ds.session.fastMode === undefined) {
+          // Materialize the default on first use so resumes no longer depend on
+          // Codex's process-global persisted service tier.
+          ds.session.fastMode = enabled;
+          sessionStore.updateSession(ds.session);
+        }
+        await sessionReply(rootId, t(enabled ? 'cmd.fast.on' : 'cmd.fast.off', undefined, loc));
+        logger.info(`[${logTag}] Fast Mode ${enabled ? 'enabled' : 'disabled'} for Session`);
+        break;
+      }
+
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
@@ -3281,6 +3337,7 @@ export async function handleCommand(
           t('help.repo_wt', undefined, loc),
           t('help.rename', undefined, loc),
           t('help.status', undefined, loc),
+          t('help.fast', undefined, loc),
           t('help.card', undefined, loc),
           t('help.term', undefined, loc),
           t('help.dashboard', undefined, loc),

@@ -2250,6 +2250,9 @@ export function forkWorker(
     wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
+    // Fast Mode is frozen on the Session rather than inherited from Codex's
+    // CODEX_HOME. Missing means the Session has never opted in → standard.
+    fastMode: agentCfg.cliId === 'codex' ? ds.session.fastMode === true : undefined,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only

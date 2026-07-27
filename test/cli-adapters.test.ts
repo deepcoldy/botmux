@@ -333,7 +333,9 @@ describe('codex buildArgs', () => {
     // pure --remote viewer: no paste-mode bypass flag, no stale resume path
     expect(args).toEqual([
       '--remote', 'ws://127.0.0.1:9931', 'resume', '--no-alt-screen',
-      '-c', 'check_for_update_on_startup=false', 'thread-abc',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'service_tier="default"',
+      'thread-abc',
     ]);
     // the -c disable must land BEFORE the thread id (a resume-subcommand config)
     const cIdx = args.indexOf('-c');
@@ -394,6 +396,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       '-C',
       '/repo/root',
     ]);
@@ -407,6 +411,8 @@ describe('codex buildArgs', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       '-C',
       '/repo/root',
     ]);
@@ -417,6 +423,15 @@ describe('codex buildArgs', () => {
     const idx = args.indexOf('check_for_update_on_startup=false');
     expect(idx).toBeGreaterThan(0);
     expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('starts every Codex Session with Fast Mode off unless that Session opted in', () => {
+    const standard = adapter.buildArgs({ sessionId: 'sess-standard', resume: false });
+    const fast = adapter.buildArgs({ sessionId: 'sess-fast', resume: false, fastMode: true });
+
+    expect(standard).toContain('service_tier="default"');
+    expect(fast).toContain('service_tier="fast"');
+    expect(fast).not.toContain('service_tier="default"');
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {

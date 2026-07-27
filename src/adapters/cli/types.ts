@@ -94,6 +94,9 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Session-scoped Fast Mode. Codex consumes this as a process-level service
+     * tier override; other adapters ignore it. Missing/false means standard. */
+    fastMode?: boolean;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */

@@ -231,6 +231,14 @@ describe('stripWrapperUnsafeArgs', () => {
       .toEqual(['--model', 'm']);
   });
 
+  it('strips the botmux-injected Session service tier override', () => {
+    expect(stripWrapperUnsafeArgs([
+      '-c', 'service_tier="default"',
+      '-c', 'service_tier="fast"',
+      '--model', 'm',
+    ])).toEqual(['--model', 'm']);
+  });
+
   it('leaves a user-supplied -c (non-botmux config override) untouched', () => {
     expect(stripWrapperUnsafeArgs(['-c', 'model_reasoning_effort="high"', '--model', 'm']))
       .toEqual(['-c', 'model_reasoning_effort="high"', '--model', 'm']);

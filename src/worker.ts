@@ -6947,6 +6947,7 @@ async function spawnCli(
     larkAppId: cfg.larkAppId,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    fastMode: cfg.fastMode === true,
     disableCliBypass: cfg.disableCliBypass === true,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willRedirectCliData,

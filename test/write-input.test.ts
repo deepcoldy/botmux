@@ -1089,6 +1089,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1110,6 +1112,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1129,6 +1133,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       'new-codex-session',
     ]);
   });
@@ -1149,6 +1155,8 @@ describe('codex writeInput submission confirmation', () => {
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
+        '-c',
+        'service_tier="default"',
         'custom-codex-session',
       ]);
 
@@ -1174,6 +1182,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
     ]);
   });
 
@@ -1192,6 +1202,8 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'service_tier="default"',
       '-C',
       '/repo/root',
     ]);
