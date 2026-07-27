@@ -366,7 +366,9 @@ describe('zmx backend pure helpers', () => {
     expect(files.bootstrap).toContain(releasePath);
     expect(files.bootstrap).toContain(readyNonce);
     expect(files.bootstrap).toContain(releaseToken);
-    expect(files.bootstrap).toContain('exec </dev/tty');
+    // The ZMX forkpty child already owns the correct slave descriptor. Reopening
+    // `/dev/tty` changes fd 0 into a Darwin kqueue-incompatible descriptor.
+    expect(files.bootstrap).not.toContain('exec </dev/tty');
     expect(files.bootstrap).toContain('cli_pid_path=');
     expect(files.bootstrap).toContain('"$$" > "$cli_pid_path"');
     expect(files.bootstrap).toContain('/bin/sh -c ');

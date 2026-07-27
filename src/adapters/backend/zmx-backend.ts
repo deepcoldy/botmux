@@ -1593,7 +1593,11 @@ export function buildZmxLaunchFiles(
     'rm -f -- "$ready_path" "$release_path"',
     'unset ready_path release_path release_value attempt cli_pid_path ready_nonce release_token',
     'trap - 1 2 15',
-    'exec </dev/tty || exit 126',
+    // Keep the ZMX forkpty slave inherited on fd 0. Reopening `/dev/tty`
+    // produces a descriptor that Darwin kqueue rejects with EINVAL, so
+    // crossterm/mio event readers fail to initialize even though isatty(0)
+    // still reports true. The release-file read above redirects only that one
+    // command and automatically restores the inherited PTY afterwards.
     `exec ${shellCommand}`,
   ].join('\n');
   const gateCommand = [

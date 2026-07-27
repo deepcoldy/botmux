@@ -5,6 +5,7 @@
  *   pnpm vitest run --project e2e test/zmx-backend.e2e.ts
  */
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 
@@ -12,9 +13,12 @@ const TEST_SESSION = `bmx-e2e-zmx-${process.pid}`;
 const RECOVERY_SESSION = `bmx-e2e-recover-${process.pid}`;
 const FRAMING_SESSION = `bmx-e2e-frame-${process.pid}`;
 const KILL_SESSION = `bmx-e2e-kill-${process.pid}`;
+const TTY_SESSION = `bmx-e2e-tty-${process.pid}`;
 const SESSION_ID = `e2e-${process.pid}-1111-2222-333333333333`;
 const PRIVATE_VALUE = `zmx-private-${process.pid}`;
 const ZMX_AVAILABLE = ZmxBackend.isAvailable();
+const DARWIN_KQUEUE_PROBE_AVAILABLE = process.platform !== 'darwin'
+  || spawnSync('python3', ['-c', 'import select'], { stdio: 'ignore' }).status === 0;
 
 if (process.env.BOTMUX_E2E_REQUIRE_ZMX === '1' && !ZMX_AVAILABLE) {
   throw new Error(
@@ -68,7 +72,43 @@ describe('ZmxBackend e2e', () => {
     ZmxBackend.killSession(RECOVERY_SESSION);
     ZmxBackend.killSession(FRAMING_SESSION);
     ZmxBackend.killSession(KILL_SESSION);
+    ZmxBackend.killSession(TTY_SESSION);
   });
+
+  it.skipIf(!ZMX_AVAILABLE)(
+    'preserves the forkpty stdin descriptor required by Darwin kqueue readers',
+    async () => {
+      const backend = backendFor(TTY_SESSION);
+      backend.spawn('sh', ['-lc', [
+        'printf "STDIN_TTY=%s\\n" "$(tty)"',
+        'if [ "$(uname -s)" = Darwin ] && command -v python3 >/dev/null 2>&1; then',
+        '  python3 -c \'import select, sys; kq = select.kqueue(); kq.control([select.kevent(sys.stdin.fileno(), filter=select.KQ_FILTER_READ, flags=select.KQ_EV_ADD)], 0, 0); kq.close()\'',
+        '  printf "KQUEUE_STDIN=%s\\n" "$?"',
+        'else',
+        '  printf "KQUEUE_STDIN=skip\\n"',
+        'fi',
+        'sleep 1',
+      ].join('\n')], {
+        cwd: process.cwd(),
+        cols: 80,
+        rows: 24,
+        env: process.env as Record<string, string>,
+      });
+      const observed = observe(backend);
+
+      await waitFor(
+        () => observed.screen.includes('KQUEUE_STDIN='),
+        7000,
+        'stdin tty/kqueue probe',
+      );
+      expect(observed.screen).toMatch(/STDIN_TTY=\/dev\/(?:ttys|pts\/)\S+/);
+      if (process.platform === 'darwin' && DARWIN_KQUEUE_PROBE_AVAILABLE) {
+        expect(observed.screen).toContain('KQUEUE_STDIN=0');
+      } else {
+        expect(observed.screen).toContain('KQUEUE_STDIN=skip');
+      }
+    },
+  );
 
   it.skipIf(!ZMX_AVAILABLE)(
     'creates with a gated one-shot client, streams plain text, detaches, and reattaches from history',
