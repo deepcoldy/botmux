@@ -12,6 +12,7 @@ const pendingResults = new Map<string, PendingFastModeResult>();
 export function waitForFastModeResult(
   requestId: string,
   timeoutMs: number,
+  onTimeout?: () => void,
 ): Promise<FastModeApplyResult> {
   return new Promise(resolve => {
     const previous = pendingResults.get(requestId);
@@ -21,6 +22,7 @@ export function waitForFastModeResult(
     }
     const timer = setTimeout(() => {
       pendingResults.delete(requestId);
+      try { onTimeout?.(); } catch { /* best-effort worker cancellation */ }
       resolve({ ok: false, reason: 'not_ready' });
     }, timeoutMs);
     pendingResults.set(requestId, { resolve, timer });

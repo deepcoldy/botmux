@@ -363,6 +363,28 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain('仅支持由 Botmux 管理');
   });
 
+  it('Riff-backed /fast on reports unsupported without probing or creating a session', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'riff',
+      backendType: 'riff',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_fast_riff', '/fast on'),
+      makeCtx('om_fast_riff', 'om_fast_riff'),
+    );
+
+    expect(mocks.probeCodexFastServiceTier).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('仅支持由 Botmux 管理');
+  });
+
   it('valid Codex /fast on preflights the model, then creates exactly one Fast session', async () => {
     const bot = registerBot({
       larkAppId: APP,

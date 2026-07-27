@@ -88,7 +88,11 @@ import type { LarkMessage, DaemonToWorker, FastModeApplyResult } from '../types.
 import { sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
-import { fastModeSessionSupported, parseFastModeAction } from './fast-mode-control.js';
+import {
+  fastModeSessionSupported,
+  fastModeStateNeedsReconciliation,
+  parseFastModeAction,
+} from './fast-mode-control.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
@@ -1908,6 +1912,12 @@ export async function handleCommand(
         const wrapperCli = ds.session.agentFrozen
           ? ds.session.wrapperCli
           : (ds.session.wrapperCli ?? botConfig.wrapperCli);
+        const backendType = resolvePairedSpawnBackendType(
+          sessionCliId,
+          ds.session.backendType,
+          botConfig.backendType,
+          config.daemon.backendType,
+        );
         // Aiden rejects every Codex config override, so Botmux cannot pin the
         // service tier on cold start and therefore cannot uphold Session-local
         // semantics. Other known wrappers either rewrite or pass the override.
@@ -1915,6 +1925,7 @@ export async function handleCommand(
           cliId: sessionCliId,
           wrapperCli,
           adopted: !!ds.adoptedFrom,
+          backendType,
         })) {
           await sessionReply(rootId, t('cmd.fast.unsupported', undefined, loc));
           break;
@@ -1930,8 +1941,11 @@ export async function handleCommand(
         // A legacy `fastMode:true` record without a catalog tier is not proof
         // that the executor actually applied Fast Mode. Re-apply it through the
         // acknowledged path so the persisted state self-heals.
-        const needsApply = enabled !== current
-          || (enabled && (!ds.session.fastServiceTier || ds.session.fastModeStateVersion !== 1));
+        const needsApply = enabled !== current || fastModeStateNeedsReconciliation({
+          enabled,
+          serviceTier: ds.session.fastServiceTier,
+          stateVersion: ds.session.fastModeStateVersion,
+        });
         if (needsApply) {
           const executorWasLive = !!ds.worker && !ds.worker.killed;
           const applied = deps.applyFastMode

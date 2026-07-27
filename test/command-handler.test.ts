@@ -1654,6 +1654,15 @@ describe('handleCommand', () => {
       expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
     });
 
+    it('re-applies a disabled legacy Session until an executor confirms default tier', async () => {
+      const ds = makeCodexFastSession(false);
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast off'), deps, 'app-2');
+
+      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, false);
+    });
+
     it('persists and reports success only after the worker ACKs the change', async () => {
       const ds = makeCodexFastSession(false);
       const deps = makeDeps(ds);
@@ -1722,6 +1731,7 @@ describe('handleCommand', () => {
 
     it('keeps /fast off idempotent and does not toggle the native CLI', async () => {
       const ds = makeCodexFastSession(false);
+      ds.session.fastModeStateVersion = 1;
       const deps = makeDeps(ds);
 
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast off'), deps, 'app-2');
@@ -1782,6 +1792,20 @@ describe('handleCommand', () => {
       expect(aidenDeps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('Aiden'),
+        undefined,
+        'app-2',
+        'msg_001',
+      );
+
+      const riff = makeCodexFastSession(false);
+      riff.session.cliId = 'riff';
+      riff.session.backendType = 'riff';
+      const riffDeps = makeDeps(riff);
+      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), riffDeps, 'app-2');
+      expect(riffDeps.applyFastMode).not.toHaveBeenCalled();
+      expect(riffDeps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('仅支持由 Botmux 管理'),
         undefined,
         'app-2',
         'msg_001',

@@ -2,13 +2,25 @@ import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
 import { CodexRpcEngine } from '../codex-rpc-engine.js';
 import type { CliId } from '../adapters/cli/types.js';
-import type { FastModeApplyResult } from '../types.js';
+import type { BackendType } from '../adapters/backend/types.js';
+import type { DaemonToWorker, FastModeApplyResult } from '../types.js';
 import {
   cancelFastModeResult,
   waitForFastModeResult,
 } from './fast-mode-handshake.js';
 
 export type FastModeAction = 'toggle' | 'on' | 'off' | 'status' | 'invalid';
+
+/** A persisted Session state is trustworthy only after the executor confirmed
+ * that exact ON/OFF target. Enabled state additionally requires the concrete
+ * model-catalog tier used to launch future native processes. */
+export function fastModeStateNeedsReconciliation(input: {
+  enabled: boolean;
+  serviceTier?: string;
+  stateVersion?: 1;
+}): boolean {
+  return input.stateVersion !== 1 || (input.enabled && !input.serviceTier);
+}
 
 /** Parse the public `/fast` surface once so daemon routing and the command
  * handler cannot disagree about which invocations may create a Session. */
@@ -27,8 +39,9 @@ export function fastModeSessionSupported(input: {
   cliId: CliId;
   wrapperCli?: string;
   adopted?: boolean;
+  backendType?: BackendType;
 }): boolean {
-  if (input.cliId !== 'codex' || input.adopted) return false;
+  if (input.cliId !== 'codex' || input.adopted || input.backendType === 'riff') return false;
   return input.wrapperCli?.trim().split(/\s+/)[0] !== 'aiden';
 }
 
@@ -80,10 +93,20 @@ export async function requestWorkerFastModeChange(
     return { ok: false, reason: 'not_ready' };
   }
   const requestId = randomUUID();
-  const result = waitForFastModeResult(requestId, timeoutMs);
+  const result = waitForFastModeResult(requestId, timeoutMs, () => {
+    if (worker.killed || worker.connected === false) return;
+    try {
+      worker.send({
+        type: 'cancel_fast_mode',
+        requestId,
+      } satisfies DaemonToWorker);
+    } catch {
+      // The daemon-side waiter is already resolving fail-closed.
+    }
+  });
   try {
     worker.send(
-      { type: 'set_fast_mode', requestId, enabled },
+      { type: 'set_fast_mode', requestId, enabled } satisfies DaemonToWorker,
       error => {
         if (error) cancelFastModeResult(requestId);
       },

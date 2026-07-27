@@ -614,6 +614,9 @@ export type DaemonToWorker =
    * accepted it. Unlike raw_input this is queued across startup/restart gates
    * and updates the worker's restart config before success is reported. */
   | { type: 'set_fast_mode'; requestId: string; enabled: boolean }
+  /** Cancel the exact still-queued or native-restart Fast transaction after
+   * the daemon-side waiter expires. Stale request ids are ignored. */
+  | { type: 'cancel_fast_mode'; requestId: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle

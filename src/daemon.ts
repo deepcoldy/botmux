@@ -199,7 +199,7 @@ import {
   resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
-import type { PersistentBackendTarget } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -3776,12 +3776,14 @@ function fastModeTargetConfig(larkAppId: string, ds?: DaemonSession): {
   cliPathOverride?: string;
   wrapperCli?: string;
   model?: string;
+  backendType: BackendType;
   env?: Record<string, string | number | boolean>;
 } {
   const botCfg = getBot(larkAppId).config;
   const frozen = ds?.session.agentFrozen === true;
+  const cliId = ds?.session.cliId ?? botCfg.cliId;
   return {
-    cliId: ds?.session.cliId ?? botCfg.cliId,
+    cliId,
     cliPathOverride: frozen
       ? ds?.session.cliPathOverride
       : (ds?.session.cliPathOverride ?? botCfg.cliPathOverride),
@@ -3791,6 +3793,12 @@ function fastModeTargetConfig(larkAppId: string, ds?: DaemonSession): {
     model: frozen
       ? ds?.session.model
       : (ds?.session.model ?? botCfg.model),
+    backendType: resolvePairedSpawnBackendType(
+      cliId,
+      ds?.session.backendType,
+      botCfg.backendType,
+      config.daemon.backendType,
+    ),
     env: botCfg.env,
   };
 }
@@ -3805,6 +3813,7 @@ async function probeFastModeForTarget(
     cliId: target.cliId,
     wrapperCli: target.wrapperCli,
     adopted: !!ds?.adoptedFrom,
+    backendType: target.backendType,
   })) {
     return { ok: false, reason: 'unsupported_session' };
   }
@@ -3832,6 +3841,7 @@ async function applyFastModeForSession(
     cliId: target.cliId,
     wrapperCli: target.wrapperCli,
     adopted: !!ds.adoptedFrom,
+    backendType: target.backendType,
   })) {
     return { ok: false, reason: 'unsupported_session' };
   }
@@ -15337,6 +15347,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         if (!fastModeSessionSupported({
           cliId: target.cliId,
           wrapperCli: target.wrapperCli,
+          backendType: target.backendType,
         })) {
           await sessionReply(anchor, tr('cmd.fast.unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
           return;
@@ -16199,6 +16210,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         if (!fastModeSessionSupported({
           cliId: target.cliId,
           wrapperCli: target.wrapperCli,
+          backendType: target.backendType,
         })) {
           await sessionReply(anchor, tr('cmd.fast.unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
           return;

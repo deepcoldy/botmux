@@ -31,10 +31,16 @@ describe('Fast Mode IPC handshake', () => {
   });
 
   it('fails closed on timeout or send cancellation', async () => {
-    await expect(waitForFastModeResult('req-timeout', 5)).resolves.toEqual({
+    const cancelled: string[] = [];
+    await expect(waitForFastModeResult(
+      'req-timeout',
+      5,
+      () => cancelled.push('req-timeout'),
+    )).resolves.toEqual({
       ok: false,
       reason: 'not_ready',
     });
+    expect(cancelled).toEqual(['req-timeout']);
 
     const pending = waitForFastModeResult('req-cancel', 1_000);
     expect(cancelFastModeResult('req-cancel')).toBe(true);

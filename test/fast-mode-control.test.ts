@@ -2,6 +2,7 @@ import { chmodSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { beforeAll, describe, expect, it } from 'vitest';
 import {
+  fastModeStateNeedsReconciliation,
   fastModeSessionSupported,
   parseFastModeAction,
   probeCodexFastServiceTier,
@@ -21,11 +22,31 @@ describe('Fast Mode control', () => {
     expect(parseFastModeAction('/fast turbo')).toBe('invalid');
   });
 
-  it('rejects non-Codex, adopted, and Aiden-wrapped sessions', () => {
+  it('rejects non-Codex, adopted, Aiden-wrapped, and Riff-backed sessions', () => {
     expect(fastModeSessionSupported({ cliId: 'codex' })).toBe(true);
     expect(fastModeSessionSupported({ cliId: 'claude-code' })).toBe(false);
     expect(fastModeSessionSupported({ cliId: 'codex', adopted: true })).toBe(false);
     expect(fastModeSessionSupported({ cliId: 'codex', wrapperCli: 'aiden x codex' })).toBe(false);
+    expect(fastModeSessionSupported({ cliId: 'codex', backendType: 'riff' })).toBe(false);
+  });
+
+  it('requires executor confirmation for both enabled and disabled legacy states', () => {
+    expect(fastModeStateNeedsReconciliation({
+      enabled: false,
+    })).toBe(true);
+    expect(fastModeStateNeedsReconciliation({
+      enabled: false,
+      stateVersion: 1,
+    })).toBe(false);
+    expect(fastModeStateNeedsReconciliation({
+      enabled: true,
+      serviceTier: 'priority',
+      stateVersion: 1,
+    })).toBe(false);
+    expect(fastModeStateNeedsReconciliation({
+      enabled: true,
+      stateVersion: 1,
+    })).toBe(true);
   });
 
   it('resolves the selected model Fast tier from app-server model/list', async () => {
@@ -79,6 +100,30 @@ describe('Fast Mode control', () => {
       ok: true,
       enabled: true,
       serviceTier: 'priority',
+    });
+  });
+
+  it('cancels the exact worker transaction when the daemon wait expires', async () => {
+    const sent: any[] = [];
+    const worker = {
+      killed: false,
+      connected: true,
+      send(message: unknown, callback?: (error: Error | null) => void) {
+        sent.push(message);
+        callback?.(null);
+      },
+    } as any;
+
+    await expect(requestWorkerFastModeChange(worker, true, 5)).resolves.toEqual({
+      ok: false,
+      reason: 'not_ready',
+    });
+
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatchObject({ type: 'set_fast_mode', enabled: true });
+    expect(sent[1]).toEqual({
+      type: 'cancel_fast_mode',
+      requestId: sent[0].requestId,
     });
   });
 });
