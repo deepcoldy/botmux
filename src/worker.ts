@@ -251,6 +251,10 @@ import {
   replaceManagedOriginCapabilityFile,
 } from './core/managed-origin-capability.js';
 import { CodexRpcEngine } from './codex-rpc-engine.js';
+import {
+  fastModeSessionSupported,
+  probeCodexFastServiceTier,
+} from './core/fast-mode-control.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -383,6 +387,45 @@ function codexNativeTitleEnv(cfg: Extract<DaemonToWorker, { type: 'init' }>): No
   };
   env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
   return env;
+}
+
+async function resolveWorkerFastServiceTier(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): Promise<Awaited<ReturnType<typeof probeCodexFastServiceTier>>> {
+  if (!fastModeSessionSupported({
+    cliId: cfg.cliId as CliId,
+    wrapperCli: cfg.wrapperCli,
+    adopted: cfg.adoptMode,
+  })) {
+    return { ok: false, reason: 'unsupported_session' };
+  }
+  const cliBin = createCliAdapterSync(cfg.cliId as CliId, cfg.cliPathOverride).resolvedBin;
+  return probeCodexFastServiceTier({
+    cliBin,
+    cwd: cfg.workingDir,
+    env: codexNativeTitleEnv(cfg),
+    model: cfg.model,
+    log: message => log(`[fast-probe] ${message}`),
+  });
+}
+
+/** Migrate pre-catalog Fast sessions before buildArgs. Failing closed here is
+ * preferable to launching a process that silently executes at default tier
+ * while the persisted Session says ON. */
+async function ensureConfiguredFastServiceTier(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): Promise<void> {
+  if (cfg.fastMode !== true || cfg.fastServiceTier) return;
+  const resolved = await resolveWorkerFastServiceTier(cfg);
+  if (!resolved.ok || !resolved.serviceTier) {
+    const detail = !resolved.ok && resolved.message ? `: ${resolved.message}` : '';
+    throw new Error(
+      resolved.ok || resolved.reason === 'unsupported_model'
+        ? `Fast Mode is not supported by model ${cfg.model ?? '(default)'}`
+        : `Fast Mode capability check failed${detail}`,
+    );
+  }
+  cfg.fastServiceTier = resolved.serviceTier;
 }
 
 function registerNativeTitleForceClose(forceClose: () => void): () => void {
@@ -689,7 +732,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
-      model: cfg.model, log: (m: string) => log(m),
+      model: cfg.model, fastMode: cfg.fastMode === true, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
@@ -716,6 +759,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // per-turn identity instead of falling back to a stale/session-only env.
     registerRpcEnginePidMarker(engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
+    cfg.fastServiceTier = engine.activeServiceTier;
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
       // Three-state delivery (P1-1, exactly-once priority): 'accepted' (ack or
@@ -1470,6 +1514,16 @@ const pendingMessages: PendingCliInput[] = [];
  * an owned CLI restart was fenced. Normal raw_input commands are still
  * delivered immediately (including while busy). */
 const pendingRawInputs: Array<Extract<DaemonToWorker, { type: 'raw_input' }>> = [];
+/** Fast Mode is a Session configuration barrier, not ordinary terminal input.
+ * Requests survive startup/restart gates and run before later user messages. */
+const pendingFastModeChanges: Array<Extract<DaemonToWorker, { type: 'set_fast_mode' }>> = [];
+let fastModeChangeInFlight = false;
+let pendingRestartFastModeAck: {
+  request: Extract<DaemonToWorker, { type: 'set_fast_mode' }>;
+  serviceTier?: string;
+  previousFastMode: boolean;
+  previousServiceTier?: string;
+} | null = null;
 /** Latest requested canonical session title. Unlike a normal prompt this is an
  * administrative TUI command: never type-ahead while the agent is busy, never
  * open a model turn, and latest-wins if several renames arrive before idle. */
@@ -5038,6 +5092,141 @@ function markPromptReadyFromPty(): void {
   }
 }
 
+function commitFastModeChange(
+  request: Extract<DaemonToWorker, { type: 'set_fast_mode' }>,
+  serviceTier?: string,
+): void {
+  if (!lastInitConfig) return;
+  lastInitConfig.fastMode = request.enabled;
+  lastInitConfig.fastServiceTier = request.enabled ? serviceTier : undefined;
+  // Publish the accepted executor state before resolving the command waiter.
+  // IPC preserves ordering, so persistence happens before the success reply;
+  // a late ACK after the daemon-side wait deadline still cannot leave the
+  // worker and Session store split-brained.
+  send({
+    type: 'fast_mode_state',
+    enabled: request.enabled,
+    ...(request.enabled && serviceTier ? { serviceTier } : {}),
+  });
+  send({
+    type: 'fast_mode_result',
+    requestId: request.requestId,
+    ok: true,
+    enabled: request.enabled,
+    ...(request.enabled && serviceTier ? { serviceTier } : {}),
+  });
+}
+
+function rejectFastModeChange(
+  request: Extract<DaemonToWorker, { type: 'set_fast_mode' }>,
+  reason: 'unsupported_session' | 'unsupported_model' | 'not_ready' | 'apply_failed',
+  message?: string,
+): void {
+  send({
+    type: 'fast_mode_result',
+    requestId: request.requestId,
+    ok: false,
+    reason,
+    ...(message ? { message } : {}),
+  });
+}
+
+function continueAfterFastModeChange(): void {
+  queueMicrotask(() => {
+    if (pendingFastModeChanges.length > 0) void flushPendingFastModeChanges();
+    else void flushPending();
+  });
+}
+
+/** Apply one Fast Mode request at an idle prompt. RPC mode uses the protocol's
+ * acknowledged settings update. Native mode restarts/resumes with an explicit
+ * catalog tier instead of injecting the toggle-only `/fast` command; this makes
+ * on/off deterministic and gives the replacement prompt a real ACK boundary. */
+async function flushPendingFastModeChanges(): Promise<void> {
+  if (fastModeChangeInFlight || isFlushing || cliRestartInProgress) return;
+  if (!backend || !cliAdapter || !isPromptReady) return;
+  if (commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight) return;
+  const request = pendingFastModeChanges.shift();
+  if (!request) return;
+  fastModeChangeInFlight = true;
+
+  if (!lastInitConfig || !fastModeSessionSupported({
+    cliId: lastInitConfig.cliId as CliId,
+    wrapperCli: lastInitConfig.wrapperCli,
+    adopted: lastInitConfig.adoptMode,
+  })) {
+    rejectFastModeChange(request, 'unsupported_session');
+    fastModeChangeInFlight = false;
+    continueAfterFastModeChange();
+    return;
+  }
+
+  try {
+    if (codexRpcEngine) {
+      const applied = await codexRpcEngine.setFastMode(request.enabled);
+      commitFastModeChange(request, applied.serviceTier);
+      fastModeChangeInFlight = false;
+      continueAfterFastModeChange();
+      return;
+    }
+
+    let serviceTier: string | undefined;
+    if (request.enabled) {
+      const resolved = await resolveWorkerFastServiceTier(lastInitConfig);
+      if (!resolved.ok || !resolved.serviceTier) {
+        rejectFastModeChange(
+          request,
+          !resolved.ok ? resolved.reason : 'unsupported_model',
+          !resolved.ok ? resolved.message : undefined,
+        );
+        fastModeChangeInFlight = false;
+        continueAfterFastModeChange();
+        return;
+      }
+      serviceTier = resolved.serviceTier;
+    }
+
+    // The launch snapshot is authoritative for this worker generation. An
+    // idempotent request needs no native toggle; the resolved tier still heals
+    // a legacy record before ACK.
+    if (lastInitConfig.fastMode === request.enabled) {
+      commitFastModeChange(request, serviceTier ?? lastInitConfig.fastServiceTier);
+      fastModeChangeInFlight = false;
+      continueAfterFastModeChange();
+      return;
+    }
+
+    pendingRestartFastModeAck = {
+      request,
+      serviceTier,
+      previousFastMode: lastInitConfig.fastMode === true,
+      previousServiceTier: lastInitConfig.fastServiceTier,
+    };
+    // Stage the replacement config before teardown. The daemon does not persist
+    // it until the replacement prompt ACK below.
+    lastInitConfig.fastMode = request.enabled;
+    lastInitConfig.fastServiceTier = request.enabled ? serviceTier : undefined;
+    await restartCliProcess(
+      `Fast Mode ${request.enabled ? 'enable' : 'disable'} reconciliation`,
+      { immediate: true, preservePending: true, skipRestartBudget: true },
+    );
+    log(`Fast Mode replacement launched; waiting for prompt ACK (${request.enabled ? 'on' : 'off'})`);
+  } catch (error) {
+    if (pendingRestartFastModeAck && lastInitConfig) {
+      lastInitConfig.fastMode = pendingRestartFastModeAck.previousFastMode;
+      lastInitConfig.fastServiceTier = pendingRestartFastModeAck.previousServiceTier;
+    }
+    pendingRestartFastModeAck = null;
+    rejectFastModeChange(
+      request,
+      'apply_failed',
+      error instanceof Error ? error.message : String(error),
+    );
+    fastModeChangeInFlight = false;
+    continueAfterFastModeChange();
+  }
+}
+
 function markPromptReady(): void {
   if (isPromptReady) return;  // guard against duplicate calls
   stopBusyPatternIdleProbe();
@@ -5070,6 +5259,15 @@ function markPromptReady(): void {
     return;
   }
   isPromptReady = true;
+  // A non-RPC Fast change is committed only after its replacement CLI has
+  // resumed with the explicit tier and reached a real prompt.
+  if (pendingRestartFastModeAck) {
+    const pending = pendingRestartFastModeAck;
+    pendingRestartFastModeAck = null;
+    commitFastModeChange(pending.request, pending.serviceTier);
+    fastModeChangeInFlight = false;
+    log(`Fast Mode replacement confirmed at prompt (${pending.request.enabled ? 'on' : 'off'})`);
+  }
   clearSessionRenameInFlight();
   // An old backend can still report idle while its async teardown is running.
   // Only a prompt observed after the general restart fence drops may release
@@ -5103,7 +5301,9 @@ function markPromptReady(): void {
   // make the CLI busy, so the idle state is transient and shouldn't appear
   // in the card.  This avoids a false "就绪" flash on daemon restart
   // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0
+    && pendingFastModeChanges.length === 0 && !fastModeChangeInFlight
+    && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
@@ -5112,7 +5312,9 @@ function markPromptReady(): void {
   // flushPending 不会饿死用户消息：flushPending 自身的 injectionFlushing 守卫
   // 会挡住并发写入，flushPendingInjections 的 finally 会在注入完成、CLI 重新
   // idle 后补踢一次 flushPending 排空 pendingMessages。
-  if (shouldFlushInjectionsFirst(pendingInjections)) {
+  if (pendingFastModeChanges.length > 0) {
+    void flushPendingFastModeChanges();
+  } else if (shouldFlushInjectionsFirst(pendingInjections)) {
     void flushPendingInjections();
   } else {
     flushPending();
@@ -5418,6 +5620,12 @@ async function flushPending(): Promise<void> {
   // backend's idle/task-done callback) write across that restart boundary.
   if (cliRestartInProgress) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
+  // A Fast Mode request is a configuration barrier for every later user turn.
+  // Its own queue owns delivery until the executor ACKs it.
+  if (pendingFastModeChanges.length > 0 || fastModeChangeInFlight) {
+    void flushPendingFastModeChanges();
+    return;
+  }
   if (!backend || !cliAdapter) return;
   if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight) return;  // wait for /rename to finish before any user input
@@ -6948,9 +7156,12 @@ async function spawnCli(
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     fastMode: cfg.fastMode === true,
+    fastServiceTier: cfg.fastServiceTier,
     disableCliBypass: cfg.disableCliBypass === true,
     skillPluginDir: cfg.skillPluginDir,
     readIsolation: willRedirectCliData,
+    remoteWsUrl,
+    remoteThreadId,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -7487,6 +7698,9 @@ async function spawnCli(
     } else {
       const launch = buildWrappedLaunch(cfg.wrapperCli, spawnArgs, (b) => locateOnPath(b) ?? b, {
         ttadkModel: cfg.model,
+        codexServiceTier: cfg.cliId === 'codex'
+          ? (cfg.fastMode === true ? cfg.fastServiceTier : 'default')
+          : undefined,
       });
       if (launch.bin) {
         spawnBin = launch.bin;
@@ -7677,6 +7891,9 @@ async function spawnCli(
       sandboxOn: sandboxRequested,
       binResolver: (b) => locateOnPath(b) ?? b,
       ttadkModel: cfg.model,
+      codexServiceTier: cfg.cliId === 'codex'
+        ? (cfg.fastMode === true ? cfg.fastServiceTier : 'default')
+        : undefined,
     });
     capturedSpawnCommand = buildReproduceCommand({
       backendType: effectiveBackendType,
@@ -9732,6 +9949,17 @@ process.on('message', async (raw: unknown) => {
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
+        // RPC engage resolves the tier itself; native/migration paths resolve
+        // it here before buildArgs so a persisted Fast Session can never launch
+        // at default tier.
+        await ensureConfiguredFastServiceTier(msg);
+        if (msg.fastMode === true && msg.fastServiceTier) {
+          send({
+            type: 'fast_mode_state',
+            enabled: true,
+            serviceTier: msg.fastServiceTier,
+          });
+        }
         await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
@@ -9981,6 +10209,15 @@ process.on('message', async (raw: unknown) => {
       break;
     }
 
+    case 'set_fast_mode': {
+      // Queue even if init/backend is still starting. The prompt-gated flush
+      // applies this before any later user input and returns an explicit ACK.
+      pendingFastModeChanges.push(msg);
+      log(`Queued Fast Mode change (${msg.enabled ? 'on' : 'off'}, request=${msg.requestId.slice(0, 8)})`);
+      void flushPendingFastModeChanges();
+      break;
+    }
+
     case 'raw_input': {
       // Preserve legacy busy delivery (/btw and other steering commands). A
       // native /rename and an owned CLI restart are the exceptions: never splice
@@ -10000,7 +10237,8 @@ process.on('message', async (raw: unknown) => {
       // 这些 pending 不会再被 flush（与 pendingMessages 同款处理），符合预期。
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
-        || bareShellCheckInProgress || bareShellLaunchBlocked) {
+        || bareShellCheckInProgress || bareShellLaunchBlocked
+        || pendingFastModeChanges.length > 0 || fastModeChangeInFlight) {
         pendingRawInputs.push(msg);
         log(`Deferred passthrough slash command until CLI input gate settles: ${msg.content}`);
       } else {

@@ -275,6 +275,8 @@ export const messages: Record<string, string> = {
   'cmd.fast.off': '⚪ Fast Mode 已关闭（仅当前话题 Session）。',
   'cmd.fast.usage': '用法：/fast（切换）| /fast on | /fast off | /fast status',
   'cmd.fast.unsupported': '⚠️ /fast 仅支持由 Botmux 管理且能固定服务等级的 Codex Session（Aiden 网关暂不支持）。',
+  'cmd.fast.unsupported_model': '⚠️ 当前模型不支持 Fast Mode，状态未修改。',
+  'cmd.fast.apply_failed': '⚠️ Fast Mode 未能在 Codex 执行端确认生效，状态未修改；请稍后重试。',
   'cmd.login.no_credentials': '❌ 无法获取应用凭证',
   'cmd.login.title': '🔐 飞书用户授权',
   'cmd.login.step1': '1. 点击下方链接完成授权：',

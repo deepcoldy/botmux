@@ -84,10 +84,11 @@ import {
   readRoleProfileEntry,
   writeRoleProfileEntry,
 } from '../services/role-profile-store.js';
-import type { LarkMessage, DaemonToWorker } from '../types.js';
+import type { LarkMessage, DaemonToWorker, FastModeApplyResult } from '../types.js';
 import { sessionKey, sessionAnchorId, markRepoCardConsumed, claimCurrentRepoCard } from './types.js';
 import type { DaemonSession } from './types.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
+import { fastModeSessionSupported, parseFastModeAction } from './fast-mode-control.js';
 import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
@@ -132,16 +133,13 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
 }
 
 /**
- * Daemon commands that operate on an ALREADY-EXISTING session and must never
- * pre-create one. `/rename` renames the current session — with no session there
- * is nothing to rename, so the daemon routes must skip their generic
- * "createSession + activeSessions.set(worker:null)" pre-create block and let
- * handleCommand's `!ds` branch reply no_active_session. Without this, `/rename`
- * in a brand-new topic (or a thread with no session) would spawn a phantom
- * worker:null session just to rename it, polluting the dashboard. (Same class
- * of fix as the `/card` / `/term` special cases in daemon.ts.)
+ * Commands that normally operate on an ALREADY-EXISTING session and must not
+ * pass through the generic pre-create path. Without this guard, `/rename …` or
+ * `/fast status` in a new topic would leave a phantom worker:null session.
+ * daemon.ts has one deliberate exception: a valid Codex `/fast on` may create
+ * a session, but only after model-catalog preflight succeeds.
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fast']);
 
 export function resolveAdapterDefaultPassthroughCommands(larkAppId?: string): string[] {
   if (!larkAppId) return [];
@@ -389,6 +387,9 @@ export interface CommandHandlerDeps {
   lastRepoScan: Map<string, import('../services/project-scanner.js').ProjectInfo[]>;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  /** Apply Fast Mode at the real executor boundary. The implementation waits
+   * for a worker/app-server ACK and returns the concrete model-catalog tier. */
+  applyFastMode?: (ds: DaemonSession, enabled: boolean) => Promise<FastModeApplyResult>;
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -1893,6 +1894,11 @@ export async function handleCommand(
       }
 
       case '/fast': {
+        const action = parseFastModeAction(message.content);
+        if (action === 'invalid') {
+          await sessionReply(rootId, t('cmd.fast.usage', undefined, loc));
+          break;
+        }
         if (!ds) {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
           break;
@@ -1905,15 +1911,12 @@ export async function handleCommand(
         // Aiden rejects every Codex config override, so Botmux cannot pin the
         // service tier on cold start and therefore cannot uphold Session-local
         // semantics. Other known wrappers either rewrite or pass the override.
-        const isAidenWrapped = wrapperCli?.trim().split(/\s+/)[0] === 'aiden';
-        if (sessionCliId !== 'codex' || ds.adoptedFrom || isAidenWrapped) {
+        if (!fastModeSessionSupported({
+          cliId: sessionCliId,
+          wrapperCli,
+          adopted: !!ds.adoptedFrom,
+        })) {
           await sessionReply(rootId, t('cmd.fast.unsupported', undefined, loc));
-          break;
-        }
-
-        const action = message.content.replace(/^\/fast(?:\s+)?/i, '').trim().toLowerCase();
-        if (action && action !== 'on' && action !== 'off' && action !== 'status') {
-          await sessionReply(rootId, t('cmd.fast.usage', undefined, loc));
           break;
         }
 
@@ -1923,24 +1926,41 @@ export async function handleCommand(
           break;
         }
 
-        const enabled = action === 'on' || (!action && !current);
-        if (enabled !== current) {
-          ds.session.fastMode = enabled;
-          sessionStore.updateSession(ds.session);
-          if (ds.worker && !ds.worker.killed) {
-            // Codex 0.145 exposes only a bare native /fast toggle. Botmux owns
-            // on/off/status semantics and sends the toggle only on a real state
-            // transition, so repeated `/fast on` is deterministic.
-            ds.worker.send({
-              type: 'raw_input',
-              content: '/fast',
-              turnId: message.messageId,
-            } as DaemonToWorker);
+        const enabled = action === 'on' || (action === 'toggle' && !current);
+        // A legacy `fastMode:true` record without a catalog tier is not proof
+        // that the executor actually applied Fast Mode. Re-apply it through the
+        // acknowledged path so the persisted state self-heals.
+        const needsApply = enabled !== current || (enabled && !ds.session.fastServiceTier);
+        if (needsApply) {
+          const applied = deps.applyFastMode
+            ? await deps.applyFastMode(ds, enabled)
+            : ({ ok: false, reason: 'apply_failed' } as const);
+          if (!applied.ok || applied.enabled !== enabled) {
+            const key = !applied.ok && applied.reason === 'unsupported_model'
+              ? 'cmd.fast.unsupported_model'
+              : 'cmd.fast.apply_failed';
+            await sessionReply(rootId, t(key, undefined, loc));
+            break;
           }
+
+          // Commit only after the executor ACKs. Keep both persisted Session
+          // state and the daemon's in-memory restart snapshot coherent.
+          ds.session.fastMode = enabled;
+          ds.session.fastServiceTier = enabled ? applied.serviceTier : undefined;
+          if (ds.initConfig) {
+            ds.initConfig.fastMode = enabled;
+            ds.initConfig.fastServiceTier = enabled ? applied.serviceTier : undefined;
+          }
+          sessionStore.updateSession(ds.session);
         } else if (ds.session.fastMode === undefined) {
           // Materialize the default on first use so resumes no longer depend on
           // Codex's process-global persisted service tier.
           ds.session.fastMode = enabled;
+          ds.session.fastServiceTier = undefined;
+          if (ds.initConfig) {
+            ds.initConfig.fastMode = enabled;
+            ds.initConfig.fastServiceTier = undefined;
+          }
           sessionStore.updateSession(ds.session);
         }
         await sessionReply(rootId, t(enabled ? 'cmd.fast.on' : 'cmd.fast.off', undefined, loc));

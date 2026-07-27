@@ -571,6 +571,11 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
     prewarmDocCommentSession: vi.fn(async () => {}),
+    applyFastMode: vi.fn(async (_session, enabled) => (
+      enabled
+        ? { ok: true as const, enabled: true, serviceTier: 'priority' }
+        : { ok: true as const, enabled: false }
+    )),
   };
 }
 
@@ -1610,12 +1615,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
 
-      expect(ds.worker?.send).toHaveBeenCalledWith({
-        type: 'raw_input',
-        content: '/fast',
-        turnId: 'msg_001',
-      });
+      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
+      expect(ds.worker?.send).not.toHaveBeenCalled();
       expect(ds.session.fastMode).toBe(true);
+      expect(ds.session.fastServiceTier).toBe('priority');
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
@@ -1632,9 +1635,61 @@ describe('handleCommand', () => {
 
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
 
+      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
       expect(ds.session.fastMode).toBe(true);
+      expect(ds.session.fastServiceTier).toBe('priority');
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(deps.sessionReply).toHaveBeenCalled();
+    });
+
+    it('persists and reports success only after the worker ACKs the change', async () => {
+      const ds = makeCodexFastSession(false);
+      const deps = makeDeps(ds);
+      let resolveApply!: (value: { ok: true; enabled: true; serviceTier: string }) => void;
+      deps.applyFastMode = vi.fn(() => new Promise(resolve => { resolveApply = resolve; }));
+
+      const pending = handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
+      await Promise.resolve();
+
+      expect(ds.session.fastMode).toBe(false);
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+
+      resolveApply({ ok: true, enabled: true, serviceTier: 'priority' });
+      await pending;
+
+      expect(ds.session.fastMode).toBe(true);
+      expect(ds.session.fastServiceTier).toBe('priority');
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringMatching(/Fast Mode.*已开启/s),
+        undefined,
+        'app-2',
+        'msg_001',
+      );
+    });
+
+    it('keeps persisted state unchanged when applying Fast Mode fails', async () => {
+      const ds = makeCodexFastSession(false);
+      const deps = makeDeps(ds);
+      deps.applyFastMode = vi.fn(async () => ({
+        ok: false as const,
+        reason: 'unsupported_model' as const,
+      }));
+
+      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
+
+      expect(ds.session.fastMode).toBe(false);
+      expect(ds.session.fastServiceTier).toBeUndefined();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('当前模型不支持'),
+        undefined,
+        'app-2',
+        'msg_001',
+      );
     });
 
     it('reports Session state without toggling Codex', async () => {
@@ -1659,6 +1714,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast off'), deps, 'app-2');
 
+      expect(deps.applyFastMode).not.toHaveBeenCalled();
       expect(ds.worker?.send).not.toHaveBeenCalled();
       expect(ds.session.fastMode).toBe(false);
       expect(deps.sessionReply).toHaveBeenCalledWith(
@@ -1677,10 +1733,8 @@ describe('handleCommand', () => {
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast'), deps, 'app-2');
 
       expect(ds.session.fastMode).toBe(true);
-      expect(ds.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'raw_input',
-        content: '/fast',
-      }));
+      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
+      expect(ds.worker?.send).not.toHaveBeenCalled();
     });
 
     it('rejects unsupported arguments and non-Codex Sessions explicitly', async () => {

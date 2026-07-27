@@ -39,6 +39,7 @@ export function selectReproduceLaunch(input: {
   sandboxOn: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
+  codexServiceTier?: string;
 }): { bin: string; args: string[] } {
   const { baseBin, baseArgs, wrapperCli, sandboxOn } = input;
   if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
@@ -46,7 +47,10 @@ export function selectReproduceLaunch(input: {
       wrapperCli,
       baseArgs,
       input.binResolver ?? ((b) => b),
-      { ttadkModel: input.ttadkModel },
+      {
+        ttadkModel: input.ttadkModel,
+        codexServiceTier: input.codexServiceTier,
+      },
     );
     if (launch.bin) return { bin: launch.bin, args: launch.args };
   }

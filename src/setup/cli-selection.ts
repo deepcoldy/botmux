@@ -250,13 +250,20 @@ function isCjadkWrapper(tokens: ReadonlyArray<string>): boolean {
 }
 
 /** 是否为 botmux 自己给 Codex 注入的 config 覆盖。精确白名单避免误伤用户自带的
- * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。 */
-function isBotmuxCodexConfigValue(value: string | undefined): boolean {
+ * `-c key=val`；wrapper 层据此决定剥离（aiden）或改成长参数（cjadk）。
+ *
+ * Fast tier id 来自 Codex model catalog，不能静态枚举；调用方必须把本次实际注入的
+ * tier 显式传入，不能按 `service_tier=*` 泛匹配，否则会误伤用户自己的 config。 */
+function isBotmuxCodexConfigValue(value: string | undefined, codexServiceTier?: string): boolean {
+  const injectedServiceTier = codexServiceTier
+    ? `service_tier=${JSON.stringify(codexServiceTier)}`
+    : undefined;
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
     || value === 'service_tier="default"'
     || value === 'service_tier="fast"'
+    || value === injectedServiceTier
   );
 }
 
@@ -296,13 +303,16 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  * 注意范围仅限上述两种 botmux 注入形态：coco 的 `--config model.name=…`（承载 model、非 session
  * 管线，且无内置 `aiden x coco` 选项）等不同形态的 config 覆盖**有意不在此剥离**。
  */
-export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
+export function stripWrapperUnsafeArgs(
+  args: ReadonlyArray<string>,
+  codexServiceTier?: string,
+): string[] {
   // 先剥 claude 的 --settings（单一事实源 stripSettingsArgs），再剥 codex 注入的 -c override。
   const afterSettings = stripSettingsArgs(args);
   const out: string[] = [];
   for (let i = 0; i < afterSettings.length; i++) {
     const a = afterSettings[i]!;
-    if (a === '-c' && isBotmuxCodexConfigValue(afterSettings[i + 1])) { i++; continue; }
+    if (a === '-c' && isBotmuxCodexConfigValue(afterSettings[i + 1], codexServiceTier)) { i++; continue; }
     out.push(a);
   }
   return out;
@@ -326,11 +336,14 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
  * 非 codex 的 cjadk 形态（cjadk claude 带 `--settings`、不带这些值）经此函数是 no-op，
  * `--settings` 照常保留透传。
  */
-export function rewriteCjadkCodexConfigArgs(args: ReadonlyArray<string>): string[] {
+export function rewriteCjadkCodexConfigArgs(
+  args: ReadonlyArray<string>,
+  codexServiceTier?: string,
+): string[] {
   const out: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a === '-c' && isBotmuxCodexConfigValue(args[i + 1])) {
+    if (a === '-c' && isBotmuxCodexConfigValue(args[i + 1], codexServiceTier)) {
       out.push('--config', args[i + 1]!);
       i++;
       continue;
@@ -359,6 +372,11 @@ export interface WrappedLaunchOptions {
    * 用 {@link TTADK_DEFAULT_MODEL} 兜底；不接受 -m 的子命令（CoCo）忽略此项。
    */
   readonly ttadkModel?: string;
+  /**
+   * Botmux 本次给 Codex 注入的 service tier。只用于精确识别该一条 config，
+   * 以便 aiden 剥离或 cjadk 改写，不会匹配用户自带的其他 service_tier。
+   */
+  readonly codexServiceTier?: string;
 }
 
 /**
@@ -424,8 +442,8 @@ export function buildWrappedLaunch(
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
   let forwarded: string[];
-  if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
-  else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);
+  if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs, opts.codexServiceTier);
+  else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs, opts.codexServiceTier);
   else forwarded = [...cliArgs];
   return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwarded] };
 }

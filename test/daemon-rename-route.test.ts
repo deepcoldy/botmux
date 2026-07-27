@@ -44,6 +44,12 @@ const mocks = vi.hoisted(() => {
         : undefined
     )),
     forkWorker: vi.fn(),
+    probeCodexFastServiceTier: vi.fn(async () => ({
+      ok: true as const,
+      enabled: true,
+      serviceTier: 'priority',
+    })),
+    requestWorkerFastModeChange: vi.fn(),
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => ({
       sessionId: `sess-fake-${++seq}`,
       chatId,
@@ -86,6 +92,15 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
+});
+
+vi.mock('../src/core/fast-mode-control.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/fast-mode-control.js');
+  return {
+    ...actual,
+    probeCodexFastServiceTier: (...args: any[]) => mocks.probeCodexFastServiceTier(...args),
+    requestWorkerFastModeChange: (...args: any[]) => mocks.requestWorkerFastModeChange(...args),
+  };
 });
 
 import { registerBot } from '../src/bot-registry.js';
@@ -231,6 +246,11 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.probeCodexFastServiceTier.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      serviceTier: 'priority',
+    });
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -313,6 +333,81 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  it('/fast status and invalid input never create phantom sessions on either route', async () => {
+    await handleNewTopic(
+      makeEventData('om_fast_status', '/fast status'),
+      makeCtx('om_fast_status', 'om_fast_status'),
+    );
+    await handleThreadReply(
+      makeEventData('om_fast_invalid', '/fast turbo', 'om_fast_root'),
+      makeCtx('om_fast_root', 'om_fast_invalid'),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('没有活跃的会话');
+    expect(repliedText()).toContain('/fast on');
+  });
+
+  it('non-Codex /fast on reports unsupported without creating a session', async () => {
+    await handleNewTopic(
+      makeEventData('om_fast_claude', '/fast on'),
+      makeCtx('om_fast_claude', 'om_fast_claude'),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.probeCodexFastServiceTier).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('仅支持由 Botmux 管理');
+  });
+
+  it('valid Codex /fast on preflights the model, then creates exactly one Fast session', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(
+      makeEventData('om_fast_on', '/fast on'),
+      makeCtx('om_fast_on', 'om_fast_on'),
+    );
+
+    expect(mocks.probeCodexFastServiceTier).toHaveBeenCalledTimes(1);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    const ds = activeSessions.get(sessionKey('om_fast_on', APP));
+    expect(ds?.worker).toBeNull();
+    expect(ds?.session.fastMode).toBe(true);
+    expect(ds?.session.fastServiceTier).toBe('priority');
+  });
+
+  it('unsupported Codex model fails before session creation', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    mocks.probeCodexFastServiceTier.mockResolvedValue({
+      ok: false,
+      reason: 'unsupported_model',
+    });
+
+    await handleThreadReply(
+      makeEventData('om_fast_unsupported', '/fast on', 'om_fast_unsupported_root'),
+      makeCtx('om_fast_unsupported_root', 'om_fast_unsupported'),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText()).toContain('当前模型不支持');
   });
 
   it('new topic: passes the accepted Lark message id into the first worker', async () => {

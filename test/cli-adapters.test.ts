@@ -427,11 +427,24 @@ describe('codex buildArgs', () => {
 
   it('starts every Codex Session with Fast Mode off unless that Session opted in', () => {
     const standard = adapter.buildArgs({ sessionId: 'sess-standard', resume: false });
-    const fast = adapter.buildArgs({ sessionId: 'sess-fast', resume: false, fastMode: true });
+    const fast = adapter.buildArgs({
+      sessionId: 'sess-fast',
+      resume: false,
+      fastMode: true,
+      fastServiceTier: 'priority',
+    });
 
     expect(standard).toContain('service_tier="default"');
-    expect(fast).toContain('service_tier="fast"');
+    expect(fast).toContain('service_tier="priority"');
     expect(fast).not.toContain('service_tier="default"');
+  });
+
+  it('refuses to guess a Fast protocol tier when the model catalog was not resolved', () => {
+    expect(() => adapter.buildArgs({
+      sessionId: 'sess-fast-unresolved',
+      resume: false,
+      fastMode: true,
+    })).toThrow(/Fast service tier was not resolved/);
   });
 
   it('keeps the startup update override on resume before the Codex session id', () => {

@@ -97,6 +97,8 @@ export interface CliAdapter {
     /** Session-scoped Fast Mode. Codex consumes this as a process-level service
      * tier override; other adapters ignore it. Missing/false means standard. */
     fastMode?: boolean;
+    /** Concrete Fast tier id resolved from Codex's model catalog. */
+    fastServiceTier?: string;
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */

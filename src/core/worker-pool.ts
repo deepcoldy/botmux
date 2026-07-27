@@ -108,6 +108,7 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
+import { acknowledgeFastModeResult } from './fast-mode-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
@@ -2253,6 +2254,7 @@ export function forkWorker(
     // Fast Mode is frozen on the Session rather than inherited from Codex's
     // CODEX_HOME. Missing means the Session has never opted in → standard.
     fastMode: agentCfg.cliId === 'codex' ? ds.session.fastMode === true : undefined,
+    fastServiceTier: agentCfg.cliId === 'codex' ? ds.session.fastServiceTier : undefined,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
@@ -2577,6 +2579,28 @@ function setupWorkerHandlers(
           break;
         }
         acknowledgeSessionReady(msg.requestId);
+        break;
+      }
+      case 'fast_mode_result': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored fast_mode_result from stale worker generation`);
+          break;
+        }
+        acknowledgeFastModeResult(msg);
+        break;
+      }
+      case 'fast_mode_state': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored fast_mode_state from stale worker generation`);
+          break;
+        }
+        ds.session.fastMode = msg.enabled;
+        ds.session.fastServiceTier = msg.serviceTier;
+        if (ds.initConfig) {
+          ds.initConfig.fastMode = msg.enabled;
+          ds.initConfig.fastServiceTier = msg.serviceTier;
+        }
+        sessionStore.updateSession(ds.session);
         break;
       }
       case 'local_process_attestation': {

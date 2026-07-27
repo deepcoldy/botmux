@@ -68,6 +68,9 @@ export interface CodexRpcEngineOpts {
   /** Optional model + reasoning effort forwarded to thread config (P1). */
   model?: string;
   reasoningEffort?: string;
+  /** Session-scoped Fast Mode. The concrete protocol tier id is resolved from
+   * `model/list`; "Fast" is a display name and is not itself a stable tier id. */
+  fastMode?: boolean;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
@@ -111,6 +114,7 @@ export class CodexRpcEngine {
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private port = 0;
   private threadId?: string;
+  private serviceTier?: string;
   private closed = false;
   private deadNotified = false;
   private lastStderr = '';
@@ -122,6 +126,7 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
+  get activeServiceTier(): string | undefined { return this.serviceTier; }
   get appServerPid(): number | undefined { return this.child?.pid; }
 
   /** Spawn the app-server, connect, and complete the initialize handshake. */
@@ -159,6 +164,7 @@ export class CodexRpcEngine {
   /** Create a fresh session thread. Its id (== codex rollout session id) is what
    *  the TUI resumes and what botmux persists for future resume. */
   async startThread(): Promise<string> {
+    await this.prepareInitialServiceTier();
     const r = await this.request('thread/start', this.threadParams());
     this.threadId = String(r?.thread?.id ?? '');
     if (!this.threadId) throw new Error('thread/start returned no thread id');
@@ -169,6 +175,7 @@ export class CodexRpcEngine {
    *  so RPC mode stays engaged across daemon restarts instead of reverting to
    *  the paste path. */
   async resumeThread(threadId: string): Promise<string> {
+    await this.prepareInitialServiceTier();
     const params: Json = { ...this.threadParams(), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
@@ -191,8 +198,80 @@ export class CodexRpcEngine {
       serviceName: 'botmux',
       ephemeral: false,
       persistExtendedHistory: true,
+      serviceTier: this.serviceTier ?? null,
       config,
     };
+  }
+
+  /** Resolve the current model's catalog entry whose user-facing name is Fast.
+   * Codex 0.145 deliberately selects by tier name and sends the catalog's id
+   * (currently `priority` for OpenAI models), so callers must never hardcode
+   * `fast` as the protocol value. */
+  async resolveFastServiceTier(model = this.opts.model): Promise<{ model: string; serviceTier: string } | undefined> {
+    let cursor: string | null | undefined;
+    const models: Json[] = [];
+    do {
+      const result = await this.request('model/list', {
+        cursor: cursor ?? null,
+        limit: 100,
+        includeHidden: true,
+      });
+      if (Array.isArray(result?.data)) models.push(...result.data);
+      cursor = typeof result?.nextCursor === 'string' && result.nextCursor
+        ? result.nextCursor
+        : null;
+    } while (cursor);
+
+    const requested = model?.trim();
+    const selected = requested
+      ? models.find(entry => entry?.id === requested || entry?.model === requested)
+      : models.find(entry => entry?.isDefault === true);
+    if (!selected) return undefined;
+    const fast = Array.isArray(selected.serviceTiers)
+      ? selected.serviceTiers.find((tier: Json) =>
+        typeof tier?.name === 'string' && tier.name.toLowerCase() === 'fast')
+      : undefined;
+    if (!fast || typeof fast.id !== 'string' || !fast.id) return undefined;
+    return {
+      model: String(selected.model ?? selected.id),
+      serviceTier: fast.id,
+    };
+  }
+
+  private async prepareInitialServiceTier(): Promise<void> {
+    if (!this.opts.fastMode) {
+      this.serviceTier = undefined;
+      return;
+    }
+    if (this.serviceTier) return;
+    const resolved = await this.resolveFastServiceTier();
+    if (!resolved) {
+      throw new Error(`Fast Mode is not supported by model ${this.opts.model ?? '(default)'}`);
+    }
+    this.serviceTier = resolved.serviceTier;
+  }
+
+  /** Change the loaded thread's tier for subsequent turns. State is committed
+   * only after app-server acknowledges `thread/settings/update`, so the daemon
+   * can persist exactly what the executor accepted. */
+  async setFastMode(enabled: boolean): Promise<{ enabled: boolean; serviceTier?: string }> {
+    if (!this.threadId) throw new Error('setFastMode before startThread/resumeThread');
+    let nextTier: string | undefined;
+    if (enabled) {
+      const resolved = await this.resolveFastServiceTier();
+      if (!resolved) {
+        throw new Error(`Fast Mode is not supported by model ${this.opts.model ?? '(default)'}`);
+      }
+      nextTier = resolved.serviceTier;
+    }
+    await this.request('thread/settings/update', {
+      threadId: this.threadId,
+      serviceTier: nextTier ?? null,
+    });
+    this.serviceTier = nextTier;
+    return nextTier
+      ? { enabled: true, serviceTier: nextTier }
+      : { enabled: false };
   }
 
   /** Inject one user message as a turn. Resolves when the app-server acks the
@@ -212,6 +291,7 @@ export class CodexRpcEngine {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
+      serviceTier: this.serviceTier ?? null,
     };
     if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
     await this.request('turn/start', params, opts);
@@ -298,6 +378,7 @@ export class CodexRpcEngine {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
+      serviceTier: this.serviceTier ?? null,
     };
     if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
     try {

@@ -145,7 +145,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, fastMode, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, fastMode, fastServiceTier, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+      if (fastMode === true && !fastServiceTier) {
+        throw new Error('Fast service tier was not resolved from the Codex model catalog');
+      }
+      const serviceTier = fastMode === true ? fastServiceTier! : 'default';
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -159,7 +163,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         return [
           '--remote', remoteWsUrl, 'resume', '--no-alt-screen',
           '-c', 'check_for_update_on_startup=false',
-          '-c', `service_tier=${JSON.stringify(fastMode === true ? 'fast' : 'default')}`,
+          '-c', `service_tier=${JSON.stringify(serviceTier)}`,
           remoteThreadId,
         ];
       }
@@ -182,7 +186,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // otherwise leak one Session's choice into every later Session. Pin the
         // effective tier at process launch; Botmux owns the per-Session state.
         '-c',
-        `service_tier=${JSON.stringify(fastMode === true ? 'fast' : 'default')}`,
+        `service_tier=${JSON.stringify(serviceTier)}`,
       ];
       // Under read isolation the worker denies bots.json, so `botmux send` (a shell
       // subprocess) registers this bot from the worker-written cred FILE, keyed by

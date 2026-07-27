@@ -272,6 +272,8 @@ export const messages: Record<string, string> = {
   'cmd.fast.off': '⚪ Fast Mode is OFF for this Session only.',
   'cmd.fast.usage': 'Usage: /fast (toggle) | /fast on | /fast off | /fast status',
   'cmd.fast.unsupported': '⚠️ /fast requires a Botmux-managed Codex Session whose service tier can be pinned (Aiden gateways are not supported).',
+  'cmd.fast.unsupported_model': '⚠️ The current model does not support Fast Mode. State was not changed.',
+  'cmd.fast.apply_failed': '⚠️ Codex did not confirm the Fast Mode change. State was not changed; please retry.',
   'cmd.login.no_credentials': '❌ Cannot read app credentials.',
   'cmd.login.title': '🔐 Lark User OAuth',
   'cmd.login.step1': '1. Click the link below to authorize:',
