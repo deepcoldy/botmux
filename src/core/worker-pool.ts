@@ -2255,6 +2255,7 @@ export function forkWorker(
     // CODEX_HOME. Missing means the Session has never opted in → standard.
     fastMode: agentCfg.cliId === 'codex' ? ds.session.fastMode === true : undefined,
     fastServiceTier: agentCfg.cliId === 'codex' ? ds.session.fastServiceTier : undefined,
+    fastModeStateVersion: agentCfg.cliId === 'codex' ? ds.session.fastModeStateVersion : undefined,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
@@ -2596,9 +2597,11 @@ function setupWorkerHandlers(
         }
         ds.session.fastMode = msg.enabled;
         ds.session.fastServiceTier = msg.serviceTier;
+        ds.session.fastModeStateVersion = 1;
         if (ds.initConfig) {
           ds.initConfig.fastMode = msg.enabled;
           ds.initConfig.fastServiceTier = msg.serviceTier;
+          ds.initConfig.fastModeStateVersion = 1;
         }
         sessionStore.updateSession(ds.session);
         break;

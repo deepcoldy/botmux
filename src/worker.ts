@@ -209,7 +209,7 @@ import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
 } from './platform/device-paths.js';
-import type { BackendType, SessionBackend } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget, SessionBackend } from './adapters/backend/types.js';
 import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
@@ -354,6 +354,16 @@ async function killPersistentSessionVerified(backendType: PersistentBackendType,
   return killAndVerifyPersistentPane(name, {
     kill: (resolvedName) => killPersistentSession(backendType, resolvedName),
     isLive: (resolvedName) => persistentPaneLive(backendType, resolvedName),
+    wait: delay,
+  });
+}
+
+/** Kill the exact persisted backend resource (including an agent-scoped Herdr
+ * target) and fail closed unless probing confirms it is gone. */
+async function killPersistentBackendTargetVerified(target: PersistentBackendTarget): Promise<boolean> {
+  return killAndVerifyPersistentPane(target.sessionName, {
+    kill: () => killPersistentBackendTarget(target),
+    isLive: () => probePersistentBackendTarget(target) !== 'missing',
     wait: delay,
   });
 }
@@ -1523,6 +1533,13 @@ let pendingRestartFastModeAck: {
   serviceTier?: string;
   previousFastMode: boolean;
   previousServiceTier?: string;
+  previousStateVersion?: 1;
+} | null = null;
+/** A cold or legacy native Fast setting is only executor-confirmed after the
+ * explicitly-tiered replacement process reaches a real prompt. */
+let pendingInitialFastModeConfirmation: {
+  enabled: true;
+  serviceTier: string;
 } | null = null;
 /** Latest requested canonical session title. Unlike a normal prompt this is an
  * administrative TUI command: never type-ahead while the agent is busy, never
@@ -5092,22 +5109,30 @@ function markPromptReadyFromPty(): void {
   }
 }
 
-function commitFastModeChange(
-  request: Extract<DaemonToWorker, { type: 'set_fast_mode' }>,
+function publishFastModeExecutorState(
+  enabled: boolean,
   serviceTier?: string,
 ): void {
   if (!lastInitConfig) return;
-  lastInitConfig.fastMode = request.enabled;
-  lastInitConfig.fastServiceTier = request.enabled ? serviceTier : undefined;
+  lastInitConfig.fastMode = enabled;
+  lastInitConfig.fastServiceTier = enabled ? serviceTier : undefined;
+  lastInitConfig.fastModeStateVersion = 1;
   // Publish the accepted executor state before resolving the command waiter.
   // IPC preserves ordering, so persistence happens before the success reply;
   // a late ACK after the daemon-side wait deadline still cannot leave the
   // worker and Session store split-brained.
   send({
     type: 'fast_mode_state',
-    enabled: request.enabled,
-    ...(request.enabled && serviceTier ? { serviceTier } : {}),
+    enabled,
+    ...(enabled && serviceTier ? { serviceTier } : {}),
   });
+}
+
+function commitFastModeChange(
+  request: Extract<DaemonToWorker, { type: 'set_fast_mode' }>,
+  serviceTier?: string,
+): void {
+  publishFastModeExecutorState(request.enabled, serviceTier);
   send({
     type: 'fast_mode_result',
     requestId: request.requestId,
@@ -5189,7 +5214,8 @@ async function flushPendingFastModeChanges(): Promise<void> {
     // The launch snapshot is authoritative for this worker generation. An
     // idempotent request needs no native toggle; the resolved tier still heals
     // a legacy record before ACK.
-    if (lastInitConfig.fastMode === request.enabled) {
+    if (lastInitConfig.fastMode === request.enabled
+      && (!request.enabled || lastInitConfig.fastModeStateVersion === 1)) {
       commitFastModeChange(request, serviceTier ?? lastInitConfig.fastServiceTier);
       fastModeChangeInFlight = false;
       continueAfterFastModeChange();
@@ -5201,11 +5227,13 @@ async function flushPendingFastModeChanges(): Promise<void> {
       serviceTier,
       previousFastMode: lastInitConfig.fastMode === true,
       previousServiceTier: lastInitConfig.fastServiceTier,
+      previousStateVersion: lastInitConfig.fastModeStateVersion,
     };
     // Stage the replacement config before teardown. The daemon does not persist
     // it until the replacement prompt ACK below.
     lastInitConfig.fastMode = request.enabled;
     lastInitConfig.fastServiceTier = request.enabled ? serviceTier : undefined;
+    lastInitConfig.fastModeStateVersion = undefined;
     await restartCliProcess(
       `Fast Mode ${request.enabled ? 'enable' : 'disable'} reconciliation`,
       { immediate: true, preservePending: true, skipRestartBudget: true },
@@ -5215,6 +5243,7 @@ async function flushPendingFastModeChanges(): Promise<void> {
     if (pendingRestartFastModeAck && lastInitConfig) {
       lastInitConfig.fastMode = pendingRestartFastModeAck.previousFastMode;
       lastInitConfig.fastServiceTier = pendingRestartFastModeAck.previousServiceTier;
+      lastInitConfig.fastModeStateVersion = pendingRestartFastModeAck.previousStateVersion;
     }
     pendingRestartFastModeAck = null;
     rejectFastModeChange(
@@ -5267,6 +5296,12 @@ function markPromptReady(): void {
     commitFastModeChange(pending.request, pending.serviceTier);
     fastModeChangeInFlight = false;
     log(`Fast Mode replacement confirmed at prompt (${pending.request.enabled ? 'on' : 'off'})`);
+  }
+  if (pendingInitialFastModeConfirmation) {
+    const pending = pendingInitialFastModeConfirmation;
+    pendingInitialFastModeConfirmation = null;
+    publishFastModeExecutorState(pending.enabled, pending.serviceTier);
+    log('Initial Fast Mode state confirmed at prompt');
   }
   clearSessionRenameInFlight();
   // An old backend can still report idle while its async teardown is running.
@@ -6361,7 +6396,7 @@ function scheduleBusyPatternIdleProbe(source: string): void {
 
 async function spawnCli(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
-  opts: { pluginGenerationPrepared?: boolean } = {},
+  opts: { pluginGenerationPrepared?: boolean; forceFreshPersistent?: boolean } = {},
 ): Promise<void> {
   clearSessionRenameInFlight();
   currentCliCredentialIsolated = false;
@@ -6842,6 +6877,34 @@ async function spawnCli(
   // real host path the probe may not be able to stat). Computed here (not at
   // the spawn site below) so the pre-flight can short-circuit on it.
   let persistentSessionName = selectedBackend.persistentSessionName;
+  const persistentBackendType: PersistentBackendType | undefined =
+    effectiveBackendType === 'tmux'
+      || effectiveBackendType === 'herdr'
+      || effectiveBackendType === 'zellij'
+      ? effectiveBackendType
+      : undefined;
+  if (opts.forceFreshPersistent && persistentSessionName && persistentBackendType) {
+    const target = selectedBackend.persistentBackendTarget ?? {
+      backendType: persistentBackendType,
+      sessionName: persistentSessionName,
+    };
+    if (probePersistentBackendTarget(target) !== 'missing') {
+      log(`[fast-mode] replacing unconfirmed legacy persistent pane for ${cfg.sessionId}`);
+      const killed = await killPersistentBackendTargetVerified(target);
+      if (!killed) {
+        throw new Error(
+          `[fast-mode] refusing to reattach unconfirmed persistent pane for ${cfg.sessionId}`,
+        );
+      }
+      selectedBackend = selectBackend();
+      isTmuxMode = selectedBackend.isTmuxMode;
+      isPipeMode = selectedBackend.isPipeMode;
+      isZellijMode = selectedBackend.isZellijMode;
+      backend = selectedBackend.backend;
+      cliLifetimeNonce++;
+      persistentSessionName = selectedBackend.persistentSessionName;
+    }
+  }
   // [read-isolation] Before we decide to reattach a persistent pane: a pane can
   // survive a daemon restart still running a CLI that may NOT be isolated (e.g.
   // spawned before isolation was enabled, or by an old build). Isolation is only
@@ -9928,6 +9991,8 @@ process.on('message', async (raw: unknown) => {
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        const fastModeNeedsReconciliation = msg.fastMode === true
+          && (msg.fastModeStateVersion !== 1 || !msg.fastServiceTier);
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
           paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
@@ -9954,13 +10019,23 @@ process.on('message', async (raw: unknown) => {
         // at default tier.
         await ensureConfiguredFastServiceTier(msg);
         if (msg.fastMode === true && msg.fastServiceTier) {
-          send({
-            type: 'fast_mode_state',
-            enabled: true,
-            serviceTier: msg.fastServiceTier,
-          });
+          if (codexRpcEngine) {
+            // thread/start|resume already accepted this concrete tier.
+            publishFastModeExecutorState(true, msg.fastServiceTier);
+          } else if (fastModeNeedsReconciliation) {
+            // Native launch args are not proof until the replacement reaches a
+            // real prompt. Arm this before spawn so an early ready event cannot
+            // race past the confirmation.
+            pendingInitialFastModeConfirmation = {
+              enabled: true,
+              serviceTier: msg.fastServiceTier,
+            };
+          }
         }
-        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        await spawnCli(msg, {
+          pluginGenerationPrepared: rpcPluginGenerationPrepared,
+          forceFreshPersistent: fastModeNeedsReconciliation && !codexRpcEngine,
+        });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
 

@@ -1631,6 +1631,7 @@ describe('handleCommand', () => {
 
     it('stores the setting without spawning a CLI when /fast starts a new topic', async () => {
       const ds = makeCodexFastSession(false, false);
+      ds.session.fastModeStateVersion = 1;
       const deps = makeDeps(ds);
 
       await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
@@ -1638,8 +1639,19 @@ describe('handleCommand', () => {
       expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
       expect(ds.session.fastMode).toBe(true);
       expect(ds.session.fastServiceTier).toBe('priority');
+      expect(ds.session.fastModeStateVersion).toBeUndefined();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(deps.sessionReply).toHaveBeenCalled();
+    });
+
+    it('re-applies an enabled legacy Session until an executor confirms it', async () => {
+      const ds = makeCodexFastSession(true);
+      ds.session.fastServiceTier = 'priority';
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
+
+      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
     });
 
     it('persists and reports success only after the worker ACKs the change', async () => {

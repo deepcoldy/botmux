@@ -1930,8 +1930,10 @@ export async function handleCommand(
         // A legacy `fastMode:true` record without a catalog tier is not proof
         // that the executor actually applied Fast Mode. Re-apply it through the
         // acknowledged path so the persisted state self-heals.
-        const needsApply = enabled !== current || (enabled && !ds.session.fastServiceTier);
+        const needsApply = enabled !== current
+          || (enabled && (!ds.session.fastServiceTier || ds.session.fastModeStateVersion !== 1));
         if (needsApply) {
+          const executorWasLive = !!ds.worker && !ds.worker.killed;
           const applied = deps.applyFastMode
             ? await deps.applyFastMode(ds, enabled)
             : ({ ok: false, reason: 'apply_failed' } as const);
@@ -1947,9 +1949,15 @@ export async function handleCommand(
           // state and the daemon's in-memory restart snapshot coherent.
           ds.session.fastMode = enabled;
           ds.session.fastServiceTier = enabled ? applied.serviceTier : undefined;
+          // A capability probe can stage a cold Session, but it is not an
+          // executor ACK. Leave the marker absent so init reconciles before
+          // trusting any persistent pane. A live worker publishes version 1
+          // through fast_mode_state before its result ACK.
+          if (!executorWasLive) ds.session.fastModeStateVersion = undefined;
           if (ds.initConfig) {
             ds.initConfig.fastMode = enabled;
             ds.initConfig.fastServiceTier = enabled ? applied.serviceTier : undefined;
+            if (!executorWasLive) ds.initConfig.fastModeStateVersion = undefined;
           }
           sessionStore.updateSession(ds.session);
         } else if (ds.session.fastMode === undefined) {
