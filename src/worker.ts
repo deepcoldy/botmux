@@ -2327,6 +2327,28 @@ function readSendMarkers(): BridgeSendMarker[] {
   }
 }
 
+function explicitReplyMarkerForTurnWindow(
+  turn: { markTimeMs: number | undefined; isLocal: boolean | undefined },
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): BridgeSendMarker | undefined {
+  if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return undefined;
+  const lower = turn.markTimeMs;
+  const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
+  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper);
+  return inWindow.at(-1);
+}
+
+function notifyExplicitReplyObserved(turnId: string, marker: BridgeSendMarker | undefined): void {
+  if (!marker) return;
+  send({
+    type: 'explicit_reply_observed',
+    turnId,
+    ...(marker.messageId ? { messageId: marker.messageId } : {}),
+  });
+}
+
 function submitActivityEvidenceSince(sinceMs: number): SubmitActivityEvidence | undefined {
   if (lastPtyActivityAtMs > sinceMs) return 'pty-output';
   if (lastStructuredBridgeActivityAtMs > sinceMs) return 'structured-transcript';
@@ -3361,9 +3383,14 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     if (assistantText.length === 0) continue;
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
-    if (shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText }, nextBoundaryMs, markers, adoptMode)) {
+    const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
+    if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       const reason = turn.isLocal ? 'local-typed' : 'model called botmux send within window';
       log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+      notifyExplicitReplyObserved(
+        turn.turnId,
+        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
+      );
       continue;
     }
 
@@ -4063,6 +4090,10 @@ function emitReadyCodexTurns(): void {
     if (!content) continue;
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode)) {
       log(`Codex bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (gate)`);
+      notifyExplicitReplyObserved(
+        turn.turnId,
+        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
+      );
       continue;
     }
     if (turn.isLocal) {
@@ -5383,14 +5414,20 @@ function handleCodexAppMarker(body: string): void {
     // equality for compatibility, but can never select another attempt.
     const dispatchAttempt = currentBotmuxDispatchAttempt;
     if (startedAtMs !== undefined) {
+      const markers = readSendMarkers();
+      const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: payload.content };
       const sentByModel = shouldSuppressBridgeEmit(
-        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
+        gateInput,
         completedAtMs + 5_001,
-        readSendMarkers(),
+        markers,
         false,
       );
       if (sentByModel) {
         log(`${cliName()} final_output suppressed (model already called botmux send)`);
+        notifyExplicitReplyObserved(
+          turnId,
+          explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, markers, false),
+        );
         emitTurnTerminal(turnId, 'completed', undefined, dispatchAttempt);
         return;
       }

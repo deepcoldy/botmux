@@ -122,6 +122,12 @@ import { listVcMeetingActions } from '../src/services/vc-meeting-action-store.js
 import { listVcMeetingListenerMessageIds } from '../src/services/vc-meeting-listener-message-store.js';
 import { getSessionUsageSnapshot } from '../src/core/cost-calculator.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+import {
+  clearMessageListenerRunPreviewStore,
+  createMessageListenerRunPreview,
+  getMessageListenerRunPreview,
+  markMessageListenerRunPreviewTriggered,
+} from '../src/services/message-listener-run-preview-store.js';
 
 // Build a fake worker child process whose IPC `message` event we can fire
 // manually, then wire it through setupWorkerHandlers via forkAdoptWorker.
@@ -240,6 +246,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   afterEach(() => {
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
+    clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
   });
 
@@ -339,6 +346,42 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.usageLimit).toBeUndefined();
     expect(ds.lastScreenStatus).not.toBe('limited');
     expect(sessionReply).toHaveBeenCalled();
+  });
+
+  it('marks message listener run preview replied when an explicit botmux send is observed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+
+    const run = createMessageListenerRunPreview('app_test', 'oc_chat', ['om_source']);
+    const triggerId = 'mlrp_turn_explicit_send';
+    markMessageListenerRunPreviewTriggered(run.runId, 'om_source', {
+      action: 'queued',
+      sessionId: 'sid-final-out',
+      triggerId,
+    });
+
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: triggerId,
+      messageId: 'om_explicit_reply',
+    } as any);
+
+    const updated = getMessageListenerRunPreview(run.runId);
+    expect(updated?.results[0]).toMatchObject({
+      messageId: 'om_source',
+      state: 'replied',
+      sessionId: ds.session.sessionId,
+      replyMessageId: 'om_explicit_reply',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {

@@ -113,6 +113,154 @@ describe('message listener evaluation', () => {
     expect(matches.at(-1)?.messageText).toBe('告警 24');
   });
 
+  it('matches REST history messages whose content is nested under body.content', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_allowed'],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+        },
+      },
+    });
+
+    const match = evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: {
+        message_id: 'om_rest',
+        chat_id: 'oc_chat',
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'CPU 告警来自 REST 历史' }) },
+      },
+      senderOpenId: 'ou_allowed',
+      senderTypeRaw: 'user',
+      explicitlyMentionedThisBot: false,
+    });
+
+    expect(match).toMatchObject({
+      messageText: 'CPU 告警来自 REST 历史',
+      msgType: 'text',
+      senderOpenId: 'ou_allowed',
+      senderType: 'user',
+    });
+  });
+
+  it('treats REST history root messages with thread_id as top-level messages', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['cli_argos'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+
+    const match = evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: {
+        message_id: 'om_root_card',
+        thread_id: 'omt_root_topic',
+        chat_id: 'oc_chat',
+        msg_type: 'interactive',
+        body: {
+          content: JSON.stringify({
+            title: 'Argos平台报警',
+            elements: [[{ tag: 'text', text: '规则名称：成片任务执行成功率 < 90%' }]],
+          }),
+        },
+      },
+      senderOpenId: 'cli_argos',
+      senderTypeRaw: 'app',
+      explicitlyMentionedThisBot: false,
+    });
+
+    expect(match).toMatchObject({
+      messageTitle: 'Argos平台报警',
+      senderType: 'bot',
+      messageText: expect.stringContaining('规则名称：成片任务执行成功率 < 90%'),
+    });
+
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: {
+        message_id: 'om_reply',
+        root_id: 'om_root_card',
+        thread_id: 'omt_root_topic',
+        msg_type: 'interactive',
+        body: { content: JSON.stringify({ title: 'reply card' }) },
+      },
+      senderOpenId: 'cli_argos',
+      senderTypeRaw: 'app',
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
+  });
+
+  it('extracts sender names and card titles for REST history preview matches', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '分析卡片',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['cli_argos'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+
+    const matches = previewMessageListenerMatches({
+      bot: state,
+      chatId: 'oc_chat',
+      limit: 5,
+      messages: [{
+        message_id: 'om_card',
+        create_time: '3000',
+        msg_type: 'interactive',
+        body: {
+          content: JSON.stringify({
+            header: { title: { content: '[critical] ABase 写流量告警' } },
+            body: {
+              elements: [
+                { tag: 'div', text: { content: '服务: bytedance.abase2.ecom_alliance_ai' } },
+              ],
+            },
+          }),
+        },
+        sender: { id: 'cli_argos', sender_type: 'app', sender_name: 'Argos' },
+      }],
+      senderForMessage: message => ({
+        senderOpenId: message.sender.id,
+        senderTypeRaw: message.sender.sender_type,
+        senderName: message.sender.sender_name,
+      }),
+    });
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({
+      messageId: 'om_card',
+      messageTitle: '[critical] ABase 写流量告警',
+      senderName: 'Argos',
+      messageText: expect.stringContaining('服务: bytedance.abase2.ecom_alliance_ai'),
+    });
+  });
+
   it('does not hijack explicit mentions or existing topics', () => {
     const state = bot({
       messageListeners: {

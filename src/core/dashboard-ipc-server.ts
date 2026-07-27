@@ -106,7 +106,16 @@ import {
   renderMessageListenerPrompt,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
+import {
+  createMessageListenerRunPreview,
+  createMessageListenerRunPreviewTurnId,
+  getMessageListenerRunPreview,
+  markMessageListenerRunPreviewFailed,
+  markMessageListenerRunPreviewTriggered,
+} from '../services/message-listener-run-preview-store.js';
 import { listChatMemberDisplays } from '../services/groups-store.js';
+
+const MESSAGE_LISTENER_PREVIEW_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 let exactChatGrantHandler: typeof applyExactChatGrantRequest = applyExactChatGrantRequest;
 /** Test seam: replace the exact-grant service without touching live Feishu/config state. */
@@ -2438,16 +2447,23 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
   jsonRes(res, 200, { ok: true, listener: result.listener });
 });
 
-function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderTypeRaw?: string } {
+function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string } {
   const sender = message?.sender ?? {};
   const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
+  const senderName = sender.sender_name ?? sender.name ?? sender.user_name ?? message?.sender_name;
   const senderIdType = sender.id_type ?? sender.sender_id_type;
   const senderTypeRaw = sender.sender_type ?? message?.sender_type ?? (senderIdType === 'app_id' ? 'app' : undefined);
   return {
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
+    senderName: typeof senderName === 'string' && senderName.trim() ? senderName.trim() : undefined,
     senderTypeRaw: typeof senderTypeRaw === 'string' ? senderTypeRaw : undefined,
   };
+}
+
+function dashboardMessageCreateTimeMs(message: any): number | undefined {
+  const value = Number(message?.create_time ?? message?.createTime);
+  return Number.isFinite(value) ? value : undefined;
 }
 
 async function readMessageListenerPreviewRequest(req: IncomingMessage): Promise<
@@ -2494,9 +2510,14 @@ async function collectMessageListenerPreviewMatches(
       },
     },
   };
+  const cutoff = Date.now() - MESSAGE_LISTENER_PREVIEW_WINDOW_MS;
   const messages = await listChatMessagesUntil(larkAppId, chatId, {
     pageSize: 50,
-    stopAfter: (_message, seenCount) => seenCount >= Math.max(100, limit * 5),
+    stopAfter: (message, seenCount) => {
+      const createdAt = dashboardMessageCreateTimeMs(message);
+      return seenCount >= Math.max(100, limit * 5) ||
+        (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
+    },
   });
   return previewMessageListenerMatches({
     bot: previewBot,
@@ -2512,8 +2533,10 @@ function publicMessageListenerMatch(match: MessageListenerPreviewMatch): Record<
     messageId: match.messageId,
     createTime: match.createTime,
     messageText: match.messageText,
+    messageTitle: match.messageTitle,
     msgType: match.msgType,
     senderOpenId: match.senderOpenId,
+    senderName: match.senderName,
     senderType: match.senderType,
   };
 }
@@ -2544,8 +2567,10 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
   if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
   try {
     const matches = await collectMessageListenerPreviewMatches(cachedLarkAppId, p.chatId, parsed.listener, parsed.limit);
+    const run = createMessageListenerRunPreview(cachedLarkAppId, p.chatId, matches.map(match => match.messageId));
     const results = [];
     for (const match of matches) {
+      const triggerId = createMessageListenerRunPreviewTurnId();
       try {
         const result = await triggerSessionTurn({
           source: {
@@ -2569,25 +2594,46 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
           },
           instruction: renderMessageListenerPrompt(match),
           presentation: { topicMessage: null },
-          options: { asyncReturnSessionId: true },
-        }, { larkAppId: cachedLarkAppId, activeSessions });
-        results.push({
+        }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
+        const tracked = result.ok
+          ? markMessageListenerRunPreviewTriggered(run.runId, match.messageId, {
+              action: result.action,
+              sessionId: result.target?.sessionId,
+              triggerId: result.triggerId ?? triggerId,
+            })
+          : markMessageListenerRunPreviewFailed(run.runId, {
+              messageId: match.messageId,
+              sessionId: result.target?.sessionId,
+              error: result.error,
+            });
+        results.push(tracked ?? {
+          runId: run.runId,
           messageId: match.messageId,
           ok: result.ok,
+          state: result.ok ? 'triggered' : 'failed',
           action: result.action,
           sessionId: result.target?.sessionId,
+          triggerId: result.triggerId ?? triggerId,
           error: result.error,
         });
       } catch (err) {
-        results.push({
+        const error = err instanceof Error ? err.message : String(err);
+        const tracked = markMessageListenerRunPreviewFailed(run.runId, {
+          messageId: match.messageId,
+          error,
+        });
+        results.push(tracked ?? {
+          runId: run.runId,
           messageId: match.messageId,
           ok: false,
-          error: err instanceof Error ? err.message : String(err),
+          state: 'failed',
+          error,
         });
       }
     }
     jsonRes(res, 200, {
       ok: results.every(result => result.ok),
+      runId: run.runId,
       requestedLimit: parsed.limit,
       matches: matches.map(publicMessageListenerMatch),
       results,
@@ -2595,6 +2641,22 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
   } catch (err) {
     jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) });
   }
+});
+
+ipcRoute('GET', '/api/message-listeners/:chatId/run-preview/:runId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  const run = getMessageListenerRunPreview(p.runId);
+  if (!run || run.larkAppId !== cachedLarkAppId || run.chatId !== p.chatId) {
+    return jsonRes(res, 404, { ok: false, error: 'not_found' });
+  }
+  jsonRes(res, 200, {
+    ok: true,
+    runId: run.runId,
+    createdAt: run.createdAt,
+    updatedAt: run.updatedAt,
+    results: run.results,
+  });
 });
 
 ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {

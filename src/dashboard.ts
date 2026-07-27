@@ -4039,7 +4039,23 @@ const server = createServer(async (req, res) => {
     // PUT    /api/message-listeners/:larkAppId/:chatId
     // DELETE /api/message-listeners/:larkAppId/:chatId
     // POST   /api/message-listeners/:larkAppId/:chatId/(preview|run-preview)
+    // GET    /api/message-listeners/:larkAppId/:chatId/run-preview/:runId
     let mMessageListener: RegExpMatchArray | null;
+    if ((mMessageListener = url.pathname.match(/^\/api\/message-listeners\/([^/]+)\/([^/]+)\/run-preview\/([^/]+)$/))) {
+      const larkAppId = decodeURIComponent(mMessageListener[1]);
+      const chatId = decodeURIComponent(mMessageListener[2]);
+      const runId = decodeURIComponent(mMessageListener[3]);
+      if (req.method === 'GET') {
+        const upstream = await proxyToDaemon(
+          larkAppId,
+          `/api/message-listeners/${encodeURIComponent(chatId)}/run-preview/${encodeURIComponent(runId)}`,
+          { method: 'GET' },
+        );
+        res.writeHead(upstream.status, { 'content-type': 'application/json' });
+        res.end(await upstream.text());
+        return;
+      }
+    }
     if ((mMessageListener = url.pathname.match(/^\/api\/message-listeners\/([^/]+)\/([^/]+)\/(preview|run-preview)$/))) {
       const larkAppId = decodeURIComponent(mMessageListener[1]);
       const chatId = decodeURIComponent(mMessageListener[2]);

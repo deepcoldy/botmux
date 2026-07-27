@@ -31,10 +31,12 @@ import {
   entryForBot,
   filterRoleGroups,
   filterRoleProfiles,
+  formatListenerPreviewTime,
   hashChatId,
   isValidProfileId,
   loadGroupMemberDisplays,
   loadGroups,
+  loadMessageListenerRunPreviewStatus,
   loadMessageListener,
   loadProfileEntries,
   loadProfileEntry,
@@ -60,6 +62,8 @@ import {
   type MessageListenerData,
   type MessageListenerPreviewItem,
   type MessageListenerPreviewResponse,
+  type MessageListenerRunPreviewResult,
+  type MessageListenerRunPreviewState,
   type RoleData,
   type RoleInjectMode,
   type RoleProfileApplyResult,
@@ -140,6 +144,23 @@ function listenerSenderTypeMatches(member: GroupMemberDisplay, listener: Message
   const includeTypes = new Set(listener.senderPolicy?.includeSenderTypes ?? DEFAULT_LISTENER.senderPolicy?.includeSenderTypes ?? []);
   if (includeTypes.size === 0) return true;
   return (member.memberType === 'user' || member.memberType === 'bot') && includeTypes.has(member.memberType);
+}
+
+function mergeListenerRunPreviewResults(
+  current: MessageListenerRunPreviewResult[] | undefined,
+  next: MessageListenerRunPreviewResult[],
+): MessageListenerRunPreviewResult[] {
+  const merged = new Map<string, MessageListenerRunPreviewResult>();
+  for (const result of current ?? []) merged.set(result.messageId, result);
+  for (const result of next) merged.set(result.messageId, { ...merged.get(result.messageId), ...result });
+  return [...merged.values()];
+}
+
+function listenerRunPreviewStateClass(state: MessageListenerRunPreviewState | undefined, ok: boolean): string {
+  if (!ok || state === 'failed') return 'error';
+  if (state === 'replied') return 'ok';
+  if (state === 'running') return 'running';
+  return 'triggered';
 }
 
 function listenerForEditor(listener: MessageListenerData | null | undefined, members: GroupMemberDisplay[] = []): MessageListenerData {
@@ -232,6 +253,8 @@ function RolesPage(props: { tab: RolesTab }) {
   const [listenerFlash, setListenerFlash] = useState<FlashState>(null);
   const [listenerPreviewLimit, setListenerPreviewLimit] = useState(DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT);
   const [listenerPreviewStatus, setListenerPreviewStatus] = useState<ListenerPreviewStatus>({ kind: 'idle' });
+  const listenerRunPollRef = useRef<{ runId: string; token: number } | null>(null);
+  const listenerRunPollToken = useRef(0);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [selectedProfileBotId, setSelectedProfileBotId] = useState<string | null>(null);
   const [profileEntries, setProfileEntries] = useState<RoleProfileEntry[]>([]);
@@ -379,6 +402,11 @@ function RolesPage(props: { tab: RolesTab }) {
   useEffect(() => {
     void loadInitial();
   }, [loadInitial]);
+
+  useEffect(() => () => {
+    listenerRunPollToken.current += 1;
+    listenerRunPollRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (selectedApplyGroupId || groups.length === 0) return;
@@ -639,10 +667,49 @@ function RolesPage(props: { tab: RolesTab }) {
       setListenerPreviewStatus(response.ok
         ? { kind: 'result', response, mode }
         : { kind: 'error', text: response.error || tr('roles.listenerPreviewFailed') });
+      if (response.ok && run && response.runId) {
+        startListenerRunPreviewPolling(response.runId);
+      }
     } catch (err) {
       if (!alive.current) return;
       setListenerPreviewStatus({ kind: 'error', text: err instanceof Error ? err.message : tr('roles.listenerPreviewFailed') });
     }
+  }
+
+  function startListenerRunPreviewPolling(runId: string): void {
+    if (!selectedGroupId || !selectedBotId) return;
+    const token = ++listenerRunPollToken.current;
+    listenerRunPollRef.current = { runId, token };
+    const poll = async () => {
+      if (!alive.current) return;
+      const current = listenerRunPollRef.current;
+      if (!current || current.runId !== runId || current.token !== token || !selectedGroupId || !selectedBotId) return;
+      try {
+        const status = await loadMessageListenerRunPreviewStatus(selectedBotId, selectedGroupId, runId);
+        if (!alive.current) return;
+        if (status.ok && status.results) {
+          const nextResults = status.results;
+          setListenerPreviewStatus(previous => {
+            if (previous.kind !== 'result' || previous.mode !== 'run' || previous.response.runId !== runId) return previous;
+            return {
+              ...previous,
+              response: {
+                ...previous.response,
+                results: mergeListenerRunPreviewResults(previous.response.results, nextResults),
+              },
+            };
+          });
+          if (nextResults.some(result => result.state === 'triggered' || result.state === 'running')) {
+            scheduleTimer(poll, 1500);
+          } else if (listenerRunPollRef.current?.runId === runId) {
+            listenerRunPollRef.current = null;
+          }
+        }
+      } catch {
+        scheduleTimer(poll, 2500);
+      }
+    };
+    scheduleTimer(poll, 1500);
   }
 
   async function handleSaveListener(): Promise<void> {
@@ -1427,8 +1494,8 @@ function MessageListenerEditor(props: {
         />
         <span className="filter-toggle-switch" aria-hidden="true"></span>
         <span className="filter-toggle-label">{tr('roles.listenerEnabled')}</span>
-        <span className="roles-help" title={tr('roles.listenerScopeHelp')} aria-label={tr('roles.listenerScopeHelp')}>?</span>
       </label>
+      <p className="roles-listener-scope-help">{tr('roles.listenerScopeHelp')}</p>
       <div className="roles-listener-grid">
         <label className="roles-listener-field">
           <span className="roles-field-label">{tr('roles.listenerName')}</span>
@@ -1695,13 +1762,22 @@ function ListenerPreviewResult(props: { status: ListenerPreviewStatus; tr: Trans
   if (status.kind === 'loading') return <LoadingState label={tr('common.loading')} />;
   if (status.kind === 'error') return <div className="roles-listener-preview-error">{status.text}</div>;
   const matches = status.response.matches ?? [];
+  const results = status.response.results ?? [];
+  const stateCounts = results.reduce((acc, result) => {
+    const state = !result.ok ? 'failed' : result.state ?? 'triggered';
+    acc[state] = (acc[state] ?? 0) + 1;
+    return acc;
+  }, {} as Record<MessageListenerRunPreviewState, number>);
   return (
     <div className="roles-listener-preview-results">
       <div className="roles-listener-preview-summary">
         {status.mode === 'run'
           ? tr('roles.listenerRunPreviewSummary', {
               count: matches.length,
-              ok: status.response.results?.filter(result => result.ok).length ?? 0,
+              triggered: stateCounts.triggered ?? 0,
+              running: stateCounts.running ?? 0,
+              replied: stateCounts.replied ?? 0,
+              failed: stateCounts.failed ?? 0,
             })
           : tr('roles.listenerPreviewSummary', { count: matches.length })}
       </div>
@@ -1710,7 +1786,12 @@ function ListenerPreviewResult(props: { status: ListenerPreviewStatus; tr: Trans
       ) : (
         <div className="roles-listener-preview-list">
           {matches.map(item => (
-            <ListenerPreviewItem item={item} result={status.response.results?.find(result => result.messageId === item.messageId)} key={item.messageId} />
+            <ListenerPreviewItem
+              item={item}
+              result={status.response.results?.find(result => result.messageId === item.messageId)}
+              tr={tr}
+              key={item.messageId}
+            />
           ))}
         </div>
       )}
@@ -1720,11 +1801,14 @@ function ListenerPreviewResult(props: { status: ListenerPreviewStatus; tr: Trans
 
 function ListenerPreviewItem(props: {
   item: MessageListenerPreviewItem;
-  result?: { ok: boolean; action?: string; sessionId?: string; error?: string };
+  result?: MessageListenerRunPreviewResult;
+  tr: Translator;
 }) {
   const text = props.item.messageText.length > 300
     ? `${props.item.messageText.slice(0, 300)}...`
     : props.item.messageText;
+  const senderLabel = props.item.senderName || props.item.senderOpenId || props.item.senderType;
+  const sentAt = formatListenerPreviewTime(props.item.createTime);
   return (
     <div className="roles-listener-preview-item">
       <div className="roles-listener-preview-meta">
@@ -1733,11 +1817,35 @@ function ListenerPreviewItem(props: {
         {props.item.senderOpenId ? <span>{props.item.senderOpenId}</span> : null}
         <span>{props.item.messageId}</span>
         {props.result ? (
-          <span className={props.result.ok ? 'ok' : 'error'}>
-            {props.result.ok ? (props.result.sessionId ?? props.result.action ?? 'ok') : (props.result.error ?? 'failed')}
+          <span className={listenerRunPreviewStateClass(props.result.state, props.result.ok)}>
+            {props.tr(`roles.listenerRunPreviewState.${!props.result.ok ? 'failed' : props.result.state ?? 'triggered'}`)}
           </span>
         ) : null}
       </div>
+      {props.result?.sessionId || props.result?.replyMessageId || props.result?.error ? (
+        <div className="roles-listener-preview-run-detail">
+          {props.result.sessionId ? <span>{props.result.sessionId}</span> : null}
+          {props.result.replyMessageId ? <span>{props.result.replyMessageId}</span> : null}
+          {props.result.error ? <strong>{props.result.error}</strong> : null}
+        </div>
+      ) : null}
+      <div className="roles-listener-preview-sender">
+        <span>{props.tr('roles.listenerPreviewSender')}</span>
+        <strong>{senderLabel}</strong>
+      </div>
+      {sentAt ? (
+        <div className="roles-listener-preview-time">
+          <span>{props.tr('roles.listenerPreviewTime')}</span>
+          <strong>{sentAt}</strong>
+        </div>
+      ) : null}
+      {props.item.messageTitle ? (
+        <div className="roles-listener-preview-title">
+          <span>{props.tr('roles.listenerPreviewMessageTitle')}</span>
+          <strong>{props.item.messageTitle}</strong>
+        </div>
+      ) : null}
+      <div className="roles-listener-preview-content-label">{props.tr('roles.listenerPreviewContent')}</div>
       <pre>{text}</pre>
     </div>
   );

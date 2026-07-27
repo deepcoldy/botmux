@@ -62,22 +62,43 @@ export interface MessageListenerPreviewItem {
   messageId: string;
   createTime?: string;
   messageText: string;
+  messageTitle?: string;
   msgType: string;
   senderOpenId?: string;
+  senderName?: string;
   senderType: 'user' | 'bot';
+}
+
+export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+
+export interface MessageListenerRunPreviewResult {
+  runId?: string;
+  messageId: string;
+  ok: boolean;
+  state?: MessageListenerRunPreviewState;
+  action?: string;
+  sessionId?: string;
+  triggerId?: string;
+  error?: string;
+  replyMessageId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  finishedAt?: string;
 }
 
 export interface MessageListenerPreviewResponse {
   ok: boolean;
   requestedLimit: number;
   matches: MessageListenerPreviewItem[];
-  results?: Array<{
-    messageId: string;
-    ok: boolean;
-    action?: string;
-    sessionId?: string;
-    error?: string;
-  }>;
+  runId?: string;
+  results?: MessageListenerRunPreviewResult[];
+  error?: string;
+}
+
+export interface MessageListenerRunPreviewStatusResponse {
+  ok: boolean;
+  runId?: string;
+  results?: MessageListenerRunPreviewResult[];
   error?: string;
 }
 
@@ -280,6 +301,32 @@ export function normalizeListenerPreviewLimit(limit: number): number {
   return Math.min(MAX_MESSAGE_LISTENER_PREVIEW_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
+function padDatePart(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+export function formatListenerPreviewTime(createTime: string | undefined): string {
+  if (!createTime) return '';
+  const raw = Number(createTime);
+  if (!Number.isFinite(raw) || raw <= 0) return '';
+  const ms = raw < 1_000_000_000_000 ? raw * 1000 : raw;
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return '';
+  return [
+    date.getFullYear(),
+    '-',
+    padDatePart(date.getMonth() + 1),
+    '-',
+    padDatePart(date.getDate()),
+    ' ',
+    padDatePart(date.getHours()),
+    ':',
+    padDatePart(date.getMinutes()),
+    ':',
+    padDatePart(date.getSeconds()),
+  ].join('');
+}
+
 export async function previewMessageListener(
   larkAppId: string,
   chatId: string,
@@ -316,6 +363,21 @@ export async function runMessageListenerPreview(
     ok: r.ok && body.ok !== false,
     requestedLimit: body.requestedLimit ?? normalizeListenerPreviewLimit(limit),
     matches: body.matches ?? [],
+    results: body.results,
+    error: body.error,
+  };
+}
+
+export async function loadMessageListenerRunPreviewStatus(
+  larkAppId: string,
+  chatId: string,
+  runId: string,
+): Promise<MessageListenerRunPreviewStatusResponse> {
+  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}/run-preview/${encodeURIComponent(runId)}`);
+  const body = await readJson(r);
+  return {
+    ok: r.ok && body.ok !== false,
+    runId: body.runId,
     results: body.results,
     error: body.error,
   };

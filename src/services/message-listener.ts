@@ -1,5 +1,5 @@
 import type { BotState, MessageListenerConfig } from '../bot-registry.js';
-import { extractCardContent } from '../im/lark/message-parser.js';
+import { extractCardContent, unwrapUserDslContent } from '../im/lark/message-parser.js';
 
 export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 
@@ -11,8 +11,10 @@ export interface MessageListenerMatch {
   prompt: string;
   workingDir?: string;
   messageText: string;
+  messageTitle?: string;
   msgType: string;
   senderOpenId?: string;
+  senderName?: string;
   senderType: MessageListenerSenderType;
 }
 
@@ -32,11 +34,73 @@ export function messageTypeOf(message: any): string {
   return String(message?.message_type ?? message?.msg_type ?? '').trim() || 'text';
 }
 
+function listenerMessageRawContent(message: any): string {
+  const content = message?.content ?? message?.body?.content;
+  return typeof content === 'string' ? content : '';
+}
+
+function listenerMessageContent(message: any): string {
+  const content = listenerMessageRawContent(message);
+  if (!content) return '';
+  return messageTypeOf(message) === 'interactive'
+    ? unwrapUserDslContent(content) ?? content
+    : content;
+}
+
+function firstTrimmedString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return undefined;
+}
+
+export function extractListenerMessageTitle(message: any): string | undefined {
+  const content = listenerMessageContent(message);
+  if (!content) return undefined;
+  const msgType = messageTypeOf(message);
+  if (msgType === 'interactive') {
+    const renderedTitle = content.match(/<card\s+title=(["'])(.*?)\1/i)?.[2];
+    if (renderedTitle?.trim()) return renderedTitle.trim();
+    try {
+      const card = JSON.parse(content);
+      return firstTrimmedString(
+        card?.title,
+        card?.header?.title?.content,
+        card?.header?.title?.i18n?.zh_cn,
+        card?.header?.title?.i18n?.en_us,
+      );
+    } catch {
+      return undefined;
+    }
+  }
+  if (msgType === 'post') {
+    try {
+      const obj = JSON.parse(content);
+      const inner = obj?.zh_cn ?? obj?.en_us ?? obj;
+      return firstTrimmedString(inner?.title, obj?.title);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 export function extractListenerMessageText(message: any): string {
-  const content = typeof message?.content === 'string' ? message.content : '';
+  const content = listenerMessageContent(message);
   if (!content) return '';
   const msgType = messageTypeOf(message);
   if (msgType === 'interactive') return extractCardContent(content);
+  if (msgType === 'image') {
+    try {
+      const obj = JSON.parse(content);
+      const key = firstTrimmedString(obj?.image_key, obj?.img_key);
+      return key ? `[图片消息: ${key}]` : '[图片消息]';
+    } catch {
+      return '[图片消息]';
+    }
+  }
   try {
     const obj = JSON.parse(content);
     if (typeof obj?.text === 'string') return obj.text.trim();
@@ -97,6 +161,7 @@ export function evaluateMessageListener(input: {
   chatId: string;
   message: any;
   senderOpenId?: string;
+  senderName?: string;
   senderTypeRaw?: string;
   explicitlyMentionedThisBot: boolean;
 }): MessageListenerMatch | undefined {
@@ -104,7 +169,12 @@ export function evaluateMessageListener(input: {
   const messageId = String(input.message?.message_id ?? '');
   const rootId = input.message?.root_id ? String(input.message.root_id) : '';
   const threadId = input.message?.thread_id ? String(input.message.thread_id) : '';
-  if ((rootId && rootId !== messageId) || (threadId && threadId !== messageId)) return undefined;
+  const parentId = input.message?.parent_id ? String(input.message.parent_id) : '';
+  // REST history returns a top-level topic root as message_id=om_* plus
+  // thread_id=omt_*. Replies carry root_id/parent_id. Do not reject the root
+  // solely because thread_id uses a different id namespace.
+  if ((rootId && rootId !== messageId) || (parentId && parentId !== messageId)) return undefined;
+  if (threadId && threadId.startsWith('om_') && threadId !== messageId) return undefined;
 
   const listener = findMessageListenerForChat(input.bot, input.chatId);
   if (!listener) return undefined;
@@ -121,6 +191,7 @@ export function evaluateMessageListener(input: {
 
   const messageText = extractListenerMessageText(input.message);
   if (!messageText && (msgType === 'text' || msgType === 'post')) return undefined;
+  const messageTitle = extractListenerMessageTitle(input.message);
 
   return {
     name: listener.name,
@@ -128,8 +199,10 @@ export function evaluateMessageListener(input: {
     prompt: listener.prompt,
     workingDir: listener.workingDir,
     messageText,
+    messageTitle,
     msgType,
     senderOpenId: input.senderOpenId,
+    senderName: input.senderName,
     senderType,
   };
 }
@@ -145,7 +218,7 @@ export function previewMessageListenerMatches(input: {
   chatId: string;
   messages: any[];
   limit: number;
-  senderForMessage(message: any): { senderOpenId?: string; senderTypeRaw?: string };
+  senderForMessage(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string };
   explicitlyMentionedThisBot?: (message: any, senderOpenId?: string) => boolean;
 }): MessageListenerPreviewMatch[] {
   const limit = normalizeMessageListenerPreviewLimit(input.limit);
@@ -159,6 +232,7 @@ export function previewMessageListenerMatches(input: {
       chatId: input.chatId,
       message,
       senderOpenId: sender.senderOpenId,
+      senderName: sender.senderName,
       senderTypeRaw: sender.senderTypeRaw,
       explicitlyMentionedThisBot: input.explicitlyMentionedThisBot?.(message, sender.senderOpenId) ?? false,
     });
@@ -183,7 +257,9 @@ export function renderMessageListenerPrompt(match: MessageListenerMatch): string
     '  <observed_message',
     `    sender_type="${escapeXml(match.senderType)}"`,
     match.senderOpenId ? `    sender_open_id="${escapeXml(match.senderOpenId)}"` : '',
+    match.senderName ? `    sender_name="${escapeXml(match.senderName)}"` : '',
     `    msg_type="${escapeXml(match.msgType)}"`,
+    match.messageTitle ? `    message_title="${escapeXml(match.messageTitle)}"` : '',
     '  >',
     observedText,
     '  </observed_message>',

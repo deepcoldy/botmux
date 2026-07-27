@@ -18,6 +18,7 @@ import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
+import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
@@ -114,6 +115,7 @@ afterEach(async () => {
   setIpcAuthSecret(null);
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
+  clearMessageListenerRunPreviewStore();
 });
 
 describe('dashboard IPC server', () => {
@@ -2465,22 +2467,28 @@ describe('role profile IPC routes', () => {
       larkAppSecret: 'secret',
       cliId: 'codex',
     });
-    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
-      {
-        message_id: 'om_ignore',
-        create_time: '1000',
-        message_type: 'text',
-        content: JSON.stringify({ text: 'ignore' }),
-        sender: { id: 'ou_other', sender_type: 'user' },
-      },
-      {
-        message_id: 'om_match',
-        create_time: '2000',
-        message_type: 'text',
-        content: JSON.stringify({ text: 'CPU 告警' }),
-        sender: { id: 'ou_allowed', sender_type: 'user' },
-      },
-    ]);
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockImplementation(async (_larkAppId, _chatId, options) => {
+      expect(options?.pageSize).toBe(50);
+      expect(options?.stopAfter?.({ create_time: String(now - 24 * 60 * 60 * 1000 - 60_000) }, 1)).toBe(true);
+      expect(options?.stopAfter?.({ create_time: String(now - 24 * 60 * 60 * 1000 + 60_000) }, 1)).toBe(false);
+      return [
+        {
+          message_id: 'om_ignore',
+          create_time: String(now - 10_000),
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'ignore' }) },
+          sender: { id: 'ou_other', sender_type: 'user', sender_name: 'Other' },
+        },
+        {
+          message_id: 'om_match',
+          create_time: String(now - 5_000),
+          msg_type: 'text',
+          body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+          sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+        },
+      ];
+    });
     try {
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
       const base = `http://127.0.0.1:${handle.port}`;
@@ -2510,11 +2518,162 @@ describe('role profile IPC routes', () => {
           messageId: 'om_match',
           messageText: 'CPU 告警',
           senderOpenId: 'ou_allowed',
+          senderName: '张三',
           senderType: 'user',
         }],
       });
       expect(historySpy).toHaveBeenCalledWith('cli_listener', 'oc_alerts', expect.any(Object));
     } finally {
+      historySpy.mockRestore();
+    }
+  });
+
+  it('runs message listener preview through the visible listener reply path', async () => {
+    setLarkAppId('cli_listener_run');
+    registerBot({
+      larkAppId: 'cli_listener_run',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_match_run',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({
+        ok: true,
+        runId: expect.stringMatching(/^mlrp_/),
+        matches: [{ messageId: 'om_match_run', messageText: 'CPU 告警' }],
+        results: [{
+          messageId: 'om_match_run',
+          ok: true,
+          action: 'queued',
+          state: 'triggered',
+          runId: expect.stringMatching(/^mlrp_/),
+          triggerId: expect.stringMatching(/^mlrp_turn_/),
+        }],
+      });
+      expect(body.results[0].runId).toBe(body.runId);
+      expect(messageChatSpy).toHaveBeenCalledWith('cli_listener_run', 'om_match_run');
+      expect(forkSpy).toHaveBeenCalledTimes(1);
+      expect(forkSpy.mock.calls[0][2]).toMatch(/^mlrp_turn_/);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      historySpy.mockRestore();
+    }
+  });
+
+  it('reports message listener run preview reply lifecycle by run id', async () => {
+    setLarkAppId('cli_listener_status');
+    registerBot({
+      larkAppId: 'cli_listener_status',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_match_status',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: 'CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const runRes = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+      expect(runRes.status).toBe(200);
+      const runBody = await runRes.json();
+      const triggerId = runBody.results[0].triggerId;
+
+      markMessageListenerRunPreviewReplied(triggerId, {
+        sessionId: runBody.results[0].sessionId,
+        replyMessageId: 'om_reply_status',
+      });
+
+      const statusRes = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview/${runBody.runId}`);
+      expect(statusRes.status).toBe(200);
+      expect(await statusRes.json()).toMatchObject({
+        ok: true,
+        runId: runBody.runId,
+        results: [{
+          messageId: 'om_match_status',
+          ok: true,
+          state: 'replied',
+          triggerId,
+          replyMessageId: 'om_reply_status',
+        }],
+      });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
       historySpy.mockRestore();
     }
   });

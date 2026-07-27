@@ -7137,19 +7137,12 @@ dialog.onboarding-dialog::backdrop {
   background: var(--accent);
   transform: translate(13px, -50%);
 }
-.roles-help {
-  display: inline-grid;
-  place-items: center;
-  flex: none;
-  width: 18px;
-  height: 18px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
-  color: var(--muted);
-  background: var(--surface-muted);
+.roles-listener-scope-help {
+  margin: -6px 0 0;
+  max-width: 760px;
+  color: var(--faint);
   font-size: 12px;
-  line-height: 1;
-  cursor: help;
+  line-height: 1.5;
 }
 .roles-listener-grid {
   display: grid;
@@ -7333,8 +7326,57 @@ dialog.onboarding-dialog::backdrop {
 .roles-listener-preview-meta span.ok {
   color: var(--success);
 }
+.roles-listener-preview-meta span.running,
+.roles-listener-preview-meta span.triggered {
+  color: var(--accent);
+}
 .roles-listener-preview-meta span.error {
   color: var(--danger);
+}
+.roles-listener-preview-run-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: -2px 0 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.roles-listener-preview-run-detail span,
+.roles-listener-preview-run-detail strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.roles-listener-preview-run-detail strong {
+  color: var(--danger);
+  font-weight: 600;
+}
+.roles-listener-preview-sender,
+.roles-listener-preview-time,
+.roles-listener-preview-title {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+.roles-listener-preview-sender span,
+.roles-listener-preview-time span,
+.roles-listener-preview-title span,
+.roles-listener-preview-content-label {
+  color: var(--faint);
+}
+.roles-listener-preview-sender strong,
+.roles-listener-preview-time strong,
+.roles-listener-preview-title strong {
+  min-width: 0;
+  color: var(--fg);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.roles-listener-preview-content-label {
+  margin: 6px 0 3px;
+  font-size: 12px;
 }
 .roles-listener-preview-item pre {
   margin: 0;

@@ -751,6 +751,10 @@ export type WorkerToDaemon =
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
+  /** Worker observed a successful explicit `botmux send` for this turn, so
+   * the daemon should treat listener-preview runs as visibly replied even
+   * though transcript fallback output is suppressed to avoid duplicates. */
+  | { type: 'explicit_reply_observed'; turnId: string; messageId?: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_resolved'; selectedText?: string; cardMessageId?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_prompt_submit_failed'; cardMessageId?: string; stuckNonce?: number; turnId?: string; dispatchAttempt?: number }

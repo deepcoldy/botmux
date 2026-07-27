@@ -16,6 +16,7 @@ import {
   entryForBot,
   filterRoleGroups,
   filterRoleProfiles,
+  formatListenerPreviewTime,
   hashChatId,
   isValidProfileId,
   previewMessageListener,
@@ -128,6 +129,19 @@ describe('roles helpers', () => {
     ], 'cli_a')?.content).toBe('role');
     expect(entryForBot([], 'cli_a')).toBeUndefined();
     expect(entryForBot([], null)).toBeUndefined();
+  });
+
+  it('formats listener preview create times as local timestamps', () => {
+    const expected = (() => {
+      const d = new Date(1785139176792);
+      const pad = (value: number) => String(value).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    })();
+
+    expect(formatListenerPreviewTime('1785139176792')).toBe(expected);
+    expect(formatListenerPreviewTime('1785139176')).toBe(formatListenerPreviewTime('1785139176000'));
+    expect(formatListenerPreviewTime(undefined)).toBe('');
+    expect(formatListenerPreviewTime('not-a-time')).toBe('');
   });
 
   it('keeps role write APIs on the existing endpoints and request bodies', async () => {
