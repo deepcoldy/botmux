@@ -1019,9 +1019,14 @@ async function maybeApplySharedTopicSeed(input: {
   messageId: string;
   routing: { scope: 'thread' | 'chat'; anchor: string };
   forceTopicApplied?: boolean;
+  independentTopicSeed?: boolean;
 }): Promise<string | undefined> {
-  const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied } = input;
+  const { larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied, independentTopicSeed } = input;
   if (forceTopicApplied) return undefined;
+  // A user explicitly created this Lark topic in an ordinary group. It owns a
+  // fresh botmux session even when the group's configured reply mode is
+  // `shared`; shared folding is only for bot-opened aliases/top-level turns.
+  if (independentTopicSeed) return undefined;
   if (chatType !== 'group') return undefined;
   if (resolveRegularGroupMode(larkAppId, chatId) !== 'shared') return undefined;
   // Seeding a shared topic normally needs an @mention. But under the 'never'
@@ -1040,7 +1045,9 @@ async function maybeApplySharedTopicSeed(input: {
 }
 
 /** Compute the scope + anchor for an inbound message:
- *   - root_id + thread_id     → thread-scope, anchor = root_id (real Lark 话题)
+ *   - thread_id               → thread-scope: replies anchor at root_id, while
+ *                               a user-created topic seed (no root_id yet)
+ *                               anchors at its own message_id
  *   - 话题群 + no real thread → thread-scope, anchor = message_id (thread seed)
  *   - p2p + no real thread    → thread-scope, anchor = message_id (each DM
  *                               top-level message starts a fresh topic; a
@@ -1097,7 +1104,13 @@ async function decideRoutingWithSource(
     return { scope: 'chat', anchor: chatId, source: 'p2p' };
   }
 
-  if (rootId && threadId) return { scope: 'thread', anchor: rootId, source: 'real-thread' };
+  // Existing topic replies are mode-independent and always route by their
+  // message root. A thread_id-only seed still needs chat-mode classification
+  // below: topic chats must retain source=topic-chat for auto-start semantics,
+  // while ordinary-group user-created topics become real-thread sessions.
+  if (rootId && threadId) {
+    return { scope: 'thread', anchor: rootId, source: 'real-thread' };
+  }
 
   // 私聊默认（thread 模式）：每条 top-level DM 都视为新话题 — 跟话题群同款，匹配
   // Lark DM 的话题化默认行为，避免无限把 1:1 对话塞进同一个 CLI 进程里。
@@ -1109,6 +1122,9 @@ async function decideRoutingWithSource(
   const mode = await getChatMode(larkAppId, chatId);
   if (mode === 'topic') {
     return { scope: 'thread', anchor: messageId, source: 'topic-chat' };
+  }
+  if (threadId?.startsWith('omt_')) {
+    return { scope: 'thread', anchor: messageId, source: 'real-thread' };
   }
   return regularGroupRouting(larkAppId, messageId, chatId);
 }
@@ -1398,7 +1414,17 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
         const seedReplyRootId = await maybeApplySharedTopicSeed({
-          larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+          larkAppId,
+          chatId,
+          chatType,
+          message,
+          senderOpenId,
+          messageId,
+          routing,
+          forceTopicApplied,
+          independentTopicSeed: decision.source === 'real-thread'
+            && !!message.thread_id
+            && !message.root_id,
         });
         if (seedReplyRootId) {
           replyRootId = seedReplyRootId;

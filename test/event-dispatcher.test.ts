@@ -261,6 +261,28 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
     expect(await decideRouting(MY_APP_ID, { message_id: 'msg-g', chat_id: 'oc_g', chat_type: 'group', root_id: 'root-g', thread_id: 'root-g' }))
       .toEqual({ scope: 'thread', anchor: 'root-g' });
   });
+
+  it('ordinary-group user-created topic seed with thread_id but no root_id gets an isolated session', async () => {
+    setupBotState({});
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-user-topic-seed',
+      chat_id: 'oc_regular_group',
+      chat_type: 'group',
+      root_id: undefined,
+      thread_id: 'omt_user_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-user-topic-seed' });
+  });
+
+  it('later replies in that user-created topic reuse the seed session anchor', async () => {
+    setupBotState({});
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-user-topic-reply',
+      chat_id: 'oc_regular_group',
+      chat_type: 'group',
+      root_id: 'msg-user-topic-seed',
+      thread_id: 'omt_user_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-user-topic-seed' });
+  });
 });
 
 describe('isBotMentioned', () => {
@@ -1136,6 +1158,35 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('starts an isolated session for a user-created topic seed in 普通群 even when chat-scope session exists', async () => {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA isolated user topic' }),
+      messageId: 'user-topic-seed',
+      rootId: undefined,
+      threadId: 'omt_user_created',
+      chatId: 'chat-with-flat-session',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    // The group already has a flat chat-scope session, but not one at the
+    // user-created topic's message root.
+    handlers.isSessionOwner.mockImplementation(
+      (anchor: string) => anchor === 'chat-with-flat-session',
+    );
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'user-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
     // Bot already owns a thread-scope session at this root → continue it.
     const event = makeUserMessageEvent({
@@ -1203,6 +1254,32 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('shared mode does not absorb a user-created independent topic seed', async () => {
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA independent user topic' }),
+      messageId: 'msg-independent-shared',
+      threadId: 'omt_independent_shared',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-independent-shared',
+      replyRootId: undefined,
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('shared thread-contained @ starts a fresh alias on the current message id', async () => {
@@ -2191,6 +2268,28 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'thread',
       anchor: 'msg-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('话题群新话题 seed 带 omt_* thread_id 且无 root_id 时仍免 @ 自动开工', async () => {
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '带 thread id 的话题根消息' }),
+      messageId: 'msg-topic-thread-seed',
+      threadId: 'omt_topic_chat_seed',
+      chatId: 'chat-topic-thread-seed',
+      chatType: 'group',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-topic-thread-seed',
       larkAppId: MY_APP_ID,
     }));
   });
