@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -33,6 +33,10 @@ beforeEach(() => {
   execFileSyncMock.mockReset();
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('zmx env/probe helpers', () => {
   it('strips inherited session vars but preserves the socket dir', () => {
     const env = zmxEnv({
@@ -55,6 +59,7 @@ describe('zmx env/probe helpers', () => {
   // ENOENT may be reported as "not on PATH" — anything else must surface the
   // real cause, or a Linux operator reinstalls zmx forever chasing the wrong bug.
   it('reports the real cause instead of blaming PATH when the socket dir is unusable', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/zmx-readonly');
     const failure: any = new Error('Command failed');
     failure.status = 1;
     failure.stderr = Buffer.from('error: ReadOnlyFileSystem\n');
@@ -66,7 +71,7 @@ describe('zmx env/probe helpers', () => {
       expect(result.reason).toContain('ReadOnlyFileSystem');
       expect(result.reason).not.toContain('不在 PATH 上');
       // The effective socket-dir source is actionable on a headless daemon.
-      expect(result.reason).toContain('ZMX_DIR');
+      expect(result.reason).toContain('ZMX_DIR=/tmp/zmx-readonly');
     }
   });
 

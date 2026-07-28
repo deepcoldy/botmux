@@ -194,8 +194,12 @@ import { restoreActiveSessions, closeCliMismatchedSessionsForBot } from '../src/
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
-import { forkWorker, closeSession } from '../src/core/worker-pool.js';
-import { forkAdoptWorker } from '../src/core/worker-pool.js';
+import {
+  closeSession,
+  forkAdoptWorker,
+  forkWorker,
+  setActiveSessionSafe,
+} from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';

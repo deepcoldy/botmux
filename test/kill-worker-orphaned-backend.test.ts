@@ -15,15 +15,27 @@
  *
  * Run:  pnpm vitest run test/kill-worker-orphaned-backend.test.ts
  */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
 
-const { tmuxKill, herdrKill, herdrKillAgent, zellijKill, zmxKill, getBotMock } = vi.hoisted(() => ({
+const {
+  tmuxKill,
+  herdrKill,
+  herdrKillAgent,
+  zellijKill,
+  zmxKill,
+  zmxList,
+  getBotMock,
+} = vi.hoisted(() => ({
   tmuxKill: vi.fn(),
   herdrKill: vi.fn(),
   herdrKillAgent: vi.fn(),
   zellijKill: vi.fn(),
   zmxKill: vi.fn(),
+  zmxList: vi.fn(() => [] as string[]),
   getBotMock: vi.fn(() => ({ resolvedAllowedUsers: [], config: {} })),
 }));
 
@@ -44,7 +56,7 @@ vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
   ZmxBackend: {
     sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
     killManagedSession: zmxKill,
-    listBotmuxSessions: vi.fn(() => []),
+    listBotmuxSessions: zmxList,
   },
 }));
 
@@ -72,7 +84,13 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose } from '../src/core/worker-pool.js';
+import { config } from '../src/config.js';
+import {
+  killStalePids,
+  killWorker,
+  teardownAuthoritativePersistentBackingBeforeClose,
+} from '../src/core/worker-pool.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const SID = 'abcd1234-0000-0000-0000-000000000000';
 const EXPECTED_NAME = 'bmx-abcd1234';
@@ -92,7 +110,41 @@ const ds = (over: Partial<DaemonSession> = {}, initOver: any = {}): DaemonSessio
 
 beforeEach(() => {
   vi.clearAllMocks();
+  zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
+});
+
+describe('killStalePids — ZMX CLI-change cleanup', () => {
+  it('keeps the complete owning session identity and does not issue a second name-only kill', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-cli-change-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const previousCliId = config.daemon.cliId;
+
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'zmx';
+      config.daemon.cliId = 'codex';
+      sessionStore.init('zmx-cli-change-test');
+      writeFileSync(join(dataDir, 'last-cli-id-zmx'), 'claude-code', 'utf8');
+      zmxList.mockReturnValue([EXPECTED_NAME]);
+
+      expect(() => killStalePids([{
+        sessionId: SID,
+        backendType: 'zmx',
+      } as any])).not.toThrow();
+
+      expect(zmxKill).toHaveBeenCalledTimes(1);
+      expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
+    } finally {
+      sessionStore.init();
+      config.daemon.cliId = previousCliId;
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('killWorker — orphaned backing session teardown (no live worker)', () => {

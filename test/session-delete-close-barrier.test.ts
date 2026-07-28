@@ -86,7 +86,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(markerPath)).toBe(false);
 
       releaseCleanup();
-      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });
+      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false, known: true });
       stopDashboardEvents();
       const closePatch = dashboardEvents.find(event =>
         event.type === 'session.update'
@@ -175,7 +175,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(markerPath)).toBe(true);
 
       worker.emit('exit');
-      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });
+      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false, known: true });
       expect(existsSync(markerPath)).toBe(false);
     } finally {
       config.session.dataDir = previousDataDir;

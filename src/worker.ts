@@ -7088,6 +7088,15 @@ async function spawnCli(
   }
   const sandboxRequested = !riffRemoteBackend
     && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  const backendIsolationGate = backendSandboxCompatibilityError({
+    backendType: effectiveBackendType,
+    fileSandboxRequested: sandboxRequested,
+    // The unified sandbox request above already includes legacy readIsolation.
+    effectiveReadIsolationRequested: false,
+  });
+  if (backendIsolationGate) {
+    throw new Error(backendSandboxCompatibilityUserMessage(backendIsolationGate));
+  }
   const fullIsolationCoversCredentials = sandboxRequested;
   let credentialMechanismAvailable = true;
   let credentialMechanismExecutable: string | undefined;

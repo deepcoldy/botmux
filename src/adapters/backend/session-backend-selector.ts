@@ -66,9 +66,9 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
 export function backendSandboxCompatibilityError(opts: {
   backendType: BackendType;
   fileSandboxRequested: boolean;
-  /** True only when the legacy standalone readIsolation flag is effective
-   * on this host. The raw config value is intentionally not accepted here:
-   * on Linux that legacy flag is a no-op unless the unified sandbox is on. */
+  /** Compatibility input for callers that still model standalone read
+   * isolation. The worker passes false because its unified sandbox request
+   * already folds in the legacy readIsolation flag on every host. */
   effectiveReadIsolationRequested: boolean;
 }): string | undefined {
   if (
@@ -85,7 +85,7 @@ export function backendSandboxCompatibilityUserMessage(reason: string): string {
   return [
     '⚠️ ZMX 当前无法执行 botmux 的文件沙盒或读隔离，已拒绝启动以避免未隔离运行。',
     `原因：${reason}`,
-    '请将该 bot 的 backendType 改为 tmux / pty，或关闭 sandbox（含全局 BOTMUX_SANDBOX）及 macOS 上独立生效的 readIsolation 后重试。',
+    '请将该 bot 的 backendType 改为 tmux / pty，或关闭 sandbox（含全局 BOTMUX_SANDBOX）及 legacy readIsolation 后重试。',
   ].join('\n');
 }
 

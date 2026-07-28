@@ -5786,8 +5786,13 @@ function cleanupPersistentBackendSessions(backendType: 'tmux' | 'herdr' | 'zmx',
     // each persisted managed target precisely so a CLI switch cannot reattach
     // the old executable, while never stopping the shared `botmux` host or an
     // explicitly adopted user pane.
-    for (const target of managedTargetsForCliChange(backendType, activeSessions_)) {
-      killPersistentBackendTarget(target);
+    if (backendType === 'herdr') {
+      for (const target of managedTargetsForCliChange(
+        'herdr',
+        activeSessions_.filter(belongsToBackend),
+      )) {
+        killPersistentBackendTarget(target);
+      }
     }
   } else {
     for (const name of backend.listBotmuxSessions()) {

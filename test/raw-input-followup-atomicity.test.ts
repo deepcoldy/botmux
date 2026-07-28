@@ -225,12 +225,14 @@ describe('post-settle restart fence', () => {
     const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
     const startup = flush.indexOf('await runStartupCommands()', detector);
     const rawShift = flush.indexOf('freshnessInputQueue.takeRaw()', detector);
-    const writeInput = flush.indexOf('cliAdapter.writeInput(backend', detector);
+    const writeStructuredInput = flush.indexOf('cliAdapter.writeStructuredInput(', detector);
+    const writeInput = flush.indexOf('cliAdapter.writeInput(', detector);
     expect(detector).toBeGreaterThanOrEqual(0);
     expect(fence).toBeGreaterThan(detector);
     // Fence must precede every downstream write/shift the settle await exposed.
     expect(startup).toBeGreaterThan(fence);
     expect(rawShift).toBeGreaterThan(fence);
+    expect(writeStructuredInput).toBeGreaterThan(fence);
     expect(writeInput).toBeGreaterThan(fence);
   });
 

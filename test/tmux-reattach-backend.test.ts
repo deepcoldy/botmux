@@ -274,7 +274,7 @@ describe('backendSandboxCompatibilityError', () => {
     })).toMatch(/does not support/);
   });
 
-  it('allows unsandboxed ZMX, including a Linux legacy readIsolation no-op', () => {
+  it('allows unsandboxed ZMX and does not gate isolation-capable backends', () => {
     expect(backendSandboxCompatibilityError({
       backendType: 'zmx',
       fileSandboxRequested: false,

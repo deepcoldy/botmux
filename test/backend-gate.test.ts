@@ -79,7 +79,7 @@ describe('backendGateUserMessage', () => {
 });
 
 describe('ZMX filesystem-isolation gate', () => {
-  it('posts an actionable user notification before failing closed', () => {
+  it('formats an actionable startup error before failing closed', () => {
     const msg = backendSandboxCompatibilityUserMessage(
       'backend "zmx" does not support file/read isolation',
     );
@@ -91,22 +91,27 @@ describe('ZMX filesystem-isolation gate', () => {
     expect(msg).toContain('readIsolation');
   });
 
-  it('gates on effective isolation and sends user_notify before throwing', () => {
-    const start = workerSource.indexOf('const explicitLegacyReadIso =');
-    const end = workerSource.indexOf('const readIsolationGate =', start);
+  it('gates on the unified effective isolation before selecting or mutating a backend', () => {
+    const start = workerSource.indexOf('const sandboxRequested =');
+    const end = workerSource.indexOf('const fullIsolationCoversCredentials =', start);
     const gate = workerSource.slice(start, end);
 
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    // A bare legacy readIsolation flag is a no-op on Linux. Passing the raw
-    // cfg value here would reject ZMX even though no boundary is enforced.
-    expect(gate).toContain('effectiveReadIsolationRequested: explicitLegacyReadIso');
+    expect(gate).toContain('backendSandboxCompatibilityError({');
+    expect(gate).toContain('fileSandboxRequested: sandboxRequested');
+    // readIsolation is already folded into sandboxRequested on every host.
+    expect(gate).toContain('effectiveReadIsolationRequested: false');
     expect(gate).not.toContain('effectiveReadIsolationRequested: cfg.readIsolation');
-
-    const notify = gate.indexOf("type: 'user_notify'");
+    expect(gate).not.toContain("type: 'user_notify'");
+    const compatibilityCheck = gate.indexOf('backendSandboxCompatibilityError({');
     const failure = gate.indexOf('throw new Error');
-    expect(notify).toBeGreaterThan(-1);
-    expect(failure).toBeGreaterThan(notify);
+    expect(compatibilityCheck).toBeGreaterThan(-1);
+    expect(failure).toBeGreaterThan(compatibilityCheck);
+    expect(gate).toContain(
+      'throw new Error(backendSandboxCompatibilityUserMessage(backendIsolationGate))',
+    );
+    expect(workerSource.indexOf('const selectBackend =', start)).toBeGreaterThan(end);
   });
 });
 
