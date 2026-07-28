@@ -133,6 +133,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
     ...orig,
+    closeSession: vi.fn((sessionId: string) => orig.closeSession(sessionId)),
     forkWorker: vi.fn(),
     killWorker: vi.fn(),
     initWorkerPool: vi.fn(),
@@ -171,7 +172,13 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 // ─── Imports ──────────────────────────────────────────────────────────────
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
-import { scheduleCardPatch, setActiveSessionsRegistry, forkWorker, requestSessionRestart } from '../src/core/worker-pool.js';
+import {
+  closeSession as closeWorkerSession,
+  scheduleCardPatch,
+  setActiveSessionsRegistry,
+  forkWorker,
+  requestSessionRestart,
+} from '../src/core/worker-pool.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -872,6 +879,46 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID, expect.stringContaining('"type":"closed"'), 'interactive', APP_ID,
       );
+    });
+
+    it('does not delete a replacement session that wins the route while close cleanup awaits', async () => {
+      const ds = makeDaemonSession({ scope: 'thread' });
+      const replacement = makeDaemonSession({
+        session: {
+          ...ds.session,
+          sessionId: 'uuid-replacement-after-close',
+          status: 'active' as any,
+        },
+      });
+      const sessions = new Map<string, DaemonSession>();
+      const sKey = sessionKey(ROOT_ID, APP_ID);
+      sessions.set(sKey, ds);
+      const deps = makeDeps(sessions);
+      let signalCloseStarted!: () => void;
+      const closeStarted = new Promise<void>((resolve) => {
+        signalCloseStarted = resolve;
+      });
+      let releaseClose!: () => void;
+      const closeCleanupPending = new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      });
+      vi.mocked(closeWorkerSession).mockImplementationOnce(async () => {
+        // Production closeSession removes and closes the captured ds before its
+        // first network-cleanup await. A new session may then claim the key.
+        sessions.delete(sKey);
+        ds.session.status = 'closed';
+        signalCloseStarted();
+        await closeCleanupPending;
+        return { ok: true, alreadyClosed: false, known: true };
+      });
+
+      const closeAction = handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
+      await closeStarted;
+      sessions.set(sKey, replacement);
+      releaseClose();
+      await closeAction;
+
+      expect(sessions.get(sKey)).toBe(replacement);
     });
 
     it('resume notice in a thread-scope session is replied in-thread, never ephemeral', async () => {

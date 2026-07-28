@@ -6,7 +6,7 @@
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
@@ -14,6 +14,11 @@ const mocks = vi.hoisted(() => ({
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
   getProjectScanDirs: vi.fn(() => [] as string[]),
   ensureDefaultOncallBound: vi.fn(async () => undefined),
+  downloadResources: vi.fn(async () => ({ attachments: [] as any[], needLogin: false })),
+  deleteMessage: vi.fn(async () => true),
+  resolveSender: vi.fn(async (_appId: string, openId: string | undefined) => (
+    openId ? { openId, type: 'user' as const, name: 'Owner' } : undefined
+  )),
   listChatMemberOpenIds: vi.fn(async () => ['ou_owner']),
   replyMessage: vi.fn(async () => 'om_reply'),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
@@ -36,6 +41,7 @@ vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
   return {
     ...actual,
+    deleteMessage: mocks.deleteMessage,
     getChatMode: mocks.getChatMode,
     listChatMemberOpenIds: mocks.listChatMemberOpenIds,
     replyMessage: mocks.replyMessage,
@@ -47,10 +53,16 @@ vi.mock('../src/core/session-manager.js', async () => {
   const actual = await vi.importActual<any>('../src/core/session-manager.js');
   return {
     ...actual,
+    downloadResources: mocks.downloadResources,
     ensureSessionWhiteboard: vi.fn(),
     getAvailableBots: mocks.getAvailableBots,
     getProjectScanDirs: mocks.getProjectScanDirs,
   };
+});
+
+vi.mock('../src/im/lark/identity-cache.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
+  return { ...actual, resolveSender: mocks.resolveSender };
 });
 
 vi.mock('../src/services/project-scanner.js', async () => {
@@ -95,14 +107,25 @@ beforeAll(async () => {
 beforeEach(() => {
   modules.registry.__testOnly_resetBotRegistry();
   modules.daemon.__testOnly_activeSessions.clear();
+  modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
   vi.clearAllMocks();
+  mocks.forkWorker.mockReset();
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getProjectScanDirs.mockReturnValue([]);
   mocks.ensureDefaultOncallBound.mockResolvedValue(undefined);
+  mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+  mocks.deleteMessage.mockResolvedValue(true);
+  mocks.resolveSender.mockImplementation(async (_appId: string, openId: string | undefined) => (
+    openId ? { openId, type: 'user', name: 'Owner' } : undefined
+  ));
   mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
   mocks.replyMessage.mockResolvedValue('om_reply');
   mocks.scanMultipleProjects.mockReturnValue([]);
   mocks.sendMessage.mockResolvedValue('om_join_seed');
+});
+
+afterEach(() => {
+  modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
 });
 
 afterAll(() => {
@@ -330,6 +353,433 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
     expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes a chat turn behind the registered join session initialization', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_race';
+    const chatId = 'oc_join_shared_inbound_race';
+    const userMessageId = 'om_user_during_join';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-race'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '加入期间的用户消息' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseSeed('om_join_seed');
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+    expect(ds?.session.currentReplyTarget).toMatchObject({
+      rootMessageId: userMessageId,
+      turnId: userMessageId,
+    });
+  });
+
+  it('also covers the non-shared post-registration fork window', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_inbound_race';
+    const chatId = 'oc_join_chat_inbound_race';
+    const userMessageId = 'om_user_during_chat_join';
+    const key = types.sessionKey(chatId, appId);
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-chat-inbound-race'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '普通 chat 模式并发消息' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseAvailableBots();
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+  });
+
+  it('yields without re-forking when a non-message entry starts the registered session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_external_fork_race';
+    const chatId = 'oc_join_external_fork_race';
+    const key = types.sessionKey(chatId, appId);
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-external-fork-race'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    const ds = daemon.__testOnly_activeSessions.get(key)!;
+    const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
+    ds.worker = externalWorker;
+
+    releaseAvailableBots();
+    await joinPromise;
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.worker).toBe(externalWorker);
+  });
+
+  it('releases a waiting chat turn when shared seed setup rolls back', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_seed_failure';
+    const chatId = 'oc_join_shared_inbound_seed_failure';
+    const userMessageId = 'om_user_after_join_seed_failure';
+    const key = types.sessionKey(chatId, appId);
+    let rejectSeed!: (error: Error) => void;
+    const seedPending = new Promise<string>((_resolve, reject) => {
+      rejectSeed = reject;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-seed-failure'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const rejectedJoinSessionId = daemon.__testOnly_activeSessions.get(key)?.session.sessionId;
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'seed 失败后仍需处理' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    rejectSeed(new Error('Lark unavailable during join'));
+    await Promise.all([joinPromise, replyPromise]);
+
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.session.sessionId).not.toBe(rejectedJoinSessionId);
+    expect(ds?.session.status).toBe('active');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
+      { turnId: userMessageId },
+    );
+    expect(ds?.session.currentReplyTarget).toMatchObject({
+      rootMessageId: userMessageId,
+      turnId: userMessageId,
+    });
+  });
+
+  it('cancels a hung bootstrap so the waiting turn can create the authoritative session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_timeout';
+    const chatId = 'oc_join_shared_inbound_timeout';
+    const userMessageId = 'om_user_after_join_timeout';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-timeout'),
+      regularGroupReplyMode: 'shared',
+    });
+    daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs(20);
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const timedOutJoinSessionId = daemon.__testOnly_activeSessions.get(key)?.session.sessionId;
+
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'bootstrap 超时后接管' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.session.sessionId).not.toBe(timedOutJoinSessionId);
+    expect(ds?.session.status).toBe('active');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
+      { turnId: userMessageId },
+    );
+
+    releaseSeed('om_late_join_seed');
+    await joinPromise;
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(appId, 'om_late_join_seed');
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+  });
+
+  it('serializes replies to a topic-group join seed by the exact session key', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_inbound_race';
+    const chatId = 'oc_join_topic_inbound_race';
+    const seedId = 'om_join_seed';
+    const userMessageId = 'om_user_during_topic_join';
+    const key = types.sessionKey(seedId, appId);
+    mocks.getChatMode.mockResolvedValue('topic');
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-topic-inbound-race'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          root_id: seedId,
+          thread_id: 'omt_join_topic',
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'seed 话题内的并发回复' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'thread',
+        anchor: seedId,
+        replyRootId: seedId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseAvailableBots();
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
   });
 
   it('话题群继续使用 seed 锚定的 thread-scope session', async () => {

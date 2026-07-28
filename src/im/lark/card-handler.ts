@@ -1939,8 +1939,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           },
         };
       }
-      // closeSession is authoritative and may await worker teardown. Do not
-      // delete a replacement that claimed the same routing key meanwhile.
+      // closeSession removes the captured ds before awaiting best-effort remote
+      // cleanup. A new session may claim the same route during that await; only
+      // delete here if this handler still owns the exact object it closed.
       if (activeSessions.get(sKey) === ds) activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the

@@ -43,7 +43,7 @@ import {
 } from './core/cli-runtime-update.js';
 import { sendRestartReportIfPending } from './core/restart-report.js';
 import { statSync } from 'node:fs';
-import { addReaction, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -15933,6 +15933,85 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
 // for the same chat (reconnect replay / double-delivery) can't both spawn —
 // claimed synchronously before the first await, released in `finally` (FR-13).
 const autoStartJoinInFlight = new Set<string>();
+// A join candidate becomes visible in activeSessions before its seed/reply
+// target and synchronous bootstrap are ready. Inbound turns for that exact
+// routing key must wait; otherwise they can re-fork the worker-null session and
+// then be replaced by the join handler's own fork. Deferred pendingRepo /
+// auto-worktree paths release after publishing their stable buffered state.
+const AUTO_START_JOIN_READY_MAX_WAIT_MS = 5_000;
+let testOnlyAutoStartJoinReadyMaxWaitMs: number | undefined;
+
+interface AutoStartJoinReadyBarrier {
+  ready: Promise<void>;
+  cancelled: boolean;
+  settle: () => void;
+  cancel: () => void;
+}
+
+const autoStartJoinReadyBySessionKey = new Map<string, AutoStartJoinReadyBarrier>();
+
+function beginAutoStartJoinReadyBarrier(
+  routingKey: string,
+  onCancel: () => void,
+): AutoStartJoinReadyBarrier {
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    resolveReady = resolve;
+  });
+  let settled = false;
+  let barrier!: AutoStartJoinReadyBarrier;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    resolveReady();
+    if (autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      autoStartJoinReadyBySessionKey.delete(routingKey);
+    }
+  };
+  const cancel = () => {
+    if (settled) return;
+    barrier.cancelled = true;
+    try {
+      onCancel();
+    } catch (err) {
+      logger.warn(`[auto-start:入群] bootstrap timeout cleanup failed for ${routingKey}: ${err}`);
+    } finally {
+      settle();
+    }
+  };
+  barrier = { ready, cancelled: false, settle, cancel };
+  autoStartJoinReadyBySessionKey.set(routingKey, barrier);
+  return barrier;
+}
+
+async function waitForAutoStartJoinReady(larkAppId: string, anchor: string): Promise<void> {
+  const routingKey = sessionKey(anchor, larkAppId);
+  while (true) {
+    const barrier = autoStartJoinReadyBySessionKey.get(routingKey);
+    if (!barrier) return;
+    const maxWaitMs = testOnlyAutoStartJoinReadyMaxWaitMs ?? AUTO_START_JOIN_READY_MAX_WAIT_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      barrier.ready.then(() => 'ready' as const),
+      new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), maxWaitMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (outcome === 'timeout' && autoStartJoinReadyBySessionKey.get(routingKey) === barrier) {
+      logger.warn(
+        `[auto-start:入群] bootstrap exceeded ${maxWaitMs}ms for ${anchor.substring(0, 12)}; ` +
+        `yielding registration to the waiting turn`,
+      );
+      barrier.cancel();
+    }
+  }
+}
+
+export function __testOnly_setAutoStartJoinReadyMaxWaitMs(value?: number): void {
+  testOnlyAutoStartJoinReadyMaxWaitMs = value;
+}
+
 // 主动开工 — 场景①: `${appId}:${chatId}` → the activeSessions key of the
 // auto-started join session. Needed because in a 话题群 the session is keyed at
 // the seed message id (not chatId), so a plain `activeSessions.has(chatId)`
@@ -16001,6 +16080,7 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
   }
   if (priorAnchorKey) groupJoinAnchorByChat.delete(chatLiveKey); // stale entry, will re-register below
   autoStartJoinInFlight.add(lockKey);
+  let joinReady: AutoStartJoinReadyBarrier | undefined;
   try {
     // D7 gate: an allowedUser must be a member of the chat. Alarm/oncall
     // platforms (e.g. Nexus) create the chat, add bots first and the human
@@ -16099,6 +16179,23 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       await closeSessionHelper(session.sessionId);
       return;
     }
+    // Publish the barrier only after this candidate wins registration. There is
+    // no await between the CAS and this write, so a turn can never observe the
+    // worker-null session without also observing the barrier. Publishing earlier
+    // would unnecessarily stall real messages during membership retry and
+    // mode/working-dir discovery, where their own session may safely win.
+    joinReady = beginAutoStartJoinReadyBarrier(dsKey, () => {
+      // A user turn waited longer than the serializer's normal safety cap.
+      // Relinquish this half-bootstrapped registration instead of letting the
+      // turn fall back to the old "refork now, then get killed by late join"
+      // behavior. closeSessionHelper completes map/status/store mutation before
+      // its first await; the late best-effort cleanup must not hold the turn.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      void closing.catch((err) => {
+        logger.warn(`[auto-start:入群] timeout close failed for ${session.sessionId.substring(0, 8)}: ${err}`);
+      });
+    });
     const rollbackRegisteredJoinSession = async (): Promise<void> => {
       // closeSession transitions the row before its first await, but this
       // handler owns a caller-supplied registry too. Drop only our identity so
@@ -16112,6 +16209,32 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
     // after this candidate owns the routing key; a CAS loser must leave no
     // orphaned "joined" topic and must not silently consume the first prompt.
     let sharedReplyRootId: string | undefined;
+    const withdrawSharedReplySeed = (): void => {
+      if (!sharedReplyRootId) return;
+      const messageId = sharedReplyRootId;
+      sharedReplyRootId = undefined;
+      void deleteMessage(larkAppId, messageId);
+    };
+    const joinBootstrapWasTakenOver = (): boolean => {
+      const takenOver = (
+        joinReady?.cancelled === true
+        || activeSessions.get(dsKey) !== ds
+        || ds.session.status !== 'active'
+        || !!(ds.worker && !ds.worker.killed)
+      );
+      if (takenOver && ds.worker && !ds.worker.killed) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap 期间会话已由其它入口启动，让位且不再 refork`,
+        );
+      }
+      return takenOver;
+    };
+    const armSharedReplyTarget = (): void => {
+      if (!sharedReplyRootId) return;
+      ds.pendingTurnId = sharedReplyRootId;
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      sessionStore.updateSession(ds.session);
+    };
     if (needsSharedReply) {
       try {
         sharedReplyRootId = await sendMessage(
@@ -16125,14 +16248,23 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
         await rollbackRegisteredJoinSession();
         return;
       }
+      if (joinReady.cancelled) {
+        // The send may have reached Lark even though its response exceeded the
+        // local wait cap. Best-effort withdraw the now-ownerless shared seed.
+        withdrawSharedReplySeed();
+        return;
+      }
       if (activeSessions.get(dsKey) !== ds || ds.session.status !== 'active') {
         logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已被替换，停止首轮`);
+        withdrawSharedReplySeed();
         await rollbackRegisteredJoinSession();
         return;
       }
-      ds.pendingTurnId = sharedReplyRootId;
-      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
-      sessionStore.updateSession(ds.session);
+      if (ds.worker && !ds.worker.killed) {
+        withdrawSharedReplySeed();
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已由其它入口启动，让位`);
+        return;
+      }
     }
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
@@ -16148,17 +16280,33 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
 
     // Auto-worktree: register PENDING, build worktree off-path, commit+fork later.
     if (pinnedWorkingDir && autoWt) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title, prompt: promptBody, operatorOpenId });
       return;
     }
 
     // Pinned working dir → spawn immediately.
     if (pinnedWorkingDir) {
-      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+      if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
@@ -16167,26 +16315,52 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
     }
 
     // No default dir → degrade to repo-selection card (D6 / FR-4).
-    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
+    if (await replyInvalidWorkingDirs(anchor, larkAppId, ds) || joinBootstrapWasTakenOver()) {
+      withdrawSharedReplySeed();
+      return;
+    }
     const scanDirs = getProjectScanDirs(ds).filter(d => existsSync(d));
     const projects = scanDirs.length > 0 ? scanMultipleProjects(scanDirs, 3, repoPickerScanOptions()) : [];
     if (projects.length > 0) {
       lastRepoScan.set(chatId, projects);
       const cardJson = buildRepoSelectCard(projects, getSessionWorkingDir(ds), anchor, localeForBot(larkAppId), getBot(larkAppId).config.worktreeMultiPicker);
-      ds.repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      // The repo card itself belongs under the shared join seed. Arm the target
+      // immediately before its single network await; pendingRepo already makes
+      // this a stable buffered state for normal inbound/scheduler paths.
+      armSharedReplyTarget();
+      const repoCardMessageId = await sessionReply(anchor, cardJson, 'interactive', larkAppId);
+      if (joinBootstrapWasTakenOver()) {
+        void deleteMessage(larkAppId, repoCardMessageId);
+        // If another entry actually started this same ds, its output still owns
+        // the shared seed we just armed. Preserve that root; closed/replaced
+        // candidates may withdraw it.
+        if (!ds.worker || ds.worker.killed) withdrawSharedReplySeed();
+        return;
+      }
+      ds.repoCardMessageId = repoCardMessageId;
       announcePendingRepoSession(ds);
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录，弹 repo 选择卡（${projects.length} 个项目）`);
     } else {
       ds.pendingRepo = false;
       ensureSessionWhiteboard(ds);
       const prompt = await buildPrompt();
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
       await noteTurnReceived(ds, anchor, promptBody);
+      if (joinBootstrapWasTakenOver()) {
+        withdrawSharedReplySeed();
+        return;
+      }
+      armSharedReplyTarget();
       rememberLastCliInput(ds, promptBody, prompt);
       forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
       ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
+    joinReady?.settle();
     autoStartJoinInFlight.delete(lockKey);
   }
 }
@@ -16247,6 +16421,7 @@ async function handleThreadReply(
   prepared?: PreparedThreadReply,
 ): Promise<void> {
   const { chatId: ctxChatId, chatType: ctxChatType, scope, anchor, larkAppId, replyRootId, substituteTrigger } = ctx;
+  await waitForAutoStartJoinReady(larkAppId, anchor);
   if (!prepared) await resolveNonsupportMessage(data, larkAppId);
   const parsedResult = prepared ?? parseEventMessage(data);
   const parsed = parsedResult.parsed;

@@ -63,7 +63,20 @@ vi.mock('../src/im/lark/client.js', () => ({
 const forkWorkerMock = vi.fn();
 const sendWorkerInputMock = vi.fn(() => true);
 vi.mock('../src/core/worker-pool.js', () => ({
-  forkWorker: (...a: any[]) => forkWorkerMock(...a),
+  forkWorker: (...a: any[]) => {
+    // Faithfully model the production queued-session transition. A loose
+    // no-op mock would hide the exact regression this suite guards: forking a
+    // parked session permanently consumes its dashboard task.
+    const ds = a[0] as DaemonSession;
+    if (ds.session.queued) {
+      ds.session.queued = false;
+      ds.session.queuedPrompt = undefined;
+      ds.session.queuedCodexAppText = undefined;
+      ds.session.queuedCodexAppMessageContext = undefined;
+      store.set(ds.session.sessionId, ds.session);
+    }
+    return forkWorkerMock(...a);
+  },
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
@@ -466,6 +479,95 @@ describe('executeScheduledTask — live-session injection', () => {
       turnId: expect.stringMatching(/^schedule:task0001:/),
     });
     expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+  });
+
+  it('fails visibly instead of consuming a parked dashboard task', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.hasHistory = false;
+    existing.session.queued = true;
+    existing.session.queuedPrompt = '用户排进待办池的任务';
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/queued|parked|待办池/i);
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(existing.session.queued).toBe(true);
+    expect(existing.session.queuedPrompt).toBe('用户排进待办池的任务');
+    expect(store.size).toBe(1);
+  });
+
+  it('fails visibly instead of forking a pending repo/worktree setup', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.hasHistory = false;
+    existing.pendingRepo = true;
+    existing.worktreeCreating = true;
+    existing.pendingPrompt = '等待 worktree 后执行的首轮';
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/pending|setup|repo|worktree/i);
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(existing.pendingRepo).toBe(true);
+    expect(existing.worktreeCreating).toBe(true);
+    expect(existing.pendingPrompt).toBe('等待 worktree 后执行的首轮');
+  });
+});
+
+describe('executeScheduledTask — registration rejection', () => {
+  it('throws after closing the rejected candidate instead of reporting a false success', async () => {
+    const active = new Map<string, DaemonSession>();
+    const winner: DaemonSession = {
+      session: {
+        sessionId: 'sess-registration-winner',
+        chatId: CHAT,
+        rootMessageId: 'om_banner_123',
+        title: 'winner',
+        status: 'active',
+        createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      },
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: CHAT,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: 'test-cli-v1',
+      lastMessageAt: 0,
+      hasHistory: false,
+      workingDir: '/tmp',
+    };
+    active.set(sessionKey('om_banner_123', APP), winner);
+
+    await expect(executeScheduledTask(
+      baseTask({ executionPosition: 'new-topic', silent: false }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/registration|active session|注册/i);
+
+    expect(active.get(sessionKey('om_banner_123', APP))).toBe(winner);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
   });
 });
 

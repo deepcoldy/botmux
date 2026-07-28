@@ -2206,6 +2206,23 @@ export async function executeScheduledTask(
   // creating a competing row that the registration CAS will reject.
   const activeKey = sessionKey(anchor, larkAppId);
   const existing = activeSessions.get(activeKey);
+  const blockedDeferredSetup = existing && (
+    existing.session.queued
+    || existing.pendingRepo
+    || existing.pendingRepoCommitInFlight
+    || existing.worktreeCreating
+  );
+  if (isContinuation && blockedDeferredSetup) {
+    // Dashboard backlog and repo/worktree setup rows deliberately own the route
+    // while keeping their worker null. Cold-resuming one with the scheduled
+    // prompt either consumes queuedPrompt or races the later deferred fork.
+    // Reject observably while preserving the user's pending setup intact.
+    const setupKind = existing.session.queued ? 'queued' : 'pending setup';
+    throw new Error(
+      `scheduled continuation ${task.id} is blocked by ${setupKind} session ${existing.session.sessionId}; ` +
+      'the deferred task was preserved',
+    );
+  }
   if (isContinuation && existing) {
     markSessionActivity(existing);
     ensureSessionWhiteboard(existing);
@@ -2301,8 +2318,12 @@ export async function executeScheduledTask(
   ensureSessionWhiteboard(ds);
   const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
   if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
+    const winner = activeSessions.get(activeKey);
     await closeSession(session.sessionId);
-    return;
+    throw new Error(
+      `scheduled task ${task.id} lost active-session registration for ${anchor}` +
+      (winner ? ` to ${winner.session.sessionId}` : ''),
+    );
   }
   rememberLastCliInput(ds, task.prompt, prompt);
   if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
