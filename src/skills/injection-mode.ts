@@ -171,11 +171,14 @@ export function builtinSkillContent(name: string): string | undefined {
 }
 
 /**
- * The `<botmux_skills>` prompt block for `prompt` mode: a one-line-per-skill
+ * The `<botmux_builtin_skills>` prompt block for `prompt` mode: a one-line-per-skill
  * catalog (name + trigger description) plus the instruction to read the full
  * body on demand. Deliberately compact (descriptions only) — full instructions
  * are pulled via `botmux skill show <name>`, mirroring native progressive
  * disclosure without the per-session token cost of inlining every SKILL.md.
+ *
+ * Contract: only the outer wrapper is structural. The intro and catalog lines
+ * are prose (including dynamic skill descriptions), so escape them here.
  */
 export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], locale?: Locale): string {
   if (entries.length === 0) return '';
@@ -192,7 +195,8 @@ export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], loca
 
 /** `off` mode nudge: no catalog, just point the model at the CLI's own help.
  *  Returned as an XML block (same `<botmux_builtin_skills>` tag as the catalog)
- *  so it's consistently wrapped rather than a bare line in the prompt. */
+ *  so it's consistently wrapped rather than a bare line in the prompt. Its
+ *  inner help line follows the same text-only contract as the catalog body. */
 export function builtinSkillHelpPointer(locale?: Locale): string {
   const inner = locale === 'en'
     ? 'Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule / workflow / …) are shell subcommands — run `botmux --help`, and `botmux <cmd> --help` for a specific one, to discover them.'
