@@ -2095,8 +2095,15 @@ export function forkWorker(
   // ANY session mutation or child fork. One deferred spawn per logical session
   // is replayed after the exact freeze lease is released; a session closed by
   // the activation transaction is deliberately not revived.
-  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
-    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+  // Same immutable-identity rule as the ops freeze below: `ds.session` is
+  // replaced wholesale by a repo switch, so both the queue key and the replay
+  // guard must use the id captured here, never a re-read of `ds.session`.
+  const deferredSessionId = ds.session.sessionId;
+  if (deferWorkerSpawnDuringDeviceIsolation(deferredSessionId, () => {
+    if (
+      ds.session.sessionId === deferredSessionId
+      && findActiveBySessionId(deferredSessionId) === ds
+    ) {
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {
@@ -2110,12 +2117,6 @@ export function forkWorker(
   // Deliberately only blocks new spawns: tearing down live CLIs is
   // `botmux suspend`'s job, and conflating the two would make every freeze a
   // fleet-wide cold restart.
-  // Capture the session id NOW: `ds.session` is replaced wholesale on a repo
-  // switch (command-handler swaps in the new Session on the SAME ds), so a
-  // closure that read `ds.session.sessionId` at replay time would accept an
-  // entry queued for the previous session and fork a second worker for the new
-  // one — killing and replacing the first.
-  const deferredSessionId = ds.session.sessionId;
   const opsFreeze = deferSpawnDuringFreeze({
     sessionId: deferredSessionId,
     larkAppId: ds.larkAppId,

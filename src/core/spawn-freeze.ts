@@ -41,7 +41,7 @@
  * handed out before the boot can never cover. The two compose — `forkWorker`
  * defers when either one applies.
  */
-import { lstatSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from './data-dir.js';
 
@@ -344,7 +344,9 @@ export function writeSpawnFreeze(
 export function clearSpawnFreeze(deps: SpawnFreezeDeps = {}): boolean {
   const path = spawnFreezePath(deps);
   try {
-    statSync(path);
+    // lstat for the same reason the reader uses it: "exists" must include a
+    // dangling symlink, which statSync would report as absent and leave behind.
+    lstatSync(path);
   } catch {
     return false;
   }
