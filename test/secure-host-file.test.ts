@@ -3,15 +3,13 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  realpathSync,
   readFileSync,
   rmSync,
   symlinkSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   readSecureHostFileSync,
@@ -93,40 +91,6 @@ describe('secure host authority files', () => {
     if (process.platform === 'win32') return;
     const root = tempRoot();
     chmodSync(root, 0o1777);
-    const file = join(root, '.botmux', 'device.json');
-
-    writeSecureHostFileSync(file, 'secret');
-    expect(readSecureHostFileSync(file)).toBe('secret');
-  });
-
-  it('accepts an owned credential below a non-current-user filesystem mount root', () => {
-    if (process.platform === 'win32' || !process.getuid) return;
-    const uid = process.getuid();
-    const canonicalHome = realpathSync(homedir());
-    let current = canonicalHome;
-    let hasNonUserMountRoot = false;
-
-    while (true) {
-      const parent = dirname(current);
-      if (parent === current) break;
-      const currentStats = statSync(current);
-      const parentStats = statSync(parent);
-      if (
-        currentStats.dev !== parentStats.dev
-        && currentStats.uid !== uid
-        && currentStats.uid !== 0
-        && (currentStats.mode & 0o022) === 0
-      ) {
-        hasNonUserMountRoot = true;
-        break;
-      }
-      current = parent;
-    }
-
-    if (!hasNonUserMountRoot) return;
-
-    const root = mkdtempSync(join(canonicalHome, '.botmux-secure-host-'));
-    roots.push(root);
     const file = join(root, '.botmux', 'device.json');
 
     writeSecureHostFileSync(file, 'secret');

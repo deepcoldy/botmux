@@ -103,7 +103,7 @@ import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
-  renderMessageListenerPrompt,
+  renderMessageListenerInstruction,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
 import {
@@ -2592,7 +2592,7 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', async (req, res, 
             payload: publicMessageListenerMatch(match),
             rawText: match.messageText,
           },
-          instruction: renderMessageListenerPrompt(match),
+          instruction: renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
         }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
         const tracked = result.ok

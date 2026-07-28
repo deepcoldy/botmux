@@ -180,7 +180,13 @@ export function evaluateMessageListener(input: {
   if (!listener) return undefined;
 
   const senderType = listenerSenderType(input.senderTypeRaw);
-  if ((listener.senderPolicy?.excludeSelf ?? true) && input.senderOpenId && input.senderOpenId === input.bot.botOpenId) {
+  // Self-exclusion must cover BOTH identity forms the bot appears under:
+  // realtime events carry the bot's open_id (ou_…), but the message-history API
+  // (polled backfill) reports the bot's own messages under its app_id
+  // (== larkAppId). Comparing only against botOpenId (an open_id) silently
+  // fails on the polled path and would let the bot's own posts self-trigger.
+  const ownIds = [input.bot.botOpenId, input.bot.config.larkAppId].filter(Boolean);
+  if ((listener.senderPolicy?.excludeSelf ?? true) && input.senderOpenId && ownIds.includes(input.senderOpenId)) {
     return undefined;
   }
   if (!senderTypeAllowed(listener, senderType)) return undefined;
@@ -246,8 +252,35 @@ export function previewMessageListenerMatches(input: {
   return matches.slice(Math.max(0, matches.length - limit));
 }
 
+/**
+ * Trusted operator directive for a listener match: the admin-authored name +
+ * prompt only. Contains NO observed (untrusted) group-message bytes, so it is
+ * safe to place in a trusted application-context block (e.g. triggerSessionTurn's
+ * `<botmux_task trusted="true">`). The observed message must be delivered
+ * separately through the untrusted event channel (payload / rawText).
+ */
+export function renderMessageListenerInstruction(match: MessageListenerMatch): string {
+  return [
+    '<message_listener>',
+    match.name ? `  <name>${escapeXml(match.name)}</name>` : '',
+    '  <instruction>',
+    match.prompt,
+    '  </instruction>',
+    '</message_listener>',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Self-contained listener prompt for callers that feed a SINGLE string to the
+ * CLI as the whole turn (the daemon new-topic path). The trusted operator
+ * `<instruction>` and the untrusted `<observed_message>` are kept in separate
+ * blocks, and the observed body is BOTH xml-escaped AND explicitly marked
+ * `trusted="false"` so a group member cannot close `</observed_message>` /
+ * `</message_listener>` early and forge a trusted `<instruction>`. `match.prompt`
+ * stays raw because it is operator-authored config, not attacker-controlled.
+ */
 export function renderMessageListenerPrompt(match: MessageListenerMatch): string {
-  const observedText = truncateUtf8(match.messageText, MAX_MESSAGE_LISTENER_PROMPT_BYTES);
+  const observedText = escapeXml(truncateUtf8(match.messageText, MAX_MESSAGE_LISTENER_PROMPT_BYTES));
   return [
     '<message_listener>',
     match.name ? `  <name>${escapeXml(match.name)}</name>` : '',
@@ -255,6 +288,7 @@ export function renderMessageListenerPrompt(match: MessageListenerMatch): string
     match.prompt,
     '  </instruction>',
     '  <observed_message',
+    '    trusted="false"',
     `    sender_type="${escapeXml(match.senderType)}"`,
     match.senderOpenId ? `    sender_open_id="${escapeXml(match.senderOpenId)}"` : '',
     match.senderName ? `    sender_name="${escapeXml(match.senderName)}"` : '',
