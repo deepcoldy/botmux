@@ -16056,14 +16056,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
-    const sharedReplyRootId = mode === 'group' && resolveRegularGroupMode(larkAppId, chatId) === 'shared'
-      ? await sendMessage(
-          larkAppId,
-          chatId,
-          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
-          'text',
-        )
-      : undefined;
+    const needsSharedReply = mode === 'group'
+      && resolveRegularGroupMode(larkAppId, chatId) === 'shared';
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -16099,15 +16093,46 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
-      pendingTurnId: sharedReplyRootId,
+      pendingTurnId: undefined,
     };
-    if (sharedReplyRootId) {
-      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
-      sessionStore.updateSession(ds.session);
-    }
     if (!setActiveSessionIfActive(activeSessions, dsKey, ds)) {
       await closeSessionHelper(session.sessionId);
       return;
+    }
+    const rollbackRegisteredJoinSession = async (): Promise<void> => {
+      // closeSession transitions the row before its first await, but this
+      // handler owns a caller-supplied registry too. Drop only our identity so
+      // slow best-effort cleanup cannot block a retry or erase a replacement.
+      const closing = closeSessionHelper(session.sessionId);
+      if (activeSessions.get(dsKey) === ds) activeSessions.delete(dsKey);
+      await closing;
+    };
+
+    // Shared-mode seed/reply authority is externally visible. Publish it only
+    // after this candidate owns the routing key; a CAS loser must leave no
+    // orphaned "joined" topic and must not silently consume the first prompt.
+    let sharedReplyRootId: string | undefined;
+    if (needsSharedReply) {
+      try {
+        sharedReplyRootId = await sendMessage(
+          larkAppId,
+          chatId,
+          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          'text',
+        );
+      } catch (err: any) {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 发送失败：${err?.message ?? err}`);
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      if (activeSessions.get(dsKey) !== ds || ds.session.status !== 'active') {
+        logger.warn(`[auto-start:入群] ${chatId.substring(0, 12)} shared seed 返回时会话已被替换，停止首轮`);
+        await rollbackRegisteredJoinSession();
+        return;
+      }
+      ds.pendingTurnId = sharedReplyRootId;
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      sessionStore.updateSession(ds.session);
     }
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).

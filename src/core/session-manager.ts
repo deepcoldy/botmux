@@ -2200,37 +2200,57 @@ export async function executeScheduledTask(
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${task.prompt}`
     : task.prompt;
-  // Inject into a live session if one already exists at this anchor.
-  const existing = activeSessions.get(sessionKey(anchor, larkAppId));
-  if (isContinuation && existing?.worker && !existing.worker.killed) {
+  // Continue through the session already registered at this anchor. A
+  // deliberately suspended session keeps its active registration with
+  // worker=null; scheduled turns must cold-resume that same session instead of
+  // creating a competing row that the registration CAS will reject.
+  const activeKey = sessionKey(anchor, larkAppId);
+  const existing = activeSessions.get(activeKey);
+  if (isContinuation && existing) {
     markSessionActivity(existing);
-    try {
-      ensureSessionWhiteboard(existing);
-      if (sharedTopicRootId) {
-        beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
-        sessionStore.updateSession(existing.session);
-      }
-      const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
-        isAdoptMode: false,
-        cliId: existing.session.cliId ?? bot.config.cliId,
-        cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
-        locale: localeForBot(larkAppId),
-        larkAppId,
-        chatId: task.chatId,
-        whiteboardId: existing.session.whiteboardId,
-      });
-      rememberLastCliInput(existing, task.prompt, input);
-      if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
-      if (!sendWorkerInput(existing, input, scheduledTurnId)) {
-        if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-        throw new Error('worker unavailable');
-      }
-      logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
-      return;
-    } catch (err: any) {
-      if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
-      logger.warn(`[scheduler] Failed to inject into live session (${err.message}); spawning fresh worker`);
+    ensureSessionWhiteboard(existing);
+    if (sharedTopicRootId) {
+      beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
+      sessionStore.updateSession(existing.session);
     }
+    const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
+      isAdoptMode: false,
+      cliId: existing.session.cliId ?? bot.config.cliId,
+      cliPathOverride: existing.session.cliPathOverride ?? bot.config.cliPathOverride,
+      locale: localeForBot(larkAppId),
+      larkAppId,
+      chatId: task.chatId,
+      whiteboardId: existing.session.whiteboardId,
+    });
+    rememberLastCliInput(existing, task.prompt, input);
+    if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
+
+    if (existing.worker && !existing.worker.killed) {
+      try {
+        if (sendWorkerInput(existing, input, scheduledTurnId)) {
+          logger.info(`[scheduler] Task "${task.name}" injected into live session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
+          return;
+        }
+      } catch (err: any) {
+        logger.warn(`[scheduler] Live injection threw (${err.message}); cold-resuming registered session`);
+      }
+    }
+
+    if (activeSessions.get(activeKey) !== existing || existing.session.status !== 'active') {
+      if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+      throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
+    }
+    try {
+      forkWorker(existing, input, {
+        resume: existing.hasHistory,
+        turnId: scheduledTurnId,
+      });
+    } catch (err) {
+      if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
+      throw err;
+    }
+    logger.info(`[scheduler] Task "${task.name}" cold-resumed session ${existing.session.sessionId}${silent ? ' (silent)' : ''}`);
+    return;
   }
 
   // Spawn a fresh session bound to the chosen anchor.
@@ -2280,7 +2300,7 @@ export async function executeScheduledTask(
   }
   ensureSessionWhiteboard(ds);
   const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
-  if (!setActiveSessionIfActive(activeSessions, sessionKey(anchor, larkAppId), ds)) {
+  if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
     await closeSession(session.sessionId);
     return;
   }

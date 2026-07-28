@@ -1525,6 +1525,30 @@ describe('handleCommand', () => {
       expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('ZMX ownership probe unavailable');
     });
 
+    it('does not delete a replacement session that wins the anchor while close awaits cleanup', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      let releaseClose!: (value: { ok: true; alreadyClosed: boolean; known: boolean }) => void;
+      vi.mocked(closeSession).mockImplementationOnce(() => new Promise(resolve => {
+        releaseClose = resolve;
+      }));
+
+      const closing = handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith('sess-001'));
+
+      const replacement = makeDaemonSession();
+      replacement.session = {
+        ...replacement.session,
+        sessionId: 'sess-replacement',
+        title: 'replacement',
+      };
+      deps.activeSessions.set(sessionKey(ROOT_ID, LARK_APP_ID), replacement);
+      releaseClose({ ok: true, alreadyClosed: false, known: true });
+      await closing;
+
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(replacement);
+    });
+
     it('keeps ttadk non-interactive flags in the closed-card resume command', async () => {
       // A ttadk × Claude bot: the manual resume command on the closed card must
       // carry `-m <model> --skip-check`, else copy-pasting it hits ttadk's model

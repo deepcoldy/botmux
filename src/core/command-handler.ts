@@ -1279,6 +1279,7 @@ export async function handleCommand(
           // Capture the closed-session card BEFORE killWorker/closeSession —
           // it reads the live session's identity off `ds`.
           const card = buildClosedSessionCard(ds, loc);
+          const activeKey = sessionKey(rootId, larkAppId!);
           try {
             await closeSession(ds.session.sessionId);
           } catch (err) {
@@ -1289,10 +1290,7 @@ export async function handleCommand(
             );
             break;
           }
-          // closeSession may await worker teardown. Do not delete a replacement
-          // that claimed the same routing key while the close was in flight.
-          const key = sessionKey(rootId, larkAppId!);
-          if (activeSessions.get(key) === ds) activeSessions.delete(key);
+          if (activeSessions.get(activeKey) === ds) activeSessions.delete(activeKey);
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
           // ——与流式卡片上「关闭会话」按钮的送达方式保持一致。

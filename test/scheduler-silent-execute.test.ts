@@ -149,6 +149,7 @@ beforeEach(() => {
   sessionSeq = 0;
   forkWorkerMock.mockClear();
   sendWorkerInputMock.mockClear();
+  sendWorkerInputMock.mockReturnValue(true);
   sendMessageMock.mockClear();
   replyMessageMock.mockClear();
   getChatModeMock.mockClear();
@@ -413,6 +414,58 @@ describe('executeScheduledTask — live-session injection', () => {
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(existing.silentScheduledTurns?.has(turnId)).toBe(true);
     expect(existing.silentScheduledTurns?.has('normal-user-turn')).toBe(false);
+  });
+
+  it('cold-resumes the registered worker-less session instead of losing the scheduled turn to CAS', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.session.suspendedColdResume = true;
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(store.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [, input, options] = forkWorkerMock.mock.calls[0];
+    expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
+    expect(options).toMatchObject({
+      resume: true,
+      turnId: expect.stringMatching(/^schedule:task0001:/),
+    });
+    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+  });
+
+  it('falls back from a rejected live injection by re-forking the same registered session', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+    sendWorkerInputMock.mockReturnValueOnce(false);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(store.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [, , options] = forkWorkerMock.mock.calls[0];
+    expect(options).toMatchObject({
+      resume: true,
+      turnId: expect.stringMatching(/^schedule:task0001:/),
+    });
+    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
   });
 });
 

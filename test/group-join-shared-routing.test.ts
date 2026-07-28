@@ -13,6 +13,7 @@ const mocks = vi.hoisted(() => ({
   getAvailableBots: vi.fn(async () => []),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
   getProjectScanDirs: vi.fn(() => [] as string[]),
+  ensureDefaultOncallBound: vi.fn(async () => undefined),
   listChatMemberOpenIds: vi.fn(async () => ['ou_owner']),
   replyMessage: vi.fn(async () => 'om_reply'),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
@@ -57,6 +58,11 @@ vi.mock('../src/services/project-scanner.js', async () => {
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
 });
 
+vi.mock('../src/services/oncall-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/oncall-store.js');
+  return { ...actual, ensureDefaultOncallBound: mocks.ensureDefaultOncallBound };
+});
+
 vi.mock('../src/core/worker-pool.js', async () => {
   const actual = await vi.importActual<any>('../src/core/worker-pool.js');
   return { ...actual, forkWorker: mocks.forkWorker };
@@ -92,6 +98,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getProjectScanDirs.mockReturnValue([]);
+  mocks.ensureDefaultOncallBound.mockResolvedValue(undefined);
   mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
   mocks.replyMessage.mockResolvedValue('om_reply');
   mocks.scanMultipleProjects.mockReturnValue([]);
@@ -246,6 +253,83 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       undefined,
       expect.anything(),
     );
+  });
+
+  it('losing registration leaves no shared seed message or orphaned first turn', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_race';
+    const chatId = 'oc_join_shared_race';
+    const key = types.sessionKey(chatId, appId);
+    const winner = {
+      session: {
+        sessionId: 'sess-race-winner',
+        chatId,
+        rootMessageId: chatId,
+        title: 'winner',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: appId,
+        scope: 'chat',
+      },
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: appId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.now(),
+      cliVersion: 'test',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+    } as any;
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-race'),
+      regularGroupReplyMode: 'shared',
+    });
+    mocks.ensureDefaultOncallBound.mockImplementationOnce(async () => {
+      daemon.__testOnly_activeSessions.set(key, winner);
+      return undefined;
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(winner);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the registered session when the post-CAS shared seed fails', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_seed_failure';
+    const chatId = 'oc_join_shared_seed_failure';
+    const key = types.sessionKey(chatId, appId);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-seed-failure'),
+      regularGroupReplyMode: 'shared',
+    });
+    mocks.sendMessage.mockRejectedValueOnce(new Error('Lark unavailable'));
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
   it('话题群继续使用 seed 锚定的 thread-scope session', async () => {
