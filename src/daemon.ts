@@ -16179,12 +16179,39 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       await closeSessionHelper(session.sessionId);
       return;
     }
+    const joinBootstrapExternallyTakenOver = (): boolean => (
+      activeSessions.get(dsKey) !== ds
+      || ds.session.status !== 'active'
+      || !!(ds.worker && !ds.worker.killed)
+    );
+    const joinBootstrapWasTakenOver = (): boolean => {
+      const takenOver = (
+        joinReady?.cancelled === true
+        || joinBootstrapExternallyTakenOver()
+      );
+      if (takenOver && ds.worker && !ds.worker.killed) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap 期间会话已由其它入口启动，让位且不再 refork`,
+        );
+      }
+      return takenOver;
+    };
     // Publish the barrier only after this candidate wins registration. There is
     // no await between the CAS and this write, so a turn can never observe the
     // worker-null session without also observing the barrier. Publishing earlier
     // would unnecessarily stall real messages during membership retry and
     // mode/working-dir discovery, where their own session may safely win.
     joinReady = beginAutoStartJoinReadyBarrier(dsKey, () => {
+      // Scheduler/dashboard/trigger paths do not wait on the inbound-message
+      // barrier and may legitimately start this exact ds while join bootstrap
+      // is awaiting Lark/network I/O. Once that happens, timeout cancellation
+      // must yield to the new worker instead of closing its active turn.
+      if (joinBootstrapExternallyTakenOver()) {
+        logger.warn(
+          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap timeout 时会话已被接管，跳过候选回收`,
+        );
+        return;
+      }
       // A user turn waited longer than the serializer's normal safety cap.
       // Relinquish this half-bootstrapped registration instead of letting the
       // turn fall back to the old "refork now, then get killed by late join"
@@ -16214,20 +16241,6 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const messageId = sharedReplyRootId;
       sharedReplyRootId = undefined;
       void deleteMessage(larkAppId, messageId);
-    };
-    const joinBootstrapWasTakenOver = (): boolean => {
-      const takenOver = (
-        joinReady?.cancelled === true
-        || activeSessions.get(dsKey) !== ds
-        || ds.session.status !== 'active'
-        || !!(ds.worker && !ds.worker.killed)
-      );
-      if (takenOver && ds.worker && !ds.worker.killed) {
-        logger.warn(
-          `[auto-start:入群] ${chatId.substring(0, 12)} bootstrap 期间会话已由其它入口启动，让位且不再 refork`,
-        );
-      }
-      return takenOver;
     };
     const armSharedReplyTarget = (): void => {
       if (!sharedReplyRootId) return;

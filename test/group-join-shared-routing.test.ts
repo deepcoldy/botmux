@@ -662,7 +662,8 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
 
     const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
     await seedStartedPromise;
-    const timedOutJoinSessionId = daemon.__testOnly_activeSessions.get(key)?.session.sessionId;
+    const timedOutJoinDs = daemon.__testOnly_activeSessions.get(key)!;
+    const timedOutJoinSessionId = timedOutJoinDs.session.sessionId;
 
     await daemon.__testOnly_handleThreadReply(
       {
@@ -688,6 +689,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     );
 
     const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(timedOutJoinDs.session.status).toBe('closed');
     expect(ds?.session.sessionId).not.toBe(timedOutJoinSessionId);
     expect(ds?.session.status).toBe('active');
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
@@ -703,6 +705,83 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.deleteMessage).toHaveBeenCalledWith(appId, 'om_late_join_seed');
     expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+  });
+
+  it('does not close a live worker that took over before bootstrap timeout', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_timeout_takeover';
+    const chatId = 'oc_join_shared_timeout_takeover';
+    const userMessageId = 'om_user_after_external_takeover';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-timeout-takeover'),
+      regularGroupReplyMode: 'shared',
+    });
+    daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs(20);
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const ds = daemon.__testOnly_activeSessions.get(key)!;
+    const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
+    ds.worker = externalWorker;
+
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '接管后仍要保留 worker' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.session.status).toBe('active');
+    expect(ds.worker).toBe(externalWorker);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(externalWorker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+
+    releaseSeed('om_late_join_seed_after_takeover');
+    await joinPromise;
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.session.status).toBe('active');
+    expect(ds.worker).toBe(externalWorker);
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(appId, 'om_late_join_seed_after_takeover');
   });
 
   it('serializes replies to a topic-group join seed by the exact session key', async () => {
