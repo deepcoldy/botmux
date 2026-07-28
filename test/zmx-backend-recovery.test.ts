@@ -564,6 +564,65 @@ describe('ZmxBackend history-authoritative transport', () => {
     );
   });
 
+  it.each([
+    'logical recovery',
+    'adapter control',
+  ] as const)(
+    'starts the next cancel cooldown after a slow $firstAttempt settles',
+    (firstAttempt) => {
+      const backend = spawnBackend();
+      const originalExecFileSync = childMocks.execFileSync.getMockImplementation()!;
+      let now = 10_000;
+      let firstRecoverySettledAt = 0;
+      let delayedFirstRecovery = false;
+      const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const atomicsWait = vi.spyOn(Atomics, 'wait').mockImplementation(
+        (_array, _index, _value, timeout) => {
+          now += typeof timeout === 'number' ? timeout : 0;
+          return 'timed-out';
+        },
+      );
+      childMocks.execFileSync.mockImplementation((...args: any[]) => {
+        const result = originalExecFileSync(...args);
+        const input = Buffer.from(args[2]?.input ?? '');
+        if (args[1]?.[0] === 'send' && input.includes(0x03) && !delayedFirstRecovery) {
+          delayedFirstRecovery = true;
+          now += TERMINAL_CANCEL_COOLDOWN_MS + 100;
+          firstRecoverySettledAt = now;
+        }
+        return result;
+      });
+
+      try {
+        const firstFence = backend.captureAmbiguousSubmissionFence();
+        state.failSendAt = 1;
+        expect(backend.sendText('first ambiguous prompt')).toBe(false);
+        if (firstAttempt === 'logical recovery') {
+          backend.cancelAmbiguousSubmission(firstFence);
+        } else {
+          state.failSendAt = null;
+          expect(backend.sendSpecialKeys('C-c')).toBe(true);
+          backend.cancelAmbiguousSubmission(firstFence);
+        }
+
+        const secondFence = backend.captureAmbiguousSubmissionFence();
+        state.failSendAt = 4;
+        expect(backend.sendText('second confirmed prefix')).toBe(true);
+        expect(backend.sendText('second ambiguous suffix')).toBe(false);
+        backend.cancelAmbiguousSubmission(secondFence);
+
+        expect(firstRecoverySettledAt).toBeGreaterThan(0);
+        expect(state.sendTimes[4]! - firstRecoverySettledAt).toBeGreaterThanOrEqual(
+          TERMINAL_CANCEL_COOLDOWN_MS,
+        );
+      } finally {
+        childMocks.execFileSync.mockImplementation(originalExecFileSync);
+        atomicsWait.mockRestore();
+        dateNow.mockRestore();
+      }
+    },
+  );
+
   it('treats an adapter Ctrl+C after a text failure as recovery for that generation', () => {
     const backend = spawnBackend();
     const fence = backend.captureAmbiguousSubmissionFence();

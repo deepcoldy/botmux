@@ -266,7 +266,7 @@ export class ZmxBackend implements SessionBackend {
   private ambiguousTextFailureSequence = 0;
   /** Highest ambiguous text generation covered by any Ctrl+C attempt. */
   private cancelledAmbiguousTextFailureSequence = 0;
-  /** Conservative timestamp: the Ctrl+C send may have landed even on timeout. */
+  /** Completion-time timestamp: a timed-out Ctrl+C may have landed just before return. */
   private lastInjectedCancelAtMs = 0;
 
   claudeJsonlPath?: string;
@@ -542,12 +542,16 @@ export class ZmxBackend implements SessionBackend {
   }
 
   /** Record which ambiguous generation the imminent Ctrl+C can clean. */
-  private noteInjectedCancelAttempt(): void {
-    this.lastInjectedCancelAtMs = Date.now();
+  private markAmbiguousGenerationCovered(): void {
     this.cancelledAmbiguousTextFailureSequence = Math.max(
       this.cancelledAmbiguousTextFailureSequence,
       this.ambiguousTextFailureSequence,
     );
+  }
+
+  /** Start the next terminal-side cooldown after this attempt has settled. */
+  private noteInjectedCancelAttemptSettled(): void {
+    this.lastInjectedCancelAtMs = Date.now();
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -1431,6 +1435,7 @@ export class ZmxBackend implements SessionBackend {
         || explicitPasteOpenAtBoundary?.[chunkIndex] === true
         || explicitPasteOpenAtBoundary?.[chunkIndex + 1] === true;
       try {
+        let injectedCancelAttempt = false;
         if (intent === 'control' && chunk.includes(0x03)) {
           this.waitForInjectedCancelCooldown();
           const postCooldownIdentity = this.verifyBackingIdentity('control-key cooldown');
@@ -1441,16 +1446,22 @@ export class ZmxBackend implements SessionBackend {
             );
             return false;
           }
-          this.noteInjectedCancelAttempt();
+          this.markAmbiguousGenerationCovered();
+          injectedCancelAttempt = true;
         }
-        const stdout = execFileSync('zmx', ['send', this.sessionName], {
-          input,
-          encoding: 'utf8',
-          stdio: ['pipe', 'pipe', 'pipe'],
-          timeout: ZMX_COMMAND_TIMEOUT_MS,
-          maxBuffer: 1024 * 1024,
-          env: zmxControlEnv(this.lastOpts),
-        });
+        let stdout: string;
+        try {
+          stdout = execFileSync('zmx', ['send', this.sessionName], {
+            input,
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: ZMX_COMMAND_TIMEOUT_MS,
+            maxBuffer: 1024 * 1024,
+            env: zmxControlEnv(this.lastOpts),
+          });
+        } finally {
+          if (injectedCancelAttempt) this.noteInjectedCancelAttemptSettled();
+        }
         // Several ZMX control-plane failures are reported on stdout with exit
         // status 0. Empty stdout is part of the transport contract.
         if (stdout.trim()) {
@@ -1517,17 +1528,22 @@ export class ZmxBackend implements SessionBackend {
         );
         return;
       }
-      // A timeout after this point is ambiguous: the Ctrl+C may already have
-      // reached the TUI, so downstream recovery must respect its cooldown.
-      this.noteInjectedCancelAttempt();
-      const stdout = execFileSync('zmx', ['send', this.sessionName], {
-        input: Buffer.concat([Buffer.from(recovery), Buffer.from('\n')]),
-        encoding: 'utf8',
-        stdio: ['pipe', 'pipe', 'pipe'],
-        timeout: ZMX_COMMAND_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024,
-        env: zmxControlEnv(this.lastOpts),
-      });
+      this.markAmbiguousGenerationCovered();
+      let stdout: string;
+      try {
+        stdout = execFileSync('zmx', ['send', this.sessionName], {
+          input: Buffer.concat([Buffer.from(recovery), Buffer.from('\n')]),
+          encoding: 'utf8',
+          stdio: ['pipe', 'pipe', 'pipe'],
+          timeout: ZMX_COMMAND_TIMEOUT_MS,
+          maxBuffer: 1024 * 1024,
+          env: zmxControlEnv(this.lastOpts),
+        });
+      } finally {
+        // A timeout is ambiguous: the Ctrl+C may have landed at any point
+        // before the command returned, so start downstream cooldown now.
+        this.noteInjectedCancelAttemptSettled();
+      }
       if (stdout.trim()) throw new Error(stdout.trim());
       logger.warn(`[zmx:${this.sessionName}] cancelled a partially delivered input sequence`);
     } catch (err) {
