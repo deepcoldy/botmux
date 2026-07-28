@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -13,6 +13,7 @@ import {
   shouldAnnounceSpawnFreeze,
   SPAWN_FREEZE_FILENAME,
   SPAWN_FREEZE_HARD_CAP_MS,
+  SPAWN_FREEZE_MTIME_SKEW_MS,
   spawnFreezeApplies,
   writeSpawnFreeze,
   type SpawnFreezeDeclaration,
@@ -136,6 +137,27 @@ describe('spawn freeze declaration', () => {
     const fleet = readActiveSpawnFreeze(deps(dir))!;
     expect(fleet.larkAppIds).toBeUndefined();
     expect(spawnFreezeApplies(fleet, undefined)).toBe(true);
+  });
+
+  it('refuses a future mtime instead of clamping it (a clamp would never expire)', () => {
+    const dir = freshDir();
+    // `touch -t 2099…` on the declaration would otherwise re-anchor the hard cap
+    // on every read — a permanent, un-expiring freeze.
+    writeDeclaration(dir, { reason: 'stuck', deadline: Number.MAX_SAFE_INTEGER, pid: 1 },
+      NOW + SPAWN_FREEZE_MTIME_SKEW_MS + 1_000);
+    expect(readActiveSpawnFreeze(deps(dir))).toBeNull();
+    // Inside the skew tolerance it is still honored (clock drift is not an attack).
+    writeDeclaration(dir, { reason: 'ok', deadline: NOW + 60_000 }, NOW + 1_000);
+    expect(readActiveSpawnFreeze(deps(dir))).not.toBeNull();
+  });
+
+  it('refuses a symlinked declaration (it would borrow another file\'s mtime)', () => {
+    const dir = freshDir();
+    const target = join(dir, 'freeze-target.json');
+    writeFileSync(target, JSON.stringify({ reason: 'stuck', deadline: Number.MAX_SAFE_INTEGER, pid: 1 }));
+    utimesSync(target, new Date(NOW + 10 * 365 * 24 * 3_600_000), new Date(NOW + 10 * 365 * 24 * 3_600_000));
+    symlinkSync(target, join(dir, SPAWN_FREEZE_FILENAME));
+    expect(readActiveSpawnFreeze(deps(dir))).toBeNull();
   });
 
   it('clears idempotently', () => {

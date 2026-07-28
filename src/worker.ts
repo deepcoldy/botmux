@@ -974,19 +974,32 @@ function provisionIsolatedBotHome(
       // rotate, so a copy taken mid-window hands this bot a token that is
       // already dead — and a bot that then refreshes on its own rotates the
       // shared refresh token out from under the script, which is the whole
-      // poisoning chain the freeze exists to prevent. Keep whatever copy this
-      // bot already has; the next cold spawn after release re-syncs.
+      // poisoning chain the freeze exists to prevent.
+      //
+      // The daemon's spawn gate does not make this check redundant: the freeze
+      // can begin AFTER forkWorker cleared it and before this line runs, so the
+      // decision has to be made here too.
+      //
+      // "Skip" can only mean "keep the copy this bot already has". With no copy
+      // at all — a brand-new isolated bot, or one whose file was removed — there
+      // is nothing to protect and skipping would start the CLI straight into a
+      // login screen. Seed it, preferring an unexpired credential so the
+      // script's fake-expired file is not what gets propagated.
+      const credPath = join(cdir, '.credentials.json');
+      const hasCredCopy = existsSync(credPath);
       const credFreeze = activeSpawnFreezeFor(larkAppId);
-      if (credFreeze) {
+      let fresh: string | null;
+      if (!credFreeze) {
+        fresh = freshestClaudeCred();
+      } else if (hasCredCopy) {
         log(`[read-isolation] spawn-freeze active (${credFreeze.reason}) — keeping existing per-bot credential copy`);
+        fresh = null;
+      } else {
+        fresh = freshestClaudeCred({ requireUnexpired: true }) ?? freshestClaudeCred();
+        log(`[read-isolation] spawn-freeze active (${credFreeze.reason}) but this bot has no credential copy yet — seeding ${fresh ? 'the freshest unexpired credential' : 'nothing (none found)'}`);
       }
-      const fresh = credFreeze ? null : freshestClaudeCred();
-      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
-      else if (
-        !credFreeze
-        && !existsSync(join(cdir, '.credentials.json'))
-        && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
-      ) {
+      if (fresh) writeCredIfChanged(credPath, fresh);
+      else if (!hasCredCopy && !claudeSettingsHasProviderAuth(isolatedSettingsPath)) {
         log(`[read-isolation] WARN no Claude provider auth found (global settings env, keychain, or ~/.claude/.credentials.json) — bot may hit login screen`);
       }
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
@@ -1000,11 +1013,15 @@ function provisionIsolatedBotHome(
       // elsewhere rotates the refresh token, which would strand a stale per-bot copy) —
       // skipped mid-freeze for the same reason as the Claude branch above.
       const authSrc = join(homedir(), '.codex', 'auth.json');
+      const authDst = join(cdir, 'auth.json');
       const codexFreeze = activeSpawnFreezeFor(larkAppId);
-      if (codexFreeze) {
+      // Same rule as the Claude branch: a freeze protects an EXISTING copy; with
+      // none yet there is nothing to protect and skipping would only produce a
+      // logged-out CLI.
+      if (codexFreeze && existsSync(authDst)) {
         log(`[read-isolation] spawn-freeze active (${codexFreeze.reason}) — keeping existing per-bot codex auth copy`);
       } else if (existsSync(authSrc)) {
-        writeCredIfChanged(join(cdir, 'auth.json'), readFileSync(authSrc, 'utf-8'));
+        writeCredIfChanged(authDst, readFileSync(authSrc, 'utf-8'));
       }
       // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
       const cfgDst = join(cdir, 'config.toml');
@@ -1037,7 +1054,7 @@ function claudeSettingsHasProviderAuth(settingsPath: string): boolean {
  *  `~/.claude/.credentials.json`, by `claudeAiOauth.expiresAt` (longest runway
  *  wins — a re-login updates one of the two, and this picks whichever is newer).
  *  Returns the raw credential JSON string, or null when neither source exists. */
-function freshestClaudeCred(): string | null {
+function freshestClaudeCred(opts: { requireUnexpired?: boolean } = {}): string | null {
   const cands: { raw: string; exp: number }[] = [];
   const expOf = (raw: string): number => {
     try { return Number(JSON.parse(raw)?.claudeAiOauth?.expiresAt) || 0; } catch { return 0; }
@@ -1067,9 +1084,15 @@ function freshestClaudeCred(): string | null {
     const raw = (r.stdout ?? '').trim();
     if (raw && usable(raw)) cands.push({ raw, exp: expOf(raw) });
   } catch { /* no keychain (non-mac) → skip candidate */ }
-  if (!cands.length) return null;
-  cands.sort((a, b) => b.exp - a.exp);
-  return cands[0].raw;
+  // `requireUnexpired` is only for the mid-freeze seed path: an expired token
+  // whose refresh token still works is a perfectly normal credential (and the
+  // default path must keep copying it, or a bot can never self-heal), but it is
+  // also exactly what the refresh script's fake-expire step produces — so the
+  // one case that must not copy it is seeding a fresh bot during a freeze.
+  const usableCands = opts.requireUnexpired ? cands.filter(c => c.exp > Date.now()) : cands;
+  if (!usableCands.length) return null;
+  usableCands.sort((a, b) => b.exp - a.exp);
+  return usableCands[0].raw;
 }
 
 /** Write a credential file (mode 0600) only when its content actually changed —

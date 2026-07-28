@@ -2110,12 +2110,22 @@ export function forkWorker(
   // Deliberately only blocks new spawns: tearing down live CLIs is
   // `botmux suspend`'s job, and conflating the two would make every freeze a
   // fleet-wide cold restart.
+  // Capture the session id NOW: `ds.session` is replaced wholesale on a repo
+  // switch (command-handler swaps in the new Session on the SAME ds), so a
+  // closure that read `ds.session.sessionId` at replay time would accept an
+  // entry queued for the previous session and fork a second worker for the new
+  // one — killing and replacing the first.
+  const deferredSessionId = ds.session.sessionId;
   const opsFreeze = deferSpawnDuringFreeze({
-    sessionId: ds.session.sessionId,
+    sessionId: deferredSessionId,
     larkAppId: ds.larkAppId,
     replay: () => {
-      // The session may have been closed while parked; never revive it.
-      if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      // Replay only when this ds is STILL the live session it was queued for:
+      // closed, replaced or transferred sessions must never be revived.
+      if (
+        ds.session.sessionId === deferredSessionId
+        && findActiveBySessionId(deferredSessionId) === ds
+      ) {
         forkWorker(ds, promptInput, resumeOrTurnId);
       }
     },

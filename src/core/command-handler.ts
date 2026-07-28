@@ -25,6 +25,7 @@ import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
 import { killWorker, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from './worker-pool.js';
+import { forgetDeferredSpawn } from './spawn-freeze.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -1650,6 +1651,9 @@ export async function handleCommand(
               ds!.scope,
             );
             ds!.session = session;
+            // 这个 ds 从此代表新 session：冻结期为旧 session 暂存的 spawn 必须就地丢弃，
+            // 否则解冻重放会为同一个 ds 起第二个 worker，把刚起来的那个顶掉。
+            forgetDeferredSpawn(oldSession.sessionId);
             ds!.lastUserPrompt = undefined;
             ds!.lastCliInput = undefined;
             ds!.workingDir = selectedPath;

@@ -17,8 +17,17 @@
  *
  *  1. the declared `deadline`,
  *  2. the declaring process (`pid`) exiting, and
- *  3. a hard cap measured from the file's own mtime, which the content cannot
- *     forge.
+ *  3. a hard cap measured from the file's mtime.
+ *
+ * The cap deserves a note on what it can and cannot do. mtime is not content,
+ * but it is still writable by whoever owns the file (`touch -t`), and a symlink
+ * would let the declaration borrow some other file's timestamps — so the reader
+ * refuses symlinks and refuses a future mtime outright instead of clamping it
+ * (clamping to `now` would slide the window forward on every read, i.e. exactly
+ * the permanent freeze the cap exists to prevent). What remains is that a live
+ * process can keep re-declaring; that is not a hole, it is the same authority
+ * as holding a legitimate freeze. The cap's job is bounding an ABANDONED
+ * declaration — `kill -9` before the cleanup trap, power loss — and it does.
  *
  * A freeze must never be able to wedge the fleet. Not starting CLIs for a few
  * seconds is cheap; never starting them again is an outage — so anything
@@ -32,7 +41,7 @@
  * handed out before the boot can never cover. The two compose — `forkWorker`
  * defers when either one applies.
  */
-import { readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { lstatSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from './data-dir.js';
 
@@ -43,6 +52,12 @@ export const SPAWN_FREEZE_FILENAME = 'spawn-freeze.json';
  *  cleanup trap — `kill -9`, power loss — cannot freeze the fleet for longer
  *  than this even if it declared a deadline years out. */
 export const SPAWN_FREEZE_HARD_CAP_MS = 10 * 60_000;
+
+/** How far ahead of `now` an mtime may sit before we stop believing it. Covers
+ *  ordinary clock skew / filesystem timestamp granularity; anything beyond it is
+ *  a timestamp nobody legitimately produces, and honoring it would hand the
+ *  writer an unbounded freeze. */
+export const SPAWN_FREEZE_MTIME_SKEW_MS = 60_000;
 
 /** How often a deferred spawn re-checks the declaration. Polling (rather than
  *  fs.watch) keeps this portable and cheap: the timer only runs while at least
@@ -183,13 +198,17 @@ export function readActiveSpawnFreeze(deps: SpawnFreezeDeps = {}): ActiveSpawnFr
   const { dataDir, now, processAlive } = resolveDeps(deps);
   const path = join(dataDir(), SPAWN_FREEZE_FILENAME);
   try {
-    const stat = statSync(path);
+    // lstat, not stat: a symlink would let the declaration inherit an arbitrary
+    // file's mtime (and thus escape the hard cap), so it is refused outright.
+    const stat = lstatSync(path);
     if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return null;
+    const at = now();
+    // A future mtime cannot be honored and must not be clamped to `now` either:
+    // clamping would re-anchor the cap on every read and never expire.
+    if (stat.mtimeMs > at + SPAWN_FREEZE_MTIME_SKEW_MS) return null;
     const declaration = parseSpawnFreezeDeclaration(JSON.parse(readFileSync(path, 'utf-8')));
-    // The hard cap is anchored to mtime, not to a timestamp inside the file:
-    // content is whatever the writer says, mtime is what actually happened.
     const effectiveUntil = Math.min(declaration.deadline, stat.mtimeMs + SPAWN_FREEZE_HARD_CAP_MS);
-    if (effectiveUntil <= now()) return null;
+    if (effectiveUntil <= at) return null;
     if (declaration.pid !== undefined && !processAlive(declaration.pid)) return null;
     return {
       reason: declaration.reason,
