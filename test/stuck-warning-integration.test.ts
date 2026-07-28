@@ -2,7 +2,8 @@
  * Integration tests for the stuck-warning state machine in worker-pool.ts.
  *
  * Exercises the REAL message handlers (stuck_warning / tui_keys_delivered /
- * stuck_warning_expired) via __testOnly_setupWorkerHandlers, with a deferred
+ * stuck_warning_expired / tui_prompt_submit_failed) via
+ * __testOnly_setupWorkerHandlers, with a deferred
  * sessionReply to simulate in-flight card POSTs.
  *
  * Covers (PR #559 review rounds 3-5):
@@ -37,6 +38,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptCard: vi.fn(() => '{"type":"tui_prompt"}'),
   buildTuiPromptResolvedCard: vi.fn((text: string) => JSON.stringify({ type: 'resolved', text })),
+  buildTuiPromptFailedCard: vi.fn((text: string) => JSON.stringify({ type: 'failed', text })),
   buildTuiPromptProcessingCard: vi.fn((text: string) => JSON.stringify({ type: 'processing', text })),
   buildStreamingCard: vi.fn(() => '{}'),
   buildSessionCard: vi.fn(() => '{}'),
@@ -297,6 +299,95 @@ describe('stuck-warning state machine (integration)', () => {
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(ds.stuckWarningCardId).toBeUndefined();
     expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('backend delivery failure renders a failure state and clears stuck-card authority', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'stuck_warning',
+      elapsedMs: 15000,
+      snapshot: '...',
+      matchedPattern: 'hook review level 1',
+      turnId: 'turn_1',
+      cliLifetime: 1,
+    });
+    await flush();
+    sessionReplyDeferred.resolve('om_card_1');
+    await flush();
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_submit_failed',
+      stuckNonce: 1,
+      turnId: 'turn_1',
+    });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_card_1',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.stuckWarningCardId).toBeUndefined();
+    expect(ds.stuckWarningNonce).toBeUndefined();
+  });
+
+  it('normal TUI cards resolve only from a matching worker ACK', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      tuiPromptCardId: 'om_tui_card',
+      tuiPromptOptions: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_resolved',
+      cardMessageId: 'om_old_card',
+      selectedText: 'stale',
+    });
+    await flush();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.tuiPromptCardId).toBe('om_tui_card');
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_resolved',
+      cardMessageId: 'om_tui_card',
+      selectedText: 'Approve',
+    });
+    await flush();
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(ds.tuiPromptCardId).toBeUndefined();
+  });
+
+  it('normal TUI backend failure renders failed instead of selected', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      worker: fakeWorker,
+      tuiPromptCardId: 'om_tui_card',
+      tuiPromptOptions: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+      ],
+    });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    sessionReplyDeferred.resolve('om_failure_notice');
+
+    fakeWorker.emit('message', {
+      type: 'tui_prompt_submit_failed',
+      cardMessageId: 'om_tui_card',
+    });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_tui_card',
+      expect.stringContaining('"type":"failed"'),
+    );
+    expect(ds.tuiPromptCardId).toBeUndefined();
   });
 
   it('old ACK (nonce=1) after new warning (nonce=2) does not affect new authority', async () => {

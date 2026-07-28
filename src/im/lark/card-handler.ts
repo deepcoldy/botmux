@@ -9,7 +9,7 @@ import { config } from '../../config.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
 import {
   findConfigField,
   applyConfigField,
@@ -87,6 +87,7 @@ import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistS
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
+import { sendWorkerIpc } from '../../core/worker-ipc.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isRepoCardConsumed, isActiveRepoCard, claimCurrentRepoCard } from '../../core/types.js';
@@ -2134,6 +2135,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (ds.worker) {
         let allKeys: string[] = [];
         let isFinalStuck = false;
+        let dispatchedKeys = false;
         if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
@@ -2210,11 +2212,36 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
           const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
           const effectiveFinal = isFinal || isFinalStuck;
-          ds.worker.send({ type: 'tui_keys', keys: allKeys, isFinal: effectiveFinal, rearmStuckDetector: isStuckWarningEnter, stuckNonce, stuckCliLifetime, stuckPageType: stuckPage } as DaemonToWorker);
+          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
+            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
+            : selectedText;
+          try {
+            await sendWorkerIpc(ds.worker, {
+              type: 'tui_keys',
+              keys: allKeys,
+              isFinal: effectiveFinal,
+              rearmStuckDetector: isStuckWarningEnter,
+              stuckNonce,
+              stuckCliLifetime,
+              stuckPageType: stuckPage,
+              cardMessageId: isActiveTuiCard ? cardMessageId : undefined,
+              selectedText: resolveText || selectedText,
+            } as DaemonToWorker);
+            dispatchedKeys = true;
+          } catch (err) {
+            if (isActiveStuckCard) ds.stuckWarningProcessing = false;
+            logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+            return {
+              toast: {
+                type: 'warning',
+                content: t('card.action.tui_ipc_failed', undefined, localeForBot(ds.larkAppId)),
+              },
+            };
+          }
           logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
         }
 
-        if (isFinal || isFinalStuck) {
+        if ((isFinal || isFinalStuck) && dispatchedKeys) {
           const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
@@ -2223,8 +2250,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // For a stuck-warning card, do NOT clear authority or render success
           // here. The worker may still reject the keys (stale screen). We show a
           // "processing" state to block duplicate clicks, and wait for the
-          // worker's tui_keys_delivered (success) or stuck_warning_expired
-          // ("page changed, not sent") ACK before resolving the card.
+          // worker's tui_keys_delivered (success), stuck_warning_expired
+          // ("page changed, not sent"), or tui_prompt_submit_failed ACK before
+          // resolving the card.
           if (isActiveStuckCard) {
             if (cardMessageId) {
               const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
@@ -2235,24 +2263,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             publishAttentionPatch(ds);
             try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
           }
-          // Normal TUI prompt card (ScreenAnalyzer): resolve immediately.
-          if (cardMessageId) {
-            setTimeout(() => {
-              const resolvedCard = buildTuiPromptResolvedCard(finalText, locDs);
-              updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
-                logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
-              );
-            }, allKeys.length * 100 + 500);
-          }
-          // Clear state only for the card that was actually clicked — a stuck
-          // card click must NOT wipe the ScreenAnalyzer TUI prompt state (or
-          // vice versa) if both coexist / race.
-          if (cardMessageId === ds.tuiPromptCardId) {
-            ds.tuiPromptCardId = undefined;
-            ds.tuiPromptOptions = undefined;
-            ds.tuiPromptMultiSelect = undefined;
-            ds.tuiToggledIndices = undefined;
-          }
+          // Normal TUI prompt cards also remain in processing until the worker
+          // confirms backend delivery via tui_prompt_resolved. A worker/backend
+          // rejection produces tui_prompt_submit_failed instead.
           publishAttentionPatch(ds);
           try { return JSON.parse(buildTuiPromptProcessingCard(finalText, locDs)); } catch { /* fall through */ }
         }
@@ -2265,23 +2278,43 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       let inputKeys: string[] = [];
       try { inputKeys = JSON.parse(value?.input_keys ?? '[]'); } catch { /* bad json */ }
       const locDs = localeForBot(ds.larkAppId);
-      if (ds.worker && inputText && inputKeys.length > 0) {
-        // Atomic IPC — worker handles keys + text in one flow to avoid race
-        ds.worker.send({ type: 'tui_text_input', keys: inputKeys, text: inputText } as DaemonToWorker);
-        logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
-        if (cardMessageId) {
-          const resolvedCard = buildTuiPromptResolvedCard(inputText, locDs);
-          updateMessage(ds.larkAppId, cardMessageId, resolvedCard).catch(err =>
-            logger.debug(`[${tag(ds)}] Failed to update TUI prompt card: ${err}`),
-          );
-        }
-        ds.tuiPromptCardId = undefined;
-        ds.tuiPromptOptions = undefined;
-        publishAttentionPatch(ds);
+      const isActiveTuiCard = !!ds.tuiPromptCardId && cardMessageId === ds.tuiPromptCardId;
+      if (!isActiveTuiCard) {
+        logger.info(`[${tag(ds)}] tui_text_input from stale card ${cardMessageId} — ignored`);
+        return;
       }
+      if (!ds.worker || !inputText || inputKeys.length === 0) {
+        logger.info(
+          `[${tag(ds)}] TUI text input not dispatched ` +
+          `(worker=${!!ds.worker}, text=${!!inputText}, keys=${inputKeys.length})`,
+        );
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.tui_ipc_failed', undefined, locDs),
+          },
+        };
+      }
+      // Atomic IPC — worker handles keys + text in one flow to avoid race
       try {
-        return JSON.parse(buildTuiPromptResolvedCard(inputText || t('card.action.tui_custom_input', undefined, locDs), locDs));
-      } catch { /* fall through */ }
+        await sendWorkerIpc(ds.worker, {
+          type: 'tui_text_input',
+          keys: inputKeys,
+          text: inputText,
+          cardMessageId,
+        } as DaemonToWorker);
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] TUI text IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.tui_ipc_failed', undefined, locDs),
+          },
+        };
+      }
+      logger.info(`[${tag(ds)}] TUI text input: "${inputText}" (keys: ${JSON.stringify(inputKeys)})`);
+      publishAttentionPatch(ds);
+      try { return JSON.parse(buildTuiPromptProcessingCard(inputText, locDs)); } catch { /* fall through */ }
     }
 
     // Compatibility path for cards emitted before open_local_cli was introduced.

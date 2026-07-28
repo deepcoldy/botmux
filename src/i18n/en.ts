@@ -37,6 +37,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': 'Limit reached',
   'card.status.retry_ready': 'Ready to retry',
   'card.status.executing': 'Executing…',
+  'card.status.failed': 'Failed',
   'card.status.session_closed': '🛑 Session Closed',
   'card.status.relay_frozen': '🔄 Relayed away',
   'card.status.selected': 'Selected',
@@ -742,6 +743,7 @@ export const messages: Record<string, string> = {
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
+  'card.action.tui_ipc_failed': '⚠️ The TUI action was not sent; the worker may be unavailable. Please try again.',
   'card.action.continue_using_current_repo': 'Keeping current repo: {cwd}',
   'card.action.retry_last_task_missing': '⚠️ Cannot find the last task to retry. Send a new message instead.',
   'card.action.retry_last_task_unavailable': '⚠️ This retry state is no longer active. Send a new message instead.',
@@ -754,6 +756,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.start_exited_early': 'The worker exited before becoming ready (exit code: {code}); see the Botmux logs for details.',
+  'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────

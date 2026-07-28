@@ -245,6 +245,7 @@ import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
 import { IdleDetector } from './utils/idle-detector.js';
 import { StuckDetector, matchHookReviewScreen } from './utils/stuck-detector.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
+import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
 import { captureToPng } from './utils/screenshot-renderer.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
 import { chooseWebTerminalSeed } from './utils/web-terminal-seed.js';
@@ -4714,20 +4715,18 @@ const KEY_TO_ANSI: Record<string, string> = {
  */
 async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
   if (!backend || keys.length === 0) return false;
+  const targetBackend = backend;
 
   try {
-    if ('sendSpecialKeys' in backend) {
-      const b = backend as any;
-      // Send each key individually with 100ms delay for TUI state processing
-      for (const key of keys) {
-        b.sendSpecialKeys(key);
-        await new Promise(r => setTimeout(r, 100));
-      }
-    } else {
-      for (const key of keys) {
-        backend.write(KEY_TO_ANSI[key] ?? key);
-        await new Promise(r => setTimeout(r, 100));
-      }
+    const delivered = await sendTuiKeySequence(
+      targetBackend,
+      keys,
+      KEY_TO_ANSI,
+      { isCurrent: () => backend === targetBackend },
+    );
+    if (!delivered) {
+      logError('handleTuiKeys write rejected or backend replaced');
+      return false;
     }
   } catch (e: any) {
     logError(`handleTuiKeys write failed: ${e?.message ?? e}`);
@@ -4832,43 +4831,38 @@ async function flushPendingInjections(): Promise<void> {
  * is treated as a "decline" action, not a "enter text mode" action. The TUI
  * auto-switches to text input mode as soon as a character is typed.
  */
-async function handleTuiTextInput(keys: string[], text: string): Promise<void> {
-  if (!backend || !cliAdapter) return;
+async function handleTuiTextInput(keys: string[], text: string): Promise<boolean> {
+  if (!backend || !cliAdapter) return false;
+  const targetBackend = backend;
+  const targetAdapter = cliAdapter;
+  const navKeyCount = keys[keys.length - 1] === 'Enter' ? keys.length - 1 : keys.length;
 
-  // Strip trailing Enter from keys — we don't want to press Enter on "Type something"
-  const navKeys = keys[keys.length - 1] === 'Enter' ? keys.slice(0, -1) : keys;
-
-  // Step 1: navigate to "Type something" (no Enter)
-  if ('sendSpecialKeys' in backend) {
-    const b = backend as any;
-    for (const key of navKeys) {
-      b.sendSpecialKeys(key);
-      await new Promise(r => setTimeout(r, 100));
+  log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
+  try {
+    const delivered = await submitTuiTextInput({
+      target: strictInputHandle(targetBackend),
+      keys,
+      text,
+      keyToAnsi: KEY_TO_ANSI,
+      isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter,
+      writeInput: (target, content) => targetAdapter.writeInput(target, content),
+    });
+    if (!delivered) {
+      logError('TUI text input was rejected, unconfirmed, or crossed a backend replacement');
+      return false;
     }
-  } else {
-    for (const key of navKeys) {
-      backend.write(KEY_TO_ANSI[key] ?? key);
-      await new Promise(r => setTimeout(r, 100));
-    }
+  } catch (err: any) {
+    logError(`TUI text input write failed: ${err?.message ?? err}`);
+    return false;
   }
 
-  // Step 2: clear blocking state
+  // Clear blocking only after navigation and adapter submission both succeed.
   tuiPromptBlocking = false;
   if (isPromptReady) {
     isPromptReady = false;
     idleDetector?.reset();
   }
-
-  // Wait briefly so the cursor position is stable before pasting
-  await new Promise(r => setTimeout(r, 200));
-
-  // Step 3: write text via cliAdapter (auto-switches to text mode + submits with Enter)
-  log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeys.length} nav keys)`);
-  try {
-    await cliAdapter.writeInput(adapterInputHandle(backend), text);
-  } catch (err: any) {
-    log(`TUI text input write failed: ${err.message}`);
-  }
+  return true;
 }
 
 /**
@@ -4908,34 +4902,80 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
   // The hook returns passthrough → CoCo renders the picker; only then send keys.
   const appeared = await waitFor(/Enter to select|Tab\/Arrow keys|Review your answers/, 30_000);
   if (!appeared) { log('coco_drive_picker: picker not detected within 30s — aborting drive'); return; }
+  if (!backend) return;
+  const targetBackend = backend;
   tuiPromptBlocking = true;
+  let failureReported = false;
+  const reportFailure = (detail?: unknown): void => {
+    if (failureReported) return;
+    failureReported = true;
+    const suffix = detail
+      ? `: ${detail instanceof Error ? detail.message : String(detail)}`
+      : '';
+    logError(`coco_drive_picker: TUI answer delivery failed${suffix}`);
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      message: t('worker.tui_submit_failed', { cliName: cliName() }),
+    });
+  };
 
   if (comment && comment.trim()) {
     // Free-text reply: navigate to the first question's "Type something" row,
     // type the text, then a single Enter. Single-question submits directly; for
     // multi-question this only fills the first question (logged limitation).
     log(`coco_drive_picker: free-text answer (${navKeys.length} nav keys)${needsReviewSubmit ? ' [multi-question — partial]' : ''}`);
-    const b = backend as any;
-    if ('sendSpecialKeys' in backend) {
-      for (const key of navKeys) { b.sendSpecialKeys(key); await new Promise(r => setTimeout(r, 100)); }
-    } else {
-      for (const key of navKeys) { backend.write(KEY_TO_ANSI[key] ?? key); await new Promise(r => setTimeout(r, 100)); }
+    try {
+      const navigated = await sendTuiKeySequence(
+        targetBackend,
+        navKeys,
+        KEY_TO_ANSI,
+        { isCurrent: () => backend === targetBackend },
+      );
+      if (!navigated) {
+        reportFailure();
+        return;
+      }
+      await new Promise(r => setTimeout(r, 150));
+      if (backend !== targetBackend) {
+        reportFailure();
+        return;
+      }
+      const input = strictInputHandle(targetBackend as SessionBackend & PtyHandle);
+      if (typeof input.sendText === 'function') input.sendText(comment);
+      else input.write(comment);
+      await new Promise(r => setTimeout(r, 200));
+      if (backend !== targetBackend) {
+        reportFailure();
+        return;
+      }
+      if (!await handleTuiKeys(['Enter'], true)) {
+        reportFailure();
+      }
+    } catch (err) {
+      reportFailure(err);
     }
-    await new Promise(r => setTimeout(r, 150));
-    if ('sendText' in backend && b.sendText) b.sendText(comment); else backend.write(comment);
-    await new Promise(r => setTimeout(r, 200));
-    await handleTuiKeys(['Enter'], true); // single Enter submits + clears blocking state
     return;
   }
 
   // Button selection. Single question: navKeys submit directly (isFinal=true).
   // Multi question: navKeys land on Review, then one Enter on "Submit answers".
   log(`coco_drive_picker: selection answer (${navKeys.length} keys, review=${needsReviewSubmit})`);
-  await handleTuiKeys(navKeys, !needsReviewSubmit);
+  if (!await handleTuiKeys(navKeys, !needsReviewSubmit)) {
+    reportFailure();
+    return;
+  }
   if (needsReviewSubmit) {
     const review = await waitFor(/Review your answers|Submit answers/, 8_000);
     if (!review) log('coco_drive_picker: Review screen not detected — submitting anyway');
-    await handleTuiKeys(['Enter'], true); // cursor defaults to "Submit answers"
+    if (backend !== targetBackend) {
+      reportFailure();
+      return;
+    }
+    if (!await handleTuiKeys(['Enter'], true)) {
+      reportFailure();
+    }
   }
 }
 
@@ -11245,13 +11285,38 @@ process.on('message', async (raw: unknown) => {
             writeKeys: handleTuiKeys,
             sendExpired: (nonce, turnId, dispatchAttempt) => send({ type: 'stuck_warning_expired', nonce, turnId, dispatchAttempt }),
             sendDelivered: (nonce, turnId, dispatchAttempt) => send({ type: 'tui_keys_delivered', nonce, turnId, dispatchAttempt }),
+            sendFailed: (nonce, turnId, dispatchAttempt) => send({ type: 'tui_prompt_submit_failed', stuckNonce: nonce, turnId, dispatchAttempt }),
             log,
           },
         );
         wroteKeys = result.wroteKeys;
       } else {
-        await handleTuiKeys(msg.keys, msg.isFinal);
-        wroteKeys = true;
+        wroteKeys = await handleTuiKeys(msg.keys, msg.isFinal);
+        if (msg.cardMessageId) {
+          if (!wroteKeys) {
+            send({
+              type: 'tui_prompt_submit_failed',
+              cardMessageId: msg.cardMessageId,
+              turnId: currentBotmuxTurnId,
+              dispatchAttempt: currentBotmuxDispatchAttempt,
+            });
+          } else if (msg.isFinal) {
+            send({
+              type: 'tui_prompt_resolved',
+              cardMessageId: msg.cardMessageId,
+              selectedText: msg.selectedText,
+              turnId: currentBotmuxTurnId,
+              dispatchAttempt: currentBotmuxDispatchAttempt,
+            });
+          }
+        } else if (!wroteKeys) {
+          send({
+            type: 'user_notify',
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+            message: t('worker.tui_submit_failed', { cliName: cliName() }),
+          });
+        }
       }
       // Re-arm the stuck detector ONLY when the card-handler explicitly flags
       // this as a stuck-warning card's Enter action (advances to the next
@@ -11273,7 +11338,30 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'tui_text_input': {
-      handleTuiTextInput(msg.keys, msg.text);
+      const wroteText = await handleTuiTextInput(msg.keys, msg.text);
+      if (msg.cardMessageId) {
+        send(wroteText
+          ? {
+              type: 'tui_prompt_resolved',
+              cardMessageId: msg.cardMessageId,
+              selectedText: msg.text,
+              turnId: currentBotmuxTurnId,
+              dispatchAttempt: currentBotmuxDispatchAttempt,
+            }
+          : {
+              type: 'tui_prompt_submit_failed',
+              cardMessageId: msg.cardMessageId,
+              turnId: currentBotmuxTurnId,
+              dispatchAttempt: currentBotmuxDispatchAttempt,
+            });
+      } else if (!wroteText) {
+        send({
+          type: 'user_notify',
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+          message: t('worker.tui_submit_failed', { cliName: cliName() }),
+        });
+      }
       break;
     }
 

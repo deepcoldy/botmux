@@ -40,6 +40,7 @@ export const messages: Record<string, string> = {
   'card.status.limited': '限额已达',
   'card.status.retry_ready': '可重试',
   'card.status.executing': '正在执行…',
+  'card.status.failed': '提交失败',
   'card.status.session_closed': '🛑 会话已关闭',
   'card.status.relay_frozen': '🔄 会话已搬迁',
   'card.status.selected': '已选择',
@@ -745,6 +746,7 @@ export const messages: Record<string, string> = {
   'card.action.tui_select_title': 'Select options',
   'card.action.tui_custom_input': 'Custom input',
   'card.action.tui_done': 'Done',
+  'card.action.tui_ipc_failed': '⚠️ TUI 操作未发送（worker 可能不可用），请重试。',
   'card.action.continue_using_current_repo': '继续使用当前仓库：{cwd}',
   'card.action.retry_last_task_missing': '⚠️ 找不到上一条任务，无法重发。请直接发送新的消息。',
   'card.action.retry_last_task_unavailable': '⚠️ 当前重试状态已失效。请直接发送新的消息。',
@@ -757,6 +759,7 @@ export const messages: Record<string, string> = {
   'worker.crash_recent_output': '最近终端输出：',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
+  'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────

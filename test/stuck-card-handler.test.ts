@@ -137,6 +137,21 @@ function makeTuiKeysEvent(value: Record<string, any>, clickedMessageId = CARD_ID
   };
 }
 
+function makeTuiTextEvent(text: string, inputKeys = '["Down","Enter"]') {
+  return {
+    action: {
+      value: {
+        action: 'tui_text_input',
+        root_id: ROOT_ID,
+        input_keys: inputKeys,
+      },
+      form_value: { tui_custom_input: text },
+    },
+    operator: { open_id: 'ou_user' },
+    context: { open_message_id: CARD_ID },
+  };
+}
+
 function flush(): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
@@ -148,7 +163,10 @@ describe('stuck-warning card tui_keys handler', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    workerSend = vi.fn();
+    workerSend = vi.fn((_message, callback?: (error: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
   });
 
   it('sends allowlisted key derived from pageType+index (ignores value.keys)', async () => {
@@ -267,5 +285,106 @@ describe('stuck-warning card tui_keys handler', () => {
 
     expect(workerSend).toHaveBeenCalledTimes(1);
     expect(workerSend.mock.calls[0][0].keys).toEqual(['Escape']);
+  });
+
+  it('releases the stuck-card processing claim when IPC delivery fails', async () => {
+    workerSend.mockImplementation((_message, callback?: (error: Error | null) => void) => {
+      callback?.(new Error('channel closed'));
+      return false;
+    });
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      stuckWarningCardId: CARD_ID,
+      stuckWarningNonce: 1,
+      stuckWarningNonceCounter: 1,
+      stuckWarningPageType: 'hook review level 1',
+      stuckWarningCliLifetime: 1,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+    const result = await handleCardAction(
+      makeTuiKeysEvent({ selected_index: '0', is_final: '1' }) as any,
+      makeDeps(sessions),
+      APP_ID,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.stuckWarningProcessing).toBe(false);
+  });
+
+  it('keeps a normal TUI card active until the worker/backend ACK arrives', async () => {
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+      tuiPromptOptions: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+      ],
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+    const result = await handleCardAction(
+      makeTuiKeysEvent({
+        keys: '["Enter"]',
+        selected_index: '0',
+        selected_text: 'Approve',
+        option_type: 'select',
+        is_final: '1',
+      }) as any,
+      makeDeps(sessions),
+      APP_ID,
+    );
+
+    expect(result).toEqual({ text: 'Approve' });
+    expect(ds.tuiPromptCardId).toBe(CARD_ID);
+    expect(workerSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tui_keys',
+        cardMessageId: CARD_ID,
+        selectedText: 'Approve',
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it('keeps text-input cards active while awaiting the worker/backend ACK', async () => {
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+    const result = await handleCardAction(
+      makeTuiTextEvent('custom answer') as any,
+      makeDeps(sessions),
+      APP_ID,
+    );
+
+    expect(result).toEqual({ text: 'custom answer' });
+    expect(ds.tuiPromptCardId).toBe(CARD_ID);
+    expect(workerSend).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'tui_text_input',
+        cardMessageId: CARD_ID,
+        text: 'custom answer',
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it('does not render text input as processing when nothing was dispatched', async () => {
+    const ds = makeDs({
+      worker: null,
+      tuiPromptCardId: CARD_ID,
+    });
+    const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+
+    const result = await handleCardAction(
+      makeTuiTextEvent('custom answer') as any,
+      makeDeps(sessions),
+      APP_ID,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.tuiPromptCardId).toBe(CARD_ID);
   });
 });

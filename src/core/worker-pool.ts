@@ -21,7 +21,7 @@ import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -4010,6 +4010,13 @@ function setupWorkerHandlers(
       case 'tui_prompt_resolved': {
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
+        if (msg.cardMessageId && ds.tuiPromptCardId !== msg.cardMessageId) {
+          logger.info(
+            `[${t}] Ignored stale TUI resolved ACK for ${msg.cardMessageId} ` +
+            `(active=${ds.tuiPromptCardId ?? 'none'})`,
+          );
+          break;
+        }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
@@ -4024,6 +4031,52 @@ function setupWorkerHandlers(
           ds.tuiPromptOptions = undefined;
           publishAttentionPatch(ds);
         }
+        break;
+      }
+
+      case 'tui_prompt_submit_failed': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        const matchesTuiCard = !!msg.cardMessageId
+          && ds.tuiPromptCardId === msg.cardMessageId;
+        const matchesStuckCard = msg.stuckNonce !== undefined
+          && ds.stuckWarningNonce === msg.stuckNonce
+          && !!ds.stuckWarningCardId;
+        if (!matchesTuiCard && !matchesStuckCard) {
+          logger.info(
+            `[${t}] Ignored stale TUI submit failure ` +
+            `(card=${msg.cardMessageId ?? 'none'}, stuckNonce=${msg.stuckNonce ?? 'none'})`,
+          );
+          break;
+        }
+
+        const failureText = tr('worker.tui_submit_failed', {
+          cliName: getCliDisplayName(effectiveCliId),
+        }, loc);
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          const failedCard = buildTuiPromptFailedCard(failureText, loc);
+          const failedCardId = matchesTuiCard
+            ? ds.tuiPromptCardId
+            : ds.stuckWarningCardId;
+          if (failedCardId) {
+            updateMessage(ds.larkAppId, failedCardId, failedCard).catch(err =>
+              logger.debug(`[${t}] Failed to update TUI failure card: ${err}`),
+            );
+          }
+          try {
+            await scopedReply(failureText, 'text', msg.turnId);
+          } catch (err: any) {
+            logger.error(`[${t}] Failed to deliver TUI submit failure: ${err.message}`);
+          }
+        }
+
+        if (matchesTuiCard) {
+          ds.tuiPromptCardId = undefined;
+          ds.tuiPromptOptions = undefined;
+          ds.tuiPromptMultiSelect = undefined;
+          ds.tuiToggledIndices = undefined;
+        }
+        if (matchesStuckCard) clearStuckWarningAuthority(ds);
+        publishAttentionPatch(ds);
         break;
       }
 

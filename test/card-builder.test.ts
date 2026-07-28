@@ -20,6 +20,7 @@ import {
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
+  buildTuiPromptFailedCard,
   getCliDisplayName,
 } from '../src/im/lark/card-builder.js';
 import type { RelayPickerEntry } from '../src/im/lark/card-builder.js';
@@ -62,6 +63,18 @@ function buttonTexts(actions: any[]): string[] {
     .filter((a: any) => a.tag === 'button')
     .map((a: any) => a.text.content);
 }
+
+describe('buildTuiPromptFailedCard', () => {
+  it('renders an explicit red terminal state for unconfirmed TUI delivery', () => {
+    const card = parse(buildTuiPromptFailedCard('Input was not delivered', 'en'));
+
+    expect(card.header).toMatchObject({
+      template: 'red',
+      title: { content: 'Failed' },
+    });
+    expect(card.elements[0].text.content).toBe('Input was not delivered');
+  });
+});
 
 function allActions(card: any): any[] {
   return card.elements

@@ -1654,6 +1654,24 @@ export function buildTuiPromptResolvedCard(selectedText: string, locale?: Locale
   return JSON.stringify(card);
 }
 
+/** Build a terminal failure state when worker/backend input was not confirmed. */
+export function buildTuiPromptFailedCard(message: string, locale?: Locale): string {
+  const card = {
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.status.failed', undefined, locale) },
+      template: 'red',
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: { tag: 'lark_md', content: escapeMd(message) },
+      },
+    ],
+  };
+  return JSON.stringify(card);
+}
+
 // ─── Adopt cards ─────────────────────────────────────────────────────────────
 
 function formatDuration(ms: number): string {
