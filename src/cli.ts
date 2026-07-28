@@ -3846,7 +3846,6 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
 
   let cursor = 0;
   let confirmDelete = false;  // true when waiting for y/n confirmation
-  let deleting = false;
   let flashMsg = '';
 
   function render(): void {
@@ -4307,7 +4306,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename' | 'rename',
+  route: 'slash' | 'cd' | 'close' | 'chat-rename',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4490,10 +4489,6 @@ function listDaemonDescriptors(): DaemonDescriptorLite[] {
     } catch { /* skip malformed */ }
   }
   return all;
-}
-
-function daemonDescriptorDefinitelyDead(d: DaemonDescriptorLite): boolean {
-  return typeof d.pid === 'number' && d.pid > 0 && !isProcessAlive(d.pid);
 }
 
 function listOnlineDaemons(): DaemonDescriptorLite[] {

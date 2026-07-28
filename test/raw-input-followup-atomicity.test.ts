@@ -135,6 +135,19 @@ describe('worker raw_input delivery', () => {
     expect(terminalIdx).toBeGreaterThan(catchIdx);
     expect(notifyIdx).toBeGreaterThan(terminalIdx);
   });
+
+  it('only claims follow-up text was skipped when that IPC actually carried one', () => {
+    const catchIdx = region.indexOf('catch (err');
+    const conditionIdx = region.indexOf('msg.followUpContent', catchIdx);
+    const followUpKeyIdx = region.indexOf("'worker.raw_input_failed'", conditionIdx);
+    const commandOnlyKeyIdx = region.indexOf("'worker.raw_input_failed_command_only'", conditionIdx);
+    const notifyIdx = region.indexOf("type: 'user_notify'", catchIdx);
+
+    expect(conditionIdx).toBeGreaterThan(catchIdx);
+    expect(followUpKeyIdx).toBeGreaterThan(conditionIdx);
+    expect(commandOnlyKeyIdx).toBeGreaterThan(followUpKeyIdx);
+    expect(notifyIdx).toBeGreaterThan(commandOnlyKeyIdx);
+  });
 });
 
 describe('worker command-line write mutex', () => {

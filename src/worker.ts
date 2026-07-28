@@ -1691,10 +1691,13 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     if (failedTurnId) {
       emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
     }
+    const failureMessageKey = msg.followUpContent
+      ? 'worker.raw_input_failed'
+      : 'worker.raw_input_failed_command_only';
     send({
       type: 'user_notify',
       ...(failedTurnId ? { turnId: failedTurnId } : {}),
-      message: t('worker.raw_input_failed', { cliName: cliName() }),
+      message: t(failureMessageKey, { cliName: cliName() }),
     });
   }
 
