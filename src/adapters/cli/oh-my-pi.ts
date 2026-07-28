@@ -1,13 +1,13 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 
 import { delay } from '../../utils/timing.js';
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
 const OMP_INPUT_THROTTLE_MS = 20;
-const OMP_CLEAR_COOLDOWN_MS = 550;
 const BRACKETED_PASTE_START = '\x1b[200~';
 const BRACKETED_PASTE_END = '\x1b[201~';
 
@@ -101,7 +101,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       lastClearAttemptAt,
       pty.lastInjectedCancelAt ?? 0,
     );
-    const waitMs = OMP_CLEAR_COOLDOWN_MS - (Date.now() - mostRecentCancelAt);
+    const waitMs = TERMINAL_CANCEL_COOLDOWN_MS - (Date.now() - mostRecentCancelAt);
     if (waitMs > 0) await delay(waitMs);
     lastClearAttemptAt = Date.now();
     try {

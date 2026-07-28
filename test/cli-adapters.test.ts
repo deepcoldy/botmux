@@ -23,6 +23,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -934,12 +935,15 @@ describe('oh-my-pi buildArgs', () => {
       } as PtyHandle & { readonly lastInjectedCancelAt: number };
 
       const write = isolatedAdapter.writeInput(pty, 'ambiguous paste');
-      await vi.advanceTimersByTimeAsync(549);
+      await vi.advanceTimersByTimeAsync(TERMINAL_CANCEL_COOLDOWN_MS - 1);
       expect(events).toEqual([]);
 
       await vi.advanceTimersByTimeAsync(1);
       await expect(write).resolves.toEqual({ submitted: false });
-      expect(events).toEqual([{ key: 'C-c', at: backendCancelAt + 550 }]);
+      expect(events).toEqual([{
+        key: 'C-c',
+        at: backendCancelAt + TERMINAL_CANCEL_COOLDOWN_MS,
+      }]);
     } finally {
       vi.useRealTimers();
     }

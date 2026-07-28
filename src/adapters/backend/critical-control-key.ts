@@ -1,3 +1,12 @@
+/**
+ * Minimum spacing between botmux-generated Ctrl+C writes.
+ *
+ * Oh My Pi treats two Ctrl+C events within 500 ms as an exit gesture. Keep a
+ * small margin so backend recovery and adapter cleanup cannot accidentally
+ * terminate the CLI when consecutive transport failures happen quickly.
+ */
+export const TERMINAL_CANCEL_COOLDOWN_MS = 550;
+
 export function isCriticalInterruptKey(key: string): boolean {
   return key === 'ctrlc' || key === 'esc';
 }

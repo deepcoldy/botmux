@@ -29,6 +29,7 @@ import {
   resolveUserShell,
   SHELL_WRAPPER_SCRIPT,
 } from './tmux-backend.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
 import { logger } from '../../utils/logger.js';
 
 const EARLY_BUFFER_MAX = 1024 * 1024;
@@ -65,7 +66,6 @@ const ZMX_SEND_CHUNK_BYTES = 1024;
 // one-shot payloads well below that ceiling before writing any prefix; adapters
 // that intentionally stream larger input already split and throttle their calls.
 const ZMX_SEND_MAX_BYTES = 64 * 1024;
-const ZMX_AMBIGUOUS_CANCEL_DEDUPE_MS = 550;
 const BRACKETED_PASTE_START_BYTES = Buffer.from('\x1b[200~');
 const BRACKETED_PASTE_END = '\x1b[201~';
 const BRACKETED_PASTE_END_BYTES = Buffer.from(BRACKETED_PASTE_END);
@@ -264,8 +264,8 @@ export class ZmxBackend implements SessionBackend {
   private launchPid: number | null = null;
   /** Monotonic generation of compatible, transport-ambiguous text writes. */
   private ambiguousTextFailureSequence = 0;
-  /** Highest ambiguous text generation already covered by logical recovery. */
-  private handledAmbiguousTextFailureSequence = 0;
+  /** Highest ambiguous text generation covered by any Ctrl+C attempt. */
+  private cancelledAmbiguousTextFailureSequence = 0;
   /** Conservative timestamp: the Ctrl+C send may have landed even on timeout. */
   private lastInjectedCancelAtMs = 0;
 
@@ -522,24 +522,32 @@ export class ZmxBackend implements SessionBackend {
     const failedThrough = this.ambiguousTextFailureSequence;
     if (
       failedThrough <= fence
-      || failedThrough <= this.handledAmbiguousTextFailureSequence
-    ) {
-      return;
-    }
-    this.handledAmbiguousTextFailureSequence = failedThrough;
-
-    // Frame-level paste recovery or an adapter-level clear may already have
-    // injected Ctrl+C. With no transport ACK, even a timed-out attempt must be
-    // treated as possibly delivered so OMP's double-Ctrl+C exit gesture is not
-    // triggered by an immediate duplicate.
-    const sinceLastCancel = Date.now() - this.lastInjectedCancelAtMs;
-    if (
-      this.lastInjectedCancelAtMs > 0
-      && sinceLastCancel < ZMX_AMBIGUOUS_CANCEL_DEDUPE_MS
+      || failedThrough <= this.cancelledAmbiguousTextFailureSequence
     ) {
       return;
     }
     this.abortPartialSend(false);
+  }
+
+  /**
+   * Space terminal writes themselves so two valid cancellation debts cannot
+   * become OMP's double-Ctrl+C exit gesture.
+   */
+  private waitForInjectedCancelCooldown(): void {
+    if (this.lastInjectedCancelAtMs > 0) {
+      const elapsed = Math.max(0, Date.now() - this.lastInjectedCancelAtMs);
+      const waitMs = TERMINAL_CANCEL_COOLDOWN_MS - elapsed;
+      if (waitMs > 0) sleepSync(waitMs);
+    }
+  }
+
+  /** Record which ambiguous generation the imminent Ctrl+C can clean. */
+  private noteInjectedCancelAttempt(): void {
+    this.lastInjectedCancelAtMs = Date.now();
+    this.cancelledAmbiguousTextFailureSequence = Math.max(
+      this.cancelledAmbiguousTextFailureSequence,
+      this.ambiguousTextFailureSequence,
+    );
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
@@ -1424,7 +1432,16 @@ export class ZmxBackend implements SessionBackend {
         || explicitPasteOpenAtBoundary?.[chunkIndex + 1] === true;
       try {
         if (intent === 'control' && chunk.includes(0x03)) {
-          this.lastInjectedCancelAtMs = Date.now();
+          this.waitForInjectedCancelCooldown();
+          const postCooldownIdentity = this.verifyBackingIdentity('control-key cooldown');
+          if (postCooldownIdentity.state !== 'compatible') {
+            logger.warn(
+              `[zmx:${this.sessionName}] skipped Ctrl+C after cooldown: ` +
+              `backing identity is ${postCooldownIdentity.state}`,
+            );
+            return false;
+          }
+          this.noteInjectedCancelAttempt();
         }
         const stdout = execFileSync('zmx', ['send', this.sessionName], {
           input,
@@ -1491,9 +1508,18 @@ export class ZmxBackend implements SessionBackend {
     // so a later retry cannot append to/trivially submit truncated input.
     const recovery = closeOpenPaste ? `${BRACKETED_PASTE_END}\x03` : '\x03';
     try {
+      this.waitForInjectedCancelCooldown();
+      const postCooldownIdentity = this.verifyBackingIdentity('partial-send recovery cooldown');
+      if (postCooldownIdentity.state !== 'compatible') {
+        logger.warn(
+          `[zmx:${this.sessionName}] skipped partial-send recovery after cooldown: ` +
+          `backing identity is ${postCooldownIdentity.state}`,
+        );
+        return;
+      }
       // A timeout after this point is ambiguous: the Ctrl+C may already have
       // reached the TUI, so downstream recovery must respect its cooldown.
-      this.lastInjectedCancelAtMs = Date.now();
+      this.noteInjectedCancelAttempt();
       const stdout = execFileSync('zmx', ['send', this.sessionName], {
         input: Buffer.concat([Buffer.from(recovery), Buffer.from('\n')]),
         encoding: 'utf8',

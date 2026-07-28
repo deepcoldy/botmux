@@ -90,6 +90,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 
 const SESSION = 'bmx-test0001';
 const SESSION_ID = 'test0001-1111-2222-3333-444444444444';
@@ -106,6 +107,7 @@ interface FakeZmxState {
   history: string;
   historyStderr: string;
   sendInputs: Buffer[];
+  sendTimes: number[];
   failSendAt: number | null;
   throwOnFailedSend: boolean;
   replaceOnFailedSend: boolean;
@@ -187,6 +189,7 @@ describe('ZmxBackend history-authoritative transport', () => {
       history: '',
       historyStderr: '',
       sendInputs: [],
+      sendTimes: [],
       failSendAt: null,
       throwOnFailedSend: false,
       replaceOnFailedSend: false,
@@ -227,6 +230,7 @@ describe('ZmxBackend history-authoritative transport', () => {
       }
       if (command === 'send') {
         state.sendInputs.push(Buffer.from(options?.input ?? ''));
+        state.sendTimes.push(Date.now());
         if (state.failSendAt === state.sendInputs.length) {
           if (state.replaceOnFailedSend) {
             state.sessionId = 'replacement-session-id';
@@ -530,6 +534,83 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs).toHaveLength(4);
   });
 
+  it('does not let a previous failure cancellation suppress a new ambiguous generation', () => {
+    const backend = spawnBackend();
+    const firstFence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('first ambiguous prompt')).toBe(false);
+    backend.cancelAmbiguousSubmission(firstFence);
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'first ambiguous prompt\n',
+      '\x03\n',
+    ]);
+
+    const secondFence = backend.captureAmbiguousSubmissionFence();
+    state.failSendAt = 4;
+    expect(backend.sendText('second confirmed prefix')).toBe(true);
+    expect(backend.sendText('second ambiguous suffix')).toBe(false);
+    backend.cancelAmbiguousSubmission(secondFence);
+
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'first ambiguous prompt\n',
+      '\x03\n',
+      'second confirmed prefix\n',
+      'second ambiguous suffix\n',
+      '\x03\n',
+    ]);
+    expect(state.sendTimes[4]! - state.sendTimes[1]!).toBeGreaterThanOrEqual(
+      TERMINAL_CANCEL_COOLDOWN_MS,
+    );
+  });
+
+  it('treats an adapter Ctrl+C after a text failure as recovery for that generation', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('ambiguous prompt')).toBe(false);
+    state.failSendAt = null;
+    expect(backend.sendSpecialKeys('C-c')).toBe(true);
+    backend.cancelAmbiguousSubmission(fence);
+
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'ambiguous prompt\n',
+      '\x03\n',
+    ]);
+  });
+
+  it('does not pay a pending cancellation debt into a replacement session', () => {
+    const backend = spawnBackend();
+    const firstFence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('first ambiguous prompt')).toBe(false);
+    backend.cancelAmbiguousSubmission(firstFence);
+
+    const secondFence = backend.captureAmbiguousSubmissionFence();
+    state.failSendAt = 4;
+    expect(backend.sendText('second confirmed prefix')).toBe(true);
+    expect(backend.sendText('second ambiguous suffix')).toBe(false);
+
+    const wait = vi.spyOn(Atomics, 'wait').mockImplementation(() => {
+      state.sessionId = 'replacement-session-id';
+      return 'timed-out';
+    });
+    try {
+      backend.cancelAmbiguousSubmission(secondFence);
+    } finally {
+      wait.mockRestore();
+    }
+
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'first ambiguous prompt\n',
+      '\x03\n',
+      'second confirmed prefix\n',
+      'second ambiguous suffix\n',
+    ]);
+  });
+
   it('does not cancel a failed control key as though it were prompt text', () => {
     const backend = spawnBackend();
     const fence = backend.captureAmbiguousSubmissionFence();
@@ -610,6 +691,23 @@ describe('ZmxBackend history-authoritative transport', () => {
 
     backend.cancelAmbiguousSubmission(fence);
     expect(state.sendInputs).toHaveLength(2);
+  });
+
+  it('spaces frame recovery cancels across consecutive ambiguous generations', () => {
+    const backend = spawnBackend();
+    const ompStylePaste = `\x1b[200~${'中'.repeat(512)}\x1b[201~`;
+
+    state.failSendAt = 1;
+    expect(backend.sendText(ompStylePaste)).toBe(false);
+    state.failSendAt = 3;
+    expect(backend.sendText(ompStylePaste)).toBe(false);
+
+    expect(state.sendInputs).toHaveLength(4);
+    expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+    expect(state.sendInputs[3]!.toString()).toBe('\x1b[201~\x03\n');
+    expect(state.sendTimes[3]! - state.sendTimes[1]!).toBeGreaterThanOrEqual(
+      TERMINAL_CANCEL_COOLDOWN_MS,
+    );
   });
 
   it('detects an opening paste marker split across an ambiguous chunk boundary', () => {
