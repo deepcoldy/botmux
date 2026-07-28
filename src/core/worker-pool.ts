@@ -106,6 +106,7 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import { deferSpawnDuringFreeze, forgetDeferredSpawn, shouldAnnounceSpawnFreeze } from './spawn-freeze.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
   extractBotmuxLarkNativeSessionTitlePrompt,
@@ -1640,6 +1641,10 @@ export async function closeSession(
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  // A spawn parked by an ops freeze must not outlive its session. The replay
+  // callback re-checks the registry anyway, so this is about not holding the
+  // closure (and the poll timer) alive for a session that is already gone.
+  forgetDeferredSpawn(sessionId);
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -2096,6 +2101,49 @@ export function forkWorker(
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    return;
+  }
+  // An ops maintenance window (credential refresh, `claude` upgrade, workspace
+  // rebuild) can declare that no new CLI may start on this host. Same defer +
+  // replay shape as the device-isolation lease above, but driven by an on-disk
+  // declaration so a daemon that BOOTS during the window freezes itself too.
+  // Deliberately only blocks new spawns: tearing down live CLIs is
+  // `botmux suspend`'s job, and conflating the two would make every freeze a
+  // fleet-wide cold restart.
+  const opsFreeze = deferSpawnDuringFreeze({
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    replay: () => {
+      // The session may have been closed while parked; never revive it.
+      if (findActiveBySessionId(ds.session.sessionId) === ds) {
+        forkWorker(ds, promptInput, resumeOrTurnId);
+      }
+    },
+  });
+  if (opsFreeze) {
+    const remainingSec = Math.max(1, Math.ceil((opsFreeze.effectiveUntil - Date.now()) / 1000));
+    logger.info(
+      `[${tag(ds)}] worker spawn deferred by spawn-freeze (reason=${opsFreeze.reason}, `
+      + `~${remainingSec}s left)`,
+    );
+    const chatKey = ds.session.chatId ?? ds.session.sessionId;
+    if (shouldAnnounceSpawnFreeze(opsFreeze, chatKey)) {
+      const gateTurnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null ? resumeOrTurnId.turnId : undefined);
+      try {
+        void requireCallbacks().sessionReply(
+          sessionAnchorId(ds),
+          `🔧 维护中（${opsFreeze.reason}），暂不启动新的 CLI 会话；约 ${remainingSec} 秒后自动继续处理这条消息。`,
+          'text',
+          ds.larkAppId,
+          fallbackTurnId(ds, gateTurnId),
+        ).catch(err => logger.warn(`[${tag(ds)}] spawn-freeze notice failed: ${err?.message ?? err}`));
+      } catch {
+        // No callbacks wired (unit tests / early boot) — the delay is silent,
+        // which is strictly better than failing the gate itself.
+      }
+    }
     return;
   }
   const cb = requireCallbacks();

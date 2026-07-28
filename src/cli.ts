@@ -32,6 +32,7 @@ import { randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import { clearSpawnFreeze, readActiveSpawnFreeze, spawnFreezePath, writeSpawnFreeze, SPAWN_FREEZE_HARD_CAP_MS } from './core/spawn-freeze.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { acceptedDispatchBotAppIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
@@ -4082,6 +4083,134 @@ async function cmdSuspend(): Promise<void> {
   if (failed > 0) process.exitCode = 1;
 }
 
+/** `--for 90s` / `5m` / 裸数字（秒）。返回毫秒；非法返回 null。 */
+function parseFreezeDuration(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const m = /^(\d+)(s|m)?$/.exec(raw.trim());
+  if (!m) return null;
+  const value = Number(m[1]);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  return m[2] === 'm' ? value * 60_000 : value * 1_000;
+}
+
+function formatFreezeClock(epochMs: number): string {
+  const d = new Date(epochMs);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * `botmux freeze` —— 声明「这台机器暂时不要起新的 CLI 会话」。
+ *
+ * 用途：任何会让「新起的 CLI」踩到半成品状态的维护窗口——刷 Claude 凭证（伪过期
+ * 期间冷启动的 CLI 会自己去刷、轮换掉 refresh token，把整队投毒）、升级 claude
+ * 二进制、重建某个 bot 的工作区。冻结期间 daemon 把该会话的这次 spawn 记下来，
+ * 解冻后自动重放——用户的消息只是晚几秒被处理，不会丢。
+ *
+ * 只拦「新起」，不动已在跑的 CLI：那是 `botmux suspend` 的职责。典型顺序是
+ * freeze → suspend → 干活 → 验证 → release。
+ *
+ * 三重兜底保证一次维护不会把机器冻死：声明的 deadline、写文件进程（--pid）退出、
+ * 以及 daemon 侧按文件 mtime 算的 10 分钟硬上限。daemon 读不到/读坏一律放行。
+ */
+async function cmdFreeze(): Promise<void> {
+  const argv = process.argv.slice(3);
+  const flagValue = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 ? argv[i + 1] : undefined;
+  };
+  const release = argv.includes('--release');
+  const status = argv.includes('--status');
+
+  if (release && status) {
+    console.error('❌ --release 与 --status 不能同时用');
+    process.exit(1);
+  }
+
+  if (status) {
+    const freeze = readActiveSpawnFreeze();
+    if (!freeze) {
+      console.log('当前无冻结：新 CLI 会话可正常启动。');
+      return;
+    }
+    const remaining = Math.max(0, Math.ceil((freeze.effectiveUntil - Date.now()) / 1000));
+    console.log('当前处于冻结中（新 CLI 会话不会启动）：');
+    console.log(`  原因      ${freeze.reason}`);
+    console.log(`  生效至    ${formatFreezeClock(freeze.effectiveUntil)}（剩 ${remaining}s）`);
+    if (freeze.effectiveUntil < freeze.deadline) {
+      console.log(`  ⚠️ 已被 10 分钟硬上限截断（声明的 deadline 是 ${formatFreezeClock(freeze.deadline)}）`);
+    }
+    console.log(`  范围      ${freeze.larkAppIds ? freeze.larkAppIds.join(', ') : '全部 bot'}`);
+    console.log(`  声明进程  ${freeze.declaredByPid ?? '（未记录 pid，仅靠 deadline 兜底）'}`);
+    console.log(`  维护提示  ${freeze.notify ? '开（冻结期每个话题回一条）' : '关（静默延迟）'}`);
+    console.log(`  文件      ${spawnFreezePath()}`);
+    return;
+  }
+
+  if (release) {
+    const removed = clearSpawnFreeze();
+    console.log(removed
+      ? '✓ 已解冻：被暂存的 spawn 会在各 daemon 的下一次轮询（≤1s）自动重放。'
+      : '· 本就没有冻结声明（目标态已达成）。');
+    return;
+  }
+
+  const reason = flagValue('--reason');
+  if (!reason) {
+    console.error('用法: botmux freeze --reason <说明> [--for 120s] [--pid <pid>] [--notify] [--bot <appId>]...');
+    console.error('      botmux freeze --status | --release');
+    console.error('  维护期间禁止本机起新的 CLI 会话；被拦下的 spawn 解冻后自动重放（消息不丢）');
+    console.error('  --for     默认 120s，支持 90s / 5m / 裸数字(秒)；上限 10m（daemon 侧硬截断）');
+    console.error('  --pid     声明进程 pid（脚本里传 $$）：进程一死立即解冻，崩了也能自愈');
+    console.error('  --notify  冻结期收到消息时回一条「维护中」；建议 deadline > 30s 才开');
+    console.error('  --bot     只冻某个 bot（可重复）；不给 = 全队');
+    process.exit(1);
+  }
+
+  const durationRaw = flagValue('--for');
+  if (durationRaw !== undefined && parseFreezeDuration(durationRaw) === null) {
+    console.error(`❌ --for 无法解析: ${durationRaw}（示例：90s / 5m / 120）`);
+    process.exit(1);
+  }
+  let durationMs = parseFreezeDuration(durationRaw) ?? 120_000;
+  if (durationMs > SPAWN_FREEZE_HARD_CAP_MS) {
+    console.log(`⚠️ --for 超过硬上限，按 ${SPAWN_FREEZE_HARD_CAP_MS / 60_000} 分钟处理。`);
+    durationMs = SPAWN_FREEZE_HARD_CAP_MS;
+  }
+
+  const pidRaw = flagValue('--pid');
+  let pid: number | undefined;
+  if (pidRaw !== undefined) {
+    const parsed = Number(pidRaw);
+    if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+      console.error(`❌ --pid 非法: ${pidRaw}`);
+      process.exit(1);
+    }
+    pid = parsed;
+  }
+
+  // --bot 可重复
+  const larkAppIds: string[] = [];
+  argv.forEach((arg, i) => {
+    if (arg === '--bot' && argv[i + 1] && !argv[i + 1].startsWith('--')) larkAppIds.push(argv[i + 1]);
+  });
+
+  const deadline = Date.now() + durationMs;
+  const path = writeSpawnFreeze({
+    reason,
+    deadline,
+    ...(pid !== undefined ? { pid } : {}),
+    ...(argv.includes('--notify') ? { notify: true } : {}),
+    ...(larkAppIds.length ? { scope: { larkAppIds } } : {}),
+  });
+  console.log(`✓ 已冻结（${reason}）：${larkAppIds.length ? larkAppIds.join(', ') : '全部 bot'} 在 ${formatFreezeClock(deadline)} 前不会起新 CLI。`);
+  console.log(`  声明文件 ${path}`);
+  if (pid === undefined) {
+    console.log('  ⚠️ 未传 --pid：脚本中途被杀时只能等 deadline / 10 分钟硬上限自动解冻。建议加 --pid $$。');
+  }
+  console.log('  记得在结束时（含 trap）执行 botmux freeze --release；已在跑的 CLI 不受影响，需要的话另跑 botmux suspend。');
+}
+
 /** 会话级 CLI IPC（slash/cd/close）的 POST：与 postAsk 同款双路径——能读 host secret
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
@@ -4806,6 +4935,13 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --bot <appId>   挂起该 bot 的全部活跃会话
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
        --dry-run       只列出目标，不执行
+  freeze --reason <说明>  维护窗口内禁止本机起新 CLI 会话（被拦下的 spawn 解冻后自动重放，消息不丢）
+       --for 120s      冻结时长（默认 120s，上限 10m）
+       --pid <pid>     声明进程（脚本传 $$）：进程一死立即解冻
+       --notify        冻结期回一条「维护中」（deadline > 30s 建议开）
+       --bot <appId>   只冻某个 bot（可重复）；不给 = 全队
+       --status        查看当前是否冻结、为什么、还剩多久
+       --release       解冻（幂等，可放脚本 trap 里）
   slash "<斜杠命令>"   会话空闲后向本会话 CLI 注入一条原生斜杠命令（需 bots.json 配 tuiSlashAllow；/cd 恒被拒）
   role switch <目录>  （会话内）切换本话题到角色库内的角色目录——角色切换用；
                    目录必须位于 ~/botmux-roles 之下
@@ -9922,6 +10058,7 @@ switch (command) {
   case 'rm':      await cmdDelete(); break;
   case 'resume':  await cmdResume(); break;
   case 'suspend': await cmdSuspend(); break;
+  case 'freeze': await cmdFreeze(); break;
   case 'slash':   await cmdSlash(); break;
   case 'cd': {
     // Tombstone for the removed `botmux cd`（改名为 `botmux role switch`）。**必须
