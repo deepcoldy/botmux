@@ -161,6 +161,56 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
   });
 
+  it('limits inconclusive-probe startup rejection to ZMX in both persistent gates', () => {
+    const readIsolationStart = workerSource.indexOf(
+      'if (appliedIsolationCapabilities.length > 0 && persistentSessionName',
+    );
+    const readIsolationEnd = workerSource.indexOf('let willReattachPersistent', readIsolationStart);
+    const mcpStart = workerSource.indexOf(
+      'if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length',
+    );
+    const mcpEnd = workerSource.indexOf('// The plugin set is stable only', mcpStart);
+    const gates = [
+      workerSource.slice(readIsolationStart, readIsolationEnd),
+      workerSource.slice(mcpStart, mcpEnd),
+    ];
+
+    expect(readIsolationStart).toBeGreaterThan(-1);
+    expect(readIsolationEnd).toBeGreaterThan(readIsolationStart);
+    expect(mcpStart).toBeGreaterThan(-1);
+    expect(mcpEnd).toBeGreaterThan(mcpStart);
+    for (const gate of gates) {
+      expect(gate).toContain(
+        "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
+      );
+      expect(gate).not.toContain("if (paneProbe === 'unknown')");
+    }
+  });
+
+  it('verifies read-isolation teardown against the exact captured backend target', () => {
+    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const end = workerSource.indexOf('let willReattachPersistent', start);
+    const gate = workerSource.slice(start, end);
+    const capture = gate.indexOf(
+      'const stalePersistentTarget = selectedBackend.persistentBackendTarget;',
+    );
+    const kill = gate.indexOf(
+      'killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId)',
+    );
+    const postKillProbe = gate.indexOf(
+      'probePersistentBackendTarget(stalePersistentTarget)',
+      kill,
+    );
+    const reselect = gate.indexOf('selectedBackend = selectBackend();');
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(capture).toBeGreaterThanOrEqual(0);
+    expect(kill).toBeGreaterThan(capture);
+    expect(postKillProbe).toBeGreaterThan(kill);
+    expect(reselect).toBeGreaterThan(postKillProbe);
+  });
+
   it('refreshes the frozen ZMX probe before read-isolation re-selects the backend', () => {
     const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
     const end = workerSource.indexOf('let willReattachPersistent', start);

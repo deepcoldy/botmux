@@ -7313,8 +7313,9 @@ async function spawnCli(
     const zmxOwnedProbe = effectiveBackendType === 'zmx'
       ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)
       : undefined;
-    // An unverifiable pane must never be treated as absent: falling through to
-    // "no pane" would cold-spawn a second CLI beside a live unisolated one.
+    // ZMX ownership is label/PID-sensitive, so an inconclusive ZMX probe must
+    // fail closed. Other persistent backends retain the upstream semantics:
+    // their target probe returning unknown is not proof that a pane exists.
     const paneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
     if (
@@ -7327,7 +7328,7 @@ async function spawnCli(
         'ZMX session appeared after the frozen launch probe',
       );
     }
-    if (paneProbe === 'unknown') {
+    if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
       throw new Error(
         `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,
@@ -7353,6 +7354,7 @@ async function spawnCli(
         // `string | undefined`, but the backing name we are tearing down is
         // this one and does not change.
         const staleSessionName = persistentSessionName;
+        const stalePersistentTarget = selectedBackend.persistentBackendTarget;
         try {
           // ZMX keeps its own call here rather than going through the target
           // helper: only this path holds the frozen PID, which makes the
@@ -7364,8 +7366,7 @@ async function spawnCli(
               resolvedZmxSessionPid,
             );
           } else {
-            const persistentTarget = selectedBackend.persistentBackendTarget;
-            if (persistentTarget) killPersistentBackendTarget(persistentTarget, cfg.sessionId);
+            if (stalePersistentTarget) killPersistentBackendTarget(stalePersistentTarget, cfg.sessionId);
             else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
           }
         } catch (e) {
@@ -7373,10 +7374,12 @@ async function spawnCli(
         }
         const postKillProbe = effectiveBackendType === 'zmx'
           ? probeOwnedZmxSession(staleSessionName, cfg.sessionId).probe
-          : probePersistentSession(
-              effectiveBackendType as PersistentBackendType,
-              staleSessionName,
-            );
+          : (stalePersistentTarget
+            ? probePersistentBackendTarget(stalePersistentTarget)
+            : probePersistentSession(
+                effectiveBackendType as PersistentBackendType,
+                staleSessionName,
+              ));
         if (postKillProbe !== 'missing') {
           throw new Error(
             `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
@@ -7403,8 +7406,8 @@ async function spawnCli(
   let willReattachPersistent = selectedBackend.isReattach === true;
   if (cliAdapter.mcpGateway && mcpRuntimeManifest?.entries.length && persistentSessionName && effectiveBackendType !== 'pty') {
     const persistentTarget = selectedBackend.persistentBackendTarget;
-    // Fail closed on an inconclusive probe: treating 'unknown' as "no pane"
-    // would cold-spawn a second CLI next to a live one holding MCP state.
+    // ZMX ownership is label/PID-sensitive, so only its inconclusive probe
+    // fails closed. Other backends keep the pre-ZMX target-probe semantics.
     const paneProbe = effectiveBackendType === 'zmx'
       ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid).probe
       : (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
@@ -7418,7 +7421,7 @@ async function spawnCli(
         'ZMX session appeared after the frozen launch probe',
       );
     }
-    if (paneProbe === 'unknown') {
+    if (effectiveBackendType === 'zmx' && paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,
