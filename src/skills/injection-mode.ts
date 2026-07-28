@@ -140,6 +140,14 @@ function frontmatterDescription(content: string): string {
   return line ? line.slice('description:'.length).trim() : '';
 }
 
+/** Escape prose rendered as text inside an XML-like prompt block. */
+function escapeXmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /**
  * The built-in skills the model should be told about in `prompt` mode. Mirrors
  * exactly what `global` mode would install: the unconditional BUILTIN_SKILLS,
@@ -182,11 +190,11 @@ export function buildBuiltinSkillCatalogBlock(entries: BuiltinSkillEntry[], loca
   const intro = en
     ? '<botmux_routing> covers basic communication only. These supplementary botmux skills are available in this session. Match the task against a description, then run `botmux skill show <name>` to read that skill\'s full instructions before acting — do not guess the commands.'
     : '<botmux_routing> 只覆盖基础通信用法。当前 botmux 会话还有下面这些可按需读取的内置技能。先按描述判断该用哪个，再用 `botmux skill show <name>` 读取完整说明后再执行——不要凭空猜命令。';
-  const lines = entries.map((e) => `- ${e.name}: ${promptCatalogDescription(e, locale)}`);
+  const lines = entries.map((e) => escapeXmlText(`- ${e.name}: ${promptCatalogDescription(e, locale)}`));
   // Distinct tag from the user-registered skill catalog (`<botmux_skills
   // mode=...>`, injected only in the worker via prepareSessionSkillPrompt) so
   // the two never collide and can co-exist in one prompt.
-  return ['<botmux_builtin_skills>', intro, ...lines, '</botmux_builtin_skills>'].join('\n');
+  return ['<botmux_builtin_skills>', escapeXmlText(intro), ...lines, '</botmux_builtin_skills>'].join('\n');
 }
 
 /** `off` mode nudge: no catalog, just point the model at the CLI's own help.
@@ -196,7 +204,7 @@ export function builtinSkillHelpPointer(locale?: Locale): string {
   const inner = locale === 'en'
     ? 'Beyond the commands in <botmux_routing>, more botmux capabilities (ask / schedule / workflow / …) are shell subcommands — run `botmux --help`, and `botmux <cmd> --help` for a specific one, to discover them.'
     : '除了 <botmux_routing> 里的命令，botmux 还有更多能力（ask / schedule / workflow 等），都是 shell 子命令——用 `botmux --help` 查全部，`botmux <子命令> --help` 查单个用法。';
-  return `<botmux_builtin_skills>\n${inner}\n</botmux_builtin_skills>`;
+  return `<botmux_builtin_skills>\n${escapeXmlText(inner)}\n</botmux_builtin_skills>`;
 }
 
 /**
