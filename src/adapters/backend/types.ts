@@ -54,6 +54,17 @@ export interface SpawnOpts {
 export interface SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   write(data: string): void;
+  /**
+   * Snapshot the backend's text-write failure generation before one logical
+   * adapter submission. Backends without ambiguous transport writes omit it.
+   */
+  captureAmbiguousSubmissionFence?(): number;
+  /**
+   * Best-effort cleanup for a text write that became ambiguous after `fence`.
+   * The backend owns deduplication against any frame-level recovery it already
+   * injected. Control/navigation-key failures are deliberately excluded.
+   */
+  cancelAmbiguousSubmission?(fence: number): void;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): void;
   /**

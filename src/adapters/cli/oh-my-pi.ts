@@ -95,8 +95,13 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
 
   const clearComposer = async (pty: PtyHandle): Promise<boolean> => {
     // OMP treats a second Ctrl+C within 500 ms as exit. Keep recovery clears
-    // outside that window even when consecutive terminal writes fail quickly.
-    const waitMs = OMP_CLEAR_COOLDOWN_MS - (Date.now() - lastClearAttemptAt);
+    // outside that window even when the backend already injected the first one
+    // while recovering an ambiguous ZMX frame.
+    const mostRecentCancelAt = Math.max(
+      lastClearAttemptAt,
+      pty.lastInjectedCancelAt ?? 0,
+    );
+    const waitMs = OMP_CLEAR_COOLDOWN_MS - (Date.now() - mostRecentCancelAt);
     if (waitMs > 0) await delay(waitMs);
     lastClearAttemptAt = Date.now();
     try {

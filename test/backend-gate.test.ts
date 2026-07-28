@@ -156,7 +156,7 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain('probeOwnedZmxSession(');
     expect(gate).toContain('probePersistentBackendTarget(');
     expect(gate).toContain("paneProbe === 'unknown'");
-    expect(gate).toContain("postKillProbe !== 'missing'");
+    expect(gate).toContain('shouldRejectPersistentPostKillProbe(');
     expect(gate).toContain("effectiveBackendType === 'zmx'");
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
   });
@@ -184,6 +184,8 @@ describe('persistent backend cold-restart ordering', () => {
         "if (effectiveBackendType === 'zmx' && paneProbe === 'unknown')",
       );
       expect(gate).not.toContain("if (paneProbe === 'unknown')");
+      expect(gate).toContain('shouldRejectPersistentPostKillProbe(');
+      expect(gate).not.toContain("postKillProbe !== 'missing'");
     }
   });
 

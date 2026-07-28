@@ -22,6 +22,21 @@ import type { Session } from '../types.js';
 
 export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
+/**
+ * Decide whether a post-kill probe still blocks a cold replacement.
+ *
+ * ZMX owns sessions by labels + frozen PID, so an inconclusive confirmation
+ * must remain fail-closed. The older mux backends only have best-effort
+ * process/session probes: after a successful kill, `unknown` is not proof that
+ * the target survived (notably zellij reports zero live sessions with exit 1).
+ */
+export function shouldRejectPersistentPostKillProbe(
+  backendType: PersistentBackendType,
+  probe: SessionProbe,
+): boolean {
+  return probe === 'exists' || (backendType === 'zmx' && probe === 'unknown');
+}
+
 export function isSuspendableBackendType(
   backendType: BackendType | undefined,
 ): backendType is PersistentBackendType {

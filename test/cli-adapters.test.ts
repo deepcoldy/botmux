@@ -916,6 +916,35 @@ describe('oh-my-pi buildArgs', () => {
     expect(events).toEqual(['text:524', 'text:524', 'keys:C-c']);
   });
 
+  it('keeps its recovery Ctrl+C outside the backend-injected cancel window', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T00:00:00.000Z'));
+    try {
+      const isolatedAdapter = createOhMyPiAdapter('/usr/bin/omp');
+      const events: Array<{ key: string; at: number }> = [];
+      const backendCancelAt = Date.now();
+      const pty = {
+        write() {},
+        sendText() { return false; },
+        sendSpecialKeys(...keys: string[]) {
+          events.push({ key: keys.join(','), at: Date.now() });
+          return true;
+        },
+        lastInjectedCancelAt: backendCancelAt,
+      } as PtyHandle & { readonly lastInjectedCancelAt: number };
+
+      const write = isolatedAdapter.writeInput(pty, 'ambiguous paste');
+      await vi.advanceTimersByTimeAsync(549);
+      expect(events).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(write).resolves.toEqual({ submitted: false });
+      expect(events).toEqual([{ key: 'C-c', at: backendCancelAt + 550 }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('clears the OMP composer when Enter retries are all dropped', async () => {
     const events: string[] = [];
     const pty = {

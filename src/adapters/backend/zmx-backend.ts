@@ -65,32 +65,58 @@ const ZMX_SEND_CHUNK_BYTES = 1024;
 // one-shot payloads well below that ceiling before writing any prefix; adapters
 // that intentionally stream larger input already split and throttle their calls.
 const ZMX_SEND_MAX_BYTES = 64 * 1024;
+const ZMX_AMBIGUOUS_CANCEL_DEDUPE_MS = 550;
 const BRACKETED_PASTE_START_BYTES = Buffer.from('\x1b[200~');
 const BRACKETED_PASTE_END = '\x1b[201~';
+const BRACKETED_PASTE_END_BYTES = Buffer.from(BRACKETED_PASTE_END);
 const ZMX_TRANSPORT_LABEL = 'botmux.transport';
 const ZMX_TRANSPORT = 'tail-send-v1';
 const ZMX_SESSION_LABEL = 'botmux.session';
 const ZMX_LAUNCH_PID_LABEL = 'botmux.launch_pid';
 
 type BackendState = 'idle' | 'observing' | 'recovering' | 'stopped' | 'exited';
+type ZmxSendIntent = 'text' | 'control';
 
-function hasUnclosedBracketedPaste(bytes: Buffer): boolean {
-  const endBytes = Buffer.from(BRACKETED_PASTE_END);
+function bytesMatchAt(bytes: Buffer, marker: Buffer, cursor: number, boundary: number): boolean {
+  if (cursor + marker.length > boundary) return false;
+  for (let i = 0; i < marker.length; i += 1) {
+    if (bytes[cursor + i] !== marker[i]) return false;
+  }
+  return true;
+}
+
+function bracketedPasteOpenStatesAtChunkBoundaries(bytes: Buffer): boolean[] {
+  const states = [false];
   let openPastes = 0;
   let cursor = 0;
-  while (cursor < bytes.length) {
-    const nextOpen = bytes.indexOf(BRACKETED_PASTE_START_BYTES, cursor);
-    const nextClose = bytes.indexOf(endBytes, cursor);
-    if (nextOpen < 0 && nextClose < 0) break;
-    if (nextOpen >= 0 && (nextClose < 0 || nextOpen < nextClose)) {
-      openPastes += 1;
-      cursor = nextOpen + BRACKETED_PASTE_START_BYTES.length;
-      continue;
+  const shortestMarkerLength = Math.min(
+    BRACKETED_PASTE_START_BYTES.length,
+    BRACKETED_PASTE_END_BYTES.length,
+  );
+
+  for (
+    let boundary = Math.min(ZMX_SEND_CHUNK_BYTES, bytes.length);
+    boundary > 0;
+    boundary = Math.min(boundary + ZMX_SEND_CHUNK_BYTES, bytes.length)
+  ) {
+    while (cursor + shortestMarkerLength <= boundary) {
+      if (bytesMatchAt(bytes, BRACKETED_PASTE_START_BYTES, cursor, boundary)) {
+        openPastes += 1;
+        cursor += BRACKETED_PASTE_START_BYTES.length;
+        continue;
+      }
+      if (bytesMatchAt(bytes, BRACKETED_PASTE_END_BYTES, cursor, boundary)) {
+        if (openPastes > 0) openPastes -= 1;
+        cursor += BRACKETED_PASTE_END_BYTES.length;
+        continue;
+      }
+      cursor += 1;
     }
-    if (openPastes > 0) openPastes -= 1;
-    cursor = nextClose + endBytes.length;
+    states.push(openPastes > 0);
+    if (boundary === bytes.length) break;
   }
-  return openPastes > 0;
+
+  return states;
 }
 
 type BackingIdentityProbe =
@@ -236,6 +262,12 @@ export class ZmxBackend implements SessionBackend {
   private backingPid: number | null = null;
   /** Stable direct child of the PTY root; wrapper resolution may refine cliPid. */
   private launchPid: number | null = null;
+  /** Monotonic generation of compatible, transport-ambiguous text writes. */
+  private ambiguousTextFailureSequence = 0;
+  /** Highest ambiguous text generation already covered by logical recovery. */
+  private handledAmbiguousTextFailureSequence = 0;
+  /** Conservative timestamp: the Ctrl+C send may have landed even on timeout. */
+  private lastInjectedCancelAtMs = 0;
 
   claudeJsonlPath?: string;
   cliPid?: number;
@@ -478,6 +510,38 @@ export class ZmxBackend implements SessionBackend {
     return this.reattaching;
   }
 
+  get lastInjectedCancelAt(): number {
+    return this.lastInjectedCancelAtMs;
+  }
+
+  captureAmbiguousSubmissionFence(): number {
+    return this.ambiguousTextFailureSequence;
+  }
+
+  cancelAmbiguousSubmission(fence: number): void {
+    const failedThrough = this.ambiguousTextFailureSequence;
+    if (
+      failedThrough <= fence
+      || failedThrough <= this.handledAmbiguousTextFailureSequence
+    ) {
+      return;
+    }
+    this.handledAmbiguousTextFailureSequence = failedThrough;
+
+    // Frame-level paste recovery or an adapter-level clear may already have
+    // injected Ctrl+C. With no transport ACK, even a timed-out attempt must be
+    // treated as possibly delivered so OMP's double-Ctrl+C exit gesture is not
+    // triggered by an immediate duplicate.
+    const sinceLastCancel = Date.now() - this.lastInjectedCancelAtMs;
+    if (
+      this.lastInjectedCancelAtMs > 0
+      && sinceLastCancel < ZMX_AMBIGUOUS_CANCEL_DEDUPE_MS
+    ) {
+      return;
+    }
+    this.abortPartialSend(false);
+  }
+
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     const frozenOpts: SpawnOpts = {
       ...opts,
@@ -544,15 +608,23 @@ export class ZmxBackend implements SessionBackend {
   }
 
   sendText(text: string): boolean {
-    return this.sendBytes(Buffer.from(text, 'utf8'));
+    return this.sendBytes(Buffer.from(text, 'utf8'), false, 'text');
   }
 
   sendSpecialKeys(...keys: string[]): boolean {
-    return this.sendText(keys.map(tmuxKeyToBytes).join(''));
+    return this.sendBytes(
+      Buffer.from(keys.map(tmuxKeyToBytes).join(''), 'utf8'),
+      false,
+      'control',
+    );
   }
 
   pasteText(text: string): void {
-    if (!this.sendBytes(Buffer.from(`\x1b[200~${text}\x1b[201~`, 'utf8'), true)) {
+    if (!this.sendBytes(
+      Buffer.from(`\x1b[200~${text}\x1b[201~`, 'utf8'),
+      true,
+      'text',
+    )) {
       throw new Error(`ZMX 会话 ${this.sessionName} 粘贴发送失败`);
     }
   }
@@ -1311,7 +1383,11 @@ export class ZmxBackend implements SessionBackend {
     }
   }
 
-  private sendBytes(bytes: Buffer, bracketedPaste = false): boolean {
+  private sendBytes(
+    bytes: Buffer,
+    bracketedPaste = false,
+    intent: ZmxSendIntent = 'text',
+  ): boolean {
     if (bytes.length === 0) return true;
     if (this.exited || this.intentionalExit || !this.lastOpts) return false;
     if (bytes.length > ZMX_SEND_MAX_BYTES) {
@@ -1328,6 +1404,9 @@ export class ZmxBackend implements SessionBackend {
       return false;
     }
 
+    const explicitPasteOpenAtBoundary = bracketedPaste
+      ? null
+      : bracketedPasteOpenStatesAtChunkBoundaries(bytes);
     for (let offset = 0; offset < bytes.length; offset += ZMX_SEND_CHUNK_BYTES) {
       const chunk = bytes.subarray(offset, Math.min(offset + ZMX_SEND_CHUNK_BYTES, bytes.length));
       // ZMX strips exactly one trailing LF from piped stdin. Appending our own
@@ -1339,10 +1418,14 @@ export class ZmxBackend implements SessionBackend {
       // confirmed prefix misses an opening marker in a first ambiguous frame;
       // looking only through the current frame misses an opening marker whose
       // matching close sits in that ambiguous frame.
+      const chunkIndex = offset / ZMX_SEND_CHUNK_BYTES;
       const mayHaveOpenPasteAfterAmbiguousSend = bracketedPaste
-        || hasUnclosedBracketedPaste(bytes.subarray(0, offset))
-        || hasUnclosedBracketedPaste(bytes.subarray(0, offset + chunk.length));
+        || explicitPasteOpenAtBoundary?.[chunkIndex] === true
+        || explicitPasteOpenAtBoundary?.[chunkIndex + 1] === true;
       try {
+        if (intent === 'control' && chunk.includes(0x03)) {
+          this.lastInjectedCancelAtMs = Date.now();
+        }
         const stdout = execFileSync('zmx', ['send', this.sessionName], {
           input,
           encoding: 'utf8',
@@ -1357,6 +1440,9 @@ export class ZmxBackend implements SessionBackend {
           logger.warn(`[zmx:${this.sessionName}] send rejected: ${stdout.trim()}`);
           const probe = this.verifyBackingIdentity('send rejection');
           const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
+          if (probe.state === 'compatible' && intent === 'text') {
+            this.ambiguousTextFailureSequence += 1;
+          }
           if (closeOpenPaste || offset > 0) {
             if (probe.state === 'compatible') {
               this.abortPartialSend(closeOpenPaste);
@@ -1378,6 +1464,9 @@ export class ZmxBackend implements SessionBackend {
         // Never retry an ambiguous send: ZMX has no PTY-level ACK, so retrying
         // can duplicate a prompt that the daemon already queued.
         const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
+        if (probe.state === 'compatible' && intent === 'text') {
+          this.ambiguousTextFailureSequence += 1;
+        }
         if (closeOpenPaste || offset > 0) {
           if (probe.state === 'compatible') {
             this.abortPartialSend(closeOpenPaste);
@@ -1402,6 +1491,9 @@ export class ZmxBackend implements SessionBackend {
     // so a later retry cannot append to/trivially submit truncated input.
     const recovery = closeOpenPaste ? `${BRACKETED_PASTE_END}\x03` : '\x03';
     try {
+      // A timeout after this point is ambiguous: the Ctrl+C may already have
+      // reached the TUI, so downstream recovery must respect its cooldown.
+      this.lastInjectedCancelAtMs = Date.now();
       const stdout = execFileSync('zmx', ['send', this.sessionName], {
         input: Buffer.concat([Buffer.from(recovery), Buffer.from('\n')]),
         encoding: 'utf8',

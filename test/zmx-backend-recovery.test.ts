@@ -512,6 +512,36 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs[0]!.subarray(0, -1).toString()).toBe('\r');
   });
 
+  it('cancels a logical prompt whose later independent sendText call fails ambiguously', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    expect(backend.sendText('first confirmed chunk')).toBe(true);
+    expect(backend.sendText('second confirmed chunk')).toBe(true);
+    state.failSendAt = 3;
+    expect(backend.sendText('ambiguous third chunk')).toBe(false);
+    expect(state.sendInputs).toHaveLength(3);
+
+    backend.cancelAmbiguousSubmission(fence);
+    expect(state.sendInputs).toHaveLength(4);
+    expect(state.sendInputs[3]!.toString()).toBe('\x03\n');
+
+    backend.cancelAmbiguousSubmission(fence);
+    expect(state.sendInputs).toHaveLength(4);
+  });
+
+  it('does not cancel a failed control key as though it were prompt text', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+    state.failSendAt = 1;
+
+    expect(backend.sendSpecialKeys('Enter')).toBe(false);
+    backend.cancelAmbiguousSubmission(fence);
+
+    expect(state.sendInputs).toHaveLength(1);
+    expect(state.sendInputs[0]!.toString()).toBe('\r\n');
+  });
+
   it('rejects input above 64 KiB before sending any prefix', () => {
     const backend = spawnBackend();
 
@@ -567,6 +597,45 @@ describe('ZmxBackend history-authoritative transport', () => {
       expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
     },
   );
+
+  it('deduplicates logical recovery after frame recovery already injected Ctrl+C', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+    state.failSendAt = 1;
+    const ompStylePaste = `\x1b[200~${'中'.repeat(512)}\x1b[201~`;
+
+    expect(backend.sendText(ompStylePaste)).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
+    expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+
+    backend.cancelAmbiguousSubmission(fence);
+    expect(state.sendInputs).toHaveLength(2);
+  });
+
+  it('detects an opening paste marker split across an ambiguous chunk boundary', () => {
+    const backend = spawnBackend();
+    state.failSendAt = 2;
+    const splitMarkerPaste = `${'x'.repeat(1_021)}\x1b[200~${'y'.repeat(1_021)}\x1b[201~`;
+
+    expect(backend.sendText(splitMarkerPaste)).toBe(false);
+    expect(state.sendInputs).toHaveLength(3);
+    expect(state.sendInputs[0]!.subarray(-4).toString()).toBe('\x1b[2\n');
+    expect(state.sendInputs[1]!.subarray(0, 3).toString()).toBe('00~');
+    expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
+  });
+
+  it('keeps marker-dense maximum-size recovery analysis bounded', () => {
+    const backend = spawnBackend();
+    const closingMarker = '\x1b[201~';
+    const markerDenseInput = closingMarker.repeat(
+      Math.floor((64 * 1_024) / Buffer.byteLength(closingMarker)),
+    );
+    const startedAt = performance.now();
+
+    expect(backend.sendText(markerDenseInput)).toBe(true);
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    expect(state.sendInputs).toHaveLength(Math.ceil(Buffer.byteLength(markerDenseInput) / 1_024));
+  });
 
   it('does not inject partial-send recovery into a replacement session', () => {
     const backend = spawnBackend();

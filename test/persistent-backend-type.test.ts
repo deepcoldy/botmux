@@ -29,6 +29,7 @@ import {
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   resolveSpawnBackendType,
+  shouldRejectPersistentPostKillProbe,
   shutdownBackendDisposition,
 } from '../src/core/persistent-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
@@ -204,6 +205,28 @@ describe('probePersistentSessions', () => {
     expect(probe).toHaveBeenCalledTimes(1);
     probe.mockRestore();
   });
+});
+
+describe('persistent post-kill probe policy', () => {
+  it.each([
+    { backendType: 'tmux', probe: 'missing', reject: false },
+    { backendType: 'tmux', probe: 'unknown', reject: false },
+    { backendType: 'tmux', probe: 'exists', reject: true },
+    { backendType: 'herdr', probe: 'missing', reject: false },
+    { backendType: 'herdr', probe: 'unknown', reject: false },
+    { backendType: 'herdr', probe: 'exists', reject: true },
+    { backendType: 'zellij', probe: 'missing', reject: false },
+    { backendType: 'zellij', probe: 'unknown', reject: false },
+    { backendType: 'zellij', probe: 'exists', reject: true },
+    { backendType: 'zmx', probe: 'missing', reject: false },
+    { backendType: 'zmx', probe: 'unknown', reject: true },
+    { backendType: 'zmx', probe: 'exists', reject: true },
+  ] as const)(
+    '$backendType + $probe → reject=$reject',
+    ({ backendType, probe, reject }) => {
+      expect(shouldRejectPersistentPostKillProbe(backendType, probe)).toBe(reject);
+    },
+  );
 });
 
 describe('killPersistentSession ZMX ownership fence', () => {

@@ -34,7 +34,7 @@ import {
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths, FsPolicyConfigError } from './adapters/cli/fs-policy.js';
-import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, type PersistentBackendType } from './core/persistent-backend.js';
+import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
@@ -5367,6 +5367,27 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+function captureAmbiguousSubmissionFence(target: SessionBackend): number | undefined {
+  try {
+    return target.captureAmbiguousSubmissionFence?.();
+  } catch (err) {
+    log(`Unable to capture ambiguous-submission fence: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+}
+
+function cancelAmbiguousSubmissionAfterFailure(
+  target: SessionBackend | null,
+  fence: number | undefined,
+): void {
+  if (!target || fence === undefined || backend !== target) return;
+  try {
+    target.cancelAmbiguousSubmission?.(fence);
+  } catch (err) {
+    log(`Unable to cancel ambiguous submission: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function onPtyData(data: string): void {
   data = splitCodexAppControl(data);
   if (data.length === 0) return;
@@ -6190,6 +6211,8 @@ async function flushPending(): Promise<void> {
       // escaping rejection would become an unhandledRejection and crash the
       // worker — exactly the failure mode this change is closing. Contain it.
       let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
+      let submissionBackend: SessionBackend | null = null;
+      let submissionFence: number | undefined;
       try {
         if (codexRpcEngine) {
           // RPC input mode: deliver via JSON-RPC turn/start (its ack IS the
@@ -6200,6 +6223,8 @@ async function flushPending(): Promise<void> {
           await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
+          submissionBackend = backend;
+          submissionFence = captureAmbiguousSubmissionFence(backend);
           result = await cliAdapter.writeStructuredInput(
             adapterInputHandle(backend),
             msg,
@@ -6207,6 +6232,8 @@ async function flushPending(): Promise<void> {
             { turnId: item.turnId },
           );
         } else {
+          submissionBackend = backend;
+          submissionFence = captureAmbiguousSubmissionFence(backend);
           result = await cliAdapter.writeInput(
             adapterInputHandle(backend),
             msg,
@@ -6215,6 +6242,7 @@ async function flushPending(): Promise<void> {
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
+        cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
         log(`writeInput threw: ${err?.message ?? err}`);
         if (durableWrite && item.turnId) {
           // A throwing backend cannot prove whether bytes reached the CLI.
@@ -6263,6 +6291,7 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
+        cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
         scheduleSubmitFailureNotify(
           logicalMsg,
           result.recheck,
@@ -7380,7 +7409,10 @@ async function spawnCli(
                 effectiveBackendType as PersistentBackendType,
                 staleSessionName,
               ));
-        if (postKillProbe !== 'missing') {
+        if (shouldRejectPersistentPostKillProbe(
+          effectiveBackendType as PersistentBackendType,
+          postKillProbe,
+        )) {
           throw new Error(
             `[read-isolation] refusing to start session ${cfg.sessionId}: ` +
             `could not confirm stale ${effectiveBackendType} pane termination`,
@@ -7456,7 +7488,7 @@ async function spawnCli(
         : (persistentTarget
           ? probePersistentBackendTarget(persistentTarget)
           : probePersistentSession(persistentBackendType, persistentSessionName));
-      if (postKillProbe !== 'missing') {
+      if (shouldRejectPersistentPostKillProbe(persistentBackendType, postKillProbe)) {
         throw new Error(
           `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
           `could not confirm stale ${effectiveBackendType} pane termination`,
@@ -11011,6 +11043,8 @@ process.on('message', async (raw: unknown) => {
             // message handler. Errors are best-effort logged; the bridge
             // ingest path is unaffected because mark already happened
             // above (codexBridgeMarkPendingTurn / bridgeMarkPendingTurn).
+            const submissionBackend = backend;
+            const submissionFence = captureAmbiguousSubmissionFence(backend);
             try {
               const result = await cliAdapter.writeInput(adapterInputHandle(backend), content);
               if (result?.cliSessionId) {
@@ -11018,11 +11052,13 @@ process.on('message', async (raw: unknown) => {
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
               if (result && result.submitted === false) {
+                cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
                 scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
               } else {
                 acknowledgeTurnInputCommitted(msg.turnId);
               }
             } catch (err: any) {
+              cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
               log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
