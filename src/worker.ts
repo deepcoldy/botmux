@@ -35,6 +35,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
+import { roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -7581,6 +7582,13 @@ async function spawnCli(
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
       botHome: canonical(ownBotHome!),
+      // Own role-library subtree. roleLibrarySubtree() does the existence +
+      // canonicalization + "must be a real dir, not a symlink" checks itself
+      // (deliberately NOT via keepExisting: its realpath would follow a planted
+      // link and hand rw to the target). A bot that never used roles simply
+      // gets no rule, and a library created after spawn only takes effect for
+      // the next session — bwrap cannot bind a nonexistent source anyway.
+      roleLibrarySubtree: roleLibrarySubtree(cfg.larkAppId) ?? undefined,
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,

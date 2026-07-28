@@ -72,6 +72,11 @@ export interface FsPolicyContext {
   sessionId?: string;
   /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite. */
   botHome: string;
+  /** This bot's OWN role-library subtree (`<roleLibraryRoot>/<appId>`) — readWrite.
+   *  Optional: absent when the subtree does not exist (bot never used roles) or
+   *  when building a non-session policy. See the emission site for why the whole
+   *  subtree — not just the active role dir — has to be writable. */
+  roleLibrarySubtree?: string;
   /** True when the CLI's data root is redirected into BOT_HOME
    *  (CLAUDE_CONFIG_DIR / CODEX_HOME). False → cliDataPaths are exposed rw. */
   redirectedCliData: boolean;
@@ -360,7 +365,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     for (const p of paths ?? []) candidates.push({ path: p, access, source });
   };
 
-  candidates.push(...(ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir)));
+  const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
+  candidates.push(...baseline);
 
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
@@ -369,6 +375,44 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
 
   // botmux internals.
   push([ctx.workingDir, ctx.botHome], 'readWrite', 'internal');
+  // Own role-library subtree (`~/botmux-roles/<self>`). workingDir alone covers
+  // only the ACTIVE role dir, which silently disables the whole role system
+  // under sandbox: 「切换角色/有哪些角色」enumerates the sibling role dirs and
+  // reads each `.botmux-dir.json`, 「新建角色」writes `users/<openId>/<slug>/`
+  // and copies the library-root `_role-protocol.md` into it, and after a switch
+  // 「沉淀知识」writes `knowledge/` + `.botmux-dir.json` in the NEW role dir —
+  // all of them outside the pre-switch workingDir. readWrite (not readOnly) for
+  // that last reason: a read-only grant looks fine through switch+enumerate and
+  // only EPERMs later, at the knowledge write.
+  // Scoped to `<appId>` on purpose — NOT the shared library root: a sibling
+  // bot's roles (and its users' private role dirs) stay denied by construction,
+  // so cross-bot read isolation is preserved. (Note this is deliberately
+  // NARROWER than `validateRoleLibraryPath`, which only requires the target to
+  // be somewhere under the library root; a cross-bot switch now fails at the fs
+  // layer even if the daemon-side check passes.)
+  // …and suppressed entirely when ANY deny — baseline, owner, or mandatory —
+  // already covers it: source rank only settles conflicts on the SAME path, so a
+  // shallower `deny: ["~/botmux-roles"]` would otherwise be silently re-opened
+  // at `<appId>` by this deeper internal rule (longest-prefix-wins). An owner who
+  // denies the library must get a denied library, not a hole in it. Baseline is
+  // in the list defensively: a canonical `<library>/<appId>` cannot normally land
+  // inside a crown-jewel deny, but "cannot normally" is not a check.
+  const roleLibDenied = (raw: string) => {
+    const p = normalizeFsPath(raw);
+    if (!p) return true; // unusable path → no rule (mergeFsRules would drop it anyway)
+    return [
+      ...baseline.filter(r => r.access === 'deny').map(r => r.path),
+      ...(ctx.userPaths?.deny ?? []),
+      ...(ctx.mandatoryDenyPaths ?? []),
+    ]
+      .map(normalizeFsPath)
+      .some((d) => !!d && coversPath(d, p));
+  };
+  push(
+    ctx.roleLibrarySubtree && !roleLibDenied(ctx.roleLibrarySubtree) ? [ctx.roleLibrarySubtree] : [],
+    'readWrite',
+    'internal',
+  );
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(ctx.extraWritePaths, 'readWrite', 'internal');
   push(ctx.readonlyRoots, 'readOnly', 'internal');

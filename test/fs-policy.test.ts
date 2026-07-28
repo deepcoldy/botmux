@@ -196,6 +196,57 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_other/m1/f.pdf').access).toBe('none');
   });
 
+  it('own role-library subtree is rw (enumerate/switch/create roles + post-switch knowledge writes); sibling bots’ libraries stay uncovered', () => {
+    const p = buildFsPolicy(ctx({ roleLibrarySubtree: '/Users/u/botmux-roles/cli_self' }));
+    // library-root protocol file the 新建角色 flow copies into each new role dir
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/_role-protocol.md').access).toBe('readWrite');
+    // sibling role dirs 「切换角色」 enumerates, and their display-name metadata
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/shared/pm/.botmux-dir.json').access).toBe('readWrite');
+    // 「新建角色」 writes under users/<openId>/<slug>/
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/users/ou_x/xhs-ops/CLAUDE.md').access).toBe('readWrite');
+    // 「沉淀知识」 writes knowledge/ in whatever role is active AFTER a switch —
+    // this is why the grant is rw, not ro (a ro grant only EPERMs at this step).
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/shared/pm/knowledge/INDEX.md').access).toBe('readWrite');
+    // scoped per-appId: another bot's library (incl. its users' private roles)
+    // stays denied by construction, and the shared root itself is not granted.
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_other/shared/default/CLAUDE.md').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_other/users/ou_y/secret/CLAUDE.md').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles').access).toBe('none');
+    // the owner can still lock it back down: a user rule outranks the internal
+    // grant at the same path (user > internal), and a nested deny wins by depth.
+    const off = buildFsPolicy(ctx({
+      roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+      userPaths: { deny: ['/Users/u/botmux-roles/cli_self'] },
+    }));
+    expect(accessForPath(off.rules, '/Users/u/botmux-roles/cli_self/shared/pm/CLAUDE.md').access).toBe('deny');
+  });
+
+  it('an ANCESTOR deny (owner or mandatory) suppresses the role-library grant — longest-prefix-wins must not punch a hole in it', () => {
+    // source rank only settles same-path conflicts; without the suppression the
+    // deeper internal rw would re-open <appId> under a denied library root.
+    for (const key of ['userPaths', 'mandatoryDenyPaths'] as const) {
+      const p = buildFsPolicy(ctx({
+        roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+        ...(key === 'userPaths'
+          ? { userPaths: { deny: ['/Users/u/botmux-roles'] } }
+          : { mandatoryDenyPaths: ['/Users/u/botmux-roles'] }),
+      }));
+      expect(p.rules.some(r => r.path === '/Users/u/botmux-roles/cli_self')).toBe(false);
+      expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/shared/pm/CLAUDE.md').access).toBe('deny');
+    }
+    // baseline deny counts too (defence-in-depth: a canonical library path
+    // shouldn't be able to land inside a crown jewel, but that's not a check).
+    const inJewel = buildFsPolicy(ctx({ roleLibrarySubtree: '/Users/u/.ssh/roles/cli_self' }));
+    expect(inJewel.rules.some(r => r.path === '/Users/u/.ssh/roles/cli_self')).toBe(false);
+    expect(accessForPath(inJewel.rules, '/Users/u/.ssh/roles/cli_self/x').access).toBe('deny');
+  });
+
+  it('no role-library rule at all when the subtree is absent (bot never used roles)', () => {
+    const p = buildFsPolicy(ctx());
+    expect(p.rules.some(r => r.path.includes('botmux-roles'))).toBe(false);
+    expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/shared/default/CLAUDE.md').access).toBe('none');
+  });
+
   it('user paths take precedence and support nested deny', () => {
     const p = buildFsPolicy(ctx({
       userPaths: {

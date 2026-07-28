@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { homedir, tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { validateRoleLibraryPath } from '../src/core/role-library.js';
+import { roleLibrarySubtree, validateRoleLibraryPath } from '../src/core/role-library.js';
 
 function setup() {
   const base = mkdtempSync(join(tmpdir(), 'rolelib-'));
@@ -98,5 +98,64 @@ describe('validateRoleLibraryPath', () => {
     symlinkSync(target, link);
     expect(validateRoleLibraryPath(link, root))
       .toEqual({ ok: false, error: 'invalid_path_chars' });
+  });
+});
+
+describe('roleLibrarySubtree（沙盒白名单用）', () => {
+  it('真实目录 → 根 realpath 下的同名单段路径', () => {
+    const { root } = setup();
+    mkdirSync(join(root, 'cli_abc123'));
+    expect(roleLibrarySubtree('cli_abc123', root)).toBe(join(realpathSync(root), 'cli_abc123'));
+  });
+  it('拒绝任何会解析到角色库之外的 appId（分隔符 / .. / 空值 / 控制字符）', () => {
+    const { root } = setup();
+    // join('/r', '../../.ssh') === '/.ssh' —— `..` 被 join 吃掉，normalizeFsPath
+    // 的 `..` 拦截够不到，所以必须在拼路径前就挡住。
+    for (const bad of ['../../.ssh', '..', '.', 'a/b', '/abs', '', 'x\ny', 'a b']) {
+      expect(roleLibrarySubtree(bad, root)).toBeNull();
+    }
+    expect(roleLibrarySubtree(undefined as unknown as string, root)).toBeNull();
+  });
+  it('子树是符号链接 → null（否则 realpath 会把链接目标当成本 bot 的子树授 rw）', () => {
+    const { base, root } = setup();
+    // 库外的敏感目录（模拟 ~/.ssh），以及另一个 bot 的角色库
+    const outside = join(base, 'secret'); mkdirSync(outside);
+    mkdirSync(join(root, 'cli_other', 'users', 'ou_y'), { recursive: true });
+    symlinkSync(outside, join(root, 'cli_escape'));
+    symlinkSync(join(root, 'cli_other'), join(root, 'cli_crossbot'));
+    expect(roleLibrarySubtree('cli_escape', root)).toBeNull();
+    expect(roleLibrarySubtree('cli_crossbot', root)).toBeNull();
+    // 对照：同名真实目录照常放行
+    mkdirSync(join(root, 'cli_real'));
+    expect(roleLibrarySubtree('cli_real', root)).not.toBeNull();
+  });
+  it('不存在、或是文件而非目录 → null', () => {
+    const { root } = setup();
+    expect(roleLibrarySubtree('cli_missing', root)).toBeNull();
+    writeFileSync(join(root, 'cli_file'), 'x');
+    expect(roleLibrarySubtree('cli_file', root)).toBeNull();
+  });
+  it('角色库根不存在 → null', () => {
+    const { base } = setup();
+    expect(roleLibrarySubtree('cli_x', join(base, 'no-such-root'))).toBeNull();
+  });
+  it('角色库根本身是符号链接 → null（末两段都不许跟链，否则整棵库被替换掉）', () => {
+    const { base, root } = setup();
+    mkdirSync(join(root, 'cli_x'));
+    // 库外目录，里面也放一个同名 appId 目录：跟链的实现会返回它
+    const fake = join(base, 'fake-roles'); mkdirSync(join(fake, 'cli_x'), { recursive: true });
+    const link = join(base, 'roles-link');
+    symlinkSync(fake, link);
+    expect(roleLibrarySubtree('cli_x', link)).toBeNull();
+  });
+  it('根之上的中间段是符号链接 → 照常放行，且返回 canonical 路径（$HOME 本身是链接的机器）', () => {
+    // 只 realpath 根的父目录：/home/u → /data00/home/u 这类布局不能因此 fail-open，
+    // 也不能被误拒。这里用一个指向 base 的链接充当「符号链接的 $HOME」。
+    const { base, root } = setup();
+    mkdirSync(join(root, 'cli_x'));
+    const homeLink = join(mkdtempSync(join(tmpdir(), 'homelink-')), 'home');
+    symlinkSync(base, homeLink);
+    expect(roleLibrarySubtree('cli_x', join(homeLink, 'botmux-roles')))
+      .toBe(join(realpathSync(root), 'cli_x'));
   });
 });
