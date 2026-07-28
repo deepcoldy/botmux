@@ -1326,8 +1326,17 @@ export class ZmxBackend implements SessionBackend {
         // status 0. Empty stdout is part of the transport contract.
         if (stdout.trim()) {
           logger.warn(`[zmx:${this.sessionName}] send rejected: ${stdout.trim()}`);
-          this.verifyBackingIdentity('send rejection');
-          if (bracketedPaste || offset > 0) this.abortPartialSend(bracketedPaste);
+          const probe = this.verifyBackingIdentity('send rejection');
+          if (bracketedPaste || offset > 0) {
+            if (probe.state === 'compatible') {
+              this.abortPartialSend(bracketedPaste);
+            } else {
+              logger.warn(
+                `[zmx:${this.sessionName}] skipped partial-send recovery: ` +
+                `backing identity is ${probe.state}`,
+              );
+            }
+          }
           return false;
         }
       } catch (err) {
@@ -1338,7 +1347,16 @@ export class ZmxBackend implements SessionBackend {
         );
         // Never retry an ambiguous send: ZMX has no PTY-level ACK, so retrying
         // can duplicate a prompt that the daemon already queued.
-        if (bracketedPaste || offset > 0) this.abortPartialSend(bracketedPaste);
+        if (bracketedPaste || offset > 0) {
+          if (probe.state === 'compatible') {
+            this.abortPartialSend(bracketedPaste);
+          } else {
+            logger.warn(
+              `[zmx:${this.sessionName}] skipped partial-send recovery: ` +
+              `backing identity is ${probe.state}`,
+            );
+          }
+        }
         return false;
       }
     }

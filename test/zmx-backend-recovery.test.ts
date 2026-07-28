@@ -107,6 +107,7 @@ interface FakeZmxState {
   historyStderr: string;
   sendInputs: Buffer[];
   failSendAt: number | null;
+  replaceOnFailedSend: boolean;
   deferHistory: boolean;
   readyPath: string | null;
 }
@@ -186,6 +187,7 @@ describe('ZmxBackend history-authoritative transport', () => {
       historyStderr: '',
       sendInputs: [],
       failSendAt: null,
+      replaceOnFailedSend: false,
       deferHistory: false,
       readyPath: null,
     };
@@ -223,9 +225,13 @@ describe('ZmxBackend history-authoritative transport', () => {
       }
       if (command === 'send') {
         state.sendInputs.push(Buffer.from(options?.input ?? ''));
-        return state.failSendAt === state.sendInputs.length
-          ? `session ${SESSION} is unresponsive\n`
-          : '';
+        if (state.failSendAt === state.sendInputs.length) {
+          if (state.replaceOnFailedSend) {
+            state.sessionId = 'replacement-session-id';
+          }
+          return `session ${SESSION} is unresponsive\n`;
+        }
+        return '';
       }
       if (command === 'kill') {
         state.exists = false;
@@ -526,6 +532,17 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs).toHaveLength(3);
     expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
     expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
+  });
+
+  it('does not inject partial-send recovery into a replacement session', () => {
+    const backend = spawnBackend();
+    state.failSendAt = 2;
+    state.replaceOnFailedSend = true;
+
+    expect(() => backend.pasteText('x'.repeat(2_000))).toThrow(/粘贴发送失败/);
+    expect(state.sendInputs).toHaveLength(2);
+    expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+    expect(state.sendInputs).not.toContainEqual(Buffer.from('\x1b[201~\x03\n'));
   });
 
   it('serves captureCurrentScreen from the cache without spawning history', async () => {
