@@ -15,7 +15,6 @@
  *   botmux device enroll|status|logout — manage the host desktop device credential
  *   botmux list           — interactive session picker (TUI), attach to managed tmux/ZMX sessions
  *   botmux list --plain   — plain table output (for piping / scripts)
- *   botmux title [--session-id <id>] <title> — rename a session title
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
@@ -178,7 +177,6 @@ import {
   probePersistentSessions,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
-import { normalizeSessionTitle } from './core/session-board.js';
 
 // Resolve the CLI's UI locale once from the global config file, so subsequent
 // CLI output (and any t() callers that don't pass an explicit locale) honour
@@ -3163,8 +3161,6 @@ interface SessionData {
     memberEpoch: number;
   };
   title: string;
-  titleUpdatedAt?: string;
-  titleSource?: string;
   status: 'active' | 'closed';
   createdAt: string;
   lastMessageAt?: string;
@@ -5049,136 +5045,6 @@ async function cmdResume(): Promise<void> {
     console.error(`❌ 恢复失败: ${errCode}`);
   }
   process.exit(1);
-}
-
-function titleCliUsage(): never {
-  console.error('用法: botmux title [--session-id <session-id|prefix>] <新标题>');
-  console.error('  在 botmux 会话里运行时可省略 --session-id，会自动使用当前会话。');
-  process.exit(1);
-}
-
-function parseTitleArgs(rest: string[]): { sessionIdArg?: string; title: string; json: boolean } {
-  const titleParts: string[] = [];
-  let sessionIdArg: string | undefined;
-  let json = false;
-  for (let i = 0; i < rest.length; i++) {
-    const token = rest[i]!;
-    if (token === '--session-id' || token === '-s') {
-      sessionIdArg = rest[i + 1];
-      i++;
-      continue;
-    }
-    if (token === '--json') {
-      json = true;
-      continue;
-    }
-    if (token === '--') {
-      titleParts.push(...rest.slice(i + 1));
-      break;
-    }
-    titleParts.push(token);
-  }
-  return { sessionIdArg, title: titleParts.join(' ').trim(), json };
-}
-
-function resolveSessionByIdOrPrefix(sessions: SessionData[], idOrPrefix: string): SessionData | null {
-  const exact = sessions.find(s => s.sessionId === idOrPrefix);
-  if (exact) return exact;
-  const matches = sessions.filter(s => s.sessionId.startsWith(idOrPrefix));
-  if (matches.length === 1) return matches[0]!;
-  if (matches.length > 1) {
-    console.error(`❌ "${idOrPrefix}" 匹配了 ${matches.length} 个会话，请提供更长的 ID 前缀：`);
-    for (const s of matches) console.error(`   ${s.sessionId.substring(0, 12)}  ${s.title}`);
-    process.exit(1);
-  }
-  return null;
-}
-
-async function cmdTitle(rest: string[]): Promise<void> {
-  const parsed = parseTitleArgs(rest);
-  const title = normalizeSessionTitle(parsed.title);
-  if (!title) titleCliUsage();
-
-  process.env.SESSION_DATA_DIR ??= resolveDataDir();
-  const sessions = [...loadSessions().values()];
-  const inferredSid = parsed.sessionIdArg ?? findAncestorSessionId();
-  let session: SessionData | null = null;
-
-  if (inferredSid) {
-    session = resolveSessionByIdOrPrefix(sessions, inferredSid);
-  } else {
-    const active = sessions.filter(s => s.status === 'active');
-    if (active.length === 1) session = active[0]!;
-    else titleCliUsage();
-  }
-
-  if (!session) {
-    console.error(`❌ 未找到会话：${inferredSid}`);
-    process.exit(1);
-  }
-
-  if (!session.larkAppId) {
-    const online = listOnlineDaemons();
-    if (online.length > 1) {
-      console.error(`❌ 会话 ${session.sessionId.substring(0, 12)} 缺少 larkAppId，多 bot 部署下无法判定归属。`);
-      console.error(`   在线 daemon (${online.length}): ${online.map(d => d.larkAppId).join(', ')}`);
-      process.exit(1);
-    }
-    if (online.length === 0) {
-      console.error('❌ 没有在线 daemon。改名需要 daemon 广播 SSE；请先：botmux start');
-      process.exit(1);
-    }
-  }
-
-  const daemon = findDaemon(session.larkAppId);
-  if (!daemon) {
-    console.error('❌ 未找到在线 daemon。改名需要 daemon 广播 SSE；请确认 daemon 正在运行：botmux status');
-    process.exit(1);
-  }
-
-  const source = process.env.BOTMUX_SESSION_ID === session.sessionId ? 'agent' : 'cli';
-  let res: Response;
-  try {
-    res = source === 'agent'
-      ? await postSessionCliIpc(
-          daemon.ipcPort,
-          session.sessionId,
-          'rename',
-          { title, source },
-        )
-      : await fetchDaemonIpc(
-          daemon.ipcPort,
-          `/api/sessions/${encodeURIComponent(session.sessionId)}/rename`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ title, source }),
-          },
-        );
-  } catch (err: any) {
-    console.error(`❌ 无法连接到 daemon (port=${daemon.ipcPort}): ${err?.message ?? err}`);
-    process.exit(1);
-  }
-
-  let body: any = {};
-  try { body = await res.json(); } catch { /* */ }
-  if (!res.ok || !body?.ok) {
-    console.error(`❌ 改名失败: ${body?.error ?? `HTTP ${res.status}`}`);
-    process.exit(1);
-  }
-
-  if (parsed.json) {
-    console.log(JSON.stringify({
-      ok: true,
-      sessionId: session.sessionId,
-      title: body.title,
-      titleUpdatedAt: body.titleUpdatedAt,
-      titleSource: body.titleSource,
-    }));
-    return;
-  }
-  console.log(`✅ 会话标题已更新: ${body.title}`);
-  console.log(`   会话: ${session.sessionId.substring(0, 12)}`);
 }
 
 /**
