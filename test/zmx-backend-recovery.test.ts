@@ -107,6 +107,7 @@ interface FakeZmxState {
   historyStderr: string;
   sendInputs: Buffer[];
   failSendAt: number | null;
+  throwOnFailedSend: boolean;
   replaceOnFailedSend: boolean;
   deferHistory: boolean;
   readyPath: string | null;
@@ -187,6 +188,7 @@ describe('ZmxBackend history-authoritative transport', () => {
       historyStderr: '',
       sendInputs: [],
       failSendAt: null,
+      throwOnFailedSend: false,
       replaceOnFailedSend: false,
       deferHistory: false,
       readyPath: null,
@@ -228,6 +230,9 @@ describe('ZmxBackend history-authoritative transport', () => {
         if (state.failSendAt === state.sendInputs.length) {
           if (state.replaceOnFailedSend) {
             state.sessionId = 'replacement-session-id';
+          }
+          if (state.throwOnFailedSend) {
+            throw new Error(`zmx send ${SESSION} timed out`);
           }
           return `session ${SESSION} is unresponsive\n`;
         }
@@ -544,6 +549,24 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
     expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
   });
+
+  it.each([
+    { failure: 'stdout rejection', throwOnFailedSend: false },
+    { failure: 'thrown transport error', throwOnFailedSend: true },
+  ])(
+    'closes a possibly delivered sendText paste when its first frame has a $failure',
+    ({ throwOnFailedSend }) => {
+      const backend = spawnBackend();
+      state.failSendAt = 1;
+      state.throwOnFailedSend = throwOnFailedSend;
+      const ompStylePaste = `\x1b[200~${'中'.repeat(512)}\x1b[201~`;
+
+      expect(backend.sendText(ompStylePaste)).toBe(false);
+      expect(state.sendInputs).toHaveLength(2);
+      expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+      expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+    },
+  );
 
   it('does not inject partial-send recovery into a replacement session', () => {
     const backend = spawnBackend();

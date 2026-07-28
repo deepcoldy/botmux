@@ -1334,6 +1334,14 @@ export class ZmxBackend implements SessionBackend {
       // framing LF therefore preserves the caller's original bytes exactly,
       // including an original trailing LF, while keeping secrets out of argv.
       const input = Buffer.concat([chunk, Buffer.from('\n')]);
+      // A failed send has no PTY-level ACK: the current chunk may or may not
+      // have reached the CLI. Track both possible states. Looking only at the
+      // confirmed prefix misses an opening marker in a first ambiguous frame;
+      // looking only through the current frame misses an opening marker whose
+      // matching close sits in that ambiguous frame.
+      const mayHaveOpenPasteAfterAmbiguousSend = bracketedPaste
+        || hasUnclosedBracketedPaste(bytes.subarray(0, offset))
+        || hasUnclosedBracketedPaste(bytes.subarray(0, offset + chunk.length));
       try {
         const stdout = execFileSync('zmx', ['send', this.sessionName], {
           input,
@@ -1348,8 +1356,7 @@ export class ZmxBackend implements SessionBackend {
         if (stdout.trim()) {
           logger.warn(`[zmx:${this.sessionName}] send rejected: ${stdout.trim()}`);
           const probe = this.verifyBackingIdentity('send rejection');
-          const closeOpenPaste = bracketedPaste
-            || hasUnclosedBracketedPaste(bytes.subarray(0, offset));
+          const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
           if (closeOpenPaste || offset > 0) {
             if (probe.state === 'compatible') {
               this.abortPartialSend(closeOpenPaste);
@@ -1370,8 +1377,7 @@ export class ZmxBackend implements SessionBackend {
         );
         // Never retry an ambiguous send: ZMX has no PTY-level ACK, so retrying
         // can duplicate a prompt that the daemon already queued.
-        const closeOpenPaste = bracketedPaste
-          || hasUnclosedBracketedPaste(bytes.subarray(0, offset));
+        const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
         if (closeOpenPaste || offset > 0) {
           if (probe.state === 'compatible') {
             this.abortPartialSend(closeOpenPaste);
