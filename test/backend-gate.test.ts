@@ -160,6 +160,21 @@ describe('persistent backend cold-restart ordering', () => {
     expect(gate).toContain("effectiveBackendType === 'zmx'");
     expect(gate).toContain('resolvedZmxSessionProbe = postKillProbe');
   });
+
+  it('refreshes the frozen ZMX probe before read-isolation re-selects the backend', () => {
+    const start = workerSource.indexOf('[read-isolation] legacy/unmarked persistent pane');
+    const end = workerSource.indexOf('let willReattachPersistent', start);
+    const gate = workerSource.slice(start, end);
+    const postKillProbe = gate.indexOf('const postKillProbe =');
+    const frozenProbeRefresh = gate.indexOf('resolvedZmxSessionProbe = postKillProbe', postKillProbe);
+    const reselect = gate.indexOf('selectedBackend = selectBackend();');
+
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    expect(postKillProbe).toBeGreaterThanOrEqual(0);
+    expect(frozenProbeRefresh).toBeGreaterThan(postKillProbe);
+    expect(reselect).toBeGreaterThan(frozenProbeRefresh);
+  });
 });
 
 describe('ZMX observer crash cleanup', () => {

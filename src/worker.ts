@@ -1687,6 +1687,15 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     // Do not send another queued command against a backend whose write failed.
     isPromptReady = false;
     log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
+    const failedTurnId = msg.followUpTurnId ?? msg.turnId;
+    if (failedTurnId) {
+      emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
+    }
+    send({
+      type: 'user_notify',
+      ...(failedTurnId ? { turnId: failedTurnId } : {}),
+      message: t('worker.raw_input_failed', { cliName: cliName() }),
+    });
   }
 
   // Follow-up rides on the same IPC and is enqueued only after this command's
@@ -7356,13 +7365,6 @@ async function spawnCli(
             if (persistentTarget) killPersistentBackendTarget(persistentTarget, cfg.sessionId);
             else killPersistentSession(effectiveBackendType as PersistentBackendType, persistentSessionName, cfg.sessionId);
           }
-          selectedBackend = selectBackend();
-          isTmuxMode = selectedBackend.isTmuxMode;
-          isPipeMode = selectedBackend.isPipeMode;
-          isZellijMode = selectedBackend.isZellijMode;
-          backend = selectedBackend.backend;
-          cliLifetimeNonce++;
-          persistentSessionName = selectedBackend.persistentSessionName;
         } catch (e) {
           throw new Error(`[read-isolation] refusing to start session ${cfg.sessionId}: could not kill stale persistent pane (${(e as Error).message})`);
         }
@@ -7382,6 +7384,16 @@ async function spawnCli(
           resolvedZmxSessionProbe = postKillProbe;
           resolvedZmxSessionPid = undefined;
         }
+        // ZMX backend selection consumes the frozen probe. Refresh it before
+        // re-selecting or the replacement keeps isReattach=true for the pane
+        // that this gate just proved was removed.
+        selectedBackend = selectBackend();
+        isTmuxMode = selectedBackend.isTmuxMode;
+        isPipeMode = selectedBackend.isPipeMode;
+        isZellijMode = selectedBackend.isZellijMode;
+        backend = selectedBackend.backend;
+        cliLifetimeNonce++;
+        persistentSessionName = selectedBackend.persistentSessionName;
       }
     }
   }

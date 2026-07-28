@@ -2092,6 +2092,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const optionType = value?.option_type ?? 'select';
       const selectedIndex = Number(value?.selected_index ?? 0);
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
+      if (isActiveTuiCard && ds.tuiPromptProcessing) {
+        logger.info(`[${tag(ds)}] Duplicate TUI prompt card click — dropped (processing already in flight)`);
+        return;
+      }
 
       if (optionType === 'toggle') {
         // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
@@ -2185,6 +2189,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         }
 
         if (allKeys.length > 0) {
+          const effectiveFinal = isFinal || isFinalStuck;
           // Atomic processing claim: if a previous click is already in flight
           // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
           // this duplicate. Without this, two rapid clicks could both pass the
@@ -2195,6 +2200,9 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               return;
             }
             ds.stuckWarningProcessing = true;
+          }
+          if (isActiveTuiCard && effectiveFinal) {
+            ds.tuiPromptProcessing = true;
           }
           // Only the stuck-warning card's Enter action re-arms the detector
           // (Enter advances from the hook list to a per-hook review). Match by
@@ -2211,7 +2219,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
           const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
           const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          const effectiveFinal = isFinal || isFinalStuck;
           const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
             ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
             : selectedText;
@@ -2230,6 +2237,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             dispatchedKeys = true;
           } catch (err) {
             if (isActiveStuckCard) ds.stuckWarningProcessing = false;
+            if (isActiveTuiCard && effectiveFinal) ds.tuiPromptProcessing = false;
             logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
             return {
               toast: {
@@ -2283,6 +2291,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         logger.info(`[${tag(ds)}] tui_text_input from stale card ${cardMessageId} — ignored`);
         return;
       }
+      if (ds.tuiPromptProcessing) {
+        logger.info(`[${tag(ds)}] Duplicate TUI text input — dropped (processing already in flight)`);
+        return;
+      }
       if (!ds.worker || !inputText || inputKeys.length === 0) {
         logger.info(
           `[${tag(ds)}] TUI text input not dispatched ` +
@@ -2296,6 +2308,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         };
       }
       // Atomic IPC — worker handles keys + text in one flow to avoid race
+      ds.tuiPromptProcessing = true;
       try {
         await sendWorkerIpc(ds.worker, {
           type: 'tui_text_input',
@@ -2304,6 +2317,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardMessageId,
         } as DaemonToWorker);
       } catch (err) {
+        ds.tuiPromptProcessing = false;
         logger.warn(`[${tag(ds)}] TUI text IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
         return {
           toast: {

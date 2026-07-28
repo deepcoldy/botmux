@@ -245,6 +245,10 @@ export interface DaemonSession {
   vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin;
   /** message_id of the TUI prompt interactive card (if active) */
   tuiPromptCardId?: string;
+  /** A final ScreenAnalyzer TUI answer has been dispatched and is waiting for
+   * the worker's resolved/failed ACK. Claimed synchronously by card-handler so
+   * duplicate clicks cannot inject a second key sequence into the same CLI. */
+  tuiPromptProcessing?: boolean;
   /** turnId of the last stuck_warning posted — dedup so we don't spam the
    *  thread with repeated warnings for the same unresolved turn. */
   stuckWarningTurnId?: string;

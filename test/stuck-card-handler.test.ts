@@ -346,6 +346,73 @@ describe('stuck-warning card tui_keys handler', () => {
     );
   });
 
+  it('claims a normal TUI card synchronously so a second final click cannot inject keys twice', async () => {
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+      tuiPromptOptions: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['1', 'Enter'] },
+        { text: 'Reject', selected: false, type: 'select', keys: ['3', 'Enter'] },
+      ],
+    });
+    const deps = makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]]));
+
+    await handleCardAction(
+      makeTuiKeysEvent({
+        keys: '["1","Enter"]',
+        selected_index: '0',
+        selected_text: 'Approve',
+        option_type: 'select',
+        is_final: '1',
+      }) as any,
+      deps,
+      APP_ID,
+    );
+    await handleCardAction(
+      makeTuiKeysEvent({
+        keys: '["3","Enter"]',
+        selected_index: '1',
+        selected_text: 'Reject',
+        option_type: 'select',
+        is_final: '1',
+      }) as any,
+      deps,
+      APP_ID,
+    );
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(ds.tuiPromptProcessing).toBe(true);
+  });
+
+  it('releases the normal TUI key claim when daemon-to-worker IPC delivery fails', async () => {
+    workerSend.mockImplementation((_message, callback?: (error: Error | null) => void) => {
+      callback?.(new Error('channel closed'));
+      return false;
+    });
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+      tuiPromptOptions: [
+        { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
+      ],
+    });
+
+    const result = await handleCardAction(
+      makeTuiKeysEvent({
+        keys: '["Enter"]',
+        selected_index: '0',
+        selected_text: 'Approve',
+        option_type: 'select',
+        is_final: '1',
+      }) as any,
+      makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])),
+      APP_ID,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.tuiPromptProcessing).toBe(false);
+  });
+
   it('keeps text-input cards active while awaiting the worker/backend ACK', async () => {
     const ds = makeDs({
       worker: { killed: false, connected: true, send: workerSend } as any,
@@ -369,6 +436,40 @@ describe('stuck-warning card tui_keys handler', () => {
       }),
       expect.any(Function),
     );
+  });
+
+  it('claims a normal TUI text-input card until the worker/backend ACK arrives', async () => {
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+    });
+    const deps = makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]]));
+
+    await handleCardAction(makeTuiTextEvent('first answer') as any, deps, APP_ID);
+    await handleCardAction(makeTuiTextEvent('second answer') as any, deps, APP_ID);
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(ds.tuiPromptProcessing).toBe(true);
+  });
+
+  it('releases the normal TUI text-input claim when daemon-to-worker IPC delivery fails', async () => {
+    workerSend.mockImplementation((_message, callback?: (error: Error | null) => void) => {
+      callback?.(new Error('channel closed'));
+      return false;
+    });
+    const ds = makeDs({
+      worker: { killed: false, connected: true, send: workerSend } as any,
+      tuiPromptCardId: CARD_ID,
+    });
+
+    const result = await handleCardAction(
+      makeTuiTextEvent('retryable answer') as any,
+      makeDeps(new Map([[sessionKey(ROOT_ID, APP_ID), ds]])),
+      APP_ID,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'warning' } });
+    expect(ds.tuiPromptProcessing).toBe(false);
   });
 
   it('does not render text input as processing when nothing was dispatched', async () => {

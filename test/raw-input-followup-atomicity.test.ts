@@ -122,6 +122,19 @@ describe('worker raw_input delivery', () => {
     expect(region).not.toContain('if (!isPromptReady)');
     expect(region).not.toContain('if (isPromptReady)');
   });
+
+  it('surfaces an ambiguous terminal and user notice when the literal command write fails', () => {
+    const catchIdx = region.indexOf('catch (err');
+    const terminalIdx = region.indexOf(
+      "emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed')",
+      catchIdx,
+    );
+    const notifyIdx = region.indexOf("type: 'user_notify'", catchIdx);
+
+    expect(catchIdx).toBeGreaterThanOrEqual(0);
+    expect(terminalIdx).toBeGreaterThan(catchIdx);
+    expect(notifyIdx).toBeGreaterThan(terminalIdx);
+  });
 });
 
 describe('worker command-line write mutex', () => {

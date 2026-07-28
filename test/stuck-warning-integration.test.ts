@@ -339,6 +339,7 @@ describe('stuck-warning state machine (integration)', () => {
     const ds = makeDs({
       worker: fakeWorker,
       tuiPromptCardId: 'om_tui_card',
+      tuiPromptProcessing: true,
       tuiPromptOptions: [
         { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
       ],
@@ -353,6 +354,7 @@ describe('stuck-warning state machine (integration)', () => {
     await flush();
     expect(updateMessageMock).not.toHaveBeenCalled();
     expect(ds.tuiPromptCardId).toBe('om_tui_card');
+    expect(ds.tuiPromptProcessing).toBe(true);
 
     fakeWorker.emit('message', {
       type: 'tui_prompt_resolved',
@@ -362,6 +364,7 @@ describe('stuck-warning state machine (integration)', () => {
     await flush();
     expect(updateMessageMock).toHaveBeenCalledTimes(1);
     expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
   });
 
   it('normal TUI backend failure renders failed instead of selected', async () => {
@@ -369,6 +372,7 @@ describe('stuck-warning state machine (integration)', () => {
     const ds = makeDs({
       worker: fakeWorker,
       tuiPromptCardId: 'om_tui_card',
+      tuiPromptProcessing: true,
       tuiPromptOptions: [
         { text: 'Approve', selected: false, type: 'select', keys: ['Enter'] },
       ],
@@ -388,6 +392,7 @@ describe('stuck-warning state machine (integration)', () => {
       expect.stringContaining('"type":"failed"'),
     );
     expect(ds.tuiPromptCardId).toBeUndefined();
+    expect(ds.tuiPromptProcessing).toBe(false);
   });
 
   it('old ACK (nonce=1) after new warning (nonce=2) does not affect new authority', async () => {

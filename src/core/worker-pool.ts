@@ -3961,6 +3961,7 @@ function setupWorkerHandlers(
         ds.tuiPromptOptions = msg.options;
         ds.tuiPromptMultiSelect = msg.multiSelect;
         ds.tuiToggledIndices = [];
+        ds.tuiPromptProcessing = false;
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'tui_prompt',
           description: msg.description,
@@ -4020,6 +4021,7 @@ function setupWorkerHandlers(
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
+          ds.tuiPromptProcessing = false;
           break;
         }
         if (ds.tuiPromptCardId) {
@@ -4029,6 +4031,7 @@ function setupWorkerHandlers(
           );
           ds.tuiPromptCardId = undefined;
           ds.tuiPromptOptions = undefined;
+          ds.tuiPromptProcessing = false;
           publishAttentionPatch(ds);
         }
         break;
@@ -4074,6 +4077,7 @@ function setupWorkerHandlers(
           ds.tuiPromptOptions = undefined;
           ds.tuiPromptMultiSelect = undefined;
           ds.tuiToggledIndices = undefined;
+          ds.tuiPromptProcessing = false;
         }
         if (matchesStuckCard) clearStuckWarningAuthority(ds);
         publishAttentionPatch(ds);

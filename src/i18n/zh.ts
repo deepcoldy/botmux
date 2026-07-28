@@ -760,6 +760,7 @@ export const messages: Record<string, string> = {
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.start_exited_early': 'worker 在就绪前退出（exit code: {code}）；详细错误可查看 Botmux 日志。',
   'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
+  'worker.raw_input_failed': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。请检查当前终端状态后重发。',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
