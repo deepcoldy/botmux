@@ -67,6 +67,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -15534,11 +15535,13 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
  * prompt is the configured prompt, or empty (the role/identity envelope still
  * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
  *
- * Scope is mode-aware: a 普通群 gets a chat-scope session anchored at chatId; a
- * 话题群 (topic mode) has no thread to attach to yet, so we seed a fresh topic
- * (a top-level message) and run a thread-scope session anchored at that seed —
- * otherwise a chat-scope session in a 话题群 is the known stale-session bug
- * (every reply would wrap into a new topic, and later messages route elsewhere).
+ * Scope is mode-aware: a 普通群 keeps a chat-scope session anchored at chatId.
+ * When its reply mode is shared, a top-level seed supplies the visible topic
+ * root while every turn still reuses that chat-scope session. A 话题群 has no
+ * thread to attach to yet, so it also seeds a fresh topic, but runs a
+ * thread-scope session anchored at that seed — otherwise a chat-scope session
+ * in a 话题群 is the known stale-session bug (every reply would wrap into a new
+ * topic, and later messages route elsewhere).
  */
 async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
@@ -15616,6 +15619,14 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
+    const sharedReplyRootId = mode === 'group' && resolveRegularGroupMode(larkAppId, chatId) === 'shared'
+      ? await sendMessage(
+          larkAppId,
+          chatId,
+          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          'text',
+        )
+      : undefined;
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15651,7 +15662,12 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
+      pendingTurnId: sharedReplyRootId,
     };
+    if (sharedReplyRootId) {
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      sessionStore.updateSession(ds.session);
+    }
     activeSessions.set(dsKey, ds);
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
@@ -15679,7 +15695,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -15700,13 +15717,16 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
     autoStartJoinInFlight.delete(lockKey);
   }
 }
+
+export const __testOnly_handleBotAdded = handleBotAdded;
 
 /** Reverse-lookup a foreign bot's display name for a sender open_id observed on
  *  this app's WS events. Priority:
