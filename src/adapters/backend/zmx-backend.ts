@@ -65,12 +65,33 @@ const ZMX_SEND_CHUNK_BYTES = 1024;
 // one-shot payloads well below that ceiling before writing any prefix; adapters
 // that intentionally stream larger input already split and throttle their calls.
 const ZMX_SEND_MAX_BYTES = 64 * 1024;
+const BRACKETED_PASTE_START_BYTES = Buffer.from('\x1b[200~');
+const BRACKETED_PASTE_END = '\x1b[201~';
 const ZMX_TRANSPORT_LABEL = 'botmux.transport';
 const ZMX_TRANSPORT = 'tail-send-v1';
 const ZMX_SESSION_LABEL = 'botmux.session';
 const ZMX_LAUNCH_PID_LABEL = 'botmux.launch_pid';
 
 type BackendState = 'idle' | 'observing' | 'recovering' | 'stopped' | 'exited';
+
+function hasUnclosedBracketedPaste(bytes: Buffer): boolean {
+  const endBytes = Buffer.from(BRACKETED_PASTE_END);
+  let openPastes = 0;
+  let cursor = 0;
+  while (cursor < bytes.length) {
+    const nextOpen = bytes.indexOf(BRACKETED_PASTE_START_BYTES, cursor);
+    const nextClose = bytes.indexOf(endBytes, cursor);
+    if (nextOpen < 0 && nextClose < 0) break;
+    if (nextOpen >= 0 && (nextClose < 0 || nextOpen < nextClose)) {
+      openPastes += 1;
+      cursor = nextOpen + BRACKETED_PASTE_START_BYTES.length;
+      continue;
+    }
+    if (openPastes > 0) openPastes -= 1;
+    cursor = nextClose + endBytes.length;
+  }
+  return openPastes > 0;
+}
 
 type BackingIdentityProbe =
   | { state: 'compatible'; clients: number | null }
@@ -1327,9 +1348,11 @@ export class ZmxBackend implements SessionBackend {
         if (stdout.trim()) {
           logger.warn(`[zmx:${this.sessionName}] send rejected: ${stdout.trim()}`);
           const probe = this.verifyBackingIdentity('send rejection');
-          if (bracketedPaste || offset > 0) {
+          const closeOpenPaste = bracketedPaste
+            || hasUnclosedBracketedPaste(bytes.subarray(0, offset));
+          if (closeOpenPaste || offset > 0) {
             if (probe.state === 'compatible') {
-              this.abortPartialSend(bracketedPaste);
+              this.abortPartialSend(closeOpenPaste);
             } else {
               logger.warn(
                 `[zmx:${this.sessionName}] skipped partial-send recovery: ` +
@@ -1347,9 +1370,11 @@ export class ZmxBackend implements SessionBackend {
         );
         // Never retry an ambiguous send: ZMX has no PTY-level ACK, so retrying
         // can duplicate a prompt that the daemon already queued.
-        if (bracketedPaste || offset > 0) {
+        const closeOpenPaste = bracketedPaste
+          || hasUnclosedBracketedPaste(bytes.subarray(0, offset));
+        if (closeOpenPaste || offset > 0) {
           if (probe.state === 'compatible') {
-            this.abortPartialSend(bracketedPaste);
+            this.abortPartialSend(closeOpenPaste);
           } else {
             logger.warn(
               `[zmx:${this.sessionName}] skipped partial-send recovery: ` +
@@ -1364,12 +1389,12 @@ export class ZmxBackend implements SessionBackend {
     return true;
   }
 
-  private abortPartialSend(bracketedPaste: boolean): void {
+  private abortPartialSend(closeOpenPaste: boolean): void {
     if (!this.lastOpts) return;
     // A failed multi-frame paste may have delivered the opening marker but not
     // its close. Best-effort close it first, then cancel the partial composer
     // so a later retry cannot append to/trivially submit truncated input.
-    const recovery = bracketedPaste ? '\x1b[201~\x03' : '\x03';
+    const recovery = closeOpenPaste ? `${BRACKETED_PASTE_END}\x03` : '\x03';
     try {
       const stdout = execFileSync('zmx', ['send', this.sessionName], {
         input: Buffer.concat([Buffer.from(recovery), Buffer.from('\n')]),

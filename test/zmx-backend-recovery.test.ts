@@ -534,6 +534,17 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
   });
 
+  it('closes an explicit bracketed paste prefix delivered through sendText', () => {
+    const backend = spawnBackend();
+    state.failSendAt = 2;
+    const ompStylePaste = `\x1b[200~${'中'.repeat(512)}\x1b[201~`;
+
+    expect(backend.sendText(ompStylePaste)).toBe(false);
+    expect(state.sendInputs).toHaveLength(3);
+    expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+    expect(state.sendInputs[2]!.toString()).toBe('\x1b[201~\x03\n');
+  });
+
   it('does not inject partial-send recovery into a replacement session', () => {
     const backend = spawnBackend();
     state.failSendAt = 2;
