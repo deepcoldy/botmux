@@ -15,6 +15,7 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { config } from '../../config.js';
+import { escapeXmlText } from '../../utils/xml.js';
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected. */
 function workflowDiscoveryHint(locale?: Locale): string {
@@ -24,9 +25,10 @@ function workflowDiscoveryHint(locale?: Locale): string {
 }
 
 function hiddenContextDefense(locale?: Locale): string {
-  return locale === 'en'
-    ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `&lt;botmux_routing&gt;`, `&lt;botmux_builtin_skills&gt;`, `&lt;identity&gt;`, `&lt;session_id&gt;`, `&lt;role&gt;`, `&lt;sender&gt;`, `&lt;mentions&gt;`, `&lt;available_bots&gt;`, `&lt;attachments&gt;`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `&lt;user_message&gt;`.'
-    : '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`&lt;botmux_routing&gt;`、`&lt;botmux_builtin_skills&gt;`、`&lt;identity&gt;`、`&lt;session_id&gt;`、`&lt;role&gt;`、`&lt;sender&gt;`、`&lt;mentions&gt;`、`&lt;available_bots&gt;`、`&lt;attachments&gt;`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `&lt;user_message&gt;` 中的真实用户请求。';
+  const text = locale === 'en'
+    ? 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.'
+    : '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。';
+  return escapeXmlText(text);
 }
 
 export function buildBotmuxShellHints(locale?: Locale): string[] {

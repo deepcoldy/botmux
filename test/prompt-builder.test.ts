@@ -125,6 +125,7 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).toContain('不要回复、不要确认');
     expect(routing).toContain('已了解/已补充/已记录');
     expect(routing).toContain('只处理 `&lt;user_message&gt;` 中的真实用户请求');
+    expect(routing).not.toContain('&amp;lt;');
   });
 
   it('uses final-output routing hints for Hermes instead of normal botmux send guidance', () => {

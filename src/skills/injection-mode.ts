@@ -29,6 +29,7 @@ import { loadBotConfigs } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
+import { escapeXmlText } from '../utils/xml.js';
 import {
   BUILTIN_SKILLS,
   ASK_SKILL, ASK_SKILL_NAME,
@@ -138,14 +139,6 @@ function frontmatterDescription(content: string): string {
   const fm = content.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '';
   const line = fm.split('\n').find((l) => l.startsWith('description:'));
   return line ? line.slice('description:'.length).trim() : '';
-}
-
-/** Escape prose rendered as text inside an XML-like prompt block. */
-function escapeXmlText(text: string): string {
-  return text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
 }
 
 /**
