@@ -348,13 +348,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
-  // schedules.json: `botmux schedule` is a READ-MODIFY-WRITE store shared by all
-  // bots (one file). It must be readWrite — a read-deny makes a sandboxed
-  // `botmux schedule` load an empty map and overwrite, wiping EVERY bot's tasks.
-  // This DOES expose other bots' task prompts+routing; accepted by the owner
-  // (王旭 2026-07-16) as the cost of the schedule feature — same call the old
-  // read-isolation made (schedules.json deliberately never denied).
-  push([`${sd}/schedules.json`], 'readWrite', 'internal');
+  // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
+  // already readWrite above and siblings' stores are denied by construction,
+  // so the old shared data/schedules.json grant (and the cross-bot task-prompt
+  // exposure it had to accept) is gone. The RMW sibling lock lives in the same
+  // rw dir, so sandboxed `botmux schedule` mutations work on both platforms.)
   // macOS lark-cli key store carve-out. The baseline DENIES the whole
   // `~/Library/Application Support/lark-cli` dir (it holds EVERY bot's appsecret
   // ciphertext + the master key — the pre-refactor cross-bot leak). But this bot

@@ -222,9 +222,13 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
   if (ds?.larkAppId) {
     const bot = getBot(ds.larkAppId);
     const dirs = new Set<string>();
-    const workingDirs = bot.config.workingDirs?.length
-      ? bot.config.workingDirs
-      : parseWorkingDirList(bot.config.workingDir ?? '~');
+    const configuredMultiDirs = parseWorkingDirList(bot.config.workingDirs);
+    const configuredLegacyDirs = parseWorkingDirList(bot.config.workingDir);
+    const workingDirs = configuredMultiDirs.length > 0
+      ? configuredMultiDirs
+      : configuredLegacyDirs.length > 0
+        ? configuredLegacyDirs
+        : [effectiveDefaultWorkingDir(bot.config) ?? '~'];
     for (const wd of workingDirs) {
       dirs.add(expandHome(wd));
     }
@@ -235,7 +239,14 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
   }
   // Fallback to global config
   const dirs = new Set<string>();
-  for (const wd of config.daemon.workingDirs) {
+  const configuredMultiDirs = parseWorkingDirList(config.daemon.workingDirs);
+  const configuredLegacyDirs = parseWorkingDirList(config.daemon.workingDir);
+  const workingDirs = configuredMultiDirs.length > 0
+    ? configuredMultiDirs
+    : configuredLegacyDirs.length > 0
+      ? configuredLegacyDirs
+      : ['~'];
+  for (const wd of workingDirs) {
     dirs.add(expandHome(wd));
   }
   if (ds?.workingDir) {

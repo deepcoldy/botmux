@@ -75,6 +75,7 @@ import {
   type SessionTopicGroup,
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
+import { dashboardShellAllowsWebTerminal } from './client-shell.js';
 import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
 import {
   filterMentionBots,
@@ -242,7 +243,7 @@ function IconActionButton(props: {
 }
 
 function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
-  if (!props.url) return null;
+  if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
   const readOnly = !shouldOpenWritableTerminal();
   return (
     <span className={`term-pill${readOnly ? ' readonly' : ' writable'}`}>
@@ -662,12 +663,15 @@ function BulkBar(props: {
   const busy = !!props.closeProgress || !!props.lockProgress;
   const lockText = props.lockProgress?.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.lockSelected');
   const unlockText = props.lockProgress && !props.lockProgress.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.unlockSelected');
+  const webTerminalAvailable = dashboardShellAllowsWebTerminal();
   return (
     <div id="bulk-bar" className="bulk-bar" hidden={props.selectedCount === 0}>
       <span id="bulk-count">{t('sessions.selectedCount', { count: props.selectedCount })}</span>
-      <button type="button" id="bulk-monitor-room" disabled={busy || props.selectedCount === 0} onClick={props.onAddToMonitorRoom}>
-        {props.monitorRoomText ?? t('sessions.addToMonitorRoom')}
-      </button>
+      {webTerminalAvailable ? (
+        <button type="button" id="bulk-monitor-room" disabled={busy || props.selectedCount === 0} onClick={props.onAddToMonitorRoom}>
+          {props.monitorRoomText ?? t('sessions.addToMonitorRoom')}
+        </button>
+      ) : null}
       <button type="button" id="bulk-lock" disabled={busy || props.lockDisabled} onClick={() => props.onLock(true)}>{lockText}</button>
       <button type="button" id="bulk-unlock" disabled={busy || props.unlockDisabled} onClick={() => props.onLock(false)}>{unlockText}</button>
       <button type="button" id="bulk-close" className="contrast" disabled={busy} onClick={props.onClose}>
@@ -2715,6 +2719,7 @@ function SessionsPage(): JSX.Element {
   }, []);
 
   const openTerminalModal = useCallback((row: any): void => {
+    if (!dashboardShellAllowsWebTerminal()) return;
     const readonlyUrl = terminalHref(row);
     if (!readonlyUrl) {
       setDrawerSessionId(row.sessionId);
@@ -3043,9 +3048,11 @@ function SessionsPage(): JSX.Element {
           </div>
         </div>
         <div className="page-heading-actions sessions-page-actions">
-          <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
-            {t('sessions.monitorRoom')}
-          </button>
+          {dashboardShellAllowsWebTerminal() ? (
+            <button type="button" id="monitor-room-open" className="monitor-room-open" onClick={() => { window.location.href = monitorRoomUrl(); }}>
+              {t('sessions.monitorRoom')}
+            </button>
+          ) : null}
           {ui.authed ? (
             <button
               type="button"
@@ -3230,7 +3237,7 @@ function SessionsPage(): JSX.Element {
               onMoveRows={handleKanbanMoves}
               onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
               onNeedTeams={() => { void loadKanbanTeams(); }}
-              onOpenTerminal={openTerminalModal}
+              onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
               onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
               onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
               onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}

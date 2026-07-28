@@ -37,13 +37,16 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
-import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, managedTargetsForCliChange, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
+import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
+import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomUUID();
+const restartCoordinator = new RestartCoordinator();
 
 export function getDaemonBootId(): string {
   return DAEMON_BOOT_ID;
@@ -135,6 +138,12 @@ function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
   return env;
+}
+
+/** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
+function syncWorkerDisplayMode(ds: DaemonSession): void {
+  if (!ds.worker || !ds.displayMode || ds.displayMode === 'hidden') return;
+  ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
 }
 
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
@@ -1322,6 +1331,7 @@ export function ensureClaudeFolderTrust(workingDir: string, stateJsonPath: strin
 // ─── Kill worker ────────────────────────────────────────────────────────────
 
 export function killWorker(ds: DaemonSession): void {
+  restartCoordinator.cancelSession(ds.session.sessionId);
   clearUsageLimitState(ds);
   ds.localProcessAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
@@ -1357,6 +1367,123 @@ export function killWorker(ds: DaemonSession): void {
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
+}
+
+/**
+ * Whether a worker-less restart must first destroy the session's persistent
+ * backing pane. Adopt sessions are excluded — botmux never owned the user's
+ * pane, so killing it would violate the bridge invariant. Pure so the
+ * adopt-skip decision is unit-testable without spawning a worker.
+ */
+export function shouldDestroyPaneBeforeRestart(
+  ds: Pick<DaemonSession, 'initConfig' | 'adoptedFrom'>,
+): boolean {
+  return !ds.initConfig?.adoptMode && !ds.adoptedFrom;
+}
+
+/**
+ * Destroy a still-alive persistent backing pane (tmux/herdr/zellij) before a
+ * worker-less restart forks a fresh worker. Without this, a session that lost
+ * its worker but kept its pane (the normal post-daemon-restart state) would let
+ * spawnCli REATTACH the surviving CLI instead of relaunching it — the CLI is
+ * never actually restarted, yet prompt-ready still fires `restart_result:
+ * succeeded`, so the user sees "restarted" while a wedged CLI stays wedged.
+ * Killing the pane first forces a genuine physical fresh spawn, making the
+ * success receipt truthful.
+ *
+ * Fail-safe (codex 复审观察): the kill primitives swallow their own failures
+ * (TmuxBackend.killSession `catch {}`, Herdr `runHerdr` returns false), so a
+ * plain try/catch here can NEVER observe a failed kill — a wedged tmux server
+ * could leave the pane alive and the fork would silently reattach. So we PROBE
+ * after killing and retry once if the pane survives, escalating to a loud warn
+ * when it still exists. A surviving pane still forks (refusing would strand the
+ * session with no restart at all, strictly worse than the original bug), but
+ * the warn makes the rare failure diagnosable instead of a silent false
+ * success. A fully reattach-proof path (forceFresh signal into spawnCli) is a
+ * larger, separate change — tracked as a follow-up, not blocking this fix.
+ *
+ * Scope: persistent panes only (getSessionPersistentBackendType excludes riff,
+ * which never reattaches — it always builds a fresh RiffBackend — and whose
+ * remote task must survive a restart to preserve follow-up lineage). Adopt
+ * sessions are skipped: botmux never owned the user's pane.
+ */
+function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
+  if (!shouldDestroyPaneBeforeRestart(ds)) return;
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) return;
+
+  const killOnce = (): void => {
+    try {
+      killPersistentBackendTarget(target);
+    } catch (err) {
+      // The primitives normally swallow their own errors; this only catches a
+      // truly unexpected throw (e.g. target resolution). Non-fatal — the probe
+      // below is the real signal.
+      logger.warn(`[${tag(ds)}] restart: kill of ${target.backendType} pane threw: ${err}`);
+    }
+  };
+
+  killOnce();
+  // Advance a single probe result monotonically through the real retry path so
+  // an 'unknown' first probe is never mislabelled as a post-retry survivor:
+  //  - 'missing' → gone, fork is genuinely fresh.
+  //  - 'unknown' → probe indeterminate (e.g. tmux server hiccup); do NOT retry
+  //    and do NOT block the restart — pre-fix always forked, stranding is worse.
+  //  - 'exists'  → confirmed alive: warn, kill once more, re-probe. Only this
+  //    branch performs (and can report) a retry.
+  let probe = probePersistentBackendTarget(target);
+  if (probe === 'exists') {
+    logger.warn(`[${tag(ds)}] restart: ${target.backendType} pane survived first kill — retrying before refork`);
+    killOnce();
+    probe = probePersistentBackendTarget(target);
+  }
+  if (probe === 'exists') {
+    // The kill genuinely failed (twice). Forking will likely reattach the live
+    // pane (the very bug this guards), so the eventual `restart_result:
+    // succeeded` may again be untruthful — but leave a loud, greppable trail.
+    logger.error(
+      `[${tag(ds)}] restart: ${target.backendType} pane STILL alive after retry — `
+      + 'the refork may reattach instead of relaunching (restart success may be untruthful)',
+    );
+  } else if (probe === 'unknown') {
+    // Do NOT over-promise a relaunch: an indeterminate probe could still be a
+    // live pane the fork reattaches. Fork proceeds (stranding is worse) but the
+    // diagnostic must not claim a fresh relaunch it can't guarantee.
+    logger.warn(
+      `[${tag(ds)}] restart: ${target.backendType} kill outcome indeterminate — `
+      + 'refork may reattach instead of relaunching',
+    );
+  } else {
+    logger.info(
+      `[${tag(ds)}] restart: ${target.backendType} pane missing after kill — CLI will physically relaunch`,
+    );
+  }
+}
+
+/** Join or start one correlated physical restart for a session. */
+export function requestSessionRestart(
+  ds: DaemonSession,
+  observer: RestartObserver,
+): { attemptId: string; joined: boolean } {
+  return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+    if (ds.worker && !ds.worker.killed) {
+      ds.worker.send({ type: 'restart', attemptId } as DaemonToWorker);
+      return;
+    }
+    // No live worker but the persistent pane may still be alive (e.g. after a
+    // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
+    // fresh CLI instead of reattaching the old one and falsely reporting a
+    // successful restart.
+    destroyLivePaneBeforeRestart(ds);
+    forkWorker(ds, '', {
+      resume: ds.hasHistory,
+      restartAttemptId: attemptId,
+    });
+  });
+}
+
+export function __testOnly_resetRestartCoordinator(): void {
+  restartCoordinator.reset();
 }
 
 /**
@@ -1956,6 +2083,7 @@ export function forkWorker(
     resume?: boolean;
     turnId?: string;
     dispatchAttempt?: number;
+    restartAttemptId?: string;
   } = false,
 ): void {
   // Device enrollment briefly freezes every daemon before the one-way host
@@ -1994,12 +2122,14 @@ export function forkWorker(
   let resume = false;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let restartAttemptId: string | undefined;
   if (typeof resumeOrTurnId === 'string') {
     initTurnId = resumeOrTurnId;
   } else if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
     resume = resumeOrTurnId.resume === true;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    restartAttemptId = resumeOrTurnId.restartAttemptId;
   } else {
     resume = resumeOrTurnId;
   }
@@ -2239,6 +2369,7 @@ export function forkWorker(
     promptPayload.codexAppInput,
     initAttributionTurnId,
   );
+  const runtimeIdentity = runtimeBuildIdentity();
   const initMsg: DaemonToWorker = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -2318,6 +2449,11 @@ export function forkWorker(
     ),
     pluginBindings: botCfg.plugins,
     skillPolicy: botCfg.skills,
+    ...(runtimeIdentity.status === 'known'
+      ? { runnerBuildId: runtimeIdentity.id }
+      : {}),
+    ...(ds.session.runnerBuildId ? { persistedRunnerBuildId: ds.session.runnerBuildId } : {}),
+    ...(restartAttemptId ? { restartAttemptId } : {}),
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -2695,6 +2831,7 @@ function setupWorkerHandlers(
         // (if any) is left untouched. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
+          syncWorkerDisplayMode(ds);
           logger.info(`[${t}] Restored session — suppressing recovery streaming card (silent restart)`);
           break;
         }
@@ -2747,9 +2884,7 @@ function setupWorkerHandlers(
             }
             persistStreamCardState(ds);
             // Re-sync worker's display mode (it starts fresh in 'hidden')
-            if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
-              ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
-            }
+            syncWorkerDisplayMode(ds);
             // The restored card is now the active one — withdraw any cards
             // frozen before the daemon went down so they don't pile up in the
             // thread on each restart.
@@ -2814,9 +2949,7 @@ function setupWorkerHandlers(
           ds.streamCardPending = false;
           persistStreamCardState(ds);
           // Re-sync worker's display mode (it starts fresh in 'hidden')
-          if (ds.worker && ds.displayMode && ds.displayMode !== 'hidden') {
-            ds.worker.send({ type: 'set_display_mode', mode: ds.displayMode } as DaemonToWorker);
-          }
+          syncWorkerDisplayMode(ds);
           // New card is live — recall any cards frozen by previous turns.
           // Done after `streamCardId` is committed so we never delete the old
           // card without a successor visible to the user.
@@ -2928,6 +3061,31 @@ function setupWorkerHandlers(
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');
+        break;
+      }
+
+      case 'runner_build_ready': {
+        const identity = runtimeBuildIdentity();
+        if (
+          ds.worker === worker
+          && effectiveCliId === 'codex-app'
+          && identity.status === 'known'
+          && msg.runnerBuildId === identity.id
+        ) {
+          ds.session.runnerBuildId = msg.runnerBuildId;
+          sessionStore.updateSession(ds.session);
+        } else {
+          logger.warn(`[${t}] Ignored invalid or stale runner_build_ready`);
+        }
+        break;
+      }
+
+      case 'restart_result': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
+          break;
+        }
+        restartCoordinator.resolve(ds.session.sessionId, msg.attemptId, msg.status);
         break;
       }
 
@@ -3630,6 +3788,28 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'steer_accepted': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored steer_accepted from stale worker generation`);
+          break;
+        }
+        logger.info(
+          `[${t}] Codex App steer accepted `
+          + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)}`,
+        );
+        if (managedAuxUiSuppressed(msg.turnId, undefined)) break;
+        try {
+          await scopedReply(tr('worker.steer_accepted', undefined, loc), 'text', msg.turnId);
+        } catch {
+          logger.error(
+            `[${t}] Failed to deliver steer acknowledgement `
+            + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)} `
+            + 'category=delivery',
+          );
+        }
+        break;
+      }
+
       case 'turn_terminal': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored turn_terminal from stale worker generation`);
@@ -3828,6 +4008,7 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
+      restartCoordinator.failSession(ds.session.sessionId);
       ds.worker = null;
       ds.workerPort = null;
       ds.managedTurnOrigin = undefined;

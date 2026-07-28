@@ -599,6 +599,7 @@ describe('daemon-session wrappers', () => {
       sessionId: 'sess-1',
       cliSessionId: 'cli-sess-1',
       cwd: '/live-repo',
+      larkAppId: 'cli_app',
       fresh: true,
     });
     expect(rec).toMatchObject({

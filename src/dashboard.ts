@@ -19,6 +19,11 @@ import {
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
+import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
+import {
+  parseDashboardAskAnswerRequest,
+  proxyDashboardAskAnswer,
+} from './dashboard/desktop-asks.js';
 import { createDebugTerminalManager } from './dashboard/debug-terminal.js';
 import { pickCreatorForGroup } from './dashboard/operator-selector.js';
 import { buildTeamGroupCreatePayload, planGroupCreator } from './dashboard/team-group.js';
@@ -36,6 +41,8 @@ import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  redactSessionEventForPublic,
+  redactSessionsForPublic,
   redactSettingsForPublic,
 } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
@@ -59,6 +66,7 @@ import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
 import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
+import { getGitRepoInfo } from './core/session-row-enrichment.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, botmuxCliEntry, botmuxInstallRoot } from './utils/install-info.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion } from './utils/install-diagnostics.js';
@@ -165,7 +173,10 @@ import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncM
 import { applyPlatformTeamSync, getPlatformTeamSyncRev, listPlatformTeams } from './services/platform-team-store.js';
 import { getBotUnionId } from './services/bot-union-ids-store.js';
 import { cleanupIdleSessions, parseIdleCleanupHours } from './dashboard/session-cleanup.js';
-import { handleDesktopCompat } from './dashboard/compat.js';
+import {
+  compatMachineIdForAuthenticatedRequest,
+  handleDesktopCompat,
+} from './dashboard/compat.js';
 import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
@@ -289,6 +300,14 @@ function verifyDashboardBinding(port: number): Promise<boolean> {
 mkdirSync(REGISTRY_DIR, { recursive: true });
 const registry = new DaemonRegistry(REGISTRY_DIR);
 const aggregator = new Aggregator();
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+
+// Keep Git-derived fields in the central read-model so REST snapshots and SSE
+// share one row shape. Idle/limited turn boundaries force a branch refresh
+// after the CLI has had a chance to change repositories — that is one
+// `git rev-parse` per session per turn, bounded by the resolver's concurrency
+// cap, NOT a slow background poll.
+aggregator.on(sessionPresentation.onEvent);
 
 // 调试终端（owner-only 裸 bash）。默认工作目录取当前所有 session 的工作目录去重，
 // 让 owner 从熟悉的目录起终端复现问题；都没有时模块内退回 homedir。
@@ -1255,7 +1274,11 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
       ]);
       const s = await sRes.json() as { sessions: any[] };
       const sch = await schRes.json() as { schedules: any[] };
-      aggregator.hydrateSessions(d.larkAppId, s.sessions ?? []);
+      const rows = (s.sessions ?? []).map((row) => (
+        d.botAvatarUrl ? { ...row, botAvatarUrl: d.botAvatarUrl } : row
+      ));
+      aggregator.hydrateSessions(d.larkAppId, rows);
+      for (const row of rows) sessionPresentation.schedule(d.larkAppId, row);
       aggregator.hydrateSchedules(sch.schedules ?? []);
     } catch (e: any) {
       logger.warn(`[dashboard] hydrate ${d.larkAppId}: ${e.message ?? e}`);
@@ -1276,13 +1299,24 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
 }
 
 function syncSubscriptions(): void {
-  const online = new Set(registry.list().map(d => d.larkAppId));
+  const daemons = registry.list();
+  const online = new Set(daemons.map(d => d.larkAppId));
   // Attach (hydrate + subscribe) any newly-online daemon. Fire-and-forget
   // because the registry callback is sync and the attach is per-daemon
   // independent.
-  for (const d of registry.list()) {
+  for (const d of daemons) {
     if (!subs.has(d.larkAppId)) {
       void attachDaemon(d);
+    }
+    // Push avatar changes in BOTH directions: gating on `d.botAvatarUrl` would
+    // leave the stale image on every row when a bot's avatar is cleared.
+    const avatar = d.botAvatarUrl ?? null;
+    for (const row of aggregator.getSessions()) {
+      if (row.larkAppId !== d.larkAppId || (row.botAvatarUrl ?? null) === avatar) continue;
+      aggregator.applyEvent(d.larkAppId, {
+        type: 'session.update',
+        body: { sessionId: row.sessionId, patch: { botAvatarUrl: avatar } },
+      });
     }
   }
   // Close subscriptions for daemons that went offline. Cache entries are
@@ -2385,7 +2419,17 @@ const server = createServer(async (req, res) => {
     // Desktop shell compatibility probe (read-only, no token required). Keep it
     // outside the browser auth gate so packaged desktop apps can decide whether
     // this runtime speaks their dashboard protocol before loading the SPA.
-    if (handleDesktopCompat(req, res, url)) {
+    if (req.method === 'GET' && url.pathname === '/__desktop/compat') {
+      const presentedToken = authedToken(req, url);
+      const boundMachineId = activeToken && presentedToken === activeToken
+        ? readPlatformBinding()?.machineId
+        : null;
+      const compatMachineId = compatMachineIdForAuthenticatedRequest(
+        presentedToken,
+        activeToken,
+        boundMachineId,
+      );
+      handleDesktopCompat(req, res, url, { machineId: compatMachineId ?? undefined });
       return;
     }
 
@@ -2645,7 +2689,51 @@ const server = createServer(async (req, res) => {
           ? { ...s, botName: n }
           : s;
       });
-      return jsonRes(res, 200, { sessions });
+      return jsonRes(res, 200, {
+        sessions: authed ? sessions : redactSessionsForPublic(sessions),
+      });
+    }
+
+    // Desktop / operator UI: aggregate pending ask-hooks across daemons.
+    if (req.method === 'GET' && url.pathname === '/api/asks/pending') {
+      const daemons = registry.list();
+      const asks: unknown[] = [];
+      await Promise.all(daemons.map(async (d) => {
+        try {
+          const upstream = await fetchDaemonIpc(d.ipcPort, '/api/asks/pending', {
+            signal: AbortSignal.timeout(2_000),
+          });
+          if (!upstream.ok) return;
+          const body = await upstream.json() as { asks?: unknown[] };
+          for (const a of body.asks ?? []) {
+            asks.push({
+              ...(typeof a === 'object' && a ? a : {}),
+              botName: d.botName,
+              larkAppId: d.larkAppId,
+            });
+          }
+        } catch {
+          /* offline daemon */
+        }
+      }));
+      return jsonRes(res, 200, { asks });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/asks/answer') {
+      let body: unknown;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+      }
+      const parsed = parseDashboardAskAnswerRequest(body);
+      if (!parsed.ok) {
+        return jsonRes(res, 400, { ok: false, error: parsed.error });
+      }
+      const upstream = await proxyDashboardAskAnswer(parsed.value, proxyToDaemon);
+      res.writeHead(upstream.status, { 'content-type': upstream.contentType });
+      res.end(upstream.body);
+      return;
     }
     if (req.method === 'POST' && url.pathname === '/api/sessions/cleanup-idle') {
       let body: { olderThanHours?: unknown; sessionIds?: unknown };
@@ -4889,7 +4977,9 @@ const server = createServer(async (req, res) => {
         // full task object — strip the prompt AND workingDir for anonymous SSE
         // listeners, or the REST-side scrub would be trivially bypassed by
         // `/events`.
-        let body = ev.body;
+        let body = authed
+          ? ev.body
+          : redactSessionEventForPublic(ev.type, ev.body) as typeof ev.body;
         if (!authed && (ev.type === 'schedule.created' || ev.type === 'schedule.updated')) {
           const b = body as { schedule?: Record<string, unknown>; patch?: Record<string, unknown>; id?: string };
           body = {

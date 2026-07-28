@@ -8,6 +8,11 @@ import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import { setScheduleScope } from '../src/services/schedule-store.js';
+
+// Per-bot schedule stores: the daemon binds the store to its own bot before
+// serving IPC; the schedule endpoints under test assume that binding exists.
+setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -17,6 +22,12 @@ import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
+import {
+  _allAskIds,
+  _resetForTest as resetAskBrokerForTest,
+  registerAsk,
+  setCardDispatcher,
+} from '../src/core/ask-broker.js';
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -101,6 +112,7 @@ afterEach(async () => {
   setLarkAppId('');
   __testOnly_resetBotRegistry();
   setIpcAuthSecret(null);
+  resetAskBrokerForTest();
   setExactChatGrantHandler(null);
 });
 
@@ -167,6 +179,106 @@ describe('dashboard IPC server', () => {
       headers: trustedHostHeaders('GET', '/api/sessions', handle.port, rotatedSecret),
     });
     expect(currentSecret.status).toBe(200);
+  });
+});
+
+describe('Desktop ask IPC', () => {
+  it('keeps pending asks behind the trusted-host boundary', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const pending = await fetch(`${base}/api/asks/pending`);
+    expect(pending.status).toBe(403);
+    expect(await pending.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+
+    const answer = await fetch(`${base}/api/asks/answer`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ askId: 'unknown', selections: [['yes']] }),
+    });
+    expect(answer.status).toBe(403);
+    expect(await answer.json()).toEqual({ ok: false, error: 'trusted_host_required' });
+  });
+
+  it('lists and answers only the selected daemon ask with validated selections', async () => {
+    setCardDispatcher({ send: async () => ({ messageId: 'om_dashboard_ask' }) });
+    const result = registerAsk({
+      larkAppId: 'app-one',
+      chatId: 'oc-chat',
+      rootMessageId: 'om-root',
+      sessionId: 'session-one',
+      questions: [{
+        prompt: '继续吗？',
+        options: [
+          { key: 'yes', label: '继续' },
+          { key: 'no', label: '停止' },
+        ],
+        multiSelect: false,
+      }],
+      timeoutMs: 30_000,
+    });
+    const [askId] = _allAskIds();
+    expect(askId).toBeTruthy();
+
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({
+      port: 0,
+      host: '127.0.0.1',
+      authRequired: true,
+    });
+    const base = `http://127.0.0.1:${handle.port}`;
+
+    const pendingPath = '/api/asks/pending';
+    const pending = await fetch(`${base}${pendingPath}`, {
+      headers: trustedHostHeaders('GET', pendingPath, handle.port),
+    });
+    expect(pending.status).toBe(200);
+    expect(await pending.json()).toMatchObject({
+      asks: [{
+        askId,
+        sessionId: 'session-one',
+        larkAppId: 'app-one',
+      }],
+    });
+
+    const answerPath = '/api/asks/answer';
+    const invalid = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [[]] }),
+    });
+    expect(invalid.status).toBe(409);
+    expect(await invalid.json()).toEqual({ ok: false, error: 'stale' });
+
+    const accepted = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [['yes']], by: 'desktop' }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(await accepted.json()).toEqual({ ok: true, outcome: 'accepted' });
+    await expect(result).resolves.toMatchObject({
+      kind: 'answered',
+      answers: [['yes']],
+      by: 'desktop',
+    });
+
+    const duplicate = await fetch(`${base}${answerPath}`, {
+      method: 'POST',
+      headers: {
+        ...trustedHostHeaders('POST', answerPath, handle.port),
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ askId, selections: [['yes']] }),
+    });
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toEqual({ ok: false, error: 'already_settled' });
   });
 });
 

@@ -169,6 +169,13 @@ describe('writeRunnerInput — tmux mode', () => {
         clientUserMessageId: 'om_1',
       },
     });
+
+    const correlated = encodeRunnerInput('legacy prompt', undefined, 'om_reply_1');
+    expect(JSON.parse(Buffer.from(correlated, 'base64').toString('utf8'))).toEqual({
+      type: 'message',
+      content: 'legacy prompt',
+      replyTurnId: 'om_reply_1',
+    });
   });
 
   it('reports submitted:false and flushes the partial when a chunk is dropped', async () => {

@@ -18,14 +18,19 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../src/core/session-marker.js';
-import { withFileLock, withFileLockSync } from '../src/utils/file-lock.js';
+import {
+  __testOnly_setFileLockHooks,
+  withFileLock,
+  withFileLockSync,
+} from '../src/utils/file-lock.js';
 
 function staleClaimPathForTest(lockPath: string): string {
   const observed = statSync(lockPath);
@@ -40,6 +45,22 @@ function staleClaimPathForTest(lockPath: string): string {
   return join(dirname(lockPath), `.botmux-stale-claim-${generation}`);
 }
 
+function plantStaleClaimOwner(
+  target: string,
+  ownerPayload: string,
+): { lockPath: string; claimPath: string; ownerPath: string; old: Date } {
+  const lockPath = target + '.lock';
+  writeFileSync(lockPath, '99999999', 'utf8');
+  const old = new Date(Date.now() - 5_000);
+  utimesSync(lockPath, old, old);
+  const claimPath = staleClaimPathForTest(lockPath);
+  linkSync(lockPath, claimPath);
+  const ownerPath = `${claimPath}.owner-000000000000`;
+  writeFileSync(ownerPath, ownerPayload, 'utf8');
+  utimesSync(ownerPath, old, old);
+  return { lockPath, claimPath, ownerPath, old };
+}
+
 describe('withFileLock', () => {
   let target: string;
 
@@ -47,6 +68,10 @@ describe('withFileLock', () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-file-lock-'));
     target = join(dir, 'data.json');
     writeFileSync(target, '{}', 'utf-8');
+  });
+
+  afterEach(() => {
+    __testOnly_setFileLockHooks();
   });
 
   it('runs fn and releases the lock', async () => {
@@ -237,6 +262,271 @@ describe('withFileLock', () => {
 
     expect(results.sort((left, right) => left - right)).toEqual(Array.from({ length: 12 }, (_, index) => index));
     expect(maxInFlight).toBe(1);
+  });
+
+  it('retries when an async owner pathname is cleaned after the first pinned stat', async () => {
+    const { lockPath, claimPath, ownerPath } = plantStaleClaimOwner(target, '99999998');
+    let cleaned = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStat: path => {
+        if (path !== ownerPath || cleaned) return;
+        cleaned = true;
+        unlinkSync(lockPath);
+        unlinkSync(claimPath);
+        unlinkSync(ownerPath);
+      },
+    });
+
+    await expect(withFileLock(target, async () => 'lost-race-retried', { minStaleAgeMs: 0 }))
+      .resolves.toBe('lost-race-retried');
+    expect(cleaned).toBe(true);
+  });
+
+  it('retries when a sync owner pathname is cleaned after the first pinned stat', () => {
+    const { lockPath, claimPath, ownerPath } = plantStaleClaimOwner(target, '99999998');
+    let cleaned = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStatSync: path => {
+        if (path !== ownerPath || cleaned) return;
+        cleaned = true;
+        unlinkSync(lockPath);
+        unlinkSync(claimPath);
+        unlinkSync(ownerPath);
+      },
+    });
+
+    expect(withFileLockSync(target, () => 'lost-race-retried-sync', { minStaleAgeMs: 0 }))
+      .toBe('lost-race-retried-sync');
+    expect(cleaned).toBe(true);
+  });
+
+  it('retries an async owner observed while its empty payload is being published', async () => {
+    const { ownerPath, old } = plantStaleClaimOwner(target, '');
+    let published = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStat: path => {
+        if (path !== ownerPath || published) return;
+        published = true;
+        writeFileSync(ownerPath, '99999998', 'utf8');
+        utimesSync(ownerPath, old, old);
+      },
+    });
+
+    await expect(withFileLock(target, async () => 'partial-owner-retried', { minStaleAgeMs: 0 }))
+      .resolves.toBe('partial-owner-retried');
+    expect(published).toBe(true);
+  });
+
+  it('retries a sync owner observed while its empty payload is being published', () => {
+    const { ownerPath, old } = plantStaleClaimOwner(target, '');
+    let published = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStatSync: path => {
+        if (path !== ownerPath || published) return;
+        published = true;
+        writeFileSync(ownerPath, '99999998', 'utf8');
+        utimesSync(ownerPath, old, old);
+      },
+    });
+
+    expect(withFileLockSync(target, () => 'partial-owner-retried-sync', { minStaleAgeMs: 0 }))
+      .toBe('partial-owner-retried-sync');
+    expect(published).toBe(true);
+  });
+
+  it('publishes a complete async owner payload before making its pathname visible', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    let ownerAtPublish: { visible: boolean; payload?: string } | undefined;
+    __testOnly_setFileLockHooks({
+      beforeStaleClaimOwnerPublish: ownerPath => {
+        const visible = existsSync(ownerPath);
+        ownerAtPublish = {
+          visible,
+          ...(visible ? { payload: readFileSync(ownerPath, 'utf8') } : {}),
+        };
+      },
+    });
+
+    await expect(withFileLock(target, async () => 'atomically-published', { minStaleAgeMs: 0 }))
+      .resolves.toBe('atomically-published');
+    expect(ownerAtPublish).toEqual({ visible: false });
+  });
+
+  it('publishes a complete sync owner payload before making its pathname visible', () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    let ownerAtPublish: { visible: boolean; payload?: string } | undefined;
+    __testOnly_setFileLockHooks({
+      beforeStaleClaimOwnerPublishSync: ownerPath => {
+        const visible = existsSync(ownerPath);
+        ownerAtPublish = {
+          visible,
+          ...(visible ? { payload: readFileSync(ownerPath, 'utf8') } : {}),
+        };
+      },
+    });
+
+    expect(withFileLockSync(target, () => 'atomically-published-sync', { minStaleAgeMs: 0 }))
+      .toBe('atomically-published-sync');
+    expect(ownerAtPublish).toEqual({ visible: false });
+  });
+
+  it('cleans an orphaned owner publication candidate after stale recovery', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    const claimPath = staleClaimPathForTest(lockPath);
+    const orphanCandidate =
+      `${claimPath}.owner-000000000000.candidate-99999998-550e8400-e29b-41d4-a716-446655440000`;
+    writeFileSync(orphanCandidate, '99999998', 'utf8');
+
+    await expect(withFileLock(target, async () => 'candidate-cleaned', { minStaleAgeMs: 0 }))
+      .resolves.toBe('candidate-cleaned');
+    expect(existsSync(orphanCandidate)).toBe(false);
+  });
+
+  it('does not let an async stale waiter unlink a replacement public lock inode', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    let replacement: ReturnType<typeof lstatSync> | undefined;
+    let callbackCalls = 0;
+    __testOnly_setFileLockHooks({
+      beforeStalePublicLockUnlink: path => {
+        if (replacement) return;
+        unlinkSync(path);
+        writeFileSync(path, String(process.pid), 'utf8');
+        replacement = lstatSync(path);
+      },
+    });
+
+    await expect(withFileLock(target, async () => {
+      callbackCalls++;
+      return 'stolen';
+    }, { minStaleAgeMs: 0, maxWaitMs: 150 })).rejects.toThrow(/file-lock timeout/);
+    expect(callbackCalls).toBe(0);
+    expect(readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    expect(lstatSync(lockPath).ino).toBe(replacement?.ino);
+  });
+
+  it('does not let a sync stale waiter unlink a replacement public lock inode', () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    let replacement: ReturnType<typeof lstatSync> | undefined;
+    let callbackCalls = 0;
+    __testOnly_setFileLockHooks({
+      beforeStalePublicLockUnlinkSync: path => {
+        if (replacement) return;
+        unlinkSync(path);
+        writeFileSync(path, String(process.pid), 'utf8');
+        replacement = lstatSync(path);
+      },
+    });
+
+    expect(() => withFileLockSync(target, () => {
+      callbackCalls++;
+      return 'stolen-sync';
+    }, { minStaleAgeMs: 0, maxWaitMs: 150 })).toThrow(/file-lock timeout/);
+    expect(callbackCalls).toBe(0);
+    expect(readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    expect(lstatSync(lockPath).ino).toBe(replacement?.ino);
+  });
+
+  it('does not steal an async lock that publishes a live holder before stale unlink', async () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    const staleInode = lstatSync(lockPath).ino;
+    let published = false;
+    let callbackCalls = 0;
+    __testOnly_setFileLockHooks({
+      beforeStalePublicLockUnlink: path => {
+        if (published) return;
+        published = true;
+        writeFileSync(path, String(process.pid), 'utf8');
+      },
+    });
+
+    await expect(withFileLock(target, async () => {
+      callbackCalls++;
+      return 'stolen';
+    }, { minStaleAgeMs: 0, maxWaitMs: 150 })).rejects.toThrow(/file-lock timeout/);
+    expect(callbackCalls).toBe(0);
+    expect(readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    expect(lstatSync(lockPath).ino).toBe(staleInode);
+  });
+
+  it('does not steal a sync lock that publishes a live holder before stale unlink', () => {
+    const lockPath = target + '.lock';
+    writeFileSync(lockPath, '99999999', 'utf8');
+    const old = new Date(Date.now() - 5_000);
+    utimesSync(lockPath, old, old);
+    const staleInode = lstatSync(lockPath).ino;
+    let published = false;
+    let callbackCalls = 0;
+    __testOnly_setFileLockHooks({
+      beforeStalePublicLockUnlinkSync: path => {
+        if (published) return;
+        published = true;
+        writeFileSync(path, String(process.pid), 'utf8');
+      },
+    });
+
+    expect(() => withFileLockSync(target, () => {
+      callbackCalls++;
+      return 'stolen-sync';
+    }, { minStaleAgeMs: 0, maxWaitMs: 150 })).toThrow(/file-lock timeout/);
+    expect(callbackCalls).toBe(0);
+    expect(readFileSync(lockPath, 'utf8')).toBe(String(process.pid));
+    expect(lstatSync(lockPath).ino).toBe(staleInode);
+  });
+
+  // A same-length in-flight rewrite of the owner payload is caught via mtime
+  // moving off the planted age. We deliberately do NOT restore mtime here:
+  // relying on ctime to advance is not portable (ext4's ms-resolution ctime
+  // frequently does not tick within a same-size+same-mtime rewrite, so that
+  // assertion was ~64% flaky on Linux). mtime advancing off `old` is a
+  // deterministic, cross-platform signal for the untrusted fail-closed path.
+  it('fails closed when async owner content is rewritten in flight', async () => {
+    const { ownerPath } = plantStaleClaimOwner(target, '99999998');
+    let changed = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStat: path => {
+        if (path !== ownerPath || changed) return;
+        changed = true;
+        writeFileSync(ownerPath, '99999997', 'utf8');
+      },
+    });
+
+    await expect(withFileLock(target, async () => 'unreachable', { minStaleAgeMs: 0 }))
+      .rejects.toThrow('file-lock stale-claim owner changed while reading');
+    expect(changed).toBe(true);
+  });
+
+  it('fails closed when sync owner content is rewritten in flight', () => {
+    const { ownerPath } = plantStaleClaimOwner(target, '99999998');
+    let changed = false;
+    __testOnly_setFileLockHooks({
+      afterPinnedHolderFirstStatSync: path => {
+        if (path !== ownerPath || changed) return;
+        changed = true;
+        writeFileSync(ownerPath, '99999997', 'utf8');
+      },
+    });
+
+    expect(() => withFileLockSync(target, () => 'unreachable-sync', { minStaleAgeMs: 0 }))
+      .toThrow('file-lock stale-claim owner changed while reading');
+    expect(changed).toBe(true);
   });
 
   it('recovers synchronously after a stale-break owner crashes before unlink', () => {

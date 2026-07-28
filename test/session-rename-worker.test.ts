@@ -161,13 +161,13 @@ describe('worker native session rename queue', () => {
     // PR #441 起入队条件多了注入围栏（injectionFlushing / barrier），rename 围栏
     // 仍必须在场——只钉本测试关心的三个 restart/rename 因子，不钉整行。
     expect(rawRegion).toContain('if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight');
-    expect(rawRegion).toContain('pendingRawInputs.push(msg)');
+    expect(rawRegion).toContain('freshnessInputQueue.enqueueRaw(msg)');
     expect(rawRegion).toContain('await deliverRawInput(msg)');
 
     const flushStart = workerSource.indexOf('async function flushPending()');
     const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
     const flushRegion = workerSource.slice(flushStart, flushEnd);
-    expect(flushRegion).toContain('pendingRawInputs.shift()');
+    expect(flushRegion).toContain('freshnessInputQueue.takeRaw()');
     expect(flushRegion).toContain('await deliverRawInput(raw)');
     expect(workerSource).toContain('await sendRawCommandLineSerially(targetBackend, msg.content)');
     expect(flushRegion.indexOf('await deliverRawInput(raw)'))

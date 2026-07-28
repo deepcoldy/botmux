@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { buildCompatManifest, handleDesktopCompat } from '../../src/dashboard/compat.js';
+import {
+  buildCompatManifest,
+  compatMachineIdForAuthenticatedRequest,
+  handleDesktopCompat,
+} from '../../src/dashboard/compat.js';
 
 let server: Server | null = null;
 
@@ -15,16 +19,98 @@ afterEach(async () => {
 });
 
 describe('dashboard desktop compat manifest', () => {
-  it('builds the stable v1 manifest shape', () => {
-    expect(buildCompatManifest({ runtimeVersion: '2.95.0' })).toEqual({
+  it('builds the v2 manifest while retaining the v1 compatibility fields', () => {
+    const manifest = buildCompatManifest({
+      runtimeVersion: '2.95.0',
+    });
+
+    expect(manifest).toMatchObject({
       schemaVersion: 1,
       product: 'botmux',
       runtimeVersion: '2.95.0',
-      dashboardProtocolVersion: 1,
+      dashboardProtocolVersion: 2,
       desktopShell: { supported: true },
-      features: ['desktop-shell', 'dashboard-protocol-v1'],
-      routes: ['#/', '#/sessions', '#/workflows', '#/groups', '#/schedules', '#/settings'],
+      features: expect.arrayContaining([
+        'desktop-shell',
+        'dashboard-protocol-v1',
+        'dashboard-protocol-v2',
+        'dashboard-modules',
+        'dashboard-capabilities',
+      ]),
+      routes: expect.arrayContaining(['#/', '#/sessions', '#/groups', '#/schedules', '#/settings']),
     });
+    expect(manifest.runtimeIdentity).toBeUndefined();
+  });
+
+  it('advertises granular dashboard modules and excludes workflow', () => {
+    const manifest = buildCompatManifest({ runtimeVersion: '2.95.0', machineId: null });
+
+    expect(manifest.modules).toMatchObject({
+      overview: { supported: true, route: '#/' },
+      sessions: { supported: true, route: '#/sessions' },
+      monitoring: { supported: true, route: '#/monitoring' },
+      insights: { supported: true, route: '#/insights' },
+      bots: { supported: true, route: '#/bot-defaults' },
+      schedules: { supported: true, route: '#/schedules' },
+      settings: { supported: true, route: '#/settings' },
+      workflow: { supported: false },
+    });
+    expect(manifest.capabilities).toMatchObject({
+      'overview.read': true,
+      'sessions.read': true,
+      'sessions.manage': true,
+      'asks.answer': true,
+      'monitoring.read': true,
+      'bots.configure': true,
+      'schedules.manage': true,
+      'settings.manage': true,
+      'workflow.read': false,
+      'workflow.manage': false,
+    });
+    expect(manifest.routes).not.toContain('#/workflows');
+    expect(manifest.routes).toEqual(
+      Object.values(manifest.modules)
+        .filter(module => module.supported && module.route)
+        .map(module => module.route),
+    );
+  });
+
+  it('only exposes a machine identity when a reliable id is supplied', () => {
+    expect(buildCompatManifest({
+      runtimeVersion: '2.95.0',
+      machineId: '  machine-123  ',
+    }).runtimeIdentity).toEqual({
+      source: 'platform-binding',
+      machineId: 'machine-123',
+    });
+
+    expect(buildCompatManifest({
+      runtimeVersion: '2.95.0',
+      machineId: '   ',
+    }).runtimeIdentity).toBeUndefined();
+  });
+
+  it('only releases the bound machine identity to the active dashboard token', () => {
+    expect(compatMachineIdForAuthenticatedRequest(
+      'active-token',
+      'active-token',
+      ' machine-123 ',
+    )).toBe('machine-123');
+    expect(compatMachineIdForAuthenticatedRequest(
+      undefined,
+      'active-token',
+      'machine-123',
+    )).toBeNull();
+    expect(compatMachineIdForAuthenticatedRequest(
+      'stale-token',
+      'active-token',
+      'machine-123',
+    )).toBeNull();
+    expect(compatMachineIdForAuthenticatedRequest(
+      'active-token',
+      undefined,
+      'machine-123',
+    )).toBeNull();
   });
 
   it('serves GET /__desktop/compat as read-only JSON', async () => {
@@ -36,8 +122,15 @@ describe('dashboard desktop compat manifest', () => {
     expect(await compat.json()).toMatchObject({
       schemaVersion: 1,
       product: 'botmux',
-      dashboardProtocolVersion: 1,
+      dashboardProtocolVersion: 2,
       desktopShell: { supported: true },
+      modules: {
+        workflow: { supported: false },
+      },
+      capabilities: {
+        'workflow.read': false,
+        'workflow.manage': false,
+      },
     });
 
     const post = await fetch(`${started.baseUrl}/__desktop/compat`, { method: 'POST' });

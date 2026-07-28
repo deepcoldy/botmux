@@ -3,6 +3,7 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.steer_accepted': '收到，引导成功',
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',
@@ -230,6 +231,9 @@ export const messages: Record<string, string> = {
   'cmd.substitute.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改替身模式开关。',
   'cmd.substitute.usage': '用法：@我 /substitute status｜on｜off',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
+  'cmd.restart.succeeded': '✅ {cliName} 已恢复就绪。',
+  'cmd.restart.failed': '❌ {cliName} 重启失败。',
+  'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',
   'cmd.restart.terminated': '{cliName} 进程已终止，下次发消息时将自动恢复。',
   'cmd.cd.usage': '用法：/cd <path>\n例如：/cd ~/projects/my-app',
   'cmd.cd.switched': '工作目录已切换到 {path}，下次发消息时将在新目录下恢复。',

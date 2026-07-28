@@ -166,7 +166,6 @@ export interface SafeInsightOverview {
 export interface InsightOverviewSessionInput extends InsightReportQuery {
   title?: string;
   botName?: string;
-  larkAppId?: string;
   workingDir?: string;
   status?: string;
   lastMessageAt?: number;
@@ -419,6 +418,9 @@ export interface InsightReportQuery {
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
+  /** Owning bot's Lark app id — lets the transcript resolver find sandboxed
+   *  (CLI-data-redirected) bots' transcripts under BOT_HOME. */
+  larkAppId?: string;
 }
 
 export interface RawInsightSpan {

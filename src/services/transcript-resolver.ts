@@ -1,7 +1,8 @@
-import { existsSync, realpathSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, realpathSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { expandHome } from '../core/working-dir.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
@@ -16,6 +17,10 @@ export interface TranscriptPathQuery {
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
+  /** Owning bot's Lark app id. Enables the BOT_HOME fallback for sandboxed
+   *  (CLI-data-redirected) bots whose transcripts live under
+   *  `<botmuxHome>/bots/<appId>/claude` instead of the global data dir. */
+  larkAppId?: string;
   /** Bypass a cached miss for lazily-created transcripts. */
   fresh?: boolean;
 }
@@ -96,20 +101,64 @@ function claudeForkDataDir(cliId: 'seed' | 'relay'): string {
   return dir;
 }
 
+/** The redirected Claude data dir of a sandboxed bot: `<botmuxHome>/bots/<appId>/claude`.
+ *  Sandboxed bots with CLI-data redirect get CLAUDE_CONFIG_DIR pointed here by the
+ *  worker, so their transcripts never appear under the global data dir and every
+ *  daemon-side reader (dashboard token column, usage ledger, insight) must fall
+ *  back to this dir on a global miss. botmuxHome is derived exactly like the
+ *  worker derives BOT_HOME (`dirname(SESSION_DATA_DIR)`); no SESSION_DATA_DIR
+ *  means no redirect ever happened, so no fallback. Deliberately existence-driven
+ *  rather than re-deriving the redirect decision (sandbox × adapter capability ×
+ *  wrapper): probing global-then-BOT_HOME is correct in every combination and
+ *  can't drift from worker.ts. */
+function botHomeClaudeDataDir(larkAppId: string | undefined): string | null {
+  if (!larkAppId) return null;
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  if (!sessionDataDir) return null;
+  try {
+    return join(botHomePath(dirname(sessionDataDir), larkAppId), 'claude');
+  } catch {
+    return null; // unsafe app id — never build a path from it
+  }
+}
+
+function claudeJsonlWithBotHomeFallback(sid: string, q: TranscriptPathQuery, primaryDataDir: string): string | null {
+  if (!q.cwd) return null;
+  const globalPath = getClaudeSessionJsonlPath(sid, q.cwd, primaryDataDir);
+  const botHomeDir = botHomeClaudeDataDir(q.larkAppId);
+  const botHomeJsonl = botHomeDir ? getClaudeSessionJsonlPath(sid, q.cwd, botHomeDir) : null;
+  // Both exist when a persistent session straddles a sandbox flip (the CLI kept
+  // its session id but moved data dirs — either direction). The stale copy stops
+  // growing while the live one keeps its mtime fresh, so newest-wins tracks the
+  // file the CLI is actually writing; a fixed preference would freeze usage at
+  // the flip point forever.
+  if (globalPath && botHomeJsonl) return newerFile(globalPath, botHomeJsonl);
+  return globalPath ?? botHomeJsonl;
+}
+
+/** Ties (e.g. a byte-identical copy) keep `a` — the global/stock path. */
+function newerFile(a: string, b: string): string {
+  try {
+    return statSync(b).mtimeMs > statSync(a).mtimeMs ? b : a;
+  } catch {
+    return a;
+  }
+}
+
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
   switch (q.cliId) {
     case 'claude-code': {
-      const path = q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, join(homedir(), '.claude')) : null;
+      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
-      const path = q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, join(homedir(), '.claude')) : null;
+      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'seed':
     case 'relay': {
-      const path = q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, claudeForkDataDir(q.cliId)) : null;
+      const path = claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'codex': {

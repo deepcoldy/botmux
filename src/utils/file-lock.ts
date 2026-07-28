@@ -36,7 +36,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../core/session-marker.js';
 import { logger } from './logger.js';
@@ -55,6 +55,23 @@ const MIN_INVALID_HOLDER_STALE_AGE_MS = 1_000;
 const STALE_CLAIM_PREFIX = '.botmux-stale-claim-';
 const STALE_CLAIM_OWNER_SUFFIX = '.owner-';
 const STALE_CLAIM_OWNER_WIDTH = 12;
+const STALE_CLAIM_OWNER_CANDIDATE_SUFFIX = '.candidate-';
+
+/** Deterministic filesystem interleavings for unit tests; never set in runtime code. */
+export interface FileLockTestHooks {
+  afterPinnedHolderFirstStat?: (path: string) => void | Promise<void>;
+  afterPinnedHolderFirstStatSync?: (path: string) => void;
+  beforeStaleClaimOwnerPublish?: (ownerPath: string) => void | Promise<void>;
+  beforeStaleClaimOwnerPublishSync?: (ownerPath: string) => void;
+  beforeStalePublicLockUnlink?: (lockPath: string) => void | Promise<void>;
+  beforeStalePublicLockUnlinkSync?: (lockPath: string) => void;
+}
+
+let fileLockTestHooks: FileLockTestHooks | undefined;
+
+export function __testOnly_setFileLockHooks(hooks?: FileLockTestHooks): void {
+  fileLockTestHooks = hooks;
+}
 
 interface LockHolder {
   pid: number;
@@ -158,26 +175,30 @@ function sameInode(
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-async function releaseOwnedLock(lockPath: string, owned: import('node:fs').Stats): Promise<void> {
+async function releaseOwnedLock(lockPath: string, owned: import('node:fs').Stats): Promise<boolean> {
   try {
     const current = await fsp.lstat(lockPath);
     if (current.isFile() && !current.isSymbolicLink() && sameInode(current, owned)) {
       await fsp.unlink(lockPath);
+      return true;
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  return false;
 }
 
-function releaseOwnedLockSync(lockPath: string, owned: import('node:fs').Stats): void {
+function releaseOwnedLockSync(lockPath: string, owned: import('node:fs').Stats): boolean {
   try {
     const current = lstatSync(lockPath);
     if (current.isFile() && !current.isSymbolicLink() && sameInode(current, owned)) {
       unlinkSync(lockPath);
+      return true;
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
+  return false;
 }
 
 function staleClaimPathFor(
@@ -214,46 +235,169 @@ function parseStaleClaimOwnerEpoch(claimPath: string, name: string): number | un
   return Number.isSafeInteger(epoch) ? epoch : undefined;
 }
 
+function staleClaimOwnerCandidatePath(ownerPath: string): string {
+  return `${ownerPath}${STALE_CLAIM_OWNER_CANDIDATE_SUFFIX}${process.pid}-${randomUUID()}`;
+}
+
+function isStaleClaimOwnerCandidate(claimPath: string, name: string): boolean {
+  const prefix = `${basename(claimPath)}${STALE_CLAIM_OWNER_SUFFIX}`;
+  if (!name.startsWith(prefix)) return false;
+  const suffix = name.slice(prefix.length);
+  return new RegExp(
+    `^\\d{${STALE_CLAIM_OWNER_WIDTH}}\\${STALE_CLAIM_OWNER_CANDIDATE_SUFFIX}` +
+    '\\d+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+  ).test(suffix);
+}
+
 interface PinnedHolderObservation {
   holder: LockHolder | undefined;
   ageMs: number;
   stats: import('node:fs').Stats;
 }
 
-async function readPinnedHolder(path: string): Promise<PinnedHolderObservation> {
+type PinnedHolderMetadataState = 'stable' | 'transient' | 'untrusted';
+
+function pinnedHolderMetadataState(
+  before: import('node:fs').Stats,
+  after: import('node:fs').Stats,
+): PinnedHolderMetadataState {
+  if (!before.isFile() || !after.isFile() || !sameInode(before, after)) return 'untrusted';
+
+  const sizeChanged = before.size !== after.size;
+  const mtimeChanged = before.mtimeMs !== after.mtimeMs;
+  const ctimeChanged = before.ctimeMs !== after.ctimeMs;
+  const linkCountChanged = before.nlink !== after.nlink;
+
+  // Compatibility with an older publisher that exposed the O_EXCL inode
+  // before writing its identity. Never trust either snapshot, but let the
+  // caller retry once the payload has become stable.
+  if (before.size === 0 && (sizeChanged || mtimeChanged || ctimeChanged)) {
+    return 'transient';
+  }
+
+  // Content-relevant metadata changing on a non-empty identity is not a
+  // normal owner lifecycle transition. A size or mtime change fails closed
+  // here. Note we cannot detect a same-size rewrite that also restores mtime
+  // purely from metadata: ctime often does not advance within it at ms
+  // resolution (e.g. ext4), so ctime is not a reliable content-tamper signal.
+  // The legitimate owner protocol never rewrites an epoch in place (O_EXCL
+  // once, then a new epoch pathname), so this residual window is defense in
+  // depth rather than a live hazard.
+  if (sizeChanged || mtimeChanged) return 'untrusted';
+
+  // link(2)/unlink(2) legitimately change ctime and nlink without touching
+  // bytes. This means the pinned inode lost a publication/cleanup race; do not
+  // use the observation, and do not surface it as a business error.
+  if (linkCountChanged) return 'transient';
+  if (ctimeChanged) return 'untrusted';
+  if (before.nlink < 1 || after.nlink < 1) return 'transient';
+  return 'stable';
+}
+
+function pinnedHolderIntegrityError(): Error {
+  return new Error('file-lock stale-claim owner changed while reading');
+}
+
+async function readPinnedHolder(path: string): Promise<PinnedHolderObservation | undefined> {
   const handle = await fsp.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = await handle.stat();
+    if (fileLockTestHooks?.afterPinnedHolderFirstStat) {
+      await fileLockTestHooks.afterPinnedHolderFirstStat(path);
+    }
     const raw = await handle.readFile('utf8');
     const after = await handle.stat();
-    if (!before.isFile() || !sameInode(before, after) || before.size !== after.size ||
-        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      throw new Error('file-lock stale-claim owner changed while reading');
+    const pinnedState = pinnedHolderMetadataState(before, after);
+    if (pinnedState === 'transient') return undefined;
+    if (pinnedState === 'untrusted') throw pinnedHolderIntegrityError();
+
+    let current: import('node:fs').Stats;
+    try {
+      current = await fsp.lstat(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
     }
-    return { holder: parseLockHolder(raw), ageMs: Date.now() - after.mtimeMs, stats: after };
+    if (!current.isFile() || current.isSymbolicLink()) throw pinnedHolderIntegrityError();
+    if (!sameInode(after, current)) return undefined;
+    const pathnameState = pinnedHolderMetadataState(after, current);
+    if (pathnameState === 'transient') return undefined;
+    if (pathnameState === 'untrusted') throw pinnedHolderIntegrityError();
+    return { holder: parseLockHolder(raw), ageMs: Date.now() - current.mtimeMs, stats: current };
   } finally {
     await handle.close();
   }
 }
 
-function readPinnedHolderSync(path: string): PinnedHolderObservation {
+function readPinnedHolderSync(path: string): PinnedHolderObservation | undefined {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     const before = fstatSync(fd);
+    fileLockTestHooks?.afterPinnedHolderFirstStatSync?.(path);
     const raw = readFileSync(fd, 'utf8');
     const after = fstatSync(fd);
-    if (!before.isFile() || !sameInode(before, after) || before.size !== after.size ||
-        before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      throw new Error('file-lock stale-claim owner changed while reading');
+    const pinnedState = pinnedHolderMetadataState(before, after);
+    if (pinnedState === 'transient') return undefined;
+    if (pinnedState === 'untrusted') throw pinnedHolderIntegrityError();
+
+    let current: import('node:fs').Stats;
+    try {
+      current = lstatSync(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
     }
-    return { holder: parseLockHolder(raw), ageMs: Date.now() - after.mtimeMs, stats: after };
+    if (!current.isFile() || current.isSymbolicLink()) throw pinnedHolderIntegrityError();
+    if (!sameInode(after, current)) return undefined;
+    const pathnameState = pinnedHolderMetadataState(after, current);
+    if (pathnameState === 'transient') return undefined;
+    if (pathnameState === 'untrusted') throw pinnedHolderIntegrityError();
+    return { holder: parseLockHolder(raw), ageMs: Date.now() - current.mtimeMs, stats: current };
   } finally {
     closeSync(fd);
   }
 }
 
+async function unlinkUnchangedPinnedPath(
+  path: string,
+  pinned: import('node:fs').Stats,
+): Promise<boolean> {
+  let current: import('node:fs').Stats;
+  try {
+    current = await fsp.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!current.isFile() || current.isSymbolicLink()) throw pinnedHolderIntegrityError();
+  if (!sameInode(current, pinned)) return false;
+  if (pinnedHolderMetadataState(pinned, current) !== 'stable') return false;
+  await fsp.unlink(path);
+  return true;
+}
+
+function unlinkUnchangedPinnedPathSync(
+  path: string,
+  pinned: import('node:fs').Stats,
+): boolean {
+  let current: import('node:fs').Stats;
+  try {
+    current = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  if (!current.isFile() || current.isSymbolicLink()) throw pinnedHolderIntegrityError();
+  if (!sameInode(current, pinned)) return false;
+  if (pinnedHolderMetadataState(pinned, current) !== 'stable') return false;
+  unlinkSync(path);
+  return true;
+}
+
 interface StaleClaimOwnership {
   ownerPath: string;
+  candidatePath: string;
+  owned: import('node:fs').Stats;
   handle: import('node:fs/promises').FileHandle;
 }
 
@@ -288,13 +432,14 @@ async function tryAcquireStaleClaimOwnership(
       return undefined;
     }
   } else {
-    let observedOwner: PinnedHolderObservation;
+    let observedOwner: PinnedHolderObservation | undefined;
     try {
       observedOwner = await readPinnedHolder(staleClaimOwnerPath(claimPath, latestEpoch));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
+    if (!observedOwner) return undefined;
     const staleAge = observedOwner.holder
       ? minStaleAgeMs
       : Math.max(minStaleAgeMs, MIN_INVALID_HOLDER_STALE_AGE_MS);
@@ -309,35 +454,61 @@ async function tryAcquireStaleClaimOwnership(
   }
 
   const ownerPath = staleClaimOwnerPath(claimPath, nextEpoch);
+  const candidatePath = staleClaimOwnerCandidatePath(ownerPath);
   let handle: import('node:fs/promises').FileHandle;
   try {
-    handle = await fsp.open(ownerPath, 'wx');
+    handle = await fsp.open(candidatePath, 'wx');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST' ||
         (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+  let owned: import('node:fs').Stats | undefined;
+  const abandonCandidate = async (): Promise<void> => {
+    try { await handle.close(); } catch { /* tolerate */ }
+    if (owned) {
+      try { await releaseOwnedLock(ownerPath, owned); } catch { /* tolerate */ }
+      try { await releaseOwnedLock(candidatePath, owned); } catch { /* tolerate */ }
+    } else {
+      try { await fsp.unlink(candidatePath); } catch { /* tolerate */ }
+    }
+  };
   try {
-    // As with the public lock, publish the identity without an async gap.
     writeFileSync(handle.fd, currentLockHolderPayload());
-    const owner = await handle.stat();
-    const currentClaim = await fsp.lstat(claimPath);
-    if (!owner.isFile() || !sameInode(currentClaim, claim)) {
-      await handle.close();
-      try { await releaseOwnedLock(ownerPath, owner); } catch { /* tolerate */ }
+    owned = await handle.stat();
+    if (!owned.isFile()) throw new Error('file-lock stale-claim owner candidate is not a regular file');
+
+    const currentClaimBeforePublish = await fsp.lstat(claimPath);
+    if (!sameInode(currentClaimBeforePublish, claim)) {
+      await abandonCandidate();
       return undefined;
     }
-    return { ownerPath, handle };
+    if (fileLockTestHooks?.beforeStaleClaimOwnerPublish) {
+      await fileLockTestHooks.beforeStaleClaimOwnerPublish(ownerPath);
+    }
+    // link(2) is an atomic no-overwrite publication: readers can observe
+    // either no epoch pathname or the complete identity, never an empty file.
+    await fsp.link(candidatePath, ownerPath);
+    const publishedOwner = await fsp.lstat(ownerPath);
+    const currentClaim = await fsp.lstat(claimPath);
+    if (!publishedOwner.isFile() || publishedOwner.isSymbolicLink() ||
+        !sameInode(publishedOwner, owned) || !sameInode(currentClaim, claim)) {
+      await abandonCandidate();
+      return undefined;
+    }
+    return { ownerPath, candidatePath, owned, handle };
   } catch (error) {
-    try { await handle.close(); } catch { /* tolerate */ }
-    try { await fsp.unlink(ownerPath); } catch { /* tolerate */ }
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    await abandonCandidate();
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST' ||
+        (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
 }
 
 interface StaleClaimOwnershipSync {
   ownerPath: string;
+  candidatePath: string;
+  owned: import('node:fs').Stats;
   fd: number;
 }
 
@@ -370,13 +541,14 @@ function tryAcquireStaleClaimOwnershipSync(
       return undefined;
     }
   } else {
-    let observedOwner: PinnedHolderObservation;
+    let observedOwner: PinnedHolderObservation | undefined;
     try {
       observedOwner = readPinnedHolderSync(staleClaimOwnerPath(claimPath, latestEpoch));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
+    if (!observedOwner) return undefined;
     const staleAge = observedOwner.holder
       ? minStaleAgeMs
       : Math.max(minStaleAgeMs, MIN_INVALID_HOLDER_STALE_AGE_MS);
@@ -391,41 +563,65 @@ function tryAcquireStaleClaimOwnershipSync(
   }
 
   const ownerPath = staleClaimOwnerPath(claimPath, nextEpoch);
+  const candidatePath = staleClaimOwnerCandidatePath(ownerPath);
   let fd: number;
   try {
-    fd = openSync(ownerPath, 'wx');
+    fd = openSync(candidatePath, 'wx');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST' ||
         (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
+  let owned: import('node:fs').Stats | undefined;
+  const abandonCandidate = (): void => {
+    try { closeSync(fd); } catch { /* tolerate */ }
+    if (owned) {
+      try { releaseOwnedLockSync(ownerPath, owned); } catch { /* tolerate */ }
+      try { releaseOwnedLockSync(candidatePath, owned); } catch { /* tolerate */ }
+    } else {
+      try { unlinkSync(candidatePath); } catch { /* tolerate */ }
+    }
+  };
   try {
     writeFileSync(fd, currentLockHolderPayload());
-    const owner = fstatSync(fd);
-    const currentClaim = lstatSync(claimPath);
-    if (!owner.isFile() || !sameInode(currentClaim, claim)) {
-      closeSync(fd);
-      try { releaseOwnedLockSync(ownerPath, owner); } catch { /* tolerate */ }
+    owned = fstatSync(fd);
+    if (!owned.isFile()) throw new Error('file-lock stale-claim owner candidate is not a regular file');
+
+    const currentClaimBeforePublish = lstatSync(claimPath);
+    if (!sameInode(currentClaimBeforePublish, claim)) {
+      abandonCandidate();
       return undefined;
     }
-    return { ownerPath, fd };
+    fileLockTestHooks?.beforeStaleClaimOwnerPublishSync?.(ownerPath);
+    linkSync(candidatePath, ownerPath);
+    const publishedOwner = lstatSync(ownerPath);
+    const currentClaim = lstatSync(claimPath);
+    if (!publishedOwner.isFile() || publishedOwner.isSymbolicLink() ||
+        !sameInode(publishedOwner, owned) || !sameInode(currentClaim, claim)) {
+      abandonCandidate();
+      return undefined;
+    }
+    return { ownerPath, candidatePath, owned, fd };
   } catch (error) {
-    try { closeSync(fd); } catch { /* tolerate */ }
-    try { unlinkSync(ownerPath); } catch { /* tolerate */ }
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    abandonCandidate();
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST' ||
+        (error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
 }
 
 async function cleanStaleClaimOwnership(claimPath: string, ownership: StaleClaimOwnership): Promise<void> {
   try { await ownership.handle.close(); } catch { /* tolerate */ }
-  try { await fsp.unlink(ownership.ownerPath); } catch { /* tolerate */ }
+  try { await releaseOwnedLock(ownership.ownerPath, ownership.owned); } catch { /* tolerate */ }
+  try { await releaseOwnedLock(ownership.candidatePath, ownership.owned); } catch { /* tolerate */ }
   // Older dead epochs are no longer security-relevant after the claim itself
   // is gone. Clean them best-effort; a loser that was already in flight may
-  // leave another harmless orphan owner file behind.
+  // leave another harmless orphan owner/candidate file behind.
   try {
     const names = await fsp.readdir(dirname(claimPath));
-    await Promise.all(names.filter(name => parseStaleClaimOwnerEpoch(claimPath, name) !== undefined).map(async name => {
+    await Promise.all(names.filter(name =>
+      parseStaleClaimOwnerEpoch(claimPath, name) !== undefined ||
+      isStaleClaimOwnerCandidate(claimPath, name)).map(async name => {
       try { await fsp.unlink(join(dirname(claimPath), name)); } catch { /* tolerate */ }
     }));
   } catch { /* tolerate */ }
@@ -433,10 +629,12 @@ async function cleanStaleClaimOwnership(claimPath: string, ownership: StaleClaim
 
 function cleanStaleClaimOwnershipSync(claimPath: string, ownership: StaleClaimOwnershipSync): void {
   try { closeSync(ownership.fd); } catch { /* tolerate */ }
-  try { unlinkSync(ownership.ownerPath); } catch { /* tolerate */ }
+  try { releaseOwnedLockSync(ownership.ownerPath, ownership.owned); } catch { /* tolerate */ }
+  try { releaseOwnedLockSync(ownership.candidatePath, ownership.owned); } catch { /* tolerate */ }
   try {
     for (const name of readdirSync(dirname(claimPath))) {
-      if (parseStaleClaimOwnerEpoch(claimPath, name) === undefined) continue;
+      if (parseStaleClaimOwnerEpoch(claimPath, name) === undefined &&
+          !isStaleClaimOwnerCandidate(claimPath, name)) continue;
       try { unlinkSync(join(dirname(claimPath), name)); } catch { /* tolerate */ }
     }
   } catch { /* tolerate */ }
@@ -465,10 +663,19 @@ async function resumeStaleBreak(
     }
 
     let current: PinnedHolderObservation | undefined;
+    let publicPathMissing = false;
     try {
       current = await readPinnedHolder(lockPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      publicPathMissing = true;
+    }
+    if (!current && !publicPathMissing) {
+      // The pinned inode or its pathname changed during validation. Withdraw
+      // this generation and retry from a fresh public-path observation.
+      await releaseOwnedLock(claimPath, claim);
+      claimRemoved = true;
+      return false;
     }
     if (current && sameInode(current.stats, observed)) {
       const staleAge = current.holder
@@ -483,7 +690,16 @@ async function resumeStaleBreak(
         claimRemoved = true;
         return false;
       }
-      await fsp.unlink(lockPath);
+      if (fileLockTestHooks?.beforeStalePublicLockUnlink) {
+        await fileLockTestHooks.beforeStalePublicLockUnlink(lockPath);
+      }
+      if (!(await unlinkUnchangedPinnedPath(lockPath, current.stats))) {
+        // A late holder publication or pathname replacement won the race.
+        // The pinned bytes are no longer authority to remove the public name.
+        await releaseOwnedLock(claimPath, claim);
+        claimRemoved = true;
+        return false;
+      }
       logger.warn(
         `[file-lock] broke stale lock at ${lockPath} ` +
         `(${current.holder ? `dead/reused pid ${current.holder.pid}` : 'empty/invalid holder'}, age ${current.ageMs}ms)`,
@@ -505,7 +721,8 @@ async function resumeStaleBreak(
       // This owner is returning synchronously and cannot later resume an
       // unlink. Withdraw its epoch so the same process does not look like a
       // permanently-live crashed breaker after a transient I/O error.
-      try { await fsp.unlink(ownership.ownerPath); } catch { /* tolerate */ }
+      try { await releaseOwnedLock(ownership.ownerPath, ownership.owned); } catch { /* tolerate */ }
+      try { await releaseOwnedLock(ownership.candidatePath, ownership.owned); } catch { /* tolerate */ }
     }
   }
 }
@@ -529,10 +746,17 @@ function resumeStaleBreakSync(
     }
 
     let current: PinnedHolderObservation | undefined;
+    let publicPathMissing = false;
     try {
       current = readPinnedHolderSync(lockPath);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      publicPathMissing = true;
+    }
+    if (!current && !publicPathMissing) {
+      releaseOwnedLockSync(claimPath, claim);
+      claimRemoved = true;
+      return false;
     }
     if (current && sameInode(current.stats, observed)) {
       const staleAge = current.holder
@@ -545,7 +769,12 @@ function resumeStaleBreakSync(
         claimRemoved = true;
         return false;
       }
-      unlinkSync(lockPath);
+      fileLockTestHooks?.beforeStalePublicLockUnlinkSync?.(lockPath);
+      if (!unlinkUnchangedPinnedPathSync(lockPath, current.stats)) {
+        releaseOwnedLockSync(claimPath, claim);
+        claimRemoved = true;
+        return false;
+      }
       logger.warn(
         `[file-lock] broke stale lock at ${lockPath} ` +
         `(${current.holder ? `dead/reused pid ${current.holder.pid}` : 'empty/invalid holder'}, age ${current.ageMs}ms)`,
@@ -558,7 +787,8 @@ function resumeStaleBreakSync(
     if (claimRemoved) cleanStaleClaimOwnershipSync(claimPath, ownership);
     else {
       try { closeSync(ownership.fd); } catch { /* tolerate */ }
-      try { unlinkSync(ownership.ownerPath); } catch { /* tolerate */ }
+      try { releaseOwnedLockSync(ownership.ownerPath, ownership.owned); } catch { /* tolerate */ }
+      try { releaseOwnedLockSync(ownership.candidatePath, ownership.owned); } catch { /* tolerate */ }
     }
   }
 }

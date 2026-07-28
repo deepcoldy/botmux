@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  redactSessionEventForPublic,
+  redactSessionsForPublic,
   redactSettingsForPublic,
 } from '../src/dashboard/public-redact.js';
 
@@ -130,6 +132,41 @@ describe('redactSchedulesForPublic', () => {
     expect(redactSchedulesForPublic([])).toEqual([]);
     expect(redactSchedulesForPublic([null] as unknown[])).toEqual([null]);
     expect(redactSchedulesForPublic(undefined as unknown as unknown[])).toBeUndefined();
+  });
+});
+
+describe('session presentation redaction', () => {
+  const session = {
+    sessionId: 's1',
+    workingDir: '/repo/customer-a',
+    repoName: 'customer-a',
+    gitBranch: 'issue/CUSTOMER-123',
+    botAvatarUrl: 'https://img.example/bot.png',
+  };
+
+  it('strips branch names from anonymous REST rows without mutating authenticated data', () => {
+    const out = redactSessionsForPublic([session]) as any[];
+    expect(out[0]).toMatchObject({
+      sessionId: 's1',
+      workingDir: '/repo/customer-a',
+      repoName: 'customer-a',
+      botAvatarUrl: 'https://img.example/bot.png',
+    });
+    expect(out[0]).not.toHaveProperty('gitBranch');
+    expect(session.gitBranch).toBe('issue/CUSTOMER-123');
+  });
+
+  it('applies the same policy to spawned and update SSE bodies', () => {
+    const spawned = redactSessionEventForPublic('session.spawned', { session }) as any;
+    expect(spawned.session).not.toHaveProperty('gitBranch');
+
+    const updateBody = {
+      sessionId: 's1',
+      patch: { gitBranch: 'issue/CUSTOMER-456', repoName: 'customer-a' },
+    };
+    const updated = redactSessionEventForPublic('session.update', updateBody) as any;
+    expect(updated.patch).toEqual({ repoName: 'customer-a' });
+    expect(updateBody.patch.gitBranch).toBe('issue/CUSTOMER-456');
   });
 });
 

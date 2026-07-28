@@ -36,7 +36,7 @@ describe('worker raw_input handler', () => {
     const gateIdx = region.indexOf(
       'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
-    const queueIdx = region.indexOf('pendingRawInputs.push(msg)');
+    const queueIdx = region.indexOf('freshnessInputQueue.enqueueRaw(msg)');
     const deliverIdx = region.indexOf('await deliverRawInput(msg)');
 
     expect(gateIdx).toBeGreaterThanOrEqual(0);
@@ -55,7 +55,7 @@ describe('worker raw_input handler', () => {
     // 同在入队条件里。
     const gate = region.slice(
       region.indexOf('if (cliRestartInProgress'),
-      region.indexOf('pendingRawInputs.push(msg)'),
+      region.indexOf('freshnessInputQueue.enqueueRaw(msg)'),
     );
     expect(gate).toContain('injectionFlushing');
     expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
@@ -69,7 +69,7 @@ describe('worker raw_input handler', () => {
     // 覆盖"检查进行中"，并用 bareShellLaunchBlocked 覆盖"已确认失败"。
     const gate = region.slice(
       region.indexOf('if (cliRestartInProgress'),
-      region.indexOf('pendingRawInputs.push(msg)'),
+      region.indexOf('freshnessInputQueue.enqueueRaw(msg)'),
     );
     expect(gate).toContain('bareShellCheckInProgress');
     expect(gate).toContain('bareShellLaunchBlocked');
@@ -197,7 +197,7 @@ describe('post-settle restart fence', () => {
     const detector = flush.indexOf('if (await detectBareShellLaunch())');
     const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
     const startup = flush.indexOf('await runStartupCommands()', detector);
-    const rawShift = flush.indexOf('pendingRawInputs.shift()', detector);
+    const rawShift = flush.indexOf('freshnessInputQueue.takeRaw()', detector);
     const writeInput = flush.indexOf('cliAdapter.writeInput(backend', detector);
     expect(detector).toBeGreaterThanOrEqual(0);
     expect(fence).toBeGreaterThan(detector);

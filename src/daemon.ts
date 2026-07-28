@@ -73,6 +73,7 @@ import * as sessionStore from './services/session-store.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
+import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -17495,8 +17496,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   }, VC_MEETING_DELIVERY_LEASE_SCAN_MS);
   vcMeetingDeliveryLeaseTimer.unref?.();
-  // Watch schedules.json for external writes (e.g. `botmux schedule add`
+  // Bind the schedule store to this daemon's bot (per-bot stores live in each
+  // BOT_HOME), split a legacy shared data/schedules.json if one still exists,
+  // then watch our own store for external writes (e.g. `botmux schedule add`
   // running in a separate node process) so dashboard event bus stays in sync.
+  scheduleStore.setScheduleScope(cfg.larkAppId);
+  migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
   setAskCardDispatcher(createLarkAskCardDispatcher());

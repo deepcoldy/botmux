@@ -5287,8 +5287,37 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   const scheduler = await import('./core/scheduler.js');
   const scheduleStore = await import('./services/schedule-store.js');
 
+  // Per-bot stores: bind this invocation to one bot's store — explicit
+  // --lark-app-id wins, else the surrounding session's bot (env/marker-derived;
+  // always present inside sandboxed sessions). A bare terminal without either
+  // binds to the primary bot (bots.json[0]) so mutations keep the legacy
+  // "ownerless task runs on bot-0" semantics; `list` without a bound bot
+  // aggregates every readable store instead.
+  const cliScopeAppId = argValue(rest, '--lark-app-id')
+    ?? detectCurrentSession()?.larkAppId
+    ?? process.env.BOTMUX_LARK_APP_ID;
+  // LAZY + sandbox-safe bots.json read: sandboxed sessions always carry a
+  // scope (env-injected appId) and must never touch bots.json — it is denied
+  // and `loadBotsJson()` process.exit(1)s on the read error. Only the bare
+  // unsandboxed terminal (aggregate list / cross-store id lookup) reads it,
+  // and even then failure degrades to "no other stores visible".
+  const allBotAppIds = (): string[] => {
+    try {
+      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE)
+        .map((b: { larkAppId?: unknown }) => b?.larkAppId)
+        .filter((x: unknown): x is string => typeof x === 'string');
+    } catch { return []; } // absent OR sandbox-denied → own scope only
+  };
+  if (cliScopeAppId) scheduleStore.setScheduleScope(cliScopeAppId);
+  else {
+    const first = allBotAppIds()[0];
+    if (first) scheduleStore.setScheduleScope(first);
+  }
+
   if (!sub || sub === 'list' || sub === 'ls') {
-    const tasks = scheduleStore.listTasks();
+    const tasks = cliScopeAppId
+      ? scheduleStore.listTasks()
+      : scheduleStore.listTasksForBots(allBotAppIds());
     if (tasks.length === 0) {
       console.log('暂无定时任务。\n\n用法:\n  botmux schedule add "每日17:50" "帮我看AI新闻"\n  botmux schedule add "every 2h" "检查构建"\n  botmux schedule add "0 9 * * *" "每天早安"');
       return;
@@ -5331,7 +5360,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
-    const larkAppId = argValue(rest, '--lark-app-id') ?? cur?.larkAppId;
+    // Owner resolution mirrors the store-scope resolution above (flag →
+    // session marker → daemon-injected env): a sandboxed session without a
+    // readable marker must still stamp its own bot as owner, or the task
+    // would land in this bot's store as OWNERLESS — which only the primary
+    // daemon executes — and never fire (codex review P1).
+    const larkAppId = cliScopeAppId;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
@@ -5380,25 +5414,36 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       process.exit(1);
     }
 
-    const task = scheduler.addTask({
-      name,
-      schedule: rawSchedule,
-      parsed,
-      prompt: promptArg,
-      workingDir,
-      chatId,
-      rootMessageId,
-      larkAppId,
-      creatorChatId: cur?.chatId,
-      creatorRootMessageId: cur?.rootMessageId,
-      creatorLarkAppId: cur?.larkAppId,
-      chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-      scope,
-      executionPosition,
-      topicTitle,
-      deliver,
-      silent,
-    });
+    let task;
+    try {
+      task = scheduler.addTask({
+        name,
+        schedule: rawSchedule,
+        parsed,
+        prompt: promptArg,
+        workingDir,
+        chatId,
+        rootMessageId,
+        larkAppId,
+        creatorChatId: cur?.chatId,
+        creatorRootMessageId: cur?.rootMessageId,
+        creatorLarkAppId: cur?.larkAppId,
+        chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
+        scope,
+        executionPosition,
+        topicTitle,
+        deliver,
+        silent,
+      });
+    } catch (err) {
+      // Sandboxed sessions can only write their OWN bot's store — a cross-bot
+      // `--lark-app-id` (or a scope pointing at another bot) fails closed here.
+      if (/EPERM|EACCES|not permitted/i.test(String(err))) {
+        console.error(`无法写入目标 bot 的定时任务存储（${larkAppId ?? '未指定'}）：沙盒会话只能管理自己 bot 的任务。`);
+        process.exit(1);
+      }
+      throw err;
+    }
 
     const next = task.nextRunAt ? new Date(task.nextRunAt).toLocaleString('zh-CN', { timeZone: scheduleTimeZone() }) : '—';
     console.log(`✅ 已创建定时任务 [${task.id}] ${task.name}`);
@@ -5417,29 +5462,51 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
+  // Id-addressed op missed the bound store: locate the id across every
+  // READABLE bot store (bare-terminal admin usage) and rebind the scope to the
+  // owning bot for this one-shot process. Sandboxed callers cannot read
+  // sibling stores, so they stay confined to their own tasks by construction.
+  const retargetIfElsewhere = (): boolean => {
+    const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
+    if (!hit || hit.appId === scheduleStore.getScheduleScope()) return false;
+    scheduleStore.setScheduleScope(hit.appId);
+    console.log(`（任务属于 bot ${hit.appId} 的存储）`);
+    return true;
+  };
+
   switch (sub) {
     case 'remove':
     case 'rm':
     case 'delete':
-    case 'del':
-      if (scheduler.removeTask(id)) console.log(`已删除任务 ${id}`);
+    case 'del': {
+      let ok = scheduler.removeTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.removeTask(id);
+      if (ok) console.log(`已删除任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'pause':
-    case 'disable':
-      if (scheduler.disableTask(id)) console.log(`已暂停任务 ${id}`);
+    case 'disable': {
+      let ok = scheduler.disableTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.disableTask(id);
+      if (ok) console.log(`已暂停任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'resume':
-    case 'enable':
-      if (scheduler.enableTask(id)) console.log(`已恢复任务 ${id}`);
+    case 'enable': {
+      let ok = scheduler.enableTask(id);
+      if (!ok && retargetIfElsewhere()) ok = scheduler.enableTask(id);
+      if (ok) console.log(`已恢复任务 ${id}`);
       else { console.error(`未找到任务 ${id}`); process.exit(1); }
       break;
+    }
     case 'run':
       // Running requires the daemon (executeCallback is daemon-side).
       // CLI can only mark a task to run ASAP; daemon's next tick picks it up.
       {
-        const task = scheduleStore.getTask(id);
+        let task = scheduleStore.getTask(id);
+        if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
         if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
         scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);

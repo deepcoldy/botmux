@@ -57,6 +57,23 @@ describe('worker restart P1 — drain reliable terminal before ambiguous emit', 
 });
 
 describe('worker restart P2 — merge guard + replacement-exit recovery (no spurious re-restart)', () => {
+  it('retains a coalesced cwd update without replacing the active correlated restart attempt', () => {
+    const branch = restartCaseBranch();
+    const cwdUpdate = branch.indexOf('if (msg.updateWorkingDir && lastInitConfig)');
+    const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');
+    const attempt = branch.indexOf('activeRestartAttemptId = msg.attemptId;', guard);
+    const freshness = branch.indexOf("codexRunnerFreshness = 'restarting_fresh';", attempt);
+
+    expect(cwdUpdate).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeGreaterThan(cwdUpdate);
+    expect(attempt).toBeGreaterThan(guard);
+    expect(freshness).toBeGreaterThan(attempt);
+    // The in-flight branch exits before touching the correlated attempt. This
+    // lets a role-switch cwd update join a manual restart without stealing its
+    // eventual prompt-ready result.
+    expect(branch.slice(guard, attempt)).toContain('break;');
+  });
+
   it('the merge guard plainly breaks — it does NOT arm any "restart requested" flag', () => {
     const branch = restartCaseBranch();
     const guard = branch.indexOf('if (cliRestartInProgress || tmuxRestartTimer)');

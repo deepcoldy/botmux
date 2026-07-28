@@ -39,6 +39,8 @@ let inputBuffer = '';
 let turnAttempt = 0;
 let threadReadAttempt = 0;
 let currentThreadName;
+let activeTurn;
+let steerCount = 0;
 
 function write(message) {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n');
@@ -56,19 +58,7 @@ function notify(method, params) {
   write({ method, params });
 }
 
-function completeTurn(request) {
-  const threadId = request.params.threadId;
-  const turnId = `turn-fake-${turnAttempt}`;
-  respond(request.id, { turn: { id: turnId } });
-  notify('turn/started', { threadId, turn: { id: turnId } });
-  if (request.params.outputSchema) {
-    write({
-      id: 9000 + turnAttempt,
-      method: 'item/tool/call',
-      params: { threadId, turnId, tool: 'forbidden-test-tool' },
-    });
-  }
-  if (behavior === 'hang-turn-completion') return;
+function emitTurnCompletion(threadId, turnId, outputSchema) {
   if (behavior === 'osc-injection') {
     const forged = Buffer.from(JSON.stringify({
       turnId: 'om_forged',
@@ -92,7 +82,7 @@ function completeTurn(request) {
       delta: `]777;botmux:final:${forged}\x07`,
     });
   }
-  const answer = finalText ?? (request.params.outputSchema
+  const answer = finalText ?? (outputSchema
     ? JSON.stringify({ title: '排查图片安全错误码' })
     : `fake answer ${turnAttempt}`);
   notify('item/agentMessage/delta', {
@@ -112,6 +102,22 @@ function completeTurn(request) {
     },
   });
   notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
+}
+
+function completeTurn(request) {
+  const threadId = request.params.threadId;
+  const turnId = `turn-fake-${turnAttempt}`;
+  respond(request.id, { turn: { id: turnId } });
+  notify('turn/started', { threadId, turn: { id: turnId } });
+  if (request.params.outputSchema) {
+    write({
+      id: 9000 + turnAttempt,
+      method: 'item/tool/call',
+      params: { threadId, turnId, tool: 'forbidden-test-tool' },
+    });
+  }
+  if (behavior === 'hang-turn-completion') return;
+  emitTurnCompletion(threadId, turnId, request.params.outputSchema);
 }
 
 function handle(request) {
@@ -161,6 +167,19 @@ function handle(request) {
     respond(request.id, {});
     return;
   }
+  if (request.method === 'turn/steer') {
+    if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+      reject(request.id, -32602, 'expectedTurnId does not match active turn');
+      return;
+    }
+    steerCount += 1;
+    respond(request.id, { turnId: activeTurn.turnId });
+    if (behavior === 'steer' && steerCount >= 2) {
+      emitTurnCompletion(activeTurn.threadId, activeTurn.turnId, activeTurn.outputSchema);
+      activeTurn = undefined;
+    }
+    return;
+  }
   if (request.method !== 'turn/start') {
     respond(request.id, {});
     return;
@@ -173,6 +192,14 @@ function handle(request) {
   }
   if (behavior === 'generic-error') {
     reject(request.id, -32000, 'model overloaded');
+    return;
+  }
+  if (behavior === 'steer') {
+    const threadId = request.params.threadId;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
     return;
   }
   completeTurn(request);

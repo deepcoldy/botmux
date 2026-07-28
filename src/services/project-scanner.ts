@@ -37,14 +37,22 @@ export interface ProjectScanOptions {
 }
 
 /**
- * Describe a single directory as a project: its basename + current git ref,
- * or null if the directory isn't a git repo/worktree. Used by `/repo <path>`
- * to label an explicitly given path that may sit outside the scanned roots
- * (the card's project list, by contrast, only covers the scan dirs).
+ * Describe a single directory as a project: the main worktree basename +
+ * current git ref, or null if the directory isn't a git repo/worktree. Using
+ * the main worktree name preserves the picker label for an explicitly selected
+ * linked worktree without recursively scanning the configured roots first.
  */
 export function describeProjectDir(dir: string): { name: string; branch: string } | null {
   if (!isValidGitMarker(dir)) return null;
-  return { name: basename(dir), branch: getGitRef(dir) };
+  const worktreeList = runGit('worktree list --porcelain', dir);
+  const mainWorktree = worktreeList
+    ?.split('\n')
+    .find(line => line.startsWith('worktree '))
+    ?.slice('worktree '.length);
+  return {
+    name: mainWorktree ? basename(mainWorktree) : basename(dir),
+    branch: getGitRef(dir),
+  };
 }
 
 /** `rev-parse --abbrev-ref HEAD` returns the literal string `HEAD` when

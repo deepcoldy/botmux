@@ -64,20 +64,27 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return null;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    async writeInput(pty: PtyHandle, content: string, context) {
       // Chunked + throttled stdin injection — a single send-keys of the whole
       // (potentially ~20KB) control line overruns the pane pty input buffer and
       // gets dropped. See runner-input.ts.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content);
+      return writeRunnerInput(pty, '::botmux-codex-app:', content, undefined, context?.turnId);
     },
 
-    async writeStructuredInput(pty, content, codexAppInput) {
+    async writeStructuredInput(pty, content, codexAppInput, context) {
       // The legacy prompt remains in the control payload as a compatibility
       // fallback. The runner uses the sidecar only on supported app-server
       // versions and never reverse-parses the XML-ish legacy envelope.
-      return writeRunnerInput(pty, '::botmux-codex-app:', content, codexAppInput);
+      return writeRunnerInput(
+        pty,
+        '::botmux-codex-app:',
+        content,
+        codexAppInput,
+        context?.turnId,
+      );
     },
 
+    supportsTypeAhead: true,
     completionPattern: undefined,
     readyPattern: /›/,
     systemHints: [],

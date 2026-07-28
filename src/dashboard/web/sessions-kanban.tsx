@@ -78,7 +78,7 @@ export interface SessionsKanbanCallbacks {
   onMoveRows: (moves: SessionsKanbanMove[]) => void;
   onNeedTeamBoard: (team: SessionsKanbanTeam) => void;
   onNeedTeams: () => void;
-  onOpenTerminal: (row: any) => void;
+  onOpenTerminal?: (row: any) => void;
   onRename: (row: any, title: string) => void;
   onRestart: (row: any, button: HTMLButtonElement) => void;
   onTeamScope: (scope: { chats: number; sessions: number } | null) => void;
@@ -427,12 +427,12 @@ function KanbanCard(props: {
         label={t('sessions.history.title')}
         onClick={() => callbacks.onHistory(row)}
       />
-      {row.webPort ? (
+      {row.webPort && callbacks.onOpenTerminal ? (
         <CardActButton
           action="terminal"
           icon={callbacks.icons.terminal}
           label={t('sessions.openTerminal')}
-          onClick={() => callbacks.onOpenTerminal(row)}
+          onClick={() => callbacks.onOpenTerminal?.(row)}
         />
       ) : null}
       {row.feishuChatLink ? (

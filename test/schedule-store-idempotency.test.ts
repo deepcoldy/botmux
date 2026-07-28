@@ -18,7 +18,7 @@ vi.mock('../src/config.js', () => ({
   config: {
     session: {
       get dataDir() {
-        return tempDir;
+        return join(tempDir, 'data');
       },
     },
   },
@@ -42,9 +42,13 @@ const BASE_PARAMS = {
   chatId: 'oc_test_chat',
 };
 
+const TEST_APP = 'cli_testapp0000000001';
+
 async function freshImport() {
   vi.resetModules();
-  return import('../src/services/schedule-store.js');
+  const mod = await import('../src/services/schedule-store.js');
+  mod.setScheduleScope(TEST_APP);
+  return mod;
 }
 
 beforeEach(() => {
@@ -173,7 +177,6 @@ describe('createTask — id provided, task exists with DIFFERENT canonical input
     ['chatId', { chatId: 'oc_other' }],
     ['rootMessageId', { rootMessageId: 'om_x' }],
     ['scope', { scope: 'chat' as const }],
-    ['larkAppId', { larkAppId: 'cli_other' }],
     ['deliver', { deliver: 'local' as const }],
   ])('throws when %s differs', async (_field, diff) => {
     const { createTask, IdempotencyConflictError } = await freshImport();
@@ -182,6 +185,23 @@ describe('createTask — id provided, task exists with DIFFERENT canonical input
     expect(() => createTask({ ...BASE_PARAMS, id, ...diff })).toThrow(
       IdempotencyConflictError,
     );
+  });
+
+  it('routes a differing larkAppId to that bot\'s own store (no same-store conflict)', async () => {
+    // Per-bot stores: larkAppId selects WHICH file the task lands in, so the
+    // same wf id addressed at another bot creates independently in that bot's
+    // store instead of raising a same-store IdempotencyConflictError. Within
+    // one bot's store the conflict contract above is unchanged. (Workflow
+    // attempt-immutability for larkAppId is enforced upstream by the frozen
+    // input sidecar, not by the store.)
+    const { createTask, getTask } = await freshImport();
+    const id = 'wf_cross_bot';
+    createTask({ ...BASE_PARAMS, id });
+    const other = createTask({ ...BASE_PARAMS, id, larkAppId: 'cli_other' });
+    expect(other.larkAppId).toBe('cli_other');
+    expect(getTask(id)).toBeDefined();                 // bound scope's store
+    expect(getTask(id, 'cli_other')).toBeDefined();   // sibling store
+    expect(getTask(id)!.larkAppId).toBeUndefined();
   });
 
   it('throws when repeat.times differs', async () => {

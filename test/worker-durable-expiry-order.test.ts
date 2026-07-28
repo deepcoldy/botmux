@@ -116,7 +116,7 @@ describe('worker durable lease expiry ordering', () => {
     const rawGate = rawInput.indexOf(
       'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight',
     );
-    const rawQueue = rawInput.indexOf('pendingRawInputs.push(msg)', rawGate);
+    const rawQueue = rawInput.indexOf('freshnessInputQueue.enqueueRaw(msg)', rawGate);
     const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);
     expect(rawGate).toBeGreaterThanOrEqual(0);
     expect(rawQueue).toBeGreaterThan(rawGate);

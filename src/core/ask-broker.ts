@@ -441,6 +441,51 @@ export function getAskSnapshot(askId: string): PendingAsk | undefined {
   return a ? snapshot(a) : undefined;
 }
 
+/** List unsettled asks for Desktop / dashboard aggregation (read-only snapshots). */
+export function listPendingAsks(): PendingAsk[] {
+  gcSettled();
+  const out: PendingAsk[] = [];
+  for (const ask of pending.values()) {
+    if (!ask.settled) out.push(snapshot(ask));
+  }
+  return out;
+}
+
+/**
+ * Desktop / trusted-host answer path. Bypasses canTalk (no Feishu openId) —
+ * caller must be authenticated as the local dashboard/desktop operator.
+ */
+export function submitAskFromDesktop(args: {
+  askId: string;
+  /** Selected option keys per question (same shape as submitAsk selections). */
+  selections: ReadonlyArray<ReadonlyArray<string>>;
+  by?: string;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  if (!ask) return 'stale';
+  if (ask.settled) return 'already_settled';
+
+  const answers = args.selections;
+  for (let i = 0; i < ask.questions.length; i++) {
+    const q = ask.questions[i]!;
+    const sel = answers[i] ?? [];
+    if (!q.multiSelect && sel.length !== 1) return 'stale';
+    for (const key of sel) {
+      if (!q.options.some((o) => o.key === key)) return 'stale';
+    }
+  }
+
+  settle(args.askId, {
+    kind: 'answered',
+    answers,
+    by: args.by ?? 'desktop',
+    comment: null,
+    timedOut: false,
+  });
+  return 'accepted';
+}
+
 /** Read a pending ask by id — for tests only. Returns a snapshot; mutating it
  *  has no effect on broker state. */
 export function _getPending(askId: string): PendingAsk | undefined {

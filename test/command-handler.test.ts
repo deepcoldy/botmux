@@ -275,6 +275,10 @@ vi.mock('../src/core/worker-pool.js', () => ({
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
+  requestSessionRestart: vi.fn((_ds: any, observer: any) => {
+    void observer.notify('in_progress');
+    return { attemptId: 'attempt-test', joined: false };
+  }),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)
@@ -464,7 +468,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo } from '../src/core/worker-pool.js';
+import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -484,7 +488,7 @@ import { existsSync, statSync, readFileSync, mkdirSync, mkdtempSync, rmSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { codexHome } from '../src/services/codex-paths.js';
-import { scanMultipleProjects } from '../src/services/project-scanner.js';
+import { scanMultipleProjects, describeProjectDir } from '../src/services/project-scanner.js';
 import { readGlobalConfig, repoPickerScanOptions } from '../src/global-config.js';
 import { createRepoWorktree, pushWorktreeBranch } from '../src/services/git-worktree.js';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
@@ -1483,6 +1487,24 @@ describe('handleCommand', () => {
   // ─── /restart ───────────────────────────────────────────────────────────
 
   describe('/restart', () => {
+    it('rejects restart for adopted sessions without creating an attempt', async () => {
+      const ds = makeDaemonSession({
+        adoptedFrom: { source: 'tmux', target: 'shared-pane' } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
+
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('adopt'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
     it('should send restart IPC when worker is alive', async () => {
       const workerSend = vi.fn();
       const ds = makeDaemonSession({
@@ -1492,7 +1514,7 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(workerSend).toHaveBeenCalledWith({ type: 'restart' });
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('正在重启'),
@@ -1510,10 +1532,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('进程已终止'),
+        expect.stringContaining('正在重启'),
         undefined,
         LARK_APP_ID,
         'msg_001',
@@ -1526,10 +1548,10 @@ describe('handleCommand', () => {
 
       await handleCommand('/restart', ROOT_ID, makeLarkMessage('/restart'), deps, LARK_APP_ID);
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
+      expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'slash' }));
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
-        expect.stringContaining('进程已终止'),
+        expect.stringContaining('正在重启'),
         undefined,
         LARK_APP_ID,
         'msg_001',
@@ -2256,14 +2278,13 @@ describe('handleCommand', () => {
 
     it('should resolve a first-level project name and switch repo (mid-session)', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
-      vi.mocked(scanMultipleProjects).mockReturnValue([
-        { name: 'payments', path: '/home/testuser/payments', branch: 'main' },
-      ]);
+      vi.mocked(describeProjectDir).mockReturnValueOnce({ name: 'payments', branch: 'main' });
       const ds = makeDaemonSession({ pendingRepo: false, repoCardMessageId: 'om_card' });
       const deps = makeDeps(ds);
 
       await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo payments'), deps, LARK_APP_ID);
 
+      expect(scanMultipleProjects).not.toHaveBeenCalled();
       expect(ds.workingDir).toBe('/home/testuser/payments');
       expect(sessionStore.createSession).toHaveBeenCalledWith(
         CHAT_ID, ROOT_ID, 'payments (main)', 'group', undefined,

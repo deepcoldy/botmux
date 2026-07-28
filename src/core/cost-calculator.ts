@@ -33,6 +33,9 @@ export interface SessionTokenUsageQuery {
   sessionId: string;
   cliSessionId?: string;
   cwd?: string;
+  /** Owning bot's Lark app id — lets the transcript resolver find sandboxed
+   *  (CLI-data-redirected) bots' transcripts under BOT_HOME. */
+  larkAppId?: string;
   /** Bypass the reparse throttle (stat short-circuit and incremental folding
    *  still apply). Use at low-frequency exact points like ledger snapshots. */
   fresh?: boolean;

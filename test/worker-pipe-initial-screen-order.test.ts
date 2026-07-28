@@ -36,7 +36,7 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(backend, msg, item.codexAppInput);');
+    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(');
     const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 

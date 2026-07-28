@@ -400,4 +400,29 @@ describe('dashboard sessions kanban react view', () => {
     expect((html.match(/data-id="closed-/g) ?? []).length).toBe(50);
     expect(html).toContain('还有 5 个未显示');
   });
+
+  it('omits the terminal action when the embedding shell does not provide it', () => {
+    const html = renderToStaticMarkup(createElement(SessionsKanbanView, {
+      host: null,
+      ...kanbanCallbacks,
+      onOpenTerminal: undefined,
+      rows: [{
+        sessionId: 'embedded-session',
+        status: 'working',
+        cliId: 'codex',
+        title: 'Embedded',
+        botName: 'Bot A',
+        lastMessageAt: 1000,
+        webPort: 3001,
+      }],
+      groupBy: 'flow',
+      teams: [],
+      teamsLoaded: true,
+      teamKey: '',
+      teamBoardData: null,
+      teamBoardKey: '',
+    }));
+
+    expect(html).not.toContain('data-action="terminal"');
+  });
 });

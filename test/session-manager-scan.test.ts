@@ -13,6 +13,10 @@ const mockGetBot = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (id: string) => mockGetBot(id),
   getAllBots: () => [],
+  effectiveDefaultWorkingDir: (cfg: any) =>
+    cfg?.defaultWorkingDir
+    || (cfg?.defaultOncall?.enabled ? cfg.defaultOncall.workingDir : undefined)
+    || undefined,
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -43,6 +47,39 @@ describe('getProjectScanDir (single)', () => {
 });
 
 describe('getProjectScanDirs (multi)', () => {
+  it('uses defaultWorkingDir instead of implicitly scanning HOME', () => {
+    mockGetBot.mockReturnValue({ config: { defaultWorkingDir: '~/Code' } });
+    expect(getProjectScanDirs({ larkAppId: 'a1' } as any)).toEqual([`${HOME}/Code`]);
+  });
+
+  it('keeps workingDirs → workingDir → effective default priority', () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        workingDirs: ['/repos/one', '/repos/two'],
+        workingDir: '/legacy/root',
+        defaultWorkingDir: '/default/root',
+      },
+    });
+    expect(getProjectScanDirs({ larkAppId: 'a1' } as any)).toEqual(['/repos/one', '/repos/two']);
+
+    mockGetBot.mockReturnValue({
+      config: {
+        workingDir: '/legacy/root',
+        defaultWorkingDir: '/default/root',
+      },
+    });
+    expect(getProjectScanDirs({ larkAppId: 'a1' } as any)).toEqual(['/legacy/root']);
+  });
+
+  it('uses the enabled defaultOncall dir as the effective default', () => {
+    mockGetBot.mockReturnValue({
+      config: {
+        defaultOncall: { enabled: true, workingDir: '/oncall/root' },
+      },
+    });
+    expect(getProjectScanDirs({ larkAppId: 'a1' } as any)).toEqual(['/oncall/root']);
+  });
+
   it('scans each configured workingDir from itself, not the parent', () => {
     mockGetBot.mockReturnValue({ config: { workingDir: '/repos/foo' } });
     expect(getProjectScanDirs({ larkAppId: 'a1' } as any)).toEqual(['/repos/foo']);
@@ -63,6 +100,14 @@ describe('getProjectScanDirs (multi)', () => {
     const dirs = getProjectScanDirs({ larkAppId: 'a1', workingDir: '/repos/baz' } as any);
     expect(dirs).toContain('/repos/baz');
     expect(dirs).not.toContain('/repos'); // never the parent
+  });
+
+  it('deduplicates the session workingDir after home expansion', () => {
+    mockGetBot.mockReturnValue({ config: { defaultWorkingDir: '~/Code' } });
+    expect(getProjectScanDirs({
+      larkAppId: 'a1',
+      workingDir: `${HOME}/Code`,
+    } as any)).toEqual([`${HOME}/Code`]);
   });
 
   it('falls back to global config workingDirs rooted at themselves (no bot)', () => {

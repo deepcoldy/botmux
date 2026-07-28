@@ -69,7 +69,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
@@ -1759,22 +1759,22 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
-      const botCfg = getBot(ds.larkAppId).config;
       const effectiveCliId = sessionCliId(ds);
-      if (ds.worker) {
-        logger.info(`[${tag(ds)}] Restart via card button`);
-        ds.worker.send({ type: 'restart' } as DaemonToWorker);
-        const cliName = getCliDisplayName(effectiveCliId);
-        const restartedMsg = t('card.action.restarted', { cliName }, locDs);
-        await deliverEphemeralOrReply(ds, operatorOpenId, restartedMsg, 'text', () => sessionReply(rootId, restartedMsg));
-      } else {
-        logger.info(`[${tag(ds)}] Re-forking worker via card button`);
-        forkWorker(ds, '', ds.hasHistory);
-        const cliName = getCliDisplayName(effectiveCliId);
-        const restartedFreshMsg = t('card.action.restarted_fresh', { cliName }, locDs);
-        await deliverEphemeralOrReply(ds, operatorOpenId, restartedFreshMsg, 'text', () => sessionReply(rootId, restartedFreshMsg));
-        // DM card will be sent by the ready handler when worker starts
-      }
+      const cliName = getCliDisplayName(effectiveCliId);
+      logger.info(`[${tag(ds)}] Correlated restart via card button`);
+      requestSessionRestart(ds, {
+        source: 'card',
+        notify: status => {
+          const content = t(`cmd.restart.${status}`, { cliName }, locDs);
+          return deliverEphemeralOrReply(
+            ds,
+            operatorOpenId,
+            content,
+            'text',
+            () => sessionReply(rootId, content),
+          );
+        },
+      });
     }
 
     if (actionType === 'close') {

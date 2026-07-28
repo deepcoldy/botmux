@@ -4,6 +4,19 @@ import type { DashboardEvent } from '../core/dashboard-events.js';
 
 type Row = { sessionId: string; larkAppId: string; [k: string]: unknown };
 type Sched = { id: string; [k: string]: unknown };
+const SESSION_PRESENTATION_FIELDS = ['botAvatarUrl', 'repoName', 'gitBranch'] as const;
+
+function mergeSpawnedRow(current: Row | undefined, incoming: Row, larkAppId: string): Row {
+  const next: Row = { ...incoming, larkAppId };
+  if (current && current.workingDir === next.workingDir) {
+    for (const field of SESSION_PRESENTATION_FIELDS) {
+      if (next[field] === undefined && current[field] !== undefined) {
+        next[field] = current[field];
+      }
+    }
+  }
+  return next;
+}
 
 /**
  * Aggregates session and schedule state across all online daemons.
@@ -17,15 +30,29 @@ export class Aggregator {
   private listeners = new Set<(e: DashboardEvent & { larkAppId: string }) => void>();
 
   applyEvent(larkAppId: string, ev: DashboardEvent): void {
+    let emitted = ev;
     switch (ev.type) {
       case 'session.spawned': {
         const r = ev.body.session as Row;
-        this.sessions.set(r.sessionId, { ...r, larkAppId });
+        const next = mergeSpawnedRow(this.sessions.get(r.sessionId), r, larkAppId);
+        this.sessions.set(r.sessionId, next);
+        emitted = { ...ev, body: { session: next } };
         break;
       }
       case 'session.update': {
         const cur = this.sessions.get(ev.body.sessionId);
-        if (cur) this.sessions.set(ev.body.sessionId, { ...cur, ...ev.body.patch });
+        if (cur) {
+          const patch = { ...ev.body.patch };
+          if (
+            Object.prototype.hasOwnProperty.call(patch, 'workingDir')
+            && patch.workingDir !== cur.workingDir
+          ) {
+            patch.repoName = null;
+            patch.gitBranch = null;
+          }
+          this.sessions.set(ev.body.sessionId, { ...cur, ...patch });
+          emitted = { ...ev, body: { ...ev.body, patch } };
+        }
         break;
       }
       case 'session.exited': {
@@ -47,19 +74,22 @@ export class Aggregator {
       // schedule.fired and heartbeat are pass-through (no cache mutation)
     }
     for (const fn of this.listeners) {
-      try { fn({ ...ev, larkAppId } as any); } catch { /* swallow */ }
+      try { fn({ ...emitted, larkAppId } as any); } catch { /* swallow */ }
     }
   }
 
   /** Bulk-load on dashboard start before SSE catches up. Idempotent. */
   hydrateSessions(larkAppId: string, rows: Row[]): void {
-    for (const r of rows) this.sessions.set(r.sessionId, { ...r, larkAppId });
+    for (const r of rows) {
+      this.sessions.set(r.sessionId, mergeSpawnedRow(this.sessions.get(r.sessionId), r, larkAppId));
+    }
   }
   hydrateSchedules(rows: Sched[]): void {
     for (const r of rows) this.schedules.set(r.id, r);
   }
 
   getSessions(): Row[] { return [...this.sessions.values()]; }
+  getSession(sessionId: string): Row | undefined { return this.sessions.get(sessionId); }
   getSchedules(): Sched[] { return [...this.schedules.values()]; }
 
   /** sessionId → owning daemon's larkAppId (used for write routing). */
@@ -137,6 +167,9 @@ export function subscribeDaemon(
               const data = line.slice(5).trim();
               try {
                 const body = JSON.parse(data);
+                if (evt === 'session.spawned' && d.botAvatarUrl && body?.session) {
+                  body.session = { ...body.session, botAvatarUrl: d.botAvatarUrl };
+                }
                 agg.applyEvent(d.larkAppId, { type: evt, body } as any);
               } catch {
                 // Skip malformed frame

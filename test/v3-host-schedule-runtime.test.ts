@@ -7,7 +7,7 @@ let tempDataDir = '';
 
 vi.mock('../src/config.js', () => ({
   config: {
-    session: { get dataDir() { return tempDataDir; } },
+    session: { get dataDir() { return join(tempDataDir, 'data'); } },
   },
 }));
 vi.mock('../src/utils/logger.js', () => ({
@@ -15,7 +15,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { createDefaultHostExecutorRegistry } from '../src/workflows/hostExecutors/registry.js';
-import { getTask, listTasks } from '../src/services/schedule-store.js';
+import { getTask, listTasks, setScheduleScope } from '../src/services/schedule-store.js';
 import { validateDag } from '../src/workflows/v3/dag.js';
 import { prepareV3HostInputArtifact } from '../src/workflows/v3/host-execution.js';
 import { readJournal } from '../src/workflows/v3/journal.js';
@@ -35,6 +35,7 @@ const validateManifest: V3RuntimeDeps['validateManifest'] = async (manifestPath,
 
 beforeEach(() => {
   tempDataDir = mkdtempSync(join(tmpdir(), 'v3-host-schedule-store-'));
+  setScheduleScope('cli_test');
 });
 
 afterEach(() => {

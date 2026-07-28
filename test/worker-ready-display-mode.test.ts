@@ -9,6 +9,7 @@
  *   1. POST path + displayMode='screenshot' → worker.send called
  *   2. POST path + displayMode='hidden' → worker.send NOT called
  *   3. PATCH path + displayMode='screenshot' → worker.send called (symmetry)
+ *   4. silent recovery + displayMode='screenshot' → worker.send called without card IO
  *
  * Run:  pnpm vitest run test/worker-ready-display-mode.test.ts
  */
@@ -333,6 +334,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
     );
+  });
+
+  it('silent recovery restores screenshot mode without touching the streaming card', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      displayMode: 'screenshot',
+      suppressRecoveryCard: true,
+      streamCardPending: false,
+      streamCardId: 'om_existing_card',
+      worker: fakeWorker,
+    });
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(fakeWorker.send).toHaveBeenCalledWith({
+      type: 'set_display_mode',
+      mode: 'screenshot',
+    });
   });
 
   it('re-applies readiness when cli_session_id races a restored-card PATCH', async () => {

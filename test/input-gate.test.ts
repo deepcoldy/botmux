@@ -29,6 +29,15 @@ const base = {
 };
 
 describe('shouldWriteNow', () => {
+  it('holds stale busy Codex App input even when type-ahead is supported', () => {
+    expect(shouldWriteNow({
+      isPromptReady: false,
+      isFlushing: false,
+      supportsTypeAhead: true,
+      awaitingFirstPrompt: false,
+      holdForRunnerReload: true,
+    })).toBe(false);
+  });
   it('writes immediately when the prompt is ready (idle)', () => {
     expect(shouldWriteNow({ ...base, isPromptReady: true })).toBe(true);
   });

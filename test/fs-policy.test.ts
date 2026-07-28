@@ -153,7 +153,10 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-master.key').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/webhook-secrets.json').access).toBe('none');
     // cross-bot content/routing (codex high finding)
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('readWrite'); // RMW schedule store — owner-accepted cross-bot exposure
+    // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
+    // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_other.json').access).toBe('none'); // sibling
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('none');
