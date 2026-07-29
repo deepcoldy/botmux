@@ -4174,6 +4174,7 @@ async function cmdFreeze(): Promise<void> {
   // 静默忽略不相容的参数会让人以为自己冻结/解冻成了别的样子。
   if (status || release) {
     const irrelevant = ['--reason', '--for', '--bot', '--notify', '--force']
+      .concat(status ? ['--pid'] : [])   // --pid 只对 acquire 与 --release 有意义
       .filter(flag => argv.includes(flag));
     if (irrelevant.length) {
       console.error(`❌ ${status ? '--status' : '--release'} 不接受 ${irrelevant.join(' / ')}`);

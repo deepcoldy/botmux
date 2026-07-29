@@ -106,7 +106,7 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
-import { activeSpawnFreezeFor, deferSpawnDuringFreeze, forgetDeferredSpawn, shouldAnnounceSpawnFreeze } from './spawn-freeze.js';
+import { deferSpawnDuringFreeze, forgetDeferredSpawn, shouldAnnounceSpawnFreeze } from './spawn-freeze.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
   extractBotmuxLarkNativeSessionTitlePrompt,
@@ -2117,27 +2117,18 @@ export function forkWorker(
   // Deliberately only blocks new spawns: tearing down live CLIs is
   // `botmux suspend`'s job, and conflating the two would make every freeze a
   // fleet-wide cold restart.
-  // A promptless spawn (restore re-attach, warm-up) carries nothing to deliver,
-  // so it must NOT occupy this session's single parked slot: doing so would make
-  // the freeze drop the FIRST real user turn that arrives behind it. During a
-  // window such a spawn is simply skipped — the session stays worker-less and
-  // cold-resumes on its next message, exactly as after `botmux suspend`.
-  const gatePayloadEmpty = typeof promptInput === 'string'
-    ? promptInput.trim() === ''
-    : promptInput.content.trim() === '' && !promptInput.codexAppInput;
-  if (gatePayloadEmpty) {
-    const skipFreeze = activeSpawnFreezeFor(ds.larkAppId);
-    if (skipFreeze) {
-      logger.info(
-        `[${tag(ds)}] promptless worker spawn skipped during spawn-freeze `
-        + `(reason=${skipFreeze.reason}) — session stays worker-less and cold-resumes later`,
-      );
-      return;
-    }
-  }
+  // Whether this spawn carries a user turn. A promptless one (restore re-attach,
+  // warm-up, a start whose only job is to let a queued raw command reach a ready
+  // CLI) is still parked — skipping it outright would silently strand dashboard
+  // wakes and `pendingRawInput` — but it must not shut out the first real turn,
+  // so the gate lets a payload-bearing request displace it.
+  const gateHasPayload = typeof promptInput === 'string'
+    ? promptInput.trim() !== ''
+    : promptInput.content.trim() !== '' || !!promptInput.codexAppInput;
   const opsFreeze = deferSpawnDuringFreeze({
     sessionId: deferredSessionId,
     larkAppId: ds.larkAppId,
+    hasPayload: gateHasPayload,
     replay: () => {
       // Replay only when this ds is STILL the live session it was queued for:
       // closed, replaced or transferred sessions must never be revived.
@@ -2160,7 +2151,7 @@ export function forkWorker(
     if (parked) {
       logger.info(
         `[${tag(ds)}] worker spawn parked by spawn-freeze (reason=${freeze.reason}, `
-        + `~${remainingSec}s left)`,
+        + `~${remainingSec}s left${opsFreeze.superseded ? ', superseded a promptless spawn' : ''})`,
       );
     } else {
       logger.warn(

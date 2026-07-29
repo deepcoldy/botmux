@@ -12,8 +12,10 @@
  *
  *  - the FIRST message that would have started a CLI in a session is replayed
  *    after release, so it is delayed rather than dropped;
- *  - a promptless spawn (restore re-attach / warm-up) is skipped rather than
- *    parked, so it cannot consume the slot that the first real turn needs;
+ *  - a promptless spawn (restore re-attach, warm-up, a start that only exists so
+ *    a queued raw command can be written once the CLI is ready) parks like any
+ *    other, but a payload-bearing turn SUPERSEDES it, so a warm-up cannot
+ *    consume the slot the first real turn needs;
  *  - a SECOND message to that same session in the same window is NOT parked
  *    (replaying two forks would kill and replace the first new worker), and
  *    nothing else is holding it either: the worker never started, so the
@@ -27,6 +29,11 @@
  * structured CLI input) would make this a delivery queue rather than a gate;
  * that is deliberately out of scope. The limits above are surfaced instead of
  * papered over — keep maintenance windows short.
+ *
+ * `pid` is a cooperative identity, not a security boundary: it is only checked
+ * for liveness, so a same-user caller could name somebody else's pid (and one
+ * that can write this file could equally pass `--force`). It exists to keep an
+ * operator's own scripts from disarming each other, nothing more.
  *
  * Out of scope by definition: `/adopt` sessions. Botmux never started those
  * CLIs (the user did, outside botmux) and re-attaching to one starts no new CLI,
@@ -269,13 +276,21 @@ export function activeSpawnFreezeFor(
 
 export interface SpawnFreezeDeferral {
   freeze: ActiveSpawnFreeze;
-  /** False when this session already had a spawn parked — i.e. THIS request will
-   *  not be replayed and the turn behind it is lost unless re-sent. */
+  /** False when this session already had a payload-bearing spawn parked — i.e.
+   *  THIS request will not be replayed and the turn behind it is lost unless
+   *  re-sent. */
   parked: boolean;
+  /** True when parking this request displaced a promptless one (warm-up /
+   *  re-attach). Nothing is lost — that spawn carried no turn — but it is worth
+   *  a log line. */
+  superseded?: boolean;
 }
 
 interface DeferredSpawn {
   larkAppId?: string;
+  /** A promptless spawn (empty prompt, no structured input) carries no user turn
+   *  and may be displaced by one that does. */
+  hasPayload: boolean;
   replay: () => void;
 }
 
@@ -319,17 +334,26 @@ function ensurePoll(deps: SpawnFreezeDeps = {}): void {
  * `parked: false` is something the caller must surface, not swallow.
  */
 export function deferSpawnDuringFreeze(
-  input: { sessionId: string; larkAppId?: string; replay: () => void },
+  input: { sessionId: string; larkAppId?: string; hasPayload: boolean; replay: () => void },
   deps: SpawnFreezeDeps = {},
 ): SpawnFreezeDeferral | null {
   const freeze = activeSpawnFreezeFor(input.larkAppId, deps);
   if (!freeze) return null;
-  const parked = !deferredSpawns.has(input.sessionId);
+  const existing = deferredSpawns.get(input.sessionId);
+  // A promptless spawn still has to be parked — some of them exist precisely so
+  // a queued raw command or a dashboard wake gets a CLI — but it must not shut
+  // out the first real turn, so a payload-bearing request displaces it.
+  const superseded = existing !== undefined && !existing.hasPayload && input.hasPayload;
+  const parked = existing === undefined || superseded;
   if (parked) {
-    deferredSpawns.set(input.sessionId, { larkAppId: input.larkAppId, replay: input.replay });
+    deferredSpawns.set(input.sessionId, {
+      larkAppId: input.larkAppId,
+      hasPayload: input.hasPayload,
+      replay: input.replay,
+    });
   }
   ensurePoll(deps);
-  return { freeze, parked };
+  return { freeze, parked, ...(superseded ? { superseded: true } : {}) };
 }
 
 /** Drop a parked spawn without replaying it (session closed while frozen). */
@@ -411,8 +435,10 @@ export function writeSpawnFreeze(
   const path = spawnFreezePath(deps);
   const body = `${JSON.stringify(parsed, null, 2)}\n`;
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, body, { mode: 0o600 });
   try {
+    // Inside the try: a partial write (disk full, EIO) must not leave the temp
+    // behind either.
+    writeFileSync(tmp, body, { mode: 0o600 });
     if (opts.force) {
       renameSync(tmp, path);
       return path;

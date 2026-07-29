@@ -247,15 +247,15 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('first') }, d))
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('first') }, d))
       .toMatchObject({ parked: true });
     // A second turn for the same session must NOT queue a second fork (replaying
     // two forks would kill and replace the first new worker). `parked: false` is
     // how the caller learns THIS turn is dropped and has to be reported — the
     // barrier is a delay, not a queue.
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('second') }, d))
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('second') }, d))
       .toMatchObject({ parked: false });
-    expect(deferSpawnDuringFreeze({ sessionId: 's2', replay: () => replays.push('other') }, d))
+    expect(deferSpawnDuringFreeze({ sessionId: 's2', hasPayload: true, replay: () => replays.push('other') }, d))
       .toMatchObject({ parked: true });
     expect(deferredSpawnCount()).toBe(2);
     expect(replays).toEqual([]);
@@ -276,15 +276,38 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', replay: () => replays.push('a') }, d))
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', hasPayload: true, replay: () => replays.push('a') }, d))
       .toMatchObject({ parked: true });
     // Out of scope: never deferred in the first place.
-    expect(deferSpawnDuringFreeze({ sessionId: 's2', larkAppId: 'cli_b', replay: () => replays.push('b') }, d)).toBeNull();
+    expect(deferSpawnDuringFreeze({ sessionId: 's2', larkAppId: 'cli_b', hasPayload: true, replay: () => replays.push('b') }, d)).toBeNull();
     expect(deferredSpawnCount()).toBe(1);
 
     clearSpawnFreeze(d);
     await waitForPolls();
     expect(replays).toEqual(['a']);
+  });
+
+  it('lets a real turn supersede a parked promptless spawn, but never the reverse', async () => {
+    const dir = freshDir();
+    writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 60_000 });
+    const d = deps(dir);
+
+    const replays: string[] = [];
+    // A warm-up / re-attach parks (some of those exist so a queued raw command
+    // reaches a ready CLI — skipping them outright would strand it)…
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup') }, d))
+      .toMatchObject({ parked: true });
+    // …but the first real turn takes the slot from it.
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('real') }, d))
+      .toMatchObject({ parked: true, superseded: true });
+    // A later promptless spawn must NOT displace the real turn.
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup2') }, d))
+      .toMatchObject({ parked: false });
+    expect(deferredSpawnCount()).toBe(1);
+
+    clearSpawnFreeze(d);
+    await waitForPolls();
+    expect(replays).toEqual(['real']);
   });
 
   it('drops a parked spawn when its session is closed', async () => {
@@ -293,7 +316,7 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('s1') }, d);
+    deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('s1') }, d);
     forgetDeferredSpawn('s1');
     expect(deferredSpawnCount()).toBe(0);
 
@@ -309,7 +332,7 @@ describe('deferred spawns', () => {
     const d = { dataDir: () => dir, now: () => now, processAlive: () => true, pollMs: POLL_MS };
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('s1') }, d))
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('s1') }, d))
       .toMatchObject({ parked: true });
 
     now = NOW + 2_001;
