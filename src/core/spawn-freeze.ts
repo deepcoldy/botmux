@@ -4,9 +4,27 @@
  * A maintenance script — credential refresh, `claude` upgrade, workspace
  * rebuild — declares a freeze by writing `<dataDir>/spawn-freeze.json`, and
  * every daemon reads that declaration immediately before it would start a CLI.
- * While the declaration is effective `forkWorker` queues at most one cold spawn
- * per logical session and replays it on release, so a user's message is delayed
- * instead of lost.
+ * While the declaration is effective `forkWorker` parks at most one cold spawn
+ * per logical session and replays it on release.
+ *
+ * What that does and does NOT guarantee, precisely — this is a delay, not a
+ * queue:
+ *
+ *  - the FIRST message that would have started a CLI in a session is replayed
+ *    after release, so it is delayed rather than dropped;
+ *  - a SECOND message to that same session in the same window is NOT parked
+ *    (replaying two forks would kill and replace the first new worker), and
+ *    nothing else is holding it either: the worker never started, so the
+ *    worker-side pre-ready input buffer that normally absorbs follow-up turns
+ *    does not exist yet. Such a turn is reported — log, plus a chat notice when
+ *    `notify` is on — and has to be re-sent;
+ *  - a daemon restart inside the window loses the parked spawns. The
+ *    declaration is on disk; the parked closures are not.
+ *
+ * Buffering whole turns durably (message id, attachments, reaction settlement,
+ * structured CLI input) would make this a delivery queue rather than a gate;
+ * that is deliberately out of scope. The limits above are surfaced instead of
+ * papered over — keep maintenance windows short.
  *
  * The file is data, never code: a declaration can only ask for "no new CLI
  * until T", it can never make the daemon execute anything. That keeps the
@@ -243,6 +261,13 @@ export function activeSpawnFreezeFor(
   return spawnFreezeApplies(freeze, larkAppId) ? freeze : null;
 }
 
+export interface SpawnFreezeDeferral {
+  freeze: ActiveSpawnFreeze;
+  /** False when this session already had a spawn parked — i.e. THIS request will
+   *  not be replayed and the turn behind it is lost unless re-sent. */
+  parked: boolean;
+}
+
 interface DeferredSpawn {
   larkAppId?: string;
   replay: () => void;
@@ -277,25 +302,28 @@ function ensurePoll(deps: SpawnFreezeDeps = {}): void {
 }
 
 /**
- * Park a cold spawn while a freeze applies, and return the freeze that caused
- * it (null = not frozen, caller proceeds).
+ * Park a cold spawn while a freeze applies. Returns null when not frozen (the
+ * caller proceeds to spawn), otherwise the freeze plus whether THIS request is
+ * the one that got parked.
  *
- * Only the FIRST request per logical session is queued: later turns are
- * already retained by the session's own pending-input machinery, and replaying
- * several fork requests would kill and replace the first new worker. Same
- * invariant as `deferWorkerSpawnDuringDeviceIsolation`.
+ * Only the first request per logical session can be parked: replaying several
+ * fork requests would kill and replace the first new worker. Same invariant as
+ * `deferWorkerSpawnDuringDeviceIsolation` — and, as the module header spells
+ * out, a later turn is genuinely dropped rather than queued elsewhere, so
+ * `parked: false` is something the caller must surface, not swallow.
  */
 export function deferSpawnDuringFreeze(
   input: { sessionId: string; larkAppId?: string; replay: () => void },
   deps: SpawnFreezeDeps = {},
-): ActiveSpawnFreeze | null {
+): SpawnFreezeDeferral | null {
   const freeze = activeSpawnFreezeFor(input.larkAppId, deps);
   if (!freeze) return null;
-  if (!deferredSpawns.has(input.sessionId)) {
+  const parked = !deferredSpawns.has(input.sessionId);
+  if (parked) {
     deferredSpawns.set(input.sessionId, { larkAppId: input.larkAppId, replay: input.replay });
   }
   ensurePoll(deps);
-  return freeze;
+  return { freeze, parked };
 }
 
 /** Drop a parked spawn without replaying it (session closed while frozen). */
@@ -309,29 +337,63 @@ export function deferredSpawnCount(): number {
 }
 
 /**
- * One-shot gate for the "maintenance in progress" reply: true the first time a
- * given chat asks during a given declaration. Without this a busy group gets
- * one notice per message; with it the group is told once and then simply waits.
+ * One-shot gate for a "maintenance in progress" reply: true the first time a
+ * given anchor asks during a given declaration, per `kind`. Without it a busy
+ * chat gets one notice per message; with it it is told once and then waits.
  * State resets when the declaration changes, so the next window speaks again.
+ *
+ * `anchor` must be the same key the notice is delivered to (the session's reply
+ * anchor, NOT its chat id): keyed by chat, a second topic in the same group
+ * would be silenced even though a different person is waiting in it.
+ *
+ * `kind` separates the two things worth saying once each: "parked, it continues
+ * by itself" and "this one was dropped, re-send it".
  */
-export function shouldAnnounceSpawnFreeze(freeze: ActiveSpawnFreeze, chatKey: string): boolean {
+export function shouldAnnounceSpawnFreeze(
+  freeze: ActiveSpawnFreeze,
+  anchor: string,
+  kind: 'parked' | 'dropped' = 'parked',
+): boolean {
   if (!freeze.notify) return false;
   if (noticeFreezeId !== freeze.freezeId) {
     noticeFreezeId = freeze.freezeId;
     noticedChats.clear();
   }
-  if (noticedChats.has(chatKey)) return false;
-  noticedChats.add(chatKey);
+  const key = `${kind}:${anchor}`;
+  if (noticedChats.has(key)) return false;
+  noticedChats.add(key);
   return true;
 }
 
-/** Atomically publish a declaration. Same-directory temp + rename so a reader
- *  never observes a half-written file. */
+export class SpawnFreezeConflictError extends Error {
+  constructor(public readonly active: ActiveSpawnFreeze) {
+    super(`another spawn freeze is active: ${active.reason}`);
+    this.name = 'SpawnFreezeConflictError';
+  }
+}
+
+/**
+ * Atomically publish a declaration. Same-directory temp + rename so a reader
+ * never observes a half-written file.
+ *
+ * Refuses to clobber a declaration that is still in effect. There is exactly one
+ * declaration file, so an unconditional write let two overlapping maintenance
+ * scripts silently disarm each other — the later writer erasing the earlier
+ * one's scope, then the earlier one's cleanup deleting the later one's freeze.
+ * Making that a visible failure (so the second script decides what to do) is
+ * worth ~10 lines; a multi-record lease protocol is not, so overlapping windows
+ * are simply unsupported.
+ */
 export function writeSpawnFreeze(
   declaration: SpawnFreezeDeclaration,
   deps: SpawnFreezeDeps = {},
+  opts: { force?: boolean } = {},
 ): string {
   const parsed = parseSpawnFreezeDeclaration(declaration);
+  if (!opts.force) {
+    const active = readActiveSpawnFreeze(deps);
+    if (active) throw new SpawnFreezeConflictError(active);
+  }
   const path = spawnFreezePath(deps);
   const tmp = `${path}.tmp-${process.pid}`;
   writeFileSync(tmp, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 });
@@ -339,19 +401,42 @@ export function writeSpawnFreeze(
   return path;
 }
 
-/** Remove the declaration. Idempotent — releasing a freeze that already
- *  expired must not fail a maintenance script's cleanup trap. */
-export function clearSpawnFreeze(deps: SpawnFreezeDeps = {}): boolean {
+export type ClearSpawnFreezeResult = 'cleared' | 'absent' | 'not_owner';
+
+/**
+ * Remove the declaration. Idempotent — releasing a freeze that already expired
+ * must not fail a maintenance script's cleanup trap.
+ *
+ * With `ownerPid`, only a declaration made by that pid is removed: a script's
+ * EXIT trap must never delete somebody else's freeze. A declaration written
+ * without a pid has no owner to check and stays removable by anyone.
+ */
+export function clearSpawnFreeze(
+  deps: SpawnFreezeDeps = {},
+  opts: { ownerPid?: number } = {},
+): ClearSpawnFreezeResult {
   const path = spawnFreezePath(deps);
   try {
     // lstat for the same reason the reader uses it: "exists" must include a
     // dangling symlink, which statSync would report as absent and leave behind.
     lstatSync(path);
   } catch {
-    return false;
+    return 'absent';
+  }
+  if (opts.ownerPid !== undefined) {
+    // Read the raw declaration rather than `readActiveSpawnFreeze`: an EXPIRED
+    // declaration must still be removable by its owner, and one we cannot parse
+    // carries no ownership claim to respect.
+    let declaredPid: number | undefined;
+    try {
+      declaredPid = parseSpawnFreezeDeclaration(JSON.parse(readFileSync(path, 'utf-8'))).pid;
+    } catch {
+      declaredPid = undefined;
+    }
+    if (declaredPid !== undefined && declaredPid !== opts.ownerPid) return 'not_owner';
   }
   rmSync(path, { force: true });
-  return true;
+  return 'cleared';
 }
 
 /** Test-only: production state is driven entirely by the file and the timer. */

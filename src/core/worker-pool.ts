@@ -2132,27 +2132,43 @@ export function forkWorker(
     },
   });
   if (opsFreeze) {
-    const remainingSec = Math.max(1, Math.ceil((opsFreeze.effectiveUntil - Date.now()) / 1000));
-    logger.info(
-      `[${tag(ds)}] worker spawn deferred by spawn-freeze (reason=${opsFreeze.reason}, `
-      + `~${remainingSec}s left)`,
-    );
-    const chatKey = ds.session.chatId ?? ds.session.sessionId;
-    if (shouldAnnounceSpawnFreeze(opsFreeze, chatKey)) {
+    const { freeze, parked } = opsFreeze;
+    const remainingSec = Math.max(1, Math.ceil((freeze.effectiveUntil - Date.now()) / 1000));
+    const anchor = sessionAnchorId(ds);
+    // `parked: false` means this session already has a spawn waiting, so THIS
+    // turn will not be replayed — it is dropped. Say so loudly: the reaction
+    // bookkeeping settles pending turns when the replayed one finishes, so an
+    // unreported drop would show up to the user as "handled".
+    if (parked) {
+      logger.info(
+        `[${tag(ds)}] worker spawn parked by spawn-freeze (reason=${freeze.reason}, `
+        + `~${remainingSec}s left)`,
+      );
+    } else {
+      logger.warn(
+        `[${tag(ds)}] spawn-freeze (reason=${freeze.reason}) already holds a parked spawn for this `
+        + `session — THIS turn will not be replayed and must be re-sent after release `
+        + `(~${remainingSec}s left)`,
+      );
+    }
+    if (shouldAnnounceSpawnFreeze(freeze, anchor, parked ? 'parked' : 'dropped')) {
       const gateTurnId = typeof resumeOrTurnId === 'string'
         ? resumeOrTurnId
         : (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null ? resumeOrTurnId.turnId : undefined);
+      const notice = parked
+        ? `🔧 维护中（${freeze.reason}），暂不启动新的 CLI 会话；约 ${remainingSec} 秒后自动继续处理这条消息。`
+        : `🔧 维护中（${freeze.reason}），这条消息不会被自动处理——本会话已有一条在排队。请在约 ${remainingSec} 秒后重发。`;
       try {
         void requireCallbacks().sessionReply(
-          sessionAnchorId(ds),
-          `🔧 维护中（${opsFreeze.reason}），暂不启动新的 CLI 会话；约 ${remainingSec} 秒后自动继续处理这条消息。`,
+          anchor,
+          notice,
           'text',
           ds.larkAppId,
           fallbackTurnId(ds, gateTurnId),
         ).catch(err => logger.warn(`[${tag(ds)}] spawn-freeze notice failed: ${err?.message ?? err}`));
       } catch {
-        // No callbacks wired (unit tests / early boot) — the delay is silent,
-        // which is strictly better than failing the gate itself.
+        // No callbacks wired (unit tests / early boot) — the log above is the
+        // only report, which is strictly better than failing the gate itself.
       }
     }
     return;

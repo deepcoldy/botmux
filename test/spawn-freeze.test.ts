@@ -6,6 +6,7 @@ import {
   activeSpawnFreezeFor,
   clearSpawnFreeze,
   deferSpawnDuringFreeze,
+  SpawnFreezeConflictError,
   deferredSpawnCount,
   forgetDeferredSpawn,
   readActiveSpawnFreeze,
@@ -46,7 +47,20 @@ function writeRaw(dir: string, body: string, mtimeMs = NOW): void {
 }
 
 function writeDeclaration(dir: string, declaration: SpawnFreezeDeclaration, mtimeMs = NOW): void {
+  // force: several tests deliberately replace an in-effect declaration.
+  writeSpawnFreeze(declaration, deps(dir), { force: true });
+  stampMtime(dir, mtimeMs);
+}
+
+/** Write WITHOUT force (the conflict check runs), then normalize mtime: the
+ *  harness clock (`NOW`) is far in the past, so a real write time would read as
+ *  a future mtime and be refused. */
+function writeUnforced(dir: string, declaration: SpawnFreezeDeclaration, mtimeMs = NOW): void {
   writeSpawnFreeze(declaration, deps(dir));
+  stampMtime(dir, mtimeMs);
+}
+
+function stampMtime(dir: string, mtimeMs: number): void {
   const path = join(dir, SPAWN_FREEZE_FILENAME);
   utimesSync(path, new Date(mtimeMs), new Date(mtimeMs));
 }
@@ -163,9 +177,45 @@ describe('spawn freeze declaration', () => {
   it('clears idempotently', () => {
     const dir = freshDir();
     writeDeclaration(dir, { reason: 'cred-refresh', deadline: NOW + 60_000 });
-    expect(clearSpawnFreeze(deps(dir))).toBe(true);
-    expect(clearSpawnFreeze(deps(dir))).toBe(false);
+    expect(clearSpawnFreeze(deps(dir))).toBe('cleared');
+    expect(clearSpawnFreeze(deps(dir))).toBe('absent');
     expect(readActiveSpawnFreeze(deps(dir))).toBeNull();
+  });
+
+  it('refuses to clobber an in-effect declaration unless forced', () => {
+    const dir = freshDir();
+    // Two overlapping maintenance scripts would otherwise disarm each other:
+    // the later write erases the earlier scope, the earlier cleanup deletes the
+    // later freeze.
+    writeDeclaration(dir, { reason: 'first', deadline: NOW + 60_000, pid: 111 });
+    expect(() => writeSpawnFreeze({ reason: 'second', deadline: NOW + 60_000 }, deps(dir)))
+      .toThrow(SpawnFreezeConflictError);
+    expect(readActiveSpawnFreeze(deps(dir))!.reason).toBe('first');
+    // --force is the explicit takeover…
+    writeDeclaration(dir, { reason: 'second', deadline: NOW + 60_000 });
+    expect(readActiveSpawnFreeze(deps(dir))!.reason).toBe('second');
+    // …and an EXPIRED declaration is not a conflict at all: an abandoned file
+    // must never block the next maintenance window.
+    writeDeclaration(dir, { reason: 'stale', deadline: NOW - 1 });
+    writeUnforced(dir, { reason: 'third', deadline: NOW + 60_000 });
+    expect(readActiveSpawnFreeze(deps(dir))!.reason).toBe('third');
+  });
+
+  it('releases only its own declaration when an owner pid is given', () => {
+    const dir = freshDir();
+    writeDeclaration(dir, { reason: 'theirs', deadline: NOW + 60_000, pid: 4242 });
+    // A script's EXIT trap must not delete somebody else's freeze.
+    expect(clearSpawnFreeze(deps(dir), { ownerPid: 777 })).toBe('not_owner');
+    expect(readActiveSpawnFreeze(deps(dir))).not.toBeNull();
+    expect(clearSpawnFreeze(deps(dir), { ownerPid: 4242 })).toBe('cleared');
+
+    // An owner must still be able to clean up its own EXPIRED declaration.
+    writeDeclaration(dir, { reason: 'mine', deadline: NOW - 1, pid: 4242 });
+    expect(clearSpawnFreeze(deps(dir), { ownerPid: 4242 })).toBe('cleared');
+
+    // No pid recorded → no ownership claim to respect.
+    writeDeclaration(dir, { reason: 'ownerless', deadline: NOW + 60_000 });
+    expect(clearSpawnFreeze(deps(dir), { ownerPid: 999 })).toBe('cleared');
   });
 });
 
@@ -176,11 +226,16 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('first') }, d)).not.toBeNull();
-    // A second turn for the same session must NOT queue a second fork: replaying
-    // two forks would kill and replace the first new worker.
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('second') }, d)).not.toBeNull();
-    expect(deferSpawnDuringFreeze({ sessionId: 's2', replay: () => replays.push('other') }, d)).not.toBeNull();
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('first') }, d))
+      .toMatchObject({ parked: true });
+    // A second turn for the same session must NOT queue a second fork (replaying
+    // two forks would kill and replace the first new worker). `parked: false` is
+    // how the caller learns THIS turn is dropped and has to be reported — the
+    // barrier is a delay, not a queue.
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('second') }, d))
+      .toMatchObject({ parked: false });
+    expect(deferSpawnDuringFreeze({ sessionId: 's2', replay: () => replays.push('other') }, d))
+      .toMatchObject({ parked: true });
     expect(deferredSpawnCount()).toBe(2);
     expect(replays).toEqual([]);
 
@@ -200,7 +255,8 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', replay: () => replays.push('a') }, d)).not.toBeNull();
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', replay: () => replays.push('a') }, d))
+      .toMatchObject({ parked: true });
     // Out of scope: never deferred in the first place.
     expect(deferSpawnDuringFreeze({ sessionId: 's2', larkAppId: 'cli_b', replay: () => replays.push('b') }, d)).toBeNull();
     expect(deferredSpawnCount()).toBe(1);
@@ -232,7 +288,8 @@ describe('deferred spawns', () => {
     const d = { dataDir: () => dir, now: () => now, processAlive: () => true, pollMs: POLL_MS };
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('s1') }, d)).not.toBeNull();
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', replay: () => replays.push('s1') }, d))
+      .toMatchObject({ parked: true });
 
     now = NOW + 2_001;
     await waitForPolls();
@@ -245,18 +302,24 @@ describe('freeze announcements', () => {
     const dir = freshDir();
     writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 300_000, notify: true });
     const first = readActiveSpawnFreeze(deps(dir))!;
-    expect(shouldAnnounceSpawnFreeze(first, 'chat-1')).toBe(true);
-    expect(shouldAnnounceSpawnFreeze(first, 'chat-1')).toBe(false);
-    expect(shouldAnnounceSpawnFreeze(first, 'chat-2')).toBe(true);
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1')).toBe(true);
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1')).toBe(false);
+    // A different session in the same group has its own anchor and must still be
+    // told — keying by chat id would silence whoever is waiting in it.
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-2')).toBe(true);
+    // "parked" and "dropped" are different messages, one each.
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'dropped')).toBe(true);
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'dropped')).toBe(false);
 
     // A NEW declaration is a new window: the same chat is told again.
     writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 400_000, notify: true });
     const second = readActiveSpawnFreeze(deps(dir))!;
     expect(second.freezeId).not.toBe(first.freezeId);
-    expect(shouldAnnounceSpawnFreeze(second, 'chat-1')).toBe(true);
+    expect(shouldAnnounceSpawnFreeze(second, 'anchor-1')).toBe(true);
 
     writeDeclaration(dir, { reason: 'quiet', deadline: NOW + 60_000 });
     const quiet = readActiveSpawnFreeze(deps(dir))!;
-    expect(shouldAnnounceSpawnFreeze(quiet, 'chat-1')).toBe(false);
+    expect(shouldAnnounceSpawnFreeze(quiet, 'anchor-1')).toBe(false);
+    expect(shouldAnnounceSpawnFreeze(quiet, 'anchor-1', 'dropped')).toBe(false);
   });
 });
