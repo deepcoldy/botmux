@@ -12,6 +12,8 @@
  *
  *  - the FIRST message that would have started a CLI in a session is replayed
  *    after release, so it is delayed rather than dropped;
+ *  - a promptless spawn (restore re-attach / warm-up) is skipped rather than
+ *    parked, so it cannot consume the slot that the first real turn needs;
  *  - a SECOND message to that same session in the same window is NOT parked
  *    (replaying two forks would kill and replace the first new worker), and
  *    nothing else is holding it either: the worker never started, so the
@@ -25,6 +27,10 @@
  * structured CLI input) would make this a delivery queue rather than a gate;
  * that is deliberately out of scope. The limits above are surfaced instead of
  * papered over — keep maintenance windows short.
+ *
+ * Out of scope by definition: `/adopt` sessions. Botmux never started those
+ * CLIs (the user did, outside botmux) and re-attaching to one starts no new CLI,
+ * so a maintenance window has nothing to protect there.
  *
  * The file is data, never code: a declaration can only ask for "no new CLI
  * until T", it can never make the daemon execute anything. That keeps the
@@ -59,7 +65,7 @@
  * handed out before the boot can never cover. The two compose — `forkWorker`
  * defers when either one applies.
  */
-import { lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { linkSync, lstatSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from './data-dir.js';
 
@@ -373,16 +379,28 @@ export class SpawnFreezeConflictError extends Error {
 }
 
 /**
- * Atomically publish a declaration. Same-directory temp + rename so a reader
- * never observes a half-written file.
+ * Publish a declaration. A reader never observes a half-written file: the
+ * content is written to a same-directory temp and then linked/renamed into
+ * place.
  *
- * Refuses to clobber a declaration that is still in effect. There is exactly one
- * declaration file, so an unconditional write let two overlapping maintenance
- * scripts silently disarm each other — the later writer erasing the earlier
- * one's scope, then the earlier one's cleanup deleting the later one's freeze.
- * Making that a visible failure (so the second script decides what to do) is
- * worth ~10 lines; a multi-record lease protocol is not, so overlapping windows
- * are simply unsupported.
+ * Refuses to clobber a declaration that is still in effect and belongs to
+ * somebody else. There is exactly one declaration file, so an unconditional
+ * write let two overlapping maintenance scripts silently disarm each other —
+ * the later writer erasing the earlier one's scope, then the earlier one's
+ * cleanup deleting the later one's freeze. Making that a visible failure (so the
+ * second script decides what to do) is worth the code; a multi-record lease
+ * protocol is not, so overlapping windows from DIFFERENT owners stay
+ * unsupported.
+ *
+ * Three cases are allowed through:
+ *  - nothing in effect (missing / expired / dead declarer / unparseable);
+ *  - same `pid` — an owner extending or amending its own window (both sides must
+ *    name a pid; two anonymous declarations are two owners, not one);
+ *  - `force` — an explicit operator takeover.
+ *
+ * The create path uses `link()`, which fails if the destination exists, so the
+ * check and the publish are one atomic step rather than a TOCTOU pair: two
+ * scripts racing from scratch cannot both win.
  */
 export function writeSpawnFreeze(
   declaration: SpawnFreezeDeclaration,
@@ -390,15 +408,41 @@ export function writeSpawnFreeze(
   opts: { force?: boolean } = {},
 ): string {
   const parsed = parseSpawnFreezeDeclaration(declaration);
-  if (!opts.force) {
-    const active = readActiveSpawnFreeze(deps);
-    if (active) throw new SpawnFreezeConflictError(active);
-  }
   const path = spawnFreezePath(deps);
+  const body = `${JSON.stringify(parsed, null, 2)}\n`;
   const tmp = `${path}.tmp-${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
-  return path;
+  writeFileSync(tmp, body, { mode: 0o600 });
+  try {
+    if (opts.force) {
+      renameSync(tmp, path);
+      return path;
+    }
+    // Bounded retry: each round either wins the atomic create, hands back a
+    // real conflict, or removes exactly one superseded declaration.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        linkSync(tmp, path);
+        return path;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== 'EEXIST') throw error;
+      }
+      const active = readActiveSpawnFreeze(deps);
+      // Same owner requires BOTH sides to actually name one: two declarations
+      // that simply omit `pid` are not "the same owner", they are two anonymous
+      // writers, and treating undefined === undefined as a match let every racer
+      // replace every other one (verified: 10 concurrent writers all succeeded).
+      const sameOwner = active !== null
+        && parsed.pid !== undefined
+        && active.declaredByPid === parsed.pid;
+      if (active && !sameOwner) throw new SpawnFreezeConflictError(active);
+      // Ours to replace (same owner), or nothing in effect: drop the stale file
+      // and try the atomic create again.
+      try { unlinkSync(path); } catch { /* somebody else removed it first */ }
+    }
+    throw new Error('spawn-freeze declaration is being rewritten concurrently');
+  } finally {
+    try { unlinkSync(tmp); } catch { /* already linked away or gone */ }
+  }
 }
 
 export type ClearSpawnFreezeResult = 'cleared' | 'absent' | 'not_owner';

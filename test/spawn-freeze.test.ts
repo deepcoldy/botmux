@@ -201,6 +201,27 @@ describe('spawn freeze declaration', () => {
     expect(readActiveSpawnFreeze(deps(dir))!.reason).toBe('third');
   });
 
+  it('lets the same owner update its own window, and stays atomic against a racer', () => {
+    const dir = freshDir();
+    writeDeclaration(dir, { reason: 'cred-refresh', deadline: NOW + 60_000, pid: 111 });
+    // Extending / amending your own declaration must not require --force.
+    writeUnforced(dir, { reason: 'cred-refresh', deadline: NOW + 120_000, pid: 111 });
+    expect(readActiveSpawnFreeze(deps(dir))!.deadline).toBe(NOW + 120_000);
+    // A different owner is still refused.
+    expect(() => writeSpawnFreeze({ reason: 'other', deadline: NOW + 60_000, pid: 222 }, deps(dir)))
+      .toThrow(SpawnFreezeConflictError);
+    // …and an ownerless declaration is not the same owner as a pid-bearing one.
+    expect(() => writeSpawnFreeze({ reason: 'other', deadline: NOW + 60_000 }, deps(dir)))
+      .toThrow(SpawnFreezeConflictError);
+    // Two ownerless declarations are two owners, not one — otherwise every
+    // anonymous writer replaces every other one (10 concurrent writers all won).
+    clearSpawnFreeze(deps(dir));
+    writeDeclaration(dir, { reason: 'anon-1', deadline: NOW + 60_000 });
+    expect(() => writeSpawnFreeze({ reason: 'anon-2', deadline: NOW + 60_000 }, deps(dir)))
+      .toThrow(SpawnFreezeConflictError);
+    expect(readActiveSpawnFreeze(deps(dir))!.reason).toBe('anon-1');
+  });
+
   it('releases only its own declaration when an owner pid is given', () => {
     const dir = freshDir();
     writeDeclaration(dir, { reason: 'theirs', deadline: NOW + 60_000, pid: 4242 });

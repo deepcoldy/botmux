@@ -4171,6 +4171,15 @@ async function cmdFreeze(): Promise<void> {
     console.error('❌ --release 与 --status 不能同时用');
     process.exit(1);
   }
+  // 静默忽略不相容的参数会让人以为自己冻结/解冻成了别的样子。
+  if (status || release) {
+    const irrelevant = ['--reason', '--for', '--bot', '--notify', '--force']
+      .filter(flag => argv.includes(flag));
+    if (irrelevant.length) {
+      console.error(`❌ ${status ? '--status' : '--release'} 不接受 ${irrelevant.join(' / ')}`);
+      usage();
+    }
+  }
 
   const pidRaw = single('--pid');
   let pid: number | undefined;
