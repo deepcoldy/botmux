@@ -185,6 +185,14 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt).toContain('<whiteboard id="wb_test">');
     expect(prompt).toContain('读取：`botmux whiteboard read --id wb_test --json`');
+    expect(prompt).toContain('&lt;上次 read 的 updatedAt&gt;');
+    expect(prompt).toContain('&lt;内容&gt;');
+    const whiteboard = prompt.slice(
+      prompt.indexOf('<whiteboard '),
+      prompt.indexOf('</whiteboard>') + '</whiteboard>'.length,
+    );
+    const whiteboardProse = whiteboard.replace(/<\/?whiteboard(?:\s[^>]*)?>/g, '');
+    expect(whiteboardProse.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
     // The CAS flow: update carries --expected-updated-at, and a mismatch tells
     // the agent to re-read. Pin both so the prompt keeps guiding agents to CAS.
     expect(prompt).toContain('update --id wb_test --expected-updated-at');

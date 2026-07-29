@@ -16,6 +16,10 @@ export function escapeXmlText(value: string): string {
  * as the `<<'EOF'` heredoc marker have no closing `>` and must remain copyable.
  * Apply it to prose fields before rendering them, never to a serialized block
  * whose real structural tags must stay intact.
+ *
+ * Any complete `<...>` span is treated as a tag-like token. Do not apply this
+ * helper to arbitrary shell/math prose where unrelated `<` and `>` operators
+ * may occur on the same line (for example, `cmd < input > output`).
  */
 export function escapeXmlTagLikeTokens(value: string): string {
   return value.replace(/<[^<>\r\n]+>/g, token => escapeXmlText(token));

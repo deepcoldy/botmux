@@ -525,7 +525,7 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
   return [
     `<whiteboard id="${id}">`,
     '本地项目上下文；读取：`botmux whiteboard read --id ' + id + ' --json`（拿到 content 与 updatedAt）。',
-    '更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+    escapeXmlTagLikeTokens('更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。'),
     '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
     '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
     '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',

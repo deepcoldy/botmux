@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
@@ -27,9 +28,9 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
   'Multi-line messages MUST use a heredoc — never `botmux send "line1\\nline2"`, since `\\n` may appear literally in Lark.',
   "Correct multi-line example:\n  botmux send <<'EOF'\n  line 1\n  line 2\n  EOF",
   '',
-  'Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).',
+  escapeXmlTagLikeTokens('Helpers: `botmux history` (read this session\'s history), `botmux quoted <message_id>` (fetch a quoted message), `botmux bots list` (list other bots in the group).'),
   '',
-  '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id>` (use the open_id from the <sender> tag of the CURRENT message you are answering) / `--no-mention` (low-priority notes). NEVER use `--mention-back` in this sandbox: the session-recorded sender is frozen at task creation, so on follow-up turns it would @ the wrong person (it is disabled here and will error).',
+  escapeXmlTagLikeTokens('@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id>` (use the open_id from the <sender> tag of the CURRENT message you are answering) / `--no-mention` (low-priority notes). NEVER use `--mention-back` in this sandbox: the session-recorded sender is frozen at task creation, so on follow-up turns it would @ the wrong person (it is disabled here and will error).'),
   '',
   'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply.',
   'COMPLETION CONTRACT: a turn is complete ONLY after `botmux send` actually ran and printed ✓ success. Writing the answer solely in your final report/output does NOT reach the user — always run `botmux send` first, then summarize in the report.',
