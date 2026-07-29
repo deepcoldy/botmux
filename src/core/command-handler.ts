@@ -93,6 +93,7 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { setChatStartupCommands } from '../services/chat-startup-commands-store.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -115,6 +116,70 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
 export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/skills', '/vc-auth', '/watch-comment']);
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
+
+const GROUP_EFFORT_VALUES = ['auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultracode'] as const;
+type GroupEffortValue = typeof GROUP_EFFORT_VALUES[number];
+const GROUP_EFFORT_VALUE_SET = new Set<string>(GROUP_EFFORT_VALUES);
+
+interface ParsedGroupEffort {
+  rawArgs: string;
+  effort?: GroupEffortValue;
+  error?: 'missing' | 'invalid';
+  invalidValue?: string;
+}
+
+/**
+ * Pull `--effort value` / `--effort=value` out of `/group` arguments without
+ * making its position significant. Token removal preserves line breaks so the
+ * legacy "first non-blank line is the group name" rule remains unchanged.
+ */
+function parseGroupEffort(rawArgs: string): ParsedGroupEffort {
+  const tokens = [...rawArgs.matchAll(/\S+/g)].map(match => match[0]);
+  const removed = new Set<number>();
+  let effort: GroupEffortValue | undefined;
+  let error: ParsedGroupEffort['error'];
+  let invalidValue: string | undefined;
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    const lower = token.toLowerCase();
+    let rawValue: string | undefined;
+
+    if (lower === '--effort') {
+      removed.add(i);
+      const next = tokens[i + 1];
+      if (next && !next.startsWith('--')) {
+        rawValue = next;
+        removed.add(i + 1);
+        i += 1;
+      } else if (!error) {
+        error = 'missing';
+      }
+    } else if (lower.startsWith('--effort=')) {
+      removed.add(i);
+      rawValue = token.slice(token.indexOf('=') + 1);
+      if (!rawValue && !error) error = 'missing';
+    } else {
+      continue;
+    }
+
+    if (rawValue) {
+      const normalized = rawValue.toLowerCase();
+      if (GROUP_EFFORT_VALUE_SET.has(normalized)) {
+        effort = normalized as GroupEffortValue;
+      } else if (!error) {
+        error = 'invalid';
+        invalidValue = rawValue;
+      }
+    }
+  }
+
+  let tokenIndex = 0;
+  const stripped = rawArgs.replace(/\S+/g, token => (
+    removed.has(tokenIndex++) ? '' : token
+  ));
+  return { rawArgs: stripped, effort, error, invalidValue };
+}
 
 /** Apply the machine-wide prefix used only by `/group` and `/g`, then keep the
  *  existing Lark headroom. The legacy limit is measured in UTF-16 code units;
@@ -2623,6 +2688,29 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
+        const parsedEffort = parseGroupEffort(rawArgs);
+        rawArgs = parsedEffort.rawArgs;
+        if (parsedEffort.error === 'missing') {
+          await sessionReply(rootId, t('cmd.group.effort_missing', {
+            allowed: GROUP_EFFORT_VALUES.join(', '),
+          }, loc));
+          break;
+        }
+        if (parsedEffort.error === 'invalid') {
+          await sessionReply(rootId, t('cmd.group.effort_invalid', {
+            value: parsedEffort.invalidValue ?? '',
+            allowed: GROUP_EFFORT_VALUES.join(', '),
+          }, loc));
+          break;
+        }
+        const groupEffort = parsedEffort.effort;
+        const creatorCliId = getBot(creatorAppId).config.cliId;
+        if (groupEffort && creatorCliId !== 'claude-code') {
+          await sessionReply(rootId, t('cmd.group.effort_unsupported', {
+            cli: getCliDisplayName(creatorCliId),
+          }, loc));
+          break;
+        }
         let roleProfileId: string | undefined;
         const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
         if (roleProfileArg) {
@@ -2633,7 +2721,10 @@ export async function handleCommand(
           roleProfileId = roleProfileArg[1];
           rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
         }
-        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const firstLine = rawArgs
+          .split(/\r?\n/)
+          .map(s => (groupEffort ? s.replace(/[ \t]+/g, ' ') : s).trim())
+          .find(Boolean) ?? '';
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -2647,6 +2738,7 @@ export async function handleCommand(
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
         const larkAppIdsForGroup = mentionedBotAppIds.length > 0 ? mentionedBotAppIds : [creatorAppId];
+        let effortPersistenceError: string | undefined;
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
@@ -2658,6 +2750,14 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            onChatCreated: groupEffort ? (newChatId) => {
+              try {
+                setChatStartupCommands(creatorAppId, newChatId, [`/effort ${groupEffort}`]);
+              } catch (error: any) {
+                effortPersistenceError = error?.message ?? String(error);
+                logger.error(`[${logTag}] /group failed to persist effort for chat=${newChatId}: ${effortPersistenceError}`);
+              }
+            } : undefined,
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -2666,6 +2766,11 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (groupEffort) {
+            hints.push(effortPersistenceError
+              ? t('cmd.group.effort_save_failed', { effort: groupEffort }, loc)
+              : t('cmd.group.effort_saved', { effort: groupEffort }, loc));
+          }
           if (result.invalidUserIds.includes(senderOpenId)) {
             hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
           } else if (result.transferError) {

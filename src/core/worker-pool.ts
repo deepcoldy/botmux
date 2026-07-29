@@ -41,6 +41,7 @@ import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBa
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { resolveStartupCommands } from '../services/chat-startup-commands-store.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -2362,7 +2363,7 @@ export function forkWorker(
     }
   });
 
-  // Send init config — use per-bot settings
+  // Send init config — use per-bot settings plus durable chat overrides.
   const promptCodexAppInput = codexAppInputForSession(
     ds,
     promptPayload.codexAppInput,
@@ -2384,9 +2385,10 @@ export function forkWorker(
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
-    // settings like `/effort ultracode` are re-established. Adopt sessions are
-    // observed, not driven — forkAdoptWorker intentionally omits this.
-    startupCommands: botCfg.startupCommands,
+    // settings like `/effort ultracode` are re-established. Chat-specific
+    // commands are appended after bot defaults so the chat override wins.
+    // Adopt sessions are observed, not driven — forkAdoptWorker omits this.
+    startupCommands: resolveStartupCommands(ds.larkAppId, ds.chatId, botCfg.startupCommands),
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.

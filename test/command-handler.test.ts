@@ -92,6 +92,10 @@ vi.mock('../src/services/role-profile-store.js', () => ({
   writeRoleProfileEntry: vi.fn(),
 }));
 
+vi.mock('../src/services/chat-startup-commands-store.js', () => ({
+  setChatStartupCommands: vi.fn((_appId: string, _chatId: string, commands: string[]) => commands),
+}));
+
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -243,20 +247,25 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
-  createGroupWithBots: vi.fn(async (opts: any) => ({
-    ok: true,
-    chatId: 'oc_new_group',
-    creator: opts.creatorLarkAppId,
-    invalidBotIds: [],
-    invalidUserIds: [],
-    ownerTransferredTo: opts.transferOwnerTo ?? null,
-    transferError: null,
-    notifyMessageId: 'om_notify',
-    notifyError: null,
-    oncallBindings: [],
-    roleProfileBootstrapMessageId: null,
-    roleProfileBootstrapError: null,
-  })),
+  createGroupWithBots: vi.fn(async (opts: any) => {
+    opts.onChatCreated?.('oc_new_group');
+    return {
+      ok: true,
+      chatId: 'oc_new_group',
+      creator: opts.creatorLarkAppId,
+      invalidBotIds: [],
+      invalidUserIds: [],
+      ownerTransferredTo: opts.transferOwnerTo ?? null,
+      transferError: null,
+      notifyMessageId: 'om_notify',
+      notifyError: null,
+      shareLink: null,
+      shareLinkError: null,
+      oncallBindings: [],
+      roleProfileBootstrapMessageId: null,
+      roleProfileBootstrapError: null,
+    };
+  }),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -478,6 +487,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
+import { setChatStartupCommands } from '../src/services/chat-startup-commands-store.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
@@ -1090,6 +1100,7 @@ describe('handleCommand', () => {
     vi.mocked(readGlobalConfig).mockReturnValue({});
     vi.mocked(repoPickerScanOptions).mockReturnValue({ includeWorktrees: true });
     vi.mocked(findOncallChat).mockReturnValue(undefined);
+    vi.mocked(setChatStartupCommands).mockImplementation((_appId, _chatId, commands) => commands as string[]);
     vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue(null);
     vi.mocked(scheduler.extractDeliveryMode).mockImplementation((prompt: string) => ({ deliver: 'origin' as const, prompt }));
     vi.mocked(scheduler.extractScheduleModifiers).mockImplementation((prompt: string) => ({
@@ -3449,6 +3460,70 @@ describe('handleCommand', () => {
       const opts = mockedCreate.mock.calls[0][0];
       expect(opts.name).toBe('My Project');
       expect(opts.roleProfileId).toBe('collab-main');
+    });
+
+    it.each([
+      ['/g My Project --effort max', 'max'],
+      ['/g --effort high My Project', 'high'],
+      ['/g My Project --effort=ultracode', 'ultracode'],
+      ['/g My --effort xhigh Project', 'xhigh'],
+    ])('accepts order-independent effort syntax and strips it from the group name: %s', async (content, effort) => {
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage(content), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(mockedCreate.mock.calls[0][0].name).toBe('My Project');
+      expect(mockedCreate.mock.calls[0][0].onChatCreated).toEqual(expect.any(Function));
+      expect(setChatStartupCommands).toHaveBeenCalledWith(
+        LARK_APP_ID,
+        'oc_new_group',
+        [`/effort ${effort}`],
+      );
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain(`effort：\`${effort}\``);
+    });
+
+    it.each([
+      ['/g My Project --effort turbo', 'turbo'],
+      ['/g My Project --effort', '--effort'],
+      ['/g My Project --effort=', '--effort'],
+    ])('rejects an invalid or missing effort before creating a group: %s', async (content, expected) => {
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage(content), deps, LARK_APP_ID);
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(setChatStartupCommands).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain(expected);
+      expect(reply).toContain('max');
+    });
+
+    it('rejects --effort when the group creator is not a Claude Code bot', async () => {
+      const deps = makeDeps();
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g My Project --effort max'), deps, 'app-2');
+
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect(setChatStartupCommands).not.toHaveBeenCalled();
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('仅适用于 Claude Code');
+    });
+
+    it('keeps the created group usable and surfaces a hint when effort persistence fails', async () => {
+      vi.mocked(setChatStartupCommands).mockImplementationOnce(() => {
+        throw new Error('disk unavailable');
+      });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g My Project --effort max'), deps, LARK_APP_ID);
+
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('群已创建');
+      expect(reply).toContain('预设保存失败');
+      expect(reply).toContain('/effort max');
     });
 
     it('does NOT auto-post a repo-select card after creating the group', async () => {

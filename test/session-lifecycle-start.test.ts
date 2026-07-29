@@ -75,6 +75,10 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
+vi.mock('../src/services/chat-startup-commands-store.js', () => ({
+  resolveStartupCommands: vi.fn((_appId: string, _chatId: string, botDefaults: string[] | undefined) => botDefaults),
+}));
+
 vi.mock('../src/services/session-store.js', () => ({
   closeSession: vi.fn(),
   updateSession: vi.fn(),
@@ -136,6 +140,7 @@ import { forkAdoptWorker, forkWorker, initWorkerPool, sendWorkerInput } from '..
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { resolveStartupCommands } from '../src/services/chat-startup-commands-store.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
@@ -200,6 +205,7 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
+  vi.mocked(resolveStartupCommands).mockImplementation((_appId, _chatId, botDefaults) => botDefaults as string[] | undefined);
   __testOnly_resetSessionLifecycleHooks();
   forkMock.mockImplementation(() => makeFakeWorker());
   initWorkerPool({
@@ -1518,6 +1524,25 @@ describe('worker startup failure delivery', () => {
 });
 
 describe('forkWorker session agent config freeze', () => {
+  it('merges chat-specific startup commands into the worker init payload', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ startupCommands: ['/effort high'] }));
+    vi.mocked(resolveStartupCommands).mockReturnValueOnce(['/effort high', '/effort max']);
+    const ds = makeDs();
+
+    forkWorker(ds, 'hello', false);
+
+    expect(resolveStartupCommands).toHaveBeenCalledWith(
+      'app_test',
+      'oc_chat',
+      ['/effort high'],
+    );
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      startupCommands: ['/effort high', '/effort max'],
+    }));
+  });
+
   it('freezes sandbox read and network policy on fresh sessions before spawning', () => {
     vi.mocked(getBot).mockReturnValueOnce({
       config: {
