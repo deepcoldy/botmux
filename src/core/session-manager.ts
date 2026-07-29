@@ -65,6 +65,7 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -683,7 +684,7 @@ export function buildNewTopicPrompt(
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      `  <routing_rules>${t('ai.identity.short_routing', undefined, locale)}</routing_rules>`,
+      `  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`,
       '</identity>',
     ].join('\n');
   }

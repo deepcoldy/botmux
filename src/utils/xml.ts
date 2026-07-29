@@ -8,3 +8,15 @@ export function escapeXmlText(value: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
+
+/**
+ * Escape complete angle-bracket tokens embedded in XML prompt prose.
+ *
+ * This is intentionally narrower than `escapeXmlText`: shell operators such
+ * as the `<<'EOF'` heredoc marker have no closing `>` and must remain copyable.
+ * Apply it to prose fields before rendering them, never to a serialized block
+ * whose real structural tags must stay intact.
+ */
+export function escapeXmlTagLikeTokens(value: string): string {
+  return value.replace(/<[^<>\r\n]+>/g, token => escapeXmlText(token));
+}

@@ -86,6 +86,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
+import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // ─── Tests ────────────────────────────────────────────────────────────────
@@ -106,6 +107,7 @@ describe('buildNewTopicPrompt', () => {
   it('should include heredoc guidance for non-Claude CLIs', () => {
     const prompt = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
     expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
     expect(prompt).toContain('第一行');
     expect(prompt).toContain('第二行');
     expect(prompt).toContain('botmux send "第一行\\n第二行"');
@@ -229,6 +231,29 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt.indexOf(`<session_id>${SESSION_ID}</session_id>`)).toBeLessThan(prompt.indexOf('<user_message>'));
   });
 
+  it.each([
+    ['zh', '&lt;对方 open_id&gt;'],
+    ['en', '&lt;their open_id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s inline identity prose', (locale, expectedPlaceholder) => {
+    const prompt = buildNewTopicPrompt(
+      'hello',
+      SESSION_ID,
+      'codex',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { name: 'Codex Bot', openId: 'ou_bot' },
+      locale,
+    );
+    const identity = prompt.slice(prompt.indexOf('<identity>'), prompt.indexOf('</identity>') + '</identity>'.length);
+    const prose = identity.replace(/<\/?(?:identity|name|open_id|routing_rules)>/g, '');
+
+    expect(identity).toContain(expectedPlaceholder);
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
   it('keeps per-turn sender and mentions after the first user message', () => {
     const prompt = buildNewTopicPrompt(
       'hello',
@@ -246,6 +271,52 @@ describe('buildNewTopicPrompt', () => {
 
     expect(prompt.indexOf('<sender ')).toBeGreaterThan(prompt.indexOf('<user_message>'));
     expect(prompt.indexOf('<mentions>')).toBeGreaterThan(prompt.indexOf('<user_message>'));
+  });
+});
+
+describe('botmux routing prose XML boundaries', () => {
+  it.each([
+    ['zh', '&lt;open_id:名字&gt;'],
+    ['en', '&lt;open_id:name&gt;'],
+  ] as const)('escapes tag-like placeholders in %s inline shell hints while preserving heredoc syntax', (locale, mentionPlaceholder) => {
+    const hints = buildBotmuxShellHints(locale).join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain(mentionPlaceholder);
+    expect(hints).toContain('&lt;whiteboard&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it('keeps the legacy static shell hints on the same selective-escaping boundary', () => {
+    const hints = BOTMUX_SHELL_HINTS.join('\n');
+
+    expect(hints).toContain('&lt;message_id&gt;');
+    expect(hints).toContain("botmux send <<'EOF'");
+    expect(hints).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(hints.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+  });
+
+  it.each([
+    ['zh', '&lt;对方 bot 的 open_id&gt;'],
+    ['en', '&lt;other-bot-open-id&gt;'],
+  ] as const)('escapes tag-like placeholders in the %s system-prompt prose while preserving real structure and heredoc syntax', (locale, mentionPlaceholder) => {
+    const prompt = buildBotmuxSystemPromptText({
+      locale,
+      botName: 'Codex Bot',
+      botOpenId: 'ou_bot',
+    });
+    const prose = prompt.replace(/<\/?(?:botmux_routing|identity|name|open_id|routing_rules)>/g, '');
+
+    expect(prompt).toContain('<botmux_routing>');
+    expect(prompt).toContain('<identity>');
+    expect(prompt).toContain(mentionPlaceholder);
+    expect(prompt).toContain('&lt;available_bots&gt;');
+    expect(prompt).toContain('&lt;whiteboard&gt;');
+    expect(prompt).toContain("botmux send <<'EOF'");
+    expect(prompt).not.toContain("botmux send &lt;&lt;'EOF'");
+    expect(prose.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
   });
 });
 
