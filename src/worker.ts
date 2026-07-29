@@ -1233,12 +1233,11 @@ let rawInputRestartGate = false;
  *  when the CLI restarts. Consumed inside flushPending right before the first
  *  user prompt is drained, so the commands always precede it (see runStartupCommands). */
 let hasRunStartupCommands = false;
-/** Per-spawn latch: set once the launch-failure detector has decided the pane
- *  leaf is a bare shell (the CLI never launched — e.g. a user rcfile that
- *  `exec`-trampolines into another shell pre-empted the wrapper's `exec <cli>`).
- *  Once set, flushPending refuses to type prompts into the bare shell (which
- *  would just produce `zsh: parse error`) and the user gets one diagnostic
- *  instead. Reset per spawn in spawnCli. */
+/** Per-spawn latch: set when the launch-failure detector still sees a bare
+ *  shell after its bounded settle. While set, no input may reach the pane. A
+ *  later PTY prompt may release it, but only after the pane leaf has actually
+ *  changed to a non-shell process; otherwise a shell prompt that resembles a
+ *  CLI prompt could leak the queued message into zsh/bash. Reset per spawn. */
 let bareShellLaunchBlocked = false;
 /** Per-spawn one-shot: has the bare-shell launch check already run for this
  *  spawn? Gates detectBareShellLaunch() to the FIRST flush only (the
@@ -5170,7 +5169,33 @@ function releaseRawInputRestartGate(): void {
   log('Replacement CLI prompt ready — releasing deferred passthrough commands');
 }
 
-function markPromptReadyFromPty(): void {
+function readPaneLeafComm(observedBackend: SessionBackend | null = backend): string | undefined {
+  const pid = observedBackend?.getChildPid?.();
+  return pid ? readComm(pid) : undefined;
+}
+
+/** A slow rcfile can outlive the launch detector's settle window, then finish
+ *  normally. Screen readiness alone is not enough to reopen the gate because a
+ *  customized shell prompt can resemble a CLI prompt. Require both the PTY
+ *  readiness signal and a non-shell pane leaf before releasing queued input. */
+function recoverBareShellLaunchFromPty(observedBackend: SessionBackend): boolean {
+  if (!bareShellLaunchBlocked) return true;
+  if (backend !== observedBackend) {
+    log('Ignoring PTY prompt-ready from a replaced backend generation');
+    return false;
+  }
+  const comm = readPaneLeafComm(observedBackend);
+  if (!comm || isBareShellComm(comm)) {
+    log(`Ignoring PTY prompt-ready while launch pane is still a bare shell (comm=${comm ?? '?'})`);
+    return false;
+  }
+  bareShellLaunchBlocked = false;
+  log(`Late CLI launch recovered: pane leaf comm=${comm}; releasing queued input`);
+  return true;
+}
+
+function markPromptReadyFromPty(observedBackend: SessionBackend): void {
+  if (!recoverBareShellLaunchFromPty(observedBackend)) return;
   postSessionStartPromptEvidenceInFlight = true;
   try {
     markPromptReady();
@@ -5180,6 +5205,14 @@ function markPromptReadyFromPty(): void {
 }
 
 function markPromptReady(): void {
+  // Only screen readiness plus a non-shell pane leaf may release a launch that
+  // was previously blocked. Transcript/task callbacks can arrive while the
+  // wrapper is still a shell; accepting one here would set isPromptReady and
+  // make the later real PTY callback return early, stranding queued input.
+  if (bareShellLaunchBlocked) {
+    log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
+    return;
+  }
   if (isPromptReady) return;  // guard against duplicate calls
   if (cliRestartInProgress && !replacementSpawnInProgress) {
     log('Ignoring prompt-ready from backend generation being replaced');
@@ -5509,15 +5542,15 @@ function scheduleSubmitFailureNotify(
  * runs, and the pane is left at a bare shell. Typing the multi-line prompt into
  * it just yields `zsh: parse error near '\n'` and the user is stuck (the exact
  * bug this guards). Instead of typing into the shell we surface ONE actionable
- * diagnostic and latch the session so no further prompt is mis-typed.
+ * diagnostic and hold the session so no prompt is mis-typed. A same-shell
+ * verdict is provisional: slow rc startup may still exec the CLI later, in
+ * which case current-generation PTY readiness can release the hold safely.
  *
- * Why this is the right moment / low false-positive: the first prompt is held
- * until the CLI signals ready OR the 15s/45s first-prompt timeout fires, so by
- * the time we get here a healthy CLI has long since `exec`'d (leaf comm =
- * codex/node/…) — only a trampolined/failed launch is still a bare shell. We
- * skip wrapperCli/adopt (their leaf is legitimately a launcher/observed pane)
- * and the pty/herdr backends (which `exec` the CLI directly — getChildPid is the
- * CLI itself, never a shell).
+ * Why this is the right moment: it is the last guard before the first write.
+ * The first-prompt timeout plus bounded settle catches ordinary wrapper jitter,
+ * while the reversible hold covers slower rc startup without ever typing into
+ * a shell. We skip wrapperCli/adopt (their leaf is legitimately a launcher or
+ * observed pane); direct backends self-exclude because their child is the CLI.
  *
  * Returns true when a persistent bare-shell launch was detected (caller must
  * NOT flush). A transient wrapper shell gets a bounded chance to exec the CLI.
@@ -5533,10 +5566,7 @@ async function detectBareShellLaunch(): Promise<boolean> {
   bareShellCheckInProgress = true;
   let comm: string | undefined;
   try {
-    comm = await settleLaunchComm(() => {
-      const pid = backend?.getChildPid?.();
-      return pid ? readComm(pid) : undefined;
-    });
+    comm = await settleLaunchComm(readPaneLeafComm);
   } finally {
     bareShellCheckInProgress = false;
   }
@@ -5551,15 +5581,23 @@ async function detectBareShellLaunch(): Promise<boolean> {
   if (cliRestartInProgress) return false;
   if (!isBareShellComm(comm)) return false;          // CLI (rust/go/node) is running — healthy launch
 
-  // Bare shell is the pane leaf → the CLI never launched. Tier the message on
-  // whether the leaf shell differs from the one botmux launched with: a
-  // mismatch is the unmistakable signature of an rcfile `exec`-trampoline.
+  // The pane leaf is still a shell. A mismatch is the unmistakable signature
+  // of an rcfile `exec`-trampoline; the same shell is ambiguous because a slow
+  // rcfile may still finish and exec the CLI after this bounded check.
   const launchShell = (lastInitConfig?.launchShell || process.env.SHELL || '').trim();
   const expectedShell = launchShell ? basename(launchShell) : '';
   const trampolined = bareShellLaunchKind(comm!, expectedShell) === 'trampoline';
   bareShellLaunchBlocked = true;
-  log(`Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
-    `cli=${lastInitConfig?.cliId}; suppressing first-prompt write (${trampolined ? 'rc trampoline' : 'CLI did not start'})`);
+  // Injection-first flushes can enter while isPromptReady is still true. Make
+  // this a real busy/blocked transition so a later PTY-ready event re-enters
+  // markPromptReady instead of being swallowed by its duplicate-ready guard.
+  isPromptReady = false;
+  idleDetector?.reset();
+  log(trampolined
+    ? `Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
+      `cli=${lastInitConfig?.cliId}; suppressing first-prompt write (rc trampoline)`
+    : `CLI launch still pending: pane leaf comm=${comm}, cli=${lastInitConfig?.cliId}; ` +
+      `holding queued input until PTY readiness confirms a non-shell process`);
 
   const cli = cliName();
   let message: string;
@@ -5572,17 +5610,16 @@ async function detectBareShellLaunch(): Promise<boolean> {
       `② 给这个 bot 配 \`launchShell: ${comm}\`（dashboard 机器人配置，或 \`/config launchShell ${comm}\`），直接用 \`${comm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${comm}\` 的 rc 里。`;
   } else {
     message =
-      `⚠️ 会话没能启动：pane 里还停在 \`${comm}\`，${cli} 没真正跑起来——我没把消息打进去（否则会被当 shell 命令执行）。\n\n` +
-      `最常见原因：rc 文件里有交互式提示卡住了 shell 启动，例如：\n` +
-      `① Oh My Zsh 升级提示（"Would you like to update Oh My Zsh? [Y/n]"）——${comm} source ~/.zshrc 时弹出，等你按 Y/n，CLI 的启动命令没机会跑\n` +
-      `② git 凭据弹窗（GIT_TERMINAL_PROMPT）或其它需要交互输入的启动脚本\n` +
-      `③ ${cli} 的可执行文件不在 PATH 上（CLI 没找到）\n\n` +
-      `修法（任选其一，改完重启 daemon 再发一条消息）：\n` +
-      `• 最省事：升级 botmux 到含自动注入 DISABLE_AUTO_UPDATE=true 的版本（仅 botmux 托管 shell 启动时跳过 oh-my-zsh 升级检查，不影响你自己的终端）\n` +
-      `• 手动修：在 ~/.zshrc 的 source $ZSH/oh-my-zsh.sh 之前加一行 DISABLE_UPDATE_PROMPT="true"（自动升级不弹提示）；或加 DISABLE_AUTO_UPDATE="true"（完全跳过升级检查）\n` +
-      `• 在 web 终端里手动敲一下启动命令看报什么错；确认 CLI 二进制能在 PATH 上找到；或精简 rc 启动逻辑后重启 daemon 再试`;
+      `⚠️ ${cli} 启动时间较长：pane 里暂时仍是 \`${comm}\`。我没有把消息写进 shell，消息还在队列里；检测到真实输入框后会自动继续投递，无需重发。\n\n` +
+      `仅凭进程仍是 \`${comm}\` 无法判断具体原因，可能只是 rc 文件或机器负载让启动变慢。若长时间没有恢复，请打开 Web 终端查看当前提示，处理后等待自动继续，或使用 \`/restart\` 重启会话。`;
   }
-  send({ type: 'user_notify', turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, message });
+  const pendingTurn = pendingMessages[0];
+  send({
+    type: 'user_notify',
+    turnId: pendingTurn?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: pendingTurn?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message,
+  });
   return true;
 }
 
@@ -5612,7 +5649,7 @@ async function flushPending(): Promise<void> {
   // rename）会落进旧 cwd 的 CLI。消息留在 pendingMessages，待 markPromptReady →
   // flushPendingInjections 消费完 barrier 后由其 finally 的 re-kick 排空。
   if (shouldDeferUserFlush(pendingInjections)) return;
-  if (bareShellLaunchBlocked) return;  // launch failed into a bare shell — don't type prompts into it
+  if (bareShellLaunchBlocked) return;  // launch is held at a bare shell — don't type prompts into it
   // Screen-idle is not a durable receipt. A permission/AskUser prompt can look
   // idle while the logical delivery is unresolved, so no following IM or
   // meeting turn may cross this boundary until an explicit terminal releases
@@ -8261,6 +8298,7 @@ async function spawnCli(
   // markPromptReady(): that call may synchronously flush a type-ahead turn and
   // advance bridge attribution. Both screen-idle and authoritative Herdr status
   // must preserve this ordering.
+  const observedBackend = backend;
   const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
     if (bridgeJsonlPath) {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
@@ -8268,7 +8306,7 @@ async function spawnCli(
     if (codexBridgeFallbackActive()) {
       try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
     }
-    if (evidenceSource === 'screen') markPromptReadyFromPty();
+    if (evidenceSource === 'screen') markPromptReadyFromPty(observedBackend);
     else markPromptReady();
   };
 
@@ -8284,8 +8322,10 @@ async function spawnCli(
     });
   }
 
-  backend.onData(onPtyData);
-  const observedBackend = backend;
+  observedBackend.onData((data) => {
+    if (backend !== observedBackend) return;
+    onPtyData(data);
+  });
   if (observedBackend instanceof HerdrBackend) {
     observedBackend.onAgentStatus((status) => {
       if (backend !== observedBackend) return;
@@ -10313,9 +10353,9 @@ process.on('message', async (raw: unknown) => {
       // await settleLaunchComm() 最长 2s 等 wrapper 完成 `exec <cli>`——这段
       // await 让出事件循环，而 IPC handler 不串行（见 raw-input-followup-
       // atomicity.test.ts），若此刻放行 passthrough 就会打进尚未 exec 的临时
-      // shell。bareShellCheckInProgress 覆盖"检查进行中"、bareShellLaunchBlocked
-      // 覆盖"已确认裸 shell 启动失败"两种状态,一并入队。裸 shell 确认失败后
-      // 这些 pending 不会再被 flush（与 pendingMessages 同款处理），符合预期。
+      // shell。bareShellCheckInProgress 覆盖“检查进行中”、bareShellLaunchBlocked
+      // 覆盖“仍停在裸 shell 的安全 hold”两种状态，一并入队；若该进程随后出现
+      // 真实 PTY prompt 且 leaf 已变为非 shell，markPromptReady 会恢复排空。
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)

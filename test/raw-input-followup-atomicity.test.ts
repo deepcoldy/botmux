@@ -61,12 +61,12 @@ describe('worker raw_input handler', () => {
     expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
   });
 
-  it('also defers across the bounded launch-settle window and after a confirmed bare-shell block', () => {
+  it('also defers across the bounded launch-settle window and while the bare-shell hold is active', () => {
     // PR #570 二审阻塞项：detectBareShellLaunch() 采到裸 shell 后 await
     // settleLaunchComm() 让出事件循环最长 2s；IPC handler 不串行，raw_input
     // 若在此窗口放行会打进尚未 `exec <cli>` 的临时 shell。isFlushing 挡不住它
     // （raw_input 刻意保留 busy 直送）——须用专用 bareShellCheckInProgress latch
-    // 覆盖"检查进行中"，并用 bareShellLaunchBlocked 覆盖"已确认失败"。
+    // 覆盖“检查进行中”，并用 bareShellLaunchBlocked 覆盖“仍停在裸 shell”。
     const gate = region.slice(
       region.indexOf('if (cliRestartInProgress'),
       region.indexOf('freshnessInputQueue.enqueueRaw(msg)'),
@@ -230,5 +230,72 @@ describe('post-settle restart fence', () => {
     expect(restartCheck).toBeGreaterThan(settle);
     expect(classify).toBeGreaterThan(restartCheck);
     expect(block).toBeGreaterThan(restartCheck);
+  });
+});
+
+describe('late bare-shell launch recovery', () => {
+  it('releases the launch block only after PTY readiness and a non-shell pane leaf', () => {
+    const helper = caseRegion(workerSrc, 'function recoverBareShellLaunchFromPty(observedBackend:', 1600);
+    const generationFence = helper.indexOf('if (backend !== observedBackend)');
+    const read = helper.indexOf('readPaneLeafComm(observedBackend)');
+    const rejectBare = helper.indexOf('if (!comm || isBareShellComm(comm))', read);
+    const release = helper.indexOf('bareShellLaunchBlocked = false', rejectBare);
+
+    expect(generationFence).toBeGreaterThanOrEqual(0);
+    expect(read).toBeGreaterThan(generationFence);
+    expect(rejectBare).toBeGreaterThan(read);
+    expect(release).toBeGreaterThan(rejectBare);
+
+    const ptyReady = caseRegion(workerSrc, 'function markPromptReadyFromPty(observedBackend:', 600);
+    const recover = ptyReady.indexOf('if (!recoverBareShellLaunchFromPty(observedBackend)) return;');
+    const mark = ptyReady.indexOf('markPromptReady()', recover);
+    expect(recover).toBeGreaterThanOrEqual(0);
+    expect(mark).toBeGreaterThan(recover);
+  });
+
+  it('turns an injection-first shell verdict back into a non-ready state', () => {
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 4300);
+    const block = detect.indexOf('bareShellLaunchBlocked = true');
+    const clearReady = detect.indexOf('isPromptReady = false', block);
+    const resetIdle = detect.indexOf('idleDetector?.reset()', clearReady);
+    const notify = detect.indexOf("type: 'user_notify'", resetIdle);
+
+    expect(block).toBeGreaterThanOrEqual(0);
+    expect(clearReady).toBeGreaterThan(block);
+    expect(resetIdle).toBeGreaterThan(clearReady);
+    expect(notify).toBeGreaterThan(resetIdle);
+  });
+
+  it('generation-fences PTY data before it can feed the active idle detector', () => {
+    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 2300);
+    const onData = wiring.indexOf('observedBackend.onData((data) =>');
+    const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
+    const feed = wiring.indexOf('onPtyData(data)', fence);
+    const ptyReady = wiring.indexOf('markPromptReadyFromPty(observedBackend)');
+
+    expect(onData).toBeGreaterThanOrEqual(0);
+    expect(fence).toBeGreaterThan(onData);
+    expect(feed).toBeGreaterThan(fence);
+    expect(ptyReady).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps non-PTY ready sources from stranding a blocked launch', () => {
+    const markReady = caseRegion(workerSrc, 'function markPromptReady(): void', 900);
+    const block = markReady.indexOf('if (bareShellLaunchBlocked)');
+    const duplicateReadyGuard = markReady.indexOf('if (isPromptReady) return', block);
+    expect(block).toBeGreaterThanOrEqual(0);
+    expect(duplicateReadyGuard).toBeGreaterThan(block);
+  });
+
+  it('reports an unresolved same-shell launch as delayed instead of naming stale causes', () => {
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 5200);
+    expect(detect).toContain('启动时间较长');
+    expect(detect).toContain('检测到真实输入框后会自动继续投递');
+    expect(detect).toContain('仅凭进程仍是');
+    expect(detect).not.toContain('Oh My Zsh 升级提示');
+    expect(detect).not.toContain('GIT_TERMINAL_PROMPT');
+    expect(detect).not.toContain('可执行文件不在 PATH');
+    expect(detect).toContain('turnId: pendingTurn?.turnId ?? currentBotmuxTurnId');
+    expect(detect).toContain('dispatchAttempt: pendingTurn?.dispatchAttempt ?? currentBotmuxDispatchAttempt');
   });
 });

@@ -100,7 +100,7 @@ describe('worker pipe initial screen ordering', () => {
       sessionReadyCase,
     );
     const resetEvidenceIdx = source.indexOf('idleDetector?.resetReadyEvidence();', waitDecisionIdx);
-    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty();');
+    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty(observedBackend);');
     const screenEvidenceGuardIdx = source.indexOf("if (evidenceSource === 'screen')");
     const signalReleaseIdx = source.indexOf(
       "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });",
