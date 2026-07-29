@@ -55,6 +55,7 @@ import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirs
 import { decideRestartFollowup, settleDurableTurnForRestart } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
+import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import {
   mergeQueuedCliInput,
@@ -1612,6 +1613,10 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     isPromptReady = false;
     idleDetector?.reset();
     log(`Passthrough slash command: ${msg.content}`);
+    // A mid-session `/effort <level>` opens a Yes/No "Change effort level?"
+    // confirm dialog; arm the guard so onPtyData can auto-accept it. Bare
+    // `/effort` opens a level picker (unknown target) and is left alone.
+    if (isEffortLevelCommand(msg.content)) armEffortConfirm();
   } catch (err: any) {
     // Do not send another queued command against a backend whose write failed.
     isPromptReady = false;
@@ -4828,6 +4833,34 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
+// Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
+// Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
+// and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
+const effortConfirmGuard = new EffortConfirmDialogGuard();
+let effortConfirmTimer: ReturnType<typeof setTimeout> | null = null;
+// The dialog appears within a second of the command landing; keep the arm
+// window short so a later, unrelated screen can never be mistaken for it.
+const EFFORT_CONFIRM_WINDOW_MS = 8_000;
+
+function disarmEffortConfirm(): void {
+  if (effortConfirmTimer) {
+    clearTimeout(effortConfirmTimer);
+    effortConfirmTimer = null;
+  }
+  effortConfirmGuard.disarm();
+}
+
+/** Arm the effort-confirm guard for a bounded window after a `/effort <level>`
+ *  passthrough. Only claude-code sessions we drive show this dialog. */
+function armEffortConfirm(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
+  disarmEffortConfirm();
+  effortConfirmGuard.arm();
+  effortConfirmTimer = setTimeout(() => {
+    effortConfirmTimer = null;
+    effortConfirmGuard.disarm();
+  }, EFFORT_CONFIRM_WINDOW_MS);
+}
 
 /**
  * Aiden refuses the Codex `-c check_for_update_on_startup=false` override.
@@ -5156,6 +5189,20 @@ function onPtyData(data: string): void {
       }
       return;
     }
+  }
+
+  // Effort-switch confirm auto-accept. Armed only by our own `/effort <level>`
+  // passthrough, so this never fires on an ordinary screen. The dialog's
+  // default row is "Yes", so Enter confirms — mirroring the trust dialog.
+  if (effortConfirmGuard.isArmed() && effortConfirmGuard.inspect(data) === 'confirm') {
+    disarmEffortConfirm();
+    log('Effort-switch confirm dialog detected, auto-accepting...');
+    if (backend && 'sendSpecialKeys' in backend) {
+      (backend as any).sendSpecialKeys('Enter');
+    } else {
+      backend?.write('\r');
+    }
+    return;
   }
 
   // Track last PTY output time for the ready-gate quiescence settle (see
@@ -8572,6 +8619,7 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   altBufferActive = false;
   trustHandled = false;
   codexUpdateDialogGuard.reset();
+  disarmEffortConfirm();
   appRunnerControlDecoder.reset();
 }
 
