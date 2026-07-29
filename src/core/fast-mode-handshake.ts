@@ -7,6 +7,11 @@ type PendingFastModeResult = {
 
 const pendingResults = new Map<string, PendingFastModeResult>();
 
+/** Read-only exact-request fence for executor-state persistence. */
+export function isFastModeResultPending(requestId: string): boolean {
+  return pendingResults.has(requestId);
+}
+
 /** Register before sending set_fast_mode. Timeout is deliberately fail-closed:
  * the daemon must never persist or report a state the worker did not ACK. */
 export function waitForFastModeResult(

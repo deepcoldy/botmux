@@ -27,23 +27,32 @@ describe('Codex Fast Mode worker wiring', () => {
     expect(region).toContain('fastServiceTier: cfg.fastServiceTier');
   });
 
-  it('queues typed runtime changes and ACKs only after restart config is updated', () => {
+  it('queues typed runtime changes and persists only an exact pending result', () => {
     expect(workerSource).toContain("case 'set_fast_mode':");
     expect(workerSource).toContain('pendingFastModeChanges.push(msg)');
 
-    const applyStart = workerSource.indexOf('function publishFastModeExecutorState(');
+    const applyStart = workerSource.indexOf('function updateWorkerFastModeExecutorState(');
     const applyEnd = workerSource.indexOf('\n}', applyStart);
     const apply = workerSource.slice(applyStart, applyEnd);
     expect(applyStart).toBeGreaterThan(-1);
     expect(apply.indexOf('lastInitConfig.fastMode =')).toBeGreaterThan(-1);
-    expect(apply.indexOf("type: 'fast_mode_state'")).toBeGreaterThan(
-      apply.indexOf('lastInitConfig.fastMode ='),
-    );
     const commitStart = workerSource.indexOf('function commitFastModeChange(');
     const commitEnd = workerSource.indexOf('\n}', commitStart);
     const commit = workerSource.slice(commitStart, commitEnd);
     expect(commit.indexOf("type: 'fast_mode_result'")).toBeGreaterThan(
-      commit.indexOf('publishFastModeExecutorState('),
+      commit.indexOf('updateWorkerFastModeExecutorState('),
+    );
+    expect(commit).not.toContain("type: 'fast_mode_state'");
+
+    const resultStart = workerPoolSource.indexOf("case 'fast_mode_result':");
+    const resultEnd = workerPoolSource.indexOf("case 'fast_mode_state':", resultStart);
+    const result = workerPoolSource.slice(resultStart, resultEnd);
+    expect(result.indexOf('isFastModeResultPending(msg.requestId)')).toBeGreaterThan(-1);
+    expect(result.indexOf('ds.session.fastMode = msg.enabled')).toBeGreaterThan(
+      result.indexOf('isFastModeResultPending(msg.requestId)'),
+    );
+    expect(result.indexOf('acknowledgeFastModeResult(msg)')).toBeGreaterThan(
+      result.indexOf('ds.session.fastMode = msg.enabled'),
     );
   });
 
@@ -85,29 +94,39 @@ describe('Codex Fast Mode worker wiring', () => {
     const readyEnd = workerSource.indexOf('clearSessionRenameInFlight();', readyStart);
     const ready = workerSource.slice(readyStart, readyEnd);
     expect(ready).toContain('pendingInitialFastModeConfirmation');
-    expect(ready).toContain('publishFastModeExecutorState');
+    expect(ready).toContain('publishInitialFastModeExecutorState');
   });
 
-  it('bounds and cancels a native replacement without allowing a late prompt to commit it', () => {
+  it('owns the exact request from dequeue through async apply and native prompt ACK', () => {
     expect(workerSource).toContain("case 'cancel_fast_mode':");
-    expect(workerSource).toContain('fastModeRestartWatchdog.arm(request.requestId');
+    expect(workerSource).toContain('await cancelActiveFastModeChange(msg.requestId');
 
-    const abortStart = workerSource.indexOf('async function abortPendingNativeFastModeChange(');
-    const abortEnd = workerSource.indexOf('\n}\n\n/** Apply one Fast Mode request', abortStart);
-    const abort = workerSource.slice(abortStart, abortEnd);
-    expect(abortStart).toBeGreaterThan(-1);
-    expect(abortEnd).toBeGreaterThan(abortStart);
-    expect(abort).toContain('pending.request.requestId !== requestId');
-    expect(abort).toContain('pendingRestartFastModeAck = null');
-    expect(abort).toContain('restorePendingFastModeConfig(pending)');
-    expect(abort).toContain('await restartCliProcess(');
-    expect(abort).toContain('rejectFastModeChange(');
-    expect(abort).toContain('fastModeChangeInFlight = false');
-    expect(abort).toContain('continueAfterFastModeChange()');
+    const beginFnStart = workerSource.indexOf('function beginActiveFastModeChange(');
+    const beginFnEnd = workerSource.indexOf('function assertActiveFastModeChange(', beginFnStart);
+    const beginFn = workerSource.slice(beginFnStart, beginFnEnd);
+    expect(beginFn.indexOf('activeFastModeChange = active')).toBeGreaterThan(-1);
+    expect(beginFn.indexOf('fastModeApplyWatchdog.arm(request.requestId')).toBeGreaterThan(
+      beginFn.indexOf('activeFastModeChange = active'),
+    );
+
+    const runtimeStart = workerSource.indexOf('async function flushPendingFastModeChanges(): Promise<void>');
+    const runtimeEnd = workerSource.indexOf('function markPromptReady(): void', runtimeStart);
+    const runtime = workerSource.slice(runtimeStart, runtimeEnd);
+    const dequeue = runtime.indexOf('pendingFastModeChanges.shift()');
+    const begin = runtime.indexOf('beginActiveFastModeChange(request)');
+    const rpcApply = runtime.indexOf('rpcEngine.setFastMode(');
+    const nativeProbe = runtime.indexOf('resolveWorkerFastServiceTier(');
+    expect(dequeue).toBeGreaterThan(-1);
+    expect(begin).toBeGreaterThan(dequeue);
+    expect(rpcApply).toBeGreaterThan(begin);
+    expect(nativeProbe).toBeGreaterThan(begin);
+    expect(runtime).toContain('active.transaction.waitFor(');
+    expect(runtime).toContain('signal: active.transaction.signal');
 
     const readyStart = workerSource.indexOf('function markPromptReady(): void');
     const readyEnd = workerSource.indexOf('clearSessionRenameInFlight();', readyStart);
     const ready = workerSource.slice(readyStart, readyEnd);
-    expect(ready).toContain('fastModeRestartWatchdog.clear(pending.request.requestId)');
+    expect(ready).toContain("activeFastModeChange?.phase === 'awaiting_native_prompt'");
+    expect(ready).toContain('commitFastModeChange(active');
   });
 });

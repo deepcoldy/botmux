@@ -4,7 +4,10 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import {
+  CodexRpcEngine,
+  CodexRpcFastModeCancelledError,
+} from '../src/codex-rpc-engine.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -26,6 +29,17 @@ function readRpcLog(path: string): Array<{ method?: string; params?: Record<stri
     .split('\n')
     .filter(Boolean)
     .map(line => JSON.parse(line));
+}
+
+async function waitForRpcCount(path: string, method: string, count: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    if (existsSync(path) && readRpcLog(path).filter(entry => entry.method === method).length >= count) {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${count} ${method} request(s)`);
 }
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
@@ -80,6 +94,40 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
       expect(updates.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
       const turns = requests.filter(entry => entry.method === 'turn/start');
       expect(turns.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
+    } finally {
+      engine.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('compensates to the previous tier when a settings ACK arrives after cancellation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-fast-rpc-cancel-'));
+    const rpcLog = join(dir, 'rpc.jsonl');
+    const engine = makeEngine({
+      model: 'gpt-fast',
+      env: {
+        ...process.env,
+        FAKE_RPC_LOG: rpcLog,
+        FAKE_SETTINGS_UPDATE_ACK_DELAY_MS: '100',
+      },
+    });
+    const controller = new AbortController();
+
+    try {
+      await engine.start();
+      await engine.resumeThread('thread-fast-cancel');
+
+      const applying = engine.setFastMode(true, { signal: controller.signal });
+      await waitForRpcCount(rpcLog, 'thread/settings/update', 1);
+      controller.abort();
+
+      await expect(applying).rejects.toBeInstanceOf(CodexRpcFastModeCancelledError);
+      await waitForRpcCount(rpcLog, 'thread/settings/update', 2);
+
+      const updates = readRpcLog(rpcLog)
+        .filter(entry => entry.method === 'thread/settings/update');
+      expect(updates.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
+      expect(engine.activeServiceTier).toBeUndefined();
     } finally {
       engine.stop();
       rmSync(dir, { recursive: true, force: true });

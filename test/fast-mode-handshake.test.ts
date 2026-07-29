@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acknowledgeFastModeResult,
   cancelFastModeResult,
+  isFastModeResultPending,
   waitForFastModeResult,
 } from '../src/core/fast-mode-handshake.js';
 
@@ -9,6 +10,8 @@ describe('Fast Mode IPC handshake', () => {
   it('resolves only the exact request ACK', async () => {
     const pending = waitForFastModeResult('req-1', 1_000);
 
+    expect(isFastModeResultPending('req-1')).toBe(true);
+    expect(isFastModeResultPending('other')).toBe(false);
     expect(acknowledgeFastModeResult({
       type: 'fast_mode_result',
       requestId: 'other',
@@ -23,6 +26,7 @@ describe('Fast Mode IPC handshake', () => {
       enabled: true,
       serviceTier: 'priority',
     })).toBe(true);
+    expect(isFastModeResultPending('req-1')).toBe(false);
     await expect(pending).resolves.toEqual({
       ok: true,
       enabled: true,

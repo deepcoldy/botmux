@@ -616,8 +616,8 @@ export type DaemonToWorker =
    * accepted it. Unlike raw_input this is queued across startup/restart gates
    * and updates the worker's restart config before success is reported. */
   | { type: 'set_fast_mode'; requestId: string; enabled: boolean }
-  /** Cancel the exact still-queued or native-restart Fast transaction after
-   * the daemon-side waiter expires. Stale request ids are ignored. */
+  /** Cancel the exact queued or active Fast transaction after the daemon-side
+   * waiter expires. The active lifetime begins when the worker dequeues it. */
   | { type: 'cancel_fast_mode'; requestId: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
@@ -697,8 +697,8 @@ export type WorkerToDaemon =
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'fast_mode_result'; requestId: string; ok: true; enabled: boolean; serviceTier?: string }
   | { type: 'fast_mode_result'; requestId: string; ok: false; reason: FastModeFailureReason; message?: string }
-  /** Executor-confirmed Fast Mode state. The daemon persists it with the
-   * current state version so later worker generations can safely reattach. */
+  /** Executor-confirmed state discovered during cold/legacy reconciliation.
+   * Runtime command state is committed through exact-request fast_mode_result. */
   | { type: 'fast_mode_state'; enabled: boolean; serviceTier?: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }

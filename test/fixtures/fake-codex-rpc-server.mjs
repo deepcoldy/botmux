@@ -18,6 +18,7 @@ const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
 const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
 const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
 const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
+const SETTINGS_UPDATE_ACK_DELAY_MS = Number(process.env.FAKE_SETTINGS_UPDATE_ACK_DELAY_MS ?? '0');
 const RPC_LOG = process.env.FAKE_RPC_LOG;
 let threadReadAttempt = 0;
 let currentThreadName;
@@ -75,7 +76,11 @@ wss.on('connection', (ws) => {
       });
       case 'thread/start': return reply({ thread: { id: 'thread-fake-1' } });
       case 'thread/resume': return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
-      case 'thread/settings/update': return reply({});
+      case 'thread/settings/update':
+        if (SETTINGS_UPDATE_ACK_DELAY_MS > 0) {
+          return setTimeout(() => reply({}), SETTINGS_UPDATE_ACK_DELAY_MS);
+        }
+        return reply({});
       case 'thread/read':
         threadReadAttempt += 1;
         return reply({ thread: {

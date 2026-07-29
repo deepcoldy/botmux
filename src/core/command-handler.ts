@@ -1970,7 +1970,7 @@ export async function handleCommand(
           // A capability probe can stage a cold Session, but it is not an
           // executor ACK. Leave the marker absent so init reconciles before
           // trusting any persistent pane. A live worker publishes version 1
-          // through fast_mode_state before its result ACK.
+          // atomically through its exact fast_mode_result before the waiter resolves.
           if (!executorWasLive) ds.session.fastModeStateVersion = undefined;
           if (ds.initConfig) {
             ds.initConfig.fastMode = enabled;

@@ -32,6 +32,20 @@ import { WebSocket } from 'ws';
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
 
+class CodexRpcRequestAbortedError extends Error {
+  constructor(method: string) {
+    super(`codex app-server request '${method}' was cancelled`);
+    this.name = 'CodexRpcRequestAbortedError';
+  }
+}
+
+export class CodexRpcFastModeCancelledError extends Error {
+  constructor(message = 'Codex Fast Mode update was cancelled') {
+    super(message);
+    this.name = 'CodexRpcFastModeCancelledError';
+  }
+}
+
 async function findFreePort(): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const srv = createServer();
@@ -207,7 +221,10 @@ export class CodexRpcEngine {
    * Codex 0.145 deliberately selects by tier name and sends the catalog's id
    * (currently `priority` for OpenAI models), so callers must never hardcode
    * `fast` as the protocol value. */
-  async resolveFastServiceTier(model = this.opts.model): Promise<{ model: string; serviceTier: string } | undefined> {
+  async resolveFastServiceTier(
+    model = this.opts.model,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{ model: string; serviceTier: string } | undefined> {
     let cursor: string | null | undefined;
     const models: Json[] = [];
     do {
@@ -215,7 +232,7 @@ export class CodexRpcEngine {
         cursor: cursor ?? null,
         limit: 100,
         includeHidden: true,
-      });
+      }, { signal: opts?.signal });
       if (Array.isArray(result?.data)) models.push(...result.data);
       cursor = typeof result?.nextCursor === 'string' && result.nextCursor
         ? result.nextCursor
@@ -254,24 +271,73 @@ export class CodexRpcEngine {
   /** Change the loaded thread's tier for subsequent turns. State is committed
    * only after app-server acknowledges `thread/settings/update`, so the daemon
    * can persist exactly what the executor accepted. */
-  async setFastMode(enabled: boolean): Promise<{ enabled: boolean; serviceTier?: string }> {
+  async setFastMode(
+    enabled: boolean,
+    opts?: { signal?: AbortSignal },
+  ): Promise<{ enabled: boolean; serviceTier?: string }> {
     if (!this.threadId) throw new Error('setFastMode before startThread/resumeThread');
+    const previousTier = this.serviceTier;
     let nextTier: string | undefined;
-    if (enabled) {
-      const resolved = await this.resolveFastServiceTier();
-      if (!resolved) {
-        throw new Error(`Fast Mode is not supported by model ${this.opts.model ?? '(default)'}`);
+    let settingsUpdateDispatched = false;
+    try {
+      if (opts?.signal?.aborted) throw new CodexRpcRequestAbortedError('thread/settings/update');
+      if (enabled) {
+        const resolved = await this.resolveFastServiceTier(this.opts.model, opts);
+        if (!resolved) {
+          throw new Error(`Fast Mode is not supported by model ${this.opts.model ?? '(default)'}`);
+        }
+        nextTier = resolved.serviceTier;
       }
-      nextTier = resolved.serviceTier;
+      if (opts?.signal?.aborted) throw new CodexRpcRequestAbortedError('thread/settings/update');
+      await this.request('thread/settings/update', {
+        threadId: this.threadId,
+        serviceTier: nextTier ?? null,
+      }, { signal: opts?.signal }, () => {
+        settingsUpdateDispatched = true;
+      });
+      this.serviceTier = nextTier;
+      if (opts?.signal?.aborted) throw new CodexRpcRequestAbortedError('thread/settings/update');
+      return nextTier
+        ? { enabled: true, serviceTier: nextTier }
+        : { enabled: false };
+    } catch (error) {
+      const cancelled = opts?.signal?.aborted || error instanceof CodexRpcRequestAbortedError;
+      if (!cancelled) throw error;
+
+      // Once the settings frame is on the socket, cancellation is ambiguous:
+      // app-server may have accepted it even if its ACK has not arrived. Send
+      // the previous tier on the same ordered connection and wait for that ACK
+      // before reporting cancellation to the worker.
+      if (settingsUpdateDispatched) {
+        try {
+          await this.restoreFastModeServiceTier(previousTier);
+        } catch (rollbackError) {
+          const message = rollbackError instanceof Error
+            ? rollbackError.message
+            : String(rollbackError);
+          throw new CodexRpcFastModeCancelledError(
+            `Codex Fast Mode update was cancelled, but restoring the previous tier failed: ${message}`,
+          );
+        }
+      }
+      throw new CodexRpcFastModeCancelledError();
     }
-    await this.request('thread/settings/update', {
-      threadId: this.threadId,
-      serviceTier: nextTier ?? null,
-    });
-    this.serviceTier = nextTier;
-    return nextTier
-      ? { enabled: true, serviceTier: nextTier }
-      : { enabled: false };
+  }
+
+  /** Restore an already-confirmed tier after a cancelled runtime update. */
+  async restoreFastModeServiceTier(serviceTier?: string): Promise<void> {
+    if (!this.threadId) throw new Error('restoreFastModeServiceTier before startThread/resumeThread');
+    try {
+      await this.request('thread/settings/update', {
+        threadId: this.threadId,
+        serviceTier: serviceTier ?? null,
+      });
+      this.serviceTier = serviceTier;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.failAll(new Error(`Fast Mode rollback failed: ${message}`));
+      throw error;
+    }
   }
 
   /** Inject one user message as a turn. Resolves when the app-server acks the
@@ -517,13 +583,33 @@ export class CodexRpcEngine {
   private request(
     method: string,
     params: unknown,
-    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean; signal?: AbortSignal },
     onDispatch?: () => void,
   ): Promise<any> {
     const timeoutMs = opts?.timeoutMs ?? this.opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     const fatalOnTimeout = opts?.fatalOnTimeout !== false; // default fatal
     const id = this.nextId++;
+    if (opts?.signal?.aborted) {
+      return Promise.reject(new CodexRpcRequestAbortedError(method));
+    }
     return new Promise((resolve, reject) => {
+      const cleanupAbort = (): void => {
+        opts?.signal?.removeEventListener('abort', onAbort);
+      };
+      const resolveRequest = (value: unknown): void => {
+        cleanupAbort();
+        resolve(value);
+      };
+      const rejectRequest = (error: Error): void => {
+        cleanupAbort();
+        reject(error);
+      };
+      const onAbort = (): void => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        clearTimeout(timer);
+        rejectRequest(new CodexRpcRequestAbortedError(method));
+      };
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return;
         const err = new Error(`codex app-server request '${method}' timed out after ${timeoutMs}ms`);
@@ -538,16 +624,21 @@ export class CodexRpcEngine {
           // Non-fatal (the fresh first turn): reject only THIS request and keep
           // the engine alive, so its ambiguity can be resolved against rollout
           // persistence and the viewer can still resume if the turn landed (P1-1).
-          this.pending.delete(id); reject(err);
+          this.pending.delete(id); rejectRequest(err);
         }
       }, timeoutMs);
       timer.unref?.();
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
+      opts?.signal?.addEventListener('abort', onAbort, { once: true });
       // onDispatch fires ONLY after send() succeeds (ws was OPEN + no throw) — the
       // frame is then on the socket, so any later failure is "dispatched" and must
       // be treated as ambiguous, never not-sent (Codex P1-1 boundary).
       try { this.send({ jsonrpc: '2.0', id, method, params }); onDispatch?.(); }
-      catch (e) { this.pending.delete(id); clearTimeout(timer); reject(e as Error); }
+      catch (e) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        rejectRequest(e as Error);
+      }
     });
   }
 

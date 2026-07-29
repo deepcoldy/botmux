@@ -5,9 +5,9 @@ type ActiveWatchdog = {
   timer: ReturnType<typeof setTimeout>;
 };
 
-/** One native Fast replacement may wait for a prompt at a time. The request id
- * fences stale clears/cancels so a late event from transaction N cannot release
- * transaction N+1. */
+/** One Fast apply transaction may be active at a time. The worker arms this at
+ * dequeue, before native probing or RPC work; the request id fences stale
+ * clears/cancels so transaction N cannot release transaction N+1. */
 export class FastModeRestartWatchdog {
   private active?: ActiveWatchdog;
 
