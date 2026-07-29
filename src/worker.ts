@@ -1086,6 +1086,8 @@ let reattachIdleProbeTimer: ReturnType<typeof setTimeout> | null = null;
 let codexRunnerFreshness: CodexRunnerFreshnessState = 'current';
 let persistCodexRunnerBuildOnReady = false;
 let activeRestartAttemptId: string | undefined;
+let activeRestartRequiresBareShellCheck = false;
+let bareShellRetryNonce: string | undefined;
 /** Distinguishes a replacement's synchronous ready signal (Riff) from a late
  * idle callback emitted by the backend being torn down. */
 let replacementSpawnInProgress = false;
@@ -4669,7 +4671,7 @@ async function flushPendingInjections(): Promise<void> {
       // path sends first runs the detection.
       if (!bareShellChecked) {
         bareShellChecked = true;
-        if (await detectBareShellLaunch()) return;  // finally{} releases the mutex; queue stays
+        if (await detectBareShellLaunch(false)) return;  // injection-only failures have no retryable user input
       }
       // The detector's settle await can span a restart's tmux jitter window
       // (cliRestartInProgress true, old backend still alive). Re-check the fence
@@ -5257,7 +5259,7 @@ function markPromptReady(): void {
     send({ type: 'runner_build_ready', runnerBuildId: lastInitConfig.runnerBuildId });
     persistCodexRunnerBuildOnReady = false;
   }
-  if (activeRestartAttemptId) {
+  if (activeRestartAttemptId && !activeRestartRequiresBareShellCheck) {
     // Defense in depth: only report a successful restart when a replacement
     // backend is actually installed. Every legitimate ready path assigns
     // `backend` before firing (spawnCli sets it, then idle/PTY callbacks run);
@@ -5273,6 +5275,7 @@ function markPromptReady(): void {
         category: 'prompt_ready',
       });
       activeRestartAttemptId = undefined;
+      activeRestartRequiresBareShellCheck = false;
     } else {
       log('prompt-ready with no backend installed — deferring restart success receipt');
     }
@@ -5521,7 +5524,7 @@ function scheduleSubmitFailureNotify(
  * Returns true when a persistent bare-shell launch was detected (caller must
  * NOT flush). A transient wrapper shell gets a bounded chance to exec the CLI.
  */
-async function detectBareShellLaunch(): Promise<boolean> {
+async function detectBareShellLaunch(offerRetry = true): Promise<boolean> {
   if (bareShellLaunchBlocked) return true;
   if (lastInitConfig?.adoptMode) return false;       // observing an existing pane, not launching
   if (lastInitConfig?.wrapperCli) return false;      // launcher legitimately wraps the CLI (transient shell shim)
@@ -5560,15 +5563,22 @@ async function detectBareShellLaunch(): Promise<boolean> {
   log(`Bare-shell launch detected: pane leaf comm=${comm}, expected launch shell=${expectedShell || '?'}, ` +
     `cli=${lastInitConfig?.cliId}; suppressing first-prompt write (${trampolined ? 'rc trampoline' : 'CLI did not start'})`);
 
+  const retryableInputPending = offerRetry
+    || pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || pendingSessionRename !== null;
   const cli = cliName();
   let message: string;
   if (trampolined) {
     message =
       `⚠️ 会话没能启动：pane 里现在是裸 \`${comm}\`，${cli} 没真正跑起来——所以我没把你的消息打进去（否则会被当 shell 命令执行，报 \`parse error\`）。\n\n` +
       `最可能原因：botmux 用 \`${expectedShell}\` 启动 CLI，但 pane 落到了 \`${comm}\`。通常是 rc 文件（如 \`~/.${expectedShell}rc\`）里有 \`exec ${comm}\` 这类跳转——\`${expectedShell} -i\` 会 source rc，于是 shell 被顶替，CLI 的启动命令没机会跑。\n\n` +
-      `两种修法（任选其一，改完重启 daemon 再发一条消息）：\n` +
+      `两种修法（任选其一）：\n` +
       `① 给那行加守卫，只在手动开终端时切：\`[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec ${comm}\`（注意 PATH/nvm 等导出放在它之前）\n` +
-      `② 给这个 bot 配 \`launchShell: ${comm}\`（dashboard 机器人配置，或 \`/config launchShell ${comm}\`），直接用 \`${comm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${comm}\` 的 rc 里。`;
+      `② 给这个 bot 配 \`launchShell: ${comm}\`（dashboard 机器人配置，或 \`/config launchShell ${comm}\`），直接用 \`${comm}\` 启动绕开 \`${expectedShell}\` 的 rc——但要确保 PATH/nvm 在 \`${comm}\` 的 rc 里。\n\n` +
+      (retryableInputPending
+        ? `修好 rc 后可直接点击「重试」；修改 \`launchShell\` 后请新开会话。`
+        : `修好 rc 后请重新执行原命令；修改 \`launchShell\` 后请新开会话。`);
   } else {
     message =
       `⚠️ 会话没能启动：pane 里还停在 \`${comm}\`，${cli} 没真正跑起来——我没把消息打进去（否则会被当 shell 命令执行）。\n\n` +
@@ -5576,12 +5586,44 @@ async function detectBareShellLaunch(): Promise<boolean> {
       `① Oh My Zsh 升级提示（"Would you like to update Oh My Zsh? [Y/n]"）——${comm} source ~/.zshrc 时弹出，等你按 Y/n，CLI 的启动命令没机会跑\n` +
       `② git 凭据弹窗（GIT_TERMINAL_PROMPT）或其它需要交互输入的启动脚本\n` +
       `③ ${cli} 的可执行文件不在 PATH 上（CLI 没找到）\n\n` +
-      `修法（任选其一，改完重启 daemon 再发一条消息）：\n` +
+      `修法（任选其一）：\n` +
       `• 最省事：升级 botmux 到含自动注入 DISABLE_AUTO_UPDATE=true 的版本（仅 botmux 托管 shell 启动时跳过 oh-my-zsh 升级检查，不影响你自己的终端）\n` +
       `• 手动修：在 ~/.zshrc 的 source $ZSH/oh-my-zsh.sh 之前加一行 DISABLE_UPDATE_PROMPT="true"（自动升级不弹提示）；或加 DISABLE_AUTO_UPDATE="true"（完全跳过升级检查）\n` +
-      `• 在 web 终端里手动敲一下启动命令看报什么错；确认 CLI 二进制能在 PATH 上找到；或精简 rc 启动逻辑后重启 daemon 再试`;
+      `• 在 web 终端里手动敲一下启动命令看报什么错；确认 CLI 二进制能在 PATH 上找到；或精简 rc 启动逻辑\n\n` +
+      (retryableInputPending
+        ? `修好 rc/PATH 后可直接点击「重试」；若升级 botmux 或重启 daemon，请重新发送原消息（旧重试卡会失效）。`
+        : `修好 rc/PATH 后请重新执行原命令；若升级 botmux 或重启 daemon，也请重新执行。`);
   }
-  send({ type: 'user_notify', turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, message });
+  if (activeRestartAttemptId && activeRestartRequiresBareShellCheck) {
+    send({
+      type: 'restart_result',
+      attemptId: activeRestartAttemptId,
+      status: 'failed',
+      category: 'bare_shell_launch_failed',
+    });
+    activeRestartAttemptId = undefined;
+    activeRestartRequiresBareShellCheck = false;
+  }
+  const blockedInput = pendingMessages[0];
+  if (!retryableInputPending) {
+    bareShellRetryNonce = undefined;
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      message,
+    });
+    return true;
+  }
+  bareShellRetryNonce = randomBytes(12).toString('hex');
+  send({
+    type: 'user_notify',
+    turnId: blockedInput?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: blockedInput?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message,
+    kind: 'bare_shell_launch_failed',
+    retryNonce: bareShellRetryNonce,
+  });
   return true;
 }
 
@@ -5711,6 +5753,16 @@ async function flushPending(): Promise<void> {
     // write. The queue is untouched; the replacement generation's markPromptReady
     // re-invokes flushPending.
     if (cliRestartInProgress) return;  // finally{} releases the mutex; queue stays
+    if (activeRestartAttemptId && activeRestartRequiresBareShellCheck) {
+      send({
+        type: 'restart_result',
+        attemptId: activeRestartAttemptId,
+        status: 'succeeded',
+        category: 'launch_guard_passed',
+      });
+      activeRestartAttemptId = undefined;
+      activeRestartRequiresBareShellCheck = false;
+    }
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -6928,6 +6980,7 @@ async function spawnCli(
       category: 'spawn_failed',
     });
     activeRestartAttemptId = undefined;
+    activeRestartRequiresBareShellCheck = false;
   }
 
   // The plugin set is stable only for the lifetime of one real CLI process.
@@ -6955,6 +7008,7 @@ async function spawnCli(
   bareShellLaunchBlocked = false;
   bareShellChecked = false;
   bareShellCheckInProgress = false;
+  bareShellRetryNonce = undefined;
 
   // ── Resume pre-flight check + two-tier fallback ──────────────────────────
   // Tier 1 (adapter probe): adapter.checkResumeTargetExists returns false
@@ -8412,6 +8466,7 @@ async function spawnCli(
         category: 'runner_exited',
       });
       activeRestartAttemptId = undefined;
+      activeRestartRequiresBareShellCheck = false;
     }
     if (!intentionalRestart) freshnessInputQueue.onReplacementFailed();
     if (intentionalRestart) {
@@ -9935,6 +9990,7 @@ async function sendFatalWorkerErrorAndExit(
       category: 'spawn_failed',
     });
     activeRestartAttemptId = undefined;
+    activeRestartRequiresBareShellCheck = false;
   }
   await sendAndFlush({
     type: 'error',
@@ -10356,6 +10412,25 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (msg.bareShellRetryNonce) {
+        const validBareShellRetry = !!msg.attemptId
+          && msg.bareShellRetryNonce === bareShellRetryNonce
+          && bareShellLaunchBlocked
+          && !cliRestartInProgress
+          && !tmuxRestartTimer;
+        if (!validBareShellRetry) {
+          if (msg.attemptId) {
+            send({
+              type: 'restart_result',
+              attemptId: msg.attemptId,
+              status: 'failed',
+              category: cliRestartInProgress || tmuxRestartTimer ? 'restart_in_progress' : 'bare_shell_launch_failed',
+            });
+          }
+          break;
+        }
+        bareShellRetryNonce = undefined;
+      }
       // 角色切换的 cwd-move respawn：respawn 用 {...lastInitConfig, resume:true}，
       // 先收敛 workingDir 才能让 CLI 在新目录重启（新 cwd 的 CLAUDE.md/记忆索引
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
@@ -10379,6 +10454,7 @@ process.on('message', async (raw: unknown) => {
         break;
       }
       activeRestartAttemptId = msg.attemptId;
+      activeRestartRequiresBareShellCheck = !!msg.bareShellRetryNonce;
       codexRunnerFreshness = 'restarting_fresh';
       // restart 杀死 CLI，在飞的 durable turn 随之死亡。对被杀的那次投递，主动发一个
       // 'ambiguous' 终端回执：CLI 被中途杀掉，副作用到底发没发是**真的无法证明**

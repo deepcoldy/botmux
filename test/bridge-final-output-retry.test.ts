@@ -1441,7 +1441,7 @@ describe('Worker turn_terminal routing', () => {
       options: [{ text: 'allow', selected: false }], turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'tui_prompt' }>);
     (ds.worker as any).emit('message', {
-      type: 'user_notify', message: 'silent warning', turnId: 'schedule-turn',
+      type: 'user_notify', kind: 'bare_shell_launch_failed', retryNonce: 'silent-retry', message: 'silent warning', turnId: 'schedule-turn',
     } satisfies Extract<WorkerToDaemon, { type: 'user_notify' }>);
     (ds.worker as any).emit('message', {
       type: 'final_output', sessionId: ds.session.sessionId,

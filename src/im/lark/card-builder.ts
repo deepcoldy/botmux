@@ -209,6 +209,37 @@ export function getCliDisplayName(cliId: CliId): string {
   return cliDisplayNames[cliId] ?? cliId;
 }
 
+export function buildBareShellLaunchFailureCard(
+  message: string,
+  sessionId: string,
+  rootId: string,
+  cliId: CliId,
+  retryNonce: string,
+  locale?: Locale,
+): string {
+  return JSON.stringify({
+    config: { wide_screen_mode: true },
+    elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: message } },
+      {
+        tag: 'action',
+        actions: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t('card.btn.retry', undefined, locale) },
+          type: 'primary',
+          value: {
+            action: 'retry_bare_shell_launch',
+            root_id: rootId,
+            session_id: sessionId,
+            cli_id: cliId,
+            retry_nonce: retryNonce,
+          },
+        }],
+      },
+    ],
+  });
+}
+
 /** Escape Lark markdown special characters in user-controlled strings.
  *  `<`/`>` are escaped too so an attacker-controlled name (e.g. a foreign
  *  bot's app name surfaced in the grant card) cannot inject a literal
@@ -1990,4 +2021,3 @@ export function buildCodexAppThreadSelectCard(threads: CodexAppThreadSummary[], 
   };
   return JSON.stringify(card);
 }
-

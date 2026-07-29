@@ -254,7 +254,11 @@ describe('P2 worker onTaskDone generation fence', () => {
   });
 
   it('markPromptReady defers the restart success receipt when no backend is installed', () => {
-    const guard = workerSource.indexOf('if (activeRestartAttemptId) {');
+    const markPromptReady = workerSource.indexOf('function markPromptReady()');
+    const guard = workerSource.indexOf(
+      'if (activeRestartAttemptId && !activeRestartRequiresBareShellCheck) {',
+      markPromptReady,
+    );
     expect(guard).toBeGreaterThanOrEqual(0);
     const body = workerSource.slice(guard, guard + 700);
     // Success is only reported behind a live-backend check; otherwise the

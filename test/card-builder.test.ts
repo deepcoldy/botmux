@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   buildSessionCard,
+  buildBareShellLaunchFailureCard,
   buildStreamingCard,
   buildRepoSelectCard,
   buildSessionClosedCard,
@@ -157,6 +158,48 @@ describe('getCliDisplayName', () => {
 
   it('should return "Kiro" for kiro-cli', () => {
     expect(getCliDisplayName('kiro-cli')).toBe('Kiro');
+  });
+});
+
+describe('buildBareShellLaunchFailureCard', () => {
+  it('keeps the diagnostic and binds retry to a one-shot bare-shell action', () => {
+    const message = '⚠️ pane 里还停在 `zsh`';
+    const card = parse(buildBareShellLaunchFailureCard(
+      message,
+      'sid-failed-launch',
+      'om_failed_launch',
+      'codex',
+      'retry-nonce-1',
+    ));
+
+    expect(card.elements[0]).toEqual({
+      tag: 'div',
+      text: { tag: 'lark_md', content: message },
+    });
+    const actions = findActions(card);
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({
+      tag: 'button',
+      type: 'primary',
+      text: { content: '🔄 重试' },
+      value: {
+        action: 'retry_bare_shell_launch',
+        root_id: 'om_failed_launch',
+        session_id: 'sid-failed-launch',
+        cli_id: 'codex',
+        retry_nonce: 'retry-nonce-1',
+      },
+    });
+
+    const enCard = parse(buildBareShellLaunchFailureCard(
+      message,
+      'sid-failed-launch',
+      'om_failed_launch',
+      'codex',
+      'retry-nonce-1',
+      'en',
+    ));
+    expect(findActions(enCard)[0].text.content).toBe('🔄 Retry');
   });
 });
 

@@ -99,3 +99,76 @@ describe('worker restart P2 — merge guard + replacement-exit recovery (no spur
     expect(call).not.toContain('restartRequestedDuringInFlight');
   });
 });
+
+describe('bare-shell retry restart fencing', () => {
+  it('validates and consumes the one-shot nonce before durable settle or restart', () => {
+    const branch = restartCaseBranch();
+    const retryGuard = branch.indexOf('if (msg.bareShellRetryNonce)');
+    const nonceCheck = branch.indexOf('msg.bareShellRetryNonce === bareShellRetryNonce', retryGuard);
+    const consume = branch.indexOf('bareShellRetryNonce = undefined', nonceCheck);
+    const settle = branch.indexOf('settleDurableTurnForRestart({', consume);
+    const restart = branch.indexOf('await restartCliProcess(', settle);
+
+    expect(retryGuard).toBeGreaterThanOrEqual(0);
+    expect(nonceCheck).toBeGreaterThan(retryGuard);
+    expect(consume).toBeGreaterThan(nonceCheck);
+    expect(settle).toBeGreaterThan(consume);
+    expect(restart).toBeGreaterThan(settle);
+    expect(branch.slice(restart, restart + 500)).toContain('preservePending: true');
+  });
+
+  it('does not report retry success until the bare-shell launch guard passes', () => {
+    const readyStart = workerSource.indexOf('function markPromptReady()');
+    const readyEnd = workerSource.indexOf('function persistCliSessionId', readyStart);
+    const ready = workerSource.slice(readyStart, readyEnd);
+    expect(ready).toContain('activeRestartAttemptId && !activeRestartRequiresBareShellCheck');
+
+    const flushStart = workerSource.indexOf('async function flushPending()');
+    const flushEnd = workerSource.indexOf('async function sendToPty', flushStart);
+    const flush = workerSource.slice(flushStart, flushEnd);
+    const guard = flush.indexOf('await detectBareShellLaunch()');
+    const restartFence = flush.indexOf('if (cliRestartInProgress) return;', guard);
+    const success = flush.indexOf("category: 'launch_guard_passed'", guard);
+    const dequeue = flush.indexOf('freshnessInputQueue.takeNormal()', success);
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(restartFence).toBeGreaterThan(guard);
+    expect(success).toBeGreaterThan(restartFence);
+    expect(dequeue).toBeGreaterThan(success);
+  });
+
+  it('does not offer a retry for an injection-only launch failure', () => {
+    const injectionStart = workerSource.indexOf('async function flushPendingInjections()');
+    const injectionEnd = workerSource.indexOf('async function handleTuiTextInput', injectionStart);
+    const injectionFlush = workerSource.slice(injectionStart, injectionEnd);
+    expect(injectionFlush).toContain('await detectBareShellLaunch(false)');
+
+    const detectStart = workerSource.indexOf('async function detectBareShellLaunch(');
+    const detectEnd = workerSource.indexOf('async function flushPending()', detectStart);
+    const detect = workerSource.slice(detectStart, detectEnd);
+    const retryableInput = detect.indexOf('const retryableInputPending = offerRetry');
+    const plainOnly = detect.indexOf('if (!retryableInputPending)', retryableInput);
+    const plainNotify = detect.indexOf("type: 'user_notify'", plainOnly);
+    const returnFromPlain = detect.indexOf('return true;', plainNotify);
+    const retryNonce = detect.indexOf('bareShellRetryNonce = randomBytes', returnFromPlain);
+    const retryKind = detect.indexOf("kind: 'bare_shell_launch_failed'", retryNonce);
+    expect(retryableInput).toBeGreaterThanOrEqual(0);
+    expect(detect.slice(retryableInput, plainOnly)).toContain('pendingMessages.length > 0');
+    expect(detect.slice(retryableInput, plainOnly)).toContain('pendingRawInputs.length > 0');
+    expect(detect.slice(retryableInput, plainOnly)).toContain('pendingSessionRename !== null');
+    expect(plainOnly).toBeGreaterThan(retryableInput);
+    expect(plainNotify).toBeGreaterThan(plainOnly);
+    expect(returnFromPlain).toBeGreaterThan(plainNotify);
+    expect(retryNonce).toBeGreaterThan(returnFromPlain);
+    expect(retryKind).toBeGreaterThan(retryNonce);
+  });
+
+  it('fails the correlated retry before issuing a fresh failure card', () => {
+    const detectStart = workerSource.indexOf('async function detectBareShellLaunch(');
+    const detectEnd = workerSource.indexOf('async function flushPending()', detectStart);
+    const detect = workerSource.slice(detectStart, detectEnd);
+    const failure = detect.indexOf("category: 'bare_shell_launch_failed'");
+    const notification = detect.indexOf("kind: 'bare_shell_launch_failed'", failure);
+    expect(failure).toBeGreaterThanOrEqual(0);
+    expect(notification).toBeGreaterThan(failure);
+  });
+});

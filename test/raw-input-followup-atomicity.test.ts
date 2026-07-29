@@ -76,7 +76,7 @@ describe('worker raw_input handler', () => {
 
     // The latch must be held ACROSS the settle await (set before, cleared in a
     // finally), otherwise the raw gate's check races the window it guards.
-    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 1400);
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch(', 1400);
     const set = detect.indexOf('bareShellCheckInProgress = true');
     const await_ = detect.indexOf('await settleLaunchComm(', set);
     const clear = detect.indexOf('bareShellCheckInProgress = false', await_);
@@ -175,7 +175,7 @@ describe('worker sendRawCommandLine helper', () => {
 });
 
 describe('daemon prompt_ready dispatch', () => {
-  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2000);
+  const region = caseRegion(poolSrc, "case 'prompt_ready':", 2400);
 
   it('bundles the follow-up onto the raw_input IPC instead of a second message IPC', () => {
     expect(region).toContain('followUpContent: followUp?.cliInput');
@@ -209,7 +209,7 @@ describe('post-settle restart fence', () => {
 
   it('flushPendingInjections re-checks cliRestartInProgress AFTER the awaited detector, BEFORE the shift', () => {
     const inj = caseRegion(workerSrc, 'async function flushPendingInjections()', 3000);
-    const detector = inj.indexOf('if (await detectBareShellLaunch()) return');
+    const detector = inj.indexOf('if (await detectBareShellLaunch(false)) return');
     const fence = inj.indexOf('if (cliRestartInProgress) return;', detector);
     const shift = inj.indexOf('pendingInjections.shift()', detector);
     expect(detector).toBeGreaterThanOrEqual(0);
@@ -218,7 +218,7 @@ describe('post-settle restart fence', () => {
   });
 
   it('detectBareShellLaunch skips bare-shell classification when a restart began during settle', () => {
-    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 2400);
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch(', 5400);
     const settle = detect.indexOf('await settleLaunchComm(');
     const restartCheck = detect.indexOf('if (cliRestartInProgress) return false;', settle);
     const classify = detect.indexOf('isBareShellComm(comm)', restartCheck);
@@ -230,5 +230,9 @@ describe('post-settle restart fence', () => {
     expect(restartCheck).toBeGreaterThan(settle);
     expect(classify).toBeGreaterThan(restartCheck);
     expect(block).toBeGreaterThan(restartCheck);
+    expect(detect.indexOf('const blockedInput = pendingMessages[0]', block)).toBeGreaterThan(block);
+    expect(detect).toContain('turnId: blockedInput?.turnId ?? currentBotmuxTurnId');
+    expect(detect.indexOf("kind: 'bare_shell_launch_failed'", block)).toBeGreaterThan(block);
+    expect(detect).toContain('retryNonce: bareShellRetryNonce');
   });
 });

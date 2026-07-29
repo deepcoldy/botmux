@@ -23,6 +23,9 @@ vi.mock('../src/im/lark/client.js', () => {
 vi.mock('../src/im/lark/card-builder.js', () => ({
   buildStreamingCard: vi.fn(() => '{"type":"streaming"}'),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
+  buildBareShellLaunchFailureCard: vi.fn((message: string, sessionId: string, rootId: string, cliId: string, retryNonce: string) => JSON.stringify({
+    type: 'bare-shell-launch-failure', message, sessionId, rootId, cliId, retryNonce,
+  })),
   buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
@@ -103,7 +106,13 @@ import {
   emitSessionStateTransitionHook,
   setSessionLifecycleShutdown,
 } from '../src/services/session-lifecycle-hooks.js';
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import {
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  __testOnly_resetBareShellLaunchRetries,
+  __testOnly_resetRestartCoordinator,
+  requestBareShellLaunchRetry,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function makeFakeWorker() {
@@ -160,6 +169,8 @@ beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
   __testOnly_resetSessionLifecycleHooks();
+  __testOnly_resetBareShellLaunchRetries();
+  __testOnly_resetRestartCoordinator();
 });
 
 describe('session lifecycle hook helper', () => {
@@ -313,6 +324,180 @@ describe('worker-pool lifecycle hook integration', () => {
       reason: 'user_notify',
       message: 'Need manual input',
     }));
+  });
+
+  it('renders only bare-shell launch notifications as interactive retry cards', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'user_notify', message: 'ordinary warning', turnId: 'om_normal' });
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-current',
+      message: 'launch failed',
+      turnId: 'om_failed',
+    });
+    await flush();
+
+    expect(sessionReply).toHaveBeenNthCalledWith(
+      1,
+      'om_root',
+      'ordinary warning',
+      'text',
+      'app_test',
+      'om_normal',
+      undefined,
+    );
+    expect(sessionReply).toHaveBeenNthCalledWith(
+      2,
+      'om_root',
+      JSON.stringify({
+        type: 'bare-shell-launch-failure',
+        message: 'launch failed',
+        sessionId: 'sid-lifecycle-test',
+        rootId: 'om_root',
+        cliId: 'claude-code',
+        retryNonce: 'retry-current',
+      }),
+      'interactive',
+      'app_test',
+      'om_failed',
+      undefined,
+    );
+  });
+
+  it('claims a bare-shell retry once and sends the nonce to the same live worker', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-once',
+      message: 'launch failed',
+      turnId: 'om_failed',
+    });
+    await flush();
+
+    const observer = { source: 'card' as const, notify: vi.fn() };
+    expect(requestBareShellLaunchRetry(ds, 'retry-once', observer)).toBe('started');
+    expect(worker.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'restart',
+        attemptId: expect.any(String),
+        bareShellRetryNonce: 'retry-once',
+      }),
+      expect.any(Function),
+    );
+    expect(requestBareShellLaunchRetry(ds, 'retry-once', observer)).toBe('expired');
+    expect(worker.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the retry claim valid when the blocked bare shell emits another prompt-ready signal', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-after-prompt',
+      message: 'launch failed',
+    });
+    await flush();
+
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+
+    expect(requestBareShellLaunchRetry(
+      ds,
+      'retry-after-prompt',
+      { source: 'card', notify: vi.fn() },
+    )).toBe('started');
+    expect(worker.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'restart',
+        bareShellRetryNonce: 'retry-after-prompt',
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it('expires the retry when the worker generation changes', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-stale',
+      message: 'launch failed',
+    });
+    await flush();
+
+    ds.worker = makeFakeWorker();
+    expect(requestBareShellLaunchRetry(
+      ds,
+      'retry-stale',
+      { source: 'card', notify: vi.fn() },
+    )).toBe('expired');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('does not let an older card invalidate the latest retry nonce', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-old',
+      message: 'old failure',
+    });
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-current',
+      message: 'current failure',
+    });
+    await flush();
+
+    const observer = { source: 'card' as const, notify: vi.fn() };
+    expect(requestBareShellLaunchRetry(ds, 'retry-old', observer)).toBe('expired');
+    expect(requestBareShellLaunchRetry(ds, 'retry-current', observer)).toBe('started');
+    expect(worker.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores bare-shell notifications from a stale worker generation', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    ds.worker = makeFakeWorker();
+
+    worker.emit('message', {
+      type: 'user_notify',
+      kind: 'bare_shell_launch_failed',
+      retryNonce: 'retry-stale-notify',
+      message: 'stale launch failed',
+    });
+    await flush();
+
+    expect(sessionReply).not.toHaveBeenCalled();
   });
 
   it('routes accepted steer feedback to its exact turn without raising attention', async () => {

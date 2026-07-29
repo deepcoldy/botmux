@@ -17,6 +17,26 @@ export function makeRestartEvent(rootId: string, operatorOpenId = 'ou_user') {
   };
 }
 
+export function makeBareShellRetryEvent(
+  rootId: string,
+  sessionId: string,
+  retryNonce: string,
+  operatorOpenId = 'ou_user',
+) {
+  return {
+    action: {
+      value: {
+        action: 'retry_bare_shell_launch',
+        root_id: rootId,
+        session_id: sessionId,
+        cli_id: 'claude-code',
+        retry_nonce: retryNonce,
+      },
+    },
+    operator: { open_id: operatorOpenId },
+  };
+}
+
 export function makeCloseEvent(rootId: string, operatorOpenId = 'ou_user', visibility?: string) {
   return {
     action: { value: { action: 'close', root_id: rootId, ...(visibility ? { visibility } : {}) } },

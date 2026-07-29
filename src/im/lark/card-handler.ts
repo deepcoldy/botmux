@@ -69,7 +69,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, requestBareShellLaunchRetry } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -1534,6 +1534,57 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       cardMessageId,
       deps.v3DistillationDeps,
     );
+  }
+
+  if (value?.action === 'retry_bare_shell_launch') {
+    const loc = localeForBot(larkAppId);
+    const expired = () => ({
+      toast: { type: 'warning', content: t('card.action.bare_shell_retry_expired', undefined, loc) },
+    });
+    if (!larkAppId || !value.root_id) return expired();
+    const ds = getSessionByActionValue(
+      activeSessions,
+      value.root_id,
+      larkAppId,
+      value.session_id,
+      value.action,
+    );
+    if (!ds || !validateCardCliBinding(ds, value)) return expired();
+
+    const authorized = !!operatorOpenId && (
+      canOperate(larkAppId, ds.chatId, operatorOpenId)
+      || canTalk(larkAppId, ds.chatId, operatorOpenId, undefined, undefined, ds.chatType)
+    );
+    if (!authorized) {
+      return {
+        toast: { type: 'warning', content: t('card.action.bare_shell_retry_no_permission', undefined, loc) },
+      };
+    }
+
+    const cliName = getCliDisplayName(sessionCliId(ds));
+    const result = requestBareShellLaunchRetry(ds, value.retry_nonce, {
+      source: 'card',
+      notify: status => {
+        if (status === 'in_progress') return;
+        const content = t(`cmd.restart.${status}`, { cliName }, loc);
+        return deliverEphemeralOrReply(
+          ds,
+          operatorOpenId,
+          content,
+          'text',
+          () => sessionReply(value.root_id, content),
+        );
+      },
+    });
+    if (result === 'expired') return expired();
+    if (result === 'busy') {
+      return {
+        toast: { type: 'info', content: t('card.action.bare_shell_retry_busy', undefined, loc) },
+      };
+    }
+    return {
+      toast: { type: 'success', content: t('card.action.bare_shell_retry_started', undefined, loc) },
+    };
   }
 
   const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel'].includes(value.action);

@@ -21,7 +21,7 @@ import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, buildBareShellLaunchFailureCard, getCliDisplayName } from '../im/lark/card-builder.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -112,6 +112,29 @@ import {
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
+
+type BareShellLaunchRetryState = {
+  nonce: string;
+  worker: ChildProcess;
+};
+
+let bareShellLaunchRetries = new WeakMap<DaemonSession, BareShellLaunchRetryState>();
+
+function armBareShellLaunchRetry(ds: DaemonSession, worker: ChildProcess, nonce: string): void {
+  bareShellLaunchRetries.set(ds, { nonce, worker });
+}
+
+function invalidateBareShellLaunchRetry(
+  ds: DaemonSession,
+  expectedWorker?: ChildProcess,
+  expectedNonce?: string,
+): void {
+  const state = bareShellLaunchRetries.get(ds);
+  if (!state) return;
+  if (expectedWorker && state.worker !== expectedWorker) return;
+  if (expectedNonce && state.nonce !== expectedNonce) return;
+  bareShellLaunchRetries.delete(ds);
+}
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
 
@@ -1482,8 +1505,56 @@ export function requestSessionRestart(
   });
 }
 
+export type BareShellLaunchRetryRequestResult = 'started' | 'busy' | 'expired';
+
+/**
+ * Claim one current bare-shell failure and restart only its still-live worker.
+ * The blocked input exists only in that worker's in-memory queue, so a worker
+ * replacement or daemon restart intentionally expires the card instead of
+ * starting an empty CLI and pretending the original message was retried.
+ */
+export function requestBareShellLaunchRetry(
+  ds: DaemonSession,
+  nonce: string | undefined,
+  observer: RestartObserver,
+): BareShellLaunchRetryRequestResult {
+  const state = bareShellLaunchRetries.get(ds);
+  if (!nonce || !state || state.nonce !== nonce) return 'expired';
+  if (ds.worker !== state.worker || state.worker.killed || state.worker.connected === false) {
+    invalidateBareShellLaunchRetry(ds);
+    return 'expired';
+  }
+  if (restartCoordinator.activeAttemptId(ds.session.sessionId)) return 'busy';
+
+  // One-shot claim. Delete before any callback or IPC so a second card click
+  // cannot join later and restart the recovered CLI.
+  bareShellLaunchRetries.delete(ds);
+  restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
+    if (ds.worker !== state.worker || state.worker.killed || state.worker.connected === false) {
+      restartCoordinator.resolve(ds.session.sessionId, attemptId, 'failed');
+      return;
+    }
+    try {
+      state.worker.send({
+        type: 'restart',
+        attemptId,
+        bareShellRetryNonce: nonce,
+      } as DaemonToWorker, (error: Error | null) => {
+        if (error) restartCoordinator.resolve(ds.session.sessionId, attemptId, 'failed');
+      });
+    } catch {
+      restartCoordinator.resolve(ds.session.sessionId, attemptId, 'failed');
+    }
+  });
+  return 'started';
+}
+
 export function __testOnly_resetRestartCoordinator(): void {
   restartCoordinator.reset();
+}
+
+export function __testOnly_resetBareShellLaunchRetries(): void {
+  bareShellLaunchRetries = new WeakMap();
 }
 
 /**
@@ -3746,6 +3817,10 @@ function setupWorkerHandlers(
       }
 
       case 'user_notify': {
+        if (msg.kind === 'bare_shell_launch_failed' && ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored bare-shell notification from stale worker generation`);
+          break;
+        }
         logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'user_notify',
@@ -3753,8 +3828,24 @@ function setupWorkerHandlers(
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         try {
-          await scopedReply(msg.message, 'text', msg.turnId);
+          if (msg.kind === 'bare_shell_launch_failed' && msg.retryNonce) {
+            armBareShellLaunchRetry(ds, worker, msg.retryNonce);
+            const card = buildBareShellLaunchFailureCard(
+              msg.message,
+              ds.session.sessionId,
+              sessionAnchorId(ds),
+              effectiveCliId,
+              msg.retryNonce,
+              loc,
+            );
+            await scopedReply(card, 'interactive', msg.turnId);
+          } else {
+            await scopedReply(msg.message, 'text', msg.turnId);
+          }
         } catch (err: any) {
+          if (msg.kind === 'bare_shell_launch_failed' && msg.retryNonce) {
+            invalidateBareShellLaunchRetry(ds, worker, msg.retryNonce);
+          }
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }
         break;

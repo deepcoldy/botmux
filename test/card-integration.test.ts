@@ -24,6 +24,7 @@ import { FakeLarkClient } from './fixtures/fake-lark-client.js';
 import {
   makeToggleEvent,
   makeRestartEvent,
+  makeBareShellRetryEvent,
   makeCloseEvent,
   makeResumeEvent,
   makeGetWriteLinkEvent,
@@ -104,6 +105,7 @@ vi.mock('../src/bot-registry.js', () => ({
   })),
   getAllBots: vi.fn(() => []),
   getBotClient: vi.fn(),
+  findOncallChat: vi.fn(),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -135,6 +137,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
       void observer.notify('in_progress');
       return { attemptId: 'attempt-card', joined: false };
     }),
+    requestBareShellLaunchRetry: vi.fn(() => 'started'),
   };
 });
 
@@ -167,7 +170,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { handleCardAction, type CardHandlerDeps } from '../src/im/lark/card-handler.js';
 import { scheduleCardPatch } from '../src/core/worker-pool.js';
-import { killWorker, forkWorker, requestSessionRestart } from '../src/core/worker-pool.js';
+import { killWorker, forkWorker, requestSessionRestart, requestBareShellLaunchRetry } from '../src/core/worker-pool.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
@@ -463,6 +466,100 @@ describe('Card integration: full event flow', () => {
   // ── Scenario 4: restart / close actions ───────────────────────────────
 
   describe('Scenario 4: restart and close button actions', () => {
+    it('allows a talk-only user to claim the exact bare-shell retry once', async () => {
+      const botRegMod = await import('../src/bot-registry.js');
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: {
+          larkAppId: APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'claude-code',
+          allowedChatGroups: ['oc_chat'],
+        },
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+        const result = await handleCardAction(
+          makeBareShellRetryEvent(ROOT_ID, ds.session.sessionId, 'retry-card-1'),
+          makeDeps(sessions),
+          APP_ID,
+        );
+
+        expect(requestBareShellLaunchRetry).toHaveBeenCalledWith(
+          ds,
+          'retry-card-1',
+          expect.objectContaining({ source: 'card' }),
+        );
+        expect(result).toEqual(expect.objectContaining({
+          toast: expect.objectContaining({ type: 'success' }),
+        }));
+        expect(requestSessionRestart).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
+    });
+
+    it('returns an explicit warning without consuming retry state for an unauthorized user', async () => {
+      const botRegMod = await import('../src/bot-registry.js');
+      vi.mocked(botRegMod.getBot).mockReturnValue({
+        config: {
+          larkAppId: APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'claude-code',
+          allowedUsers: ['ou_admin'],
+        },
+        resolvedAllowedUsers: ['ou_admin'],
+        botOpenId: 'ou_bot',
+      } as any);
+      try {
+        const ds = makeDaemonSession();
+        const sessions = new Map<string, DaemonSession>();
+        sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+        const result = await handleCardAction(
+          makeBareShellRetryEvent(ROOT_ID, ds.session.sessionId, 'retry-card-2', 'ou_user'),
+          makeDeps(sessions),
+          APP_ID,
+        );
+
+        expect(result).toEqual(expect.objectContaining({
+          toast: expect.objectContaining({ type: 'warning' }),
+        }));
+        expect(requestBareShellLaunchRetry).not.toHaveBeenCalled();
+      } finally {
+        vi.mocked(botRegMod.getBot).mockReturnValue({
+          config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
+          resolvedAllowedUsers: [],
+          botOpenId: 'ou_bot',
+        } as any);
+      }
+    });
+
+    it('surfaces an expired retry card without falling back to workerless restart', async () => {
+      vi.mocked(requestBareShellLaunchRetry).mockReturnValueOnce('expired');
+      const ds = makeDaemonSession({ worker: null });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+
+      const result = await handleCardAction(
+        makeBareShellRetryEvent(ROOT_ID, ds.session.sessionId, 'retry-expired'),
+        makeDeps(sessions),
+        APP_ID,
+      );
+
+      expect(result).toEqual(expect.objectContaining({
+        toast: expect.objectContaining({ type: 'warning' }),
+      }));
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+    });
+
     it('restart with live worker should send restart IPC message', async () => {
       const clientMod = await import('../src/im/lark/client.js');
       const workerSend = vi.fn();

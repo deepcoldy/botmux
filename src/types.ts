@@ -625,7 +625,7 @@ export type DaemonToWorker =
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
    *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
    *  同时 --resume 续回对话上下文。`attemptId` 关联手工 restart 的完成回执。 */
-  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string }
+  | { type: 'restart'; attemptId?: string; updateWorkingDir?: string; bareShellRetryNonce?: string }
   /** Lease watchdog fencing: only the exact still-running durable attempt may
    * tear down/restart the CLI. A late command after terminal/current-turn
    * advance is ignored worker-side. */
@@ -685,7 +685,7 @@ export type WorkerToDaemon =
       type: 'restart_result';
       attemptId: string;
       status: 'succeeded' | 'failed' | 'timed_out';
-      category: 'prompt_ready' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';
+      category: 'prompt_ready' | 'launch_guard_passed' | 'bare_shell_launch_failed' | 'restart_in_progress' | 'spawn_failed' | 'runner_exited' | 'readiness_timeout';
     }
   /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
@@ -699,7 +699,7 @@ export type WorkerToDaemon =
   | { type: 'stuck_warning_expired'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'tui_keys_delivered'; nonce: number; turnId?: string; dispatchAttempt?: number }
   | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
-  | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'user_notify'; message: string; kind?: 'bare_shell_launch_failed'; retryNonce?: string; turnId?: string; dispatchAttempt?: number }
   /** A normal success acknowledgement for one app-server accepted steer.
    * `appTurnId` is diagnostic/protocol identity; `turnId` is the immutable
    * botmux/Lark reply route. This must never enter the attention path. */
