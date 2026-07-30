@@ -215,6 +215,7 @@ import {
   backendSandboxCompatibilityError,
   backendSandboxCompatibilityUserMessage,
   decideBackendGate,
+  retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
 import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
@@ -1178,6 +1179,16 @@ let lastCliExitSignal: string | null = null;
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
 let isPipeMode = false;
 let effectiveBackendType: BackendType = 'pty';
+
+/**
+ * Whether a screen snapshot can safely drive state changes or synthetic input.
+ * ZMX exposes full history but not the authoritative current PTY geometry; a
+ * local attach can resize it persistently, making a bounded render include
+ * scrollback above the real viewport. Keep that evidence display-only.
+ */
+function backendScreenEvidenceIsAuthoritativeForMutation(): boolean {
+  return effectiveBackendType !== 'zmx';
+}
 /** Worker-owned statement about the confinement attached to the CURRENT CLI
  * generation. The daemon receives this over private IPC; child-writable PID
  * marker files remain diagnostics only. */
@@ -2042,7 +2053,16 @@ function createUsageLimitTracker() {
 const usageLimitTracker = createUsageLimitTracker();
 
 function currentUsageLimitSnapshot(): string {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
+}
+
+function classifyScreenUsageLimit(
+  content: string,
+  status: RuntimeScreenStatus,
+): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
+  return usageLimitTracker.classify(content, status);
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -4406,6 +4426,10 @@ function startStuckDetector(): void {
   stopStuckDetector();
   stuckDetector = new StuckDetector(sd.timeoutMs, {
     isActuallyStuck: () => {
+      // ZMX history has no authoritative viewport geometry after a local attach
+      // resize. A stale hook-review screen may sit just above the real viewport,
+      // so never raise a key-driving stuck card from this observer.
+      if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
       // Scope gate: this PR only handles the Codex PreToolUse hook-review
       // screen. Other CLIs (Claude Code, Gemini, ...) must never see the
       // Codex-specific t/Enter/Esc card, even if their output happens to
@@ -4572,7 +4596,7 @@ async function captureAndUpload(): Promise<void> {
   send({
     type: 'screenshot_uploaded',
     imageKey,
-    ...usageLimitTracker.classify(usageLimitContent, status),
+    ...classifyScreenUsageLimit(usageLimitContent, status),
     turnId: currentBotmuxTurnId,
     dispatchAttempt: currentBotmuxDispatchAttempt,
   });
@@ -4901,6 +4925,16 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
  */
 async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, comment?: string | null): Promise<void> {
   if (!backend) return;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+    logError('coco_drive_picker: refused because ZMX screen geometry is not authoritative');
+    send({
+      type: 'user_notify',
+      turnId: currentBotmuxTurnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      message: t('worker.tui_submit_failed', { cliName: cliName() }),
+    });
+    return;
+  }
   const snap = () => (lastAnalyzerSnapshot || renderer?.rawSnapshot() || '');
   const waitFor = async (re: RegExp, timeoutMs: number): Promise<boolean> => {
     const deadline = Date.now() + timeoutMs;
@@ -5461,21 +5495,19 @@ function onPtyData(data: string): void {
  * state, not an incremental chunk, so appending it would duplicate renderer
  * and workflow history while still failing to express a reset.
  */
-function onBackendScreenResync(snapshot: string): void {
-  backendScreenRevision += 1;
+async function onBackendScreenResync(snapshot: string): Promise<void> {
+  const revision = ++backendScreenRevision;
+  const observedScreenBackend = backend;
   const now = Date.now();
   lastPtyActivityAtMs = now;
   lastPtyOutputAtMs = now;
-  lastAnalyzerSnapshot = snapshot;
   maybeReportDeferredTopicMaterialization(snapshot);
   maybeCaptureKiroSessionId(snapshot);
 
-  if (renderer) {
-    renderer.dispose();
-    renderer = new TerminalRenderer(renderCols, renderRows);
-    renderer.write(snapshot);
-  }
-
+  // Rebase synchronously before xterm's asynchronous write barrier. If newer
+  // PTY bytes arrive while the snapshot is rendering they append after this
+  // authoritative base rather than being overwritten by a late continuation.
+  idleDetector?.reset();
   if (isWorkflowWorker() && !workflowFinalOutputSent) {
     // The append-only PTY replay log has no reset opcode. Appending a full
     // history snapshot would duplicate everything already recorded; keep its
@@ -5484,16 +5516,49 @@ function onBackendScreenResync(snapshot: string): void {
     maybeEmitWorkflowTranscriptOutput();
   }
 
-  if (handleVisibleStartupInteraction(snapshot)) return;
-
-  // A prompt/final marker may have been emitted while tail was offline. Feed
-  // only the recent screen tail into a reset detector: ZMX history is scrollback,
-  // so old completion markers must not make a currently-busy CLI look idle.
-  if (idleDetector) {
-    idleDetector.reset();
-    const idleTail = snapshot.split(/\r?\n/).slice(-20).join('\n').slice(-4000);
-    if (idleTail) idleDetector.feed(idleTail);
+  let nextRenderer: TerminalRenderer | null = null;
+  if (renderer) {
+    const previousRenderer = renderer;
+    nextRenderer = new TerminalRenderer(renderCols, renderRows);
+    renderer = nextRenderer;
+    previousRenderer.dispose();
+    await nextRenderer.writeAndFlush(snapshot);
+    // A second resync, incremental output, backend replacement, or teardown can
+    // win while xterm parses the history. Never inspect or feed the stale
+    // continuation after any such generation change.
+    if (
+      backendScreenRevision !== revision
+      || backend !== observedScreenBackend
+      || renderer !== nextRenderer
+    ) return;
   }
+
+  // ZMX history includes scrollback. Keep a bounded ANSI-rendered projection
+  // for cards and non-mutating diagnostics, never as proof of the authoritative
+  // current viewport: a prior local attach may have changed the real geometry.
+  const visibleSnapshot = nextRenderer?.rawSnapshot() ?? '';
+  lastAnalyzerSnapshot = visibleSnapshot;
+
+  // ZMX history does not carry the authoritative current PTY dimensions. A
+  // local `zmx attach` can resize the session below our default 120x24 and that
+  // size persists after detach, so even the rendered tail may include rows just
+  // above the real viewport. Never synthesize Enter/Down from a full-history
+  // resync. For the same reason, do not feed history into IdleDetector: an old
+  // ready/completion marker just above the real viewport could otherwise flush
+  // queued input into a CLI that is still busy. Later append-only history deltas
+  // still flow through onPtyData; structured transcript completion remains
+  // authoritative independently of this screen observer.
+}
+
+/** Fire-and-forget bridge for backend callbacks and synchronous seed callers.
+ * Their surrounding try/catch cannot observe a rejected async renderer write,
+ * so terminate every resync promise here instead of leaking an unhandled
+ * rejection into the worker process.
+ */
+function scheduleBackendScreenResync(snapshot: string, source: string): void {
+  void onBackendScreenResync(snapshot).catch((err) => {
+    logError(`${source} screen resync failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 }
 
 function releaseRawInputRestartGate(): void {
@@ -5651,7 +5716,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    send({ type: 'screen_update', content, ...classifyScreenUsageLimit(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
   // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
   // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
@@ -6476,7 +6541,7 @@ function startScreenUpdates(): void {
         lastContent = content;
       }
 
-      const usageAware = usageLimitTracker.classify(content, status);
+      const usageAware = classifyScreenUsageLimit(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
         send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
@@ -6665,7 +6730,7 @@ function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurr
     const initial = be.captureCurrentScreen?.() ?? '';
     if (initial.length > 0) {
       if (be instanceof ZmxBackend) {
-        onBackendScreenResync(initial);
+        scheduleBackendScreenResync(initial, source);
       } else {
         onPtyData(initial);
       }
@@ -6692,6 +6757,10 @@ function probeBusyPatternIdle(
   source: string,
   be: SessionBackend,
 ): boolean {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+    log(`${source} idle probe skipped: backend screen geometry is not authoritative`);
+    return false;
+  }
   try {
     const content = captureBackendScreen(be);
     if (!content) return false;
@@ -7224,17 +7293,29 @@ async function spawnCli(
     config.session.dataDir,
   );
   const hasMcpRuntimeEntries = !!cliAdapter.mcpGateway && !!mcpRuntimeManifest?.entries.length;
+  const reuseRecordedHerdrTarget = !sandboxRequested && !hasMcpRuntimeEntries;
+  if (effectiveBackend === 'herdr' && !reuseRecordedHerdrTarget) {
+    // Isolation/MCP incarnations move historical shared-host agents to the
+    // data-root-scoped managed target. Retire the exact old pane before backend
+    // selection mutates the durable stamp or a replacement CLI can spawn.
+    retireSupersededRecordedHerdrTarget({
+      sessionId: cfg.sessionId,
+      ownershipScope: isolationRuntimeDataDir,
+      reuseRecordedHerdrTarget,
+      persistentBackendTarget: cfg.persistentBackendTarget,
+    });
+  }
   const selectBackend = () => selectSessionBackend({
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
     // Preserve that recorded target for compatibility unless this incarnation
     // requires an isolation/MCP boundary that only a Botmux-owned session can
     // safely provide. Fresh tasks use distinct agents in one machine-wide host.
-    reuseRecordedHerdrTarget: !sandboxRequested
-      && !hasMcpRuntimeEntries,
+    reuseRecordedHerdrTarget,
     // ZMX reattach vs fresh is frozen here from the probe taken above; the
     // backend refuses to silently turn a fresh launch into an attach.
     hasExistingSession: effectiveBackend === 'zmx'
@@ -8962,7 +9043,7 @@ async function spawnCli(
   backend.onScreenResync?.((snapshot) => {
     if (observedBackend !== backend) return;
     log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
-    onBackendScreenResync(snapshot);
+    scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
   });
   backend.onAccessUrl?.((url) => {
     send({
@@ -9161,7 +9242,12 @@ async function spawnCli(
   }
 }
 
-function killCli(opts: { preservePending?: boolean } = {}): void {
+function killCli(opts: {
+  preservePending?: boolean;
+  /** The replacement worker reuses this logical session's sandbox tree. Stop
+   * this worker's watcher but leave the tree/mountpoints for that replacement. */
+  preserveSandbox?: boolean;
+} = {}): void {
   currentCliCredentialIsolated = false;
   stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();
@@ -9215,7 +9301,14 @@ function killCli(opts: { preservePending?: boolean } = {}): void {
   submittedCodexAppReplyTurnIds.clear();
   pendingCodexAppSteerAckIds.clear();
   acknowledgedCodexAppSteers.clear();
-  if (sandboxCleanup) {
+  if (opts.preserveSandbox) {
+    // The daemon waits for this worker's detach ACK and exit before forking the
+    // replacement. Drop this worker's cleanup reference and disarm its process-
+    // exit hook so it cannot delete the same-session sandbox tree that the
+    // replacement will reuse.
+    sandboxCleanup = null;
+    sandboxTeardownDone = true;
+  } else if (sandboxCleanup) {
     try { sandboxCleanup(); } catch { /* */ }
     sandboxCleanup = null;
   }
@@ -10686,6 +10779,27 @@ function sendAndFlush(msg: WorkerToDaemon): Promise<void> {
   });
 }
 
+const TRANSFER_DETACH_ACK_FLUSH_MS = 250;
+
+/** Best-effort terminal ACK for transfer. Backend detach has already happened,
+ * so a wedged process.send callback must not keep this old worker alive and
+ * strand the daemon behind its detach fence indefinitely.
+ */
+async function flushTransferDetachAck(requestId: string): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      sendAndFlush({ type: 'transfer_detached', requestId }),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(resolve, TRANSFER_DETACH_ACK_FLUSH_MS);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 let fatalWorkerErrorPending = false;
 
 /** Surface a fatal (re)launch failure before terminating the worker. This is
@@ -10773,7 +10887,11 @@ process.on('message', async (raw: unknown) => {
       // up-front. Setting them later (after the renderer was built at
       // 160x50) wouldn't unwrap content xterm has already buffered, so
       // adopt-mode wide-pane content would still come out stair-stepped.
-      const dims = resolveRenderDimensions(msg);
+      const requestedBackendType = msg.backendType ?? config.daemon.backendType;
+      const dims = resolveRenderDimensions({
+        ...msg,
+        backendType: requestedBackendType,
+      });
       renderCols = dims.cols;
       renderRows = dims.rows;
       log(`Init: session=${sessionId}, cwd=${msg.workingDir}, render=${renderCols}x${renderRows}${msg.adoptMode ? ' (adopt-pane)' : ''}`);
@@ -10787,7 +10905,6 @@ process.on('message', async (raw: unknown) => {
           publishSandboxRelayCapability();
         }
         let port = 0;
-        const requestedBackendType = msg.backendType ?? config.daemon.backendType;
         const webTerminalEnabled = backendSupportsWebTerminal(requestedBackendType);
         if (!isWorkflowWorker()) {
           if (webTerminalEnabled) {
@@ -11319,6 +11436,18 @@ process.on('message', async (raw: unknown) => {
       // (no stuckNonce) bypass the guard and write keys directly.
       let wroteKeys = false;
       if (msg.stuckNonce !== undefined && msg.stuckPageType) {
+        if (!backendScreenEvidenceIsAuthoritativeForMutation()) {
+          // Defense in depth: an old card may predate this worker or a backend
+          // switch. A fresh 120x24 history render is still not authoritative
+          // after local attach resize, so expire the action without writing.
+          send({
+            type: 'stuck_warning_expired',
+            nonce: msg.stuckNonce,
+            turnId: currentBotmuxTurnId,
+            dispatchAttempt: currentBotmuxDispatchAttempt,
+          });
+          break;
+        }
         const result = await processStuckWarningTuiKeys(
           {
             stuckNonce: msg.stuckNonce,
@@ -11521,6 +11650,21 @@ process.on('message', async (raw: unknown) => {
       // same sessionId starts clean.
       clearSendMarkers();
       cleanup();
+      process.exit(0);
+    }
+
+    case 'detach_for_transfer': {
+      log('Transfer detach requested');
+      stopScreenshotLoop();
+      // Transfer keeps the logical session alive. The daemon starts its
+      // replacement on the new routing anchor only after this worker ACKs the
+      // observer detach and exits. `killCli()` deliberately calls backend.kill()
+      // rather than destroySession(): persistent mux/ZMX sessions and Riff
+      // tasks survive for reattach, while PTY keeps its existing cold-resume
+      // behavior because its kill() owns the child process.
+      killCli({ preserveSandbox: true });
+      cleanup();
+      await flushTransferDetachAck(msg.requestId);
       process.exit(0);
     }
 

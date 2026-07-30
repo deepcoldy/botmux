@@ -71,6 +71,10 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 // Map the test passes into restoreActiveSessions — production's closeSession
 // evicts from activeSessionsRegistry, which IS that Map.
 const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
+const transferState = vi.hoisted(() => ({
+  active: new WeakSet<object>(),
+  callbacks: new WeakMap<object, Set<() => void>>(),
+}));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
@@ -82,6 +86,14 @@ vi.mock('../src/core/worker-pool.js', () => ({
   killStalePids: vi.fn(),
   sweepDeadPidMarkers: vi.fn(),
   getActiveSessionsRegistry: vi.fn(() => wp.registry ?? undefined),
+  isSessionTransferring: vi.fn((ds: object) => transferState.active.has(ds)),
+  deferUntilSessionTransferSettled: vi.fn((ds: object, callback: () => void) => {
+    if (!transferState.active.has(ds)) return false;
+    const callbacks = transferState.callbacks.get(ds) ?? new Set<() => void>();
+    callbacks.add(callback);
+    transferState.callbacks.set(ds, callbacks);
+    return true;
+  }),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
@@ -123,6 +135,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
   }]),
+  getBotBrand: vi.fn(() => 'feishu'),
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({
@@ -201,6 +214,7 @@ import {
   setActiveSessionSafe,
 } from '../src/core/worker-pool.js';
 import { announceSessionRow } from '../src/core/session-activity.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -210,6 +224,8 @@ beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
   sessionStore.init();
   wp.registry = null;
+  transferState.active = new WeakSet<object>();
+  transferState.callbacks = new WeakMap<object, Set<() => void>>();
   probe.result = 'exists';
   zmxSnapshot.ok = true;
   zmxSnapshot.sessions = [];
@@ -280,6 +296,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     expect(closeSession).toHaveBeenCalledWith(blocked.sessionId);
     expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
     expect(map.get(sessionKey('om_collision_blocked', 'app_test'))).toBeUndefined();
     expect(map.get(sessionKey('om_collision_survivor', 'app_test'))?.session.sessionId).toBe(survivor.sessionId);
     expect(forkWorker).toHaveBeenCalledWith(
@@ -394,8 +411,14 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       .mockImplementationOnce(() => undefined);
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
+    const events: any[] = [];
+    const off = dashboardEventBus.subscribe(event => events.push(event));
 
-    await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    try {
+      await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
+    } finally {
+      off();
+    }
 
     expect(ZmxBackend.killManagedSession).toHaveBeenNthCalledWith(
       1,
@@ -408,9 +431,20 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       closable.sessionId,
     );
     expect(sessionStore.getSession(blocked.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(blocked.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
     expect(sessionStore.getSession(closable.sessionId)?.status).toBe('closed');
     expect(closeSession).toHaveBeenCalledWith(closable.sessionId);
     expect(closeSession).not.toHaveBeenCalledWith(blocked.sessionId);
+    expect(events).toContainEqual({
+      type: 'session.spawned',
+      body: {
+        session: expect.objectContaining({
+          sessionId: blocked.sessionId,
+          status: 'dormant',
+          quarantined: true,
+        }),
+      },
+    });
     // The uncertain row remains retryable on disk but is not registered or
     // reattached into the live map with its now-mismatched CLI.
     expect(map.size).toBe(0);
@@ -436,6 +470,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     await expect(restoreActiveSessions(map)).resolves.toBeUndefined();
 
     expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('active');
+    expect(sessionStore.getSession(hidden.sessionId)?.restoreQuarantinedAt).toEqual(expect.any(String));
     expect(closeSession).not.toHaveBeenCalledWith(hidden.sessionId);
     expect(map.get(sessionKey('om_deferred_zmx_blocked', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(survivor.sessionId)?.status).toBe('active');
@@ -725,6 +760,28 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(1);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('defers a CLI-mismatch close during relay and resweeps after the gate settles', async () => {
+    const s = makeActivePersistentSession('om_rt_transfer');
+    s.cliId = 'codex';
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    transferState.active.add(ds);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test')).toBe(0);
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('active');
+
+    const callbacks = [...(transferState.callbacks.get(ds) ?? [])];
+    expect(callbacks).toHaveLength(1);
+    transferState.active.delete(ds);
+    for (const callback of callbacks) callback();
+
+    await vi.waitFor(() => {
+      expect(closeSession).toHaveBeenCalledWith(s.sessionId);
+      expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+    });
   });
 
   it('exempts queued and adopt sessions, and other bots\' sessions', async () => {

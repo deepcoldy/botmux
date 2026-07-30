@@ -4,6 +4,7 @@ import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import {
   buildDeviceIsolationInventory,
   commitDeviceIsolationActivation,
+  mergePersistedDeviceIsolationSessions,
   prepareDeviceIsolationActivation,
   releaseDeviceIsolationActivation,
   resetDeviceIsolationDaemonForTest,
@@ -66,6 +67,208 @@ afterEach(() => {
 });
 
 describe('device-isolation daemon transaction', () => {
+  it('includes unregistered durable store rows and fails closed on exact ZMX/Herdr targets', () => {
+    const zmxTarget = {
+      backendType: 'zmx' as const,
+      sessionName: 'bmx-storezmx',
+    };
+    const herdrTarget = {
+      backendType: 'herdr' as const,
+      sessionName: 'shared-host',
+      agentName: 'botmux-store-agent',
+    };
+    const sessions = mergePersistedDeviceIsolationSessions([], [
+      {
+        sessionId: 'store-zmx',
+        status: 'active',
+        backendType: 'zmx',
+        persistentBackendTarget: zmxTarget,
+      } as any,
+      {
+        sessionId: 'store-herdr',
+        status: 'active',
+        backendType: 'herdr',
+        persistentBackendTarget: herdrTarget,
+      } as any,
+      {
+        sessionId: 'store-missing',
+        status: 'active',
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'bmx-missing',
+        },
+      } as any,
+      {
+        sessionId: 'store-adopted',
+        status: 'active',
+        backendType: 'tmux',
+        adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+      } as any,
+      {
+        sessionId: 'store-target-only',
+        status: 'active',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'bmx-target-only',
+        },
+      } as any,
+      {
+        sessionId: 'store-legacy-durable',
+        status: 'active',
+        cliSessionId: 'legacy-cli-session',
+      } as any,
+      {
+        sessionId: 'store-pty-live-pid',
+        status: 'active',
+        backendType: 'pty',
+        pid: 4242,
+      } as any,
+      {
+        sessionId: 'store-pty-dead-pid',
+        status: 'active',
+        backendType: 'pty',
+        pid: 4343,
+      } as any,
+      {
+        sessionId: 'store-queued',
+        status: 'active',
+        queued: true,
+        backendType: 'zmx',
+      } as any,
+      {
+        sessionId: 'store-scratch',
+        status: 'active',
+      } as any,
+      {
+        sessionId: 'store-closed',
+        status: 'closed',
+        backendType: 'zmx',
+      } as any,
+    ]);
+    setDeviceIsolationDaemonDependenciesForTest({
+      dataDir: () => '/tmp/data',
+      listSessions: () => sessions,
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      processExists: pid => pid === 4242,
+      probePersistent: target => {
+        if (target.sessionName === zmxTarget.sessionName) return 'exists';
+        if (
+          target.backendType === 'herdr'
+          && target.sessionName === herdrTarget.sessionName
+          && target.agentName === herdrTarget.agentName
+        ) return 'unknown';
+        return 'missing';
+      },
+    });
+
+    const inventory = buildDeviceIsolationInventory();
+
+    expect(inventory.entries.map(entry => entry.sessionId)).toEqual([
+      'store-adopted',
+      'store-herdr',
+      'store-legacy-durable',
+      'store-missing',
+      'store-pty-dead-pid',
+      'store-pty-live-pid',
+      'store-target-only',
+      'store-zmx',
+    ]);
+    expect(inventory.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        sessionId: 'store-zmx',
+        disposition: 'blocked',
+        blocker: 'unattested_worker',
+        persistent: { target: zmxTarget, probe: 'exists' },
+      }),
+      expect.objectContaining({
+        sessionId: 'store-herdr',
+        disposition: 'blocked',
+        blocker: 'backend_probe_unknown',
+        persistent: { target: herdrTarget, probe: 'unknown' },
+      }),
+      expect.objectContaining({
+        sessionId: 'store-missing',
+        disposition: 'quiescent',
+        persistent: {
+          target: { backendType: 'zmx', sessionName: 'bmx-missing' },
+          probe: 'missing',
+        },
+      }),
+      expect.objectContaining({
+        sessionId: 'store-adopted',
+        disposition: 'blocked',
+        blocker: 'adopted_session',
+      }),
+      expect.objectContaining({
+        sessionId: 'store-target-only',
+        backendType: 'zmx',
+        disposition: 'quiescent',
+        persistent: {
+          target: {
+            backendType: 'zmx',
+            sessionName: 'bmx-target-only',
+          },
+          probe: 'missing',
+        },
+      }),
+      expect.objectContaining({
+        sessionId: 'store-legacy-durable',
+        backendType: 'unknown',
+        disposition: 'blocked',
+        blocker: 'unknown_backend',
+      }),
+      expect.objectContaining({
+        sessionId: 'store-pty-live-pid',
+        backendType: 'pty',
+        disposition: 'blocked',
+        blocker: 'process_identity_unavailable',
+      }),
+      expect.objectContaining({
+        sessionId: 'store-pty-dead-pid',
+        backendType: 'pty',
+        disposition: 'quiescent',
+      }),
+    ]));
+    expect(prepareDeviceIsolationActivation({
+      activationVersion: 1,
+      nonce: NONCE,
+    })).toMatchObject({
+      status: 409,
+      body: { ok: false, error: 'activation_blocked' },
+    });
+  });
+
+  it('lets a runtime row win over a persisted active row with the same session id', () => {
+    const runtime: DeviceIsolationRuntimeSession = {
+      sessionId: 'same-session',
+      adopted: false,
+      frozenBackend: 'zmx',
+      persistentBackendTarget: {
+        backendType: 'zmx',
+        sessionName: 'bmx-runtime',
+      },
+      workerPresent: false,
+    };
+
+    const merged = mergePersistedDeviceIsolationSessions([runtime], [{
+      sessionId: runtime.sessionId,
+      status: 'active',
+      backendType: 'zmx',
+      persistentBackendTarget: {
+        backendType: 'zmx',
+        sessionName: 'bmx-stale-store',
+      },
+    } as any]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toBe(runtime);
+    expect(merged[0]?.persistentBackendTarget).toEqual({
+      backendType: 'zmx',
+      sessionName: 'bmx-runtime',
+    });
+  });
+
   it('freezes, quiesces exact local identities, accepts ACTIVE release hash, then unfreezes', async () => {
     let marker = pendingMarker();
     let sessions = [ownedPtySession()];

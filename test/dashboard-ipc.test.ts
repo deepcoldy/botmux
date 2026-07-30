@@ -691,6 +691,52 @@ describe('GET /api/sessions', () => {
     const body = await res.json();
     expect(Array.isArray(body.sessions)).toBe(true);
   });
+
+  it('shows an unregistered quarantined active row as dormant in list and detail', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quarantined-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init('cli_quarantined');
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_quarantined', 'om_quarantined', '待确认清理', 'group');
+      session.larkAppId = 'cli_quarantined';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.backendType = 'zmx';
+      session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+      sessionStore.updateSession(session);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const listRes = await fetch(`${base}/api/sessions`);
+      expect(listRes.status).toBe(200);
+      const listed = (await listRes.json()).sessions.find((row: any) => row.sessionId === session.sessionId);
+      expect(listed).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+        backendType: 'zmx',
+        webPort: null,
+      });
+      expect(listed).not.toHaveProperty('closedAt');
+
+      const detailRes = await fetch(`${base}/api/sessions/${session.sessionId}`);
+      expect(detailRes.status).toBe(200);
+      expect((await detailRes.json()).session).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+      });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId', () => {

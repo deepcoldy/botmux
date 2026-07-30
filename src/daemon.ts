@@ -116,6 +116,7 @@ import {
   forkWorker,
   forkAdoptWorker,
   sendWorkerInput,
+  sendWorkerSessionInput,
   killWorker,
   reapOrphanWorkers,
   scheduleCardPatch,
@@ -134,6 +135,7 @@ import {
   readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
+  isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, armCoreOnlyReadinessGate, setCoreOnlyReady } from './core/dashboard-ipc-server.js';
@@ -4400,7 +4402,10 @@ async function adoptCodexNotifierEvent(
       workingDir: event.cwd,
       ownerOpenId,
     };
-    activeSessions.set(activeKey, ds);
+    if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
+      await closeSessionHelper(session.sessionId);
+      throw new Error('通知所在会话路由被一条待处理的持久会话占用');
+    }
   }
 
   if (ds.session.cliSessionId !== event.threadId || !ds.worker || ds.worker.killed) {
@@ -5013,7 +5018,12 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         } else {
           navKeys = computeCocoPickerKeys(parsed.questions, result.answers).navKeys;
         }
-        cocoDs.worker.send({ type: 'coco_drive_picker', navKeys, needsReviewSubmit, comment } as DaemonToWorker);
+        sendWorkerSessionInput(cocoDs, {
+          type: 'coco_drive_picker',
+          navKeys,
+          needsReviewSubmit,
+          comment,
+        });
         logger.info(`[${cocoDs.session.sessionId.slice(0, 8)}] CoCo picker drive: ${navKeys.length} keys, review=${needsReviewSubmit}, comment=${comment ? 'yes' : 'no'}`);
       } catch (err) {
         logger.warn(`CoCo picker drive failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -15155,7 +15165,7 @@ function deliverPassthroughToExistingSession(
     substitute: boolean;
   },
 ): void {
-  if (ds.worker && !ds.worker.killed) {
+  if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // Passthrough commands bypass the normal message-forwarding block, so bind
     // the accepted Lark turn before the worker rotates its marker at the PTY
     // write boundary. This helper also covers a cold-start registration race.
@@ -15182,11 +15192,11 @@ function deliverPassthroughToExistingSession(
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
     beginNewTurn(ds, commandContent);
-    ds.worker.send({
+    sendWorkerSessionInput(ds, {
       type: 'raw_input',
       content: commandContent,
       turnId: turn.messageId,
-    } as DaemonToWorker);
+    });
     markSessionActivity(ds);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return;
@@ -15198,6 +15208,9 @@ function deliverPassthroughToExistingSession(
     larkAppId,
   );
 }
+
+export const __testOnly_deliverPassthroughToExistingSession =
+  deliverPassthroughToExistingSession;
 
 async function startInitialPassthroughSession(args: {
   larkAppId: string;

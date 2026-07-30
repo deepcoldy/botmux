@@ -259,6 +259,7 @@ export const messages: Record<string, string> = {
   'cmd.substitute.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改替身模式开关。',
   'cmd.substitute.usage': '用法：@我 /substitute status｜on｜off',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
+  'cmd.session.transfer_in_progress': '⚠️ 会话正在接力中，请等接力完成后再试。',
   'cmd.restart.succeeded': '✅ {cliName} 已恢复就绪。',
   'cmd.restart.failed': '❌ {cliName} 重启失败。',
   'cmd.restart.timed_out': '⌛ {cliName} 重启超时，尚未恢复就绪。',

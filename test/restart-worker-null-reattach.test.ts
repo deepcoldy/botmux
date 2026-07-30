@@ -234,7 +234,12 @@ describe('P2 worker onTaskDone generation fence', () => {
     // replacement. Anchored on the setupBackendHandlers occurrences (the adopt
     // observe-paths use a different, non-fenced onExit by design).
     const setup = workerSource.indexOf('const observedBackend = backend;');
+    const handlersStart = workerSource.indexOf(
+      'observedBackend.onData((data) =>',
+      setup,
+    );
     expect(setup).toBeGreaterThanOrEqual(0);
+    expect(handlersStart).toBeGreaterThan(setup);
     const region = workerSource.slice(setup, setup + 6000);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');

@@ -16,6 +16,8 @@ import type {
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
 import { config } from '../config.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
+import * as sessionStore from '../services/session-store.js';
+import type { Session } from '../types.js';
 import { logger } from '../utils/logger.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -59,6 +61,10 @@ export interface DeviceIsolationRuntimeSession {
   /** Exact worker-selected persistent resource. Shared Herdr carries both the
    * host session and the one Botmux-owned agent inside it. */
   persistentBackendTarget?: PersistentBackendTarget;
+  /** PID carried only by an unregistered persisted row. It has no process-start
+   * identity or worker-generation attestation, so a still-live/reused PID must
+   * block activation instead of being mistaken for a quiescent PTY session. */
+  unregisteredPid?: number;
   workerPresent: boolean;
   workerGeneration?: number;
   worker?: ProcessIdentity;
@@ -149,8 +155,60 @@ function safeProcessExists(pid: number): boolean {
   }
 }
 
+/**
+ * Add durable, persisted local-resource rows that startup restore intentionally
+ * kept active but could not safely register. Device isolation must see those
+ * ownership records even when the routing registry cannot: otherwise an
+ * inconclusive teardown could disappear from the activation inventory.
+ *
+ * Runtime state wins by complete session id because it carries the current
+ * worker generation and attestation. Queued rows and command scratches have no
+ * running local resource. Legacy rows with a CLI/PID/target marker are still
+ * evidence of a possibly-live local resource even when backendType was never
+ * stamped; include them as `unknown_backend` blockers instead of silently
+ * excluding them from a credential-isolation transaction.
+ */
+export function mergePersistedDeviceIsolationSessions(
+  runtimeSessions: readonly DeviceIsolationRuntimeSession[],
+  persistedSessions: readonly Session[],
+): DeviceIsolationRuntimeSession[] {
+  const merged = [...runtimeSessions];
+  const runtimeIds = new Set(runtimeSessions.map(session => session.sessionId));
+  for (const session of persistedSessions) {
+    if (
+      runtimeIds.has(session.sessionId)
+      || session.status !== 'active'
+      || session.queued
+    ) continue;
+    const adopted = !!session.adoptedFrom;
+    const frozenBackend =
+      session.backendType ?? session.persistentBackendTarget?.backendType;
+    const hasDurableLocalEvidence =
+      adopted
+      || !!session.persistentBackendTarget
+      || isPersistentBackend(frozenBackend ?? 'unknown')
+      || (typeof session.pid === 'number' && session.pid > 0)
+      || !!session.cliSessionId;
+    if (!hasDurableLocalEvidence) continue;
+    merged.push({
+      sessionId: session.sessionId,
+      adopted,
+      ...(frozenBackend ? { frozenBackend } : {}),
+      ...(session.persistentBackendTarget
+        ? { persistentBackendTarget: session.persistentBackendTarget }
+        : {}),
+      ...(typeof session.pid === 'number' && session.pid > 0
+        ? { unregisteredPid: session.pid }
+        : {}),
+      workerPresent: false,
+    });
+    runtimeIds.add(session.sessionId);
+  }
+  return merged;
+}
+
 function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
-  return listActiveSessions().map((ds) => {
+  const runtime = listActiveSessions().map((ds) => {
     const workerPresent = !!ds.worker && !ds.worker.killed;
     const workerPid = workerPresent ? ds.worker?.pid : undefined;
     const workerStart = workerPid ? readProcessStartIdentity(workerPid) : undefined;
@@ -181,6 +239,9 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
       source: ds,
     };
   });
+  // sessionStore is initialized for this daemon's own bot partition. Do not
+  // scan sibling files: every daemon proves only the local resources it owns.
+  return mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessions());
 }
 
 const defaultDependencies: DeviceIsolationDaemonDependencies = {
@@ -237,6 +298,18 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
     && session.frozenBackend !== session.attestation.backendType
   ) {
     return blockerEntry(session, backendType, 'backend_inconsistent');
+  }
+  if (session.unregisteredPid !== undefined) {
+    let processMayStillExist = true;
+    try {
+      processMayStillExist = dependencies.processExists(session.unregisteredPid);
+    } catch {
+      // Process inspection is itself part of the safety proof. An unavailable
+      // probe cannot authorize activation around an unregistered local PID.
+    }
+    if (processMayStillExist) {
+      return blockerEntry(session, backendType, 'process_identity_unavailable');
+    }
   }
   if (backendType === 'riff') {
     return {

@@ -668,7 +668,16 @@ export async function triggerSessionTurn(
     // not a hard guarantee — consistent with the 256/TTL best-effort bound.
     if (loudTurnId) newDs.pendingTurnId = loudTurnId;
     armLoudFinalSuppression(newDs);
-    deps.activeSessions.set(sessionKey(anchor, larkAppId), newDs);
+    if (!setActiveSessionIfActive(deps.activeSessions, sessionKey(anchor, larkAppId), newDs)) {
+      disarmLoudFinalSuppression(newDs);
+      await closeSession(session.sessionId);
+      return {
+        ok: false,
+        triggerId,
+        errorCode: 'trigger_failed',
+        error: 'session route is reserved by an active persisted session',
+      };
+    }
     const { runAutoWorktreeCommit } = await import('../im/lark/card-handler.js');
     void runAutoWorktreeCommit({
       ds: newDs, anchor, larkAppId, baseDir: wd.workingDir, title: triggerTitle(req),

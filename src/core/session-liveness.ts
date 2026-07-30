@@ -79,9 +79,11 @@ export function isSessionStopped(s: Session): boolean {
   if (s.pid && isProcessAlive(s.pid)) return false;
 
   // Remote Riff tasks have no local worker/backing process to prove dead.
-  // Their remote lifecycle is authoritative, so local zombie cleanup must
-  // never close them from the absence of a tmux pane.
-  if (s.backendType === 'riff') return false;
+  // ZMX likewise owns one independent daemon per session: a missing backing
+  // daemon can mean a normal process/host restart, and the transcript-backed
+  // row remains recoverable by a lazy cold-resume. Neither backend is safe to
+  // permanently close from this local zombie heuristic.
+  if (s.backendType === 'riff' || s.backendType === 'zmx') return false;
   if (s.backendType === 'pty') return true;
 
   // Rows created before backend stamping used tmux as their only externally

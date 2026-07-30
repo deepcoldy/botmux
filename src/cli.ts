@@ -3525,7 +3525,7 @@ type SessionDeleteCloseResult =
  *  persistent row, lifecycle hooks, subscriptions, and backend teardown stay
  *  coherent. This legacy local path is safe only when there is no daemon
  *  process whose in-memory state could be stranded. */
-function closeSessionOffline(s: SessionData): void {
+function closeSessionOffline(s: SessionData): SessionDeleteCloseResult {
   const originalPid = adoptedCliPid(s);
   // Adopted sessions own only the botmux worker/viewer, never the user's CLI.
   if (s.pid && s.pid !== originalPid && isProcessAlive(s.pid)) {
@@ -3541,7 +3541,21 @@ function closeSessionOffline(s: SessionData): void {
         s.sessionId,
         s.persistentBackendTarget,
       );
-      try { killPersistentBackendTarget(target, s.sessionId); } catch { /* absent or unavailable */ }
+      try {
+        killPersistentBackendTarget(target, s.sessionId);
+      } catch (err) {
+        // ZMX destruction is identity-verified against the complete botmux
+        // session UUID and waits for confirmed disappearance. Swallowing an
+        // inconclusive/mismatched kill would hide the sole control row while
+        // its CLI remains alive. Older mux backends retain their historical
+        // best-effort offline-close compatibility.
+        if (target.backendType === 'zmx') {
+          return {
+            ok: false,
+            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
     } else {
       // Legacy rows without backendType were historically tmux-backed.
       const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
@@ -3557,6 +3571,7 @@ function closeSessionOffline(s: SessionData): void {
   s.status = 'closed';
   s.closedAt = new Date().toISOString();
   saveSession(s);
+  return { ok: true, via: 'offline' };
 }
 
 /** Close through the owning daemon whenever it is online. The IPC request is
@@ -3582,8 +3597,7 @@ async function closeSessionForDelete(
   // port); it only keeps larkAppId-less legacy records on the offline fallback,
   // whose saveSession() persists to the legacy file correctly.
   if (!s.larkAppId) {
-    closeSessionOffline(s);
-    return { ok: true, via: 'offline' };
+    return closeSessionOffline(s);
   }
 
   const daemon = online.find(d => d.larkAppId === s.larkAppId);
@@ -3606,8 +3620,7 @@ async function closeSessionForDelete(
     }
   }
 
-  closeSessionOffline(s);
-  return { ok: true, via: 'offline' };
+  return closeSessionOffline(s);
 }
 
 function adoptTargetLabel(s: SessionData): string {

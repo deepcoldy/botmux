@@ -39,32 +39,16 @@ describe('isSessionStopped — botmux-suspended sessions are not zombies', () =>
     expect(isSessionStopped(session({ suspendedColdResume: undefined, pid: undefined }))).toBe(true);
   });
 
-  it.each([
-    {
-      label: 'shared Herdr agent',
+  it('keeps a workerless live shared Herdr agent out of destructive zombie cleanup', () => {
+    const persistentBackendTarget = {
       backendType: 'herdr' as const,
-      persistentBackendTarget: {
-        backendType: 'herdr' as const,
-        sessionName: 'botmux',
-        agentName: 'botmux-01234567',
-      },
-    },
-    {
-      label: 'managed ZMX session',
-      backendType: 'zmx' as const,
-      persistentBackendTarget: {
-        backendType: 'zmx' as const,
-        sessionName: 'bmx-01234567',
-      },
-    },
-  ])('keeps a workerless live $label out of destructive zombie cleanup', ({
-    backendType,
-    persistentBackendTarget,
-  }) => {
+      sessionName: 'botmux',
+      agentName: 'botmux-01234567',
+    };
     persistentProbe.mockReturnValueOnce('exists');
 
     expect(isSessionStopped(session({
-      backendType,
+      backendType: 'herdr',
       persistentBackendTarget,
       pid: undefined,
     }))).toBe(false);
@@ -72,10 +56,11 @@ describe('isSessionStopped — botmux-suspended sessions are not zombies', () =>
   });
 
   it.each([
-    ['unknown', false],
-    ['missing', true],
-  ] as const)('treats a persistent-target %s probe as stopped=%s', (probe, stopped) => {
+    'missing',
+    'unknown',
+  ] as const)('keeps a workerless ZMX row recoverable when its backing probe would be %s', (probe) => {
     persistentProbe.mockReturnValueOnce(probe);
+
     expect(isSessionStopped(session({
       backendType: 'zmx',
       persistentBackendTarget: {
@@ -83,7 +68,8 @@ describe('isSessionStopped — botmux-suspended sessions are not zombies', () =>
         sessionName: 'bmx-01234567',
       },
       pid: undefined,
-    }))).toBe(stopped);
+    }))).toBe(false);
+    expect(persistentProbe).not.toHaveBeenCalled();
   });
 
   it('does not call a remote Riff task stopped just because no local tmux pane exists', () => {

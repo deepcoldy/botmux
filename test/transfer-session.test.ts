@@ -7,19 +7,23 @@
  * invoked with resume=true so the surviving tmux session is re-attached
  * rather than recreated.
  *
- * The CLI process and tmux session are external resources; we stub
- * forkWorker / killWorker so the test exercises the *routing* logic in
- * isolation. ds.worker is set to null to avoid actually killing anything.
+ * The CLI process and tmux session are external resources; most tests stub
+ * forkWorker / detachWorker so they exercise the *routing* logic in isolation.
+ * Dedicated lifecycle cases below use a fake child process to cover the real
+ * daemon-side detach fence.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn(),
+  updateSessionPid: vi.fn(),
   getSession: vi.fn(),
   getOwnedSession: vi.fn(),
+  listSessions: vi.fn(() => []),
   closeSession: vi.fn(),
 }));
 
@@ -62,22 +66,35 @@ vi.mock('../src/services/doc-subs-store.js', () => ({
   removeDocSubscription: (...a: any[]) => removeDocSubscriptionMock(...a),
 }));
 
-// transferSession accepts forkWorker/killWorker overrides for testability —
+// transferSession accepts forkWorker/detachWorker overrides for testability —
 // real forkWorker would actually spawn a child process and attach tmux.
 const forkWorkerSpy = vi.fn();
-const killWorkerSpy = vi.fn();
+const detachWorkerSpy = vi.fn();
 
 import {
   closeSession,
+  detachWorkerForTransfer,
   destroyUnregisteredPersistentBacking,
   forkAdoptWorker,
   forkWorker,
+  initWorkerPool,
+  isSessionTransferring,
+  requestSessionRestart,
+  suspendWorker,
   transferSession,
+  __testOnly_setupWorkerHandlers,
   setActiveSessionsRegistry,
   setActiveSessionIfActive,
   setActiveSessionSafe,
   rollbackRejectedSessionAndGetWinner,
+  sendWorkerInput,
+  sendWorkerSessionInput,
 } from '../src/core/worker-pool.js';
+import {
+  acquireDeviceIsolationFreeze,
+  releaseDeviceIsolationFreeze,
+  resetDeviceIsolationActivationForTest,
+} from '../src/core/device-isolation-activation.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { sessionKey } from '../src/core/types.js';
@@ -137,11 +154,12 @@ describe('transferSession', () => {
     targetScope: 'thread' | 'chat' = 'chat',
   ) => transferSession(sessionId, targetChatId, targetRootMessageId, targetChatType, targetScope, {
     forkWorkerImpl: forkWorkerSpy as any,
-    killWorkerImpl: killWorkerSpy as any,
+    detachWorkerImpl: detachWorkerSpy as any,
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
+    resetDeviceIsolationActivationForTest();
     registry = new Map();
     setActiveSessionsRegistry(registry);
   });
@@ -375,6 +393,639 @@ describe('transferSession', () => {
     expect(resume).toBe(true);
   });
 
+  it('waits for detach ACK+exit and buffers new input for the replacement worker', async () => {
+    const lifecycle: string[] = [];
+    let detachMessage: { type: string; requestId?: string } | undefined;
+    const send = vi.fn((
+      message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => {
+      if (message.type === 'detach_for_transfer') detachMessage = message;
+      lifecycle.push(`old:${message.type}`);
+      callback?.(null);
+    });
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker: oldWorker,
+      lastScreenStatus: 'idle',
+      session: {
+        ...makeDs().session,
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'bmx-sess-abc',
+        },
+      },
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const replacementSend = vi.fn((message: { type: string }) => {
+      lifecycle.push(`replacement:${message.type}`);
+    });
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const replacementFork = vi.fn((...args: Parameters<typeof forkWorker>) => {
+      lifecycle.push('replacement:fork');
+      ds.worker = replacementWorker;
+      return forkWorkerSpy(...args);
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      { forkWorkerImpl: replacementFork as typeof forkWorker },
+    );
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    expect(detachMessage).toMatchObject({
+      type: 'detach_for_transfer',
+      requestId: expect.any(String),
+    });
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    // The replacement must not install its observer while the old worker can
+    // still run a late name-scoped tmux pipe-pane detach.
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    expect(sendWorkerInput(
+      ds,
+      'arrived during transfer',
+      'turn-late',
+      { dispatchAttempt: 7 },
+    )).toBe(true);
+    const rawDuringTransfer = {
+      type: 'raw_input' as const,
+      content: '/model opus',
+      turnId: 'turn-raw',
+      followUpContent: 'follow-up payload',
+      followUpTurnId: 'turn-follow-up',
+      followUpCodexAppInput: {
+        text: 'clean follow-up',
+        additionalContext: {
+          quoted: { kind: 'untrusted' as const, value: 'quoted context' },
+        },
+      },
+    };
+    expect(sendWorkerSessionInput(ds, rawDuringTransfer)).toBe(true);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(replacementSend).not.toHaveBeenCalled();
+
+    lifecycle.push('old:transfer_detached');
+    oldWorker.emit('message', {
+      type: 'transfer_detached',
+      requestId: detachMessage!.requestId,
+    });
+    await Promise.resolve();
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    lifecycle.push('old:exit');
+    oldWorker.exitCode = 0;
+    oldWorker.emit('exit', 0, null);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: true });
+    expect(lifecycle).toEqual([
+      'old:detach_for_transfer',
+      'old:transfer_detached',
+      'old:exit',
+      'replacement:fork',
+      'replacement:message',
+      'replacement:raw_input',
+    ]);
+    expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      content: 'arrived during transfer',
+      turnId: 'turn-late',
+      dispatchAttempt: 7,
+    }));
+    expect(replacementSend).toHaveBeenNthCalledWith(2, rawDuringTransfer);
+  });
+
+  it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const completed = await detachWorkerForTransfer(ds, { timeoutMs: 1 });
+
+    expect(completed).toBe(false);
+    expect(send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'detach_for_transfer',
+        requestId: expect.any(String),
+      }),
+      expect.any(Function),
+    );
+    expect(oldWorker.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'close' }),
+      expect.anything(),
+    );
+    expect(ds.worker).toBeNull();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('keeps detach timeout bounded when the child IPC send callback never fires', async () => {
+    const send = vi.fn(() => undefined);
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    }) as any;
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const outcome = await Promise.race([
+      detachWorkerForTransfer(ds, { timeoutMs: 1 }).then(result => ({
+        kind: 'returned' as const,
+        result,
+      })),
+      new Promise<{ kind: 'hung' }>((resolve) => {
+        setTimeout(() => resolve({ kind: 'hung' }), 50);
+      }),
+    ]);
+
+    expect(outcome).toEqual({ kind: 'returned', result: false });
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(oldWorker.kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.worker).toBeNull();
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+  });
+
+  it('cold-reattaches the unchanged source after a real detach timeout with no buffered input', async () => {
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    let oldWorker: any;
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    });
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const sourceFork = vi.fn();
+
+    const result = await transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: sourceFork as any,
+        detachWorkerImpl: current => detachWorkerForTransfer(current, { timeoutMs: 1 }),
+      },
+    );
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+  });
+
+  it('keeps source routing and cold-reattaches when the transfer detach fence fails', async () => {
+    const ds = makeDs();
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    const result = await transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: forkWorkerSpy as any,
+        detachWorkerImpl: vi.fn(() => false),
+      },
+    );
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(forkWorkerSpy).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('restarts on the source route and replays buffered input after detach timeout', async () => {
+    let oldWorker: any;
+    const send = vi.fn((
+      _message: { type: string; requestId?: string },
+      callback?: (error: Error | null) => void,
+    ) => callback?.(null));
+    const kill = vi.fn((signal: NodeJS.Signals) => {
+      oldWorker.signalCode = signal;
+      oldWorker.emit('exit', null, signal);
+      return true;
+    });
+    oldWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send,
+      kill,
+    });
+    const ds = makeDs({ worker: oldWorker, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const replacementSend = vi.fn();
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const sourceFork = vi.fn(() => {
+      ds.worker = replacementWorker;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: sourceFork as any,
+        detachWorkerImpl: current => detachWorkerForTransfer(current, { timeoutMs: 1 }),
+      },
+    );
+
+    await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+    const rawDuringTimeout = {
+      type: 'raw_input' as const,
+      content: '/effort high',
+      turnId: 'turn-timeout-raw',
+      followUpContent: 'source follow-up',
+      followUpTurnId: 'turn-timeout-follow-up',
+      followUpCodexAppInput: {
+        text: 'source clean follow-up',
+        additionalContext: {
+          attachment: { kind: 'untrusted' as const, value: '/tmp/a.png' },
+        },
+      },
+    };
+    expect(sendWorkerSessionInput(ds, rawDuringTimeout)).toBe(true);
+    expect(sendWorkerInput(ds, 'keep this turn', 'turn-timeout')).toBe(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: false, error: 'worker_detach_timeout' });
+    expect(kill).toHaveBeenCalledWith('SIGKILL');
+    expect(ds.chatId).toBe('oc_source');
+    expect(ds.session.rootMessageId).toBe('om_source_root');
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenNthCalledWith(1, rawDuringTimeout);
+    expect(replacementSend).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      type: 'message',
+      content: 'keep this turn',
+      turnId: 'turn-timeout',
+    }));
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('refuses transfer while a live worker generation has not reached ready', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: false,
+      lastScreenStatus: 'idle',
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
+
+  it('refuses transfer until a previously suspended worker actually exits', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: true,
+      lastScreenStatus: 'idle',
+      initConfig: { backendType: 'tmux' } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    expect(suspendWorker(ds, 'test')).toBe(true);
+    expect(ds.worker).toBeNull();
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+
+    worker.exitCode = 0;
+    worker.emit('exit', 0, null);
+  });
+
+  it('blocks restart and suspend requests while the transfer gate is active', async () => {
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+    }) as any;
+    const ds = makeDs({
+      worker,
+      workerReady: true,
+      lastScreenStatus: 'idle',
+      initConfig: { backendType: 'tmux' } as any,
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: forkWorkerSpy as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    expect(isSessionTransferring(ds)).toBe(true);
+
+    expect(requestSessionRestart(ds, {
+      source: 'slash',
+      notify: vi.fn(),
+    })).toBeUndefined();
+    expect(suspendWorker(ds, 'test')).toBe(false);
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'restart' }));
+    expect(worker.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'suspend' }));
+
+    releaseDetach(true);
+    await moving;
+  });
+
+  it('defers source reattach behind a device-isolation freeze that arrives during detach', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    updateMessageMock.mockClear();
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const sourceFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: sourceFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    const acquired = acquireDeviceIsolationFreeze({
+      nonce: 'transfer-freeze',
+      inventoryGeneration: 'generation-1',
+      leaseIdFactory: () => 'lease-transfer',
+    });
+    expect(acquired.ok).toBe(true);
+    releaseDetach(true);
+
+    const result = await moving;
+    expect(result).toEqual({ ok: false, error: 'worker_busy' });
+    expect(sourceFork).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(ds.chatId).toBe('oc_source');
+
+    if (!acquired.ok) throw new Error('freeze acquisition unexpectedly failed');
+    expect(releaseDeviceIsolationFreeze({
+      nonce: acquired.lease.nonce,
+      leaseId: acquired.lease.leaseId,
+    })).toBe(true);
+    await vi.waitFor(() => expect(sourceFork).toHaveBeenCalledWith(ds, '', true));
+  });
+
+  it('lets explicit close win while detach is in flight and never revives the source', async () => {
+    const ds = makeDs({
+      worker: null,
+      lastScreenStatus: 'idle',
+      session: {
+        ...makeDs().session,
+        backendType: 'pty',
+      },
+    });
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacementFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: replacementFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    await closeSession(ds.session.sessionId);
+    releaseDetach(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: false, error: 'session_not_active' });
+    expect(ds.session.status).toBe('closed');
+    expect(registry.has(sourceKey)).toBe(false);
+    expect(replacementFork).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a committed transfer successful when replacement fork and replay throw', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const throwingFork = vi.fn(() => {
+      throw new Error('fork exploded');
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: throwingFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+    expect(sendWorkerInput(ds, 'preserve me', 'turn-preserve')).toBe(true);
+    releaseDetach(true);
+
+    await expect(moving).resolves.toEqual({ ok: true });
+    expect(ds.chatId).toBe('oc_target');
+    expect(throwingFork).toHaveBeenCalled();
+    expect(isSessionTransferring(ds)).toBe(true);
+  });
+
+  it('preserves pending raw input through an empty refork requested during transfer', async () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp/project',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      worker: null,
+      lastScreenStatus: 'idle',
+      pendingRawInput: '/goal ship it',
+      pendingRawTurnId: 'turn-goal',
+      streamCardId: undefined,
+      session: {
+        ...makeDs().session,
+        streamCardId: undefined,
+      },
+    });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacement = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: vi.fn(),
+      kill: vi.fn(),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    }) as any;
+    const replacementFork = vi.fn(() => {
+      ds.worker = replacement;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: replacementFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    forkWorker(ds, '', true);
+    expect(replacementFork).not.toHaveBeenCalled();
+    releaseDetach(true);
+    await expect(moving).resolves.toEqual({ ok: true });
+    expect(replacementFork).toHaveBeenCalledTimes(1);
+
+    __testOnly_setupWorkerHandlers(ds, replacement);
+    replacement.emit('message', { type: 'prompt_ready' });
+    await Promise.resolve();
+
+    expect(replacement.send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/goal ship it',
+      turnId: 'turn-goal',
+    });
+    expect(ds.pendingRawInput).toBeUndefined();
+    expect(ds.pendingRawTurnId).toBeUndefined();
+  });
+
   it('returns worker_busy immediately when worker is mid-turn (no idle-wait loop)', async () => {
     // Source worker is alive and not in idle/limited → refuse on first check.
     // This is the design contract change: previously transferSession waited
@@ -600,7 +1251,7 @@ describe('transferSession', () => {
     expect(ds.session.chatId).toBe('oc_target');
   });
 
-  it('aborts without rewriting routing when the source closes during card freeze', async () => {
+  it('does not hold the committed move or replacement startup behind the source-card PATCH', async () => {
     const ds = makeDs();
     const sourceKey = sessionKey('om_source_root', 'cli_app_test');
     registry.set(sourceKey, ds);
@@ -611,30 +1262,43 @@ describe('transferSession', () => {
     }));
 
     const moving = callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
-    expect(updateMessageMock).toHaveBeenCalledTimes(1);
-
-    // Simulate dashboard/CLI close while updateMessage is in flight.
-    ds.session.status = 'closed';
-    registry.delete(sourceKey);
-    releaseFreeze();
+    await vi.waitFor(() => expect(updateMessageMock).toHaveBeenCalledTimes(1));
 
     const r = await moving;
-    expect(r).toEqual({ ok: false, error: 'session_not_active' });
-    expect(killWorkerSpy).not.toHaveBeenCalled();
-    expect(forkWorkerSpy).not.toHaveBeenCalled();
-    expect(ds.chatId).toBe('oc_source');
-    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+    expect(r).toEqual({ ok: true });
+    expect(detachWorkerSpy).toHaveBeenCalledWith(ds);
+    expect(forkWorkerSpy).toHaveBeenCalledWith(ds, '', true);
+    expect(ds.chatId).toBe('oc_target');
+    expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(ds);
+    expect(registry.has(sourceKey)).toBe(false);
+
+    // Settle the deliberately slow best-effort PATCH so the test leaves no
+    // unresolved work behind.
+    releaseFreeze();
   });
 
-  it('does not evict a target session created while the source card is freezing', async () => {
+  it('reattaches on the source and leaves its card live when a target appears during detach', async () => {
     const ds = makeDs();
-    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const sourceKey = sessionKey('om_source_root', 'cli_app_test');
+    registry.set(sourceKey, ds);
 
-    let releaseFreeze!: () => void;
-    updateMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => {
-      releaseFreeze = resolve;
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
     }));
-    const moving = callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+    const sourceFork = vi.fn();
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        detachWorkerImpl: detach,
+        forkWorkerImpl: sourceFork as any,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
 
     const target = makeDs({
       worker: { killed: false } as any,
@@ -649,13 +1313,69 @@ describe('transferSession', () => {
       scope: 'chat',
     });
     registry.set(sessionKey('oc_target', 'cli_app_test'), target);
-    releaseFreeze();
+    releaseDetach(true);
 
     const r = await moving;
     expect(r).toEqual({ ok: false, error: 'target_chat_has_session' });
-    expect(killWorkerSpy).not.toHaveBeenCalled();
+    expect(sourceFork).toHaveBeenCalledWith(ds, '', true);
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(target);
-    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+    expect(registry.get(sourceKey)).toBe(ds);
+    expect(ds.chatId).toBe('oc_source');
+    expect(updateMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('defers a worker-null refork that arrives while detach is pending', async () => {
+    const ds = makeDs({ worker: null, lastScreenStatus: 'idle' });
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+
+    let releaseDetach!: (completed: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => {
+      releaseDetach = resolve;
+    }));
+    const replacementSend = vi.fn();
+    const replacementWorker = Object.assign(new EventEmitter(), {
+      killed: false,
+      connected: true,
+      exitCode: null,
+      signalCode: null,
+      send: replacementSend,
+      kill: vi.fn(),
+    }) as any;
+    const replacementFork = vi.fn(() => {
+      ds.worker = replacementWorker;
+    });
+    const moving = transferSession(
+      ds.session.sessionId,
+      'oc_target',
+      'om_M1_target',
+      'group',
+      'chat',
+      {
+        forkWorkerImpl: replacementFork as any,
+        detachWorkerImpl: detach,
+      },
+    );
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    forkWorker(
+      ds,
+      { content: 'arrived while detach was pending' },
+      { resume: true, turnId: 'turn-detach', dispatchAttempt: 11 },
+    );
+    expect(replacementFork).not.toHaveBeenCalled();
+
+    releaseDetach(true);
+    const result = await moving;
+
+    expect(result).toEqual({ ok: true });
+    expect(replacementFork).toHaveBeenCalledTimes(1);
+    expect(replacementFork).toHaveBeenCalledWith(ds, '', true);
+    expect(replacementSend).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      content: 'arrived while detach was pending',
+      turnId: 'turn-detach',
+      dispatchAttempt: 11,
+    }));
   });
 
   it('does not call updateMessage when there is no source-chat card to freeze', async () => {
@@ -677,7 +1397,7 @@ describe('transferSession', () => {
 
     const r = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
-    expect(killWorkerSpy).toHaveBeenCalledWith(ds);
+    expect(detachWorkerSpy).toHaveBeenCalledWith(ds);
     expect(forkWorkerSpy).toHaveBeenCalledTimes(1);
   });
 });
@@ -755,6 +1475,29 @@ describe('setActiveSessionSafe', () => {
 
     expect(registry.get(key)).toBe(ds);
     expect(sessionStore.closeSession).not.toHaveBeenCalled();
+  });
+
+  it('reserves an empty runtime key for a quarantined active persisted row', () => {
+    const quarantined = makeSimpleDs('quarantined-sess');
+    quarantined.session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+    const fresh = makeSimpleDs('fresh-sess');
+    const key = sessionKey('oc_c', 'cli_app_test');
+    vi.mocked(sessionStore.listSessions).mockReturnValueOnce([quarantined.session]);
+
+    expect(setActiveSessionIfActive(registry, key, fresh)).toBe(false);
+    expect(registry.has(key)).toBe(false);
+  });
+
+  it('lets the quarantined row itself reclaim the route and clears its marker', () => {
+    const quarantined = makeSimpleDs('quarantined-sess');
+    quarantined.session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+    const key = sessionKey('oc_c', 'cli_app_test');
+    vi.mocked(sessionStore.listSessions).mockReturnValueOnce([quarantined.session]);
+
+    expect(setActiveSessionIfActive(registry, key, quarantined)).toBe(true);
+    expect(registry.get(key)).toBe(quarantined);
+    expect(quarantined.session.restoreQuarantinedAt).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(quarantined.session);
   });
 
   it('refuses to register a session closed while its creator was awaiting', () => {

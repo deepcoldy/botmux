@@ -218,6 +218,18 @@ export interface Session {
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
   closedAt?: string;
+  /**
+   * Restore/runtime ownership quarantine. Set when botmux cannot prove that an
+   * existing external/persistent target is safe to attach or tear down, and
+   * therefore deliberately keeps this row active without attaching it to the
+   * daemon routing registry.
+   *
+   * While present, the routing registration gate reserves this row's anchor so
+   * a later inbound turn cannot create a second runtime session beside a
+   * possibly-live backing process. A successful registration clears it; an
+   * explicit close retries authoritative teardown before closing the row.
+   */
+  restoreQuarantinedAt?: string;
   pid?: number;
   workingDir?: string;
   webPort?: number;
@@ -624,6 +636,10 @@ export type DaemonToWorker =
    *  it; all other CLIs ignore it. */
   | { type: 'rename_session'; title: string }
   | { type: 'close' }
+  /** Retire only this worker/observer during a routing transfer. Persistent
+   * backends and Riff keep their owned CLI/task alive for the replacement
+   * worker to reattach; PTY keeps its historical cold-resume behavior. */
+  | { type: 'detach_for_transfer'; requestId: string }
   | { type: 'suspend' }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
@@ -702,6 +718,10 @@ export type WorkerToDaemon =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string }
+  /** Transfer-only completion fence. Emitted after the old worker has detached
+   * its backend observer and disarmed sandbox teardown, immediately before it
+   * exits. The daemon also waits for that child exit before forking replacement. */
+  | { type: 'transfer_detached'; requestId: string }
   /** Trusted worker observation used only by the host activation transaction.
    * PID markers are child-writable diagnostics and are never security proof. */
   | {

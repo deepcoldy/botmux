@@ -256,6 +256,7 @@ export const messages: Record<string, string> = {
   'cmd.substitute.owner_only': '⚠️ Only owner/allowedUsers can change substitute mode.',
   'cmd.substitute.usage': 'Usage: @me /substitute status | on | off',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
+  'cmd.session.transfer_in_progress': '⚠️ This session is being relayed. Try again after the transfer finishes.',
   'cmd.restart.succeeded': '✅ {cliName} is ready again.',
   'cmd.restart.failed': '❌ Failed to restart {cliName}.',
   'cmd.restart.timed_out': '⌛ {cliName} restart timed out before becoming ready.',

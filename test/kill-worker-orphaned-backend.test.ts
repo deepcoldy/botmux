@@ -25,6 +25,8 @@ const {
   tmuxKill,
   herdrKill,
   herdrKillAgent,
+  herdrKillAgents,
+  herdrList,
   zellijKill,
   zmxKill,
   zmxList,
@@ -33,6 +35,8 @@ const {
   tmuxKill: vi.fn(),
   herdrKill: vi.fn(),
   herdrKillAgent: vi.fn(),
+  herdrKillAgents: vi.fn(),
+  herdrList: vi.fn(() => [] as string[]),
   zellijKill: vi.fn(),
   zmxKill: vi.fn(),
   zmxList: vi.fn(() => [] as string[]),
@@ -47,6 +51,8 @@ vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
     sessionName: (id: string) => `bmx-${id.slice(0, 8)}`,
     killSession: herdrKill,
     killAgent: herdrKillAgent,
+    killAgents: herdrKillAgents,
+    listBotmuxSessions: herdrList,
   },
 }));
 vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
@@ -85,6 +91,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import { config } from '../src/config.js';
+import { managedHerdrAgentName } from '../src/adapters/backend/session-backend-selector.js';
 import {
   killStalePids,
   killWorker,
@@ -110,6 +117,7 @@ const ds = (over: Partial<DaemonSession> = {}, initOver: any = {}): DaemonSessio
 
 beforeEach(() => {
   vi.clearAllMocks();
+  herdrList.mockReturnValue([]);
   zmxList.mockReturnValue([]);
   getBotMock.mockReturnValue({ resolvedAllowedUsers: [], config: {} } as any);
 });
@@ -136,6 +144,296 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
 
       expect(zmxKill).toHaveBeenCalledTimes(1);
       expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
+    } finally {
+      sessionStore.init();
+      config.daemon.cliId = previousCliId;
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('continues global CLI-change cleanup after one managed ZMX kill refuses ownership', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-global-cli-change-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const previousCliId = config.daemon.cliId;
+    const firstId = '33333333-0000-0000-0000-000000000000';
+    const secondId = '44444444-0000-0000-0000-000000000000';
+
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'zmx';
+      config.daemon.cliId = 'codex';
+      sessionStore.init('zmx-global-cli-change-test');
+      writeFileSync(join(dataDir, 'last-cli-id-zmx'), 'claude-code', 'utf8');
+      zmxList.mockReturnValue(['bmx-33333333', 'bmx-44444444']);
+      zmxKill
+        .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
+        .mockImplementationOnce(() => undefined);
+
+      expect(() => killStalePids([
+        { sessionId: firstId, status: 'active', backendType: 'zmx' } as any,
+        { sessionId: secondId, status: 'active', backendType: 'zmx' } as any,
+      ])).not.toThrow();
+
+      expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-33333333', firstId);
+      expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-44444444', secondId);
+    } finally {
+      sessionStore.init();
+      config.daemon.cliId = previousCliId;
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('continues cleaning other CLI-mismatch rows when one exact ZMX kill fails closed', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-zmx-mismatch-cleanup-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const previousCliId = config.daemon.cliId;
+    const firstId = '11111111-0000-0000-0000-000000000000';
+    const secondId = '22222222-0000-0000-0000-000000000000';
+
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'zmx';
+      config.daemon.cliId = 'codex';
+      sessionStore.init('zmx-mismatch-cleanup-test');
+      writeFileSync(join(dataDir, 'last-cli-id-zmx'), 'codex', 'utf8');
+      getBotMock.mockReturnValue({
+        resolvedAllowedUsers: [],
+        config: { cliId: 'codex' },
+      } as any);
+      zmxKill
+        .mockImplementationOnce(() => { throw new Error('ownership probe unavailable'); })
+        .mockImplementationOnce(() => undefined);
+
+      expect(() => killStalePids([
+        {
+          sessionId: firstId,
+          status: 'active',
+          larkAppId: 'app-one',
+          cliId: 'claude-code',
+          backendType: 'zmx',
+          persistentBackendTarget: {
+            backendType: 'zmx',
+            sessionName: 'bmx-11111111',
+          },
+        } as any,
+        {
+          sessionId: secondId,
+          status: 'active',
+          larkAppId: 'app-two',
+          cliId: 'claude-code',
+          backendType: 'zmx',
+          persistentBackendTarget: {
+            backendType: 'zmx',
+            sessionName: 'bmx-22222222',
+          },
+        } as any,
+      ])).not.toThrow();
+
+      expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-11111111', firstId);
+      expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-22222222', secondId);
+    } finally {
+      sessionStore.init();
+      config.daemon.cliId = previousCliId;
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('killStalePids — shared Herdr orphan cleanup', () => {
+  it('kills only strongly-bound persisted agents that are no longer active', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-herdr-orphan-cleanup-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const previousCliId = config.daemon.cliId;
+    const orphanSessionId = '11111111-0000-0000-0000-000000000001';
+    const activeSessionId = '22222222-0000-0000-0000-000000000002';
+    const runtimeSessionId = '33333333-0000-0000-0000-000000000003';
+    const orphanTarget = {
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: managedHerdrAgentName(orphanSessionId, dataDir),
+    } as const;
+    const activeTarget = {
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: managedHerdrAgentName(activeSessionId, dataDir),
+    } as const;
+    const runtimeTarget = {
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: managedHerdrAgentName(runtimeSessionId, dataDir),
+    } as const;
+
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'herdr';
+      config.daemon.cliId = 'codex';
+      sessionStore.init('herdr-orphan-cleanup-test');
+      writeFileSync(join(dataDir, 'last-cli-id-herdr'), 'codex', 'utf8');
+
+      const active = {
+        sessionId: activeSessionId,
+        status: 'active',
+        backendType: 'herdr',
+        persistentBackendTarget: activeTarget,
+      } as any;
+      for (const session of [
+        active,
+        {
+          sessionId: orphanSessionId,
+          status: 'closed',
+          backendType: 'herdr',
+          persistentBackendTarget: orphanTarget,
+        },
+        {
+          sessionId: '44444444-0000-0000-0000-000000000004',
+          status: 'closed',
+          backendType: 'herdr',
+          // A syntactically strong name belonging to another complete id is
+          // not startup-cleanup authority for this row.
+          persistentBackendTarget: orphanTarget,
+        },
+        {
+          sessionId: '55555555-0000-0000-0000-000000000005',
+          status: 'closed',
+          backendType: 'herdr',
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+            agentName: 'botmux-deadbeef',
+          },
+        },
+        {
+          sessionId: runtimeSessionId,
+          status: 'active',
+          backendType: 'herdr',
+          persistentBackendTarget: runtimeTarget,
+        },
+        {
+          sessionId: 'adopted0-0000-0000-0000-000000000000',
+          status: 'closed',
+          backendType: 'herdr',
+          adoptedFrom: { source: 'herdr', cwd: '/tmp' },
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+            agentName: 'user-sibling',
+          },
+        },
+        {
+          sessionId: 'hostonly-0000-0000-0000-000000000000',
+          status: 'closed',
+          backendType: 'herdr',
+          persistentBackendTarget: {
+            backendType: 'herdr',
+            sessionName: 'botmux',
+          },
+        },
+      ]) {
+        sessionStore.updateSession(session);
+      }
+
+      killStalePids(
+        [active],
+        new Map([[
+          'runtime',
+          {
+            session: {
+              sessionId: runtimeSessionId,
+              status: 'active',
+              backendType: 'herdr',
+              persistentBackendTarget: runtimeTarget,
+            },
+          } as any,
+        ]]),
+      );
+
+      expect(herdrKillAgents).toHaveBeenCalledTimes(1);
+      expect(herdrKillAgents).toHaveBeenCalledWith(
+        'botmux',
+        new Set([managedHerdrAgentName(orphanSessionId, dataDir)]),
+      );
+      expect(herdrKill).not.toHaveBeenCalledWith('botmux');
+    } finally {
+      sessionStore.init();
+      config.daemon.cliId = previousCliId;
+      config.daemon.backendType = previousBackendType;
+      if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDirEnv;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a current runtime agent while a global CLI change removes stale exact agents', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-herdr-cli-change-'));
+    const previousDataDirEnv = process.env.SESSION_DATA_DIR;
+    const previousBackendType = config.daemon.backendType;
+    const previousCliId = config.daemon.cliId;
+    const target = (sessionId: string) => ({
+      backendType: 'herdr' as const,
+      sessionName: 'botmux',
+      agentName: managedHerdrAgentName(sessionId, dataDir),
+    });
+    const staleActiveId = '66666666-0000-0000-0000-000000000006';
+    const runtimeId = '77777777-0000-0000-0000-000000000007';
+    const staleClosedId = '88888888-0000-0000-0000-000000000008';
+
+    try {
+      config.session.dataDir = dataDir;
+      config.daemon.backendType = 'herdr';
+      config.daemon.cliId = 'codex';
+      sessionStore.init('herdr-cli-change-test');
+      writeFileSync(join(dataDir, 'last-cli-id-herdr'), 'claude-code', 'utf8');
+
+      const staleActive = {
+        sessionId: staleActiveId,
+        status: 'active',
+        backendType: 'herdr',
+        persistentBackendTarget: target(staleActiveId),
+      } as any;
+      const runtime = {
+        sessionId: runtimeId,
+        status: 'active',
+        backendType: 'herdr',
+        persistentBackendTarget: target(runtimeId),
+      } as any;
+      for (const session of [
+        staleActive,
+        runtime,
+        {
+          sessionId: staleClosedId,
+          status: 'closed',
+          backendType: 'herdr',
+          persistentBackendTarget: target(staleClosedId),
+        },
+      ]) {
+        sessionStore.updateSession(session);
+      }
+
+      killStalePids(
+        [staleActive],
+        new Map([['runtime', { session: runtime } as any]]),
+      );
+
+      expect(herdrKillAgents).toHaveBeenCalledTimes(1);
+      expect(herdrKillAgents).toHaveBeenCalledWith(
+        'botmux',
+        new Set([
+          managedHerdrAgentName(staleActiveId, dataDir),
+          managedHerdrAgentName(staleClosedId, dataDir),
+        ]),
+      );
     } finally {
       sessionStore.init();
       config.daemon.cliId = previousCliId;

@@ -294,6 +294,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     void observer.notify('in_progress');
     return { attemptId: 'attempt-test', joined: false };
   }),
+  isSessionTransferring: vi.fn(() => false),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)

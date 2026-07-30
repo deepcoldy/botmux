@@ -236,7 +236,7 @@ describe('worker pipe initial screen ordering', () => {
     // stale anchor silently slices an empty string instead of failing loudly.
     const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
     expect(idleStart).toBeGreaterThan(-1);
-    const idleEnd = source.indexOf('backend.onData(onPtyData);', idleStart);
+    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
     expect(idleEnd).toBeGreaterThan(idleStart);
     const idle = source.slice(idleStart, idleEnd);
 

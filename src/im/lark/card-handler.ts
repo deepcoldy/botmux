@@ -82,7 +82,7 @@ import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { forkWorker, sendWorkerInput, killWorker, closeSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, getDaemonStreamingCardUsageSnapshot } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
@@ -1900,6 +1900,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         await sessionReply(rootId, t('card.action.adopt_no_restart', undefined, locDs));
         return;
       }
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, locDs),
+          },
+        };
+      }
       const effectiveCliId = sessionCliId(ds);
       const cliName = getCliDisplayName(effectiveCliId);
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
@@ -2076,6 +2084,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_keys' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       // Fail-closed: only act on a currently-active card (either the
       // ScreenAnalyzer TUI prompt card or our stuck-warning card). A stale
       // click from a resolved/replaced card must NOT send any IPC to the
@@ -2282,6 +2298,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     }
 
     if (actionType === 'tui_text_input' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       const inputTextRaw = action?.form_value?.tui_custom_input;
       const inputText = typeof inputTextRaw === 'string' ? inputTextRaw : '';
       let inputKeys: string[] = [];
@@ -2418,8 +2442,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           const next = nextMode(cur);
           ds.displayMode = next;
           persistStreamCardState(ds);
-          if (ds.worker) {
-            ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+          if (ds.worker || isSessionTransferring(ds)) {
+            sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
           }
           if (cardMessageId && workerHasInitialized(ds)) {
             const readUrl = readableTerminalUrlFor(ds);
@@ -2462,8 +2486,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         const next = nextMode(cur);
         ds.displayMode = next;
         persistStreamCardState(ds);
-        if (ds.worker) {
-          ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+        if (ds.worker || isSessionTransferring(ds)) {
+          sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
         }
         const effectiveCliId = sessionCliId(ds);
         const readUrl = readableTerminalUrlFor(ds);
@@ -2504,8 +2528,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const next = nextMode(cur);
       ds.displayMode = next;
       persistStreamCardState(ds);
-      if (ds.worker) {
-        ds.worker.send({ type: 'set_display_mode', mode: next } as DaemonToWorker);
+      if (ds.worker || isSessionTransferring(ds)) {
+        sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
       }
       if (ds.streamCardId && workerHasInitialized(ds)) {
         const readUrl = readableTerminalUrlFor(ds);
@@ -2565,8 +2589,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Manual screenshot refresh — force immediate capture bypassing 10s interval + hash dedup.
     if (actionType === 'refresh_screenshot' && ds) {
-      if (ds.worker) {
-        ds.worker.send({ type: 'refresh_screen' } as DaemonToWorker);
+      if (ds.worker || isSessionTransferring(ds)) {
+        sendWorkerSessionInput(ds, { type: 'refresh_screen' });
         logger.info(`[${tag(ds)}] Manual screenshot refresh`);
       }
       // Return the current card JSON so Feishu doesn't revert the displayed
@@ -2608,10 +2632,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
     // Quick-action keys (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½ page) — forward to worker.
     if (actionType === 'term_action' && ds) {
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
+      }
       const key = value?.key as TermActionKey | undefined;
       if (!key) return;
       if (ds.worker) {
-        ds.worker.send({ type: 'term_action', key } as DaemonToWorker);
+        sendWorkerSessionInput(ds, { type: 'term_action', key });
         logger.info(`[${tag(ds)}] term_action: ${key}`);
       }
       if (ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
@@ -2795,6 +2827,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
       logger.info(`codex_app_thread_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
@@ -2820,6 +2856,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await sessionReply(rootId, t('cmd.codex_app_adopt.list_failed', { error: err?.message ?? String(err) }, localeForBot(ds.larkAppId)));
       return;
     }
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     const target = threads.find(t => t.threadId === selected.threadId);
     if (!target) {
       await sessionReply(rootId, t('cmd.codex_app_adopt.thread_not_found', { threadId: selected.threadId }, localeForBot(ds.larkAppId)));
@@ -2840,6 +2884,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
@@ -2907,6 +2955,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       await new Promise(r => setTimeout(r, 150));
       target = await resolveAdoptTarget();
     }
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
       if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
@@ -2929,6 +2985,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
     const ds = activeSessions.get(sKey);
     if (!ds) return;
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
 
     if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
       logger.info(`adopt_resume_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
@@ -2944,6 +3004,14 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const botCfg = getBot(ds.larkAppId).config;
     const { discoverResumableSessionsForBot, startResumeImportSession } = await import('../../core/command-handler.js');
     const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions);
+    if (
+      ds.session !== sourceSession
+      || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds
+      || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
     const target = resumable.find(r => r.cliSessionId === selected.cliSessionId);
     if (!target) {
       await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: selected.cliSessionId }, localeForBot(ds.larkAppId)));

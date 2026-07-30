@@ -12,7 +12,7 @@ import * as sessionStore from '../services/session-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionIfActive, setActiveSessionSafe, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionIfActive, setActiveSessionSafe, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, isSessionTransferring, deferUntilSessionTransferSettled } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { buildBotmuxShellHints } from '../adapters/cli/shared-hints.js';
 import {
@@ -38,7 +38,7 @@ import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import { composeRowFromActive } from './dashboard-rows.js';
+import { composeRowFromActive, composeRowFromPersistedActive } from './dashboard-rows.js';
 import {
   composeSpawnCodexAppContext,
   composeSpawnUserContent,
@@ -83,6 +83,34 @@ function sessionLastMessageAtMs(session: { createdAt?: string; lastMessageAt?: s
   return session.lastMessageAt ? (Date.parse(session.lastMessageAt) || sessionCreatedAtMs(session)) : sessionCreatedAtMs(session);
 }
 
+function quarantineUnregisteredRestoreSession(session: Session, reason: string): void {
+  session.restoreQuarantinedAt ??= new Date().toISOString();
+  try {
+    sessionStore.updateSession(session);
+  } catch (err) {
+    logger.error(
+      `[${session.sessionId.substring(0, 8)}] Could not persist restore quarantine (${reason}): `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  // This row was intentionally never announced as a runtime DaemonSession.
+  // Upsert a dormant persisted projection so an already-open dashboard does not
+  // lose it merely because its exact backing teardown was inconclusive.
+  try {
+    dashboardEventBus.publish({
+      type: 'session.spawned',
+      body: { session: composeRowFromPersistedActive(session) },
+    });
+  } catch (err) {
+    // Visibility projection is best-effort; it must never turn one isolated
+    // teardown failure into a daemon restore failure for every later session.
+    logger.error(
+      `[${session.sessionId.substring(0, 8)}] Could not publish restore quarantine row: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
 function sameUsageLimit(a: DaemonSession['usageLimit'], b: DaemonSession['usageLimit']): boolean {
   if (!a && !b) return true;
   if (!a || !b) return false;
@@ -111,13 +139,43 @@ function sessionBotCliMismatch(ds: DaemonSession): { sessionCli: string; botCli:
   return null;
 }
 
-type CliMismatchCloseResult = 'not_mismatched' | 'closed' | 'teardown_failed';
+type CliMismatchCloseResult =
+  | 'not_mismatched'
+  | 'closed'
+  | 'teardown_failed'
+  | 'transfer_deferred';
+
+const cliMismatchResweepArmed = new WeakSet<DaemonSession>();
+
+function armCliMismatchResweep(ds: DaemonSession): void {
+  if (cliMismatchResweepArmed.has(ds)) return;
+  cliMismatchResweepArmed.add(ds);
+  const rerun = (): void => {
+    cliMismatchResweepArmed.delete(ds);
+    void closeCliMismatchedSessionsForBot(ds.larkAppId).catch((err) => {
+      logger.error(
+        `[${ds.session.sessionId.substring(0, 8)}] Deferred CLI mismatch resweep failed: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  };
+  if (!deferUntilSessionTransferSettled(ds, rerun)) {
+    // The gate settled between the caller's guard and registration.
+    queueMicrotask(rerun);
+  }
+}
 
 async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMismatchCloseResult> {
   const mismatch = sessionBotCliMismatch(ds);
   if (!mismatch) return 'not_mismatched';
 
   const tag = ds.session.sessionId.substring(0, 8);
+  if (isSessionTransferring(ds)) {
+    logger.warn(
+      `[${tag}] CLI mismatch close deferred until routing transfer settles`,
+    );
+    return 'transfer_deferred';
+  }
   const backendType = getSessionPersistentBackendType(ds);
   // 仅在没有活 worker 时预杀 backing pane：restore 守卫处 ds 尚未进 registry，
   // closeSession→killWorker 摸不到 pane，必须在这里亲手杀；而活 worker（运行时
@@ -166,8 +224,14 @@ export async function closeCliMismatchedSessionsForBot(larkAppId: string): Promi
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSessionTransferring(ds)) {
+      armCliMismatchResweep(ds);
+      continue;
+    }
     try {
-      if (await closeActiveSessionIfCliMismatch(ds) === 'closed') closed++;
+      const result = await closeActiveSessionIfCliMismatch(ds);
+      if (result === 'closed') closed++;
+      else if (result === 'transfer_deferred') armCliMismatchResweep(ds);
     } catch (err) {
       logger.error(
         `[${ds.session.sessionId.substring(0, 8)}] CLI mismatch close failed; continuing sweep: `
@@ -196,6 +260,12 @@ export async function suspendActiveSessionsForBot(larkAppId: string): Promise<nu
     if (ds.larkAppId !== larkAppId) continue;
     if (ds.session.queued) continue;
     if (ds.adoptedFrom || ds.session.adoptedFrom || ds.session.title?.startsWith('Adopt:')) continue;
+    if (isSessionTransferring(ds)) {
+      logger.warn(
+        `[${ds.session.sessionId.substring(0, 8)}] Read-isolation cold restart deferred during routing transfer`,
+      );
+      continue;
+    }
     // Prefer suspend (keeps the session; --resume continues context on the next
     // message). But suspendWorker no-ops for a NON-suspendable backend (explicit
     // PTY) — leaving the old unisolated process running would silently defeat the
@@ -1302,7 +1372,8 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
         continue;
       }
       if (validation === 'unknown') {
-        logger.warn(`Keeping adopt session ${session.sessionId} closed until next resume (target validation failed: ${adoptTargetLabel(adopted)})`);
+        logger.warn(`Keeping adopt session ${session.sessionId} active but quarantined until the target can be verified (target validation failed: ${adoptTargetLabel(adopted)})`);
+        quarantineUnregisteredRestoreSession(session, 'adopt_target_validation_unknown');
         continue;
       }
       // Original CLI still alive — re-register and fork adopt worker
@@ -1480,6 +1551,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
               `[${session.sessionId.substring(0, 8)}] Could not tear down unmaterialized deferred run; keeping active row: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
+            quarantineUnregisteredRestoreSession(session, 'deferred_run_teardown_unverified');
             continue;
           }
         }
@@ -1501,12 +1573,18 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
     try {
       const mismatchClose = await closeActiveSessionIfCliMismatch(ds);
-      if (mismatchClose !== 'not_mismatched') continue;
+      if (mismatchClose !== 'not_mismatched') {
+        if (mismatchClose === 'teardown_failed') {
+          quarantineUnregisteredRestoreSession(session, 'cli_mismatch_teardown_unverified');
+        }
+        continue;
+      }
     } catch (err) {
       logger.error(
         `[${session.sessionId.substring(0, 8)}] CLI mismatch close failed during restore; keeping active row: `
         + `${err instanceof Error ? err.message : String(err)}`,
       );
+      quarantineUnregisteredRestoreSession(session, 'cli_mismatch_close_failed');
       continue;
     }
     const anchor = sessionAnchorId(ds);
@@ -1532,6 +1610,7 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
           `[${session.sessionId.substring(0, 8)}] Could not close restore collision loser; keeping active row: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
+        quarantineUnregisteredRestoreSession(session, 'restore_collision_close_failed');
       }
       continue;
     }
@@ -2490,6 +2569,15 @@ export async function spawnDashboardSession(
   const anchor = chatId;
   const existing = activeSessions.get(sessionKey(anchor, larkAppId));
   if (existing && (existing.worker || existing.session.queued || isRelayableRealSession(existing))) {
+    return { ok: false, error: 'session_exists' };
+  }
+  const quarantinedPersisted = sessionStore.listSessions().find(session =>
+    session.status === 'active'
+    && !!session.restoreQuarantinedAt
+    && (session.larkAppId ?? larkAppId) === larkAppId
+    && storedSessionAnchorId(session) === anchor,
+  );
+  if (quarantinedPersisted) {
     return { ok: false, error: 'session_exists' };
   }
 

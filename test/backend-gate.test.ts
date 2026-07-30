@@ -78,12 +78,12 @@ describe('backendGateUserMessage', () => {
   });
 });
 
-describe('ZMX filesystem-isolation gate', () => {
+describe('persistent-backend filesystem-isolation gate', () => {
   it('formats an actionable startup error before failing closed', () => {
     const msg = backendSandboxCompatibilityUserMessage(
       'backend "zmx" does not support file/read isolation',
     );
-    expect(msg).toContain('ZMX');
+    expect(msg).toContain('backend "zmx"');
     expect(msg).toContain('拒绝启动');
     expect(msg).toContain('tmux');
     expect(msg).toContain('pty');
@@ -116,6 +116,34 @@ describe('ZMX filesystem-isolation gate', () => {
 });
 
 describe('persistent backend cold-restart ordering', () => {
+  it('retires an incompatible recorded Herdr agent before selecting, stamping, or spawning its replacement', () => {
+    const reuseDecision = workerSource.indexOf('const reuseRecordedHerdrTarget =');
+    const retirement = workerSource.indexOf(
+      'retireSupersededRecordedHerdrTarget({',
+      reuseDecision,
+    );
+    const selection = workerSource.indexOf(
+      'const selectBackend = () => selectSessionBackend({',
+      retirement,
+    );
+    const stamp = workerSource.indexOf(
+      'cfg.persistentBackendTarget = selectedBackend.persistentBackendTarget;',
+      selection,
+    );
+    const spawn = workerSource.indexOf('backend.spawn(', stamp);
+    const gate = workerSource.slice(reuseDecision, selection);
+
+    expect(reuseDecision).toBeGreaterThan(-1);
+    expect(retirement).toBeGreaterThan(reuseDecision);
+    expect(selection).toBeGreaterThan(retirement);
+    expect(stamp).toBeGreaterThan(selection);
+    expect(spawn).toBeGreaterThan(stamp);
+    expect(gate).toContain("effectiveBackend === 'herdr'");
+    expect(gate).toContain('persistentBackendTarget: cfg.persistentBackendTarget');
+    expect(gate).toContain('ownershipScope: isolationRuntimeDataDir');
+    expect(gate).toContain('reuseRecordedHerdrTarget');
+  });
+
   // The backend is selected once up-front and RE-selected through the
   // `selectBackend()` thunk after any gate kills a stale pane. The invariant is
   // no longer "select last" but "never keep a selection made against a pane that
@@ -243,7 +271,7 @@ describe('ZMX observer crash cleanup', () => {
 });
 
 describe('live-only observer screen rebase', () => {
-  it('registers the authoritative snapshot callback and refreshes idle/card state', () => {
+  it('renders authoritative history without driving startup keys from an uncertain viewport', () => {
     const handlerStart = workerSource.indexOf('function onBackendScreenResync(');
     const handlerEnd = workerSource.indexOf('function releaseRawInputRestartGate', handlerStart);
     const handler = workerSource.slice(handlerStart, handlerEnd);
@@ -251,12 +279,28 @@ describe('live-only observer screen rebase', () => {
 
     expect(handlerStart).toBeGreaterThan(-1);
     expect(registration).toBeGreaterThan(handlerStart);
+    expect(handler).toContain('const revision = ++backendScreenRevision');
+    expect(handler).toContain('const observedScreenBackend = backend');
     expect(handler).toContain('lastPtyActivityAtMs = now');
-    expect(handler).toContain('lastAnalyzerSnapshot = snapshot');
-    expect(handler).toContain('idleDetector.reset()');
-    expect(handler).toContain('idleDetector.feed(idleTail)');
+    expect(handler).toContain('await nextRenderer.writeAndFlush(snapshot)');
+    expect(handler).toContain('backendScreenRevision !== revision');
+    expect(handler).toContain('backend !== observedScreenBackend');
+    expect(handler).toContain('renderer !== nextRenderer');
+    expect(handler).toContain("const visibleSnapshot = nextRenderer?.rawSnapshot() ?? ''");
+    expect(handler).toContain('lastAnalyzerSnapshot = visibleSnapshot');
+    expect(handler).toContain('idleDetector?.reset()');
+    expect(handler).not.toContain('idleDetector.feed(');
     expect(handler).toContain('workflowTranscript = snapshot.slice');
-    expect(handler).toContain('handleVisibleStartupInteraction(snapshot)');
+    expect(handler).not.toContain('handleVisibleStartupInteraction(visibleSnapshot)');
+    expect(handler).not.toContain('handleVisibleStartupInteraction(snapshot)');
+    expect(handler).toContain('function scheduleBackendScreenResync(');
+    expect(handler).toContain('onBackendScreenResync(snapshot).catch');
+    expect(workerSource.slice(registration, registration + 400))
+      .toContain('scheduleBackendScreenResync(snapshot');
+    const seedStart = workerSource.indexOf('function seedBackendScreen(');
+    const seedEnd = workerSource.indexOf('function captureBackendScreen(', seedStart);
+    expect(workerSource.slice(seedStart, seedEnd))
+      .toContain('scheduleBackendScreenResync(initial, source)');
   });
 
   it('shares update and trust dialog handling with incremental PTY output', () => {
@@ -273,5 +317,31 @@ describe('live-only observer screen rebase', () => {
     expect(helper).toContain('TRUST_DIALOG_PATTERN.test(stripped)');
     expect(helper).toContain("sendSpecialKeys('Enter')");
     expect(ptyHandler).toContain('handleVisibleStartupInteraction(data)');
+  });
+
+  it('fails closed on ZMX screen-derived key automation when geometry is unknown', () => {
+    const stuckStart = workerSource.indexOf('function startStuckDetector(');
+    const stuckEnd = workerSource.indexOf('function stopStuckDetector(', stuckStart);
+    const pickerStart = workerSource.indexOf('async function driveCocoPicker(');
+    const pickerEnd = workerSource.indexOf('/** Synchronously read the latest', pickerStart);
+    const keyStart = workerSource.indexOf("case 'tui_keys':");
+    const keyEnd = workerSource.indexOf("case 'coco_drive_picker':", keyStart);
+    const busyStart = workerSource.indexOf('function probeBusyPatternIdle(');
+    const busyEnd = workerSource.indexOf('function scheduleBusyPatternIdleProbe(', busyStart);
+
+    expect(workerSource.slice(stuckStart, stuckEnd))
+      .toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false');
+    expect(workerSource.slice(pickerStart, pickerEnd))
+      .toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation())');
+    expect(workerSource.slice(pickerStart, pickerEnd))
+      .toContain("type: 'user_notify'");
+    expect(workerSource.slice(keyStart, keyEnd))
+      .toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation())');
+    expect(workerSource.slice(keyStart, keyEnd))
+      .toContain("type: 'stuck_warning_expired'");
+    expect(workerSource.slice(busyStart, busyEnd))
+      .toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation())');
+    expect(workerSource).toContain('function classifyScreenUsageLimit(');
+    expect(workerSource).toContain('...classifyScreenUsageLimit(usageLimitContent, status)');
   });
 });
