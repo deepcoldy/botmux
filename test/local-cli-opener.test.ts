@@ -161,20 +161,32 @@ describe('local-cli-opener', () => {
     });
   });
 
-  it('attach mode opens a managed ZMX session with an existing-only guard', () => {
+  it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {
     vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
     vi.stubEnv('ZMX_SESSION', 'outer');
     const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
     const result = buildLocalCliOpenCommand(ds({
-      session: { ...ds().session, sessionId: 'abcdef123456', backendType: 'zmx', cliSessionId: undefined },
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'zmx',
+        persistentBackendTarget: {
+          backendType: 'zmx',
+          sessionName: 'managed-zmx-target',
+        },
+        cliSessionId: undefined,
+      },
     }), { mode: 'attach', adapterFactory });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.command).toContain('unset ZMX_SESSION ZMX_SESSION_PREFIX');
       expect(result.command).toContain("export ZMX_DIR='/tmp/zmx socket'");
-      expect(result.command).toContain("grep -Fqx -- 'bmx-abcdef12'");
-      expect(result.command).toContain("exec zmx attach 'bmx-abcdef12' /bin/sh -c 'exit 75'");
+      expect(result.command).toContain('/dist/cli.js');
+      expect(result.command).toContain("__zmx-attach-managed 'managed-zmx-target' 'abcdef123456'");
+      expect(result.command).not.toContain('bmx-abcdef12');
+      expect(result.command).not.toContain('grep ');
+      expect(result.command).not.toContain('exec zmx attach');
     }
     expect(adapterFactory).not.toHaveBeenCalled();
     vi.unstubAllEnvs();

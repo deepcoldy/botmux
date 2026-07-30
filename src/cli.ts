@@ -38,7 +38,6 @@ import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
-import { zmxEnv } from './setup/ensure-zmx.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import {
   applyBotConfigEdits,
@@ -77,13 +76,17 @@ import {
 import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interactive-select.js';
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import type { CliId } from './adapters/cli/types.js';
-import type { BackendType, SessionProbe } from './adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from './adapters/backend/types.js';
 import { logger } from './utils/logger.js';
 import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional } from './cli/arg-utils.js';
 import { isColdResumeDormant, sessionListDisposition } from './cli/session-list-liveness.js';
+import {
+  attachFrozenManagedZmxSession,
+  freezeManagedZmxAttachTarget,
+} from './cli/zmx-managed-attach.js';
 import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateVideoAttachments } from './cli/send-dispatch.js';
 import { dispatchDeferredTopicSend, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -171,10 +174,10 @@ import {
 } from './core/bot-live-control.js';
 import {
   isSuspendableBackendType,
-  killPersistentSession,
-  persistentSessionName,
-  probePersistentSession,
+  killPersistentBackendTarget,
+  probePersistentBackendTarget,
   probePersistentSessions,
+  resolvePersistentBackendTarget,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 
@@ -3198,6 +3201,9 @@ interface SessionData {
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
   backendType?: BackendType;
+  /** Exact persistent host/agent selected by the worker. In particular, Herdr
+   * may own one agent inside a shared host session rather than the host itself. */
+  persistentBackendTarget?: PersistentBackendTarget;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
@@ -3530,8 +3536,12 @@ function closeSessionOffline(s: SessionData): void {
   // and still need direct cleanup when no daemon exists to run killWorker().
   if (!isAdoptedSession(s)) {
     if (isSuspendableBackendType(s.backendType)) {
-      const name = persistentSessionName(s.backendType, s.sessionId);
-      try { killPersistentSession(s.backendType, name, s.sessionId); } catch { /* absent or unavailable */ }
+      const target = resolvePersistentBackendTarget(
+        s.backendType,
+        s.sessionId,
+        s.persistentBackendTarget,
+      );
+      try { killPersistentBackendTarget(target, s.sessionId); } catch { /* absent or unavailable */ }
     } else {
       // Legacy rows without backendType were historically tmux-backed.
       const tmuxName = `bmx-${s.sessionId.substring(0, 8)}`;
@@ -3638,13 +3648,46 @@ function sessionStatusLabel(s: SessionData): string {
 
 type BackingProbeSnapshot = ReadonlyMap<string, SessionProbe>;
 
-function backingProbeKey(backendType: PersistentBackendType, name: string): string {
-  return `${backendType}\0${name}`;
+function backingProbeKey(target: PersistentBackendTarget): string {
+  const agentName = target.backendType === 'herdr' ? target.agentName ?? '' : '';
+  return `${target.backendType}\0${target.sessionName}\0${agentName}`;
+}
+
+function sessionPersistentTarget(s: SessionData): PersistentBackendTarget | undefined {
+  if (isSuspendableBackendType(s.backendType)) {
+    return resolvePersistentBackendTarget(
+      s.backendType,
+      s.sessionId,
+      s.persistentBackendTarget,
+    );
+  }
+  if (s.backendType === undefined) {
+    // Legacy rows predate backend stamping. Only tmux was externally
+    // attachable, and its deterministic target remains the compatibility path.
+    return {
+      backendType: 'tmux',
+      sessionName: `bmx-${s.sessionId.substring(0, 8)}`,
+    };
+  }
+  return undefined;
+}
+
+function persistentTargetDisplay(target: PersistentBackendTarget): string {
+  return target.backendType === 'herdr' && target.agentName
+    ? `${target.sessionName}/${target.agentName}`
+    : target.sessionName;
 }
 
 function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingProbeSnapshot {
   const namesByBackend = new Map<PersistentBackendType, Set<string>>();
-  const add = (backendType: PersistentBackendType, name: string) => {
+  const directTargets = new Map<string, PersistentBackendTarget>();
+  const add = (target: PersistentBackendTarget) => {
+    if (target.backendType === 'herdr' && target.agentName) {
+      directTargets.set(backingProbeKey(target), target);
+      return;
+    }
+    const backendType = target.backendType;
+    const name = target.sessionName;
     const names = namesByBackend.get(backendType) ?? new Set<string>();
     names.add(name);
     namesByBackend.set(backendType, names);
@@ -3652,19 +3695,19 @@ function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingPro
 
   for (const session of sessions) {
     if (isAdoptedSession(session) || session.backendType === 'pty') continue;
-    if (isSuspendableBackendType(session.backendType)) {
-      add(session.backendType, persistentSessionName(session.backendType, session.sessionId));
-    } else {
-      // Rows created before backend stamping used tmux as their only
-      // externally attachable backing session.
-      add('tmux', `bmx-${session.sessionId.substring(0, 8)}`);
-    }
+    const target = sessionPersistentTarget(session);
+    if (target) add(target);
   }
 
   const snapshot = new Map<string, SessionProbe>();
+  // Agent-scoped Herdr targets cannot be collapsed into a host-session probe:
+  // the shared host may be healthy after this exact Botmux agent exited.
+  for (const [key, target] of directTargets) {
+    snapshot.set(key, probePersistentBackendTarget(target));
+  }
   for (const [backendType, names] of namesByBackend) {
     for (const [name, probe] of probePersistentSessions(backendType, names)) {
-      snapshot.set(backingProbeKey(backendType, name), probe);
+      snapshot.set(backingProbeKey({ backendType, sessionName: name } as PersistentBackendTarget), probe);
     }
   }
   return snapshot;
@@ -3672,29 +3715,28 @@ function buildBackingProbeSnapshot(sessions: readonly SessionData[]): BackingPro
 
 function backingProbe(
   snapshot: BackingProbeSnapshot | undefined,
-  backendType: PersistentBackendType,
-  name: string,
+  target: PersistentBackendTarget,
 ): SessionProbe {
-  return snapshot?.get(backingProbeKey(backendType, name))
-    ?? probePersistentSession(backendType, name);
+  return snapshot?.get(backingProbeKey(target))
+    ?? probePersistentBackendTarget(target);
 }
 
 function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   backendType?: BackendType;
-  name?: string;
+  target?: PersistentBackendTarget;
   probe: 'exists' | 'missing' | 'unknown';
   label: string;
   attachBackend?: 'tmux' | 'zmx';
 } {
   if (isSuspendableBackendType(s.backendType)) {
-    const name = persistentSessionName(s.backendType, s.sessionId);
-    const probe = backingProbe(snapshot, s.backendType, name);
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
     const suffix = probe === 'exists' ? '' : ` (${probe})`;
     return {
       backendType: s.backendType,
-      name,
+      target,
       probe,
-      label: `${s.backendType}: ${name}${suffix}`,
+      label: `${s.backendType}: ${persistentTargetDisplay(target)}${suffix}`,
       attachBackend: s.backendType === 'tmux' || s.backendType === 'zmx'
         ? s.backendType
         : undefined,
@@ -3704,13 +3746,13 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
     return { backendType: 'pty', probe: 'missing', label: 'pty' };
   }
   // Legacy rows predate backend stamping. Only tmux was externally attachable.
-  const name = `bmx-${s.sessionId.substring(0, 8)}`;
-  const probe = backingProbe(snapshot, 'tmux', name);
+  const target = sessionPersistentTarget(s)!;
+  const probe = backingProbe(snapshot, target);
   return {
     backendType: 'tmux',
-    name,
+    target,
     probe,
-    label: probe === 'exists' ? `tmux: ${name}` : '-',
+    label: probe === 'exists' ? `tmux: ${target.sessionName}` : '-',
     attachBackend: 'tmux',
   };
 }
@@ -3728,12 +3770,13 @@ function hasRecoverableBackingSession(s: SessionData, snapshot?: BackingProbeSna
     // distinguish a host reboot from an individual CLI exit, so keep the
     // transcript-backed row for lazy resume instead of auto-pruning it.
     if (s.backendType === 'zmx') return true;
-    const name = persistentSessionName(s.backendType, s.sessionId);
-    const probe = backingProbe(snapshot, s.backendType, name);
+    const target = sessionPersistentTarget(s)!;
+    const probe = backingProbe(snapshot, target);
     return probe === 'exists' || probe === 'unknown';
   }
   // Legacy sessions created before backendType stamping only had tmux recovery.
-  return backingProbe(snapshot, 'tmux', `bmx-${s.sessionId.substring(0, 8)}`) === 'exists';
+  const target = sessionPersistentTarget(s);
+  return !!target && backingProbe(snapshot, target) === 'exists';
 }
 
 /** Shorten path for display: replace $HOME with ~. */
@@ -3780,7 +3823,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     session: SessionData;
     text: string;
     alive: boolean;
-    backendName?: string;
+    backendTarget?: PersistentBackendTarget;
     backingProbe: 'exists' | 'missing' | 'unknown';
     attachBackend?: 'tmux' | 'zmx';
     isAdopt: boolean;
@@ -3814,12 +3857,15 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
         session: s,
         text: parts.join(' │ '),
         alive,
-        backendName: 'name' in backing ? backing.name : undefined,
+        backendTarget: 'target' in backing ? backing.target : undefined,
         backingProbe: backing.probe,
         attachBackend: 'attachBackend' in backing ? backing.attachBackend : undefined,
         isAdopt,
         targetLabel,
-        canAttach: !isAdopt && backing.probe === 'exists' && !!('attachBackend' in backing && backing.attachBackend),
+        canAttach: !isAdopt
+          && backing.probe === 'exists'
+          && !!('attachBackend' in backing && backing.attachBackend)
+          && !!('target' in backing && backing.target),
       };
     });
   }
@@ -3882,7 +3928,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     const targetHint = selected.isAdopt
       ? `\x1b[33m${selected.targetLabel}\x1b[0m  \x1b[2mEnter 已禁用；请直接使用原 tmux/zellij/herdr 客户端。\x1b[0m`
       : selected.canAttach
-        ? `\x1b[32m${selected.attachBackend}: ${selected.backendName}\x1b[0m`
+        ? `\x1b[32m${selected.attachBackend}: ${selected.backendTarget?.sessionName}\x1b[0m`
         : `\x1b[2m${selected.targetLabel}（不可连接）\x1b[0m`;
     process.stdout.write(`\n  ${targetHint}\n`);
 
@@ -4004,18 +4050,42 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
           render();
           return;
         }
-        cleanup();
         if (selected.attachBackend === 'zmx') {
-          // The sentinel is ignored by an existing session. If it disappears
-          // between probe and attach, it exits immediately instead of leaving
-          // an accidental login shell behind.
-          spawnSync('zmx', ['attach', selected.backendName!, '/bin/sh', '-c', 'exit 75'], {
-            stdio: 'inherit',
-            env: zmxEnv(),
-          });
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'zmx') {
+            flashMsg = '\x1b[31mZMX attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          // First prove both complete Botmux labels while the picker is still
+          // active, then freeze the PTY root generation across terminal
+          // cleanup and re-prove it immediately before attach.
+          const frozen = freezeManagedZmxAttachTarget(
+            target.sessionName,
+            selected.session.sessionId,
+          );
+          if (!frozen.ok) {
+            flashMsg = `\x1b[31m${frozen.message}\x1b[0m`;
+            render();
+            return;
+          }
+          cleanup();
+          const attached = attachFrozenManagedZmxSession(
+            target.sessionName,
+            selected.session.sessionId,
+            frozen.pid,
+          );
+          if (!attached.ok) console.error(attached.message);
         } else {
-          applyTmuxWindowSizeLargest(selected.backendName!);
-          spawnSync('tmux', ['attach-session', '-t', `=${selected.backendName!}`], {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'tmux') {
+            flashMsg = '\x1b[31mtmux attach target is missing or inconsistent\x1b[0m';
+            render();
+            return;
+          }
+          cleanup();
+          applyTmuxWindowSizeLargest(target.sessionName);
+          spawnSync('tmux', ['attach-session', '-t', `=${target.sessionName}`], {
             stdio: 'inherit',
             env: tmuxEnv(),
           });
@@ -4025,6 +4095,32 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
       }
     });
   });
+}
+
+/**
+ * Internal host-only bridge used by Dashboard "Open CLI" commands. The
+ * generated terminal shell executes this exact checkout's cli.js, keeping all
+ * ZMX ownership checks in TypeScript instead of approximating them with
+ * name-only shell pipelines.
+ */
+function cmdManagedZmxAttach(args: string[]): void {
+  const [name, sessionId, ...extra] = args;
+  if (!name?.trim() || !sessionId?.trim() || extra.length > 0) {
+    console.error('internal usage: __zmx-attach-managed <session-name> <complete-session-id>');
+    process.exitCode = 2;
+    return;
+  }
+  const frozen = freezeManagedZmxAttachTarget(name, sessionId);
+  if (!frozen.ok) {
+    console.error(frozen.message);
+    process.exitCode = 1;
+    return;
+  }
+  const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid);
+  if (!attached.ok) {
+    console.error(attached.message);
+    process.exitCode = 1;
+  }
 }
 
 async function cmdList(): Promise<void> {
@@ -10481,6 +10577,7 @@ switch (command) {
   }
   case 'list':
   case 'ls':      await cmdList(); break;
+  case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
   case 'delete':
   case 'del':
   case 'rm':      await cmdDelete(); break;
