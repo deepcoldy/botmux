@@ -30,6 +30,7 @@ export type BotSubstituteMode = {
   targets: BotSubstituteTarget[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
+  excludedChats?: string[];
   replyMode?: 'thread' | 'quote';
   disableControlCard?: boolean;
   /** 话题群支持（缺省 true；显式 false 关）。 */
