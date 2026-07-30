@@ -98,8 +98,20 @@ describe('dashboard sessions filters', () => {
     expect(page).toContain("t('sessions.preview.latestExchange')");
     expect(page).toContain("t('sessions.history.user')");
     expect(page).toContain("t('sessions.history.bot')");
+    expect(page).toContain('className="session-card-exchange-tooltip"');
+    expect(page).toContain('role="tooltip"');
+    expect(page).toContain('aria-describedby={open ? tooltipId : undefined}');
+    expect(page).toContain('onPointerEnter={event => {');
+    expect(page).toContain("if (event.key === 'Escape') hide();");
+    expect(page).toContain('<p>{exchange.userFullText}</p>');
+    expect(page).toContain('<p>{exchange.botFullText}</p>');
     expect(css).toContain('.session-card-exchange-line > p');
     expect(css).toContain('-webkit-line-clamp: 2');
+    expect(css).toContain('.session-card-exchange-tooltip {');
+    expect(css).toContain('position: fixed;');
+    expect(css).toContain('.session-card-exchange-tooltip-scroll {');
+    expect(css).toContain('.session-card-exchange-tooltip-line > p');
+    expect(css).toContain('user-select: text;');
   });
 
   it('wires @ completion and pasted-image previews into the create-session composer', () => {

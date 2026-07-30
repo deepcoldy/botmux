@@ -2,6 +2,7 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -999,6 +1000,145 @@ function SessionsTable(props: {
   );
 }
 
+type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
+
+function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): JSX.Element | null {
+  const { exchange } = props;
+  const triggerRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const hideTimerRef = useRef<number | null>(null);
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState<{
+    left: number;
+    placement: 'top' | 'bottom';
+    top: number;
+  } | null>(null);
+  const tooltipId = `session-exchange-tooltip-${useId().replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+
+  const clearHide = useCallback(() => {
+    if (hideTimerRef.current === null) return;
+    window.clearTimeout(hideTimerRef.current);
+    hideTimerRef.current = null;
+  }, []);
+  const show = useCallback(() => {
+    clearHide();
+    setOpen(true);
+  }, [clearHide]);
+  const hide = useCallback(() => {
+    clearHide();
+    setOpen(false);
+    setPosition(null);
+  }, [clearHide]);
+  const scheduleHide = useCallback(() => {
+    clearHide();
+    hideTimerRef.current = window.setTimeout(hide, 120);
+  }, [clearHide, hide]);
+  const updatePosition = useCallback(() => {
+    const trigger = triggerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!trigger || !tooltip) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+    const margin = 12;
+    const gap = 9;
+    const roomAbove = triggerRect.top - margin - gap;
+    const roomBelow = window.innerHeight - triggerRect.bottom - margin - gap;
+    const placement = roomAbove >= tooltipRect.height || roomAbove > roomBelow ? 'top' : 'bottom';
+    const desiredLeft = triggerRect.left + triggerRect.width / 2 - tooltipRect.width / 2;
+    const left = Math.min(
+      Math.max(desiredLeft, margin),
+      Math.max(margin, window.innerWidth - tooltipRect.width - margin),
+    );
+    const desiredTop = placement === 'top'
+      ? triggerRect.top - tooltipRect.height - gap
+      : triggerRect.bottom + gap;
+    const top = Math.min(
+      Math.max(desiredTop, margin),
+      Math.max(margin, window.innerHeight - tooltipRect.height - margin),
+    );
+    setPosition({ left, placement, top });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updatePosition();
+    window.addEventListener('resize', updatePosition);
+    window.addEventListener('scroll', updatePosition, true);
+    return () => {
+      window.removeEventListener('resize', updatePosition);
+      window.removeEventListener('scroll', updatePosition, true);
+    };
+  }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
+  useEffect(() => () => clearHide(), [clearHide]);
+
+  if (!exchange.userText && !exchange.botText) return null;
+  return (
+    <>
+      <div
+        ref={triggerRef}
+        className="session-card-exchange"
+        tabIndex={0}
+        aria-label={t('sessions.preview.latestExchange')}
+        aria-describedby={open ? tooltipId : undefined}
+        onPointerEnter={event => {
+          if (event.pointerType !== 'touch') show();
+        }}
+        onPointerLeave={scheduleHide}
+        onFocus={show}
+        onBlur={scheduleHide}
+        onKeyDown={event => {
+          if (event.key === 'Escape') hide();
+        }}
+      >
+        {exchange.userText ? (
+          <div className="session-card-exchange-line">
+            <span>{t('sessions.history.user')}</span>
+            <p>{exchange.userText}</p>
+          </div>
+        ) : null}
+        {exchange.botText ? (
+          <div className="session-card-exchange-line bot">
+            <span>{t('sessions.history.bot')}</span>
+            <p>{exchange.botText}</p>
+          </div>
+        ) : null}
+      </div>
+      {open && typeof document !== 'undefined' ? createPortal(
+        <div
+          ref={tooltipRef}
+          id={tooltipId}
+          className="session-card-exchange-tooltip"
+          role="tooltip"
+          data-placement={position?.placement ?? 'top'}
+          style={{
+            left: position?.left ?? -10_000,
+            top: position?.top ?? -10_000,
+            visibility: position ? 'visible' : 'hidden',
+          }}
+          onPointerEnter={clearHide}
+          onPointerLeave={scheduleHide}
+        >
+          <div className="session-card-exchange-tooltip-scroll">
+            {exchange.userFullText ? (
+              <div className="session-card-exchange-tooltip-line">
+                <span>{t('sessions.history.user')}</span>
+                <p>{exchange.userFullText}</p>
+              </div>
+            ) : null}
+            {exchange.botFullText ? (
+              <div className="session-card-exchange-tooltip-line bot">
+                <span>{t('sessions.history.bot')}</span>
+                <p>{exchange.botFullText}</p>
+              </div>
+            ) : null}
+          </div>
+        </div>,
+        document.body,
+      ) : null}
+    </>
+  );
+}
+
 function BoardCard(props: {
   row: any;
   selected: boolean;
@@ -1048,22 +1188,7 @@ function BoardCard(props: {
           {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
         </div>
       ) : null}
-      {exchange.userText || exchange.botText ? (
-        <div className="session-card-exchange" aria-label={t('sessions.preview.latestExchange')}>
-          {exchange.userText ? (
-            <div className="session-card-exchange-line">
-              <span>{t('sessions.history.user')}</span>
-              <p title={exchange.userFullText}>{exchange.userText}</p>
-            </div>
-          ) : null}
-          {exchange.botText ? (
-            <div className="session-card-exchange-line bot">
-              <span>{t('sessions.history.bot')}</span>
-              <p title={exchange.botFullText}>{exchange.botText}</p>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
+      <SessionExchangePreview exchange={exchange} />
       <div className="session-card-time">
         <span>{row.agentAttention?.at
           ? `${t('sessions.board.waiting')} ${relTime(attentionWaitSince(row))}`

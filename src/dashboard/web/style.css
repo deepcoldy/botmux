@@ -2718,6 +2718,17 @@ button.primary {
   background: color-mix(in srgb, var(--surface) 78%, transparent);
 }
 
+.session-card-exchange:hover,
+.session-card-exchange:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+.session-card-exchange:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  outline-offset: 2px;
+}
+
 .session-card-exchange-line {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -2750,6 +2761,67 @@ button.primary {
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.session-card-exchange-tooltip {
+  position: fixed;
+  z-index: 10020;
+  display: grid;
+  gap: 10px;
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(420px, calc(100vh - 24px));
+  padding: 12px 13px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  color: var(--fg);
+  box-shadow: 0 16px 44px rgba(3, 7, 18, 0.34);
+  cursor: text;
+  overscroll-behavior: contain;
+}
+
+.session-card-exchange-tooltip-scroll {
+  display: grid;
+  gap: 10px;
+  max-height: min(394px, calc(100vh - 50px));
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.session-card-exchange-tooltip-line {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+
+.session-card-exchange-tooltip-line + .session-card-exchange-tooltip-line {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.session-card-exchange-tooltip-line > span {
+  padding-top: 2px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.session-card-exchange-tooltip-line.bot > span {
+  color: var(--accent);
+}
+
+.session-card-exchange-tooltip-line > p {
+  min-width: 0;
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .session-card-time {
