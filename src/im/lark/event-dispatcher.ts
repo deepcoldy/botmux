@@ -1127,11 +1127,15 @@ export function resolveSubstituteTrigger(
   return undefined;
 }
 
+function isSubstituteExcludedChat(cfg: { excludedChats?: string[] } | undefined, chatId: string): boolean {
+  return cfg?.excludedChats?.includes(chatId) ?? false;
+}
+
 function isSubstituteAllowedChat(cfg: { chats?: string[]; excludedChats?: string[] } | undefined, chatId: string): boolean {
   // 黑名单先判且 deny-wins：命中即整段替身触发块短路（连带跳过其后的运行态
   // 开关 isSubstituteEnabledForChat），因此配置黑名单 = 硬关闭，/substitute on
   // 也翻不回来。对普通群与话题群一视同仁，与白名单同层。
-  if (cfg?.excludedChats?.includes(chatId)) return false;
+  if (isSubstituteExcludedChat(cfg, chatId)) return false;
   if (!cfg?.chats?.length) return true;
   return cfg.chats.includes(chatId);
 }
@@ -2587,6 +2591,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (modeSupported && isSubstituteEnabledForChat(larkAppId, chatId)) {
           substituteChatMode = chatMode as 'group' | 'topic';
         }
+      }
+      // 黑名单硬静默：命中黑名单的群里，一条「本该触发替身」的消息（@ 到了配置的
+      // 替身对象、但没有直接 @ 本 bot）必须当作没读到——直接 return，不只是清 trigger。
+      // 只清 trigger 不够：消息会继续 fall-through 到通用群消息门，若 bot 在该群有活跃
+      // 会话 / 是 solo 群 / mentionMode 放开，仍会被喂进去并弹卡片（用户实测现象）。
+      // 直接 @ 本 bot（explicitlyMentionedThisBot）不受影响：黑名单只静音替身代答，
+      // 不静音「直接找 bot 问问题」。/substitute 命令已在上方 command 处理器拦截。
+      if (substituteCfg?.enabled === true
+          && chatType === 'group'
+          && !explicitlyMentionedThisBot
+          && isSubstituteExcludedChat(substituteCfg, chatId)
+          && resolveSubstituteTrigger(larkAppId, message)) {
+        logger.info(
+          `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
+          `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+        );
+        return;
       }
       let substituteTrigger = substituteChatMode
         ? resolveSubstituteTrigger(larkAppId, message)

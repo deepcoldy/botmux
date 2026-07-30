@@ -3381,6 +3381,38 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
+  it('substituteMode: excludedChats drops the @target message entirely even when the bot owns a session (no card)', async () => {
+    // Regression: the live bug. Clearing substituteTrigger alone is not enough —
+    // in a solo group (1 user + 1 bot) the owned-session relax clause fires, so
+    // the @target message would fall through to the bot and spawn a card. The
+    // blocklist must drop it entirely (early return), as if never read.
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        excludedChats: ['chat-blocked'],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 }); // solo group → owned-session relax would fire
+    handlers.isSessionOwner.mockReturnValue(true); // bot owns a session here — the live-bug condition
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-blocked-owned',
+      chatId: 'chat-blocked',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('substituteMode: direct @bot still answers in a blocklisted chat (R5)', async () => {
     // The blocklist only suppresses the substitute trigger. A direct @bot
     // mention routes and answers normally — no substituteTrigger rides.
@@ -3402,6 +3434,41 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       chatId: 'chat-blocked',
       chatType: 'group',
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      substituteTrigger: undefined,
+    }));
+  });
+
+  it('substituteMode: direct @bot in a blocklisted chat answers even when @-ing a substitute target too', async () => {
+    // A message that @s BOTH the bot and a substitute target in a blocklisted
+    // chat is a direct address to the bot — it must NOT be dropped by the
+    // blocklist early-return (that return is gated on !explicitlyMentionedThisBot).
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        excludedChats: ['chat-blocked'],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA @Sub Person help' }),
+      messageId: 'msg-substitute-blocked-both-at',
+      chatId: 'chat-blocked',
+      chatType: 'group',
+      mentions: [
+        { key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } },
+        { key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } },
+      ],
     });
 
     await capturedHandlers['im.message.receive_v1'](event);
