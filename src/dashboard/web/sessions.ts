@@ -18,6 +18,42 @@ export function formatTokenCount(value: unknown): string {
   return n === null ? '-' : n.toLocaleString('en-US');
 }
 
+export interface SessionExchangePreview {
+  userText: string;
+  userFullText: string;
+  botText: string;
+  botFullText: string;
+}
+
+function compactPreviewText(value: unknown, limit: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Latest user/bot exchange for a session card. A bot preview is shown only
+ * when it is newer than the latest user input; otherwise the card communicates
+ * the still-waiting state with the user line alone. */
+export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
+  const userFullText = compactPreviewText(
+    row.previewUserFullText
+      ?? row.previewUserText
+      ?? row.lastUserPrompt
+      ?? row.currentTurnTitle
+      ?? '',
+    4_000,
+  );
+  const botFullText = row.previewBotState === 'replied'
+    ? compactPreviewText(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    : '';
+  return {
+    userText: compactPreviewText(userFullText, 120),
+    userFullText,
+    botText: compactPreviewText(botFullText, 220),
+    botFullText,
+  };
+}
+
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
 // 不再手抄一份（手抄版曾漏 antigravity/traex/mir/kimi/genius）。
 // 'unknown' 兜底：没有 cliId 的会话在 filtered() 里按 'unknown' 归类。

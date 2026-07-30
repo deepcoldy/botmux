@@ -11,6 +11,7 @@ import {
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
+  sessionExchangePreview,
   sessionTopicKey,
   shouldOpenWritableTerminal,
 } from '../src/dashboard/web/sessions.js';
@@ -65,6 +66,42 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('shows only a current bot reply in the latest exchange preview', () => {
+    expect(sessionExchangePreview({
+      previewUserFullText: 'latest question',
+      previewBotFullText: 'latest answer',
+      previewBotState: 'replied',
+    })).toEqual({
+      userText: 'latest question',
+      userFullText: 'latest question',
+      botText: 'latest answer',
+      botFullText: 'latest answer',
+    });
+
+    expect(sessionExchangePreview({
+      previewUserText: 'follow-up',
+      previewBotText: 'stale answer',
+      previewBotState: 'waiting',
+    })).toEqual({
+      userText: 'follow-up',
+      userFullText: 'follow-up',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('renders accessible user and bot preview lines on session cards', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="session-card-exchange"');
+    expect(page).toContain("t('sessions.preview.latestExchange')");
+    expect(page).toContain("t('sessions.history.user')");
+    expect(page).toContain("t('sessions.history.bot')");
+    expect(css).toContain('.session-card-exchange-line > p');
+    expect(css).toContain('-webkit-line-clamp: 2');
+  });
+
   it('wires @ completion and pasted-image previews into the create-session composer', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
 

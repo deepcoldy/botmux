@@ -3130,6 +3130,7 @@ function setupWorkerHandlers(
         // upstream debouncer — by the time we get here, status flips are
         // already coarse-grained.
         if (prevStatus !== ds.lastScreenStatus) {
+          const dashboardRow = composeRowFromActive(ds);
           dashboardEventBus.publish({
             type: 'session.update',
             body: {
@@ -3137,7 +3138,14 @@ function setupWorkerHandlers(
               patch: {
                 status: ds.lastScreenStatus,
                 lastMessageAt: ds.lastMessageAt,
-                tokenUsage: composeRowFromActive(ds).tokenUsage,
+                tokenUsage: dashboardRow.tokenUsage,
+                previewUserText: dashboardRow.previewUserText,
+                previewBotText: dashboardRow.previewBotText,
+                previewUserFullText: dashboardRow.previewUserFullText,
+                previewBotFullText: dashboardRow.previewBotFullText,
+                previewUserAt: dashboardRow.previewUserAt,
+                previewBotAt: dashboardRow.previewBotAt,
+                previewBotState: dashboardRow.previewBotState,
               },
             },
           });

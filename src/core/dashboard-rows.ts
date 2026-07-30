@@ -13,8 +13,12 @@ import { getBotBrand } from '../bot-registry.js';
 import { type Brand, chatAppLink } from '../im/lark/lark-hosts.js';
 import { getSessionTokenUsage, type SessionTokenUsage } from './cost-calculator.js';
 import { getIdentity } from '../im/lark/identity-cache.js';
+import {
+  buildSessionMessagePreview,
+  type SessionMessagePreview,
+} from './session-message-preview.js';
 
-export interface SessionRow {
+export interface SessionRow extends SessionMessagePreview {
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -186,6 +190,7 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...buildSessionMessagePreview(ds.session),
   };
 }
 
@@ -215,5 +220,6 @@ export function composeRowFromClosed(s: Session): SessionRow {
     webPort: s.webPort ?? null,
     feishuChatLink: feishuChatLink(s.chatId, getBotBrand(s.larkAppId ?? '')),
     tokenUsage: sessionTokenUsage(s),
+    ...buildSessionMessagePreview(s),
   };
 }

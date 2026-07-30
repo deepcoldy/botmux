@@ -71,7 +71,18 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
  * for their shared session row shape. */
 export function redactSessionForPublic(session: unknown): unknown {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return session;
-  const { gitBranch: _gitBranch, riffAccessUrl: _riffAccessUrl, ...rest } = session as Record<string, unknown>;
+  const {
+    gitBranch: _gitBranch,
+    riffAccessUrl: _riffAccessUrl,
+    previewUserText: _previewUserText,
+    previewBotText: _previewBotText,
+    previewUserFullText: _previewUserFullText,
+    previewBotFullText: _previewBotFullText,
+    previewUserAt: _previewUserAt,
+    previewBotAt: _previewBotAt,
+    previewBotState: _previewBotState,
+    ...rest
+  } = session as Record<string, unknown>;
   return rest;
 }
 
@@ -93,7 +104,18 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
     && typeof eventBody.patch === 'object'
     && !Array.isArray(eventBody.patch)
   ) {
-    const { gitBranch: _gitBranch, riffAccessUrl: _riffAccessUrl, ...patch } = eventBody.patch as Record<string, unknown>;
+    const {
+      gitBranch: _gitBranch,
+      riffAccessUrl: _riffAccessUrl,
+      previewUserText: _previewUserText,
+      previewBotText: _previewBotText,
+      previewUserFullText: _previewUserFullText,
+      previewBotFullText: _previewBotFullText,
+      previewUserAt: _previewUserAt,
+      previewBotAt: _previewBotAt,
+      previewBotState: _previewBotState,
+      ...patch
+    } = eventBody.patch as Record<string, unknown>;
     return { ...eventBody, patch };
   }
   return body;

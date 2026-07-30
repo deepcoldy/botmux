@@ -142,6 +142,13 @@ describe('session presentation redaction', () => {
     repoName: 'customer-a',
     gitBranch: 'issue/CUSTOMER-123',
     botAvatarUrl: 'https://img.example/bot.png',
+    previewUserText: 'private question',
+    previewBotText: 'private answer',
+    previewUserFullText: 'private question in full',
+    previewBotFullText: 'private answer in full',
+    previewUserAt: 100,
+    previewBotAt: 200,
+    previewBotState: 'replied',
   };
 
   it('strips branch names from anonymous REST rows without mutating authenticated data', () => {
@@ -153,6 +160,13 @@ describe('session presentation redaction', () => {
       botAvatarUrl: 'https://img.example/bot.png',
     });
     expect(out[0]).not.toHaveProperty('gitBranch');
+    expect(out[0]).not.toHaveProperty('previewUserText');
+    expect(out[0]).not.toHaveProperty('previewBotText');
+    expect(out[0]).not.toHaveProperty('previewUserFullText');
+    expect(out[0]).not.toHaveProperty('previewBotFullText');
+    expect(out[0]).not.toHaveProperty('previewUserAt');
+    expect(out[0]).not.toHaveProperty('previewBotAt');
+    expect(out[0]).not.toHaveProperty('previewBotState');
     expect(session.gitBranch).toBe('issue/CUSTOMER-123');
   });
 
@@ -162,7 +176,13 @@ describe('session presentation redaction', () => {
 
     const updateBody = {
       sessionId: 's1',
-      patch: { gitBranch: 'issue/CUSTOMER-456', repoName: 'customer-a' },
+      patch: {
+        gitBranch: 'issue/CUSTOMER-456',
+        repoName: 'customer-a',
+        previewUserText: 'private question',
+        previewBotText: 'private answer',
+        previewBotState: 'replied',
+      },
     };
     const updated = redactSessionEventForPublic('session.update', updateBody) as any;
     expect(updated.patch).toEqual({ repoName: 'customer-a' });

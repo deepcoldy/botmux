@@ -331,6 +331,7 @@ import {
   announcePendingRepoSession,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
+  publishSessionMessagePreviewPatch,
   clearAgentAttention,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -16375,6 +16376,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
   // Route to file queue (keyed by anchor: rootMessageId for thread, chatId for chat)
   messageQueue.ensureQueue(anchor);
   messageQueue.appendMessage(anchor, parsed);
+  if (ds) publishSessionMessagePreviewPatch(ds);
 
   if (!ds) {
     // No active session at this anchor — auto-create. This branch is mostly a

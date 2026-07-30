@@ -74,6 +74,9 @@ export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
   contentLength?: number;
+  /** Bounded, whitespace-compacted copy for dashboard session previews.
+   *  The fallback gate still uses contentLength only. */
+  previewText?: string;
 }
 
 export interface BridgeGateInput {
@@ -92,10 +95,25 @@ export interface BridgeGateInput {
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
 }
 
-export function buildBridgeSendMarkerContent(content: string): Pick<BridgeSendMarker, 'contentLength'> | undefined {
+const BRIDGE_SEND_PREVIEW_MAX_CHARS = 4_000;
+
+export function buildBridgeSendPreviewText(content: string): string | undefined {
   const normalized = normaliseForFingerprint(content);
   if (!normalized) return undefined;
-  return { contentLength: normalized.length };
+  return normalized.length > BRIDGE_SEND_PREVIEW_MAX_CHARS
+    ? `${normalized.slice(0, BRIDGE_SEND_PREVIEW_MAX_CHARS - 1)}…`
+    : normalized;
+}
+
+export function buildBridgeSendMarkerContent(
+  content: string,
+): Pick<BridgeSendMarker, 'contentLength' | 'previewText'> | undefined {
+  const normalized = normaliseForFingerprint(content);
+  if (!normalized) return undefined;
+  return {
+    contentLength: normalized.length,
+    previewText: buildBridgeSendPreviewText(normalized),
+  };
 }
 
 type StructuredBridgeSendMarker = BridgeSendMarker & {

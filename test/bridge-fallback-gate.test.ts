@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import {
   BRIDGE_NO_REPLY_SENTINEL,
+  buildBridgeSendMarkerContent,
+  buildBridgeSendPreviewText,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldSuppressBridgeEmit,
   type BridgeSendMarker,
@@ -11,12 +13,32 @@ const turn = (markTimeMs: number | undefined, isLocal: boolean | undefined = fal
 
 const normalise = (text: string) => text.replace(/\s+/g, ' ').trim();
 const markerForContent = (sentAtMs: number, content: string): BridgeSendMarker => {
-  const normalized = normalise(content);
   return {
     sentAtMs,
-    contentLength: normalized.length,
+    ...buildBridgeSendMarkerContent(content),
   } as BridgeSendMarker;
 };
+
+describe('buildBridgeSendMarkerContent', () => {
+  it('keeps normalized length semantics and adds a bounded dashboard preview', () => {
+    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
+      contentLength: normalise('  hello\n  bot  ').length,
+      previewText: 'hello bot',
+    });
+  });
+
+  it('bounds preview storage without changing the full normalized length', () => {
+    const content = ` ${'x'.repeat(5_000)} `;
+    const marker = buildBridgeSendMarkerContent(content)!;
+    expect(marker.contentLength).toBe(5_000);
+    expect(marker.previewText).toHaveLength(4_000);
+    expect(marker.previewText?.endsWith('…')).toBe(true);
+  });
+
+  it('can add preview text without changing legacy marker suppression semantics', () => {
+    expect(buildBridgeSendPreviewText('  spoken\nreply  ')).toBe('spoken reply');
+  });
+});
 
 describe('shouldSuppressBridgeEmit', () => {
   it('non-adopt: exact no-reply sentinel suppresses without a send marker', () => {

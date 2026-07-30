@@ -132,7 +132,10 @@ import {
   whiteboardEnabled,
   whiteboardPath,
 } from './services/whiteboard-store.js';
-import { buildBridgeSendMarkerContent } from './services/bridge-fallback-gate.js';
+import {
+  buildBridgeSendMarkerContent,
+  buildBridgeSendPreviewText,
+} from './services/bridge-fallback-gate.js';
 import { bindRestartLeaseTo, writeManualIntentIfAbsentTo } from './services/restart-intent-store.js';
 import { repairMissingChatScope, stripLegacyPendingCardFields } from './services/session-store.js';
 import {
@@ -6690,7 +6693,10 @@ async function cmdSend(rest: string[]): Promise<void> {
         try {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-          appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs, messageId }) + '\n');
+          const marker: Record<string, unknown> = { sentAtMs, messageId };
+          const previewText = buildBridgeSendPreviewText(canonicalOutput.content);
+          if (previewText) marker.previewText = previewText;
+          appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
       console.error(`✓ 已发送语音 ${messageId} ｜ ${Math.round(out.durationMs / 1000)}s`);
@@ -6756,7 +6762,14 @@ async function cmdSend(rest: string[]): Promise<void> {
       try {
         const markerDir = join(resolveDataDir(), 'turn-sends');
         if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
-        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify({ sentAtMs: Date.now(), messageId: `doc:${docTarget.commentId}`, contentLength: content.length }) + '\n');
+        const marker: Record<string, unknown> = {
+          sentAtMs: Date.now(),
+          messageId: `doc:${docTarget.commentId}`,
+          contentLength: content.length,
+        };
+        const previewText = buildBridgeSendPreviewText(content);
+        if (previewText) marker.previewText = previewText;
+        appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
       } catch { /* best-effort：漏记只多一条兜底 */ }
       // 清理已消费的 per-turn 落点，避免 session 文件无限堆积。
       if (s.docCommentTargets && currentTurnId && s.docCommentTargets[currentTurnId]) {

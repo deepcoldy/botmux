@@ -64,6 +64,7 @@ import {
   restartConfirmMessage,
   sessionLocationText,
   sessionLocationTitle,
+  sessionExchangePreview,
   sessionRuntimeCounts,
   sessionSearchText,
   sessionTopicKey,
@@ -1016,6 +1017,7 @@ function BoardCard(props: {
   const term = terminalHref(row);
   const signal = boardSignalLabel(row);
   const repo = repoBasename(row.workingDir);
+  const exchange = sessionExchangePreview(row);
   const onCardClick = (event: MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement;
     if (target.closest('a, button, input, label')) return;
@@ -1044,6 +1046,22 @@ function BoardCard(props: {
           {repo !== '-' ? <span title={row.workingDir ?? ''}>{repo}</span> : null}
           {row.adopt ? <span className="badge">adopt</span> : null}
           {signal ? <span className="session-signal" title={signal}>{signal}</span> : null}
+        </div>
+      ) : null}
+      {exchange.userText || exchange.botText ? (
+        <div className="session-card-exchange" aria-label={t('sessions.preview.latestExchange')}>
+          {exchange.userText ? (
+            <div className="session-card-exchange-line">
+              <span>{t('sessions.history.user')}</span>
+              <p title={exchange.userFullText}>{exchange.userText}</p>
+            </div>
+          ) : null}
+          {exchange.botText ? (
+            <div className="session-card-exchange-line bot">
+              <span>{t('sessions.history.bot')}</span>
+              <p title={exchange.botFullText}>{exchange.botText}</p>
+            </div>
+          ) : null}
         </div>
       ) : null}
       <div className="session-card-time">

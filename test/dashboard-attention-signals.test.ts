@@ -7,7 +7,10 @@
 //     no worker yet, so the normal spawn-time announce never fires) and
 //     no-ops for non-pending sessions
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { readFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { config } from '../src/config.js';
 import { composeRowFromActive } from '../src/core/dashboard-rows.js';
 import {
   announcePendingRepoSession,
@@ -15,6 +18,7 @@ import {
   clearAgentAttention,
   publishAttentionPatch,
   publishLastInputFromBotPatch,
+  publishSessionMessagePreviewPatch,
 } from '../src/core/session-activity.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { attentionWaitSince } from '../src/dashboard/web/ui.js';
@@ -139,6 +143,39 @@ describe('attention signals', () => {
         body: { sessionId: 'sess-1', patch: { lastInputFromBot: false } },
       },
     ]);
+  });
+
+  it('publishSessionMessagePreviewPatch refreshes the exchange after queue append', () => {
+    const previousDataDir = process.env.SESSION_DATA_DIR;
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-preview-patch-'));
+    config.session.dataDir = dataDir;
+    try {
+      mkdirSync(join(dataDir, 'queues'), { recursive: true });
+      writeFileSync(join(dataDir, 'queues', 'om_root.jsonl'), `${JSON.stringify({
+        senderType: 'user',
+        content: 'latest question',
+        createTime: '2000',
+      })}\n`);
+      const seen = collectEvents();
+
+      publishSessionMessagePreviewPatch(makeDs());
+
+      expect(seen).toEqual([{
+        type: 'session.update',
+        body: {
+          sessionId: 'sess-1',
+          patch: expect.objectContaining({
+            previewUserText: 'latest question',
+            previewUserAt: 2_000,
+            previewBotState: 'waiting',
+          }),
+        },
+      }]);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+      if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = previousDataDir;
+    }
   });
 
   it('publishAttentionPatch emits session.update derived from session state', () => {

@@ -6,6 +6,7 @@
 import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive } from './dashboard-rows.js';
+import { buildSessionMessagePreview } from './session-message-preview.js';
 import type { DaemonSession } from './types.js';
 
 export function markSessionActivity(ds: DaemonSession, at: number = Date.now()): void {
@@ -17,7 +18,26 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
   }
   dashboardEventBus.publish({
     type: 'session.update',
-    body: { sessionId: ds.session.sessionId, patch: { lastMessageAt: at } },
+    body: {
+      sessionId: ds.session.sessionId,
+      patch: {
+        lastMessageAt: at,
+        ...buildSessionMessagePreview(ds.session),
+      },
+    },
+  });
+}
+
+/** Refresh the latest user/bot exchange after its append-only source file has
+ * been written. Some inbound routes mark activity before appending to queues,
+ * so keeping this explicit avoids publishing the previous turn's preview. */
+export function publishSessionMessagePreviewPatch(ds: DaemonSession): void {
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId: ds.session.sessionId,
+      patch: buildSessionMessagePreview(ds.session),
+    },
   });
 }
 
