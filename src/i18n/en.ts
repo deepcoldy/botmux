@@ -253,6 +253,7 @@ export const messages: Record<string, string> = {
   'cmd.substitute.updated_off': '✅ Substitute mode disabled for this group.',
   'cmd.substitute.unsupported': '⚠️ /substitute only works in group chats (regular or topic groups).',
   'cmd.substitute.topic_disabled': '⚠️ Substitute mode for topic groups is disabled in this bot configuration; the per-group switch cannot enable it.',
+  'cmd.substitute.blocked': '⚠️ This group is on the substitute block-list in the bot configuration; substitute never fires here and /substitute on cannot enable it.',
   'cmd.substitute.owner_only': '⚠️ Only owner/allowedUsers can change substitute mode.',
   'cmd.substitute.usage': 'Usage: @me /substitute status | on | off',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',

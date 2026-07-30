@@ -256,6 +256,7 @@ export const messages: Record<string, string> = {
   'cmd.substitute.updated_off': '✅ 已关闭当前群替身模式。',
   'cmd.substitute.unsupported': '⚠️ /substitute 仅支持群聊（普通群/话题群）。',
   'cmd.substitute.topic_disabled': '⚠️ 当前 bot 配置已关闭话题群替身支持，群内开关无法单独开启。',
+  'cmd.substitute.blocked': '⚠️ 当前群已被 bot 配置加入替身黑名单，替身不会在此触发，/substitute on 也无法开启。',
   'cmd.substitute.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改替身模式开关。',
   'cmd.substitute.usage': '用法：@我 /substitute status｜on｜off',
   'cmd.restart.in_progress': '🔄 正在重启 {cliName}...',
