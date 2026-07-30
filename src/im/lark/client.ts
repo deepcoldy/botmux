@@ -14,6 +14,7 @@ import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
+import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -230,7 +231,9 @@ export async function sendMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -291,7 +294,9 @@ export async function replyMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -814,7 +819,7 @@ export async function sendEphemeralCard(
   const c = getBotClient(larkAppId);
   let card: unknown;
   try {
-    card = JSON.parse(cardJson);
+    card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
   } catch (err) {
     throw new Error(`Invalid ephemeral card JSON: ${err}`);
   }
@@ -867,7 +872,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
   try {
     res = await c.im.v1.message.patch({
       path: { message_id: messageId },
-      data: { content: cardJson },
+      data: { content: stampBotmuxCallbackMarkers(cardJson) },
     });
   } catch (err: any) {
     if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {

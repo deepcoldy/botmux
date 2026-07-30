@@ -4,6 +4,7 @@ import { logger } from '../../utils/logger.js';
 import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
 } from './reply-card-footer-signature.js';
+import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -811,6 +812,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer): 
               // Same jump-URL policy as Format B: simple cards reach history
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
+              if (isBotmuxCallbackButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
               if (btnText) {
                 const url = buttonOpenUrl(node);
@@ -1026,6 +1028,58 @@ function firstNonEmptyString(...candidates: unknown[]): string | undefined {
   return undefined;
 }
 
+/** botmux's own card control buttons (🔊 语音总结 / 关闭会话 / 重启 / 配置 …) are
+ *  pure callbacks back into the daemon: when another bot reads the card
+ *  (history / cross-bot relay / quote), rendering them as `[🔊 语音总结]`
+ *  pollutes the receiving prompt with affordances it can never click, so
+ *  drop them structurally — same rationale as the botmux grey-footer strip
+ *  in extractElementText.
+ *
+ *  Primary detection is the egress-stamped ownership marker
+ *  (callback-button-marker.ts). This wordlist is the LEGACY fallback for
+ *  cards sent by pre-marker builds (chat history is long-lived), covering
+ *  every action dispatched by card-handler as of the fix — it is frozen;
+ *  new botmux buttons rely on the marker, not on growing this list.
+ *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
+ *  marker and their `value` never uses botmux's action vocabulary. */
+const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
+  // session / reply card controls (card-handler's actionType dispatch)
+  'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
+  'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
+  'retry_last_task', 'takeover', 'term_action', 'toggle_display',
+  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  // pendingRepo gates
+  'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
+  'worktree_toggle_mode',
+  // config / grant / relay cards
+  'config_toggle', 'config_set', 'config_quota', 'config_text_open',
+  'config_text_save', 'grant_chat', 'grant_global', 'grant_deny',
+  'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
+  // host-overload alert + codex notifier cards
+  'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
+  'codex_notifier_continue', 'codex_notifier_open_app',
+]);
+
+/** True when the button is one of botmux's own callback buttons. Primary
+ *  signal: the egress-stamped ownership marker (see
+ *  callback-button-marker.ts) — future-proof against any new botmux action
+ *  name. Legacy fallback: cards sent by pre-marker builds are still
+ *  recognized via the internal action wordlist, in EITHER of the two real
+ *  payload shapes — legacy top-level `value.action` (session/config cards)
+ *  or v2 `behaviors:[{type:'callback', value.action}]` (reply-card voice
+ *  button inside column_set). A button that somehow carries BOTH a botmux
+ *  signal AND an open_url jump target is kept, since a real link is always
+ *  worth surfacing. */
+function isBotmuxCallbackButton(el: any): boolean {
+  if (buttonOpenUrl(el)) return false;
+  if (hasBotmuxCallbackMarker(el)) return true;
+  let action: unknown = el?.value?.action;
+  if (typeof action !== 'string' && Array.isArray(el?.behaviors)) {
+    action = el.behaviors.find((b: any) => b?.type === 'callback')?.value?.action;
+  }
+  return typeof action === 'string' && BOTMUX_INTERNAL_CARD_ACTIONS.has(action);
+}
+
 /** Resolve a card button's jump target across schema generations: v1 `url` /
  *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
  *  Returns undefined for callback-only buttons (they have no followable URL). */
@@ -1121,7 +1175,9 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // Jump buttons carry their target as v1 `url`/`multi_url` or v2 `behaviors`
   // open_url; keep it so the reader can actually follow the link (e.g. Argos
   // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
+  // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
+    if (isBotmuxCallbackButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);
