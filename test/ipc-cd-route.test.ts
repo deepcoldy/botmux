@@ -319,4 +319,56 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(send).toHaveBeenCalledWith({ type: 'restart', updateWorkingDir: roleDirReal });
     expect(killSpy).not.toHaveBeenCalled();
   });
+  // ── per-bot 收窄（ds.larkAppId → validateRoleLibraryPath 的 ownAppId）──
+  // 上面所有用例的 ds 都不带 larkAppId，走的是「不收窄」旧语义（存量人类 slug
+  // 布局的回落路径）；这两例覆盖 appId 命名下的收窄行为。
+  it('403s a switch into ANOTHER bot\u2019s role subtree once the per-bot dir is named by appId', async () => {
+    const rolesRoot = join(fakeHome, 'botmux-roles');
+    const ownRole = join(rolesRoot, 'cli_self', 'shared', 'default');
+    const otherRole = join(rolesRoot, 'cli_other', 'shared', 'default');
+    mkdirSync(ownRole, { recursive: true });
+    mkdirSync(otherRole, { recursive: true });
+    const send = vi.fn();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-crossbot', cliId: 'claude-code' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+      larkAppId: 'cli_self',
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    const res = await postCd('s-crossbot', otherRole);
+
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'outside_own_role_library' });
+    expect(send).not.toHaveBeenCalled();
+    expect(repinSpy).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('200s a switch inside the bot\u2019s OWN appId subtree', async () => {
+    const rolesRoot = join(fakeHome, 'botmux-roles');
+    const ownRole = join(rolesRoot, 'cli_self', 'shared', 'pm');
+    mkdirSync(ownRole, { recursive: true });
+    const ownRoleReal = realpathSync(ownRole);
+    const send = vi.fn();
+    const ds = {
+      session: { sessionId: 's-ownbot', cliId: 'claude-code' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+      larkAppId: 'cli_self',
+    } as any;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    const res = await postCd('s-ownbot', ownRole);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: ownRoleReal });
+    expect(repinSpy).toHaveBeenCalledWith(ds, ownRoleReal);
+  });
 });

@@ -35,7 +35,7 @@ import {
 import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
-import { roleLibrarySubtree } from './core/role-library.js';
+import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -7573,6 +7573,23 @@ async function spawnCli(
       }
     }
 
+    // Own role-library subtree, plus the ONE diagnosable failure mode of keying it
+    // on appId: a deployment that named the per-bot dir something else (the layout
+    // pre-2026-07 runbooks used) gets no rule, and "the role system EPERMs" is
+    // indistinguishable from "sandbox working as intended". Say so out loud instead
+    // — the session still runs, only role switching/creation is unavailable.
+    const roleLibSubtree = roleLibrarySubtree(cfg.larkAppId) ?? undefined;
+    if (!roleLibSubtree) {
+      try {
+        const rolesRoot = canonical(roleLibraryRoot());
+        if (canonical(cfg.workingDir).startsWith(`${rolesRoot}/`)) {
+          log(`[sandbox] role library dir mismatch: workingDir is under ${rolesRoot} but ${rolesRoot}/${cfg.larkAppId} `
+            + 'is not a real directory — the role system (list/switch/create roles, post-switch knowledge writes) will '
+            + 'EPERM in this sandboxed session. Rename the per-bot dir to the appId; see docs/roles/deploy-runbook.md.');
+        }
+      } catch { /* diagnostics only — never block the spawn */ }
+    }
+
     const policy = buildFsPolicy({
       platform: process.platform as 'darwin' | 'linux',
       homeDir: sandboxHome,
@@ -7582,13 +7599,12 @@ async function spawnCli(
       currentAppId: cfg.larkAppId,
       sessionId: cfg.sessionId,
       botHome: canonical(ownBotHome!),
-      // Own role-library subtree. roleLibrarySubtree() does the existence +
-      // canonicalization + "must be a real dir, not a symlink" checks itself
-      // (deliberately NOT via keepExisting: its realpath would follow a planted
-      // link and hand rw to the target). A bot that never used roles simply
-      // gets no rule, and a library created after spawn only takes effect for
-      // the next session — bwrap cannot bind a nonexistent source anyway.
-      roleLibrarySubtree: roleLibrarySubtree(cfg.larkAppId) ?? undefined,
+      // Resolved above. roleLibrarySubtree() does the existence + canonicalization
+      // + "must be a real dir, not a symlink" checks itself (deliberately NOT via
+      // keepExisting: its realpath would follow a planted link and hand rw to the
+      // target). A library created after spawn only takes effect for the next
+      // session — bwrap cannot bind a nonexistent source anyway.
+      roleLibrarySubtree: roleLibSubtree,
       redirectedCliData: willRedirectCliData,
       cliDataPaths: willRedirectCliData ? undefined : keepExisting([
         cliAdapter.claudeDataDir,

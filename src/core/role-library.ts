@@ -78,11 +78,21 @@ function isContainedIn(childReal: string, rootReal: string): boolean {
  * `botmux role switch` 的目标目录硬校验（调用方是模型，不可信）：
  * realpath 归一化（防 ../ 与符号链接逃逸）→ 必须位于角色库根之下
  * （文件系统身份 dev+ino 比较，防前缀兄弟目录与大小写变体绕过）→ 必须是已存在的目录。
+ *
+ * 传了 `ownAppId` 时**收窄到该 bot 自己的子树** `<角色库根>/<appId>`：不传等同旧行为
+ * （只 pin 全局根）。收窄的理由是不收窄就能切进**别的 bot 的角色目录**——`/cd` 路由随后
+ * 把 `ds.workingDir` 钉过去（`dashboard-ipc-server.ts`），于是那个 bot 的沙盒会话拿到
+ * 对方整棵角色库（含 `users/<别人 openId>/` 私有角色）的 readWrite。
+ *
+ * 存量兼容：`<根>/<appId>` 不是真目录时（旧 runbook 用人类 slug 命名这一层）**回落到
+ * 全局根校验**并回 `legacyRootFallback: true` 让调用方打 deprecation 日志——否则一次
+ * 收窄会让所有存量部署当场切不动角色。
  */
 export function validateRoleLibraryPath(
   input: string,
   rootOverride?: string,
-): { ok: true; resolvedPath: string } | { ok: false; error: string } {
+  ownAppId?: string,
+): { ok: true; resolvedPath: string; legacyRootFallback?: true } | { ok: false; error: string } {
   const raw = (input ?? '').trim();
   if (!raw) return { ok: false, error: 'empty_path' };
   // 维持「单行注入」不变量（与 slash 校验的 multiline_rejected 对称）：拒绝内嵌
@@ -100,14 +110,24 @@ export function validateRoleLibraryPath(
   let rootReal: string;
   try { rootReal = realpathSync(rootOverride ?? roleLibraryRoot()); }
   catch { return { ok: false, error: 'role_library_missing' }; }
+  // 收窄边界：本 bot 自己的子树（存在则用它，否则回落全局根 + 标记 deprecation）。
+  const ownSubtree = ownAppId ? roleLibrarySubtree(ownAppId, rootOverride) : null;
+  const legacyRootFallback = !!ownAppId && !ownSubtree;
+  const boundary = ownSubtree ?? rootReal;
   let real: string;
   try { real = realpathSync(expanded); }
   catch { return { ok: false, error: 'dir_not_found' }; }
   // 库内符号链接可能指向含换行等控制字符的目录名，把 raw 处的干净校验洗掉——
   // resolvedPath 是最终写回调用方（进而可能被注入）的值，必须同样校验。
   if (/[\x00-\x1f\x7f]/.test(real)) return { ok: false, error: 'invalid_path_chars' };
-  if (!isContainedIn(real, rootReal)) return { ok: false, error: 'outside_role_library' };
+  if (!isContainedIn(real, boundary)) {
+    // 区分两种越界，便于运营自查：在库内但不在自己子树 → 跨 bot（同样 403）。
+    return {
+      ok: false,
+      error: ownSubtree && isContainedIn(real, rootReal) ? 'outside_own_role_library' : 'outside_role_library',
+    };
+  }
   try { if (!statSync(real).isDirectory()) return { ok: false, error: 'not_a_directory' }; }
   catch { return { ok: false, error: 'dir_not_found' }; }
-  return { ok: true, resolvedPath: real };
+  return legacyRootFallback ? { ok: true, resolvedPath: real, legacyRootFallback: true } : { ok: true, resolvedPath: real };
 }

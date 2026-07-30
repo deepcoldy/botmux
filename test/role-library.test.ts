@@ -159,3 +159,53 @@ describe('roleLibrarySubtree（沙盒白名单用）', () => {
       .toBe(join(realpathSync(root), 'cli_x'));
   });
 });
+
+describe('validateRoleLibraryPath + ownAppId（收窄到本 bot 自己的子树）', () => {
+  function twoBots() {
+    const { base, root } = setup();
+    const own = join(root, 'cli_self'), other = join(root, 'cli_other');
+    mkdirSync(join(own, 'shared', 'default'), { recursive: true });
+    mkdirSync(join(own, 'users', 'ou_x', 'pm'), { recursive: true });
+    mkdirSync(join(other, 'shared', 'default'), { recursive: true });
+    mkdirSync(join(other, 'users', 'ou_y', 'secret'), { recursive: true });
+    return { base, root, own, other };
+  }
+  it('放行自己子树内的角色目录', () => {
+    const { root, own } = twoBots();
+    expect(validateRoleLibraryPath(join(own, 'shared', 'default'), root, 'cli_self'))
+      .toEqual({ ok: true, resolvedPath: realpathSync(join(own, 'shared', 'default')) });
+    expect(validateRoleLibraryPath(join(own, 'users', 'ou_x', 'pm'), root, 'cli_self').ok).toBe(true);
+  });
+  it('拦住跨 bot 切换（库内但不在自己子树）→ outside_own_role_library', () => {
+    const { root, other } = twoBots();
+    expect(validateRoleLibraryPath(join(other, 'shared', 'default'), root, 'cli_self'))
+      .toEqual({ ok: false, error: 'outside_own_role_library' });
+    // 别人的私有角色同样拦住
+    expect(validateRoleLibraryPath(join(other, 'users', 'ou_y', 'secret'), root, 'cli_self'))
+      .toEqual({ ok: false, error: 'outside_own_role_library' });
+    // 不传 ownAppId = 旧行为：跨 bot 可切（存量语义，回归对照）
+    expect(validateRoleLibraryPath(join(other, 'shared', 'default'), root).ok).toBe(true);
+  });
+  it('库外仍报 outside_role_library（两种越界可区分）', () => {
+    const { base, root } = twoBots();
+    expect(validateRoleLibraryPath(base, root, 'cli_self'))
+      .toEqual({ ok: false, error: 'outside_role_library' });
+  });
+  it('自己子树本身（每-bot 根）被拒——与「拒绝库根本身」同一不变量', () => {
+    const { root, own } = twoBots();
+    expect(validateRoleLibraryPath(own, root, 'cli_self').ok).toBe(false);
+  });
+  it('存量人类 slug 布局 → 回落全局根校验 + legacyRootFallback 标记', () => {
+    const { root } = setup();  // 只有 users/ou_x/产品经理，没有 cli_* 目录
+    const legacy = join(root, 'users', 'ou_x', '产品经理');
+    const r = validateRoleLibraryPath(legacy, root, 'cli_self');
+    expect(r).toEqual({ ok: true, resolvedPath: realpathSync(legacy), legacyRootFallback: true });
+  });
+  it('子树是符号链接时也算「不存在」→ 回落，且不会因跟链把别人的库当成自己的', () => {
+    const { root, other } = twoBots();
+    symlinkSync(other, join(root, 'cli_link'));
+    const r = validateRoleLibraryPath(join(other, 'shared', 'default'), root, 'cli_link');
+    expect(r.ok).toBe(true);                       // 回落全局根 → 库内即放行
+    expect((r as { legacyRootFallback?: true }).legacyRootFallback).toBe(true);
+  });
+});

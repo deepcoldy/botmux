@@ -1,7 +1,9 @@
 # 角色系统协议（_role-protocol.md）
 
 > 本文件被每个角色目录的 CLAUDE.md `@import`，是角色行为的单一规则源。
-> 占位符 `<ROLES_ROOT>` = `~/botmux-roles/<bot名>`，部署时替换。
+> 占位符 `<ROLES_ROOT>` = `~/botmux-roles/<appId>`（每-bot 目录名必须 = 该 bot 的
+> `larkAppId`，它是沙盒白名单与 role switch 越界校验的 scoping key，详见
+> `docs/roles/deploy-runbook.md` 第 2 步），部署时替换成实际路径。
 
 ## 你的身份与角色库
 

@@ -239,6 +239,42 @@ describe('buildFsPolicy', () => {
     const inJewel = buildFsPolicy(ctx({ roleLibrarySubtree: '/Users/u/.ssh/roles/cli_self' }));
     expect(inJewel.rules.some(r => r.path === '/Users/u/.ssh/roles/cli_self')).toBe(false);
     expect(accessForPath(inJewel.rules, '/Users/u/.ssh/roles/cli_self/x').access).toBe('deny');
+    // a mandatory deny REGEX matching the subtree also suppresses it: compileToBwrap
+    // does not consume denyRegexes at all, so on Linux an rw grant inside a
+    // regex-denied tree would simply win (Seatbelt emits regex denies last).
+    const rx = buildFsPolicy(ctx({
+      roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+      mandatoryDenyRegexes: ['^/Users/u/botmux-roles/'],
+    }));
+    expect(rx.rules.some(r => r.path === '/Users/u/botmux-roles/cli_self')).toBe(false);
+    // an unusable regex must not be a grant decision either way (no throw, rule kept)
+    const badRx = buildFsPolicy(ctx({
+      roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+      mandatoryDenyRegexes: ['([unclosed'],
+    }));
+    expect(badRx.rules.some(r => r.path === '/Users/u/botmux-roles/cli_self')).toBe(true);
+  });
+
+  it('a covering readOnly (owner or mandatory) DOWNGRADES the grant to readOnly instead of silently upgrading to rw', () => {
+    // Same longest-prefix trap as the deny case: an owner who marks the library
+    // read-only must not get a writable `<appId>` hole. Downgrading (not dropping)
+    // keeps enumerate/switch working — only the knowledge write fails.
+    for (const key of ['userPaths', 'mandatoryReadOnlyPaths'] as const) {
+      const p = buildFsPolicy(ctx({
+        roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+        ...(key === 'userPaths'
+          ? { userPaths: { readOnly: ['/Users/u/botmux-roles'] } }
+          : { mandatoryReadOnlyPaths: ['/Users/u/botmux-roles'] }),
+      }));
+      expect(accessForPath(p.rules, '/Users/u/botmux-roles/cli_self/shared/pm/CLAUDE.md').access).toBe('readOnly');
+      expect(p.rules.find(r => r.path === '/Users/u/botmux-roles/cli_self')?.access).toBe('readOnly');
+    }
+    // deny still beats readOnly when both cover it → no rule at all
+    const both = buildFsPolicy(ctx({
+      roleLibrarySubtree: '/Users/u/botmux-roles/cli_self',
+      userPaths: { readOnly: ['/Users/u/botmux-roles'], deny: ['/Users/u/botmux-roles'] },
+    }));
+    expect(both.rules.some(r => r.path === '/Users/u/botmux-roles/cli_self')).toBe(false);
   });
 
   it('no role-library rule at all when the subtree is absent (bot never used roles)', () => {

@@ -814,9 +814,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   if (ds.adoptedFrom || ds.initConfig?.adoptMode) {
     return jsonRes(res, 409, { ok: false, error: 'adopt_cd_unsupported' });
   }
-  const v = validateRoleLibraryPath(body?.dir ?? '');
+  // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
+  // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
+  // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
+  const v = validateRoleLibraryPath(body?.dir ?? '', undefined, ds.larkAppId);
   if (!v.ok) {
-    return jsonRes(res, v.error === 'outside_role_library' ? 403 : 400, { ok: false, error: v.error });
+    const forbidden = v.error === 'outside_role_library' || v.error === 'outside_own_role_library';
+    return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
+  }
+  if (v.legacyRootFallback) {
+    // 存量人类 slug 布局：无法按 appId 收窄，退回全局根校验（= 旧行为，跨 bot 可切）。
+    logger.warn(`[role] 角色库每-bot 目录名不是 appId（${ds.larkAppId}）——已回落到全局根校验，跨 bot 切换未被拦住；`
+      + '按 docs/roles/deploy-runbook.md「迁移：每-bot 目录名改为 appId」重命名后即自动收窄。');
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
   if (ds.worker && !ds.worker.killed) {

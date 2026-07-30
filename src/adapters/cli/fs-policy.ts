@@ -390,29 +390,41 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // NARROWER than `validateRoleLibraryPath`, which only requires the target to
   // be somewhere under the library root; a cross-bot switch now fails at the fs
   // layer even if the daemon-side check passes.)
-  // …and suppressed entirely when ANY deny — baseline, owner, or mandatory —
-  // already covers it: source rank only settles conflicts on the SAME path, so a
-  // shallower `deny: ["~/botmux-roles"]` would otherwise be silently re-opened
-  // at `<appId>` by this deeper internal rule (longest-prefix-wins). An owner who
-  // denies the library must get a denied library, not a hole in it. Baseline is
-  // in the list defensively: a canonical `<library>/<appId>` cannot normally land
-  // inside a crown-jewel deny, but "cannot normally" is not a check.
-  const roleLibDenied = (raw: string) => {
+  // …and it never OVERRIDES a covering deny/readOnly. Source rank only settles
+  // conflicts on the SAME path — different paths are always decided by depth — so
+  // a shallower `deny: ["~/botmux-roles"]` (or `readOnly:`) would otherwise be
+  // silently re-opened/upgraded at `<appId>` by this deeper internal rule. An
+  // owner who locks the library must get a locked library, not a hole in it:
+  //   covering deny (baseline / user / mandatory, path OR mandatory regex) → no rule
+  //   covering readOnly (user / mandatoryReadOnly)                         → readOnly
+  // A readOnly grant still lets the role system enumerate + switch; only the
+  // knowledge write fails — strictly closer to what the owner asked for than
+  // either silently upgrading to rw or dropping the rule entirely.
+  // Asymmetry on purpose: baseline DENY counts (a ceiling), baseline readOnly does
+  // NOT (a floor internal grants are meant to lift — e.g. toolchain dirs).
+  const roleLibAccess = (raw: string): FsAccess | null => {
     const p = normalizeFsPath(raw);
-    if (!p) return true; // unusable path → no rule (mergeFsRules would drop it anyway)
-    return [
+    if (!p) return null; // unusable path → no rule (mergeFsRules would drop it anyway)
+    const covered = (paths: readonly string[] | undefined) =>
+      (paths ?? []).map(normalizeFsPath).some((d) => !!d && coversPath(d, p));
+    if (covered([
       ...baseline.filter(r => r.access === 'deny').map(r => r.path),
       ...(ctx.userPaths?.deny ?? []),
       ...(ctx.mandatoryDenyPaths ?? []),
-    ]
-      .map(normalizeFsPath)
-      .some((d) => !!d && coversPath(d, p));
+    ])) return null;
+    // Regex denies: Seatbelt emits them after every path allow (deny wins there),
+    // but compileToBwrap does not consume denyRegexes at all — Linux has no such
+    // backstop, so an rw grant inside a regex-denied tree would simply win. Today
+    // mandatoryDenyRegexes only ever point at BOT_HOME credential sidecars, never
+    // at the role library; this keeps that from silently becoming a hole.
+    for (const rx of ctx.mandatoryDenyRegexes ?? []) {
+      try { if (new RegExp(rx).test(p)) return null; } catch { /* unusable regex: not a grant decision */ }
+    }
+    if (covered([...(ctx.userPaths?.readOnly ?? []), ...(ctx.mandatoryReadOnlyPaths ?? [])])) return 'readOnly';
+    return 'readWrite';
   };
-  push(
-    ctx.roleLibrarySubtree && !roleLibDenied(ctx.roleLibrarySubtree) ? [ctx.roleLibrarySubtree] : [],
-    'readWrite',
-    'internal',
-  );
+  const roleLibGrant = ctx.roleLibrarySubtree ? roleLibAccess(ctx.roleLibrarySubtree) : null;
+  if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(ctx.extraWritePaths, 'readWrite', 'internal');
   push(ctx.readonlyRoots, 'readOnly', 'internal');
