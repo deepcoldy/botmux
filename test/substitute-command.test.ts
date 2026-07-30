@@ -170,6 +170,13 @@ describe('tryHandleSubstituteCommand', () => {
     await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
     expect(lastReply()).toBe('cmd.substitute.blocked');
     expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
+
+    // Blocked check is deliberately before the owner check (屏蔽状态非敏感，人人可见):
+    // a non-operator also sees blocked, not owner_only.
+    mockCanOperate.mockReturnValue(false);
+    await tryHandleSubstituteCommand(APP, msg('/substitute on'), USER);
+    expect(lastReply()).toBe('cmd.substitute.blocked');
+    expect(mockSetSubstituteEnabledForChat).not.toHaveBeenCalled();
   });
 
   it('non-blocklisted chats keep working when a blocklist is configured', async () => {
