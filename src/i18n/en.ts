@@ -1070,6 +1070,11 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
+  // Topic context — prepended on the first turn of a regular-group topic
+  // whose root is a different (earlier) message the bot never retained.
+  // Replays the whole topic thread (root + prior replies) so the bot sees the
+  // complete context. {count} is the number of prior messages surfaced.
+  'prompt.topic_context': '[Topic context — all prior messages in this topic, {count} total]',
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',

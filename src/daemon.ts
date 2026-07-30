@@ -82,6 +82,7 @@ import { createImgNumberer, parseEventMessage, resolveNonsupportMessage, stripLe
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
+import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
 import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
@@ -15363,7 +15364,16 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
   const codexAppMessageContext = codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const promptContent = codexAppQuoteContext + codexAppApplicationContext + content;
+  // 普通群「对已有消息发起话题再 @」：入站是话题内回复（root_id 指向另一条更早
+  // 的话题根消息），bot 从未留存该话题历史。首轮拉取整条话题上下文（根 + 本条
+  // @ 之前的全部回复，文本+附件下载到本 bot 附件桶）并前置到 prompt，让 CLI 先
+  // 看到话题完整上下文。best-effort，失败降级（只取根 / 空串）不阻断；coalesced
+  // forward 已自带上下文不再重复拉取。仅首轮 — 后续 handleThreadReply 回合 CLI
+  // 已在首轮拿到话题上下文，不重复拉取。
+  const topicThreadContext = (parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
+    ? await buildTopicThreadContext(larkAppId, chatId, parsed.rootId, parsed.messageId, localeForBot(larkAppId))
+    : '';
+  const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
   // resolveSender for an unseen open_id may await contact.v3.user.get with a

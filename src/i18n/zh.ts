@@ -1073,6 +1073,11 @@ export const messages: Record<string, string> = {
 
   // Quote hint (injected into the CLI prompt)
   'prompt.quote_hint': '[用户引用了消息 用 botmux quoted {id} 查看]',
+  // Topic context — prepended on the first turn of a 普通群 topic whose root
+  // is a different (earlier) message the bot never retained. Replays the whole
+  // topic thread (root + prior replies) so the bot sees the complete context.
+  // {count} is the number of prior messages surfaced.
+  'prompt.topic_context': '[话题上下文（本话题之前的全部消息，共 {count} 条）]',
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
