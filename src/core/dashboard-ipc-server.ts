@@ -738,9 +738,9 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
 /**
  * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
  * `mode`:
- *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
- *     THIS daemon's bot-scoped session store. The card handler fans this mode
- *     out to every online daemon.
+ *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no exact
+ *     persistent backing) from THIS daemon's bot-scoped session store. The
+ *     card handler fans this mode out to every online daemon.
  *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
  *     non-adopt) live workers. Live workers only exist in their owning daemon's
  *     process, so the card handler fans this mode out to every online daemon.
