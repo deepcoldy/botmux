@@ -828,11 +828,15 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
       + '按 docs/roles/deploy-runbook.md「迁移：每-bot 目录名改为 appId」重命名后即自动收窄。');
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
+  // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次
+  // forkWorker 用 initConfig 重建 init 消息，只在有活 worker 时更新的话，no-worker /
+  // worker.killed 两条分支会留下「记录新、initConfig 旧」的分裂状态，冷启动把会话
+  // 带回旧 cwd（= 旧角色，连记忆桶都是旧的）。codex review 抓出的既有 bug，与本 PR
+  // 的收窄同一处理，顺手修掉。
+  if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
   if (ds.worker && !ds.worker.killed) {
     // updateWorkingDir 随 restart 带给 worker：respawn 必须收敛到新目录，而不是
-    // 陈旧的 lastInitConfig.workingDir。daemon 侧的 ds.initConfig 同步更新，保持
-    // 与 worker 侧一致（下次 forkWorker 用它重建 init 消息）。
-    if (ds.initConfig) ds.initConfig.workingDir = v.resolvedPath;
+    // 陈旧的 lastInitConfig.workingDir（daemon 侧 initConfig 已在上面同步）。
     try {
       ds.worker.send({ type: 'restart', updateWorkingDir: v.resolvedPath } as DaemonToWorker);
     } catch {

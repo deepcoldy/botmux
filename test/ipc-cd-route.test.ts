@@ -371,4 +371,27 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(await res.json()).toEqual({ ok: true, mode: 'respawn-resume', dir: ownRoleReal });
     expect(repinSpy).toHaveBeenCalledWith(ds, ownRoleReal);
   });
+  it('initConfig.workingDir 与 repin 同步 —— 连 no-worker 分支也同步（否则冷启动带回旧 cwd）', async () => {
+    const rolesRoot = join(fakeHome, 'botmux-roles');
+    const ownRole = join(rolesRoot, 'cli_self', 'shared', 'sync');
+    mkdirSync(ownRole, { recursive: true });
+    const ownRoleReal = realpathSync(ownRole);
+    const initConfig = { workingDir: '/old/cwd' } as any;
+    const ds = {
+      session: { sessionId: 's-nosync', cliId: 'claude-code' },
+      managedTurnOrigin: { capability: CAP },
+      worker: undefined,               // no-worker 分支
+      adoptedFrom: undefined,
+      larkAppId: 'cli_self',
+      initConfig,
+    } as any;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    const res = await postCd('s-nosync', ownRole);
+
+    expect(res.status).toBe(200);
+    expect(initConfig.workingDir).toBe(ownRoleReal);
+  });
 });

@@ -386,10 +386,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // only EPERMs later, at the knowledge write.
   // Scoped to `<appId>` on purpose — NOT the shared library root: a sibling
   // bot's roles (and its users' private role dirs) stay denied by construction,
-  // so cross-bot read isolation is preserved. (Note this is deliberately
-  // NARROWER than `validateRoleLibraryPath`, which only requires the target to
-  // be somewhere under the library root; a cross-bot switch now fails at the fs
-  // layer even if the daemon-side check passes.)
+  // so cross-bot read isolation is preserved. (`validateRoleLibraryPath` narrows
+  // `botmux role switch` to the same `<root>/<appId>` boundary, so the daemon-side
+  // check and this fs-side grant agree — but the fs rule stands on its own: it
+  // still holds for a session pointed elsewhere by other means, and for the
+  // legacy-layout fallback where the daemon check cannot narrow.)
   // …and it never OVERRIDES a covering deny/readOnly. Source rank only settles
   // conflicts on the SAME path — different paths are always decided by depth — so
   // a shallower `deny: ["~/botmux-roles"]` (or `readOnly:`) would otherwise be
@@ -417,6 +418,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // backstop, so an rw grant inside a regex-denied tree would simply win. Today
     // mandatoryDenyRegexes only ever point at BOT_HOME credential sidecars, never
     // at the role library; this keeps that from silently becoming a hole.
+    // KNOWN BOUNDARY (codex review): this tests the subtree ROOT, which catches
+    // ancestor-shaped regexes (the only shape botmux generates) but NOT one that
+    // matches only a DESCENDANT (`<subtree>/secret$`) — regex-vs-subtree
+    // intersection is not decidable from a prefix. Closing it properly means
+    // either emitting a concrete deny path alongside every internal regex, or
+    // making compileToBwrap consume denyRegexes (a pre-existing gap that applies
+    // to EVERY rw grant — workingDir, botHome, … — not just this one).
     for (const rx of ctx.mandatoryDenyRegexes ?? []) {
       try { if (new RegExp(rx).test(p)) return null; } catch { /* unusable regex: not a grant decision */ }
     }

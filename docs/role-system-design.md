@@ -109,17 +109,17 @@ flowchart LR
 ~/botmux-roles/<appId>/            # 目录名 = larkAppId（沙盒 scoping key）
   _role-protocol.md            ← 共享角色协议（单一来源，各角色 CLAUDE.md @import 引用）
   shared/
-    默认助理/                   ← 默认角色：全员可用，记忆全员共享
+    default/                   ← 默认角色（ASCII slug；中文名在 .botmux-dir.json 的 name）
       CLAUDE.md                ← 人设 + @import 协议 + @import 知识索引
       knowledge/
         INDEX.md               ← 领域知识索引
         <主题>.md               ← 沉淀后的领域知识文档
   users/
     <open_id>/                 ← 用户私有区，按飞书 open_id 归属
-      产品经理/
+      pm/                      ← 同样是 ASCII slug
         CLAUDE.md
         knowledge/ ...
-      售后客服/ ...
+      after-sales/ ...          ← 同上
 ```
 
 <callout emoji="❗">

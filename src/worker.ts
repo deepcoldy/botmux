@@ -7581,8 +7581,11 @@ async function spawnCli(
     const roleLibSubtree = roleLibrarySubtree(cfg.larkAppId) ?? undefined;
     if (!roleLibSubtree) {
       try {
-        const rolesRoot = canonical(roleLibraryRoot());
-        if (canonical(cfg.workingDir).startsWith(`${rolesRoot}/`)) {
+        // 两种形态都比：配置路径表面在库内、但经中间 symlink 解析到库外时，
+        // 只比 canonical 会漏报（而这恰恰也是 roleLibrarySubtree 返回空的场景）。
+        const lexicalRoot = roleLibraryRoot(), rolesRoot = canonical(lexicalRoot);
+        const under = (root: string, p: string) => p === root || p.startsWith(`${root}/`);
+        if (under(rolesRoot, canonical(cfg.workingDir)) || under(lexicalRoot, cfg.workingDir)) {
           log(`[sandbox] role library dir mismatch: workingDir is under ${rolesRoot} but ${rolesRoot}/${cfg.larkAppId} `
             + 'is not a real directory — the role system (list/switch/create roles, post-switch knowledge writes) will '
             + 'EPERM in this sandboxed session. Rename the per-bot dir to the appId; see docs/roles/deploy-runbook.md.');

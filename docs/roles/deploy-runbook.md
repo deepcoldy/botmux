@@ -60,9 +60,15 @@ echo '{"name": "默认助理"}' > ~/botmux-roles/<appId>/shared/default/.botmux-
   「新建角色」流程同样会复制一份（见协议模板）；协议更新后需扫描各角色目录重新分发。
 
 角色库根目录固定为 `~/botmux-roles`（`src/core/role-library.ts` 的 `roleLibraryRoot()`，
-v0 硬编码约定、不接受配置），每个 bot 在其下各占一个子目录；`botmux role switch` 的越界校验
-（`validateRoleLibraryPath()`）也是对着这个全局根做包含性判断，而不是单独按 bot 子目录收紧——
-纯信息，不影响本 runbook 操作，仅供理解「角色库外」的确切边界。
+v0 硬编码约定、不接受配置），每个 bot 在其下各占一个以自己 `larkAppId` 命名的子目录。
+`botmux role switch` 的越界校验（`validateRoleLibraryPath()`）**按 `<根>/<appId>` 收窄到该
+bot 自己的子树**：切到别的 bot 的角色目录会被拒（`outside_own_role_library`，403）。
+存量部署若这一层不是 appId 命名，校验回落到「只按全局根判断」的旧行为（跨 bot 可切）并在
+daemon 日志打一行 deprecation —— 迁移见第 8 节。
+
+> 注意：飞书 IM 里人工敲的 `/cd` 走的是通用工作目录校验（`validateWorkingDir`，允许任意
+> 已存在目录、可自动创建），**不经**角色库校验 —— 它的信任契约是「运营自己输入的目录」。
+> 收窄只作用于模型驱动的 `botmux role switch`。
 
 ## 3. bots.json 配置该 bot
 
@@ -193,8 +199,14 @@ mv "$OLD" ~/botmux-roles/$APP
    done
    ```
 3. 各角色目录 `CLAUDE.md` 里若硬写了旧绝对路径，一并替换。
-4. `botmux start` 后自查：新话题进入默认角色、`botmux role switch` 可切换、
-   开了沙盒的 bot 能读到 `~/botmux-roles/<appId>/` 下的兄弟角色目录。
+4. **存量会话的 cwd**：`defaultWorkingDir` 只影响**新话题**；已存在的会话把 cwd 记在
+   session store 里（`~/.botmux/data/sessions-<appId>.json`），`mv` 之后它们仍指向旧路径
+   —— `botmux stop` 只是停 daemon，不等于关掉或重钉这些会话。迁移前先关掉相关活跃/可恢复
+   会话（或迁移后逐个 `botmux role switch` 重钉到新路径），重启后确认旧话题恢复时进的是
+   新目录，而不是已被移走的旧路径。
+5. `botmux start` 后自查：新话题进入默认角色、`botmux role switch` 可切换、
+   开了沙盒的 bot 能读到 `~/botmux-roles/<appId>/` 下的兄弟角色目录、
+   切别的 bot 的角色目录被拒（403 `outside_own_role_library`）。
 
 **记忆桶会换**：记忆按 cwd 路径 slug 分桶（`~/.claude/projects/<slug>/` 或
 `~/.botmux/bots/<appId>/claude/projects/<slug>/`），目录一改 slug 就变，旧桶里的
