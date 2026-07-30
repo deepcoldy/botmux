@@ -353,6 +353,107 @@ describe('message listener evaluation', () => {
     })).toBeUndefined();
   });
 
+  it('fails closed on an unverified bot sender when the listener excludes by open_id', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            excludeSenderOpenIds: ['ou_muted_bot'],
+            includeSenderTypes: ['user', 'bot'],
+          },
+        },
+      },
+    });
+
+    // A third-party bot whose app_id could not be resolved to an open_id must
+    // NOT trigger: we cannot prove it is not the excluded bot (the security hole).
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
+
+    // A resolved (verified) bot that is NOT the excluded one still triggers.
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'ou_allowed_bot',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: false,
+      explicitlyMentionedThisBot: false,
+    })).toBeTruthy();
+  });
+
+  it('still listens to an unverified bot when there is no open_id exclusion (empty exclude)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: { mode: 'all_except_excluded', includeSenderTypes: ['user', 'bot'] },
+        },
+      },
+    });
+
+    // No open_id-based decision is being bypassed, so "listen to all bots
+    // (except self)" must keep working even for an unverified sender.
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeTruthy();
+  });
+
+  it('does not match an unverified bot under include-only (allow-list stays fail-safe)', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listener',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_argos'],
+            includeSenderTypes: ['bot'],
+          },
+        },
+      },
+    });
+
+    // An unresolved app_id can never equal an open_id in the allow-list.
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'cli_unknown_third_party',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: true,
+      explicitlyMentionedThisBot: false,
+    })).toBeUndefined();
+
+    // The configured sibling bot, resolved to its open_id, matches.
+    expect(evaluateMessageListener({
+      bot: state,
+      chatId: 'oc_chat',
+      message: textMessage(),
+      senderOpenId: 'ou_argos',
+      senderTypeRaw: 'bot',
+      senderIdentityUnverified: false,
+      explicitlyMentionedThisBot: false,
+    })).toBeTruthy();
+  });
+
   it('does not fall back to listening to everyone when include-only mode has no selected senders', () => {
     const state = bot({
       messageListeners: {

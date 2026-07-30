@@ -134,11 +134,27 @@ function senderTypeAllowed(listener: MessageListenerConfig, type: MessageListene
   return true;
 }
 
-function senderOpenIdAllowed(listener: MessageListenerConfig, openId: string | undefined): boolean {
+function senderOpenIdAllowed(
+  listener: MessageListenerConfig,
+  openId: string | undefined,
+  identityUnverified: boolean,
+): boolean {
   const policy = listener.senderPolicy;
   const mode = policy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   if (mode === 'include_only') {
+    // Allow-list: an unverified sender (a bot whose identity could not be
+    // canonicalized to a per-app open_id) can never appear in an open_id
+    // include list, so it simply does not match — already fail-safe.
     return contains(policy?.includeSenderOpenIds, openId);
+  }
+  // all_except_excluded: an unverified sender defeats an open_id-based
+  // exclusion (the excluded open_id would never equal an app_id form), so a
+  // blocked bot would leak through on the polled backfill path. Fail closed:
+  // when the operator has ANY open_id exclusion we cannot evaluate for this
+  // sender, refuse rather than assume "not excluded". An empty exclude list
+  // makes no open_id decision, so "listen to all (except self)" still works.
+  if (identityUnverified && (policy?.excludeSenderOpenIds?.length ?? 0) > 0) {
+    return false;
   }
   return !contains(policy?.excludeSenderOpenIds, openId);
 }
@@ -163,6 +179,14 @@ export function evaluateMessageListener(input: {
   senderOpenId?: string;
   senderName?: string;
   senderTypeRaw?: string;
+  /**
+   * True when `senderOpenId` is a bot's app_id form that could NOT be resolved
+   * to a per-app open_id (the polled history API reports bots by app_id; a
+   * third-party bot with no cross-ref / observed mapping stays unresolved).
+   * Such a sender defeats open_id-based exclusion, so the exclude path fails
+   * closed. The caller resolves app_id→open_id where possible before this.
+   */
+  senderIdentityUnverified?: boolean;
   explicitlyMentionedThisBot: boolean;
 }): MessageListenerMatch | undefined {
   if (input.explicitlyMentionedThisBot) return undefined;
@@ -190,7 +214,7 @@ export function evaluateMessageListener(input: {
     return undefined;
   }
   if (!senderTypeAllowed(listener, senderType)) return undefined;
-  if (!senderOpenIdAllowed(listener, input.senderOpenId)) return undefined;
+  if (!senderOpenIdAllowed(listener, input.senderOpenId, input.senderIdentityUnverified ?? false)) return undefined;
 
   const msgType = messageTypeOf(input.message);
   if (!msgTypeAllowed(listener, msgType)) return undefined;

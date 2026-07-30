@@ -1835,6 +1835,53 @@ async function dispatchPolledMessageListenerMatch(input: {
   }));
 }
 
+/**
+ * Canonicalize a polled-history sender to the identity domain the listener
+ * config is keyed on (open_id). The message-list API reports bot senders by
+ * app_id, but listener sender filters store per-app open_ids. We resolve a bot
+ * app_id → open_id via the chat's bot roster (configured siblings + observed +
+ * live members/bots). A bot we cannot map stays unverified so the matcher can
+ * fail closed on open_id-based exclusion. Non-bot senders (open_id already)
+ * pass through verified.
+ */
+function resolvePolledSenderIdentity(
+  sender: { senderOpenId?: string; senderTypeRaw?: string; senderIdType?: string },
+  appIdToOpenId: Map<string, string>,
+): { senderOpenId?: string; identityUnverified: boolean } {
+  const isBotAppId = sender.senderIdType === 'app_id'
+    || sender.senderTypeRaw === 'app'
+    || sender.senderTypeRaw === 'bot';
+  if (!isBotAppId || !sender.senderOpenId) {
+    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
+  }
+  // Already an open_id (some history rows carry open_id for bots) → verified.
+  if (sender.senderOpenId.startsWith('ou_')) {
+    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
+  }
+  const mapped = appIdToOpenId.get(sender.senderOpenId);
+  if (mapped) return { senderOpenId: mapped, identityUnverified: false };
+  // Third-party bot with no known app_id→open_id mapping: keep the app_id but
+  // flag it unverified so exclusion fails closed.
+  return { senderOpenId: sender.senderOpenId, identityUnverified: true };
+}
+
+async function buildChatBotAppIdToOpenId(larkAppId: string, chatId: string): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    for (const member of await listChatBotMembers(larkAppId, chatId)) {
+      // openId is the observer-scoped open_id; larkAppId here is the peer bot's
+      // app_id. Only record real open_id handles (skip the app_id fallback that
+      // listChatBotMembers uses when no open_id is known).
+      if (member.larkAppId && member.openId && member.openId.startsWith('ou_')) {
+        map.set(member.larkAppId, member.openId);
+      }
+    }
+  } catch (err) {
+    logger.debug(`[message-listener:${larkAppId}] bot roster unavailable for ${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return map;
+}
+
 async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
   const bot = getBot(larkAppId);
   const chatIds = enabledMessageListenerChatIds(bot);
@@ -1859,6 +1906,14 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       continue;
     }
 
+    // Build the app_id→open_id map once per chat so bot senders (reported by
+    // app_id in history) match sender filters keyed on open_id, and unmappable
+    // third-party bots fail closed on exclusion. Only paid for when this chat
+    // actually has messages to consider.
+    const appIdToOpenId = messages.length > 0
+      ? await buildChatBotAppIdToOpenId(larkAppId, chatId)
+      : new Map<string, string>();
+
     for (const message of messages) {
       const messageId = String(message?.message_id ?? '');
       if (!messageId) continue;
@@ -1866,14 +1921,16 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       if (Number.isFinite(createdAt) && (createdAt as number) < cutoff) continue;
 
       const data = larkReceiveEventFromHistoryMessage(message, chatId);
-      const sender = historyMessageSender(message);
+      const rawSender = historyMessageSender(message);
+      const resolved = resolvePolledSenderIdentity(rawSender, appIdToOpenId);
       const match = evaluateMessageListener({
         bot,
         chatId,
         message: data.message,
-        senderOpenId: sender.senderOpenId,
-        senderTypeRaw: sender.senderTypeRaw,
-        explicitlyMentionedThisBot: isBotMentioned(larkAppId, data.message, sender.senderOpenId),
+        senderOpenId: resolved.senderOpenId,
+        senderTypeRaw: rawSender.senderTypeRaw,
+        senderIdentityUnverified: resolved.identityUnverified,
+        explicitlyMentionedThisBot: isBotMentioned(larkAppId, data.message, resolved.senderOpenId),
       });
       if (!match) continue;
 
@@ -2646,6 +2703,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const isBotSenderType = senderType === 'app' || senderType === 'bot';
       if (isBotSenderType) {
         const senderOpenId = sender.sender_id?.open_id ?? sender.sender_id?.app_id;
+        // When Feishu gave us only an app_id (no open_id), this bot sender's
+        // identity is not in the open_id domain the listener filters use, so
+        // the matcher must fail closed on open_id-based exclusion. Realtime
+        // events normally carry open_id; the app_id fallback is the rare case.
+        const senderIdentityUnverified = !sender.sender_id?.open_id && !!sender.sender_id?.app_id;
         const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
         // Self messages: learn our OWN union_id from the echo first (the only
         // reliable source — see bot-union-ids-store; reported to the platform
@@ -2711,6 +2773,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               message,
               senderOpenId,
               senderTypeRaw: sender?.sender_type,
+              senderIdentityUnverified,
               explicitlyMentionedThisBot: isBotMentioned(larkAppId, message, senderOpenId),
             })
           : undefined;

@@ -1614,6 +1614,88 @@ describe('message listener polling backfill', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
   });
 
+  it('resolves a sibling bot app_id to open_id so an open_id include list matches on the polled path', async () => {
+    // Realistic config: the sender filter stores the peer bot's OPEN_ID (what the
+    // dashboard member picker saves), while chat history reports the bot by app_id.
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '只处理 Argos 告警',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [OTHER_BOT_OPEN_ID],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    // Chat bot roster provides the app_id -> open_id mapping.
+    mockListChatBotMembers.mockResolvedValue([
+      { larkAppId: OTHER_BOT_APP_ID, openId: OTHER_BOT_OPEN_ID, name: 'BotB', displayName: 'Argos', source: 'configured', hasTeamRole: false, mentionable: true, mentionSource: 'cross-ref' },
+    ] as any);
+    const card = makeHistoryMessage({
+      senderAppId: OTHER_BOT_APP_ID,
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-polled-resolved',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: 'Argos平台报警', elements: [[{ tag: 'text', text: 'SLA 低于 95%' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.objectContaining({ message_id: 'msg-polled-resolved' }) }),
+      expect.objectContaining({ messageListener: expect.objectContaining({ msgType: 'interactive' }) }),
+    );
+  });
+
+  it('fails closed on the polled path for an unresolvable third-party bot excluded by open_id', async () => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_listener: {
+          enabled: true,
+          prompt: '监听除被屏蔽 bot 外的所有 bot',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            excludeSenderOpenIds: [OTHER_BOT_OPEN_ID],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    // Empty roster: the third-party bot's app_id cannot be resolved to open_id.
+    mockListChatBotMembers.mockResolvedValue([] as any);
+    const card = makeHistoryMessage({
+      senderAppId: 'app-third-party',
+      senderType: 'app',
+      messageType: 'interactive',
+      messageId: 'msg-polled-thirdparty',
+      chatId: 'chat_listener',
+      content: JSON.stringify({ title: '未知来源', elements: [[{ tag: 'text', text: 'x' }]] }),
+      createTime: String(Date.now()),
+    });
+    mockListChatMessagesUntil.mockResolvedValueOnce([card]);
+
+    await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    await flushEventWork();
+
+    // Cannot prove it is not the excluded bot → must not trigger.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
   it('starts polling after a listener is enabled at runtime', async () => {
     vi.useFakeTimers();
     const state = setupBotState({
