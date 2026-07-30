@@ -432,9 +432,17 @@ describe('compileToSeatbelt', () => {
     expect(prof).toContain('(allow network*)'); // net defaults true
   });
 
+  // Regression: bsd.sb carries no iokit rule, so without this grant `(deny default)`
+  // kills every IOServiceOpen — Chromium (headless screenshots) SIGSEGVs inside
+  // IOKit with no sandbox diagnostic. See the e2e for the live proof.
+  it('grants iokit-open (bsd.sb has none; missing it SIGSEGVs Chromium)', () => {
+    expect(compileToSeatbelt(policy())).toContain('(allow iokit-open)');
+  });
+
   it('omits network grants when net is disabled', () => {
     const prof = compileToSeatbelt(buildFsPolicy(ctx({ net: false })));
     expect(prof).not.toContain('(allow network*)');
+    expect(prof).toContain('(allow iokit-open)'); // not gated on net
   });
 
   it('deeper rules are emitted later (last-match wins)', () => {

@@ -493,7 +493,7 @@ const SEATBELT_BASE_PROFILE = '/System/Library/Sandbox/Profiles/bsd.sb';
  * Compile the policy to a macOS Seatbelt profile. `(deny default)` + Apple's
  * bsd.sb base makes it deny-by-default for BOTH files and other operations,
  * then we re-allow the non-file operation classes the CLI needs (process/mach/
- * ipc/sysctl/signal, network gated on policy.net) and the three file tiers
+ * ipc/sysctl/signal/iokit-open, network gated on policy.net) and the three file tiers
  * emitted shallow→deep (Seatbelt applies the LAST matching rule → deepest rule
  * wins, matching accessForPath()).
  */
@@ -510,6 +510,21 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     '(allow ipc*)',
     '(allow sysctl*)',
     '(allow file-ioctl)',
+    // IOKit user clients. bsd.sb carries NO iokit rule, so `(deny default)` denies
+    // every IOServiceOpen — and the frameworks that need one (CoreGraphics /
+    // IOSurface / IOPMrootDomain power monitoring) often do NOT check the failure:
+    // the process dies with a bare SIGSEGV inside IOKit, no sandbox diagnostic at
+    // all. Reproduced with `chrome-headless-shell` (the binary behind an agent's
+    // puppeteer/playwright screenshots): SEGV_ACCERR before first paint, every run.
+    // NOT a claim that IOKit is security-irrelevant — opening user clients is real
+    // kernel attack surface. It is an explicit COMPATIBILITY TRADE-OFF, of a piece
+    // with the wholesale mach*/ipc*/sysctl* grants above: this sandbox's threat
+    // model is the file isolation enforced by the tiers below (cross-bot reads and
+    // credentials), not kernel-surface reduction. A per-user-client-class allow-list
+    // would be tighter, but the required set drifts with macOS/silicon/toolchain and
+    // every miss fails as that same silent crash. Tighten it behind an opt-in tier
+    // if a deployment ever needs the kernel surface closed too.
+    '(allow iokit-open)',
     ...(policy.net ? ['(allow network*)', '(allow system-socket)'] : []),
   ];
   for (const r of policy.rules) {
