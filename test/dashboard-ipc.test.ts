@@ -1722,16 +1722,18 @@ describe('PUT /api/bot-substitute-mode', () => {
           targets: [{ userId: 'u_alice', name: 'Alice' }],
           disclosure: 'prefix',
           replyMode: 'quote',
+          excludedChats: ['oc_x', ' oc_y ', '', 'oc_x'],
         }),
       });
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
-        substituteMode: { replyMode: 'quote' },
+        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'] },
       });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
         replyMode: 'quote',
+        excludedChats: ['oc_x', 'oc_y'],
       });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;

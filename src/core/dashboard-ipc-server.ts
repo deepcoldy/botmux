@@ -2733,6 +2733,9 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
   const chats = Array.isArray(rec.chats)
     ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
     : [];
+  const excludedChats = Array.isArray(rec.excludedChats)
+    ? [...new Set(rec.excludedChats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
@@ -2740,6 +2743,7 @@ ipcRoute('PUT', '/api/bot-substitute-mode', async (req, res) => {
     replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
     disableControlCard: rec.disableControlCard === true,
     ...(chats.length ? { chats } : {}),
+    ...(excludedChats.length ? { excludedChats } : {}),
     // 话题群开关：显式 false 才关（旧客户端不带字段 → normalize 缺省开）。
     topicGroups: rec.topicGroups,
     topicActiveSessionTrigger: rec.topicActiveSessionTrigger,
