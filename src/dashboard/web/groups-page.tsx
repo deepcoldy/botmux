@@ -12,6 +12,7 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
+import { copyText } from './clipboard.js';
 import {
   CreateActionButton,
   DropdownMenu,
@@ -368,9 +369,11 @@ function CreateDialog(props: {
             type="button"
             data-copy={chatId}
             onClick={() => {
-              void navigator.clipboard.writeText(chatId);
-              setCopied(true);
-              props.setTimer(() => setCopied(false), 800);
+              void copyText(chatId, tr('sessions.copy')).then(didCopy => {
+                if (!didCopy) return;
+                setCopied(true);
+                props.setTimer(() => setCopied(false), 800);
+              });
             }}
           >
             {copied ? tr('sessions.copied') : tr('sessions.copy')}

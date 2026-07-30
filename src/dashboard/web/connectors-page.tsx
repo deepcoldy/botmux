@@ -4,6 +4,7 @@ import { jget, jsend } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
+import { copyText } from './clipboard.js';
 
 interface Connector {
   id: string;
@@ -621,12 +622,14 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   }
 
   function copyConnectorUrl(connector: Connector): void {
-    void navigator.clipboard?.writeText(webhookUrl(connector.id));
-    setCopiedId(connector.id);
-    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-    copyTimerRef.current = setTimeout(() => {
-      if (mountedRef.current) setCopiedId(null);
-    }, 1200);
+    void copyText(webhookUrl(connector.id), tr('connectors.copy')).then(copied => {
+      if (!copied || !mountedRef.current) return;
+      setCopiedId(connector.id);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => {
+        if (mountedRef.current) setCopiedId(null);
+      }, 1200);
+    });
   }
 
   return (

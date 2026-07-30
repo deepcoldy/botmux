@@ -7,6 +7,7 @@ import {
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { sessionTerminalHref } from './session-terminal.js';
+import { copyText } from './clipboard.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -302,17 +303,12 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
       if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
       return;
     }
-    try {
-      await navigator.clipboard.writeText(body.command);
+    if (await copyText(body.command, t('sessions.copyCommand'))) {
       if (btn) {
         const prev = btn.textContent;
         btn.textContent = t('sessions.copyCommandDone');
         setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
       }
-    } catch {
-      // Clipboard API unavailable (non-secure context) — fall back to a prompt
-      // so the user can still select + copy the command manually.
-      window.prompt(t('sessions.copyCommand'), body.command);
     }
   } catch (e) {
     alert(`${t('sessions.copyCommandFail')}: ${e}`);

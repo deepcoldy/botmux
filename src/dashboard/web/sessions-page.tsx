@@ -23,6 +23,7 @@ import {
 } from '../session-cleanup.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
+import { copyText } from './clipboard.js';
 import {
   KANBAN_TEAM_STORAGE_KEY,
   normalizeHiddenTableColumns,
@@ -385,9 +386,11 @@ function CopyButton(props: { value: string }): JSX.Element {
       type="button"
       data-copy={props.value}
       onClick={() => {
-        void navigator.clipboard.writeText(props.value);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 800);
+        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+          if (!didCopy) return;
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 800);
+        });
       }}
     >
       {copied ? t('sessions.copied') : t('sessions.copy')}

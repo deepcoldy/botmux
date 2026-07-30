@@ -3,6 +3,7 @@ import { DropdownMenu, LoadingState, dropdownLabel } from './dashboard-component
 import { jget } from './dashboard-api.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import { copyText } from './clipboard.js';
 
 type LogStatus = '' | 'ok' | 'error';
 type TimeWindow = '24h' | '7d' | '30d' | 'all';
@@ -260,7 +261,8 @@ export function WebhookLogsContent(props: { embedded?: boolean } = {}): JSX.Elem
 
   async function copySelected(): Promise<void> {
     if (!selected) return;
-    await navigator.clipboard?.writeText(JSON.stringify(selected, null, 2));
+    const didCopy = await copyText(JSON.stringify(selected, null, 2), tr('webhookLogs.copyJson'));
+    if (!didCopy) return;
     setCopied(true);
     setTimeout(() => mountedRef.current && setCopied(false), 1200);
   }
