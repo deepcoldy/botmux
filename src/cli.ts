@@ -8838,8 +8838,14 @@ async function cmdBots(sub: string, rest: string[]): Promise<void> {
   }
 
   const sessionIdArg = argValue(rest, '--session-id');
-  // 与 history/quoted 同一前奏：本地会话解析 + riff sandbox env 合成会话兜底
-  //（远端沙箱无 sessions.json/bots.json 时 `botmux bots list` 照常可用）。
+  // 与 history/quoted 同一前奏：先从本 bot 自己的 send-cred 文件注册，让 Lark client
+  // 在**不读被 deny 的 bots.json** 的前提下可用，再做会话解析 + riff sandbox env
+  // 合成会话兜底。漏掉 registerSelfFromCredFile() 时读隔离 bot 的
+  // `botmux bots list` 会在 getBotClient() 上抛 "Bot not registered"，
+  // listChatBotMembers() 把它降级成 legacy discovery（configured 行同样来自
+  // bots.json）→ 返回 `total: 0`。**失败形态是静默的**：沙盒 bot 拿到空花名册会
+  // 按"只 @ mentionable 的"判定群里没人可 @，多 bot 协作直接不发生且不报错。
+  await registerSelfFromCredFile();
   const { sid, larkAppId: resolvedAppId, session: s } = await resolveSessionAppId(sessionIdArg);
 
   const appId = resolvedAppId;
