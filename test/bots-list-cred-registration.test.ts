@@ -87,6 +87,11 @@ describe('botmux bots list under read isolation', () => {
       HOME: home,
       SESSION_DATA_DIR: dataDir,
       BOTMUX_LARK_APP_ID: APP_ID,
+      // Pin the members/bots discovery path ON. Without this the child inherits
+      // the flag from the parent/CI env; if it happens to be 'false', the code
+      // skips listChatBotsViaMembersBots() entirely — so the pre-fix version
+      // never reaches getBotClient() and this regression would falsely pass.
+      BOTMUX_LARK_LIST_BOTS_API_ENABLED: 'true',
     });
 
     const combined = `${stdout}\n${stderr}`;
