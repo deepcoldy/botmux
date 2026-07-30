@@ -89,7 +89,7 @@ botmux list
 
 - **Adopt**：ZMX 不是 `/adopt` 的扫描/接入源；需要 adopt 现有外部会话时，使用 tmux / Herdr / Zellij 支持的路径。
 - **依赖隐藏 OSC 完成事件的 runner**：`codex-app`、`mira`、`mir` 的 final / thread 事件会被纯文本 history 消费掉，因此该组合启动时 fail closed；请为这些 CLI 使用 tmux / PTY。
-- **文件沙盒与读隔离**：ZMX 子 PTY 属于会话 daemon，当前无法套用 botmux 的 bwrap / Seatbelt 文件边界。因此 `sandbox: true`、全局 `BOTMUX_SANDBOX=1`，或 macOS 上独立生效的 `readIsolation: true` 与 `backendType: "zmx"` 同时出现时会 **fail closed**；worker 会先向会话返回可操作提示，再拒绝启动。Linux 上单独设置旧 `readIsolation` 标志按统一 worker 语义是 no-op，不代表会话已隔离，也不会误拦 ZMX。需要真实隔离时，请启用 sandbox 并改用 tmux / PTY；否则明确关闭相应隔离配置。
+- **文件沙盒与读隔离**：ZMX 子 PTY 属于会话 daemon，当前无法套用 botmux 的 bwrap / Seatbelt 文件边界。因此 `sandbox: true`、全局 `BOTMUX_SANDBOX=1`，或旧配置 `readIsolation: true` 与 `backendType: "zmx"` 同时出现时，都会在**所有平台 fail closed**；配置迁移会把 `readIsolation` 统一吸收到 sandbox 请求中，worker 启动门禁也按同一决策拦截。worker 会先向会话返回可操作提示，再拒绝启动。需要真实隔离时，请启用 sandbox 并改用 tmux / PTY；否则明确关闭相应隔离配置。
 
 ## 排错
 
