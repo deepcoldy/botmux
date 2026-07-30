@@ -7,6 +7,7 @@
  * permissionPreset 是 UI 概念：custom 只对「已保存的同 id 预设」可选（服务端
  * 只允许沿用既有 policy），新预设必须先选一个模板档。
  */
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, InfoTip, dropdownLabel } from './dashboard-components.js';
 import { useDashboardLocale, useT } from './react-hooks.js';
@@ -83,7 +84,7 @@ function toDto(draft: DraftProfile): VcMeetingConsumerProfileDto {
 /** settings 页挂载门：预设 API 是私有端点，公共只读访客请求必 401——
  * canWrite=false 时完全不挂载编辑器（一次 GET 都不发），只显示提示。 */
 /** 字段标题 + hover 帮助气泡：把配置语义讲清，避免用户对着裸表单猜。 */
-function FieldHead(props: { title: string; help: string }): JSX.Element {
+function FieldHead(props: { title: string; help: string }): React.JSX.Element {
   return (
     <span className="vc-profile-field-head">
       {props.title}
@@ -100,7 +101,7 @@ function VcProfileDialog(props: {
   children: ReactNode;
   onClose(): void;
   className?: string;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const ref = useRef<HTMLDialogElement | null>(null);
   useEffect(() => {
@@ -742,7 +743,7 @@ function ProfileEditorDialog(props: {
   onUpdate(patch: Partial<DraftProfile>): void;
   onIdChange(value: string): void;
   onRemove(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const { profile, index } = props;
   return (
@@ -886,7 +887,7 @@ function TemplateDetailsDialog(props: {
   disabled: boolean;
   onClose(): void;
   onUse(): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const template = props.template;
   return (

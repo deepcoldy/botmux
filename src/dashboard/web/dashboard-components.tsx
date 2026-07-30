@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   useCallback,
   useEffect,
@@ -21,7 +22,7 @@ export function dropdownLabel<T extends string>(options: DropdownOption<T>[], va
   return options.find(option => option.value === value)?.label ?? value;
 }
 
-export function Html(props: { html: string; as?: 'span' | 'div' }): JSX.Element {
+export function Html(props: { html: string; as?: 'span' | 'div' }): React.JSX.Element {
   const Tag = props.as ?? 'span';
   return <Tag style={{ display: 'contents' }} dangerouslySetInnerHTML={{ __html: props.html }} />;
 }
@@ -30,7 +31,7 @@ export function LoadingState(props: {
   label: ReactNode;
   className?: string;
   compact?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const className = [
     'page-loading',
     props.compact ? 'page-loading-compact' : '',
@@ -50,7 +51,7 @@ export function SectionHeader(props: {
   count?: ReactNode;
   hint?: ReactNode;
   children?: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <div className="sect-head overview-panel-head">
       <h2>{props.title}</h2>
@@ -64,11 +65,11 @@ export function SectionHeader(props: {
 export function HeaderAction(props: {
   href: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return <a className="sect-head-action" href={props.href}>{props.children}</a>;
 }
 
-export function HeaderControls(props: { children: ReactNode }): JSX.Element {
+export function HeaderControls(props: { children: ReactNode }): React.JSX.Element {
   return <div className="sect-head-controls">{props.children}</div>;
 }
 
@@ -76,7 +77,7 @@ type ActionButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   children: ReactNode;
 };
 
-function ActionGlyph(props: { kind: 'plus' | 'refresh' }): JSX.Element {
+function ActionGlyph(props: { kind: 'plus' | 'refresh' }): React.JSX.Element {
   if (props.kind === 'plus') {
     return (
       <svg className="ui-action-icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -92,7 +93,7 @@ function ActionGlyph(props: { kind: 'plus' | 'refresh' }): JSX.Element {
   );
 }
 
-export function CreateActionButton(props: ActionButtonProps): JSX.Element {
+export function CreateActionButton(props: ActionButtonProps): React.JSX.Element {
   const { children, className, type = 'button', ...buttonProps } = props;
   return (
     <button {...buttonProps} type={type} className={['ui-create-action', className].filter(Boolean).join(' ')}>
@@ -105,7 +106,7 @@ export function CreateActionButton(props: ActionButtonProps): JSX.Element {
 export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> & {
   label: string;
   busy?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const { label, busy = false, className, type = 'button', ...buttonProps } = props;
   return (
     <button
@@ -138,7 +139,7 @@ export function InfoTip(props: {
   trigger?: ReactNode;
   preventClick?: boolean;
   focusable?: boolean;
-}): JSX.Element {
+}): React.JSX.Element {
   const tipRef = useRef<HTMLSpanElement | null>(null);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [open, setOpen] = useState(false);
@@ -229,7 +230,7 @@ export function OverflowText(props: {
   popoverClassName?: string;
   showPopover?: boolean;
   durationMs?: number;
-}): JSX.Element {
+}): React.JSX.Element {
   const anchorRef = useRef<HTMLSpanElement | null>(null);
   const [open, setOpen] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
@@ -341,7 +342,7 @@ export function FieldTitle(props: {
   help?: ReactNode;
   helpLabel?: string;
   className?: string;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <span className={['ui-field-title', props.className].filter(Boolean).join(' ')}>
       <span className="ui-field-title-text">{props.children}</span>
@@ -354,24 +355,24 @@ export function OverviewList(props: {
   id?: string;
   className?: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   return <ul className={['overview-list', props.className].filter(Boolean).join(' ')} id={props.id}>{props.children}</ul>;
 }
 
 export function OverviewListItem(props: HTMLAttributes<HTMLLIElement> & {
   kind?: 'session' | 'schedule' | 'group';
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const { kind, className, children, ...rest } = props;
   const kindClass = kind ? `overview-list-item-${kind}` : '';
   return <li {...rest} className={['overview-list-item', kindClass, className].filter(Boolean).join(' ')}>{children}</li>;
 }
 
-export function OverviewListMain(props: { children: ReactNode }): JSX.Element {
+export function OverviewListMain(props: { children: ReactNode }): React.JSX.Element {
   return <div className="overview-list-main">{props.children}</div>;
 }
 
-export function OverviewListTail(props: { children: ReactNode }): JSX.Element {
+export function OverviewListTail(props: { children: ReactNode }): React.JSX.Element {
   return <div className="overview-list-tail">{props.children}</div>;
 }
 
@@ -393,7 +394,7 @@ type DropdownMenuProps<T extends string> = {
   searchEmptyLabel?: ReactNode;
 };
 
-export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
+export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   const detailsRef = useRef<HTMLDetailsElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const [query, setQuery] = useState('');
@@ -508,6 +509,6 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): JSX
   );
 }
 
-export function SortMenu<T extends string>(props: DropdownMenuProps<T>): JSX.Element {
+export function SortMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
   return <DropdownMenu {...props} />;
 }

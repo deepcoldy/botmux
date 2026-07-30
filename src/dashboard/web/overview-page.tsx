@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useStoreSelector, useT } from './react-hooks.js';
@@ -117,7 +118,7 @@ function MateCard({ card }: { card: BotCard }) {
   const needsYou = card.attention.length > 0;
   const busy = card.busy.length > 0;
   const dotClass = needsYou ? 'warn' : busy ? 'busy' : offline ? 'off' : 'ok';
-  let task: JSX.Element | string;
+  let task: React.JSX.Element | string;
   if (needsYou) {
     const a = [...card.attention].sort((x, y) => attentionWaitSince(x) - attentionWaitSince(y))[0];
     task = <><b>{(stripMentionPrefix(a.title) || a.sessionId).slice(0, 60)}</b>{' · '}{attentionReason(a) ?? ''}</>;

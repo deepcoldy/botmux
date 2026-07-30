@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { jget } from './dashboard-api.js';
@@ -109,7 +110,7 @@ function formatBytes(value: number | undefined): string {
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function JsonBlock(props: { value: unknown; empty: string; fullHeight?: boolean }): JSX.Element {
+function JsonBlock(props: { value: unknown; empty: string; fullHeight?: boolean }): React.JSX.Element {
   if (props.value === undefined || props.value === null) return <p className="webhook-log-detail-empty">{props.empty}</p>;
   if (typeof props.value === 'object' && !Array.isArray(props.value) && Object.keys(props.value as object).length === 0) {
     return <p className="webhook-log-detail-empty">{props.empty}</p>;
@@ -117,7 +118,7 @@ function JsonBlock(props: { value: unknown; empty: string; fullHeight?: boolean 
   return <pre className={`webhook-log-json${props.fullHeight ? ' full-height' : ''}`}><code>{JSON.stringify(props.value, null, 2)}</code></pre>;
 }
 
-function TargetFacts(props: { value: TriggerLogEntry['target'] }): JSX.Element {
+function TargetFacts(props: { value: TriggerLogEntry['target'] }): React.JSX.Element {
   const items = [
     ['kind', props.value?.kind],
     ['mode', props.value?.mode],
@@ -146,7 +147,7 @@ function LogFilterMenu<T extends string>(props: {
   value: T;
   options: Array<{ value: T; label: ReactNode }>;
   onChange(value: T): void;
-}): JSX.Element {
+}): React.JSX.Element {
   return (
     <DropdownMenu
       id={props.id}
@@ -161,7 +162,7 @@ function LogFilterMenu<T extends string>(props: {
   );
 }
 
-function MetricCard(props: { label: string; value: string | number; tone?: 'ok' | 'error'; hint?: string }): JSX.Element {
+function MetricCard(props: { label: string; value: string | number; tone?: 'ok' | 'error'; hint?: string }): React.JSX.Element {
   return (
     <article className={`card webhook-log-metric${props.tone ? ` ${props.tone}` : ''}`}>
       <span>{props.label}</span>
@@ -171,7 +172,7 @@ function MetricCard(props: { label: string; value: string | number; tone?: 'ok' 
   );
 }
 
-export function WebhookLogsContent(props: { embedded?: boolean } = {}): JSX.Element {
+export function WebhookLogsContent(props: { embedded?: boolean } = {}): React.JSX.Element {
   const tr = useT();
   const mountedRef = useRef(false);
   const logsRef = useRef<TriggerLogEntry[]>([]);

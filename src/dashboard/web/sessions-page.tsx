@@ -1,3 +1,4 @@
+import type React from 'react';
 import {
   Fragment,
   useCallback,
@@ -203,12 +204,12 @@ function windowStorage(): Storage | undefined {
   return typeof window === 'undefined' ? undefined : window.localStorage;
 }
 
-function StatusBadge(props: { status: unknown }): JSX.Element {
+function StatusBadge(props: { status: unknown }): React.JSX.Element {
   const raw = String(props.status ?? 'unknown');
   return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
 }
 
-function LockChip(props: { row: any }): JSX.Element | null {
+function LockChip(props: { row: any }): React.JSX.Element | null {
   if (!props.row.locked) return null;
   return <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span>;
 }
@@ -222,7 +223,7 @@ function IconActionButton(props: {
   kind?: string;
   disabled?: boolean;
   onClick: (button: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const className = props.className ?? `card-act${props.kind ? ` ${props.kind}` : ''}`;
   return (
     <button
@@ -242,7 +243,7 @@ function IconActionButton(props: {
   );
 }
 
-function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
+function TerminalControls(props: { row: any; url: string | null }): React.JSX.Element | null {
   if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
   const canOpenWritable = shouldOpenWritableTerminal();
   return (
@@ -276,7 +277,7 @@ function TerminalControls(props: { row: any; url: string | null }): JSX.Element 
   );
 }
 
-function ChatScopeLink(props: { row: any; className?: string }): JSX.Element | null {
+function ChatScopeLink(props: { row: any; className?: string }): React.JSX.Element | null {
   const row = props.row;
   if (row.scope !== 'chat' || !row.feishuChatLink) return null;
   return (
@@ -299,7 +300,7 @@ function SortHeader(props: {
   sortKey: string;
   sortDir: 'asc' | 'desc';
   onSort: (key: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const active = props.sortKey === props.sort;
   return (
     <th
@@ -378,7 +379,7 @@ function useDialogVisibility(ref: React.RefObject<HTMLDialogElement | null>, ope
   }, [open, ref]);
 }
 
-function CopyButton(props: { value: string }): JSX.Element {
+function CopyButton(props: { value: string }): React.JSX.Element {
   const [copied, setCopied] = useState(false);
   return (
     <button
@@ -395,7 +396,7 @@ function CopyButton(props: { value: string }): JSX.Element {
   );
 }
 
-function LocateButton(props: { row: any; locateSession: (row: any) => Promise<boolean> }): JSX.Element {
+function LocateButton(props: { row: any; locateSession: (row: any) => Promise<boolean> }): React.JSX.Element {
   const [cooldown, setCooldown] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -422,7 +423,7 @@ function LocateButton(props: { row: any; locateSession: (row: any) => Promise<bo
 
 // Icon variant of LocateButton for board/list cards: same React-owned busy+30s
 // cooldown, but renders the pin icon via IconActionButton (no imperative DOM writes).
-function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): JSX.Element {
+function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boolean> }): React.JSX.Element {
   const [cooldown, setCooldown] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -446,7 +447,7 @@ function LocateIconButton(props: { row: any; onLocate: (row: any) => Promise<boo
   );
 }
 
-export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): JSX.Element {
+export function CliFilterGroup(props: { selected: Set<string>; onToggle: (cli: string, checked: boolean) => void }): React.JSX.Element {
   const checked = CLI_FILTER_OPTIONS.filter(cli => props.selected.has(cli)).length;
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const [query, setQuery] = useState('');
@@ -526,7 +527,7 @@ function SessionsFilters(props: {
   filters: FiltersState;
   idleCleanup: IdleCleanupBarProps;
   setFilters: (updater: (prev: FiltersState) => FiltersState) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const statusOptions = [
     { value: '', label: t('sessions.anyStatus') },
     ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
@@ -659,7 +660,7 @@ function BulkBar(props: {
   onClose: () => void;
   onAddToMonitorRoom: () => void;
   onLock: (locked: boolean) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const busy = !!props.closeProgress || !!props.lockProgress;
   const lockText = props.lockProgress?.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.lockSelected');
   const unlockText = props.lockProgress && !props.lockProgress.locked ? `${props.lockProgress.done}/${props.lockProgress.total}` : t('sessions.unlockSelected');
@@ -682,7 +683,7 @@ function BulkBar(props: {
   );
 }
 
-function IdleCleanupBar(props: IdleCleanupBarProps): JSX.Element {
+function IdleCleanupBar(props: IdleCleanupBarProps): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [draftHours, setDraftHours] = useState<IdleCleanupHours>(props.hours);
   const [popStyle, setPopStyle] = useState<CSSProperties | undefined>();
@@ -852,7 +853,7 @@ function SessionsTable(props: {
   onSelect: (id: string, selected: boolean) => void;
   onSelectAll: (selected: boolean) => void;
   onSort: (key: string) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const selectAllRef = useRef<HTMLInputElement | null>(null);
   useLayoutEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = props.selectAllIndeterminate;
@@ -891,7 +892,7 @@ function SessionsTable(props: {
   };
 
   // 单元格渲染：按列 id 返回对应的 JSX，隐藏列不渲染。
-  function renderCell(row: any, colId: string): JSX.Element | null {
+  function renderCell(row: any, colId: string): React.JSX.Element | null {
     switch (colId) {
       case 'botName':
         return <td data-label={labels.botName}>{botDisplayName(row)}</td>;
@@ -1005,7 +1006,7 @@ function BoardCard(props: {
   onRestart: (row: any, button?: HTMLButtonElement) => void;
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   const row = props.row;
   const title = stripMentionPrefix(row.title) || row.sessionId;
   const botName = botDisplayName(row);
@@ -1095,7 +1096,7 @@ function BoardView(props: {
   onRestart: (row: any, button?: HTMLButtonElement) => void;
   onLock: (row: any, locked: boolean, button?: HTMLButtonElement) => void;
   onClose: (row: any, button?: HTMLButtonElement) => void;
-}): JSX.Element {
+}): React.JSX.Element {
   useEffect(() => {
     if (!props.hidden && !props.animated) props.onAnimated();
   }, [props.animated, props.hidden, props.onAnimated]);
@@ -1215,7 +1216,7 @@ function topicGroupTitle(group: SessionTopicGroup<SessionRow>): string {
   return group.kind === 'chat' ? t('sessions.topic.wholeChat') : t('sessions.topic.singleSession');
 }
 
-export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
+export function TopicGroupsView(props: TopicGroupsViewProps): React.JSX.Element {
   const groups = useMemo(() => groupSessionsByTopic(props.rows), [props.rows]);
   const relationGroups = useMemo(
     () => new Map(groupSessionsByTopic(props.relationRows ?? props.rows).map(group => [group.key, group])),
@@ -1292,7 +1293,7 @@ export function TopicGroupsView(props: TopicGroupsViewProps): JSX.Element {
   );
 }
 
-function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): JSX.Element {
+function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: boolean }): React.JSX.Element {
   const m = props.message;
   const human = m.senderType === 'user';
   const botSender = m.senderType === 'app' || m.senderType === 'bot';
@@ -1315,7 +1316,7 @@ function HistoryBubble(props: { message: any; ownerOpenId?: string; groupStart: 
   );
 }
 
-function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): JSX.Element {
+function HistoryModal(props: { state: HistoryState | null; onClose: () => void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
@@ -1377,7 +1378,7 @@ function HistoryModal(props: { state: HistoryState | null; onClose: () => void }
   );
 }
 
-function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): JSX.Element {
+function TerminalNameEditor(props: { row: any; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -1445,7 +1446,7 @@ function TerminalNameEditor(props: { row: any; onRename: (row: any, title: strin
   );
 }
 
-function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): JSX.Element {
+function TerminalModal(props: { state: TerminalState | null; onClose: () => void; onRename: (row: any, title: string) => void }): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.state);
   const row = props.state ? store.sessions.get(props.state.sessionId) : null;
@@ -1517,7 +1518,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
 }
 
 
-function InsightReport(props: { report: any }): JSX.Element {
+function InsightReport(props: { report: any }): React.JSX.Element {
   const rep = props.report;
   if (!rep || rep.status !== 'ok') {
     const msg = rep?.error?.message ? String(rep.error.message) : String(rep?.status ?? 'error');
@@ -1591,7 +1592,7 @@ function InsightReport(props: { report: any }): JSX.Element {
   );
 }
 
-function InsightPanel(props: { row: any }): JSX.Element | null {
+function InsightPanel(props: { row: any }): React.JSX.Element | null {
   const [state, setState] = useState<{ loading: boolean; report?: any; error?: string } | null>(null);
   useEffect(() => setState(null), [props.row.sessionId]);
   if (!ui.authed) return null;
@@ -1628,7 +1629,7 @@ function Drawer(props: {
   closeSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
   setSessionLocked: (row: any, locked: boolean, button?: HTMLButtonElement) => Promise<boolean>;
   startSession: (row: any, button?: HTMLButtonElement) => Promise<boolean>;
-}): JSX.Element {
+}): React.JSX.Element {
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   useDialogVisibility(dialogRef, !!props.row);
   const row = props.row;
@@ -1700,7 +1701,7 @@ function CreateSessionDialog(props: {
   state: CreateSessionState | null;
   onClose: () => void;
   onSuccess: (body: any) => void;
-}): JSX.Element | null {
+}): React.JSX.Element | null {
   const state = props.state;
   useEffect(() => {
     const dialog = props.dialog;
@@ -2167,7 +2168,7 @@ function CreateSessionDialog(props: {
   );
 }
 
-function SessionsPage(): JSX.Element {
+function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
   const [revision, setRevision] = useState(0);

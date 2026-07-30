@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
@@ -893,7 +894,7 @@ function SettingsModule(props: {
   title: string;
   description: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-module', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -928,7 +929,7 @@ function LarkCliStatus(props: { settings: DashboardSettings['vcMeetingAgent'] })
 function SettingsGroup(props: {
   className?: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-group', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -944,7 +945,7 @@ function SettingsBlock(props: {
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>

@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { FieldTitle, Html, LoadingState, RefreshIconButton, SectionHeader } from './dashboard-components.js';
@@ -130,7 +131,7 @@ function SkillSegmented<T extends string>(props: {
   options: Array<{ value: T; label: ReactNode; help?: ReactNode }>;
   disabled?: boolean;
   onChange(value: T): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const current = props.options.find(option => option.value === props.value);
   return (
     <div className="skills-segmented-control">
@@ -639,7 +640,7 @@ export function RemoveSkillsDialog(props: {
   error: string | null;
   onCancel(): void;
   onConfirm(force: boolean): void;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const names = props.names ?? [];
@@ -1471,7 +1472,7 @@ export function SkillMultiPicker(props: {
   skills: SkillRow[];
   busy: boolean;
   onSave(names: string[]): Promise<void>;
-}): JSX.Element {
+}): React.JSX.Element {
   const tr = useT();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
