@@ -35,6 +35,7 @@ import {
   ensureSessionWhiteboard,
   getAvailableBots,
 } from './session-manager.js';
+import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
@@ -1476,6 +1477,11 @@ export async function handleCommand(
               pendingPrompt.trim().length > 0 ||
               (ds!.pendingAttachments?.length ?? 0) > 0 ||
               (ds!.pendingFollowUps?.length ?? 0) > 0;
+            // Nothing to submit at all (bare `/repo`: the message IS the command).
+            // The CLI boots idle, so the user's NEXT real message is its first
+            // turn and must carry the full new-topic opening — see
+            // markInitialUserTurnPending below.
+            const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (hasBufferedInput) ensureSessionWhiteboard(ds!);
             const wrappedInput = hasBufferedInput
               ? buildNewTopicCliInput(
@@ -1535,6 +1541,11 @@ export async function handleCommand(
             if (pendingRawInput || hasBufferedInput) {
               rememberLastCliInput(ds!, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
             }
+            // Durable, one-shot: the CLI is up but has never received a real user
+            // turn, so the next business message must be built as a NEW TOPIC
+            // (routing + built-in skill discovery + identity), not a follow-up.
+            // Set after the fork so a throwing fork leaves the session untouched.
+            if (emptyStart) markInitialUserTurnPending(ds!);
             ds!.pendingPrompt = undefined;
             ds!.pendingCodexAppText = undefined;
             ds!.pendingCodexAppApplicationContext = undefined;
@@ -1656,6 +1667,10 @@ export async function handleCommand(
             sessionStore.updateSession(ds!.session);
             ds!.hasHistory = false;
             forkWorker(ds!, '', false);
+            // Brand-new CLI in a brand-new session record: it has never seen the
+            // botmux opening context either, so the next real business message
+            // is its new-topic first turn (same invariant as the pending path).
+            markInitialUserTurnPending(ds!);
             try {
               await sessionReply(rootId, t('cmd.repo.switched_to', { name: displayName }, loc));
             } catch (e) {
@@ -2938,8 +2953,50 @@ export async function handleCommand(
           const { collectRelayPickerEntries } = await import('../services/relay-picker.js');
           const entries = await collectRelayPickerEntries(activeSessions, myAppId, targetAnchor, operatorOpenId);
           const { buildRelayPickerCard } = await import('../im/lark/card-builder.js');
-          const card = buildRelayPickerCard(entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined, targetScope, targetChatType);
-          await replyAtInvocation(card, 'interactive');
+          // ── Ephemeral (仅邀请者可见) picker ────────────────────────────────
+          // The picker exposes session metadata — title + source-chat name — to
+          // everyone who can see the message. When the bot runs in privateCard
+          // mode we hide it: send the picker as an ephemeral card visible only to
+          // the invoker.
+          //
+          // Gate on group + privateCard + **chat-scope**. The chat-scope clause
+          // is load-bearing: the ephemeral API (`ephemeral/v1/send`) takes a
+          // `chat_id` only — it has NO thread/root anchor — so a thread-scope
+          // target (话题群 / 话题 inside a 普通群 / new-topic·shared) can't keep the
+          // card in its 话题. A 话题群 rejects with 18053 (→ fall back below), but
+          // a 话题 inside a 普通群 SUCCEEDS and the card escapes to the group top
+          // level. This is the same trap `deliverEphemeralOrReply` (worker-pool)
+          // guards against with a REGRESSION test; PR #164 was the original live
+          // fix. Per 申晗 (2026-07-29): 话题内公开可接受 — so thread-scope pickers
+          // stay on the visible in-thread reply (public card in the 话题), and
+          // ephemeral is scoped to flat 普通群 only, mirroring /card & /close
+          // private cards. p2p has no ephemeral option; an unexpected reject
+          // (18053 etc.) still falls back to the visible reply below.
+          const privatePicker = targetChatType === 'group'
+            && targetScope === 'chat'
+            && getBot(myAppId).config.privateCard === true;
+          const card = buildRelayPickerCard(
+            entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
+            targetScope, targetChatType, privatePicker ? 'private' : 'public',
+          );
+          if (privatePicker) {
+            const { sendEphemeralCard } = await import('../im/lark/client.js');
+            try {
+              await sendEphemeralCard(myAppId, targetChatId, operatorOpenId, card);
+            } catch (err) {
+              // Ephemeral unavailable here (18053 topic / permission / network):
+              // fall back to the visible reply so the picker still works — the
+              // privacy win is best-effort, correctness is not.
+              logger.warn(`[${logTag}] /relay ephemeral picker failed (${err instanceof Error ? err.message : err}); sending visible picker`);
+              const visibleCard = buildRelayPickerCard(
+                entries, targetChatId, targetAnchor, operatorOpenId, loc, undefined,
+                targetScope, targetChatType, 'public',
+              );
+              await replyAtInvocation(visibleCard, 'interactive');
+            }
+          } else {
+            await replyAtInvocation(card, 'interactive');
+          }
           break;
         }
         const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();

@@ -104,6 +104,28 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
+  it('accepts per-turn model + reasoningEffort overrides', () => {
+    const req = request();
+    req.options = { model: 'gpt-5.6-terra', reasoningEffort: 'high' };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+  });
+
+  it('rejects an invalid reasoningEffort value', () => {
+    const req = request();
+    (req.options as any) = { reasoningEffort: 'ultra' };
+    const v = validateTriggerRequest(req);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('rejects a non-string / over-long model', () => {
+    for (const model of [42, 'x'.repeat(201)]) {
+      const req = request();
+      (req.options as any) = { model };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
+  });
+
   it('builds a prompt that labels event data as untrusted', () => {
     const prompt = buildUntrustedEventPrompt(request(), 'trg_1');
     expect(prompt).toContain('untrusted event data');

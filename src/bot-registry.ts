@@ -999,6 +999,19 @@ export interface BotConfig {
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
+  /**
+   * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
+   * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
+   * email entries needing a contact-API resolve every boot), this is stored raw
+   * and never resolved — so it survives a contact-API outage. Two uses:
+   *   1. a fail-safe DM recipient for allowedUsers-resolve failure notices, so
+   *      the owner is reachable even when the resolve that would have produced
+   *      their open_id is the very thing that failed (cold-start race);
+   *   2. an always-available owner anchor for runtime permission checks.
+   * Optional: bots created before this field, or via paths without a scanner
+   * identity, simply have none and fall back to the resolved allowlist.
+   */
+  ownerOpenId?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -2121,6 +2134,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // Only a well-formed native open_id is trusted; anything else (stray on_/
+      // email/garbage) is dropped so the fail-safe recipient can never be a
+      // value that itself needs resolving.
+      ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
+        ? entry.ownerOpenId
+        : undefined,
       allowedChatGroups,
       oncallChats,
       defaultOncall,
@@ -2160,9 +2179,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.receivedReactionEmoji.trim() : undefined,
       doneReactionEmoji: typeof entry.doneReactionEmoji === 'string' && entry.doneReactionEmoji.trim()
         ? entry.doneReactionEmoji.trim() : undefined,
-      // Only 'chat' is meaningful; 'thread' (and anything else) normalizes to
-      // undefined — the legacy thread-per-message default. Keeps bots.json clean.
-      p2pMode: entry.p2pMode === 'chat' ? 'chat' : undefined,
+      // Default is now 'chat' (flat continuous DM session). Only 'thread' is
+      // meaningful and persists; 'chat' (and anything else) normalizes to
+      // undefined so bots.json stays clean.
+      p2pMode: entry.p2pMode === 'thread' ? 'thread' : undefined,
       noCardChats: Array.isArray(entry.noCardChats)
         ? entry.noCardChats.filter((x: any): x is string => typeof x === 'string' && x.trim().length > 0).map((x: string) => x.trim())
         : undefined,
@@ -2180,12 +2200,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
-      // Per-bot regular-group default mode. Only the non-default modes
-      // ('chat-topic' | 'new-topic' | 'shared') are meaningful; 'chat' (the flat
-      // default) and anything else normalize to undefined so bots.json stays clean.
+      // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
+      // 连续会话；群内原生话题各自独立会话), so only the NON-default modes
+      // ('chat' | 'new-topic' | 'shared') are meaningful and persist; 'chat-topic'
+      // and anything else normalize to undefined so bots.json stays clean.
       regularGroupReplyMode: (() => {
         const mode = normalizeChatReplyModeConfig(entry.regularGroupReplyMode);
-        return mode === 'new-topic' || mode === 'shared' || mode === 'chat-topic' ? mode : undefined;
+        return mode === 'chat' || mode === 'new-topic' || mode === 'shared' ? mode : undefined;
       })(),
       // 4-tier @ policy. Only 'topic' | 'never' | 'ambient' are meaningful;
       // 'always' (the default) and anything else normalize to undefined so

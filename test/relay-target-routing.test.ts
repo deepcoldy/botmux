@@ -23,17 +23,19 @@ describe('resolveRelayTargetRouting', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resolveRegularGroupModeMock.mockReturnValue('chat');
-    getBotMock.mockReturnValue({ config: {} });  // default: thread-mode DM
+    getBotMock.mockReturnValue({ config: {} });  // default: chat-mode DM (p2pMode unset)
   });
 
   const base = { larkAppId: 'cli_app', chatId: 'oc_chat' };
 
-  it('DM thread mode (default) top-level → thread-scope seeded on the /relay message', () => {
+  it('DM thread mode (explicit) top-level → thread-scope seeded on the /relay message', () => {
+    getBotMock.mockReturnValue({ config: { p2pMode: 'thread' } });
     const r = resolveRelayTargetRouting({ ...base, chatMode: 'p2p', message: { messageId: 'om_m' } });
     expect(r).toEqual({ scope: 'thread', anchor: 'om_m' });
   });
 
-  it('DM thread mode in-thread reply → thread-scope anchored at rootId (lands in that DM 话题)', () => {
+  it('DM thread mode (explicit) in-thread reply → thread-scope anchored at rootId (lands in that DM 话题)', () => {
+    getBotMock.mockReturnValue({ config: { p2pMode: 'thread' } });
     const r = resolveRelayTargetRouting({
       ...base,
       chatMode: 'p2p',
@@ -58,10 +60,10 @@ describe('resolveRelayTargetRouting', () => {
     expect(r).toEqual({ scope: 'chat', anchor: 'oc_chat' });
   });
 
-  it('DM with unregistered bot (getBot throws) falls back to thread mode', () => {
+  it('DM with unregistered bot (getBot throws) falls back to chat mode (new default)', () => {
     getBotMock.mockImplementation(() => { throw new Error('bot not found'); });
     const r = resolveRelayTargetRouting({ ...base, chatMode: 'p2p', message: { messageId: 'om_m' } });
-    expect(r).toEqual({ scope: 'thread', anchor: 'om_m' });
+    expect(r).toEqual({ scope: 'chat', anchor: 'oc_chat' });
   });
 
   it('real-thread reply → thread-scope anchored at rootId (any group type)', () => {

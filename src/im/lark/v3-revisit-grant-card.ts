@@ -15,6 +15,7 @@
  */
 
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 
 export const V3_REVISIT_GRANT_ACTION = 'v3_revisit_grant';
 
@@ -58,7 +59,7 @@ export function v3RevisitGrantCardNonce(runId: string, sourceNodeId: string, att
 }
 
 function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 export function buildV3RevisitGrantCard(input: V3RevisitGrantCardInput): string {

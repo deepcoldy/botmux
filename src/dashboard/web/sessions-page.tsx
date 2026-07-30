@@ -244,34 +244,34 @@ function IconActionButton(props: {
 
 function TerminalControls(props: { row: any; url: string | null }): JSX.Element | null {
   if (!props.url || !dashboardShellAllowsWebTerminal()) return null;
-  const readOnly = !shouldOpenWritableTerminal();
+  const canOpenWritable = shouldOpenWritableTerminal();
   return (
-    <span className={`term-pill${readOnly ? ' readonly' : ' writable'}`}>
-      {readOnly ? (
-        <a
-          className="term-btn term-open"
-          href={props.url}
-          target="_blank"
-          rel="noopener"
-          data-tip={t('sessions.openTerminal')}
-          aria-label={t('sessions.openTerminal')}
-          onClick={event => event.stopPropagation()}
-          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
-        />
-      ) : (
+    <span className="term-pill">
+      <a
+        className="term-btn term-open"
+        href={props.url}
+        target="_blank"
+        rel="noopener"
+        data-action="terminal"
+        data-tip={t('sessions.openReadonlyTerminal')}
+        aria-label={t('sessions.openReadonlyTerminal')}
+        onClick={event => event.stopPropagation()}
+        dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
+      />
+      {canOpenWritable ? (
         <button
           type="button"
           className="term-btn term-write"
           data-action="write-link"
-          data-tip={t('sessions.openTerminal')}
-          aria-label={t('sessions.openTerminal')}
+          data-tip={t('sessions.openWritableTerminal')}
+          aria-label={t('sessions.openWritableTerminal')}
           onClick={(event) => {
             event.stopPropagation();
             void openWriteLink(props.row, event.currentTarget);
           }}
-          dangerouslySetInnerHTML={rawHtml(ICON.terminal)}
+          dangerouslySetInnerHTML={rawHtml(ICON.key)}
         />
-      )}
+      ) : null}
     </span>
   );
 }
@@ -2725,20 +2725,11 @@ function SessionsPage(): JSX.Element {
       setDrawerSessionId(row.sessionId);
       return;
     }
-    setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: true });
-    void (async () => {
-      let url = readonlyUrl;
-      if (shouldOpenWritableTerminal()) {
-        try {
-          const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/write-link`);
-          const body = await r.json().catch(() => ({}));
-          if (r.ok && body?.ok !== false && body?.url) url = body.url;
-        } catch {
-          // fallback to read-only URL
-        }
-      }
-      setTermState(prev => prev?.sessionId === row.sessionId ? { sessionId: row.sessionId, url, loading: false } : prev);
-    })();
+    setTermState({ sessionId: row.sessionId, url: readonlyUrl, loading: false });
+  }, []);
+
+  const openWritableTerminal = useCallback((row: any, button?: HTMLButtonElement): void => {
+    void openWriteLink(row, button);
   }, []);
 
   const runBulkClose = useCallback(async (): Promise<void> => {
@@ -3225,6 +3216,7 @@ function SessionsPage(): JSX.Element {
                 details: ICON.details,
                 feishu: ICON.feishu,
                 history: ICON.history,
+                key: ICON.key,
                 lock: ICON.lock,
                 restart: ICON.restart,
                 terminal: ICON.terminal,
@@ -3238,6 +3230,7 @@ function SessionsPage(): JSX.Element {
               onNeedTeamBoard={team => { void ensureTeamBoard(team); }}
               onNeedTeams={() => { void loadKanbanTeams(); }}
               onOpenTerminal={dashboardShellAllowsWebTerminal() ? openTerminalModal : undefined}
+              onOpenWritableTerminal={dashboardShellAllowsWebTerminal() && shouldOpenWritableTerminal() ? openWritableTerminal : undefined}
               onRename={(row, title) => { const s = store.sessions.get(String(row.sessionId)); if (s) void persistRename(s, title); }}
               onRestart={(row, button) => { const s = store.sessions.get(String(row.sessionId)); if (s) void restartSession(s, button); }}
               onTeamScope={scope => setTeamScopeText(scope ? t('sessions.kanban.teamScope', { chats: scope.chats, sessions: scope.sessions }) : '')}

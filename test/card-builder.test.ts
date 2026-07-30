@@ -1188,6 +1188,23 @@ describe('buildRelayPickerCard', () => {
     expect(confirmBtn).toMatch(/接力到本单聊|into this DM/);
   });
 
+  it('carries visibility in interactive values (defaults to public, private when passed)', () => {
+    // Default → public (legacy visible-to-all picker).
+    const pub = parse(buildRelayPickerCard(fixtureEntries(2), 'oc_target', 'oc_target', 'ou_invoker_test'));
+    expect(searchInput(pub).behaviors[0].value.visibility).toBe('public');
+    expect(containers(pub)[0].behaviors[0].value.visibility).toBe('public');
+    // Explicit private → carried on every interactive value (search / select /
+    // page / confirm) so the re-render handler knows to delete+resend an
+    // ephemeral card instead of returning a body for in-place patch.
+    const priv = parse(buildRelayPickerCard(
+      fixtureEntries(2), 'oc_target', 'oc_target', 'ou_invoker_test',
+      undefined, { selectedSessionId: 'sess-1' }, 'chat', 'group', 'private',
+    ));
+    expect(searchInput(priv).behaviors[0].value.visibility).toBe('private');
+    expect(containers(priv)[0].behaviors[0].value.visibility).toBe('private');
+    expect(confirmButton(priv)?.behaviors?.[0]?.value?.visibility).toBe('private');
+  });
+
   it('renders "no relayable sessions" notice when entries empty (form still shown)', () => {
     const card = parse(buildRelayPickerCard([], 'oc_target', 'om_target_root', 'ou_invoker_test'));
     const md = card.body.elements.find((e: any) => e.tag === 'markdown');

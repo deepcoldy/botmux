@@ -10,7 +10,7 @@
 
    | 字段 | 怎么填 |
    |------|--------|
-   | Base URL | **必填**。线上 `https://riff.bytedance.net`；BOE 测试环境 `https://riff-infra-boe.bytedance.net` |
+   | Base URL | **必填**。填你所在环境的 riff 服务地址（线上 / BOE 测试环境各一个域名，向 riff 团队或内部文档获取；形如 `https://riff.example.internal`） |
    | 运行环境 | 新任务使用的沙箱资源池：`BOE`（配置值 `boe`）或 `CN`（配置值 `cn`）；不配置时 Riff 默认 `boe`。该选择与 Base URL 所指向的 Riff 服务环境相互独立 |
    | 模型 | **留空**（默认 `gpt-5.5`）；推荐可选：`gpt-5.5` / `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` / `gpt-5.4` / `gpt-5.4-pro`（输入框有下拉建议） |
    | 思考等级 | codex 推理强度（low / medium / high / xhigh），留空跟随默认 medium |
@@ -25,7 +25,7 @@
 ```json
 {
   "riff": {
-    "baseUrl": "https://riff.bytedance.net",
+    "baseUrl": "https://riff.example.internal",
     "sandboxCluster": "cn"
   }
 }
@@ -67,10 +67,10 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 
 ## 仓库怎么进入沙箱
 
-- **自动复用**：会话工作目录是内部仓（code.byted.org）checkout 时，任务自动带上「该仓库 + 当前分支」。分支须已推送；本地未提交/未推送内容沙箱看不到（卡片状态行会提示）。
+- **自动复用**：会话工作目录是内部 Git 仓库 checkout 时，任务自动带上「该仓库 + 当前分支」。分支须已推送；本地未提交/未推送内容沙箱看不到（卡片状态行会提示）。
 - **仓库选择卡**：未配置默认工作目录时新会话弹卡选仓；「🔀 多仓库」可多选——批量建 worktree 全部带入，首仓为主仓（沙箱工作目录）。
 - **新建 worktree**：riff 机器人先自动把新分支 push 到远端再启动任务。
-- **限制**：仅支持 code.byted.org 内部仓库；GitHub 等外部仓自动跳过。
+- **限制**：只有 riff 服务端内部 registry 里的仓库能被 clone；GitHub 等外部仓无法进入沙箱。
 
 ## 卡片按钮说明
 
@@ -85,7 +85,7 @@ python3 -c "import json,os;print(json.load(open(os.path.expanduser('~/.config/ka
 | 现象 | 原因与处理 |
 |------|-----------|
 | 发消息后没回复 | ① JWT 过期（见上）② 模型名不在支持清单（非法值会 400 并回显完整清单）③ 打开「Web 终端」日志页看 `[riff] 错误` 行 |
-| 报「仓库 xxx 不存在」 | Base URL 环境与仓库不匹配，或填了外部仓库；确认是 code.byted.org 上的 `group/repo` |
+| 报「仓库 xxx 不存在」 | Base URL 环境与仓库不匹配，或填了外部仓库；确认是内部 Git 仓库上的 `group/repo` |
 | 保存配置报 invalid_base_url | Base URL 必填且必须以 http(s) 开头 |
 | 继续对话每轮都要几分钟 | 正常应为秒级（follow-up 复用暖沙箱）；若每轮冷启动，检查是否每次 /close 后重开、或配置中途被改 |
 | 状态行里看不到沙箱链接 | 沙箱链接是可写能力，只经「获取操作链接」私密下发，群内状态行/日志不展示 |

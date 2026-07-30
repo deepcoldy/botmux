@@ -63,7 +63,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(prefs.autoStartOnNewTopic).toBe(false);
     expect(prefs.codexAppCleanInput).toBe(false);
     expect(prefs.autoStartOnGroupJoinPrompt).toBe('');
-    expect(prefs.regularGroupReplyMode).toBe('chat');
+    expect(prefs.regularGroupReplyMode).toBe('chat-topic');
     expect(prefs.regularGroupMentionMode).toBe('always');
   });
 
@@ -179,13 +179,14 @@ describe('card-prefs store — 主动开工 fields', () => {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '   ',
       autoStartOnNewTopic: false,
-      regularGroupReplyMode: 'chat',
+      regularGroupReplyMode: 'chat-topic',
     });
 
     const disk = readConfig();
     expect(disk.autoStartOnGroupJoin).toBeUndefined();
     expect(disk.autoStartOnNewTopic).toBeUndefined();
     expect(disk.autoStartOnGroupJoinPrompt).toBeUndefined();
+    // 'chat-topic' is now the default → cleared to undefined so bots.json stays tidy.
     expect(disk.regularGroupReplyMode).toBeUndefined();
 
     const cfg = registry.getBot('app_default').config;

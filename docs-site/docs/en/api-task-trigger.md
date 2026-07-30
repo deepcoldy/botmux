@@ -56,6 +56,10 @@ Hard constraints (all validated; violations return 400):
 - **`envelope.trusted` must be `false`**. This is an injection-defense design: `trusted:false` declares "the envelope content is untrusted external data", so the daemon wraps it as an untrusted event and does not execute instructions embedded inside it. Put what you actually want the bot to do in the top-level `instruction` (the trusted directive), not in the envelope.
 - **Omitting `chatId`** requires `options` to contain either `waitForFinalOutput` or `asyncReturnSessionId`, else `target_required`.
 - **`options.timeoutMs` range `[1000, 300000]`** (1s–5min); out of range returns 400. Defaults to 120000.
+- **`options.model`** / **`options.reasoningEffort`** (optional, **codex / codex-app bots only**): override the model and reasoning level for this trigger.
+  - `model`: a codex model id (≤200 chars); `reasoningEffort`: `low` / `medium` / `high` / `xhigh` (passed to codex verbatim — no downgrade).
+  - **Fresh-session only**: frozen only when this trigger **creates a new session**; a fold-in to an existing worker does not rewrite it.
+  - **Scoped to the codex family**: ignored when the target bot is not codex/codex-app (never changes a Claude/Gemini/CoCo bot's model).
 
 ### Sync mode (waitForFinalOutput)
 
@@ -131,11 +135,11 @@ GET /api/sessions/:sessionId/trigger-result
 | `state` | Meaning | What to do | Key fields |
 |---------|---------|-----------|-----------|
 | `running` | still running | keep polling | — |
-| `completed` | final output ready | terminal; read `output.content` | `output.content`, `finishedAt` |
+| `completed` | final output ready | terminal; read `output.content` (codex-app also brings `usage`) | `output.content`, `finishedAt`, `usage?` |
 | `failed` | session terminated with no captured output (soft terminal) | see below | `errorCode:"no_output"`, `error`, `finishedAt` |
 | `not_found` | no such session (never existed / invalid id) | see two physical forms below | `errorCode:"session_not_found"` |
 
-`completed` example:
+`completed` example (`usage` present only for codex-app, and only when captured):
 
 ```json
 {
@@ -143,11 +147,19 @@ GET /api/sessions/:sessionId/trigger-result
   "state": "completed",
   "triggerId": "trg_87e7b415-...",
   "output": { "content": "ASYNC_DEMO_OK" },
+  "usage": { "inputTokens": 60, "outputTokens": 30, "cacheReadTokens": 40, "cacheCreateTokens": 0 },
   "finishedAt": "2026-07-24T08:43:17.126Z",
   "target": { "kind": "turn", "sessionId": "2eed60c4-...", "chatId": "http_async_..." },
   "async": { "status": "completed", "sessionId": "2eed60c4-...", "completedAt": "..." }
 }
 ```
+
+About `usage` (this turn's token usage, four mutually-exclusive buckets):
+- Present only for **codex-app tasks** and only when the turn's usage was captured; **omitted entirely** for other CLIs (including plain codex) or when not captured.
+- **omit ≠ 0**: no usage means no `usage` field, not four zeros — treat "field absent = unknown", don't read a missing field as a real 0.
+- Buckets: `inputTokens` (fresh input, cache read/write already subtracted), `outputTokens`, `cacheReadTokens`, `cacheCreateTokens`, all per-turn deltas (not session totals).
+- **Survives restart**: after a daemon restart, re-querying a completed session restores `usage` alongside `output` from disk.
+
 
 ### `failed` is a soft terminal — don't kill immediately
 

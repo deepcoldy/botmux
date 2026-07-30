@@ -480,8 +480,11 @@ export function prepareDirectSandbox(opts: {
 
   const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir });
   // The shared empty dir + every empty placeholder file are the ro-bind SOURCES
-  // for deny masks. mode 000 → the mask itself is unreadable/unlistable (a real
-  // deny reads as EPERM, not "empty").
+  // for deny masks: real content hidden + read-only. mode 000 additionally makes
+  // the mask unlistable for a NON-root uid (a real deny, not a listable "empty");
+  // a root uid bypasses DAC (CAP_DAC_OVERRIDE) and can traverse it, but the source
+  // is an EMPTY dir/file so no real content is exposed either way — emptiness, not
+  // the permission bits, is the load-bearing guarantee.
   try { chmodSync(emptyDir, 0o000); } catch { /* */ }
   for (const f of compiled.emptyFiles) {
     try { writeFileSync(f.path, '', { mode: 0o000 }); } catch { /* */ }

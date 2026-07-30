@@ -318,7 +318,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
-    throw new Error('--allowed-users 至少需要一个完整邮箱、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
+    throw new Error('--allowed-users 至少需要一个完整邮箱、手机号（大陆号直填，海外带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
   }
   assertOwnerWhenChatGroups(bot);
   return bot;

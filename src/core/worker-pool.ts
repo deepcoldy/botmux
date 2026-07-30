@@ -464,7 +464,7 @@ function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string },
-): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string } {
+): { cliId: CliId; cliPathOverride?: string; wrapperCli?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' } {
   // Freeze the agent launch config (cli / cliPath / wrapper / model) onto the
   // session the first time a worker forks, so later bot-level edits never
   // retroactively change a live session — same discipline as `sandbox`.
@@ -491,6 +491,7 @@ function sessionAgentConfig(
     cliPathOverride: ds.session.cliPathOverride,
     wrapperCli: ds.session.wrapperCli,
     model: ds.session.model,
+    reasoningEffort: ds.session.reasoningEffort,
   };
 }
 
@@ -2390,6 +2391,7 @@ export function forkWorker(
     fastMode: agentCfg.cliId === 'codex' ? ds.session.fastMode === true : undefined,
     fastServiceTier: agentCfg.cliId === 'codex' ? ds.session.fastServiceTier : undefined,
     fastModeStateVersion: agentCfg.cliId === 'codex' ? ds.session.fastModeStateVersion : undefined,
+    reasoningEffort: agentCfg.reasoningEffort,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
@@ -4211,10 +4213,11 @@ function deliverFinalOutput(
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = completedAt;
+    if (msg.usage) asyncResult.usage = msg.usage;
     // Durably persist the outcome so trigger-result can rebuild `completed`
-    // (with content) after a daemon restart drops the in-memory Map. Stamp the
-    // owning bot for cross-bot isolation.
-    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId);
+    // (with content + usage) after a daemon restart drops the in-memory Map.
+    // Stamp the owning bot for cross-bot isolation.
+    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
     return;
@@ -4599,7 +4602,7 @@ export function adoptSandboxBlocked(
     || sandboxEnabled();
 }
 
-export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean }): void {
+export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata?: boolean; prompt?: string; turnId?: string }): void {
   const cb = requireCallbacks();
   const workerPath = join(__dirname, '..', 'worker.js');
   const t = tag(ds);
@@ -4729,15 +4732,26 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
   //     from there (cursor-agent never calls `botmux send`).
   // Other CLIs fall back to legacy screen-capture only.
   const adoptedCliId = adopted.cliId ?? 'claude-code';
-  if (adopted.source === 'herdr' && adoptedCliId === 'claude-code' && !adopted.sessionId) {
+  // Claude adopt needs a sessionId to compute bridgeJsonlPath (the worker's
+  // claude branch starts its transcript bridge ONLY from bridgeJsonlPath — it
+  // has no by-pid fallback like codex/traex/cursor). Discovery resolves the
+  // sessionId up front for the common case, but it can still come back empty:
+  //   • herdr `agent list` exposes no pid, so a claude with no agent_session
+  //     binding has nothing to key ~/.claude/sessions/<pid>.json off;
+  //   • tmux discovery can record a launcher pid (node/ttadk/aiden wrapping
+  //     claude) when the real-CLI-pid resolver hasn't found the child yet.
+  // In BOTH cases fall back to the unique claude session for this cwd. Applies
+  // to every adopt source (not just herdr) since the tmux path hits the same
+  // undefined-sessionId → no-bridge → replies-never-return failure.
+  if (adoptedCliId === 'claude-code' && !adopted.sessionId) {
     const claudeMeta = findUniqueClaudeSessionByCwd(adopted.cwd);
     if (claudeMeta?.sessionId) {
       adopted.sessionId = claudeMeta.sessionId;
       if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = claudeMeta.sessionId;
       sessionStore.updateSession(ds.session);
-      logger.info(`[${t}] Resolved Claude session for adopted herdr target by cwd`);
+      logger.info(`[${t}] Resolved Claude session for adopted ${adopted.source ?? 'tmux'} target by cwd`);
     } else {
-      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted herdr target; final replies may be unavailable`);
+      logger.warn(`[${t}] Cannot resolve unique Claude session for adopted ${adopted.source ?? 'tmux'} target; final replies may be unavailable`);
     }
   }
   const hasCliPid = typeof adopted.originalCliPid === 'number';
@@ -4764,7 +4778,19 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
-    prompt: '',
+    // Adopt is normally observe-only (prompt=''), driven later by 'message'
+    // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
+    // — crash, or the "adopted session ended" kill path) must carry that turn's
+    // input so it isn't dropped: the daemon's worker-null branch now routes
+    // adopt sessions here instead of forkWorker (which would spawn a fresh
+    // bmx-* CLI and lose bridge semantics). The init handler queues this prompt
+    // into pendingMessages and the adopt idle detector (setupAdoptIdleDetection
+    // → markPromptReady) flushes it to the observed pane, exactly like a
+    // live-worker follow-up. Content is already bridge-formatted by the caller
+    // (buildReforkCliInput → buildBridgeInputContent), so no <user_message>
+    // wrapper leaks into the user's un-injected external CLI.
+    prompt: opts?.prompt ?? '',
+    turnId: opts?.turnId,
     resume: false,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,

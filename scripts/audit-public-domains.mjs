@@ -18,18 +18,15 @@ const textExtensions = new Set([
   '.html', '.css', '.sh', '.kdl',
 ]);
 const allowedHosts = new Set([
-  // Documented public integrations (keep intentional).
-  'riff.bytedance.net',
-  'riff-infra-boe.bytedance.net',
-  'code.byted.org',
-  'tosv.byted.org',
+  // Empty by design: no corporate deployment host should appear in the public
+  // tree. Repo specs are host-agnostic and install sources live in internal
+  // docs — so any bytedance.net / byted.org hit here is a regression to fix,
+  // not to allowlist. Add an entry only for a deliberately public integration.
 ]);
 // Require at least one label so bare corporate TLD mentions in assertions/comments
 // do not trip the gate; catch accidental private subdomains under either suffix.
 const hostnamePattern = /\b(?:[a-z0-9-]+\.)+(?:bytedance\.net|byted\.org)\b/gi;
-const allowedHostSuffixes = [
-  '.ai-sandbox-boe.byted.org',
-];
+const allowedHostSuffixes = [];
 const generatedDirectories = new Set(['node_modules', 'dist', 'doc_build']);
 const selfPath = fileURLToPath(import.meta.url);
 

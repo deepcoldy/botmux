@@ -11,11 +11,12 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
-import { config } from './config.js';
+import { config, isWildcardBindHost } from './config.js';
 import { listenWithProbe } from './utils/listen-with-probe.js';
 import {
   generateToken, parseCookie, buildSetCookie, verifyHmac, cliAuthBind, decideDashboardAuth,
-  loadPersistedToken, persistToken, loadDashboardSecret, loadOrCreateDashboardSecret,
+  loadPersistedToken, loadOrCreatePersistedToken, persistToken,
+  loadDashboardSecret, loadOrCreateDashboardSecret,
 } from './dashboard/auth.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
@@ -232,8 +233,9 @@ function loadOrCreateSecret(): string {
 }
 
 // The active dashboard token is persisted to disk so a previously-issued
-// dashboard URL survives `botmux restart`; only `botmux dashboard` (the
-// /__cli/rotate endpoint) rotates it and thereby invalidates the old link.
+// dashboard URL survives `botmux restart`. A platform-bound dashboard creates
+// the first token on startup; only `botmux dashboard` (the /__cli/rotate
+// endpoint) replaces it and thereby invalidates the old link.
 // The start/restart hint reads it via the non-rotating /__cli/current endpoint
 // so it can show the live link without invalidating it.
 let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
@@ -243,10 +245,6 @@ let activeToken: string | null = loadPersistedToken(TOKEN_PATH);
 let boundDashboardPort = config.dashboard.port;
 
 const SECRET = loadOrCreateSecret();
-
-function isWildcardBindHost(host: string): boolean {
-  return host === '0.0.0.0' || host === '::' || host === '';
-}
 
 function tcpPortAvailable(host: string, port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -528,6 +526,8 @@ interface ResolvedDashboardSettings {
     workerOnline: boolean;
     lastError: { at: string; message: string; retryAt: string } | null;
   };
+  /** Experimental anti-resend guidance in botmux routing hints. Default OFF. */
+  noVisibleOutputHint: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -1046,6 +1046,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       workerOnline: isCodexNotifierWorkerStateFresh(codexNotifierState),
       lastError: codexNotifierState?.lastError ?? null,
     },
+    noVisibleOutputHint: dashboard.noVisibleOutputHint === true, // default OFF; opt-in anti-resend guidance
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
@@ -4615,8 +4616,8 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/p2p-mode — proxy to that bot's daemon. Body
-    // `{ p2pMode: 'chat' | 'thread' }` ('chat' = flat continuous DM session;
-    // anything else clears back to the per-message thread default).
+    // `{ p2pMode: 'chat' | 'thread' }` ('thread' = per-message DM session;
+    // anything else clears back to the flat continuous chat default).
     let mBotP2pMode: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotP2pMode = url.pathname.match(/^\/api\/bots\/([^/]+)\/p2p-mode$/))) {
       const appId = decodeURIComponent(mBotP2pMode[1]);
@@ -5189,6 +5190,10 @@ function startPlatformTunnelIfBound(): void {
   try {
     const binding = readPlatformBinding();
     if (!binding) return;
+    if (!activeToken) {
+      activeToken = loadOrCreatePersistedToken(TOKEN_PATH);
+      logger.info('[platform-tunnel] 已初始化 dashboard token');
+    }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
       binding,

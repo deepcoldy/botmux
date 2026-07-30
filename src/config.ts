@@ -21,16 +21,29 @@ function nonBlankHost(value: string | undefined): string | undefined {
   return value?.trim() || undefined;
 }
 
+/** A wildcard bind (0.0.0.0 / :: / '') isn't a reachable address, so a link must
+ *  resolve it to a concrete IP; a specific host is advertised verbatim. */
+export function isWildcardBindHost(host: string): boolean {
+  return host === '0.0.0.0' || host === '::' || host === '';
+}
+
 const configuredWebExternalHost = nonBlankHost(process.env.WEB_EXTERNAL_HOST);
 const configuredDashboardExternalHost =
   nonBlankHost(process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST) ?? configuredWebExternalHost;
+const configuredDashboardBindHost = nonBlankHost(process.env.BOTMUX_DASHBOARD_HOST);
 
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();
 }
 
 export function getDashboardExternalHost(): string {
-  return configuredDashboardExternalHost ?? getLocalIp();
+  // Explicit external host → the actual (non-wildcard) listen host → LAN IP.
+  // A 127.0.0.1 bind must link to 127.0.0.1, not a LAN IP nothing listens on.
+  if (configuredDashboardExternalHost) return configuredDashboardExternalHost;
+  if (configuredDashboardBindHost && !isWildcardBindHost(configuredDashboardBindHost)) {
+    return configuredDashboardBindHost;
+  }
+  return getLocalIp();
 }
 
 /**
@@ -282,6 +295,14 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Live getter (like codexRpcInputDefault): re-reads the experimental global
+  // toggle that gates the "no visible output" anti-resend guidance in the botmux
+  // routing hints, so a Settings change takes effect on the next session without
+  // a daemon restart. Default OFF (absent ⇒ disabled): the guidance mainly helps
+  // when Claude Code (≥2.1.212) drives a non-Claude backend model that misreads a
+  // thinking-only nudge as a send failure; it is harmless but unnecessary for the
+  // common all-Claude setup, so operators opt in explicitly.
+  get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

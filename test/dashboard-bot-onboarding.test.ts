@@ -425,6 +425,48 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('submitOwner accepts a resolvable mobile owner and queries the mobiles field (not emails)', async () => {
+    // Regression for the P2 where detectUnusableOwnerEntries sent a mobile into
+    // the `emails` query → code 0 + empty user_list → a valid mobile owner was
+    // wrongly rejected as "unusable". The mobile must go through the `mobiles`
+    // field, and a resolvable one must be accepted.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-mobile-'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({
+        ok: true,
+        appId: 'cli_new',
+        appSecret: 'super-secret-value',
+        brand: 'feishu',
+        userOpenId: 'ou_owner',
+      }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+    const job = manager.start();
+    await job.done;
+    expect(manager.get(job.id)?.status).toBe('needs_owner');
+
+    // 该手机号在本企业可解析 → usable → 通过。
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ mobile: '13011112222', user_id: 'ou_resolved_mobile' }] },
+    });
+    const r = await manager.submitOwner(job.id, ['13011112222']);
+    expect(r.ok).toBe(true);
+    expect(manager.get(job.id)?.status).toBe('completed');
+
+    // 关键断言：查询走的是 mobiles 字段（不是 emails），否则合法手机号会被误拒。
+    expect(batchGetIdMock).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ mobiles: ['13011112222'] }) }),
+    );
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_new', allowedUsers: ['13011112222'] });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('restores a needs_owner job after a dashboard restart and then completes it', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-restart-'));
     const botsJsonPath = join(dir, 'bots.json');

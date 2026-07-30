@@ -465,6 +465,58 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
+describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {
+  // A tmux-adopted claude-code session whose bridge worker has exited. When a
+  // new Lark turn arrives, the daemon's worker-null branch now routes adopt
+  // sessions to forkAdoptWorker (not forkWorker, which would spawn a fresh
+  // bmx-* CLI and lose bridge semantics). forkAdoptWorker must carry that
+  // turn's prompt + turnId into the init so the worker delivers it to the
+  // observed pane instead of dropping it.
+  function makeAdoptDs(): DaemonSession {
+    return makeDs({
+      adoptedFrom: {
+        source: 'tmux',
+        tmuxTarget: 'work:0.0',
+        originalCliPid: 4242,
+        sessionId: 'sess-adopt-live',
+        cliId: 'claude-code',
+        cwd: '/repo',
+        paneCols: 200,
+        paneRows: 50,
+      },
+    });
+  }
+
+  it('forwards the re-fork prompt + turnId into the adopt init (not dropped)', () => {
+    const ds = makeAdoptDs();
+    forkAdoptWorker(ds, { prompt: '<bridge>hello from Lark</bridge>', turnId: 'om_refork_turn' });
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      adoptMode: true,
+      adoptSource: 'tmux',
+      adoptTmuxTarget: 'work:0.0',
+      cliId: 'claude-code',
+      prompt: '<bridge>hello from Lark</bridge>',
+      turnId: 'om_refork_turn',
+    }));
+  });
+
+  it('defaults to an observe-only empty prompt when no turn rides along (restore path)', () => {
+    const ds = makeAdoptDs();
+    forkAdoptWorker(ds, { restoredFromMetadata: true });
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      adoptMode: true,
+      prompt: '',
+    }));
+    expect(init.turnId).toBeUndefined();
+  });
+});
+
 describe('session.start lifecycle integration', () => {
   it('emits session.start after forkWorker spawns a worker', () => {
     forkWorker(makeDs(), 'hello', false);

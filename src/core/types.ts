@@ -222,6 +222,7 @@ export interface DaemonSession {
     createdAt: number;
     completedAt?: number;
     content?: string;
+    usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;
   /** Stable turn ids whose automatic transcript fallback is capture/discard.

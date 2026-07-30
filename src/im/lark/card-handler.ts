@@ -71,6 +71,7 @@ import * as sessionStore from '../../services/session-store.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
+import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
@@ -454,8 +455,14 @@ export async function commitRepoSelection(
         pendingPrompt.trim().length > 0 ||
         (ds.pendingAttachments?.length ?? 0) > 0 ||
         (ds.pendingFollowUps?.length ?? 0) > 0;
+      // Nothing to submit at all (session created by a bare `/repo`, i.e. the
+      // message IS the command). Boot the CLI idle instead of burning an empty
+      // `<user_message>` opening on it, and mark the session so the user's NEXT
+      // real message becomes the new-topic first turn. Mirrors the text
+      // `/repo` path in command-handler's forkPendingCli.
+      const emptyStart = !pendingRawInput && !hasBufferedInput;
       if (!pendingRawInput || hasBufferedInput) ensureSessionWhiteboard(ds);
-      const wrappedInput = (!pendingRawInput || hasBufferedInput)
+      const wrappedInput = hasBufferedInput
         ? buildNewTopicCliInput(
             pendingPrompt,
             ds.session.sessionId,
@@ -508,8 +515,11 @@ export async function commitRepoSelection(
           forkWorker(ds, '', false);
         } else if (pendingTurnId && hasBufferedInput) {
           forkWorker(ds, prompt, { turnId: pendingTurnId });
-        } else {
+        } else if (hasBufferedInput) {
           forkWorker(ds, prompt);
+        } else {
+          // Empty start — idle boot, no turn submitted.
+          forkWorker(ds, '', false);
         }
       } catch (e) {
         ds.pendingRepo = true;
@@ -517,7 +527,12 @@ export async function commitRepoSelection(
         publishAttentionPatch(ds);
         throw e;
       }
-      rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
+      if (pendingRawInput || hasBufferedInput) {
+        rememberLastCliInput(ds, pendingRawInput ?? pendingPrompt, pendingRawInput ?? wrappedInput);
+      }
+      // Durable, one-shot: the CLI is up but has never received a real user turn.
+      // Set after the fork so a throwing fork leaves the session untouched.
+      if (emptyStart) markInitialUserTurnPending(ds);
       ds.pendingPrompt = undefined;
       ds.pendingCodexAppText = undefined;
       ds.pendingCodexAppApplicationContext = undefined;
@@ -655,6 +670,9 @@ export async function commitRepoSelection(
     ds.lastScreenContent = undefined;
     ds.lastScreenStatus = undefined;
     forkWorker(ds, '', false);
+    // Brand-new CLI in a brand-new session record: the next real business
+    // message is its new-topic first turn (same invariant as the pending path).
+    markInitialUserTurnPending(ds);
     if (!opts?.suppressConfirmReply) {
       try {
         await sessionReply(rootId, t('cmd.repo.switched_to', { name: dirLabel }, locTarget));
@@ -738,17 +756,19 @@ export async function runAutoWorktreeCommit(deps: {
 /**
  * Drive a host-overload降压 sweep across daemons.
  *
- * `suspend_idle` fans out to EVERY online daemon and sums the affected counts —
- * live workers only exist in their owning daemon's process, so each must sweep
- * its own. `clean_stopped` operates on the SHARED, machine-wide session store,
- * so ONE daemon does the whole job: it tries daemons in order until the first
- * one succeeds (not a fixed `daemons[0]`, so a single flaky descriptor doesn't
- * sink the action while healthy siblings sit idle). Fanning clean_stopped out
- * would make siblings race the same zombies and double-count them.
+ * Both modes fan out to EVERY online daemon and sum the affected counts. Each
+ * daemon owns one bot-scoped session store and its own live workers, so neither
+ * stopped sessions nor idle workers can be swept through a sibling daemon.
  *
- * Throws when there are no online daemons, or when every attempt failed — so
- * the caller rolls back the nonce instead of burning the button on an action
- * that never ran. A partial success (≥1 daemon ok) returns normally.
+ * Fail-closed on partial failure: if ANY discovered daemon doesn't ACK, throw —
+ * the caller then rolls back the nonce (releaseOverloadNonce) so the owner can
+ * retry, instead of burning the button on a card that reports「已清理 0」while
+ * the daemon that actually held the zombies never ran. Both sweeps are
+ * idempotent (an already-closed session leaves the stopped set; an already-
+ * suspended worker leaves the idle set), so a retry only re-hits whatever
+ * failed. Reporting a partial count as a completed action would resurrect the
+ * exact "显示 0、实际没清" symptom this fix exists to kill — just triggered by
+ * "the daemon holding the zombies failed" instead of "the first daemon had none".
  */
 async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
@@ -771,32 +791,21 @@ async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promis
     }
   };
 
-  if (mode === 'clean_stopped') {
-    // Machine-wide (shared store): try daemons in order, stop at the first
-    // success. Only if EVERY daemon failed do we throw (→ nonce rollback).
-    for (const d of daemons) {
-      const n = await postSweep(d);
-      if (n !== null) return n;
-    }
-    throw new Error(`sweep clean_stopped reached no daemon (${daemons.length} failed)`);
-  }
-
-  // suspend_idle: fan out to all daemons and sum. Throw only if not one acked.
-  let affected = 0;
-  let ok = 0;
+  // Fan out to all daemons and sum. Fail the whole action if ANY didn't ACK, so
+  // the caller keeps the button retriable rather than reporting a partial sweep
+  // as complete.
   const results = await Promise.all(daemons.map(postSweep));
-  for (const n of results) {
-    if (n !== null) { affected += n; ok++; }
+  const failed = results.filter(n => n === null).length;
+  if (failed > 0) {
+    throw new Error(`sweep ${mode}: ${failed}/${daemons.length} daemon(s) did not ack — retriable`);
   }
-  if (ok === 0) throw new Error(`sweep suspend_idle reached no daemon (${daemons.length} failed)`);
-  return affected;
+  return results.reduce((sum: number, n) => sum + (n ?? 0), 0);
 }
 
 /**
- * Machine-wide counts for the overload alert preview. `stopped` (zombies) reads
- * the SHARED session store, so every daemon returns the same number → take the
- * max (any one authoritative). `idle` live workers are per-owning-daemon → sum.
- * Best-effort: an unreachable daemon just contributes 0.
+ * Machine-wide counts for the overload alert preview. Each daemon reports its
+ * bot-scoped stopped sessions and its own live workers, so both fields must be
+ * summed. Best-effort: an unreachable daemon just contributes 0.
  */
 export async function countHostOverload(): Promise<{ stopped: number; idle: number }> {
   const daemons = listOnlineDaemons();
@@ -807,7 +816,7 @@ export async function countHostOverload(): Promise<{ stopped: number; idle: numb
       const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/counts', { method: 'GET' });
       const body: any = await res.json().catch(() => ({}));
       if (res.ok && body?.ok) {
-        if (typeof body.stopped === 'number') stopped = Math.max(stopped, body.stopped);
+        if (typeof body.stopped === 'number') stopped += body.stopped;
         if (typeof body.idle === 'number') idle += body.idle;
       }
     } catch { /* unreachable daemon contributes 0 */ }
@@ -1153,6 +1162,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // session's chatType for DM targets. Default 'group' covers legacy cards.
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
     const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
+    const cardVisibility = (value.visibility as 'private' | 'public') ?? 'public';
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!targetChatId || !targetRootId || !operatorOpenId) {
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'missing_value' }, loc) } };
@@ -1215,7 +1225,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       },
       targetScope,
       targetChatType,
+      cardVisibility,
     );
+    // ── Private (ephemeral) picker: delete-then-resend ────────────────────
+    // Ephemeral cards CANNOT be PATCH-updated (Feishu legacy interface), so we
+    // can't return a body for the dispatcher to patch in place. Instead delete
+    // the clicked card and resend a fresh ephemeral one carrying the new state
+    // — the same send→interact→delete→resend pattern Feishu documents for
+    // ephemeral flows. Resend FIRST, then delete the old one, so a resend
+    // failure doesn't leave the user with no card at all. The toast keeps the
+    // callback response non-empty (returning {} would make Lark show nothing).
+    if (cardVisibility === 'private') {
+      const { sendEphemeralCard, deleteEphemeralCard } = await import('./client.js');
+      try {
+        await sendEphemeralCard(larkAppId, targetChatId, invokerOpenId ?? operatorOpenId, cardJson);
+        if (cardMessageId) {
+          await deleteEphemeralCard(larkAppId, cardMessageId).catch(() => { /* stale card lingering is cosmetic */ });
+        }
+        // No card body returned — the replacement is already sent. An empty
+        // response is fine here (the new ephemeral card is the user-visible
+        // result); a toast would double up with the freshly-rendered card.
+        return;
+      } catch (err) {
+        logger.warn(`[card-action] relay private picker re-render failed (${err instanceof Error ? err.message : err}); leaving old card in place`);
+        return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: 'ephemeral_refresh_failed' }, loc) } };
+      }
+    }
     // Return an updated card body — event-dispatcher wraps this as
     // { card: { type: 'raw', data: <body> } } so Lark patches the picker
     // in place rather than appending a new message.
@@ -1342,6 +1377,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // field and default to 'group' (their pickers never offered DM targets).
     const targetScope = (value.target_scope as 'thread' | 'chat') ?? 'chat';
     const targetChatType = (value.target_chat_type as 'group' | 'p2p') ?? 'group';
+    const cardVisibility = (value.visibility as 'private' | 'public') ?? 'public';
     const targetAnchor = targetScope === 'chat' ? targetChatId : targetRootId;
     const invokerOpenId = value.invoker_open_id as string | undefined;
     if (!sourceSessionId || !targetChatId || !targetRootId) {
@@ -1467,8 +1503,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'error', content: t('card.relay.toast_failed', { error: r.error }, loc) } };
     }
     // Best-effort: remove the picker card now that the selection resolved.
+    // Ephemeral (private) pickers need the ephemeral-delete endpoint —
+    // deleteMessage (im/v1/messages) doesn't apply to ephemeral message ids.
     if (cardMessageId && larkAppId) {
-      deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      if (cardVisibility === 'private') {
+        const { deleteEphemeralCard } = await import('./client.js');
+        deleteEphemeralCard(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      } else {
+        deleteMessage(larkAppId, cardMessageId).catch(() => { /* leave it */ });
+      }
     }
     return { toast: { type: 'success', content: t('card.relay.toast_success', undefined, loc) } };
   }
@@ -2646,7 +2689,24 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return discoverAdoptableZellijSessions(botCfg.cliId)
           .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
       }
-      const { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+      const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
+
+      const matchesSelected = (s: import('../../core/session-discovery.js').AdoptableSession) => selected.key
+        ? adoptTargetKey(s) === selected.key
+        : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid;
+
+      // 快路径：卡片 option 里已经带着 tmux 地址，先只解析那一个 pane。
+      // 全量扫描要对每个 pane 走进程树、且树里每个节点都拉一次全量 `ps`，pane 一多
+      // 就是数秒级同步阻塞（31 个 pane 实测 5.4s）。这里是卡片回调，飞书只给 3s
+      // 且**不会重推**，超时用户就看到「目标回调服务超时未响应」；更糟的是同步
+      // execSync 会把事件循环整个冻住，连 2500ms 提前 ACK 的保险丝都发不出去。
+      // 只收窄候选集、判定谓词与全量路径完全一致，没命中就原样回落全量扫描，
+      // 因此不改变任何既有结果，最差只多一次廉价的 tmux display。
+      if (selected.source !== 'herdr' && selected.tmuxTarget) {
+        const fast = discoverAdoptableSessionByTarget(selected.tmuxTarget, botCfg.cliId);
+        if (fast && matchesSelected(fast)) return fast;
+      }
+
       const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
         const target = active.session.persistentBackendTarget;
         return active.session.status === 'active'
@@ -2659,9 +2719,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return excludeOwnedHerdrAdoptTargets(
         discoverAdoptableSessions(botCfg.cliId),
         ownedHerdrTargets,
-      ).find(s => selected.key
-          ? adoptTargetKey(s) === selected.key
-          : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid);
+      ).find(matchesSelected);
     }
     // Discovery scans a live process tree and can transiently miss a pane under
     // load (a racing `ps` snapshot); retry a few times before giving up so a

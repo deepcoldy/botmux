@@ -29,6 +29,14 @@ const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync 
 const { join } = require('node:path');
 if (process.env.FAKE_AB_FAIL === '1') { process.stderr.write('needs login\\n'); process.exit(1); }
 if (process.env.FAKE_AB_EMPTY === '1') { process.exit(0); }
+// Simulate an expired download credential: print the interactive-auth prompt,
+// then poll "forever" (never touch stdin) — mirrors real agentbuddy so the
+// wrapper must detect the prompt and kill, not wait out the timeout.
+if (process.env.FAKE_AB_LOGIN_HANG === '1') {
+  process.stdout.write('[INFO] Downloading...\\nNo valid credentials. Logging in...\\n\\n  To login, open this URL in any browser:\\n  https://host/auth/api/v1/lark/login?session=X\\n\\n  Waiting for authorization...\\n');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000);
+  process.exit(0);
+}
 const argv = process.argv.slice(2);
 const TEL_START = '<!-- @telemetry:start -->';
 const TEL_END = '<!-- @telemetry:end -->';
@@ -90,6 +98,7 @@ describe('agentbuddy skill install', () => {
     vi.stubEnv('BOTMUX_AGENTBUDDY_CMD', `node ${fakeBin}`);
     vi.stubEnv('FAKE_AB_FAIL', '');
     vi.stubEnv('FAKE_AB_EMPTY', '');
+    vi.stubEnv('FAKE_AB_LOGIN_HANG', '');
     vi.stubEnv('FAKE_AB_TELEMETRY', '');
     vi.stubEnv('FAKE_AB_SCRUB_NOOP', '');
     vi.stubEnv('FAKE_AB_DELAY_MS', '');
@@ -195,6 +204,35 @@ describe('agentbuddy skill install', () => {
   it('errors when the CLI produces no skill', () => {
     vi.stubEnv('FAKE_AB_EMPTY', '1');
     expect(() => installAgentbuddySkill({ group: 'g/h', skill: 'deploy' })).toThrow(/agentbuddy_no_skill_produced/);
+  });
+
+  it('fails fast (no timeout hang) when the download credential is expired and agentbuddy drops to interactive login', async () => {
+    vi.stubEnv('FAKE_AB_LOGIN_HANG', '1');
+    // Big timeout: if we waited it out the test would take 30s. The prompt
+    // detector must kill the child and reject almost immediately.
+    vi.stubEnv('BOTMUX_AGENTBUDDY_TIMEOUT_MS', '30000');
+    const started = performance.now();
+    await expect(installAgentbuddySkillAsync({ group: 'g/h', skill: 'deploy' })).rejects.toThrow(/agentbuddy_login_required/);
+    expect(performance.now() - started).toBeLessThan(5000);
+    expect(readSkillRegistry().skills.deploy).toBeUndefined();
+  });
+
+  it('fails fast even when a shim grandchild (npx-style) holds the pipes open', async () => {
+    // Reproduces the real deploy shape: BOTMUX_AGENTBUDDY_CMD is a shim
+    // (`npx agentbuddy@latest …`) whose grandchild is the real CLI. Killing only
+    // the direct child leaves the grandchild alive holding stdout/stderr, so
+    // 'close' never fires — the runner must kill the whole process group and
+    // settle on 'exit'. The shim runs the login-hang fake WITHOUT exec, so node
+    // is a true grandchild that would outlive a direct-child-only kill.
+    const shim = join(mkdtempSync(join(tmpdir(), 'botmux-ab-shim-')), 'shim.sh');
+    writeFileSync(shim, `#!/bin/bash\nnode ${fakeBin} "$@"\n`, { mode: 0o755 });
+    vi.stubEnv('BOTMUX_AGENTBUDDY_CMD', shim);
+    vi.stubEnv('FAKE_AB_LOGIN_HANG', '1');
+    vi.stubEnv('BOTMUX_AGENTBUDDY_TIMEOUT_MS', '30000');
+    const started = performance.now();
+    await expect(installAgentbuddySkillAsync({ group: 'g/h', skill: 'deploy' })).rejects.toThrow(/agentbuddy_login_required/);
+    expect(performance.now() - started).toBeLessThan(8000);
+    expect(readSkillRegistry().skills.deploy).toBeUndefined();
   });
 
   it('serializes concurrent same-identifier installs (no staging clobber)', async () => {

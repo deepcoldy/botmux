@@ -174,10 +174,13 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('forces the first prompt for non-type-ahead adapters at the hard timeout', () => {
-    // THE HERMES FIX (hard-timeout path): previously the hard cap only logged
-    // "forcing queued message flush" and flushed for type-ahead adapters only;
-    // non-type-ahead adapters (Hermes) never delivered. The release must now
-    // route non-type-ahead adapters to markPromptReady() (which then flushes).
+    // Hard-timeout path (originally "THE HERMES FIX"): previously the hard cap
+    // only logged "forcing queued message flush" and flushed for type-ahead
+    // adapters only; non-type-ahead adapters never delivered. The release must
+    // now route non-type-ahead adapters to markPromptReady() (which then
+    // flushes). (Hermes drove this originally; it no longer arms the gate — see
+    // hermes.ts — but the mechanism still guards any non-type-ahead ready-gated
+    // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
     const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
@@ -194,13 +197,14 @@ describe('worker pipe initial screen ordering', () => {
 
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
-    // releaseReadyGate from the real signal is skipped entirely. A CLI whose
-    // cold start exceeds READY_SIGNAL_TIMEOUT_MS (Hermes: 2-3 min) would then
-    // never take the authoritative markPromptReady path. The session_ready case
-    // must detect the late arrival (gate armed + already received) and mark
-    // prompt-ready directly for authoritative non-Claude signals. Claude waits
-    // for post-hook prompt evidence instead. Both paths are limited to the
-    // first-prompt phase, so clear/compact SessionStart stays a no-op.
+    // releaseReadyGate from the real signal is skipped entirely. A ready-gated
+    // CLI whose cold start exceeds READY_SIGNAL_TIMEOUT_MS would then never take
+    // the authoritative markPromptReady path. The session_ready case must detect
+    // the late arrival (gate armed + already received) and mark prompt-ready
+    // directly for authoritative non-Claude signals. Claude waits for post-hook
+    // prompt evidence instead. Both paths are limited to the first-prompt phase,
+    // so clear/compact SessionStart stays a no-op. (Hermes drove this originally
+    // via its 2-3 min cold start; it no longer arms the gate — see hermes.ts.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const sessionReadyCase = source.indexOf("case 'session_ready'");
     const lateCheckIdx = source.indexOf('readyGate.isArmed && readyGate.isReceived', sessionReadyCase);

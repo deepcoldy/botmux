@@ -73,12 +73,17 @@ describe('plugin MCP Gateway', () => {
     };
   }
 
-  async function connectMcpServe(sessionId: string): Promise<Client> {
+  async function connectMcpServe(
+    sessionId: string,
+    options: { dataDir?: string; cwd?: string } = {},
+  ): Promise<Client> {
+    const env = mcpServeEnvironment(sessionId);
+    if (options.dataDir !== undefined) env.SESSION_DATA_DIR = options.dataDir;
     const transport = new StdioClientTransport({
       command: process.execPath,
-      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
-      cwd: resolve('.'),
-      env: mcpServeEnvironment(sessionId),
+      args: ['--import', import.meta.resolve('tsx'), resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: options.cwd ?? resolve('.'),
+      env,
       stderr: 'pipe',
     });
     const client = new Client({ name: 'mcp-serve-test', version: '1.0.0' });
@@ -261,6 +266,20 @@ describe('plugin MCP Gateway', () => {
     } finally {
       await client.close();
       rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
+    }
+  });
+
+  it('treats an empty SESSION_DATA_DIR as missing instead of writing into cwd', async () => {
+    const sessionId = 'mcp-serve-empty-data-dir';
+    const diagnostics = join(home, '.botmux', 'data', 'mcp-gateway', `${sessionId}.json`);
+    const cwdDiagnostics = join(home, 'mcp-gateway', `${sessionId}.json`);
+    const client = await connectMcpServe(sessionId, { dataDir: '', cwd: home });
+    try {
+      expect((await client.listTools()).tools).toEqual([]);
+      await vi.waitFor(() => expect(existsSync(diagnostics)).toBe(true));
+      expect(existsSync(cwdDiagnostics)).toBe(false);
+    } finally {
+      await client.close();
     }
   });
 

@@ -17,6 +17,7 @@ import { readFileSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { join, dirname } from 'node:path';
 import { config } from '../config.js';
+import { formatUrlHost } from '../core/dashboard-url.js';
 import { jsonRes } from './http.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
@@ -498,7 +499,7 @@ export async function handleFederationSpokeApi(
   if (path === '/api/team/local' && method === 'GET') {
     ensureDefaultTeam(dataDir);
     const me = getDeploymentIdentity(dataDir);
-    const suggestedHubUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}`;
+    const suggestedHubUrl = `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}`;
     jsonRes(res, 200, { ok: true, deployment: me, suggestedHubUrl, ...buildFederatedRoster(dataDir, DEFAULT_TEAM_ID, botConfigOrder(), undefined, live) });
     return true;
   }
@@ -507,7 +508,7 @@ export async function handleFederationSpokeApi(
   if (path === '/api/team/hosted' && method === 'GET') {
     ensureDefaultTeam(dataDir);
     const me = getDeploymentIdentity(dataDir);
-    const suggestedHubUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}`;
+    const suggestedHubUrl = `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}`;
     const teams = listTeams(dataDir).map(t => ({
       teamId: t.id, name: t.name, isDefault: t.id === DEFAULT_TEAM_ID,
       // dashboard 团队页发起过的协作群 —— 看板团队筛选的白名单之一
@@ -579,7 +580,7 @@ export async function handleFederationSpokeApi(
     // Issue a delegationToken to the hub + tell it our callback URL, so the hub
     // can delegate 拉群 back to us (hub→spoke) when it has no local creator.
     const delegationToken = randomBytes(24).toString('base64url');
-    const callbackUrl = `http://${config.dashboard.externalHost}:${config.dashboard.port}`;
+    const callbackUrl = `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}`;
     let hubRes: Response;
     try {
       hubRes = await fetchWithTimeout(fetcher, `${hubUrl}/api/federation/join`, {

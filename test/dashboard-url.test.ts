@@ -11,7 +11,7 @@ vi.mock('../src/platform/binding.js', () => ({
   publicReverseProxyBaseUrl: vi.fn(() => null),
 }));
 
-import { buildDashboardUrl, buildDashboardUrls } from '../src/core/dashboard-url.js';
+import { buildDashboardUrl, buildDashboardUrls, formatUrlHost } from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../src/platform/binding.js';
 
@@ -132,5 +132,36 @@ describe('buildDashboardUrls', () => {
       url: 'https://botmux.example.com/?t=abc',
       localUrl: 'http://1.2.3.4:7891/?t=abc',
     });
+  });
+
+  it('brackets an IPv6 literal host so the URL is valid', () => {
+    const { url } = buildDashboardUrls({ host: '::1', port: 7891, token: 'abc' });
+    expect(url).toBe('http://[::1]:7891/?t=abc');
+    expect(() => new URL(url)).not.toThrow();
+  });
+});
+
+describe('formatUrlHost', () => {
+  it('brackets a bare IPv6 literal', () => {
+    expect(formatUrlHost('::1')).toBe('[::1]');
+    expect(formatUrlHost('fe80::1')).toBe('[fe80::1]');
+    expect(formatUrlHost('::ffff:1.2.3.4')).toBe('[::ffff:1.2.3.4]');
+    expect(formatUrlHost('FE80::1')).toBe('[FE80::1]');
+  });
+
+  it('leaves IPv4, hostnames, and already-bracketed literals unchanged', () => {
+    expect(formatUrlHost('127.0.0.1')).toBe('127.0.0.1');
+    expect(formatUrlHost('dash.example.com')).toBe('dash.example.com');
+    expect(formatUrlHost('[::1]')).toBe('[::1]');
+  });
+
+  // The invariant every host→URL exit site shares (dashboard link, v3 cards,
+  // federation, web terminal): a formatted host interpolated into a URL must
+  // always parse. Guards copy-paste exits that forget to wrap.
+  it('any formatted host interpolates into a parseable URL', () => {
+    for (const host of ['::1', 'fe80::1', '::ffff:1.2.3.4', '127.0.0.1', 'dash.example.com']) {
+      const h = formatUrlHost(host);
+      expect(() => new URL(`http://${h}:7891/#/v3/run-1`)).not.toThrow();
+    }
   });
 });

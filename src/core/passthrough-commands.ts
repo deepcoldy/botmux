@@ -27,6 +27,16 @@ export const PASSTHROUGH_COMMANDS = new Set([
   '/code-review', '/security-review', '/review',
   // Codex：/btw 向当前会话追加一条旁注/引导消息
   '/btw',
+  // 推理强度调档。放全局（而非某个 adapter 的 defaultPassthroughCommands）是刻意的：
+  //   ① 这里的命令本就是「尽力透传」——/plugin /mcp /btw 也并非所有 CLI 都支持，
+  //      CLI 认得就生效、认不得顶多回一句 unknown-command（不崩溃 / 不损坏 / 不泄露）。
+  //      Claude Code(2.1.220+) / Seed / Relay 原生支持 /effort，Codex 亦有 reasoning
+  //      effort；未来别的 CLI 补上后零改动自动生效，无需再逐个 adapter 加。
+  //   ② 全局集合刻意不带「空 topic 冷启动」能力（那只认 adapter 层的
+  //      defaultPassthroughCommands，见 isInitialSessionPassthrough）——/effort 是
+  //      「调档」而非「开一段工作」的命令，空话题里单发 /effort 不应凭空拉起会话。
+  //      对照 /goal（开启目标工作）仍留在 adapter 层，保留其冷启动语义。
+  '/effort',
 ]);
 
 /**

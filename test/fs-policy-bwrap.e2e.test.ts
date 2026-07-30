@@ -13,8 +13,10 @@
  *      host creating a secret there mid-session became readable (stat→exec
  *      TOCTOU). Fixed by ALWAYS masking a reachable deny (worker pre-creates
  *      the mountpoint so the empty mask always binds).
- *  (c) 0755/0644 masks were themselves readable (`ls`/`cat` succeeded on the
- *      empty mask). Fixed with mode 000 → the access command itself fails.
+ *  (c) 0755/0644 masks were themselves listable (`ls`/`cat` succeeded on the
+ *      empty mask). Fixed with mode 000 → for a NON-root uid the access command
+ *      fails; a root uid (CAP_DAC_OVERRIDE) can still list, but the mask is empty
+ *      so no real content leaks either way (emptiness is the guarantee).
  *
  * This runs the compiler exactly as the worker does: resolve symlinks, split
  * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
@@ -118,15 +120,24 @@ d('bwrap three-tier enforcement (real bubblewrap)', () => {
     expect(run(args, `echo x > ${JSON.stringify(join(S, 'ref/hack'))}`).status).not.toBe(0);
   });
 
-  it('deny DIR (existing): real content unreadable AND the mask itself is unreadable (mode 000)', () => {
+  it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {
     const dir = join(S, 'proj/secrets');
     const { args } = build({ deny: [dir] });
     const read = run(args, `cat ${JSON.stringify(join(dir, 'key.txt'))}`);
     expect(read.status).not.toBe(0);
     expect(read.out).not.toContain('TOPSECRET');
-    // the mask itself must not even be listable (000, not an empty-but-readable dir)
-    const ls = run(args, `ls ${JSON.stringify(dir)}`);
-    expect(ls.status).not.toBe(0);
+    // The mask is a mode-000 empty tmpfs. For a NON-root uid the kernel's DAC check
+    // makes `ls` itself fail; but root bypasses DAC (CAP_DAC_OVERRIDE) and can still
+    // traverse a 000 dir — and the sandboxed process here is root (no uid drop). The
+    // real guarantee in BOTH cases is that no real entry leaks: the mask replaced the
+    // host dir with an empty one, so key.txt must be absent regardless of ls status.
+    const ls = run(args, `ls -A ${JSON.stringify(dir)}`);
+    if (process.getuid?.() === 0) {
+      expect(ls.status).toBe(0);            // root traverses the 000 mask…
+      expect(ls.out).not.toContain('key.txt'); // …but the mask is empty — no real content
+    } else {
+      expect(ls.status).not.toBe(0);        // non-root: DAC blocks listing the 000 dir
+    }
   });
 
   it('deny DIR (existing): NOT writable — regression guard for the writable-tmpfs bug', () => {

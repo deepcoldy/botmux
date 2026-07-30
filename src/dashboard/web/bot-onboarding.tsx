@@ -338,7 +338,8 @@ function OnboardingJobView(props: {
             <span>{t('botOnboarding.ownerLabel')}</span>
             <input
               id="ob-owner"
-              type="email"
+              type="text"
+              inputMode="email"
               placeholder={t('botOnboarding.ownerPlaceholder')}
               autoComplete="off"
               spellCheck={false}

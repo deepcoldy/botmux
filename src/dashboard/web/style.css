@@ -3687,11 +3687,11 @@ button.primary {
 }
 .card-act:active { transform: scale(0.9); }
 
-/* 单一终端入口：私有 dashboard 默认打开可写终端；显式开启公共只读时，
-   同一个图标降级为只读链接，避免并排「终端 + 钥匙」造成两个主操作。 */
+/* 终端与可操作 Web 终端分成两个明确入口：钥匙按钮只在有写权限时显示。 */
 .term-pill {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
 }
 .term-pill .term-btn {
   width: 30px;
@@ -8473,6 +8473,11 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 /* ── 数字生命球（bot avatar，全站统一）──────────────────────────────────── */
 .orb-avatar {
   position: relative;
+  /* inline-flex 让球在任意容器（含 grid/inline 上下文）都占满自身尺寸——
+     只写 width/height 而不定 display 时，裸 <span> 会退回 inline，宽高被忽略，
+     父级 grid 列量成 0 宽，头像整个塌掉（话题/状态板卡片即如此）。 */
+  display: inline-flex;
+  vertical-align: middle;
   width: 42px;
   height: 42px;
   border-radius: 50%;

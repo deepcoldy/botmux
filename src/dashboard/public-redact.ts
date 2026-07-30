@@ -61,12 +61,17 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
   });
 }
 
-/** Branch names often carry issue/customer identifiers. `/api/sessions` and
+/** Branch names often carry issue/customer identifiers. `riffAccessUrl` is the
+ * Riff AIO Sandbox **write** capability — a bearer URL whose unique subdomain is
+ * itself the credential (riff-backend.ts:hashUrlForLog), so an anonymous read-only
+ * visitor must never receive it (they'd gain write access to the sandbox). Read
+ * access on the dashboard goes through the local worker log terminal (webPort),
+ * which stays; only the sandbox write URL is stripped. `/api/sessions` and
  * `/events` are both public-read surfaces, so keep one non-mutating projection
  * for their shared session row shape. */
 export function redactSessionForPublic(session: unknown): unknown {
   if (!session || typeof session !== 'object' || Array.isArray(session)) return session;
-  const { gitBranch: _gitBranch, ...rest } = session as Record<string, unknown>;
+  const { gitBranch: _gitBranch, riffAccessUrl: _riffAccessUrl, ...rest } = session as Record<string, unknown>;
   return rest;
 }
 
@@ -88,7 +93,7 @@ export function redactSessionEventForPublic(type: string, body: unknown): unknow
     && typeof eventBody.patch === 'object'
     && !Array.isArray(eventBody.patch)
   ) {
-    const { gitBranch: _gitBranch, ...patch } = eventBody.patch as Record<string, unknown>;
+    const { gitBranch: _gitBranch, riffAccessUrl: _riffAccessUrl, ...patch } = eventBody.patch as Record<string, unknown>;
     return { ...eventBody, patch };
   }
   return body;

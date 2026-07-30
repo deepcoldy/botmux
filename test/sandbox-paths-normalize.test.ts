@@ -46,8 +46,8 @@ describe('normalizeSandboxPaths (cross-tier dedup for the picker)', () => {
 // The picker's live labels + path tester call effectiveAccess. It must agree
 // with the sandbox on BOTH the same-path tie-break (deny > readOnly > readWrite)
 // and `~` expansion under a symlinked $HOME — the regression codex(sg1) flagged:
-// a `~/.claude` recommendation must resolve against the CANONICAL home the tree
-// nodes + worker use, or the UI silently mislabels.
+// a `~/.claude` read-only tier entry must resolve against the CANONICAL home the
+// tree nodes + worker use, or the UI silently mislabels.
 describe('effectiveAccess (picker live labels / tester)', () => {
   const HOME = '/data00/home/u'; // canonical home (symlinked from /home/u)
 

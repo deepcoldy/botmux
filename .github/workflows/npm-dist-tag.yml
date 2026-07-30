@@ -1,0 +1,152 @@
+name: npm dist-tag
+
+# 手动重指 npm dist-tag —— 运维回滚工具。
+#
+# 用途:把某个 dist-tag（默认 latest）指向一个「已经发布过」的版本，最常见的
+# 场景是「刚发的正式版有问题，把 latest 指回上一个好版本」。这不发布新版本、
+# 不删版本、完全可逆——随时能再指回来。
+#
+# 触发方式（合入 master 后，之后每次回滚都不用再提交 commit）：
+#   - GitHub → Actions → 「npm dist-tag」→ Run workflow，填目标版本；或
+#   - gh workflow run npm-dist-tag.yml -f version=3.6.0
+#
+# 与 release.yml 的关系:release.yml 走「打 tag → 发新版本」;本 workflow 只
+# 重指 dist-tag 到已有版本,两者互补。凭证复用同一个 NPM_ACCESS_TOKEN。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 目标版本（必须是已发布的精确版本号，例如 3.6.0）
+        required: true
+        type: string
+      dist_tag:
+        description: 要重指的 dist-tag（默认 latest）
+        required: false
+        default: latest
+        type: string
+      dry_run:
+        description: 只预览会发生什么、不实际改动
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  # 串行化,别让两次重指并发打架;运维操作不该被后来的取消。
+  group: npm-dist-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require deepcoldy authority
+        # 重指 dist-tag（尤其 latest）直接改变每个 `npm i -g botmux` 用户装到的
+        # 版本,是敏感运维操作。对齐 release.yml 里「只有 deepcoldy 能动 latest」
+        # 的授权模型,这里更保守:整个 workflow 都要求 deepcoldy 本人触发。
+        # 用独立 step fail-loud（exit 1）而非 job 级 if,让未授权触发显式 failed、
+        # 不静默 skip。
+        if: github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy'
+        run: |
+          echo "REFUSING: npm dist-tag changes may only be run by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
+          exit 1
+
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Resolve package name
+        id: pkg
+        run: |
+          NAME=$(node -p "require('./package.json').name")
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "package: $NAME"
+
+      - name: Validate target version exists on npm
+        # 硬闸:目标必须是「已发布的精确版本号」。要求 npm 解析结果与输入完全相等,
+        # 从而拒绝不存在的版本、以及 range/tag 之类的模糊输入（如 ^3.6.0 / latest）,
+        # 避免把 dist-tag 指到非预期或悬空的版本上。
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          RESOLVED=$(npm view "${PKG}@${VERSION}" version 2>/dev/null || true)
+          echo "requested: ${VERSION}"
+          echo "resolved : '${RESOLVED}'"
+          if [ "$RESOLVED" != "$VERSION" ]; then
+            echo "REFUSING: '${VERSION}' is not a published exact version of ${PKG}."
+            echo "Pass an exact, already-published version (e.g. 3.6.0), not a range or dist-tag."
+            exit 1
+          fi
+          echo "OK: ${PKG}@${VERSION} exists."
+
+      - name: Warn on prerelease → latest
+        # 回滚工具「故意」不带 release.yml 那道防降级闸——重指本质上就是把 latest
+        # 移到一个更旧/不同的版本,套用防降级会把回滚自己拦死。作为补偿,这里对
+        # 「把 latest 指向 prerelease（含 - 后缀,如 3.7.0-canary.0）」这种通常不该
+        # 发生的组合给出显眼警告,但不阻止（可能有正当理由）——由操作者从下面的
+        # before/after 自行核对。
+        env:
+          TAG: ${{ inputs.dist_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$TAG" = "latest" ] && [[ "$VERSION" == *"-"* ]]; then
+            echo "::warning::Pointing 'latest' at a prerelease version (${VERSION}). Every 'npm i -g botmux' user would get a prerelease. Double-check this is intended."
+          fi
+
+      - name: Show current dist-tags (before)
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+        run: npm dist-tag ls "$PKG"
+
+      - name: Move dist-tag
+        if: ${{ !inputs.dry_run }}
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.dist_tag }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+        run: |
+          echo "Moving dist-tag '${TAG}' → ${PKG}@${VERSION}"
+          npm dist-tag add "${PKG}@${VERSION}" "$TAG"
+
+      - name: Dry run notice
+        if: ${{ inputs.dry_run }}
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.dist_tag }}
+        run: |
+          echo "::notice::DRY RUN — no change made. Would move dist-tag '${TAG}' → ${PKG}@${VERSION}."
+
+      - name: Show current dist-tags (after)
+        if: ${{ !inputs.dry_run }}
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+        run: npm dist-tag ls "$PKG"
+
+      - name: Summary
+        env:
+          PKG: ${{ steps.pkg.outputs.name }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.dist_tag }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## npm dist-tag"
+            echo ""
+            if [ "$DRY" = "true" ]; then
+              echo "**DRY RUN** — no change made."
+            else
+              echo "Moved \`${TAG}\` → \`${PKG}@${VERSION}\`"
+            fi
+            echo ""
+            echo "Verify: \`npm view ${PKG} dist-tags\`"
+          } >> "$GITHUB_STEP_SUMMARY"

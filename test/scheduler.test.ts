@@ -532,16 +532,30 @@ describe('One-shot Chinese patterns', () => {
     expect(Math.abs(runAt - expected)).toBeLessThan(5_000);
   });
 
-  it('明天X点 produces once schedule at local tomorrow', () => {
-    const result = parseNaturalSchedule('明天9:00 看下邮件');
-    expect(result).not.toBeNull();
-    expect(result!.parsed.kind).toBe('once');
-    const runAt = new Date(result!.parsed.runAt!);
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    expect(runAt.getDate()).toBe(tomorrow.getDate());
-    expect(runAt.getHours()).toBe(9);
-    expect(runAt.getMinutes()).toBe(0);
+  it('明天X点 produces once schedule at the pinned host-zone wall clock', () => {
+    // scheduleTimeZone() resolves env → global config → host. This test pins the
+    // ambient schedule zone to the JS runtime host zone and asserts the resulting
+    // wall clock under THAT explicit override — it is a consumer-behavior check,
+    // not the "no-config host fallback" (that path is covered by timezone.test.ts).
+    // Pinning also stops a machine whose ~/.botmux/config.json sets scheduleTimeZone
+    // (e.g. Asia/Shanghai on a non-+8 box) from making the wall clock disagree with
+    // getHours() and failing this spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const result = parseNaturalSchedule('明天9:00 看下邮件');
+      expect(result).not.toBeNull();
+      expect(result!.parsed.kind).toBe('once');
+      const runAt = new Date(result!.parsed.runAt!);
+      const tomorrow = new Date();
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      expect(runAt.getDate()).toBe(tomorrow.getDate());
+      expect(runAt.getHours()).toBe(9);
+      expect(runAt.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 
   it('明天X点 honors an explicit schedule timezone (host-independent wall clock)', () => {
@@ -648,17 +662,27 @@ describe('computeNextRun', () => {
     expect(next).toBeNull();
   });
 
-  it('cron: returns next wall-clock occurrence in the HOST-LOCAL timezone', () => {
-    // 0 9 * * * — daily at 09:00. computeNextRun now uses the host's local timezone
-    // (scheduleTimeZone()), matching how one-shot「明天9点」is parsed via setHours().
-    // Pre-fix it was hard-coded to Asia/Shanghai, so on any non-+8 host getHours()
-    // would NOT be 9. Host-independent assertion: both sides read the same local zone.
-    const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
-    expect(next).toBeTruthy();
-    const nextDate = new Date(next!);
-    expect(nextDate.getTime()).toBeGreaterThan(Date.now());
-    expect(nextDate.getHours()).toBe(9);
-    expect(nextDate.getMinutes()).toBe(0);
+  it('cron: next wall-clock occurrence under an explicit pinned schedule timezone', () => {
+    // 0 9 * * * — daily at 09:00. computeNextRun uses scheduleTimeZone() (env →
+    // config → host). Here we PIN BOTMUX_SCHEDULE_TIMEZONE to the JS runtime host
+    // zone and assert the wall clock under that explicit override (a consumer-
+    // behavior check; the no-config host fallback is covered by timezone.test.ts).
+    // Pinning also stops a machine-level config override (~/.botmux/config.json
+    // scheduleTimeZone) from making scheduleTimeZone() diverge from the getHours()
+    // runtime zone and failing this spuriously.
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const next = computeNextRun({ kind: 'cron', expr: '0 9 * * *', display: '每天 9:00' });
+      expect(next).toBeTruthy();
+      const nextDate = new Date(next!);
+      expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+      expect(nextDate.getHours()).toBe(9);
+      expect(nextDate.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
   });
 });
 

@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { formatUrlHost } from './dashboard-url.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 
@@ -110,8 +111,8 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     }
   }
   const base = proxyReady
-    ? `http://${config.web.externalHost}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
-    : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;
+    ? `http://${formatUrlHost(config.web.externalHost)}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
+    : `http://${formatUrlHost(config.web.externalHost)}:${ds.workerPort ?? ds.session.webPort}`;
   return opts.write
     ? withCapability(base, 'token', ds.workerToken)
     : withCapability(base, 'viewToken', ds.workerViewToken);

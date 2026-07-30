@@ -32,7 +32,7 @@ import {
   isolationPaneMarkerContent,
   type IsolationCapability,
 } from './adapters/cli/read-isolation.js';
-import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields } from './adapters/cli/fs-policy.js';
+import { buildFsPolicy, compileToSeatbelt, migrateLegacySandboxFields, resolveRedirectedAdapterAuthPaths } from './adapters/cli/fs-policy.js';
 import { killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, type PersistentBackendType } from './core/persistent-backend.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
@@ -233,7 +233,7 @@ import {
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
 import { detectCliUsageLimit, usageLimitStateKey, structuredRateLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
-import { redactChildEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { redactChildEnv, scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 import { decideSubmitConfirmationAction, type SubmitActivityEvidence } from './services/submit-confirmation.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
 import * as sessionStore from './services/session-store.js';
@@ -289,6 +289,12 @@ import { FastModeRestartWatchdog } from './core/fast-mode-restart-watchdog.js';
 // default (~/.claude relocates Claude's state file → onboarding rerun) and
 // why GROK_HOME is exempt.
 scrubSessionCliHomeEnv(process.env);
+// Claude session-identity markers ride the same restart-from-a-session vector
+// and this process's env seeds childEnv AND the tmux client env — a marker
+// that survives to the first `tmux new-session` gets copied into the shared
+// server's global env and flips transcript saving off for every pane (see
+// CLAUDE_SESSION_MARKER_ENV_KEYS).
+scrubClaudeSessionMarkerEnv(process.env);
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
@@ -760,7 +766,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
-      model: cfg.model, fastMode: cfg.fastMode === true, log: (m: string) => log(m),
+      model: cfg.model,
+      reasoningEffort: cfg.reasoningEffort,
+      fastMode: cfg.fastMode === true,
+      log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
       onRequestUserInput: cfg.cliId === 'traex'
         ? (params: unknown) => bridgeTraexUserInput(cfg, params)
@@ -1356,13 +1365,15 @@ let isSettlingFirstFlush = false;
  *  later markPromptReady call would return early with the first prompt stranded. */
 let promptReadyDetectedDuringSettle = false;
 /** While the ready-gate is holding, the IdleDetector may still fire on a real
- *  readyPattern (e.g. Hermes's ❯) — proving the input box exists — but
+ *  readyPattern (e.g. grok's ❯) — proving the input box exists — but
  *  markPromptReady() returns early because the gate is armed. Record that the
  *  pattern was seen so the gate's timeout-fallback settle can mark the prompt
  *  ready immediately instead of delivering into a !isPromptReady state that
- *  flushPending() rejects for non-type-ahead adapters. Without this, a Hermes
- *  spawn that renders ❯ but never fires BOTMUX_READY_COMMAND waits the full
- *  hard timeout (and previously never delivered at all). */
+ *  flushPending() rejects for non-type-ahead adapters. Without this, a ready-
+ *  gated spawn that renders ❯ but never fires its SessionStart signal waits the
+ *  full hard timeout (and previously never delivered at all). (Hermes used to be
+ *  the example here; it no longer arms the gate — see hermes.ts — because the
+ *  shipped binary never emitted BOTMUX_READY_COMMAND.) */
 let readyPatternSeenDuringHold = false;
 /** Claude's SessionStart hooks run in parallel. Its botmux hook proves the
  * startup selector is behind us, but sibling project hooks may still be
@@ -5052,6 +5063,7 @@ function handleCodexAppMarker(body: string): void {
         lastUuid: identity.lastUuid,
         turnId: identity.turnId,
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        ...(marker.usage ? { usage: marker.usage } : {}),
       });
       emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
       return;
@@ -7629,6 +7641,7 @@ async function spawnCli(
     larkAppId: cfg.larkAppId,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
+    reasoningEffort: cfg.reasoningEffort,
     fastMode: cfg.fastMode === true,
     fastServiceTier: cfg.fastServiceTier,
     disableCliBypass: cfg.disableCliBypass === true,
@@ -7859,6 +7872,19 @@ async function spawnCli(
     const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
     const sandboxHome = canonical(homedir());
     const expandTilde = (raw: string) => raw.replace(/^~(?=\/|$)/, sandboxHome);
+    // LEXICAL `~` expansion — uses the raw (NON-canonicalized) homedir(). Used ONLY
+    // for the redirect authPath CONTAINMENT decision below, where both sides of the
+    // coversPath check MUST live in the same namespace. `expandTilde` above resolves
+    // `~` to the CANONICAL home (correct for bwrap binds), but the rehomed roots we
+    // compare against are lexical (`cliAdapter.claudeDataDir` = join(homedir(),'.claude'),
+    // built from the un-canonicalized homedir()). Mixing the two silently fails the
+    // containment on a SYMLINKED $HOME (`/home/u` → `/data00/home/u`): the authPath
+    // canonicalizes to `/data00/home/u/.claude/...` while the root stays `/home/u/.claude`,
+    // coversPath misses, and the real host credential wrongly survives → RW-bound back
+    // into the redirected sandbox (codex #605 P1). Expanding BOTH sides lexically keeps
+    // them in one namespace; survivors are canonicalized afterwards by keepExisting.
+    const lexicalHome = homedir();
+    const expandTildeLexical = (raw: string) => raw.replace(/^~(?=\/|$)/, lexicalHome);
     const keepExisting = (paths: (string | undefined)[]) => {
       const out: string[] = [];
       for (const raw of paths) {
@@ -8038,7 +8064,37 @@ async function spawnCli(
         claudeDataDir ? `${sandboxHome}/.claude.lock` : undefined,
         claudeDataDir ? `${sandboxHome}/.local/state/claude` : undefined,
       ]),
-      authPaths: keepExisting([...(cliAdapter.authPaths ?? [])]),
+      // authPaths carries the CLI's REAL login/data surfaces (claude:
+      // ~/.claude/.credentials.json; codex/codex-app: the WHOLE ~/.codex;
+      // Seed/Relay: ~/.local/share/bytedcli SSO + <dataDir>/byted-cloud-auth.json).
+      // resolveRedirectedAdapterAuthPaths is the single source of truth (also unit-
+      // tested directly): not redirected → expose all; redirected → drop authPaths
+      // inside a rehomed host data root (their BOT_HOME copy is provisioned+covered,
+      // or — codex's whole ~/.codex — an active leak), keep data-root-external
+      // login sources (Seed/Relay bytedcli SSO) so cold-start login doesn't regress.
+      // rehomedHostRoots = the ORIGINAL host claudeDataDir (cliAdapter's, NOT the
+      // BOT_HOME value claudeDataDir was reassigned to above) + codex host ~/.codex.
+      //
+      // CONTAINMENT MUST USE LEXICAL (`~`-expanded, NOT realpath'd) paths on BOTH
+      // sides: if e.g. ~/.claude/.credentials.json is a symlink to an external
+      // dotfiles/creds dir, realpath-then-contain would resolve it OUTSIDE ~/.claude
+      // and wrongly KEEP it → the real host credential gets RW-bound back into the
+      // sandbox, defeating the redirect. AND the two sides must share ONE home
+      // namespace: expand declaredAuthPaths + rehomedHostRoots with `lexicalHome`
+      // (raw homedir()), NOT the canonical `sandboxHome` — else on a symlinked $HOME
+      // the authPath canonicalizes to /data00/home/u/... while `cliAdapter.claudeDataDir`
+      // (= join(homedir(),'.claude'), lexical) stays /home/u/..., coversPath misses,
+      // and the credential leaks (codex #605 P1). The codex host root is likewise
+      // `${lexicalHome}/.codex`, not `${sandboxHome}/.codex`, or the codex leak fix
+      // itself regresses under a symlinked home. Filter lexically first, THEN
+      // keepExisting (realpath + existence-filter) only the survivors for bwrap.
+      authPaths: keepExisting(resolveRedirectedAdapterAuthPaths({
+        declaredAuthPaths: [...(cliAdapter.authPaths ?? [])].map(expandTildeLexical),
+        willRedirectCliData,
+        rehomedHostRoots: [cliAdapter.claudeDataDir, isolatedCodexHome ? `${lexicalHome}/.codex` : undefined]
+          .filter((r): r is string => !!r)
+          .map(expandTildeLexical),
+      })),
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         ...(cfg.skillReadonlyRoots ?? []),
@@ -8634,7 +8690,11 @@ async function spawnCli(
   lastPtyOutputAtMs = Date.now();
   const readyHookAvailable = effectiveReadyHookInstall
     ? hasInstalledSessionReadyHook(effectiveReadyHookInstall)
-    : true; // Hermes emits BOTMUX_READY_COMMAND directly instead of a config hook.
+    : true; // No config-file hook to verify → assume a direct ready-command
+            // integration (env-injected BOTMUX_READY_COMMAND). No current adapter
+            // takes this branch: claude-code and grok both ship a hookInstall
+            // config. (Hermes formerly did, on a BOTMUX_READY_COMMAND contract the
+            // shipped binary never honored — it no longer sets injectsReadyHook.)
   const isolatedReadyTransportRequired = sandboxRequested || credentialBoundaryActive;
   const readyPortAvailable = !isolatedReadyTransportRequired
     || parseDaemonIpcPort(childEnv.BOTMUX_DAEMON_IPC_PORT) !== undefined;

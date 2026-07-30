@@ -949,6 +949,7 @@ function SkillsPage() {
       return tr('skills.gitNeedsAuth');
     }
     if (msg.startsWith('agentbuddy_not_found')) return tr('skills.agentbuddyNotFound');
+    if (msg.startsWith('agentbuddy_login_required')) return tr('skills.agentbuddyNeedsLogin');
     if (msg.startsWith('agentbuddy_command_failed')) {
       return /login|credential|unauthor|not logged|401|403/i.test(msg)
         ? tr('skills.agentbuddyNeedsLogin')

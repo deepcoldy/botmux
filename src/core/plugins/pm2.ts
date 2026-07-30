@@ -56,6 +56,10 @@ export function capturePluginPm2(args: string[], opts: { timeoutMs?: number; env
     env: pm2Env(opts.env),
     shell: pm2.shell ?? false,
     timeout: opts.timeoutMs ?? 10_000,
+    // `pm2 jlist` output scales with the process count (full env per process);
+    // Node's 1 MiB default spawnSync buffer overflows to ENOBUFS on large
+    // fleets. Match cli.ts pm2Capture — lift the cap far above any real size.
+    maxBuffer: 64 * 1024 * 1024,
   });
   if (result.status !== 0) {
     const detail = result.error?.message

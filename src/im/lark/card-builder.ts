@@ -71,11 +71,12 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
   runSelects.push(configSelect('lang', data.lang ?? CONFIG_UNSET,
     [{ text: def, value: CONFIG_UNSET }, { text: '中文 (zh)', value: 'zh' }, { text: 'English (en)', value: 'en' }],
     { action: 'config_set', field: 'lang', ...locVal }));
-  // 私聊单聊模式：thread（默认，每条 DM 独立会话）| chat（扁平连续会话）。thread 与
-  // 未设等价，故 thread 选项用 unset 哨兵：选它即清字段、回默认，避免把字面
-  // 'thread' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启前后一致）。
-  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'chat' ? 'chat' : CONFIG_UNSET,
-    [{ text: t('card.config.p2p.thread', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.chat', undefined, locale), value: 'chat' }],
+  // 私聊单聊模式：chat（默认，扁平连续会话）| thread（每条 DM 独立会话）。chat 与
+  // 未设等价，故 chat 选项用 unset 哨兵：选它即清字段、回默认（扁平连续 DM），
+  // 避免把字面 'chat' 写进 bots.json（与 dashboard 下拉一致，/botconfig get 重启
+  // 前后一致）。只有显式 'thread'（每条 DM 独立）才是需要落盘的值。
+  runSelects.push(configSelect(t('card.config.p2p.placeholder', undefined, locale), data.p2pMode === 'thread' ? 'thread' : CONFIG_UNSET,
+    [{ text: t('card.config.p2p.chat', undefined, locale), value: CONFIG_UNSET }, { text: t('card.config.p2p.thread', undefined, locale), value: 'thread' }],
     { action: 'config_set', field: 'p2pMode', ...locVal }));
   elements.push({ tag: 'action', actions: runSelects });
 
@@ -1596,6 +1597,17 @@ export function buildRelayPickerCard(
    *  Authoritative from the /relay command's session chatType. Default 'group'
    *  covers legacy cards rendered before this field existed. */
   targetChatType: 'group' | 'p2p' = 'group',
+  /** When 'private', the card is (or will be) delivered as an ephemeral card
+   *  visible only to the invoker — so the session title / source-chat name never
+   *  leak to other group members. Baked into every button value as `visibility`
+   *  so the re-render handlers (select / page / search) know they must delete +
+   *  resend an ephemeral card instead of returning a body for Lark to patch in
+   *  place (ephemeral cards can't be PATCH-updated). Default 'public' preserves
+   *  the legacy visible-to-all picker. Only ever set 'private' for flat chat-
+   *  scope 普通群 targets: ephemeral has no thread anchor, so command-handler
+   *  gates it on `targetScope === 'chat'` (thread-scope 话题群/话题 stay public
+   *  in-thread — see the gate comment there). p2p never goes ephemeral. */
+  visibility: 'private' | 'public' = 'public',
 ): string {
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
@@ -1620,6 +1632,7 @@ export function buildRelayPickerCard(
     target_scope: targetScope,
     target_chat_type: targetChatType,
     invoker_open_id: invokerOpenId,
+    visibility,
     search: searchQuery,
     page,
     selected: selectedSessionId ?? '',

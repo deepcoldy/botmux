@@ -22,6 +22,39 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        # Build from the EXACT released commit in both trigger paths:
+        #   - push: use github.sha (the immutable commit the tag pointed at when
+        #     the event fired), NOT github.ref. Passing the ref name would make
+        #     checkout re-resolve the tag at checkout time — and desktop runs
+        #     behind a manual approval that can lag up to 30 days, during which
+        #     the tag could be moved (repo ruleset excludes canary/beta/rc from
+        #     tag-update protection). If tag moves A→B after `release` already
+        #     published npm from A, a ref-name checkout would sign B → assets
+        #     diverge from the npm tarball. A pinned SHA cannot move.
+        #   - workflow_dispatch: no event SHA for the tag, so resolve the tag ref
+        #     explicitly (default checkout would be the dispatch ref = master).
+        # The Verify step below then fail-closes if the tag no longer points at
+        # the commit we built (tag moved), so mismatched assets never attach.
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+
+      - name: Verify HEAD is the tagged commit
+        # Prove the built commit still equals what the tag points at. On push,
+        # HEAD is github.sha; if the tag was moved during the approval wait, the
+        # current tag commit won't match HEAD → fail-closed (never attach assets
+        # built from a commit the tag no longer names). On workflow_dispatch this
+        # also catches a mis-resolved ref (e.g. accidental master checkout).
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet 2>/dev/null || true
+          TAG_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD (built) → $HEAD_SHA"
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "REFUSING: built commit $HEAD_SHA is not what tag ${RELEASE_TAG} now points at ($TAG_SHA)."
+            echo "The tag was likely moved after npm was published from the original commit."
+            echo "Signed assets must match the released commit; aborting to avoid attaching mismatched assets."
+            exit 1
+          fi
 
       - uses: actions/setup-node@v6
         with:
@@ -86,11 +119,21 @@ jobs:
           retention-days: 7
 
   release:
-    if: always() && github.event_name == 'push' && (needs.desktop.result == 'success' || needs.desktop.result == 'skipped')
-    needs: desktop
+    # npm-first: no longer `needs: desktop`. npm publish + GitHub Release run
+    # immediately on the tag push, WITHOUT waiting for the manually-gated
+    # (macos-signing environment) macOS build. The signed desktop assets are
+    # attached asynchronously afterwards by `attach-desktop-assets`. This keeps
+    # `npm i -g botmux` unblocked when macOS signing is slow / awaiting approval.
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # pull-requests: write —— 发版后给本版本包含的 PR 逐条留「Released in vX.Y.Z」
+      # 评论(见下方 Comment "Released in" 步骤)。GitHub 原生那个侧栏 released 徽标
+      # 判定用的是 PR 分支的原始 head commit,squash 合并会把它变成孤儿 commit → 徽标
+      # 永远不显示(即便 squash 出的新 commit 能从 tag 到达也不行)。此权限用于发一条
+      # 可见的时间线评论作为 squash 兼容的替代。
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -123,10 +166,18 @@ jobs:
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
 
-      - name: Require signed macOS assets for stable releases
-        if: steps.dist_tag.outputs.tag == 'latest' && needs.desktop.result != 'success'
+      - name: Require deepcoldy authority for stable (latest) releases
+        # npm-first removed the transitive authority gate that used to come via
+        # `needs: desktop` (desktop only runs for deepcoldy; the old "Require
+        # signed macOS assets" step then failed non-deepcoldy stable tags). With
+        # release decoupled from desktop, re-assert it explicitly: only deepcoldy
+        # may publish the `latest` dist-tag that every `npm i botmux` user gets.
+        # canary/beta/rc/next go to side dist-tags and stay open for branch
+        # gray-release by anyone.
+        if: steps.dist_tag.outputs.tag == 'latest' && (github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy')
         run: |
-          echo "REFUSING: stable releases require macOS signing by deepcoldy."
+          echo "REFUSING: stable (latest) releases may only be published by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
           exit 1
 
       - name: Guard against downgrading npm latest
@@ -242,6 +293,13 @@ jobs:
           done
           SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
 
+          # 复用上面已算好的 PR 列表(不再多打一次 API),抽出本版本包含的**去重** PR
+          # 号,持久化到 $RUNNER_TEMP,交给后面的「Comment "Released in"」步骤逐个留言。
+          # 从 $RAW 里 type=='pr' 的行取第 2 列(PR number),排序去重。可能为空(纯直推
+          # commit、无关联 PR)——那样评论步骤自然什么都不做。
+          awk -F'\t' '$1=="pr"{print $2}' "$RAW" | sort -un > "$RUNNER_TEMP/released_prs.txt"
+          echo "PRs in this release: $(paste -sd' ' "$RUNNER_TEMP/released_prs.txt")"
+
           {
             echo 'body<<CHANGELOG_EOF'
             # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
@@ -253,28 +311,128 @@ jobs:
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download macOS release assets
-        if: needs.desktop.result == 'success'
+      - name: Create GitHub Release (desktop assets attached asynchronously)
+        # npm-first: the Release is created right after npm publish, WITHOUT the
+        # macOS assets — those are uploaded later by `attach-desktop-assets` once
+        # signing/notarization finishes. So the Release exists with npm already
+        # live but no .dmg/.zip yet. Normally the desktop bundle lands within the
+        # same run (a few minutes) once macOS signing completes — but signing is
+        # behind a human approval gate that can wait up to 30 days, or be
+        # rejected / fail / be cancelled; in those cases the Release stays
+        # npm-only until the manual recovery re-run (see attach-desktop-assets).
+        # softprops keeps the release editable so the later --clobber upload just
+        # adds the files.
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ steps.changelog.outputs.body }}
+          prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+
+      - name: Comment "Released in" on included PRs
+        # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
+        # head commit,squash 会把它变成孤儿 commit → 徽标永不显示。这里改为在本版本
+        # 包含的每个 PR 上留一条**可见、可点**的时间线评论作为等效替代。PR 列表来自上面
+        # changelog 步骤已算好的 released_prs.txt(不额外打 API 拉取)。
+        #
+        # 只在 stable(latest)发版时评论:canary/beta/rc/next 是分支灰度,常不从 master
+        # 出、也不是用户装到的正式版;若也评论,PR 会先被刷「Released in v3.7.0-canary.0」
+        # 再来一条「v3.7.0」,既噪又易误导。对齐原生徽标只关心正式 Release 的语义。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        # 设计要点:
+        # - fail-soft:npm + Release 此时已经发布,评论失败绝不能让本 job 失败 →
+        #   continue-on-error + 每个 PR 内部 || true,单个 PR 评论失败不影响其它。
+        # - 幂等:workflow 重跑(如签名恢复 re-run)时不重复刷评论——先查该 PR 是否已
+        #   有带本版本隐藏标记 `<!-- released-in:vX.Y.Z -->` 的评论,有就跳过。
+        # - 只在有 PR 时动作;纯直推(released_prs.txt 为空)自然 no-op。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PR_FILE="$RUNNER_TEMP/released_prs.txt"
+          if [ ! -s "$PR_FILE" ]; then
+            echo "No PRs associated with this release; nothing to comment."
+            exit 0
+          fi
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          MARKER="<!-- released-in:${RELEASE_TAG} -->"
+          # 从 FD 3 读 PR 列表(而非 stdin),避免循环体内的 gh 子进程吃掉 stdin 里剩余的
+          # PR 行导致漏评论。
+          while read -r pr <&3; do
+            [ -n "$pr" ] || continue
+            # 幂等检查:该 PR 是否已有本版本的「已发布」评论
+            if gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" \
+                 --jq '.[].body' 2>/dev/null | grep -qF "$MARKER"; then
+              echo "PR #${pr}: already has released-in ${RELEASE_TAG} comment, skipping."
+              continue
+            fi
+            BODY="${MARKER}
+          🚀 Released in [**${RELEASE_TAG}**](${RELEASE_URL})"
+            if gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>/dev/null; then
+              echo "PR #${pr}: commented released-in ${RELEASE_TAG}."
+            else
+              echo "PR #${pr}: comment failed (non-fatal), continuing." >&2
+            fi
+          done 3< "$PR_FILE"
+
+      - name: Note — desktop assets pending
+        # Make the npm-first window visible in the run log: npm + Release are
+        # live now; the macOS .dmg/.zip attach in the parallel attach-desktop-assets
+        # job after signing. If signing is rejected/fails/cancelled, recover by
+        # re-running this workflow via workflow_dispatch with this release_tag.
+        run: |
+          echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
+          echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
+          echo "If signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach."
+  attach-desktop-assets:
+    # npm-first tail: once the parallel `desktop` job has signed+notarized the
+    # macOS build AND the `release` job has created the GitHub Release, upload
+    # the .dmg/.zip onto that Release. Runs on the tag-push path (the
+    # workflow_dispatch refresh path is handled by `refresh-desktop-assets`).
+    # `needs: [desktop, release]` both must succeed: desktop for the artifact,
+    # release so the GitHub Release exists to upload onto.
+    #
+    # FAILURE MODE (accepted trade-off of npm-first): the `desktop` job sits
+    # behind the macos-signing environment approval, which can wait up to 30
+    # days and may be rejected / the build may fail / the run may be cancelled.
+    # In any of those cases npm + the GitHub Release are already live but this
+    # job never runs, so the Release keeps npm-only (no .dmg/.zip). There is no
+    # auto-retry here on purpose — signing needs a human approval, so retrying
+    # would just re-block. Recovery is manual and idempotent: re-run this
+    # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
+    # macOS (fresh artifact, so the 7-day retention is irrelevant) and
+    # `refresh-desktop-assets` --clobber-attaches to the existing Release.
+    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    needs: [desktop, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download macOS build artifact
         uses: actions/download-artifact@v4
         with:
           name: botmux-macos
           path: release-assets
 
-      - name: Create GitHub Release with macOS assets
-        if: needs.desktop.result == 'success'
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
-          files: release-assets/*
-          fail_on_unmatched_files: true
+      - name: Attach macOS assets to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Create GitHub prerelease without macOS assets
-        if: needs.desktop.result == 'skipped' && steps.dist_tag.outputs.prerelease == 'true'
-        uses: softprops/action-gh-release@v3
-        with:
-          body: ${{ steps.changelog.outputs.body }}
-          prerelease: true
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done
 
   refresh-desktop-assets:
     if: github.event_name == 'workflow_dispatch'

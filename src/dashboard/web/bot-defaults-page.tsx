@@ -2157,7 +2157,7 @@ function SessionModeSection(props: {
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
   const tr = useT();
-  const [p2p, setP2p] = useState(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+  const [p2p, setP2p] = useState(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2168,7 +2168,7 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
-    setP2p(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+    setP2p(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
     setRegular(regularGroupMode(props.bot));
     setMention(mentionMode(props.bot));
     setDocMode(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2187,7 +2187,7 @@ function SessionModeSection(props: {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
       if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'chat' ? 'chat' : 'thread' });
+        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'thread' ? 'thread' : 'chat' });
         setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -2720,9 +2720,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
 }
 
 function regularGroupMode(bot: BotDefaultsRow): string {
-  return bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared' || bot.regularGroupReplyMode === 'chat-topic'
+  return bot.regularGroupReplyMode === 'chat' || bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared'
     ? bot.regularGroupReplyMode
-    : 'chat';
+    : 'chat-topic';
 }
 
 function mentionMode(bot: BotDefaultsRow): string {

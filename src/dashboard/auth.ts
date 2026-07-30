@@ -172,6 +172,15 @@ export function persistToken(tokenPath: string, token: string): void {
   chmodSync(tokenPath, 0o600);
 }
 
+/** Load the active token, creating and persisting the first one when absent. */
+export function loadOrCreatePersistedToken(tokenPath: string): string {
+  const existing = loadPersistedToken(tokenPath);
+  if (existing) return existing;
+  const token = generateToken();
+  persistToken(tokenPath, token);
+  return token;
+}
+
 /** Extract `botmux_dashboard_token` value from a Cookie header. */
 export function parseCookie(header: string | undefined): string | undefined {
   if (!header) return undefined;

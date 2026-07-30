@@ -67,6 +67,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -90,6 +91,7 @@ import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js'
 import type { Session, VcMeetingImTurnOrigin } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv } from './setup/ensure-tmux.js';
+import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import type { DaemonToWorker, LarkMessage } from './types.js';
@@ -119,6 +121,7 @@ import {
   initWorkerPool,
   setActiveSessionsRegistry,
   forkWorker,
+  forkAdoptWorker,
   sendWorkerInput,
   killWorker,
   reapOrphanWorkers,
@@ -176,6 +179,7 @@ import {
   ensureSessionWhiteboard,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
+import { claimInitialUserTurn, isInitialUserTurnPending, releaseInitialUserTurn } from './core/initial-user-turn.js';
 import { applyQueuedCodexAppLegacyFallback, mergeQueuedCodexAppTurn } from './core/session-create.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import { beginReplyTargetTurn, fallbackTurnId, isSubstituteTurn, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
@@ -3099,9 +3103,23 @@ function notifyAllowedUsersResolveFailure(
 ): void {
   logger.error(`[${larkAppId}] ${notice}`);
   const unique = [...new Set(recipients.filter(u => typeof u === 'string' && u.startsWith('ou_')))];
+  // Fail-safe recipient: on a cold start the resolve that would have produced
+  // the owner's open_id is the very thing that just failed, so `recipients` is
+  // empty and the owner would hear nothing. Fall back to the static ownerOpenId
+  // captured at setup — a raw ou_ that never needs resolving, so it survives
+  // the contact-API outage. Appended (not replacing) so a partial resolve still
+  // reaches every recovered owner too.
+  let staticOwner: string | undefined;
+  try {
+    staticOwner = getBot(larkAppId).config.ownerOpenId;
+  } catch { /* bot gone mid-flight — nothing to fall back to */ }
+  if (staticOwner && staticOwner.startsWith('ou_') && !unique.includes(staticOwner)) {
+    unique.push(staticOwner);
+  }
   if (unique.length === 0) {
     logger.error(
-      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM; ` +
+      `[${larkAppId}] allowedUsers resolve failed with no open_id recipient available for DM ` +
+      `(no resolved owner and no static ownerOpenId in bots.json); ` +
       `check daemon logs and Feishu contact API, then restart this bot.`,
     );
     return;
@@ -3132,7 +3150,27 @@ function notifyAllowedUsersResolveFailure(
 }
 
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
-  if (attempt > 3) return;
+  if (attempt > 3) {
+    // Retries exhausted (startup + 3 retries all degraded). Don't just fall
+    // silent — the owner has been locked out for ~7.5 min and auto-recovery
+    // won't try again. Emit a terminal notice so they know to intervene. Only
+    // when the allowlist is still actually broken: a config change or a bot
+    // teardown mid-retry is not an exhaustion worth alarming on.
+    try {
+      const bot = getBot(larkAppId);
+      const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
+      const stillEmpty = (bot.resolvedAllowedUsers ?? []).length === 0;
+      if (stillConfigured && stillEmpty) {
+        notifyAllowedUsersResolveFailure(
+          larkAppId,
+          `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
+          `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
+          bot.resolvedAllowedUsers ?? [],
+        );
+      }
+    } catch { /* bot gone — nothing to report */ }
+    return;
+  }
   const delayMs = attempt === 1 ? 30_000 : attempt === 2 ? 120_000 : 300_000;
   const timer = setTimeout(() => {
     void (async () => {
@@ -4185,7 +4223,7 @@ async function adoptCodexNotifierEvent(
   signal.throwIfAborted();
 
   const botCfg = getBot(larkAppId).config;
-  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'chat' ? 'chat' : 'thread';
+  const scope: 'thread' | 'chat' = botCfg.p2pMode === 'thread' ? 'thread' : 'chat';
   const anchor = scope === 'chat' ? chatId : cardMessageId;
   const activeKey = sessionKey(anchor, larkAppId);
   let ds = activeSessions.get(activeKey);
@@ -15683,11 +15721,13 @@ async function warnGroupJoinScopeOnce(larkAppId: string, detail: string): Promis
  * prompt is the configured prompt, or empty (the role/identity envelope still
  * makes it a non-empty CLI turn — the bot reads the group context itself, D8).
  *
- * Scope is mode-aware: a 普通群 gets a chat-scope session anchored at chatId; a
- * 话题群 (topic mode) has no thread to attach to yet, so we seed a fresh topic
- * (a top-level message) and run a thread-scope session anchored at that seed —
- * otherwise a chat-scope session in a 话题群 is the known stale-session bug
- * (every reply would wrap into a new topic, and later messages route elsewhere).
+ * Scope is mode-aware: a 普通群 keeps a chat-scope session anchored at chatId.
+ * When its reply mode is shared, a top-level seed supplies the visible topic
+ * root while every turn still reuses that chat-scope session. A 话题群 has no
+ * thread to attach to yet, so it also seeds a fresh topic, but runs a
+ * thread-scope session anchored at that seed — otherwise a chat-scope session
+ * in a 话题群 is the known stale-session bug (every reply would wrap into a new
+ * topic, and later messages route elsewhere).
  */
 async function handleBotAdded(chatId: string, operatorOpenId: string | undefined, larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
@@ -15765,6 +15805,14 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 锚点已有会话，跳过`);
       return;
     }
+    const sharedReplyRootId = mode === 'group' && resolveRegularGroupMode(larkAppId, chatId) === 'shared'
+      ? await sendMessage(
+          larkAppId,
+          chatId,
+          tr('daemon.auto_start_join_seed', undefined, localeForBot(larkAppId)),
+          'text',
+        )
+      : undefined;
 
     const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
@@ -15800,7 +15848,12 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       ownerOpenId: operatorOpenId,
       currentTurnTitle: title,
       workingDir: pinnedWorkingDir,
+      pendingTurnId: sharedReplyRootId,
     };
+    if (sharedReplyRootId) {
+      beginReplyTargetTurn(ds, sharedReplyRootId, sharedReplyRootId, new Date(now).toISOString());
+      sessionStore.updateSession(ds.session);
+    }
     activeSessions.set(dsKey, ds);
     // Register the anchor so a later duplicate bot.added for this chat is deduped
     // even in 话题群 (where dsKey is the seed id, not chatId).
@@ -15828,7 +15881,8 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 自动开工（${mode}/${scope}），workingDir=${pinnedWorkingDir}`);
       return;
     }
@@ -15849,13 +15903,16 @@ async function handleBotAdded(chatId: string, operatorOpenId: string | undefined
       const prompt = await buildPrompt();
       await noteTurnReceived(ds, anchor, promptBody);
       rememberLastCliInput(ds, promptBody, prompt);
-      forkWorker(ds, prompt);
+      forkWorker(ds, prompt, sharedReplyRootId ? { turnId: sharedReplyRootId } : false);
+      ds.pendingTurnId = undefined;
       logger.info(`[auto-start:入群] ${chatId.substring(0, 12)} 无默认目录且无可选项目，直接开工`);
     }
   } finally {
     autoStartJoinInFlight.delete(lockKey);
   }
 }
+
+export const __testOnly_handleBotAdded = handleBotAdded;
 
 /** Reverse-lookup a foreign bot's display name for a sender open_id observed on
  *  this app's WS events. Priority:
@@ -16161,6 +16218,15 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         // Mark a new turn so the CLI's response to /model, /clear, /compact, etc.
         // shows up as a fresh streaming card instead of silently PATCH-ing the
         // previous turn's card.
+        //
+        // Compatibility note (empty-start opening): a raw passthrough is a
+        // LITERAL CLI command — its contract is that the CLI sees exactly the
+        // bytes the user typed, never a botmux XML envelope. So it deliberately
+        // does NOT consume `Session.initialUserTurnPending`: wrapping `/model`
+        // in `<user_message>` would break the literal contract, and silently
+        // clearing the marker would lose the opening for the next real turn.
+        // `/model` on an empty-started session therefore stays literal and the
+        // FOLLOWING business message still opens as a new topic.
         beginNewTurn(ds, commandContent);
         ds.worker.send({
           type: 'raw_input',
@@ -16700,19 +16766,53 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
     const selfBot = getBot(ds.larkAppId);
     if (!isBridge) ensureSessionWhiteboard(ds);
     const effectiveCliId = ds.session.cliId ?? dsBotCfgForMsg.cliId;
+    // Empty-started session (repo select/skip/switch booted the CLI with no
+    // turn): a LIVE worker is not proof the CLI ever saw botmux's opening
+    // context — only `buildNewTopicCliInput` emits <botmux_routing> /
+    // <botmux_builtin_skills> / <identity>. Probe (non-consuming) before the
+    // awaits below, then claim SYNCHRONOUSLY right before building so two
+    // near-simultaneous first messages can only produce one opener; the loser
+    // degrades to an ordinary follow-up in queue order.
+    const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const turnSender = await getThreadSender();
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const cliInput = isBridge
       ? { content: buildBridgeInputContent(promptContent, {
           attachments,
           mentions: parsed.mentions,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
         }) }
+      : openingTurn
+      ? buildNewTopicCliInput(
+          promptContent,
+          ds.session.sessionId,
+          effectiveCliId,
+          ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
+          attachments,
+          parsed.mentions,
+          openingBots,
+          undefined,
+          { name: selfBot.botName, openId: selfBot.botOpenId },
+          localeForBot(larkAppId),
+          turnSender,
+          {
+            larkAppId,
+            chatId: ds.session.chatId,
+            whiteboardId: ds.session.whiteboardId,
+            substituteTrigger,
+            codexAppText: parsed.content,
+            codexAppApplicationContext,
+            codexAppMessageContext,
+          },
+        )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
           cliId: effectiveCliId,
           cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForMsg.cliPathOverride,
-          sender: await getThreadSender(),
+          sender: turnSender,
           larkAppId,
           chatId: ds.session.chatId,
           whiteboardId: ds.session.whiteboardId,
@@ -16722,9 +16822,22 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           codexAppMessageContext,
         });
     beginNewTurn(ds, parsed.content);
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
-    rememberLastCliInput(ds, promptContent, cliInput);
-    sendWorkerInput(ds, cliInput, parsed.messageId);
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    let accepted = false;
+    try {
+      accepted = sendWorkerInput(ds, cliInput, parsed.messageId);
+      // Record the input as the session's last real CLI turn ONLY after the
+      // worker accepted it. Recording before delivery (the old order) persisted
+      // lastCliInput / lastUserPrompt / Codex-App sidecar for a turn that never
+      // reached the CLI; a rejected send then left that poison behind, and the
+      // next message's worker-null refork would read it as `hadPriorCliInput`
+      // and wrongly `--resume` a CLI that never took a real turn.
+      if (accepted) rememberLastCliInput(ds, promptContent, cliInput);
+    } finally {
+      // The opening is one-shot: give it back when the worker died / refused,
+      // so the next message re-opens instead of silently losing the context.
+      if (openingTurn && !accepted) releaseInitialUserTurn(ds);
+    }
   } else {
     // Worker not running — re-fork with resume. This is a NEW turn, so drop
     // any restored streaming-card reference; worker_ready will POST a fresh
@@ -16785,19 +16898,36 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       currentText: parsed.content,
       currentMessageContext: codexAppMessageContext,
     });
+    // Empty-started session that lost its worker (daemon restart, idle sweep,
+    // CLI exit) — same rule as the live branch: this is still the FIRST real
+    // user turn, so it must be built as a new topic. A queued(待办池) activation
+    // is excluded: its queuedPrompt already owns the first turn.
+    const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
+    const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
+    const reforkSender = await getThreadSender();
+    // An empty-started CLI has nothing to resume: `hasHistory` is set
+    // unconditionally by restoreActiveSessions (and by claude_exit /
+    // suspendWorker), so it cannot tell "booted idle" from "has real history".
+    // `session.lastCliInput` can: rememberLastCliInput writes it on EVERY real
+    // CLI input, and the empty-start fork deliberately writes none. Snapshot it
+    // BEFORE this turn's own rememberLastCliInput below, so a session some
+    // non-IM path (scheduler / webhook trigger / doc comment) already fed keeps
+    // its normal `--resume` instead of being cold-spawned over.
+    const hadPriorCliInput = !!(ds.lastCliInput ?? ds.session.lastCliInput);
+    const openingTurn = wantsOpening && claimInitialUserTurn(ds);
     const builtReforkInput = buildReforkCliInput(ds, reforkContent, {
       attachments,
       mentions: parsed.mentions,
       cliId: ds.session.cliId ?? dsBotCfgForFork.cliId,
       cliPathOverride: ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
       selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
-      sender: await getThreadSender(),
+      sender: reforkSender,
       substituteTrigger,
       codexAppText: reforkCodexApp.text,
       codexAppApplicationContext,
       codexAppMessageContext: reforkCodexApp.messageContext,
     });
-    const wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
+    let wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
       queued: queuedDashboardTurn,
       queuedText: queuedCodexAppText,
     });
@@ -16808,13 +16938,68 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // contain the reply and would silently discard the original task.
       logger.warn(`[${tag(ds)}] Legacy queued dashboard task has no clean-input text; using the full legacy activation prompt`);
     }
-    await noteTurnReceived(ds, parsed.messageId, parsed.content, await getThreadSender(), parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    if (openingTurn) {
+      // Replace the follow-up envelope built above with the real opening. The
+      // discarded build is pure string assembly (no side effects) — keeping the
+      // refork statement unconditional keeps the queued/substitute wiring, and
+      // its guard test, on a single code path.
+      wrappedInput = buildNewTopicCliInput(
+        reforkContent,
+        ds.session.sessionId,
+        ds.session.cliId ?? dsBotCfgForFork.cliId,
+        ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
+        attachments,
+        parsed.mentions,
+        openingBots,
+        undefined,
+        { name: selfBot.botName, openId: selfBot.botOpenId },
+        localeForBot(larkAppId),
+        reforkSender,
+        {
+          larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          substituteTrigger,
+          codexAppText: reforkCodexApp.text,
+          codexAppApplicationContext,
+          codexAppMessageContext: reforkCodexApp.messageContext,
+        },
+      );
+    }
+    await noteTurnReceived(ds, parsed.messageId, parsed.content, reforkSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
+    try {
+      // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
+      // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
+      // losing the observe/bridge semantics and typing the wrapped prompt into a
+      // brand-new CLI instead of the user's original external pane. This branch
+      // is reachable whenever an adopt session's bridge worker has exited (crash,
+      // or the "adopted session ended" kill path) and a new Lark turn arrives.
+      // The turn's input rides in on the init prompt (bridge-formatted by
+      // buildReforkCliInput above); forkAdoptWorker queues it and the adopt idle
+      // detector flushes it to the observed pane. Adopt never --resumes a botmux
+      // session, so the openingTurn/hadPriorCliInput resume logic doesn't apply.
+      if (ds.adoptedFrom) {
+        forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId: parsed.messageId });
+      } else {
+        forkWorker(ds, wrappedInput, {
+          // See `hadPriorCliInput` above — an opening on a CLI that never took any
+          // input cold-spawns rather than `--resume`-ing an empty session.
+          resume: ds.hasHistory && !(openingTurn && !hadPriorCliInput),
+          turnId: parsed.messageId,
+        });
+      }
+    } catch (e) {
+      if (openingTurn) releaseInitialUserTurn(ds);
+      throw e;
+    }
+    // Record the input as the session's last real CLI turn ONLY after the fork
+    // succeeded. Recording before the fork (the old order) persisted lastCliInput
+    // for a turn that never launched when forkWorker threw; the retry then read
+    // that poison as `hadPriorCliInput` and wrongly `--resume`d a CLI that never
+    // took a real turn — breaking the empty-start invariant. forkWorker itself
+    // persists the session (clearing queued); this records last* + reply state.
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, {
-      resume: ds.hasHistory,
-      turnId: parsed.messageId,
-    });
   }
 }
 
@@ -17031,7 +17216,17 @@ async function handleDocComment(ctx: DocCommentContext): Promise<boolean> {
     await noteTurnReceived(ds, commentId, text, sender, turnId);
     rememberLastCliInput(ds, promptContent, wrappedInput);
     sessionStore.updateSession(ds.session);
-    forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+    // Same adopt re-fork routing as handleThreadReply: an adopt session whose
+    // bridge worker exited must come back through forkAdoptWorker (observe +
+    // bridge), never forkWorker. buildDocCommentTurnInput(mode:'refork')
+    // delegates to buildReforkCliInput, which already bridge-formats the content
+    // when ds.adoptedFrom is set, so the doc-comment turn reaches the observed
+    // pane without a <user_message> wrapper.
+    if (ds.adoptedFrom) {
+      forkAdoptWorker(ds, { prompt: wrappedInput.content, turnId });
+    } else {
+      forkWorker(ds, wrappedInput, { resume: ds.hasHistory, turnId });
+    }
   }
   return true;
   } catch (err) {
@@ -17814,7 +18009,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // schedule retries. The cache is a persistent sidecar — NOT the dashboard
       // descriptor, which is overwritten early in boot and deleted on shutdown.
       const configured = bot.config.allowedUsers ?? bot.resolvedAllowedUsers;
-      const needsResolve = configured.some(u => u.includes('@') || u.startsWith('on_') || u.startsWith('ou_'));
+      const needsResolve = configured.some(entryNeedsContactResolve);
       if (needsResolve) {
         const previousResolvedMap = readAllowedUsersCache(cfg.larkAppId);
         try {
@@ -17844,7 +18039,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           // entry transient so the pure fn can recover each from cache.
           const throwStatus = new Map<string, EntryResolveStatus>();
           for (const e of configured) {
-            if (e.includes('@') || e.startsWith('on_') || e.startsWith('ou_')) throwStatus.set(e, 'transient');
+            if (entryNeedsContactResolve(e)) throwStatus.set(e, 'transient');
           }
           const applied = applyAllowedUsersResolve({
             rawEntries: configured,

@@ -65,6 +65,20 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: true },
+    }));
+    expect(readGlobalConfig().dashboard).toEqual({ noVisibleOutputHint: true });
+  });
+
+  it('drops non-boolean dashboard.noVisibleOutputHint', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: 'yes' },
+    }));
+    expect(readGlobalConfig().dashboard).toBeUndefined();
+  });
+
   it('reads pinned plugin dashboards as a sanitized machine-wide preference', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: { pinnedPlugins: ['demo-addon', 'bad/id', 'demo-addon', 'agent-chrome'] },

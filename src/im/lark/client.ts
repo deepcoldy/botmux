@@ -13,6 +13,7 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
+import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -790,6 +791,34 @@ export async function sendEphemeralCard(
   return messageId ?? '';
 }
 
+/**
+ * Delete a previously-sent ephemeral card (`ephemeral/v1/delete`). Ephemeral
+ * cards CANNOT be PATCH-updated (see {@link sendEphemeralCard}), so the picker's
+ * "in-place refresh" (page / search / select) is implemented as delete-then-
+ * resend; this is the delete half. Best-effort: returns false on any failure
+ * (already gone, network) rather than throwing — a stale ephemeral card lingering
+ * is a cosmetic issue, not a correctness one, and the caller has already sent the
+ * replacement by the time cleanup runs.
+ */
+export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await (c as any).request({
+      method: 'POST',
+      url: '/open-apis/ephemeral/v1/delete',
+      data: { message_id: messageId },
+    });
+    if (res && typeof res.code === 'number' && res.code !== 0) {
+      logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
+    return false;
+  }
+}
+
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
   const c = getBotClient(larkAppId);
   let res: any;
@@ -1034,6 +1063,13 @@ export async function resolveAllowedUsersWithMap(
   const openIds: string[] = [];
   const emails: string[] = [];
   const unionIds: string[] = [];
+  // Mobile entries: keep the raw config string as the map key (exact-match with
+  // allowedUsers), but remember the normalized (spaces/dashes stripped) form to
+  // send to the API. batch_get_id accepts `mobiles` under the same
+  // contact:user.id:readonly scope as emails. Lets phone-registered users with
+  // no corporate email be an owner.
+  const mobiles: string[] = [];
+  const mobileRawByNorm = new Map<string, string>();
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       map.set(v, v);
@@ -1045,12 +1081,16 @@ export async function resolveAllowedUsersWithMap(
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
       // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
       unionIds.push(v);
+    } else if (isMobileEntry(v)) {
+      const norm = normalizeMobileEntry(v);
+      mobiles.push(norm);
+      mobileRawByNorm.set(norm, v);
     } else {
       emails.push(v);
     }
   }
 
-  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0) {
+  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0 || mobiles.length > 0) {
     const c = getBotClient(larkAppId);
 
     // Literal open_id is app-scoped. Keep it as-is for compatibility, but
@@ -1148,6 +1188,71 @@ export async function resolveAllowedUsersWithMap(
         errored = true;
         for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
+      }
+    }
+
+    if (mobiles.length > 0) {
+      // Mirror the email branch exactly (same transient/definitive contract),
+      // but over the `mobiles` field. Map keys are the RAW config entries (via
+      // mobileRawByNorm) so exact-match with allowedUsers holds even though the
+      // API is queried with the normalized number.
+      try {
+        const res = await (c as any).contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { mobiles, include_resigned: false },
+        });
+        if (res.code !== 0) {
+          // Whole-request failure — not a per-mobile verdict. Mark every
+          // requested mobile TRANSIENT so a real owner isn't fail-closed out.
+          errored = true;
+          for (const norm of mobiles) {
+            const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+            entryStatus.set(rawEntry, 'transient');
+          }
+          logger.warn(`Failed to resolve mobiles to open_ids: ${res.msg} (code: ${res.code})`);
+        } else {
+          const userList: any[] = res.data?.user_list ?? [];
+          // Index the API echo by a SINGLE canonical E.164 key. The API may echo
+          // a mobile with or without the leading `+`, and Feishu does NOT promise
+          // a byte-identical echo — canonicalMobileKey folds each number to one
+          // stable key (trusting `+` as the country code; only a genuinely-bare
+          // CN 11-digit number gets an 86 prefix). A single key per number, NOT a
+          // key SET: a set that stripped `+` and then treated every leading-1
+          // number as CN would collide a US `+1 3XX…` with a CN bare `13X…` and
+          // bind the owner to the wrong person / evict a co-owner on overwrite.
+          const byKey = new Map<string, string>();
+          for (const item of userList) {
+            if (item.user_id && item.mobile) {
+              byKey.set(canonicalMobileKey(normalizeMobileEntry(String(item.mobile))), item.user_id);
+            } else if (!item.user_id) {
+              logger.warn(`Could not resolve mobile: ${item.mobile}`);
+            }
+          }
+          for (const norm of mobiles) {
+            const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+            // Match the requested number by its canonical key. Covers CN bare-11
+            // ↔ +86 in both directions. If Feishu echoed an overseas number with
+            // the `+` dropped it becomes a safe MISS (definitive → owner falls
+            // back to email/union_id), never a cross-number mis-bind.
+            const uid = byKey.get(canonicalMobileKey(norm));
+            if (uid) {
+              map.set(rawEntry, uid);
+              entryStatus.set(rawEntry, 'resolved');
+              logger.info(`Resolved ${rawEntry} → ${uid}`);
+            } else {
+              // code-0 but this mobile absent from user_list → definitive miss
+              // (no such user / not visible), same as the email case.
+              entryStatus.set(rawEntry, 'definitive');
+            }
+          }
+        }
+      } catch (err: any) {
+        errored = true;
+        for (const norm of mobiles) {
+          const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+          entryStatus.set(rawEntry, 'transient');
+        }
+        logger.warn(`resolveAllowedUsers (mobiles) failed: ${err.message}`);
       }
     }
   }

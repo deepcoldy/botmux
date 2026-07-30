@@ -190,6 +190,26 @@ export interface Session {
   /** Dashboard-created image files retained while the session is active so
    * the CLI can read them, then removed by session-store on close. */
   dashboardAttachments?: LarkAttachment[];
+  /**
+   * 「CLI 已经空启动，但还没收到过任何真实用户轮」的一次性状态。
+   *
+   * `/repo <name>` / 选仓卡 / 跳过 / mid-session 切仓这几条路径会在**没有**任何
+   * buffered 用户输入（pendingPrompt/attachments/follow-ups/pendingRawInput 全空）
+   * 的情况下 `forkWorker(ds, '', false)` 把 CLI 拉起来待命。此时 CLI 进程活着，
+   * 但它从未见过 `<botmux_routing>` / `<botmux_builtin_skills>` / `<identity>` 这套
+   * 开场上下文——那套东西只由 `buildNewTopicCliInput` 产出。
+   *
+   * 没有这个标记时，下一条真实业务消息会被 worker 存活性判定成 follow-up
+   * （`buildFollowUpCliInput` / `buildReforkCliInput`），开场上下文永久丢失。
+   * 置位后，下一条**真实业务消息**（不含 botmux 控制命令 / 卡片回调 / raw
+   * passthrough）走与普通 new topic 完全相同的构造路径，成功投递后一次性清除。
+   *
+   * 持久化（而非只挂内存 DaemonSession）是为了扛 daemon 重启：空启动之后、首条
+   * 业务消息之前重启，重启后那条消息仍必须是 opening。它同时也是「CLI 空启动过」
+   * 与「已有真实用户历史」的判据——refork 时据此关掉 `--resume`，不去 resume 一个
+   * 从未产生过真实轮的 CLI 会话。
+   */
+  initialUserTurnPending?: boolean;
   createdAt: string;
   /** Last user/bot/scheduler input that was routed into this session. */
   lastMessageAt?: string;
@@ -347,6 +367,9 @@ export interface Session {
    * cold-staged records, which must be reconciled before a surviving native
    * pane can be trusted. */
   fastModeStateVersion?: 1;
+  /** Optional codex reasoning effort frozen at creation (per-turn API override).
+   *  Only meaningful for codex/codex-app; injected as model_reasoning_effort at spawn. */
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
   /**
    * True once `cliId`/`cliPathOverride`/`wrapperCli`/`model` have been frozen for
    * this session (see `sessionAgentConfig`). Gates the one-time freeze so it runs
@@ -604,7 +627,7 @@ export type FastModeApplyResult =
 
 /** Messages sent from Daemon to Worker */
 export type DaemonToWorker =
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; fastMode?: boolean; fastServiceTier?: string; fastModeStateVersion?: 1; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliPathOverride?: string; wrapperCli?: string; launchShell?: string; model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh'; fastMode?: boolean; fastServiceTier?: string; fastModeStateVersion?: 1; disableCliBypass?: boolean; codexRpcInput?: boolean; startupCommands?: string[]; env?: Record<string, string>; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; resume?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   | { type: 'message'; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; dispatchAttempt?: number; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -755,6 +778,14 @@ export type WorkerToDaemon =
       // which mixes presentation with payload).
       kind?: 'bridge' | 'local-turn' | 'local-turn-headless';
       userText?: string;
+      /** Per-turn token usage (codex-app). Daemon persists it with the async
+       *  trigger result so trigger-result's completed state can report it. */
+      usage?: {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheCreateTokens: number;
+      };
     }
   | {
       type: 'turn_terminal';

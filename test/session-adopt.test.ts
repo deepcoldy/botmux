@@ -334,6 +334,8 @@ describe('Adopt card actions', () => {
       // Mock discoverAdoptableSessions to return empty (target gone)
       vi.doMock('../src/core/session-discovery.js', () => ({
         discoverAdoptableSessions: vi.fn(() => []),
+        // 单 pane 快路径同样解析不到（pane 已经没了），card-handler 会回落全量扫描。
+        discoverAdoptableSessionByTarget: vi.fn(() => undefined),
         excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
         // card-handler now also pulls adoptTargetKey to disambiguate herdr
         // vs. tmux targets in the dropdown's selected-value. The empty

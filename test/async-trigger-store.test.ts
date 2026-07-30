@@ -113,6 +113,17 @@ describe('owner stamping (cross-bot isolation)', () => {
     expect(lookup('sess1')?.ownerLarkAppId).toBe('cli_botA');
   });
 
+  it('persists per-turn usage and returns it on lookup (survives reload)', () => {
+    const usage = { inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 };
+    recordCompleted('sess1', 'trg_a', 'done', 5000, 'cli_botA', usage);
+    expect(lookup('sess1')?.result.usage).toEqual(usage);
+  });
+
+  it('omits usage when none is recorded', () => {
+    recordCompleted('sess1', 'trg_a', 'done', 5000, 'cli_botA');
+    expect(lookup('sess1')?.result.usage).toBeUndefined();
+  });
+
   it('owner persists across pending → completed', () => {
     recordPending('sess1', 'trg_a', 1000, 'cli_botA');
     recordCompleted('sess1', 'trg_a', 'x', 5000, ''); // no owner on completion (legacy-unstamped)

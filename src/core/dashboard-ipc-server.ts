@@ -69,6 +69,7 @@ import * as scheduler from './scheduler.js';
 import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
+import { isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
@@ -130,7 +131,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow } from '../bot-registry.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -138,6 +139,7 @@ import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
+import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { attachSkillPolicy, detachSkillPolicy } from './skills/im-command.js';
@@ -399,7 +401,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -649,11 +651,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', (_req, res, params) => {
 
 /**
  * Count host-overload降压 candidates for THIS daemon's scope, so the alert card
- * can show "僵尸 N / 闲置 M" before the owner clicks. `stopped` counts zombies
- * from the SHARED session store (same answer on every daemon — the card handler
- * only takes it from one), `idle` counts THIS daemon's own idle live workers
- * (owning-daemon-authoritative — the handler sums across daemons). Mirrors the
- * exact classification the sweep uses so the preview matches what a click does.
+ * can show "僵尸 N / 闲置 M" before the owner clicks. Both counts are local to
+ * THIS daemon: its session store is bot-scoped, and live workers only exist in
+ * their owning process. The card handler sums every daemon's response. Mirrors
+ * the exact classification the sweep uses so the preview matches a click.
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
@@ -661,6 +662,7 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   for (const ds of listActiveSessions()) {
     if (!ds.worker || ds.worker.killed) continue;
     if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
     if (ds.lastScreenStatus !== 'idle') continue;
     idle++;
   }
@@ -671,8 +673,8 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
  * Bulk host-overload降压 sweep, driven by the overload-alert card buttons.
  * `mode`:
  *   - `clean_stopped`: close stopped zombie sessions (dead CLI + no tmux) from
- *     the SHARED session store — machine-wide, so a single daemon's sweep is
- *     enough (the alert-owning daemon calls this once, no fan-out needed).
+ *     THIS daemon's bot-scoped session store. The card handler fans this mode
+ *     out to every online daemon.
  *   - `suspend_idle`: suspend THIS daemon's own idle (non-busy, suspendable,
  *     non-adopt) live workers. Live workers only exist in their owning daemon's
  *     process, so the card handler fans this mode out to every online daemon.
@@ -690,10 +692,8 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
     for (const s of stopped) {
       try {
         const r = await closeSession(s.sessionId);
-        // Only count sessions this call actually closed. A shared-store session
-        // already closed by another daemon's concurrent sweep returns
-        // alreadyClosed=true — counting it would inflate `affected` by the
-        // number of daemons that raced on the same zombie.
+        // Only count sessions this call actually closed. A concurrent action in
+        // this daemon may already have closed the same record.
         if (r.ok && !r.alreadyClosed) affected++;
       } catch (err) {
         logger.warn(`[overload-sweep] close failed for ${s.sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
@@ -710,6 +710,7 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
     for (const ds of listActiveSessions()) {
       if (!ds.worker || ds.worker.killed) continue;             // no live worker
       if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
+      if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
       if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
       try {
         if (suspendWorker(ds, 'host_overload_suspend')) affected++;
@@ -783,6 +784,74 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
     return jsonRes(res, 502, { ok: false, error: 'worker_send_failed' });
   }
   jsonRes(res, 200, { ok: true, sessionId: params.sessionId, queued: v.command });
+});
+
+const proactiveChatRenameCooldown = new ChatRenameCooldown();
+const chatRenameSerialQueue = new ChatRenameSerialQueue();
+
+/** Session-scoped external mutation used by the botmux-chat-rename Skill. */
+ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
+  const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
+    .catch(() => ({} as { name?: unknown; proactive?: unknown } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const proactive = body.proactive === true;
+  const trigger = proactive ? 'ai_proactive' : 'user_explicit';
+  const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
+  await chatRenameSerialQueue.run(cooldownKey, async () => {
+    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+      beforeUpdate: proactive
+        ? () => {
+            const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
+            return cooldown.ok
+              ? cooldown
+              : { ...cooldown, error: 'rate_limited' as const };
+          }
+        : undefined,
+    });
+    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
+    if (!result.ok) {
+      const status = result.error === 'bot_not_in_chat' ? 403
+        : result.error === 'permission_denied' ? 403
+          : result.error === 'rate_limited' ? 429
+            : 502;
+      logger.warn(
+        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
+        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
+        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
+        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
+      );
+      return jsonRes(res, status, result);
+    }
+    if (result.changed) {
+      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
+      // FR-7: the Lark write already succeeded, so a local cache-refresh
+      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
+      // outcome into an HTTP 500 — best-effort per session, warn and keep the
+      // rename a success. Catch per-session so one bad write can't skip the rest.
+      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
+        if (active.chatId !== ds.chatId) continue;
+        active.session.chatDisplayName = result.newName;
+        try {
+          sessionStore.updateSession(active.session);
+        } catch (e) {
+          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      logger.info(
+        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
+        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
+        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
+      );
+    }
+    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+  });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
@@ -905,7 +974,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     sessionId,
     liveActive: !!ds,
     chatId: ds?.chatId ?? stored?.chatId,
-    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt } : undefined,
+    memResult: memResult ? { status: memResult.status, content: memResult.content, completedAt: memResult.completedAt, usage: memResult.usage } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
@@ -2307,8 +2376,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   const { defaultOncall, autoboundChats } = oncallStore.getBotDefaultOncall(cachedLarkAppId);
   const cardPrefs = cardPrefsStore.getBotCardPrefs(cachedLarkAppId);
   const grantPrefs = grantPrefsStore.getBotGrantPrefs(cachedLarkAppId);
-  let p2pMode: 'thread' | 'chat' = 'thread';
-  try { if (getBot(cachedLarkAppId).config.p2pMode === 'chat') p2pMode = 'chat'; } catch { /* default thread */ }
+  let p2pMode: 'thread' | 'chat' = 'chat';
+  try { if (getBot(cachedLarkAppId).config.p2pMode === 'thread') p2pMode = 'thread'; } catch { /* default chat */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -2798,8 +2867,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
 });
 
 // Per-bot 私聊单聊模式 p2pMode。Body `{ p2pMode: 'chat' | 'thread' }`:
-//   • 'chat'           → 私聊走扁平连续 chat-scope 会话
-//   • 'thread'（默认）  → 清回每条 DM 独立 thread-scope 会话
+//   • 'chat'（默认）    → 私聊走扁平连续 chat-scope 会话
+//   • 'thread'          → 显式回到每条 DM 独立 thread-scope 会话
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径），保证一致。
 ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
@@ -2809,11 +2878,11 @@ ipcRoute('PUT', '/api/bot-p2p-mode', async (req, res) => {
 
   const spec = findConfigField('p2pMode');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
-  // 只有 'chat' 有意义；其它（含 'thread'）一律清回默认，bots.json 保持干净。
-  const value = body.p2pMode === 'chat' ? 'chat' : null;
+  // 只有 'thread' 有意义；其它（含 'chat'，新默认)一律清回默认，bots.json 保持干净。
+  const value = body.p2pMode === 'thread' ? 'thread' : null;
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, p2pMode: value ?? 'thread' });
+  jsonRes(res, 200, { ok: true, p2pMode: value ?? 'chat' });
 });
 
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:

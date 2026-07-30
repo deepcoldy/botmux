@@ -197,7 +197,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildSlashListCard: vi.fn((params: any) => JSON.stringify(params)),
   buildRelayPickerCard: vi.fn(
-    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string) => JSON.stringify({
+    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string, visibility?: string) => JSON.stringify({
       schema: '2.0',
       body: {
         elements: entries.length === 0 ? [
@@ -206,7 +206,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
           tag: 'interactive_container',
           behaviors: [{
             type: 'callback',
-            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group' },
+            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group', visibility: visibility ?? 'public' },
           }],
           elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
         })),
@@ -240,6 +240,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   // Default returns null so picker entries fall back to raw chatId.
   getChatName: vi.fn(async () => null),
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+  // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
+  // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
+  // scenarios override with mockRejectedValueOnce to exercise the fallback.
+  sendEphemeralCard: vi.fn(async () => 'eph_picker_msg_id'),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -961,7 +965,7 @@ describe('/vc preparation command', () => {
 
 describe('PASSTHROUGH_COMMANDS set', () => {
   it('should contain expected slash commands forwarded to CLI', () => {
-    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw']) {
+    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw', '/effort']) {
       expect(PASSTHROUGH_COMMANDS.has(cmd), `Expected PASSTHROUGH_COMMANDS to contain ${cmd}`).toBe(true);
     }
   });
@@ -991,6 +995,32 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
     expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast');
     expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(false);
+  });
+
+  it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
+    // /effort 放在全局 PASSTHROUGH_COMMANDS,而非某个 adapter 的 defaultPassthroughCommands
+    // ——所有 CLI 都尽力透传(Claude 家族 / Codex 原生支持;其它 CLI 认不得顶多回
+    // unknown-command,不崩溃)。未来新 CLI 零改动自动继承。
+    expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(true);
+    expect(resolvePassthroughCommands('app-1').has('/effort')).toBe(true); // claude-code
+    expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(true); // codex
+    // 无 bot 上下文时也回落到全局集合,仍含 /effort。
+    expect(resolvePassthroughCommands(undefined).has('/effort')).toBe(true);
+  });
+
+  it('keeps /effort OUT of the adapter default layer so it never gains cold-start', () => {
+    // 核心语义护栏:冷启动能力(空 topic 里发命令能否拉起新会话)只认 adapter 层的
+    // defaultPassthroughCommands(见 daemon.ts 的 isInitialSessionPassthrough →
+    // resolveAdapterDefaultPassthroughCommands),不认全局 PASSTHROUGH_COMMANDS。
+    // /effort 是「调档」而非「开一段工作」的命令,必须留在全局层、绝不进 adapter 层,
+    // 否则空话题单发 /effort 会凭空 spawn 一个没活干的会话。这条断言锁住该语义:
+    // 即使有人日后误把 /effort 加回某个 adapter 的 default,resolvePassthroughCommands
+    // 层的可见性测试仍会全绿(全局也有),唯有这里能抓住回归。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/effort'); // claude-code
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/effort'); // codex
+    // /goal 相反:它是「开启目标工作」的命令,刻意留在 adapter 层保留冷启动语义。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).toContain('/goal');
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/goal');
   });
 
   it('does not expose Codex interactive /title through the Lark channel', () => {
@@ -2237,6 +2267,24 @@ describe('handleCommand', () => {
       expect(newSessionUpdate![0].workingDir).toBe('/home/testuser/project-a');
     });
 
+    it('mid-session switch empty-starts the replacement CLI and marks its first turn pending', async () => {
+      // A repo switch closes the old session and boots a BRAND-NEW CLI with an
+      // empty prompt. That fresh CLI has never seen the botmux opening context,
+      // so the next real business message must be built as a new topic — same
+      // invariant as the pending-repo empty start.
+      const ds = makeDaemonSession({ pendingRepo: false });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-a', path: '/home/testuser/project-a', branch: 'main' },
+      ]);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(ds.hasHistory).toBe(false);
+      expect(ds.session.initialUserTurnPending).toBe(true);
+    });
+
     it('should show project list card when called without argument', async () => {
       vi.mocked(existsSync).mockReturnValue(true);
       vi.mocked(scanMultipleProjects).mockReturnValue([
@@ -2293,6 +2341,28 @@ describe('handleCommand', () => {
       // the pending repo-selection card must be withdrawn after resolving
       expect(deleteMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_card');
       expect(ds.repoCardMessageId).toBeUndefined();
+    });
+
+    it('`/repo <name>` as the first message empty-starts and marks the first turn pending', async () => {
+      // The literal repro: a brand-new topic whose FIRST message is `/repo
+      // homelab`. daemon.ts seeds pendingRepo + pendingPrompt:'' (the message IS
+      // the command), so the CLI boots idle — and the user's next message must
+      // still arrive as a new-topic opening.
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(scanMultipleProjects).mockReturnValue([
+        { name: 'homelab', path: '/home/testuser/homelab', branch: 'main' },
+      ]);
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: '', worker: null });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo homelab'), deps, LARK_APP_ID);
+
+      expect(ds.workingDir).toBe('/home/testuser/homelab');
+      expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+      expect(buildNewTopicCliInput).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled(); // pending path, not a switch
+      expect(ds.pendingRepo).toBe(false);
+      expect(ds.session.initialUserTurnPending).toBe(true);
     });
 
     it('should reply path_not_found when the arg resolves to nothing', async () => {
@@ -2555,6 +2625,10 @@ describe('handleCommand', () => {
       // message becomes the first prompt (not an empty/boilerplate user_message).
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
       expect(buildNewTopicPrompt).not.toHaveBeenCalled();
+      // …and that NEXT message must still get the full new-topic opening, so the
+      // empty start has to leave a durable, persisted marker behind.
+      expect(ds.session.initialUserTurnPending).toBe(true);
+      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.createSession).not.toHaveBeenCalled();
       // Cleared pending state + withdrew the (already-sent) card.
@@ -2658,6 +2732,8 @@ describe('handleCommand', () => {
       );
       expect(ds.pendingRepo).toBe(false);
       expect(ds.pendingTurnId).toBeUndefined();
+      // The buffered message IS the first real user turn — nothing is pending.
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
     it('forwards the pending substitute trigger and complete Codex App sidecar', async () => {
@@ -2717,6 +2793,9 @@ describe('handleCommand', () => {
       expect(ds.pendingRawTurnId).toBe('om_goal_first');
       expect(ds.pendingFollowUpInput).toBeUndefined();
       expect(ds.pendingTurnId).toBeUndefined();
+      // Raw passthrough owns the first turn (delivered literally on prompt_ready),
+      // so this is NOT an "empty start awaiting its first user turn".
+      expect(ds.session.initialUserTurnPending).toBeUndefined();
     });
 
     it('raw-input cold start wraps follow-ups buffered during repo wait into pendingFollowUpInput', async () => {
@@ -3990,8 +4069,14 @@ describe('handleCommand', () => {
 
     it('renders the picker in a thread-mode DM with a thread-scope target seeded on the /relay message', async () => {
       // p2p detection is via ds.chatType (authoritative, no Lark API hit).
-      // Default DM mode is thread: the /relay message seeds a fresh DM 话题,
-      // so the baked target is thread-scope anchored at the message id.
+      // Thread mode is now the explicit DM opt-out (default is 'chat'): the
+      // /relay message seeds a fresh DM 话题, so the baked target is thread-scope
+      // anchored at the message id.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).p2pMode = 'thread';
+        return bot;
+      }) as any);
       const { getChatNameAndMode } = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
@@ -4090,6 +4175,138 @@ describe('handleCommand', () => {
       expect(containerValue?.target_scope).toBe('thread');
       // 话题群 top-level → anchor = the /relay message id (makeLarkMessage → 'msg_001').
       expect(containerValue?.root_id).toBe('msg_001');
+    });
+
+    // ── privateCard picker gate (PR #654 + 首审/复审修复) ────────────────────
+    // The picker exposes session title + source-chat name. When privateCard is
+    // on, a FLAT 普通群 (chat-scope) sends it as an ephemeral card (visible to the
+    // invoker only). But ephemeral has no thread anchor, so thread-scope targets
+    // must NOT use it (see the gate comment in command-handler + the REGRESSION
+    // in ephemeral-or-reply.test.ts). 申晗 (2026-07-29): 话题内公开可接受.
+
+    // Helper: bot with privateCard on.
+    const withPrivateCard = () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).privateCard = true;
+        return bot;
+      }) as any);
+    };
+
+    it('privateCard + flat 普通群 (chat-scope): sends the picker as an ephemeral card, NOT a visible reply', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral send to the invoker in the current chat — never a visible reply.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      expect(appId).toBe(LARK_APP_ID);
+      expect(chatId).toBe(CHAT_ID);
+      expect(openId).toBe('ou_sender');
+      expect(vi.mocked(replyMessage)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      // The ephemeral card carries visibility='private' baked into its buttons.
+      const card = JSON.parse(cardJson as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('private');
+    });
+
+    it('REGRESSION: privateCard + thread-scope (话题群) does NOT go ephemeral — stays a visible in-thread reply (public card)', async () => {
+      // Ephemeral has no thread anchor: a 话题群 rejects with 18053 and a 话题
+      // inside a 普通群 would leak the card to the group top level. So thread-
+      // scope pickers must skip ephemeral entirely (guarded, not fallback).
+      withPrivateCard();
+      const { sendEphemeralCard, getChatNameAndMode } = await import('../src/im/lark/client.js');
+      vi.mocked(getChatNameAndMode).mockResolvedValueOnce({ name: 'Topic Room', mode: 'topic' });
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral must NOT be attempted for a thread-scope target.
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      // Card goes out as a visible in-thread reply, and is PUBLIC (not private).
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(true);
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('thread');
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard + chat-scope: falls back to a visible reply when the ephemeral send fails (e.g. 18053)', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('chat can not be thread (code: 18053)'));
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Attempted ephemeral, then fell back to the visible reply with a PUBLIC card.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [, , replyContent, msgType] = vi.mocked(replyMessage).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard OFF + flat 普通群: picker stays a visible reply (no ephemeral)', async () => {
+      // Default bot has no privateCard — the gate must not fire.
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'other task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {

@@ -106,6 +106,9 @@ export interface CliAdapter {
     fastMode?: boolean;
     /** Concrete Fast tier id resolved from Codex's model catalog. */
     fastServiceTier?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
+     *  Only codex/codex-app adapters honor it; others ignore. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */

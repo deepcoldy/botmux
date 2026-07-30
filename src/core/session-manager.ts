@@ -65,6 +65,7 @@ import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
+import { escapeXmlTagLikeTokens } from '../utils/xml.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -524,7 +525,7 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
   return [
     `<whiteboard id="${id}">`,
     '本地项目上下文；读取：`botmux whiteboard read --id ' + id + ' --json`（拿到 content 与 updatedAt）。',
-    '更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+    escapeXmlTagLikeTokens('更新状态：`botmux whiteboard update --id ' + id + ' --expected-updated-at <上次 read 的 updatedAt> <内容>`。'),
     '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
     '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
     '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
@@ -683,7 +684,7 @@ export function buildNewTopicPrompt(
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      `  <routing_rules>${t('ai.identity.short_routing', undefined, locale)}</routing_rules>`,
+      `  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`,
       '</identity>',
     ].join('\n');
   }
@@ -835,9 +836,13 @@ export function buildFollowUpContent(
   if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
   if (roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
+    // Non-hermes CLIs get the anti-resend variant only when the experimental
+    // dashboard toggle is on (config.noVisibleOutputHint, default OFF); otherwise
+    // the reminder is byte-for-byte the pre-feature baseline. Live-read so a
+    // Settings flip applies to the next follow-up turn without a daemon restart.
     const reminder = opts?.cliId === 'hermes'
       ? hermesFollowupReminder(opts?.locale)
-      : t('ai.followup.reminder', undefined, opts?.locale);
+      : t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
   }
   if (whiteboardBlock) parts.push(whiteboardBlock);
@@ -1422,6 +1427,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     // Same-key collision guard — see adopt-branch comment above.
     await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
     announceSessionRow(ds);
+
+    if (session.initialUserTurnPending) {
+      // `hasHistory: true` above means "there may be a CLI process/transcript to
+      // reattach or resume", NOT "a user has ever spoken to it". This session's
+      // CLI was booted idle by the repo flow and never received a real turn, so
+      // the next business message still routes through the new-topic opening
+      // builder and cold-spawns instead of `--resume`. See core/initial-user-turn.ts.
+      logger.info(`[${session.sessionId.substring(0, 8)}] Restored empty-started session — its first real user turn still opens as a new topic`);
+    }
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }

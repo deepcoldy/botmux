@@ -45,6 +45,7 @@ export interface SessionsKanbanIcons {
   details: string;
   feishu: string;
   history: string;
+  key: string;
   lock: string;
   restart: string;
   terminal: string;
@@ -79,6 +80,7 @@ export interface SessionsKanbanCallbacks {
   onNeedTeamBoard: (team: SessionsKanbanTeam) => void;
   onNeedTeams: () => void;
   onOpenTerminal?: (row: any) => void;
+  onOpenWritableTerminal?: (row: any, button: HTMLButtonElement) => void;
   onRename: (row: any, title: string) => void;
   onRestart: (row: any, button: HTMLButtonElement) => void;
   onTeamScope: (scope: { chats: number; sessions: number } | null) => void;
@@ -431,8 +433,16 @@ function KanbanCard(props: {
         <CardActButton
           action="terminal"
           icon={callbacks.icons.terminal}
-          label={t('sessions.openTerminal')}
+          label={t('sessions.openReadonlyTerminal')}
           onClick={() => callbacks.onOpenTerminal?.(row)}
+        />
+      ) : null}
+      {row.webPort && callbacks.onOpenWritableTerminal ? (
+        <CardActButton
+          action="write-link"
+          icon={callbacks.icons.key}
+          label={t('sessions.openWritableTerminal')}
+          onClick={button => callbacks.onOpenWritableTerminal?.(row, button)}
         />
       ) : null}
       {row.feishuChatLink ? (

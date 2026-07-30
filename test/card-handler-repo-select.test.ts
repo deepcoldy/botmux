@@ -298,6 +298,71 @@ describe('repo select card — plain switch', () => {
     expect(killWorker).not.toHaveBeenCalled();
     // First-spawn (pendingRepo) closes nothing, so no "session closed" card.
     expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+    // The buffered message IS the first real user turn — nothing left pending.
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  // ─── empty start (no buffered user input at all) ─────────────────────────
+  //
+  // Reached when the session was created by a bare `/repo` (the message IS the
+  // command, so pendingPrompt is ''). The CLI must boot idle — NOT with an
+  // empty `<user_message>` opening — and leave a durable marker so the user's
+  // next real message gets the full new-topic opening context.
+
+  it('pendingRepo card selection with nothing buffered boots the CLI idle and marks the first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    // No empty/boilerplate `<user_message>` opening burned on the cold start.
+    expect(buildNewTopicCliInput).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+    expect(updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('skip_repo with nothing buffered marks the first turn pending too', async () => {
+    const ds = makeDs({ pendingRepo: true, pendingPrompt: '', worker: null });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSkipEvent(), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
+  });
+
+  it('raw-passthrough cold start does NOT mark the first turn pending', async () => {
+    // `/goal …` owns the first turn (delivered literally on prompt_ready), so
+    // this is not an "empty start awaiting its first user turn".
+    const ds = makeDs({
+      pendingRepo: true,
+      pendingPrompt: '',
+      pendingRawInput: '/goal 发布 onboarding',
+      pendingRawTurnId: 'om_goal_first',
+      worker: null,
+    });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/alpha'), deps, APP_ID);
+
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.pendingRawInput).toBe('/goal 发布 onboarding');
+    expect(ds.session.initialUserTurnPending).toBeUndefined();
+  });
+
+  it('mid-session card switch empty-starts the replacement CLI and marks its first turn pending', async () => {
+    const ds = makeDs({ pendingRepo: false });
+    const { deps } = makeDeps(ds);
+
+    await handleCardAction(makeSelectEvent('repo_switch', '/repos/beta'), deps, APP_ID);
+
+    expect(killWorker).toHaveBeenCalled();
+    expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    expect(ds.hasHistory).toBe(false);
+    expect(ds.session.initialUserTurnPending).toBe(true);
   });
 
   it('pendingRepo selection forwards the complete Codex App sidecar to forkWorker', async () => {

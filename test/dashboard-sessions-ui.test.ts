@@ -23,6 +23,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
     details: '<svg></svg>',
     feishu: '<svg></svg>',
     history: '<svg></svg>',
+    key: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
     terminal: '<svg></svg>',
@@ -36,6 +37,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
   onNeedTeamBoard: () => {},
   onNeedTeams: () => {},
   onOpenTerminal: () => {},
+  onOpenWritableTerminal: () => {},
   onRename: () => {},
   onRestart: () => {},
   onTeamScope: () => {},
@@ -406,6 +408,7 @@ describe('dashboard sessions kanban react view', () => {
       host: null,
       ...kanbanCallbacks,
       onOpenTerminal: undefined,
+      onOpenWritableTerminal: undefined,
       rows: [{
         sessionId: 'embedded-session',
         status: 'working',
@@ -424,5 +427,23 @@ describe('dashboard sessions kanban react view', () => {
     }));
 
     expect(html).not.toContain('data-action="terminal"');
+    expect(html).not.toContain('data-action="write-link"');
+  });
+
+  it('renders separate read-only and writable terminal actions when both are available', () => {
+    const html = renderKanban({
+      rows: [{
+        sessionId: 'dual-terminal-session',
+        status: 'working',
+        cliId: 'codex',
+        title: 'Dual terminal',
+        botName: 'Bot A',
+        lastMessageAt: 1000,
+        webPort: 3001,
+      }],
+    });
+
+    expect(html).toContain('data-action="terminal"');
+    expect(html).toContain('data-action="write-link"');
   });
 });

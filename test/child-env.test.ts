@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { redactChildEnv, scrubSessionCliHomeEnv, SESSION_CLI_HOME_ENV_KEYS } from '../src/utils/child-env.js';
+import {
+  CLAUDE_SESSION_MARKER_ENV_KEYS,
+  redactChildEnv,
+  scrubClaudeSessionMarkerEnv,
+  scrubSessionCliHomeEnv,
+  SESSION_CLI_HOME_ENV_KEYS,
+} from '../src/utils/child-env.js';
 
 describe('redactChildEnv()', () => {
   it('truly removes leaked keys — absent, not present-with-"undefined"', () => {
@@ -29,6 +35,21 @@ describe('redactChildEnv()', () => {
     expect(base.LARK_APP_ID).toBe('a');
     expect(base.LARK_APP_SECRET).toBe('s');
     expect(base.CLAUDECODE).toBe('1');
+  });
+
+  it('removes every Claude session marker from child env', () => {
+    // CLAUDE_CODE_CHILD_SESSION is the destructive one — an inherited marker
+    // makes the CLI treat itself as a nested subagent session and stop saving
+    // transcripts, silently breaking --resume continuity. The rest are the
+    // dead parent session's identity and must not reach a fresh CLI either.
+    const base = Object.fromEntries(CLAUDE_SESSION_MARKER_ENV_KEYS.map((k) => [k, 'leaked']));
+    const out = redactChildEnv({ ...base, CLAUDE_EFFORT: 'high', KEEP: 'v' });
+    for (const key of CLAUDE_SESSION_MARKER_ENV_KEYS) {
+      expect(key in out, key).toBe(false);
+    }
+    // Behavior knob, not an identity marker — must survive.
+    expect(out.CLAUDE_EFFORT).toBe('high');
+    expect(out.KEEP).toBe('v');
   });
 
   it('removes GitHub tokens from child env', () => {
@@ -100,6 +121,36 @@ describe('scrubSessionCliHomeEnv()', () => {
   });
 });
 
+describe('scrubClaudeSessionMarkerEnv()', () => {
+  it('deletes every inherited Claude session marker in place, keys absent not undefined', () => {
+    const env: NodeJS.ProcessEnv = {
+      ...Object.fromEntries(CLAUDE_SESSION_MARKER_ENV_KEYS.map((k) => [k, 'stale'])),
+      KEEP: 'v',
+      PATH: '/usr/bin',
+    };
+    scrubClaudeSessionMarkerEnv(env);
+    for (const key of CLAUDE_SESSION_MARKER_ENV_KEYS) {
+      expect(key in env, key).toBe(false);
+    }
+    expect(env.KEEP).toBe('v');
+    expect(env.PATH).toBe('/usr/bin');
+  });
+
+  it('also drops CLAUDE_EFFORT at boundaries — inherited it can only be the issuing session\'s', () => {
+    // An effort override that rode pm2 → daemon → worker would silently pin the
+    // issuing Claude session's effort onto every bot (behavior/cost/latency).
+    // The supported channels land AFTER this boundary scrub and keep working:
+    // per-bot env injection (all backends, PTY included) and the pane shell's
+    // profile (shell-wrapped backends) — hence the key is NOT in
+    // CLAUDE_SESSION_MARKER_ENV_KEYS (no pane unset, no server scrub, and
+    // redactChildEnv keeps it, as the marker test above pins).
+    const env: NodeJS.ProcessEnv = { CLAUDE_EFFORT: 'high' };
+    scrubClaudeSessionMarkerEnv(env);
+    expect('CLAUDE_EFFORT' in env).toBe(false);
+    expect(CLAUDE_SESSION_MARKER_ENV_KEYS).not.toContain('CLAUDE_EFFORT');
+  });
+});
+
 describe('session CLI home scrub call sites', () => {
   // The scrub only works if every process boundary actually invokes it. These
   // source-level pins keep a refactor from silently dropping a boundary:
@@ -121,5 +172,16 @@ describe('session CLI home scrub call sites', () => {
 
   it('worker.ts scrubs process.env at boot', () => {
     expect(read('worker.ts')).toContain('scrubSessionCliHomeEnv(process.env)');
+  });
+
+  it('all three boundaries also scrub Claude session markers', () => {
+    // Same rationale, same boundaries: a marker that survives pm2's persisted
+    // env or a stale dump.pm2 reaches the daemon → the tmux server it forks →
+    // every pane on the machine.
+    const cli = read('cli.ts');
+    const fn = cli.slice(cli.indexOf('function pm2Env('));
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
+    expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
+    expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
   });
 });

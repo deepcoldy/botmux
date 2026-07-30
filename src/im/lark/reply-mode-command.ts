@@ -44,7 +44,7 @@ export async function tryHandleReplyModeCommand(
   if (isP2p) {
     if (isStatus) {
       if (!canTalk) return true;
-      const cur = getBot(larkAppId).config.p2pMode === 'chat' ? 'chat' : 'new-topic';
+      const cur = getBot(larkAppId).config.p2pMode === 'thread' ? 'new-topic' : 'chat';
       await reply(t('cmd.reply_mode.dm_status', { mode: replyModeLabel(cur) }, loc));
       return true;
     }
@@ -71,8 +71,9 @@ export async function tryHandleReplyModeCommand(
       await reply(t('cmd.reply_mode.failed', { reason: 'spec_missing' }, loc));
       return true;
     }
-    // chat → 扁平连续 DM 会话；topic/new-topic → 清回默认（每条 DM 独立）。
-    const value = mode === 'chat' ? 'chat' : null;
+    // chat（默认）→ 清回默认（扁平连续 DM 会话）；topic/new-topic → 显式 thread
+    // （每条 DM 独立会话）。
+    const value = mode === 'chat' ? null : 'thread';
     const r = await applyConfigField(larkAppId, spec, value);
     if (!r.ok) {
       await reply(t('cmd.reply_mode.failed', { reason: r.reason }, loc));

@@ -247,6 +247,11 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
   const env = { ...inheritedEnv };
   // The dashboard/daemon snapshot may outlive a ~/.botmux/.env edit. Let the
   // fresh CLI reload these settings from the file.
+  //
+  // This list MUST mirror DAEMON_ENV_KEYS in src/cli/daemon-lifecycle-env.ts:
+  // every key baked into the PM2 env block there has to be stripped here, or a
+  // detached restart (dashboard update/restart, maintenance auto-update) keeps
+  // the stale baked value instead of reloading from the file. Keep them in sync.
   for (const key of [
     'WEB_EXTERNAL_HOST',
     'BOTMUX_DASHBOARD_EXTERNAL_HOST',
@@ -254,6 +259,7 @@ export function detachedRestartEnv(inheritedEnv: NodeJS.ProcessEnv = process.env
     'BOTMUX_DASHBOARD_PORT',
     'BOTMUX_DAEMON_IPC_BASE_PORT',
     'BOTMUX_DASHBOARD_PUBLIC_READONLY',
+    'BOTMUX_PUBLIC_URL',
   ]) delete env[key];
   return env;
 }

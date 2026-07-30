@@ -626,7 +626,7 @@ describe('im.message.receive_v1 — forwarded topic clarification coalescing', (
       anchor: 'root-existing-topic',
     }));
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(p2p, expect.objectContaining({
-      anchor: 'msg-p2p-immediate',
+      anchor: 'chat-p2p-immediate',
     }));
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(control, expect.objectContaining({
       anchor: 'msg-control-immediate',
@@ -1145,13 +1145,25 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
       .toEqual({ scope: 'chat', anchor: 'oc_dm' });
   });
 
-  it('default (thread) mode: top-level DM → fresh thread-scope anchored on messageId', async () => {
+  it('default (chat) mode: top-level DM → flat chat-scope anchored on chatId', async () => {
+    // p2pMode default is now 'chat': the whole DM shares one continuous session.
     setupBotState({});
+    expect(await decideRouting(MY_APP_ID, dm())).toEqual({ scope: 'chat', anchor: 'oc_dm' });
+  });
+
+  it('default (chat) mode: DM reply with root_id+thread_id still folds into the SAME chat-scope session', async () => {
+    setupBotState({});
+    expect(await decideRouting(MY_APP_ID, dm({ root_id: 'root-dm', thread_id: 'root-dm' })))
+      .toEqual({ scope: 'chat', anchor: 'oc_dm' });
+  });
+
+  it('explicit thread mode: top-level DM → fresh thread-scope anchored on messageId', async () => {
+    setupBotState({ p2pMode: 'thread' });
     expect(await decideRouting(MY_APP_ID, dm())).toEqual({ scope: 'thread', anchor: 'msg-dm' });
   });
 
-  it('default (thread) mode: DM reply with root_id+thread_id threads into its session (real-thread, unchanged)', async () => {
-    setupBotState({});
+  it('explicit thread mode: DM reply with root_id+thread_id threads into its session (real-thread)', async () => {
+    setupBotState({ p2pMode: 'thread' });
     expect(await decideRouting(MY_APP_ID, dm({ root_id: 'root-dm', thread_id: 'root-dm' })))
       .toEqual({ scope: 'thread', anchor: 'root-dm' });
   });
@@ -1160,6 +1172,52 @@ describe('decideRouting — p2p p2pMode (thread | chat)', () => {
     setupBotState({ p2pMode: 'chat' });
     expect(await decideRouting(MY_APP_ID, { message_id: 'msg-g', chat_id: 'oc_g', chat_type: 'group', root_id: 'root-g', thread_id: 'root-g' }))
       .toEqual({ scope: 'thread', anchor: 'root-g' });
+  });
+
+  it('chat-topic mode: native topic seed starts an independent session at messageId', async () => {
+    setupBotState({ regularGroupReplyMode: 'chat-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-topic-root', chat_id: 'oc_group', chat_type: 'group',
+      root_id: undefined, thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-topic-root' });
+  });
+
+  it('chat-topic mode: a later reply in that native topic stays anchored at its root', async () => {
+    setupBotState({ regularGroupReplyMode: 'chat-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-topic-reply', chat_id: 'oc_group', chat_type: 'group',
+      root_id: 'msg-topic-root', thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-topic-root' });
+  });
+
+  it('chat/shared modes: a native topic seed stays chat-scope (folds into the group session, per /reply-mode contract)', async () => {
+    // The omt_ isolation is gated on chat-topic ONLY. chat and shared are
+    // documented to fold native topics into the one group session, so the
+    // seed must NOT escape to thread-scope here.
+    mockGetChatMode.mockResolvedValue('group');
+    for (const mode of ['chat', 'shared'] as const) {
+      setupBotState({ regularGroupReplyMode: mode });
+      expect(await decideRouting(MY_APP_ID, {
+        message_id: 'msg-topic-root', chat_id: 'oc_group', chat_type: 'group',
+        root_id: undefined, thread_id: 'omt_native_topic',
+      })).toEqual({ scope: 'chat', anchor: 'oc_group' });
+    }
+  });
+
+  it('new-topic mode: a native topic seed is thread-scope via regularGroupRouting (not the omt_ branch)', async () => {
+    // new-topic forks a fresh thread-scope session for EVERY top-level message,
+    // so a native topic seed also lands thread-scope — but via regularGroupRouting
+    // (source=regular-group-thread), NOT the chat-topic-gated omt_ branch. This
+    // locks the "goes through regularGroupRouting yet still thread" semantic so a
+    // future omt_ gating change can't silently reroute new-topic seeds.
+    setupBotState({ regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    expect(await decideRouting(MY_APP_ID, {
+      message_id: 'msg-nt-seed', chat_id: 'oc_group', chat_type: 'group',
+      root_id: undefined, thread_id: 'omt_native_topic',
+    })).toEqual({ scope: 'thread', anchor: 'msg-nt-seed' });
   });
 });
 
@@ -1995,7 +2053,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // 的 `ctx.scope === 'chat' || source === 'regular-group-thread'` 两条件全 false
     // → 绕过 vetting → 静默 spawn 一个 thread-scope 会话。这条用例锁死「不能绕」。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效
-    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyMode unset(chat) → source=regular-group-chat
+    mockGetChatMode.mockResolvedValueOnce('group');  // 普通群, regularGroupReplyMode unset(chat-topic) → 顶层 @ 仍走 regularGroupRouting → source=regular-group-chat
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown peer
     const event = makeBotMessageEvent({
       senderOpenId: OTHER_BOT_OPEN_ID,
@@ -2577,13 +2635,12 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       senderOpenId: USER_OPEN_ID,
       explicitlyMentionedThisBot: true,
     }));
-    expect(hookAnchor).toBe('chat-anchor-override');
+    expect(hookAnchor).toBe('visible-topic-root');
     expect(handlers.isSessionOwner).toHaveBeenCalledWith('vc-receiver-session-1', MY_APP_ID);
     expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
       anchor: 'vc-receiver-session-1',
-      scope: 'chat',
+      scope: 'thread',
       chatId: 'chat-anchor-override',
-      replyRootId: 'visible-topic-root',
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
@@ -2672,7 +2729,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
   it('folds an @ inside a regular-group topic into the chat-scope session when no thread session owns it', async () => {
     // In chat/shared modes, a mentioned reply inside a regular-group topic should
     // reuse the group chat-scope context and reply in that same topic, rather
-    // than spawning a new thread-scope session per topic.
+    // than spawning a new thread-scope session per topic. (Pinned to 'shared'
+    // since the per-bot default is now 'chat-topic', which intentionally does
+    // NOT fold.)
+    setupBotState({ chatReplyModes: { 'chat-fallback-3': 'shared' }, allowedUsers: [USER_OPEN_ID] });
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@BotA new topic please' }),
@@ -2765,6 +2825,105 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('shared mode folds a native topic seed into the group chat-scope session (per /reply-mode contract)', async () => {
+    // Narrowed behavior: omt_ isolation is chat-topic-only. In shared mode a
+    // native topic seed must fold into the one group session (the visible reply
+    // still threads under the seed via replyRootId), NOT spawn an independent
+    // thread-scope session.
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA work here' }),
+      messageId: 'msg-independent-topic',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'omt_independent_topic',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('shared mode: a root+thread reply into a bot-OWNED thread session is NOT folded to the lobby (seed-helper guard)', async () => {
+    // Regression for the pre-existing reply-as-seed hazard in
+    // maybeApplySharedTopicSeed: a bot that already owns a thread-scope session
+    // (e.g. created via /t, a mode flip, or restore/adopt) receiving a
+    // root_id+thread_id reply must CONTINUE that thread session, never get
+    // re-folded into the group lobby. maybeFold bows out via ownsThreadSession,
+    // and the seed helper's `root_id && thread_id` guard prevents the second fold.
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'prior-thread-root');
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA continue in my thread' }),
+      rootId: 'prior-thread-root',
+      messageId: 'msg-reply-into-owned-thread',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'prior-thread-root',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](reply);
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(reply, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'prior-thread-root',
+      larkAppId: MY_APP_ID,
+    }));
+    // Crucially NOT re-folded into the group chat-scope session.
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalledWith(reply, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+    }));
+  });
+
+  it('chat-topic mode: a native topic seed spawns an independent thread session at messageId', async () => {
+    // The positive counterpart: in chat-topic mode the pure topic-root seed
+    // (thread_id only, no root_id) must isolate — fixing the gap where the
+    // topic's opening message previously folded into the group lobby.
+    setupBotState({ chatReplyModes: { 'chat-reply-mode': 'chat-topic' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    // Bot owns the group lobby, NOT the topic — must not pull the seed into it.
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-reply-mode');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    const seed = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA new native topic root' }),
+      messageId: 'msg-ct-seed',
+      chatId: 'chat-reply-mode',
+      chatType: 'group',
+      threadId: 'omt_ct_seed',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](seed);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(seed, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-ct-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalledWith(seed, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-reply-mode',
+    }));
   });
 
   it('shared thread-contained @ reuses the chat session and replies in the existing topic', async () => {
@@ -3383,8 +3542,10 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
-  it('default chat-mode @ inside a regular-group topic reuses the group chat session', async () => {
-    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+  it('chat mode @ inside a regular-group topic reuses the group chat session', async () => {
+    // Pinned to explicit 'chat' (the per-bot default is now 'chat-topic', which
+    // keeps native topics independent — see the chat-topic tests above).
+    setupBotState({ regularGroupReplyMode: 'chat', allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'chat-default');
     const event = makeUserMessageEvent({
@@ -4146,6 +4307,80 @@ describe('im.message.receive_v1 — regular group thread replies preference', ()
   });
 });
 
+describe('im.message.receive_v1 — p2p chat-mode topic reply anchoring', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    setupBotState({ p2pMode: 'chat', allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('p2p');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('a DM reply inside an existing topic stays chat-scope but anchors the visible reply back to the topic root (no leak to DM top level)', async () => {
+    // Regression: p2pMode default flipped to 'chat' makes the whole DM one flat
+    // chat-scope session. A message that is itself a reply INSIDE a native topic
+    // (root_id + thread_id) must keep the session flat (chat-scope, anchored on
+    // chatId) BUT thread its visible reply under that topic root via replyRootId
+    // — otherwise the reply leaks to the DM top level. The group-side
+    // replyRootId preservation is gated chatType==='group', so p2p needs its own.
+    const reply = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'follow up inside this DM topic' }),
+      rootId: 'dm-topic-root',
+      threadId: 'omt_dm_topic',
+      messageId: 'msg-dm-in-topic',
+      chatId: 'oc_dm_chat',
+      chatType: 'p2p',
+    });
+    // Bot owns the flat DM chat-scope session (keyed on chatId).
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'oc_dm_chat');
+
+    await capturedHandlers['im.message.receive_v1'](reply);
+    await flushEventWork();
+
+    // Session stays flat chat-scope on the DM chatId...
+    // ...and the visible reply is anchored back to the topic root (replyRootId).
+    const call = handlers.handleThreadReply.mock.calls.find(c => c[0] === reply)
+      ?? handlers.handleNewTopic.mock.calls.find(c => c[0] === reply);
+    expect(call).toBeTruthy();
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'oc_dm_chat',
+      replyRootId: 'dm-topic-root',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('a top-level DM message (no thread) stays flat with no replyRootId', async () => {
+    // The fix must NOT invent a replyRootId for ordinary top-level DM messages —
+    // only real topic replies (root_id + thread_id) get the thread anchor.
+    const top = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'plain DM message' }),
+      messageId: 'msg-dm-top',
+      chatId: 'oc_dm_chat2',
+      chatType: 'p2p',
+    });
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](top);
+    await flushEventWork();
+
+    const call = handlers.handleNewTopic.mock.calls.find(c => c[0] === top)
+      ?? handlers.handleThreadReply.mock.calls.find(c => c[0] === top);
+    expect(call).toBeTruthy();
+    expect(call![1]).toEqual(expect.objectContaining({
+      scope: 'chat',
+      anchor: 'oc_dm_chat2',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(call![1].replyRootId).toBeUndefined();
+  });
+});
+
 describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | shared)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
@@ -4870,6 +5105,28 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
       scope: 'thread',
       anchor: 'msg-topic-seed',
+      larkAppId: MY_APP_ID,
+    }));
+  });
+
+  it('话题群带 omt thread_id 的 seed 仍保留 autoStartOnNewTopic', async () => {
+    setupAutoTopicBot(true);
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '帮我处理这个新话题' }),
+      messageId: 'msg-topic-omt-seed',
+      chatId: 'chat-topic-omt',
+      chatType: 'group',
+      threadId: 'omt_topic_chat_seed',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-topic-omt-seed',
       larkAppId: MY_APP_ID,
     }));
   });

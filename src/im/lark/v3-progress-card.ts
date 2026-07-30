@@ -9,6 +9,7 @@
  */
 
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 import type { V3ProgressView } from '../../workflows/v3/progress-projection.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
 
@@ -27,7 +28,7 @@ export interface V3ProgressCardOptions {
 const MAX_INLINE_IDS = 5;
 
 export function v3ProgressRunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 /** Render one complete Feishu card body from the safe v3 progress projection. */

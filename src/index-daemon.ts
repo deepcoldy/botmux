@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
-import { scrubSessionCliHomeEnv } from './utils/child-env.js';
+import { scrubClaudeSessionMarkerEnv, scrubSessionCliHomeEnv } from './utils/child-env.js';
 
 // Under pm2 the daemon's stdout/stderr are pipes to the God daemon. A broken
 // pipe (log streaming detaches, God daemon restart) would otherwise emit an
@@ -36,6 +36,11 @@ for (const k of ['BOTMUX_SESSION_ID', 'BOTMUX_LARK_APP_ID', 'BOTMUX_CHAT_ID', 'B
 // child read/write the leaking bot's home. Per-session values are recomputed
 // downstream (worker isolation pins / adapter spawnEnv).
 scrubSessionCliHomeEnv(process.env);
+// Same vector again, Claude session-identity markers: baked into pm2's saved
+// env they make the tmux server this daemon may later fork mark every bot CLI
+// as a nested child session (transcript saving OFF → --resume continuity
+// silently lost). See CLAUDE_SESSION_MARKER_ENV_KEYS.
+scrubClaudeSessionMarkerEnv(process.env);
 
 async function main() {
   // Resolve global UI locale from ~/.botmux/config.json BEFORE loading

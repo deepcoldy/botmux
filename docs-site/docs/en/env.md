@@ -29,6 +29,7 @@ Most configuration goes through `bots.json` / the dashboard — you **usually do
 | `BOTMUX_DASHBOARD_HOST` | `0.0.0.0` | Dashboard HTTP bind address |
 | `BOTMUX_DASHBOARD_PORT` | `7891` | Dashboard HTTP port |
 | `BOTMUX_DASHBOARD_EXTERNAL_HOST` | `WEB_EXTERNAL_HOST` or auto-detect | Host used in URLs the CLI prints |
+| `BOTMUX_PUBLIC_URL` | _(unset)_ | Self-hosted reverse-proxy base (`scheme://host[:port]`). Set it when you don't use the central platform but front the dashboard with your own nginx etc. on a single public/intranet domain; dashboard and card terminal links then emit `<base>/…` and `<base>/s/<sessionId>` through the dashboard front door, with no per-bot port. Unset falls back to the local `host:port`. Must be written into `~/.botmux/.env` (a restart launched from inside a session reads only the file, it does not inherit the shell) |
 | `BOTMUX_DAEMON_IPC_BASE_PORT` | `7892` | Each daemon's IPC port = base + botIndex |
 | `BOTMUX_WORKFLOW_RUNS_DIR` | `~/.botmux/workflow-runs` | Workflow run storage directory |
 

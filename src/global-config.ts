@@ -203,6 +203,13 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Experimental: inject the "no visible output" anti-resend guidance into the
+   *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
+   *  that make a model resend after a silent `botmux send`-only turn. Default OFF
+   *  (absent ⇒ off): mainly helps when Claude Code drives a non-Claude backend
+   *  model; harmless but unnecessary otherwise. Read live — see config.ts
+   *  `noVisibleOutputHint`. */
+  noVisibleOutputHint?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -329,6 +336,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

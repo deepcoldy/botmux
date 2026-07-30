@@ -123,7 +123,7 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).not.toContain('PATH=/usr/bin');
   });
 
-  it('forwards BOTMUX_READY_COMMAND so Hermes can release the first-prompt ready gate', () => {
+  it('forwards BOTMUX_READY_COMMAND so ready-hook CLIs can release the first-prompt ready gate', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
       BOTMUX_READY_COMMAND: '"/usr/local/bin/node" "/opt/botmux/dist/cli.js" session-ready',
