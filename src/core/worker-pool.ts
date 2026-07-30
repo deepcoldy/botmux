@@ -106,6 +106,7 @@ import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
 import { writeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { deferWorkerSpawnDuringDeviceIsolation } from './device-isolation-activation.js';
+import { deferSpawnDuringFreeze, forgetDeferredSpawn, shouldAnnounceSpawnFreeze } from './spawn-freeze.js';
 import {
   buildBotmuxLarkNativeSessionTitle,
   extractBotmuxLarkNativeSessionTitlePrompt,
@@ -1641,6 +1642,10 @@ export async function closeSession(
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  // A spawn parked by an ops freeze must not outlive its session. The replay
+  // callback re-checks the registry anyway, so this is about not holding the
+  // closure (and the poll timer) alive for a session that is already gone.
+  forgetDeferredSpawn(sessionId);
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -2091,12 +2096,91 @@ export function forkWorker(
   // ANY session mutation or child fork. One deferred spawn per logical session
   // is replayed after the exact freeze lease is released; a session closed by
   // the activation transaction is deliberately not revived.
-  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
-    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+  // Same immutable-identity rule as the ops freeze below: `ds.session` is
+  // replaced wholesale by a repo switch, so both the queue key and the replay
+  // guard must use the id captured here, never a re-read of `ds.session`.
+  const deferredSessionId = ds.session.sessionId;
+  if (deferWorkerSpawnDuringDeviceIsolation(deferredSessionId, () => {
+    if (
+      ds.session.sessionId === deferredSessionId
+      && findActiveBySessionId(deferredSessionId) === ds
+    ) {
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    return;
+  }
+  // An ops maintenance window (credential refresh, `claude` upgrade, workspace
+  // rebuild) can declare that no new CLI may start on this host. Same defer +
+  // replay shape as the device-isolation lease above, but driven by an on-disk
+  // declaration so a daemon that BOOTS during the window freezes itself too.
+  // Deliberately only blocks new spawns: tearing down live CLIs is
+  // `botmux suspend`'s job, and conflating the two would make every freeze a
+  // fleet-wide cold restart.
+  // Whether this spawn carries a user turn. A promptless one (restore re-attach,
+  // warm-up, a start whose only job is to let a queued raw command reach a ready
+  // CLI) is still parked — skipping it outright would silently strand dashboard
+  // wakes and `pendingRawInput` — but it must not shut out the first real turn,
+  // so the gate lets a payload-bearing request displace it.
+  const gateHasPayload = typeof promptInput === 'string'
+    ? promptInput.trim() !== ''
+    : promptInput.content.trim() !== '' || !!promptInput.codexAppInput;
+  const opsFreeze = deferSpawnDuringFreeze({
+    sessionId: deferredSessionId,
+    larkAppId: ds.larkAppId,
+    hasPayload: gateHasPayload,
+    replay: () => {
+      // Replay only when this ds is STILL the live session it was queued for:
+      // closed, replaced or transferred sessions must never be revived.
+      if (
+        ds.session.sessionId === deferredSessionId
+        && findActiveBySessionId(deferredSessionId) === ds
+      ) {
+        forkWorker(ds, promptInput, resumeOrTurnId);
+      }
+    },
+  });
+  if (opsFreeze) {
+    const { freeze, parked } = opsFreeze;
+    const remainingSec = Math.max(1, Math.ceil((freeze.effectiveUntil - Date.now()) / 1000));
+    const anchor = sessionAnchorId(ds);
+    // `parked: false` means this session already has a spawn waiting, so THIS
+    // turn will not be replayed — it is dropped. Say so loudly: the reaction
+    // bookkeeping settles pending turns when the replayed one finishes, so an
+    // unreported drop would show up to the user as "handled".
+    if (parked) {
+      logger.info(
+        `[${tag(ds)}] worker spawn parked by spawn-freeze (reason=${freeze.reason}, `
+        + `~${remainingSec}s left${opsFreeze.superseded ? ', superseded a promptless spawn' : ''})`,
+      );
+    } else {
+      logger.warn(
+        `[${tag(ds)}] spawn-freeze (reason=${freeze.reason}) already holds a parked spawn for this `
+        + `session — THIS turn will not be replayed and must be re-sent after release `
+        + `(~${remainingSec}s left)`,
+      );
+    }
+    if (shouldAnnounceSpawnFreeze(freeze, anchor, parked ? 'parked' : 'dropped')) {
+      const gateTurnId = typeof resumeOrTurnId === 'string'
+        ? resumeOrTurnId
+        : (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null ? resumeOrTurnId.turnId : undefined);
+      const notice = parked
+        ? `🔧 维护中（${freeze.reason}），暂不启动新的 CLI 会话；约 ${remainingSec} 秒后自动继续处理这条消息。`
+        : `🔧 维护中（${freeze.reason}），这条消息不会被自动处理——本会话已有一条在排队。请在约 ${remainingSec} 秒后重发。`;
+      try {
+        void requireCallbacks().sessionReply(
+          anchor,
+          notice,
+          'text',
+          ds.larkAppId,
+          fallbackTurnId(ds, gateTurnId),
+        ).catch(err => logger.warn(`[${tag(ds)}] spawn-freeze notice failed: ${err?.message ?? err}`));
+      } catch {
+        // No callbacks wired (unit tests / early boot) — the log above is the
+        // only report, which is strictly better than failing the gate itself.
+      }
+    }
     return;
   }
   const cb = requireCallbacks();

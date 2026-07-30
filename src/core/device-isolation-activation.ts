@@ -132,6 +132,11 @@ export function releaseDeviceIsolationFreeze(input: {
  * Queue only the first spawn request for a logical session. Later turns are
  * already retained by the session's normal pending-input machinery; replaying
  * multiple fork requests would instead kill and replace the first new worker.
+ *
+ * Callers must key on an IMMUTABLE session id captured at queue time and
+ * re-check it before forking: a repo switch replaces `ds.session` wholesale on
+ * the same session object, so a replay that re-reads it would accept an entry
+ * queued for the previous session.
  */
 export function deferWorkerSpawnDuringDeviceIsolation(
   sessionId: string,

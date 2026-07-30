@@ -119,6 +119,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
+import { activeSpawnFreezeFor } from './core/spawn-freeze.js';
 import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
@@ -941,6 +942,7 @@ function provisionIsolatedBotHome(
   cliId: string,
   hookInstall: HookInstallConfig | undefined,
   log: (m: string) => void,
+  larkAppId: string,
 ): void {
   try {
     if (isClaude) {
@@ -968,12 +970,41 @@ function provisionIsolatedBotHome(
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
       // just seeding once) means a re-login elsewhere self-heals on the next cold
       // spawn — no separate sync step needed. Same shared account for every bot.
-      const fresh = freshestClaudeCred();
-      if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
-      else if (
-        !existsSync(join(cdir, '.credentials.json'))
-        && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
-      ) {
+      // …EXCEPT while an ops freeze is in effect. A credential-refresh script
+      // deliberately fake-expires the shared file before asking claude to
+      // rotate, so a copy taken mid-window hands this bot a token that is
+      // already dead — and a bot that then refreshes on its own rotates the
+      // shared refresh token out from under the script, which is the whole
+      // poisoning chain the freeze exists to prevent.
+      //
+      // The daemon's spawn gate does not make this check redundant: the freeze
+      // can begin AFTER forkWorker cleared it and before this line runs, so the
+      // decision has to be made here too.
+      //
+      // The rule while frozen is simply "do not touch credential copies" — not
+      // "copy something safer". Trying to be clever here means deciding whether
+      // an expired source is the script's fake-expire step (copying it feeds the
+      // poisoning chain) or a genuinely idle host (copying it is the self-heal
+      // path), and that is not decidable from the file. So: a bot that already
+      // has a copy keeps it, and a bot that has none stays unseeded until the
+      // window closes.
+      //
+      // The cost is explicit: a brand-new isolated bot whose FIRST spawn lands
+      // inside a maintenance window can reach a login screen, and recovers on
+      // the next spawn after release (≤ the freeze's own bound). That is one bot
+      // briefly unusable versus a shared-account rotation that takes the whole
+      // fleet offline — the trade is not close.
+      const credPath = join(cdir, '.credentials.json');
+      const hasCredCopy = existsSync(credPath);
+      const credFreeze = activeSpawnFreezeFor(larkAppId);
+      if (credFreeze) {
+        log(hasCredCopy
+          ? `[read-isolation] spawn-freeze active (${credFreeze.reason}) — keeping existing per-bot credential copy`
+          : `[read-isolation] WARN spawn-freeze active (${credFreeze.reason}) and this bot has no credential copy yet — NOT seeding one mid-window; it may hit a login screen and will sync on the first spawn after release`);
+      }
+      const fresh = credFreeze ? null : freshestClaudeCred();
+      if (fresh) writeCredIfChanged(credPath, fresh);
+      else if (!credFreeze && !hasCredCopy && !claudeSettingsHasProviderAuth(isolatedSettingsPath)) {
         log(`[read-isolation] WARN no Claude provider auth found (global settings env, keychain, or ~/.claude/.credentials.json) — bot may hit login screen`);
       }
       // State: seed <cdir>/.claude.json from the GLOBAL one MINUS `projects` (keeps the
@@ -984,9 +1015,20 @@ function provisionIsolatedBotHome(
       const cdir = join(botHome, 'codex');
       mkdirSync(cdir, { recursive: true });
       // auth.json: keep synced to the shared account's copy on EVERY spawn (a re-login
-      // elsewhere rotates the refresh token, which would strand a stale per-bot copy).
+      // elsewhere rotates the refresh token, which would strand a stale per-bot copy) —
+      // skipped mid-freeze for the same reason as the Claude branch above.
       const authSrc = join(homedir(), '.codex', 'auth.json');
-      if (existsSync(authSrc)) writeCredIfChanged(join(cdir, 'auth.json'), readFileSync(authSrc, 'utf-8'));
+      const authDst = join(cdir, 'auth.json');
+      const codexFreeze = activeSpawnFreezeFor(larkAppId);
+      // Same rule as the Claude branch, same reasoning: mid-window we do not
+      // write credential copies at all.
+      if (codexFreeze) {
+        log(existsSync(authDst)
+          ? `[read-isolation] spawn-freeze active (${codexFreeze.reason}) — keeping existing per-bot codex auth copy`
+          : `[read-isolation] WARN spawn-freeze active (${codexFreeze.reason}) and this bot has no codex auth copy yet — NOT seeding one mid-window; it will sync on the first spawn after release`);
+      } else if (existsSync(authSrc)) {
+        writeCredIfChanged(authDst, readFileSync(authSrc, 'utf-8'));
+      }
       // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
       const cfgDst = join(cdir, 'config.toml');
       const cfgSrc = join(homedir(), '.codex', 'config.toml');
@@ -1023,17 +1065,30 @@ function freshestClaudeCred(): string | null {
   const expOf = (raw: string): number => {
     try { return Number(JSON.parse(raw)?.claudeAiOauth?.expiresAt) || 0; } catch { return 0; }
   };
+  // "Non-empty" is not the same as "a credential". A source mid-rewrite (or an
+  // OAuth block stripped down to a logged-out shell) parses fine yet carries no
+  // usable token; copying it into a per-bot file only guarantees a login screen
+  // on the next spawn. Note this checks STRUCTURE, not expiry: an expired token
+  // with a live refresh token is normal and must still be copied, otherwise a
+  // bot can never self-heal after the host has been idle past a token lifetime.
+  const usable = (raw: string): boolean => {
+    try {
+      const oauth = JSON.parse(raw)?.claudeAiOauth;
+      return typeof oauth?.accessToken === 'string' && oauth.accessToken.length > 0
+        && typeof oauth?.refreshToken === 'string' && oauth.refreshToken.length > 0;
+    } catch { return false; }
+  };
   try {
     const p = join(homedir(), '.claude', '.credentials.json');
     if (existsSync(p)) {
       const raw = readFileSync(p, 'utf-8').trim();
-      if (raw) cands.push({ raw, exp: expOf(raw) });
+      if (raw && usable(raw)) cands.push({ raw, exp: expOf(raw) });
     }
   } catch { /* unreadable file → skip candidate */ }
   try {
     const r = spawnSync('security', ['find-generic-password', '-s', 'Claude Code-credentials', '-w'], { encoding: 'utf-8' });
     const raw = (r.stdout ?? '').trim();
-    if (raw) cands.push({ raw, exp: expOf(raw) });
+    if (raw && usable(raw)) cands.push({ raw, exp: expOf(raw) });
   } catch { /* no keychain (non-mac) → skip candidate */ }
   if (!cands.length) return null;
   cands.sort((a, b) => b.exp - a.exp);
@@ -6883,7 +6938,7 @@ async function spawnCli(
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log);
+    provisionIsolatedBotHome(isolationBotHome, cfg.workingDir, isClaudeFam, cfg.cliId, cliAdapter.hookInstall, log, cfg.larkAppId);
     if (isClaudeFam && effectiveReadyHookInstall) {
       effectiveReadyHookInstall = {
         ...effectiveReadyHookInstall,
