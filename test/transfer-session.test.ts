@@ -881,7 +881,10 @@ describe('closeSession concurrency', () => {
     const base = makeDs().session;
     const zmx = { ...base, backendType: 'zmx' as const };
     expect(destroyUnregisteredPersistentBacking(zmx, kill)).toBe(true);
-    expect(kill).toHaveBeenCalledWith('zmx', 'bmx-sess-abc', 'sess-abc-123');
+    expect(kill).toHaveBeenCalledWith(
+      { backendType: 'zmx', sessionName: 'bmx-sess-abc' },
+      'sess-abc-123',
+    );
 
     kill.mockClear();
     expect(destroyUnregisteredPersistentBacking({ ...zmx, adoptedFrom: {
@@ -890,6 +893,26 @@ describe('closeSession concurrency', () => {
     expect(destroyUnregisteredPersistentBacking({ ...zmx, queued: true }, kill)).toBe(false);
     expect(destroyUnregisteredPersistentBacking({ ...zmx, backendType: 'pty' }, kill)).toBe(false);
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('tears down an unregistered backing through its exact persisted target', () => {
+    const killTarget = vi.fn();
+    const base = makeDs().session;
+    const herdr = {
+      ...base,
+      backendType: 'herdr' as const,
+      persistentBackendTarget: {
+        backendType: 'herdr' as const,
+        sessionName: 'botmux',
+        agentName: 'botmux-sess-abc',
+      },
+    };
+
+    expect(destroyUnregisteredPersistentBacking(herdr, killTarget)).toBe(true);
+    expect(killTarget).toHaveBeenCalledWith(
+      herdr.persistentBackendTarget,
+      herdr.sessionId,
+    );
   });
 
   it('removes every binding while only remotely unsubscribing legacy/API-managed records', async () => {

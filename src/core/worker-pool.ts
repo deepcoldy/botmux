@@ -2177,19 +2177,26 @@ export async function closeSession(
  */
 export function destroyUnregisteredPersistentBacking(
   session: Session,
-  kill: typeof killPersistentSession = killPersistentSession,
+  kill: typeof killPersistentBackendTarget = killPersistentBackendTarget,
 ): boolean {
   if (session.adoptedFrom || session.queued) return false;
   const backendType = session.backendType;
   if (!isSuspendableBackendType(backendType)) return false;
-  const backendName = persistentSessionName(backendType, session.sessionId);
+  const target = resolvePersistentBackendTarget(
+    backendType,
+    session.sessionId,
+    session.persistentBackendTarget,
+  );
+  const targetName = target.backendType === 'herdr' && target.agentName
+    ? `${target.sessionName}/${target.agentName}`
+    : target.sessionName;
   try {
-    kill(backendType, backendName, session.sessionId);
-    logger.info(`[${session.sessionId.substring(0, 8)}] Closed unregistered ${backendType} backing ${backendName}`);
+    kill(target, session.sessionId);
+    logger.info(`[${session.sessionId.substring(0, 8)}] Closed unregistered ${backendType} backing ${targetName}`);
     return true;
   } catch (err) {
     logger.warn(
-      `[${session.sessionId.substring(0, 8)}] Failed to close unregistered ${backendType} backing ${backendName}: ` +
+      `[${session.sessionId.substring(0, 8)}] Failed to close unregistered ${backendType} backing ${targetName}: ` +
       `${err instanceof Error ? err.message : String(err)}`,
     );
     return false;
