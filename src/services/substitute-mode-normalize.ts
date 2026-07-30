@@ -18,6 +18,9 @@ import type { SubstituteModeConfig, SubstituteTarget } from '../bot-registry.js'
  *  - A DISABLED config still persists its target list (as long as it has ≥1
  *    target), so the dashboard toggle can flip on/off without re-entering
  *    everyone. Only an empty disabled config collapses to undefined (delete).
+ *  - `chats` (allow-list) and `excludedChats` (block-list) are each trimmed,
+ *    de-duplicated, and dropped when empty. They persist on a disabled config
+ *    the same way targets do.
  */
 export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
@@ -44,6 +47,9 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
   const chats = Array.isArray(rec.chats)
     ? [...new Set(rec.chats.map(String).map(s => s.trim()).filter(Boolean))]
     : [];
+  const excludedChats = Array.isArray(rec.excludedChats)
+    ? [...new Set(rec.excludedChats.map(String).map(s => s.trim()).filter(Boolean))]
+    : [];
   const out: SubstituteModeConfig = {
     enabled,
     targets,
@@ -53,6 +59,7 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
     topicActiveSessionTrigger: rec.topicActiveSessionTrigger !== false,
   };
   if (chats.length) out.chats = chats;
+  if (excludedChats.length) out.excludedChats = excludedChats;
   const replyMode = rec.replyMode === 'quote' ? 'quote' : 'thread';
   if (replyMode === 'quote') out.replyMode = 'quote';
   if (rec.disableControlCard === true) out.disableControlCard = true;

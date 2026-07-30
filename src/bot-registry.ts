@@ -814,6 +814,11 @@ export interface SubstituteModeConfig {
   disclosure?: 'prefix' | 'none';
   /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */
   chats?: string[];
+  /** Optional block-list of chat IDs (黑名单). When a chat is listed here the substitute
+   *  trigger never fires there — deny-wins over {@link chats} (a chat in both is blocked)
+   *  and hard (cannot be re-enabled by the per-chat `/substitute on` runtime toggle).
+   *  Applies to regular and topic groups alike. Direct @bot mentions are unaffected. */
+  excludedChats?: string[];
   /** When true, do not automatically DM the owner a control card for substitute-mode sessions. */
   disableControlCard?: boolean;
   /** How the bot replies to a substitute-mode trigger:

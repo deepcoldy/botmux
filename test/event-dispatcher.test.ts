@@ -802,6 +802,7 @@ function setupBotState(opts?: {
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
 	    disclosure?: 'prefix' | 'none';
 	    chats?: string[];
+	    excludedChats?: string[];
 	    topicGroups?: boolean;
 	    topicActiveSessionTrigger?: boolean;
 	  };
@@ -3317,6 +3318,98 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: excludedChats blocklist disables @substitute in listed chats (hard, even with per-chat toggle on)', async () => {
+    // R2 + R3: a chat on the blocklist never fires substitute, and the hard
+    // block wins even when the per-chat runtime toggle reports enabled.
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        excludedChats: ['chat-blocked'],
+      },
+    });
+    mockIsSubstituteEnabledForChat.mockReturnValue(true); // runtime toggle ON — must still be blocked
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-blocked',
+      chatId: 'chat-blocked',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: excludedChats wins over chats allow-list (deny-wins)', async () => {
+    // R4: a chat listed in BOTH allow-list and blocklist is blocked.
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        chats: ['chat-both'],
+        excludedChats: ['chat-both'],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@Sub Person help with this' }),
+      messageId: 'msg-substitute-deny-wins',
+      chatId: 'chat-both',
+      chatType: 'group',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('substituteMode: direct @bot still answers in a blocklisted chat (R5)', async () => {
+    // The blocklist only suppresses the substitute trigger. A direct @bot
+    // mention routes and answers normally — no substituteTrigger rides.
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      substituteMode: {
+        enabled: true,
+        targets: [{ openId: 'ou_sub', name: 'Sub Person' }],
+        excludedChats: ['chat-blocked'],
+      },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 2, botCount: 1 });
+    handlers.isSessionOwner.mockReturnValue(false);
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA help with this' }),
+      messageId: 'msg-substitute-blocked-direct-at',
+      chatId: 'chat-blocked',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      substituteTrigger: undefined,
+    }));
   });
 
   it('substituteMode: 话题群 @substitute in a topic without a session spawns the topic session (thread-scope, substituteTrigger rides)', async () => {
