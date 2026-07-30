@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import {
   buildDeviceIsolationInventory,
   commitDeviceIsolationActivation,
@@ -147,13 +148,13 @@ describe('device-isolation daemon transaction', () => {
       frozenBackend: 'zmx',
       workerPresent: false,
     }];
-    const probes: Array<{ backendType: string; name: string }> = [];
+    const probes: PersistentBackendTarget[] = [];
     setDeviceIsolationDaemonDependenciesForTest({
       dataDir: () => '/tmp/data',
       listSessions: () => sessions,
       processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
-      probePersistent: (backendType, name) => {
-        probes.push({ backendType, name });
+      probePersistent: target => {
+        probes.push(target);
         return 'exists';
       },
     });
@@ -168,12 +169,17 @@ describe('device-isolation daemon transaction', () => {
       backendType: 'zmx',
       disposition: 'blocked',
       persistent: {
-        backendType: 'zmx',
-        name: 'bmx-abcdefgh',
+        target: {
+          backendType: 'zmx',
+          sessionName: 'bmx-abcdefgh',
+        },
         probe: 'exists',
       },
     });
-    expect(probes).toEqual([{ backendType: 'zmx', name: 'bmx-abcdefgh' }]);
+    expect(probes).toEqual([{
+      backendType: 'zmx',
+      sessionName: 'bmx-abcdefgh',
+    }]);
     const result = prepareDeviceIsolationActivation({ activationVersion: 1, nonce: NONCE });
     expect(result).toMatchObject({
       status: 409,
@@ -204,7 +210,7 @@ describe('device-isolation daemon transaction', () => {
       [3001, 'zmx-worker-start'],
       [3002, 'zmx-cli-start'],
     ]);
-    const killed: Array<{ backendType: string; name: string; sessionId: string }> = [];
+    const killed: Array<{ target: PersistentBackendTarget; sessionId: string }> = [];
     let closeCalls = 0;
     setDeviceIsolationDaemonDependenciesForTest({
       now: () => NOW,
@@ -213,15 +219,15 @@ describe('device-isolation daemon transaction', () => {
       processStart: pid => live.get(pid),
       processExists: pid => live.has(pid),
       readMarker: () => marker,
-      probePersistent: (backendType, name) => {
-        expect({ backendType, name }).toEqual({
+      probePersistent: target => {
+        expect(target).toEqual({
           backendType: 'zmx',
-          name: 'bmx-abcdefgh',
+          sessionName: 'bmx-abcdefgh',
         });
         return backingExists ? 'exists' : 'missing';
       },
-      killPersistent: (backendType, name, sessionId) => {
-        killed.push({ backendType, name, sessionId });
+      killPersistent: (target, sessionId) => {
+        killed.push({ target, sessionId });
         backingExists = false;
       },
       closeWorker: () => {
@@ -246,8 +252,10 @@ describe('device-isolation daemon transaction', () => {
         backendType: 'zmx',
         disposition: 'owned_local',
         persistent: {
-          backendType: 'zmx',
-          name: 'bmx-abcdefgh',
+          target: {
+            backendType: 'zmx',
+            sessionName: 'bmx-abcdefgh',
+          },
           probe: 'exists',
         },
       }),
@@ -263,11 +271,150 @@ describe('device-isolation daemon transaction', () => {
     expect(committed).toMatchObject({ status: 200, body: { phase: 'committed' } });
     expect(closeCalls).toBe(1);
     expect(killed).toEqual([{
-      backendType: 'zmx',
-      name: 'bmx-abcdefgh',
+      target: {
+        backendType: 'zmx',
+        sessionName: 'bmx-abcdefgh',
+      },
       sessionId: 'abcdefgh-owned',
     }]);
     expect(backingExists).toBe(false);
+  });
+
+  it('uses the persisted shared Herdr host+agent for a live worker inventory', () => {
+    const sharedTarget = {
+      backendType: 'herdr' as const,
+      sessionName: 'shared-host',
+      agentName: 'botmux-owned-agent',
+    };
+    const probes: PersistentBackendTarget[] = [];
+    const session: DeviceIsolationRuntimeSession = {
+      sessionId: 'herdr-live-session',
+      adopted: false,
+      frozenBackend: 'herdr',
+      persistentBackendTarget: sharedTarget,
+      workerPresent: true,
+      workerGeneration: 11,
+      worker: { pid: 4101, procStart: 'herdr-worker-start' },
+      attestation: {
+        backendType: 'herdr' as const,
+        credentialIsolated: false,
+        cli: { pid: 4102, procStart: 'herdr-cli-start' },
+        workerGeneration: 11,
+      },
+    };
+    setDeviceIsolationDaemonDependenciesForTest({
+      listSessions: () => [session],
+      processStart: pid => new Map([
+        [4101, 'herdr-worker-start'],
+        [4102, 'herdr-cli-start'],
+      ]).get(pid),
+      probePersistent: target => {
+        probes.push(target);
+        return target.backendType === 'herdr'
+          && target.sessionName === sharedTarget.sessionName
+          && target.agentName === sharedTarget.agentName
+          ? 'exists'
+          : 'missing';
+      },
+    });
+
+    const inventory = buildDeviceIsolationInventory();
+
+    expect(inventory.blockers).toEqual([]);
+    expect(inventory.entries).toEqual([
+      expect.objectContaining({
+        sessionId: session.sessionId,
+        backendType: 'herdr',
+        disposition: 'owned_local',
+        persistent: {
+          target: sharedTarget,
+          probe: 'exists',
+        },
+      }),
+    ]);
+    expect(probes).toEqual([sharedTarget]);
+  });
+
+  it('kills only the exact worker-less shared Herdr agent before committing isolation', async () => {
+    const marker = pendingMarker();
+    const sharedTarget = {
+      backendType: 'herdr' as const,
+      sessionName: 'shared-host',
+      agentName: 'botmux-owned-agent',
+    };
+    const siblingAgent = 'botmux-sibling-agent';
+    const agents = new Set([sharedTarget.agentName, siblingAgent]);
+    const probes: PersistentBackendTarget[] = [];
+    const killed: Array<{ target: PersistentBackendTarget; sessionId: string }> = [];
+    const session: DeviceIsolationRuntimeSession = {
+      sessionId: 'herdr-workerless-session',
+      adopted: false,
+      frozenBackend: 'herdr',
+      persistentBackendTarget: sharedTarget,
+      workerPresent: false,
+    };
+
+    setDeviceIsolationDaemonDependenciesForTest({
+      now: () => NOW,
+      dataDir: () => '/tmp/data',
+      listSessions: () => [session],
+      processStart: pid => pid === process.pid ? 'daemon-start' : undefined,
+      processExists: () => false,
+      readMarker: () => marker,
+      probePersistent: target => {
+        probes.push(target);
+        return target.backendType === 'herdr'
+          && target.sessionName === sharedTarget.sessionName
+          && target.agentName !== undefined
+          && agents.has(target.agentName)
+          ? 'exists'
+          : 'missing';
+      },
+      killPersistent: (target, sessionId) => {
+        killed.push({ target, sessionId });
+        if (target.backendType === 'herdr' && target.agentName) {
+          agents.delete(target.agentName);
+        }
+      },
+      closeWorker: () => {
+        throw new Error('worker-less exact target must not invoke closeWorker');
+      },
+      sleep: async () => {},
+    });
+
+    const prepared = prepareDeviceIsolationActivation({
+      activationVersion: 1,
+      nonce: NONCE,
+    });
+    expect(prepared.status).toBe(200);
+    expect(prepared.body.inventory).toEqual([
+      expect.objectContaining({
+        sessionId: session.sessionId,
+        disposition: 'owned_local',
+        persistent: {
+          target: sharedTarget,
+          probe: 'exists',
+        },
+      }),
+    ]);
+
+    const committed = await commitDeviceIsolationActivation({
+      activationVersion: 1,
+      nonce: NONCE,
+      leaseId: prepared.body.leaseId,
+      markerSha256: digest(marker),
+    });
+
+    expect(committed).toMatchObject({ status: 200, body: { phase: 'committed' } });
+    expect(killed).toEqual([{ target: sharedTarget, sessionId: session.sessionId }]);
+    expect(agents.has(sharedTarget.agentName)).toBe(false);
+    expect(agents.has(siblingAgent)).toBe(true);
+    expect(probes.length).toBeGreaterThan(0);
+    expect(probes.every(target =>
+      target.backendType === sharedTarget.backendType
+      && target.sessionName === sharedTarget.sessionName
+      && target.agentName === sharedTarget.agentName
+    )).toBe(true);
   });
 
   it('allows abort only before commit and retains the committed freeze', async () => {
