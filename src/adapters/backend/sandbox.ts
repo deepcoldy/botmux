@@ -234,6 +234,69 @@ export function sandboxEnabled(): boolean {
 }
 
 /**
+ * Whether this host can run bwrap with a NEW PID namespace + a fresh `/proc`
+ * mount — i.e. `bwrap --unshare-pid --proc /proc`. In a NESTED sandbox (e.g.
+ * riff's AIO sandbox) mounting a fresh procfs inside a new pid namespace is
+ * denied by the kernel: `Can't mount proc on /newroot/proc: Operation not
+ * permitted`. When that happens the file sandbox must degrade (drop
+ * --unshare-pid) rather than fail every spawn — but ONLY in a context where
+ * dropping pid isolation cannot leak a sibling bot's secret via
+ * `/proc/<pid>/environ` (see coreOnlyPidNamespaceDegrade below).
+ *
+ * Probed ONCE per process and cached: it shells out to bwrap and the answer is
+ * a fixed property of the host/namespace we booted in. Returns true when the
+ * probe cannot run at all (bwrap missing) — the caller only consults this to
+ * DECIDE A DEGRADE, and a missing bwrap is handled fail-closed elsewhere; we
+ * must not spuriously degrade the normal fleet on an inconclusive probe.
+ */
+let _canUnsharePid: boolean | undefined;
+export function bwrapCanUnsharePid(): boolean {
+  if (_canUnsharePid !== undefined) return _canUnsharePid;
+  const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
+  const located = lookup.status === 0 ? lookup.stdout.trim() : '';
+  if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
+  let executable = located;
+  try { executable = realpathSync(located); } catch { /* fall through to probe */ }
+  // Minimal decisive probe: the SAME --unshare-pid + fresh --proc combo the
+  // real compilation uses (fs-policy compileToBwrap). If this fails but a
+  // proc-only mount would succeed, we're in a nested pid-ns-restricted env.
+  const r = spawnSync(executable, [
+    '--dev-bind', '/', '/',
+    '--unshare-pid',
+    '--proc', '/proc',
+    '--', '/bin/true',
+  ], { stdio: 'ignore', timeout: 5_000 });
+  _canUnsharePid = r.status === 0;
+  return _canUnsharePid;
+}
+
+/** Test-only: reset the cached pid-ns probe. */
+export function __testOnly_resetPidNamespaceProbe(): void {
+  _canUnsharePid = undefined;
+}
+
+/**
+ * Whether compileToBwrap should DROP `--unshare-pid` for this spawn. Gated on
+ * BOTH conditions, deliberately conservative (security review):
+ *   1. BOTMUX_CORE_ONLY=1 — core-only synthesizes EXACTLY ONE apiOnly bot
+ *      (bot-registry.maybeSynthesizeCoreOnlyConfig), whose worker carries
+ *      LARK_APP_SECRET='' (no-transport). There is NO sibling worker holding a
+ *      secret in env, so exposing the host pid namespace (a fresh --proc in the
+ *      host pid ns enumerates host processes) cannot leak any bot secret via
+ *      /proc/<pid>/environ. On a normal/mixed fleet a sibling transport bot's
+ *      worker DOES carry the plaintext secret in env (worker-pool.ts:2404), so
+ *      --unshare-pid MUST stay — hence this gate never fires there.
+ *   2. The host actually can't unshare-pid (nested sandbox) — otherwise keep
+ *      full isolation; there's no reason to weaken it when it works.
+ * The on-disk credential seal (fs-policy deny masks) is UNCHANGED regardless;
+ * only the pid-namespace defense-in-depth is dropped, and only where it both
+ * (a) can't work and (b) protects nothing.
+ */
+export function coreOnlyPidNamespaceDegrade(): boolean {
+  return process.env.BOTMUX_CORE_ONLY === '1' && !bwrapCanUnsharePid();
+}
+
+/**
  * Whether a LOCAL sandbox engine applies to this backend at all. riff has NO
  * local CLI process to wrap (execution happens in riff's own remote sandbox);
  * without this bypass the worker's fail-safe "backend not sandboxable" hard
@@ -478,7 +541,7 @@ export function prepareDirectSandbox(opts: {
     try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir-shaped mask */ }
   }
 
-  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir });
+  const compiled = compileToBwrap(opts.policy, { symlinks, emptyDir, emptiesDir: empties, filePaths, chdir: opts.chdir, skipPidNamespace: coreOnlyPidNamespaceDegrade() });
   // The shared empty dir + every empty placeholder file are the ro-bind SOURCES
   // for deny masks: real content hidden + read-only. mode 000 additionally makes
   // the mask unlistable for a NON-root uid (a real deny, not a listable "empty");
