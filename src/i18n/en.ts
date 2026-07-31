@@ -1072,13 +1072,10 @@ export const messages: Record<string, string> = {
   'prompt.quote_hint': '[User quoted a message — run `botmux quoted {id}` to view it]',
   // Topic context hint — prepended on the first turn of a regular-group topic
   // whose root is a different (earlier) message the bot never retained. It's a
-  // *hint*, not the transcript: signals that prior topic context exists and
-  // points at `botmux history` for on-demand retrieval (thread-scope by
-  // default). {count} is how many prior messages the topic has.
-  'prompt.topic_context': '[This is a reply inside a topic that already had {count} message(s) before you (the topic root + other replies) which you never retained. Run `botmux history` to read them if you need that context (defaults to this thread; use `--limit` for count, `botmux quoted <message_id>` for a message’s attachments).]',
-  // Countless variant — the metadata probe failed but the gate already proved a
-  // topic root exists, so still emit the hint (never drop the signal).
-  'prompt.topic_context_unknown': '[This is a reply inside a topic that already had prior messages before you (the topic root + possibly other replies) which you never retained. Run `botmux history` to read them if you need that context (defaults to this thread; use `--limit` for count, `botmux quoted <message_id>` for a message’s attachments).]',
+  // *hint*, not the transcript, and carries NO count (zero first-turn network
+  // probe): signals that prior topic context exists and points at
+  // `botmux history` for on-demand retrieval (thread-scope by default).
+  'prompt.topic_context': '[This is a reply inside a topic that already had prior messages before you (the topic root + possibly other replies) which you never retained. Run `botmux history` to read them if you need that context (defaults to this thread; use `--limit` for count, `botmux quoted <message_id>` for a message’s attachments).]',
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
