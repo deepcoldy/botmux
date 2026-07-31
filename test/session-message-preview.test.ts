@@ -123,6 +123,28 @@ describe('buildSessionMessagePreview', () => {
     });
   });
 
+  it('does not attach a newer thread-scope queue message to a closed session', () => {
+    writeJsonl('queues/om_root.jsonl', [
+      { senderType: 'user', content: 'new thread session message', createTime: '8500' },
+    ]);
+    writeJsonl('turn-sends/session-1.jsonl', [
+      { sentAtMs: 8_100, previewText: 'closed thread answer' },
+    ]);
+
+    expect(buildSessionMessagePreview(session({
+      status: 'closed',
+      lastUserPrompt: 'closed thread question',
+      lastMessageAt: new Date(8_000).toISOString(),
+      closedAt: new Date(8_300).toISOString(),
+    }))).toMatchObject({
+      previewUserText: 'closed thread question',
+      previewBotText: 'closed thread answer',
+      previewUserAt: 8_000,
+      previewBotAt: 8_100,
+      previewBotState: 'replied',
+    });
+  });
+
   it('invalidates the bounded tail cache when an append changes the file', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'first question', createTime: '9000' },

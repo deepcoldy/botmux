@@ -1703,6 +1703,13 @@ export async function closeSession(
           status: 'closed',
           closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
           tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
+          previewUserText: null,
+          previewBotText: null,
+          previewUserFullText: null,
+          previewBotFullText: null,
+          previewUserAt: null,
+          previewBotAt: null,
+          previewBotState: null,
         },
       },
     });

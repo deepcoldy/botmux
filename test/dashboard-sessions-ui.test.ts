@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { store } from '../src/dashboard/web/store.js';
 import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
 import {
   canRestartSession,
@@ -85,6 +86,51 @@ describe('dashboard sessions filters', () => {
     })).toEqual({
       userText: 'follow-up',
       userFullText: 'follow-up',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('clears merged preview fields when a close SSE patch explicitly sends nulls', () => {
+    store.replaceSnapshot([{
+      sessionId: 'closing-preview',
+      status: 'idle',
+      previewUserText: 'private question',
+      previewBotText: 'private answer',
+      previewUserFullText: 'private question in full',
+      previewBotFullText: 'private answer in full',
+      previewUserAt: 100,
+      previewBotAt: 200,
+      previewBotState: 'replied',
+    }], []);
+
+    store.applySse('session.update', {
+      sessionId: 'closing-preview',
+      patch: {
+        status: 'closed',
+        previewUserText: null,
+        previewBotText: null,
+        previewUserFullText: null,
+        previewBotFullText: null,
+        previewUserAt: null,
+        previewBotAt: null,
+        previewBotState: null,
+      },
+    });
+
+    expect(store.sessions.get('closing-preview')).toMatchObject({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+    });
+    expect(sessionExchangePreview(store.sessions.get('closing-preview') ?? {})).toEqual({
+      userText: '',
+      userFullText: '',
       botText: '',
       botFullText: '',
     });

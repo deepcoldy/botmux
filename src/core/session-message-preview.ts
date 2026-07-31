@@ -142,12 +142,12 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
   const queueAnchor = session.deferredScheduleRun?.routingAnchor
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
   const safeQueueAnchor = safeJsonlKey(queueAnchor);
-  // Chat-scope queues are shared by every historical session for that chat.
-  // Once a session is closed, reading the queue tail would attach a newer
-  // session's prompt to the old card. Closed rows therefore use their own
-  // persisted lastUserPrompt; active rows keep the live queue source.
-  const sharedClosedChatQueue = session.status === 'closed' && session.scope === 'chat';
-  const latestUser = !sharedClosedChatQueue && safeQueueAnchor
+  // Queue files are keyed by routing anchor, not session id. Both chat-scope
+  // (chatId) and thread-scope (rootMessageId) anchors can be re-used after an
+  // old session closes, so reading the live tail for a closed row can attach a
+  // later session's prompt to the historical card. Closed rows therefore use
+  // their own persisted lastUserPrompt; active rows keep the live queue source.
+  const latestUser = session.status !== 'closed' && safeQueueAnchor
     ? readLatestJsonlRow(
         join(config.session.dataDir, 'queues', `${safeQueueAnchor}.jsonl`),
         'user',

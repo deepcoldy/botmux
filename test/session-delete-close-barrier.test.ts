@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import * as docComment from '../src/im/lark/doc-comment.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
@@ -72,6 +73,8 @@ describe('daemon close barrier used by botmux delete', () => {
       } as any;
       const active = new Map([[activeSessionKey(ds), ds]]);
       workerPool.setActiveSessionsRegistry(active);
+      const dashboardEvents: DashboardEvent[] = [];
+      const stopDashboardEvents = dashboardEventBus.subscribe(event => dashboardEvents.push(event));
 
       const pending = workerPool.closeSession(session.sessionId);
 
@@ -83,6 +86,28 @@ describe('daemon close barrier used by botmux delete', () => {
 
       releaseCleanup();
       await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });
+      stopDashboardEvents();
+      const closePatch = dashboardEvents.find(event =>
+        event.type === 'session.update'
+        && event.body.sessionId === session.sessionId
+        && event.body.patch.status === 'closed'
+      );
+      expect(closePatch).toEqual({
+        type: 'session.update',
+        body: {
+          sessionId: session.sessionId,
+          patch: expect.objectContaining({
+            status: 'closed',
+            previewUserText: null,
+            previewBotText: null,
+            previewUserFullText: null,
+            previewBotFullText: null,
+            previewUserAt: null,
+            previewBotAt: null,
+            previewBotState: null,
+          }),
+        },
+      });
       expect(docSubsStore.removeDocSubscription).toHaveBeenCalledWith(
         dataDir,
         'app-delete-barrier',
