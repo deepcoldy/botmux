@@ -3,24 +3,33 @@
  *
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
- * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about two `response_item.payload.type === 'message'`
- * shapes:
+ * and creates the file lazily on the first user submit. The bridge fallback
+ * cares about exactly two records:
  *
- *   - role=user             → the user's prompt text (input_text content)
- *   - role=assistant +
- *     phase=final_answer    → the model's final reply (output_text content)
+ *   - user turn-start: `response_item.payload` message role=user
+ *     (input_text content). Stable across every codex version.
+ *   - turn terminal: `event_msg.payload` `task_complete`, which carries the
+ *     final visible text in `last_agent_message` (may be empty) and fires
+ *     exactly ONCE per turn.
  *
- * Why these and not `event_msg`:
- *   - `response_item` is the canonical transcript record; `event_msg` is a
- *     UI-event stream that can carry the same final text via two channels
- *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
- *     Picking `response_item` keeps the reader to a single source of truth
- *     and avoids any chance of double-emit if both paths are present.
- *   - Skipping role=developer (system instructions), phase=commentary
- *     (mid-turn status), reasoning, and function_call* keeps the bridge
- *     focused on what the user actually said and what the model finally
- *     answered — same scope as the Claude bridge.
+ * Why task_complete and NOT the assistant `response_item` message:
+ *   - Codex USED to tag the final assistant message `phase:'final_answer'`,
+ *     which older readers keyed on. Newer codex (observed >=0.146, and
+ *     model-provider dependent) DROPPED that field: the final assistant
+ *     message and every mid-turn assistant message are now byte-identically
+ *     `phase:undefined`, so no assistant `response_item` is a safe boundary —
+ *     keying on one would close the turn on the first mid-turn preamble and
+ *     truncate (or, if a stale second final is buffered, double-emit).
+ *   - `task_complete` is present in every observed schema (0.139 / 0.145 /
+ *     0.146), fires once per turn, and dedups codex's THREE representations of
+ *     one answer (event_msg agent_message / response_item message / event_msg
+ *     task_complete) down to a single emit — no cross-source dedup needed.
+ *   - A cancelled turn writes `turn_aborted` (no task_complete); we surface it
+ *     as an `ambiguous` terminal so the durable delivery is released instead
+ *     of wedging as "running" forever.
+ *
+ * This mirrors the traex reader (traex-transcript.ts), which adopted the same
+ * task_complete boundary earlier for the identical no-reliable-phase reason.
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
@@ -365,6 +374,17 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+/** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
+ *  durable-delivery terminal outcome. Mirrors the traex reader. */
+function codexAbortErrorCode(reason: unknown): string {
+  const normalized = (typeof reason === 'string' ? reason : 'unknown')
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64) || 'unknown';
+  return `codex_turn_aborted:${normalized}`;
+}
+
 /** Increment-read the rollout from `fromOffset`. Mirrors the byte-offset
  *  contract of claude-transcript.drainTranscript so callers can swap them
  *  out and reuse the existing fs.watch / poll wakeup machinery. */
@@ -402,23 +422,62 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    if (obj?.type !== 'response_item') continue;
-    const p = obj.payload;
-    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
+    const p = obj?.payload;
+    if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
-    if (p.role === 'user') {
+    // User turn-start: response_item message role=user. Stable across every
+    // codex version, and the ONLY event the RPC rollout-match probe reads
+    // (codex-rpc-lifecycle.rolloutUserTurnMatches), so it must stay a
+    // response_item user message.
+    if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
-    } else if (p.role === 'assistant' && p.phase === 'final_answer') {
-      const text = joinTextBlocks(p.content, 'output_text');
-      if (!text) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text });
+      continue;
     }
-    // Skip role=developer (instructions), phase=commentary (mid-turn
-    // status), and any reasoning / function_call* events — see file
-    // header for rationale.
+    // Turn terminal: event_msg `task_complete` carries the final visible text
+    // in `last_agent_message` (may be empty) and fires exactly ONCE per turn.
+    // This is the SOLE assistant_final source. Codex assistant `response_item`
+    // messages are NOT a safe boundary: the `phase:'final_answer'` marker was
+    // dropped (>=0.146), and mid-turn assistant messages are byte-identical to
+    // the final one (both phase:undefined) — keying on them would close a turn
+    // on the first mid-turn preamble and truncate/duplicate. Taking only
+    // task_complete also dedups codex's triple representation of one answer
+    // (event_msg agent_message / response_item message / event_msg
+    // task_complete). Mirrors the traex reader. See file header.
+    if (obj.type === 'event_msg'
+      && p.type === 'task_complete'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+      });
+      continue;
+    }
+    // A cancelled turn writes `turn_aborted` (turn_id, reason) and NO
+    // task_complete. Side effects may already have run, so release the durable
+    // delivery as `ambiguous` rather than wedge the turn as running forever.
+    if (obj.type === 'event_msg'
+      && p.type === 'turn_aborted'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'ambiguous',
+        terminalErrorCode: codexAbortErrorCode(p.reason),
+      });
+      continue;
+    }
+    // Everything else is skipped: role=developer/system instructions,
+    // reasoning, function_call*, and every assistant `response_item` message
+    // (mid-turn OR final) — the turn boundary comes only from task_complete.
   }
   return { events, newOffset, pendingTail };
 }
