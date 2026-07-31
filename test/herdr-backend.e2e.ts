@@ -15,16 +15,55 @@
  * Requires: `herdr` on PATH. Skips otherwise.
  * Run: pnpm vitest run test/herdr-backend.e2e.ts
  */
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterAll, afterEach, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { rmSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 
 // Unique enough to never collide with anything the user has running.
 const TEST_SESSION = 'bmx-e2e7777';
 const TEST_TIMEOUT = 30_000;
+// Keep this root short: Unix-domain socket paths are capped at ~104 bytes on
+// macOS, and named Herdr sessions append /xdg/herdr/sessions/<name>/herdr.sock.
+const FIXTURE_ROOT = mkdtempSync('/tmp/botmux-herdr-e2e-');
+const FAKE_MANAGED_AGENT = join(FIXTURE_ROOT, 'pi');
+const FIXTURE_CONFIG = join(FIXTURE_ROOT, 'config.toml');
+const FIXTURE_XDG_CONFIG_HOME = join(FIXTURE_ROOT, 'xdg');
+const ORIGINAL_XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
+const ORIGINAL_HERDR_CONFIG_PATH = process.env.HERDR_CONFIG_PATH;
+
+// All Herdr sockets, session metadata, and config reads stay inside the
+// fixture. Keep HOME untouched; XDG_CONFIG_HOME/HERDR_CONFIG_PATH are the
+// tool-specific isolation controls supported by Herdr.
+process.env.XDG_CONFIG_HOME = FIXTURE_XDG_CONFIG_HOME;
+process.env.HERDR_CONFIG_PATH = FIXTURE_CONFIG;
+
+// Herdr >=0.7.5 only starts a known managed-agent kind. Keep this E2E
+// independent of any real coding-agent install by presenting a canonical
+// `pi` executable whose process is still just /bin/bash. HERDR_AGENT is
+// Herdr's cross-platform process identity hint, so the facade can verify that
+// the lightweight fixture is the requested managed agent.
+writeFileSync(FAKE_MANAGED_AGENT, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+chmodSync(FAKE_MANAGED_AGENT, 0o700);
+writeFileSync(FIXTURE_CONFIG, `[terminal]
+default_shell = "/bin/sh"
+shell_mode = "non_login"
+`);
+
+afterAll(() => {
+  hardResetSession(TEST_SESSION);
+  if (ORIGINAL_XDG_CONFIG_HOME === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = ORIGINAL_XDG_CONFIG_HOME;
+  if (ORIGINAL_HERDR_CONFIG_PATH === undefined) delete process.env.HERDR_CONFIG_PATH;
+  else process.env.HERDR_CONFIG_PATH = ORIGINAL_HERDR_CONFIG_PATH;
+  rmSync(FIXTURE_ROOT, { recursive: true, force: true });
+});
 
 /**
  * Hard reset for a test session. `herdr session stop` is asynchronous and
@@ -34,7 +73,7 @@ const TEST_TIMEOUT = 30_000;
  */
 function hardResetSession(name: string) {
   HerdrBackend.killSession(name);
-  rmSync(join(homedir(), '.config', 'herdr', 'sessions', name), { recursive: true, force: true });
+  rmSync(join(FIXTURE_XDG_CONFIG_HOME, 'herdr', 'sessions', name), { recursive: true, force: true });
 }
 
 function spawnOpts() {
@@ -42,7 +81,11 @@ function spawnOpts() {
     cwd: '/tmp',
     cols: 80,
     rows: 24,
-    env: { ...process.env } as Record<string, string>,
+    env: {
+      ...process.env,
+      HERDR_CONFIG_PATH: FIXTURE_CONFIG,
+      PATH: [FIXTURE_ROOT, process.env.PATH].filter(Boolean).join(delimiter),
+    } as Record<string, string>,
   };
 }
 
@@ -69,7 +112,7 @@ describe('HerdrBackend (e2e)', () => {
     const output: string[] = [];
     backend.onData(d => output.push(d));
 
-    backend.spawn('/bin/bash', ['-lc', 'echo HELLO_HERDR; sleep 30'], spawnOpts());
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo HELLO_HERDR; sleep 30'], spawnOpts());
 
     await waitFor(() => output.join('').includes('HELLO_HERDR'), 10_000, 'HELLO_HERDR in output');
     expect(output.join('')).toContain('HELLO_HERDR');
@@ -87,7 +130,7 @@ describe('HerdrBackend (e2e)', () => {
     const be1 = new HerdrBackend(TEST_SESSION);
     const out1: string[] = [];
     be1.onData(d => out1.push(d));
-    be1.spawn('/bin/bash', ['-lc', 'echo PHASE1_MARKER; sleep 30'], spawnOpts());
+    be1.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo PHASE1_MARKER; sleep 30'], spawnOpts());
     await waitFor(() => out1.join('').includes('PHASE1_MARKER'), 10_000, 'PHASE1_MARKER');
     be1.kill();
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
@@ -98,7 +141,7 @@ describe('HerdrBackend (e2e)', () => {
     const be2 = new HerdrBackend(TEST_SESSION, { isReattach: true });
     const out2: string[] = [];
     be2.onData(d => out2.push(d));
-    be2.spawn('/bin/bash', ['-lc', 'echo SHOULD_NOT_RUN'], spawnOpts());
+    be2.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo SHOULD_NOT_RUN'], spawnOpts());
     expect(be2.isReattach).toBe(true);
 
     // Read recent pane content via the backend's capture API. Don't gate on
@@ -121,7 +164,7 @@ describe('HerdrBackend (e2e)', () => {
     // (the pane showed only a shell prompt). Fix: killSession() now deletes the
     // session, and a NON-reattach spawn always `agent start`s.
     const be1 = new HerdrBackend(TEST_SESSION);
-    be1.spawn('/bin/bash', ['-lc', 'echo FIRST_CLI; sleep 30'], spawnOpts());
+    be1.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo FIRST_CLI; sleep 30'], spawnOpts());
     await waitFor(() => be1.captureCurrentScreen().includes('FIRST_CLI'), 10_000, 'FIRST_CLI ran');
 
     // /restart: tear the session down, then a fresh (non-reattach) spawn.
@@ -129,7 +172,7 @@ describe('HerdrBackend (e2e)', () => {
     await waitFor(() => !HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session destroyed');
 
     const be2 = new HerdrBackend(TEST_SESSION, { createSession: true });
-    be2.spawn('/bin/bash', ['-lc', 'echo SECOND_CLI; sleep 30'], spawnOpts());
+    be2.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo SECOND_CLI; sleep 30'], spawnOpts());
     expect(be2.isReattach).toBe(false);
 
     // The new CLI must actually run: its marker appears, and the stale one is
@@ -145,7 +188,7 @@ describe('HerdrBackend (e2e)', () => {
 
   it.skipIf(!HerdrBackend.isAvailable())('write() routes input to the pane and the shell echoes it back', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
-    backend.spawn('/bin/bash', ['-lc', 'cat'], spawnOpts());
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'cat'], spawnOpts());
     await waitFor(() => HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session up');
 
     const seen: string[] = [];
@@ -165,7 +208,7 @@ describe('HerdrBackend (e2e)', () => {
 
   it.skipIf(!HerdrBackend.isAvailable())('web attach resizes the real agent terminal', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
-    backend.spawn('/bin/bash', ['-lc', `trap 'printf "SIZE "; stty size' WINCH; echo READY; while :; do sleep 0.1; done`], spawnOpts());
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', `trap 'printf "SIZE "; stty size' WINCH; echo READY; while :; do sleep 0.1; done`], spawnOpts());
     await waitFor(() => backend.captureCurrentScreen().includes('READY'), 10_000, 'resize fixture ready');
 
     const viewer = {};
@@ -183,7 +226,7 @@ describe('HerdrBackend (e2e)', () => {
 
   it.skipIf(!HerdrBackend.isAvailable())('destroySession stops the herdr session', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
-    backend.spawn('/bin/bash', ['-lc', 'sleep 30'], spawnOpts());
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'sleep 30'], spawnOpts());
     await waitFor(() => HerdrBackend.hasSession(TEST_SESSION), 10_000, 'session up');
 
     backend.destroySession();
@@ -193,7 +236,7 @@ describe('HerdrBackend (e2e)', () => {
 
   it.skipIf(!HerdrBackend.isAvailable())('listBotmuxSessions enumerates running bmx-* sessions', async () => {
     const backend = new HerdrBackend(TEST_SESSION);
-    backend.spawn('/bin/bash', ['-lc', 'sleep 30'], spawnOpts());
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'sleep 30'], spawnOpts());
     await waitFor(() => HerdrBackend.listBotmuxSessions().includes(TEST_SESSION), 10_000, 'session listed');
     expect(HerdrBackend.listBotmuxSessions()).toContain(TEST_SESSION);
     backend.destroySession();
@@ -204,9 +247,10 @@ describe('HerdrBackend (e2e)', () => {
     const exits: Array<[number | null, string | null]> = [];
     backend.onExit((code, signal) => exits.push([code, signal]));
 
-    // Very short-lived command — the bg `wait agent-status` / 500ms poll
-    // should pick up the agent disappearing.
-    backend.spawn('/bin/bash', ['-lc', 'echo BYE; exit 0'], spawnOpts());
+    // Herdr 0.7.5 deliberately requires a 3s stable/interactive window before
+    // `agent start` returns. Exit immediately after that window, then verify
+    // the bg `wait agent-status` / 500ms poll observes the disappearance.
+    backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo BYE; sleep 4; exit 0'], spawnOpts());
 
     await waitFor(() => exits.length > 0, 15_000, 'onExit fired');
     expect(exits.length).toBeGreaterThan(0);
