@@ -137,6 +137,9 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   createSession: vi.fn((_chatId: string, _rootId: string, title: string, chatType: string, scope?: 'thread' | 'chat') => ({
     sessionId: 'new-session-123',

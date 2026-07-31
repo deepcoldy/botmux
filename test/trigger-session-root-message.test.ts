@@ -30,6 +30,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
 }));

@@ -47,6 +47,9 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn((session: Session) => {
     updateSessionCalls.push(session);
   }),

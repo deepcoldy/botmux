@@ -27,6 +27,9 @@ import type { DaemonSession } from '../src/core/types.js';
 const store = new Map<string, Session>();
 let sessionSeq = 0;
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session => {
     const s: Session = {
       sessionId: `sess-${++sessionSeq}`,

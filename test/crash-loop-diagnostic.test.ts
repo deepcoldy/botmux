@@ -54,6 +54,9 @@ vi.mock('../src/config.js', () => ({
 
 const updateSessionMock = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: (...args: any[]) => updateSessionMock(...args),
 }));

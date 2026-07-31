@@ -16,6 +16,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 
 // Stub sessionStore writes so transferSession's persist call is a no-op.
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn(),
   getSession: vi.fn(),
   listSessions: vi.fn(() => []),
