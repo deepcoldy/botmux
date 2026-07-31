@@ -446,7 +446,7 @@ describe('transferSession', () => {
     const r = await callTransfer(movingDs.session.sessionId, 'oc_target', 'om_M1_target');
     expect(r.ok).toBe(true);
     // Scratch must be marked closed in the store, not silently orphaned.
-    expect(sessionStore.closeSession).toHaveBeenCalledWith('scratch-relay-cmd');
+    expect(sessionStore.closeSession).toHaveBeenCalledWith('scratch-relay-cmd', { cleanupBridgeMarkers: true });
     // The target-chat Map slot now holds the relayed session, not the scratch.
     expect(registry.get(sessionKey('oc_target', 'cli_app_test'))).toBe(movingDs);
   });
@@ -620,7 +620,7 @@ describe('setActiveSessionSafe', () => {
     await setActiveSessionSafe(registry, key, newDs);
 
     expect(registry.get(key)).toBe(newDs);
-    expect(sessionStore.closeSession).toHaveBeenCalledWith('prev-sess');
+    expect(sessionStore.closeSession).toHaveBeenCalledWith('prev-sess', { cleanupBridgeMarkers: true });
   });
 
   it('is a no-op when the key already holds the same session instance', async () => {
