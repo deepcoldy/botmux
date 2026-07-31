@@ -1,7 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
-import { codexHome } from './codex-paths.js';
 
 /** Executor-confirmed settings copied from Codex's rollout. */
 export interface CodexThreadSettings {
@@ -9,50 +6,40 @@ export interface CodexThreadSettings {
   serviceTier: string;
 }
 
-/** Card-facing snapshot. `fastActive` is derived from Codex's model catalog. */
+/** Card-facing snapshot. `nonDefault` is true when the executor is running on a
+ *  tier other than `default`. We deliberately do NOT try to map the tier id to
+ *  the catalog display name "Fast": the rollout records only the tier id, and
+ *  the catalog (`models_cache.json`) is not guaranteed to exist in every
+ *  execution environment — under read-isolation the per-bot CODEX_HOME is
+ *  provisioned with auth/config only, so a catalog lookup there fails closed and
+ *  the badge would never appear even when the faster tier IS active. The badge
+ *  therefore names the concrete tier id (`⚡ priority`), which is truthful,
+ *  provider-agnostic, and needs no external catalog. */
 export interface CodexServiceTierSnapshot extends CodexThreadSettings {
-  fastActive: boolean;
+  nonDefault: boolean;
 }
 
-const MAX_MODEL_CATALOG_BYTES = 8 * 1024 * 1024;
-
 /**
- * Resolve whether the executor tier is the catalog entry named "Fast" for the
- * concrete model. Unknown/missing catalogs fail closed: botmux must never call
- * an arbitrary non-default tier (for example `flex`) Fast.
+ * Derive the read-only presentation snapshot from executor-confirmed settings.
+ * No filesystem / catalog dependency — a non-`default` tier id is surfaced as-is.
  */
 export function resolveCodexServiceTierSnapshot(
   settings: CodexThreadSettings,
 ): CodexServiceTierSnapshot {
-  const snapshot: CodexServiceTierSnapshot = { ...settings, fastActive: false };
-  if (!settings.model || !settings.serviceTier || settings.serviceTier === 'default') return snapshot;
-
-  const catalogPath = join(codexHome(), 'models_cache.json');
-  try {
-    if (!existsSync(catalogPath)) return snapshot;
-    const size = statSync(catalogPath).size;
-    if (size <= 0 || size > MAX_MODEL_CATALOG_BYTES) return snapshot;
-    const parsed = JSON.parse(readFileSync(catalogPath, 'utf8')) as { models?: unknown };
-    if (!Array.isArray(parsed.models)) return snapshot;
-    const model = parsed.models.find((entry: any) => entry?.slug === settings.model) as any;
-    if (!model || !Array.isArray(model.service_tiers)) return snapshot;
-    snapshot.fastActive = model.service_tiers.some((tier: any) => (
-      tier?.id === settings.serviceTier
-      && typeof tier?.name === 'string'
-      && tier.name.trim().toLowerCase() === 'fast'
-    ));
-  } catch {
-    // Read-only presentation must fail closed; executor state remains untouched.
-  }
-  return snapshot;
+  const nonDefault = !!settings.serviceTier && settings.serviceTier !== 'default';
+  return { ...settings, nonDefault };
 }
 
-/** A stale Codex snapshot can never decorate another CLI's card. */
-export function codexFastBadgeActive(
+/** Card badge text for a session's tier snapshot, or undefined for
+ *  default / non-codex / no snapshot. A stale Codex snapshot can never decorate
+ *  another CLI's card (the cliId gate). Names the concrete tier id rather than
+ *  asserting "Fast" — see CodexServiceTierSnapshot. */
+export function codexServiceTierBadge(
   cliId: CliId,
   snapshot: CodexServiceTierSnapshot | undefined,
-): boolean {
-  return cliId === 'codex' && snapshot?.fastActive === true;
+): string | undefined {
+  if (cliId !== 'codex' || !snapshot?.nonDefault) return undefined;
+  return `⚡ ${snapshot.serviceTier}`;
 }
 
 function snapshotsEqual(
@@ -61,7 +48,7 @@ function snapshotsEqual(
 ): boolean {
   return left?.model === right.model
     && left?.serviceTier === right.serviceTier
-    && left?.fastActive === right.fastActive;
+    && left?.nonDefault === right.nonDefault;
 }
 
 /**

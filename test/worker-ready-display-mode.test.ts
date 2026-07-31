@@ -37,7 +37,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     type: 'streaming',
     readUrl: args[2],
     localCliReady: args[15] === true,
-    fastActive: args[16] === true,
+    serviceTierBadge: args[16],
   })),
   buildSessionCard: vi.fn(() => '{"type":"session"}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
@@ -236,22 +236,22 @@ describe('Worker ready: set_display_mode re-sync', () => {
     fakeWorker.emit('message', {
       type: 'codex_service_tier',
       snapshot: {
-        model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true,
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
       },
     });
     await flush();
-    expect(ds.codexServiceTier?.fastActive).toBe(true);
-    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ fastActive: true });
+    expect(ds.codexServiceTier?.nonDefault).toBe(true);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ serviceTierBadge: '⚡ priority' });
 
     fakeWorker.emit('message', {
       type: 'codex_service_tier',
       snapshot: {
-        model: 'gpt-5.6-sol', serviceTier: 'default', fastActive: false,
+        model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false,
       },
     });
     await flush();
-    expect(ds.codexServiceTier?.fastActive).toBe(false);
-    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2])).toMatchObject({ fastActive: false });
+    expect(ds.codexServiceTier?.nonDefault).toBe(false);
+    expect(JSON.parse(updateMessageMock.mock.calls.at(-1)![2]).serviceTierBadge).toBeUndefined();
   });
 
   it('clears tier state at worker-generation setup and ignores stale-worker updates', async () => {
@@ -262,7 +262,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       workerPort: 9999,
       streamCardId: 'om_static_card',
       codexServiceTier: {
-        model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true,
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
       },
     });
     ds.session.cliId = 'claude-code';
@@ -273,7 +273,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     staleWorker.emit('message', {
       type: 'codex_service_tier',
       snapshot: {
-        model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true,
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
       },
     });
     await flush();
@@ -312,7 +312,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
     fakeWorker.emit('message', {
       type: 'codex_service_tier',
       snapshot: {
-        model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true,
+        model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true,
       },
     });
     await flush();

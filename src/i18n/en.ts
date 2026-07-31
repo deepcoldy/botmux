@@ -780,6 +780,7 @@ export const messages: Record<string, string> = {
   'daemon.download_failed_need_login': '⚠️ Some images/files failed to download (missing User Token). Send `/login` in this topic to authorize, then resend.',
   'daemon.foreign_bot_mention_prefix': '[@mention from {botName}]',
   'daemon.cmd_needs_active_cli': '{cmd} needs an active CLI process; no running session in this topic.',
+  'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',

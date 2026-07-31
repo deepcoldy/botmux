@@ -23,8 +23,10 @@ export interface FrozenCard {
   displayMode?: DisplayMode;
   /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
   imageKey?: string;
-  /** Whether this historical Codex card was in the catalog-defined Fast tier. */
-  codexFastActive?: boolean;
+  /** Rendered service-tier badge (`⚡ priority`) captured at freeze time so a
+   *  recalled Codex card keeps its per-turn tier instead of being re-decorated
+   *  with the session's current tier. Absent = no badge. */
+  codexServiceTierBadge?: string;
 }
 
 /** Resolve effective display mode for a frozen card.

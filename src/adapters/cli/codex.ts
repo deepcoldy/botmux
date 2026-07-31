@@ -331,10 +331,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.
     deferFirstPromptTimeoutUntilReady: true,
-    // Native interactive controls that are safe and useful as the first topic
-    // message. Keeping /fast adapter-scoped prevents other CLIs from receiving
-    // a Codex-only command while preserving exact raw-input cold start.
-    defaultPassthroughCommands: ['/goal', '/fast'],
+    // Native interactive controls that are safe and useful as the FIRST topic
+    // message (cold-start: an empty topic spawns a session to run them). /goal
+    // starts goal work, so it belongs here. /fast is deliberately NOT here: it
+    // is a tier toggle, not "start a unit of work", and owner policy is that a
+    // bare /fast in an empty topic must not spawn a session — it lives in the
+    // global PASSTHROUGH_COMMANDS instead (forwarded to Codex on an existing
+    // session; harmless unknown-command on other CLIs).
+    defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:

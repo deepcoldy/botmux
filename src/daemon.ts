@@ -104,7 +104,7 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
-import { codexFastBadgeActive } from './services/codex-service-tier.js';
+import { codexServiceTierBadge } from './services/codex-service-tier.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
@@ -3702,7 +3702,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
     const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId;
     const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
-    const previousCodexFastActive = codexFastBadgeActive(effectiveCliId, ds.codexServiceTier);
+    const previousCodexTierBadge = codexServiceTierBadge(effectiveCliId, ds.codexServiceTier);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
       ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
@@ -3710,7 +3710,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-      previousCodexFastActive,
+      previousCodexTierBadge,
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -3723,7 +3723,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
         title: prevTitle,
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
-        ...(previousCodexFastActive ? { codexFastActive: true } : {}),
+        ...(previousCodexTierBadge ? { codexServiceTierBadge: previousCodexTierBadge } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }
@@ -14876,6 +14876,20 @@ function isInitialSessionPassthrough(larkAppId: string, cmd: string): boolean {
   return resolveAdapterDefaultPassthroughCommands(larkAppId).includes(cmd);
 }
 
+/** `/fast` is a passthrough keystroke to Codex's native tier toggle — it only
+ *  reaches the executor on a real paste TUI. In RPC input mode the pane is a
+ *  pure viewer (turns go over JSON-RPC, keystrokes never reach the app-server),
+ *  and the Riff backend turns the text+Enter into two remote task writes. On
+ *  those backends the toggle is a silent no-op (or worse), so fail closed:
+ *  reject with a clear message instead of pretending it worked. The read-only
+ *  card badge is unaffected — it reflects whatever tier Codex actually runs. */
+function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
+  if (!ds) return false;
+  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+  if (backendType === 'riff') return true;
+  return ds.initConfig?.codexRpcInput === true;
+}
+
 async function startInitialPassthroughSession(args: {
   larkAppId: string;
   chatId: string;
@@ -16054,6 +16068,14 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // 收紧到与 daemon 命令同档；这会同时改变真人 oncall 成员的现有行为，应单独评估。
       const ds = existingDs;
       if (ds?.worker && !ds.worker.killed) {
+        // /fast fail-closed: on RPC-input / Riff backends the keystroke can't
+        // reach Codex's executor (see fastToggleUnsupportedBackend). Reject with
+        // a clear message rather than deliver a silent no-op (or spawn junk Riff
+        // tasks). Other passthrough commands are unaffected.
+        if (cmd === '/fast' && fastToggleUnsupportedBackend(ds)) {
+          await sessionReply(anchor, tr('daemon.fast_unsupported_backend', undefined, localeForBot(larkAppId)), 'text', larkAppId);
+          return;
+        }
         // Passthrough commands bypass the normal message-forwarding block
         // below, so bind this accepted Lark turn here before the worker rotates
         // its marker at the actual PTY write boundary.

@@ -1,80 +1,69 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, expect, it } from 'vitest';
 import {
   CodexServiceTierTracker,
-  codexFastBadgeActive,
+  codexServiceTierBadge,
   resolveCodexServiceTierSnapshot,
   type CodexThreadSettings,
   type CodexServiceTierSnapshot,
 } from '../src/services/codex-service-tier.js';
 
-let codexHome: string;
-let previousCodexHome: string | undefined;
-
-beforeEach(() => {
-  previousCodexHome = process.env.CODEX_HOME;
-  codexHome = mkdtempSync(join(tmpdir(), 'codex-tier-'));
-  process.env.CODEX_HOME = codexHome;
-});
-
-afterEach(() => {
-  if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-  else process.env.CODEX_HOME = previousCodexHome;
-  rmSync(codexHome, { recursive: true, force: true });
-});
-
-function writeCatalog(): void {
-  mkdirSync(codexHome, { recursive: true });
-  writeFileSync(join(codexHome, 'models_cache.json'), JSON.stringify({
-    models: [
-      {
-        slug: 'gpt-5.6-sol',
-        service_tiers: [
-          { id: 'priority', name: 'Fast' },
-          { id: 'flex', name: 'Flex' },
-        ],
-      },
-      { slug: 'gpt-5.4-mini', service_tiers: [] },
-    ],
-  }));
-}
-
 describe('resolveCodexServiceTierSnapshot', () => {
-  it('maps Fast from the model catalog instead of treating every non-default tier as Fast', () => {
-    writeCatalog();
-
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'gpt-5.6-sol', serviceTier: 'priority',
-    }).fastActive).toBe(true);
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'gpt-5.6-sol', serviceTier: 'flex',
-    }).fastActive).toBe(false);
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'gpt-5.4-mini', serviceTier: 'priority',
-    }).fastActive).toBe(false);
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'unknown-model', serviceTier: 'priority',
-    }).fastActive).toBe(false);
+  it('flags any non-default tier as nonDefault WITHOUT a catalog lookup', () => {
+    // The rollout records only the tier id; the catalog (models_cache.json) is
+    // NOT guaranteed to exist (read-isolation provisions auth/config only), so
+    // the snapshot must not depend on it. A non-`default` id is surfaced as-is.
+    expect(resolveCodexServiceTierSnapshot({ model: 'gpt-5.6-sol', serviceTier: 'priority' }).nonDefault).toBe(true);
+    expect(resolveCodexServiceTierSnapshot({ model: 'gpt-5.6-sol', serviceTier: 'flex' }).nonDefault).toBe(true);
+    // model is irrelevant to the decision now (no catalog keyed by model).
+    expect(resolveCodexServiceTierSnapshot({ model: 'unknown-model', serviceTier: 'priority' }).nonDefault).toBe(true);
   });
 
-  it('fails closed when the catalog is absent or malformed', () => {
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'gpt-5.6-sol', serviceTier: 'priority',
-    }).fastActive).toBe(false);
+  it('treats default / empty as NOT non-default', () => {
+    expect(resolveCodexServiceTierSnapshot({ model: 'gpt-5.6-sol', serviceTier: 'default' }).nonDefault).toBe(false);
+    expect(resolveCodexServiceTierSnapshot({ model: 'gpt-5.6-sol', serviceTier: '' }).nonDefault).toBe(false);
+  });
 
-    writeFileSync(join(codexHome, 'models_cache.json'), '{broken');
-    expect(resolveCodexServiceTierSnapshot({
-      model: 'gpt-5.6-sol', serviceTier: 'priority',
-    }).fastActive).toBe(false);
+  it('does no filesystem I/O (works with no CODEX_HOME / no catalog present)', () => {
+    // Regression guard for the P1: an isolated BOT_HOME has a rollout but no
+    // models_cache.json, and the old catalog-mapping deterministically failed
+    // closed there. The neutral resolver must still surface the tier.
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = '/nonexistent/codex-home-xyz';
+    try {
+      expect(resolveCodexServiceTierSnapshot({ model: 'gpt-5.6-sol', serviceTier: 'priority' }).nonDefault).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
+  });
+});
+
+describe('codexServiceTierBadge', () => {
+  const priority: CodexServiceTierSnapshot = { model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true };
+  const flex: CodexServiceTierSnapshot = { model: 'gpt-5.6-sol', serviceTier: 'flex', nonDefault: true };
+  const dflt: CodexServiceTierSnapshot = { model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false };
+
+  it('shows the ACTUAL tier id, never a hardcoded "Fast" (flex stays flex)', () => {
+    expect(codexServiceTierBadge('codex', priority)).toBe('⚡ priority');
+    expect(codexServiceTierBadge('codex', flex)).toBe('⚡ flex');
+    expect(codexServiceTierBadge('codex', flex)).not.toContain('Fast');
+  });
+
+  it('has no badge for default / no snapshot', () => {
+    expect(codexServiceTierBadge('codex', dflt)).toBeUndefined();
+    expect(codexServiceTierBadge('codex', undefined)).toBeUndefined();
+  });
+
+  it('never leaks a Codex snapshot onto a non-Codex card', () => {
+    // A stale Codex snapshot must not decorate a Claude card (e.g. after /role).
+    expect(codexServiceTierBadge('claude-code', priority)).toBeUndefined();
   });
 });
 
 describe('CodexServiceTierTracker', () => {
   const resolve = (settings: CodexThreadSettings): CodexServiceTierSnapshot => ({
     ...settings,
-    fastActive: settings.serviceTier === 'priority',
+    nonDefault: !!settings.serviceTier && settings.serviceTier !== 'default',
   });
 
   it('covers quick toggles, rollout replacement, and stale-path observations', () => {
@@ -85,12 +74,13 @@ describe('CodexServiceTierTracker', () => {
     tracker.observe('/rollout-a.jsonl', { model: 'gpt-5.6-sol', serviceTier: 'priority' });
     tracker.observe('/rollout-a.jsonl', { model: 'gpt-5.6-sol', serviceTier: 'default' });
     tracker.bind('/rollout-b.jsonl');
+    // A late observation tagged with the OLD rollout path must be ignored.
     tracker.observe('/rollout-a.jsonl', { model: 'gpt-5.6-sol', serviceTier: 'priority' });
 
     expect(updates).toEqual([
       null,
-      { model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true },
-      { model: 'gpt-5.6-sol', serviceTier: 'default', fastActive: false },
+      { model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true },
+      { model: 'gpt-5.6-sol', serviceTier: 'default', nonDefault: false },
       null,
     ]);
   });
@@ -101,25 +91,13 @@ describe('CodexServiceTierTracker', () => {
     const settings = { model: 'gpt-5.6-sol', serviceTier: 'priority' };
 
     tracker.bind('/rollout.jsonl', settings);
-    tracker.observe('/rollout.jsonl', settings);
+    tracker.observe('/rollout.jsonl', settings);  // identical → no duplicate publish
     tracker.detach();
 
     expect(updates).toEqual([
       null,
-      { model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true },
+      { model: 'gpt-5.6-sol', serviceTier: 'priority', nonDefault: true },
       null,
     ]);
-  });
-});
-
-describe('codexFastBadgeActive', () => {
-  const fast: CodexServiceTierSnapshot = {
-    model: 'gpt-5.6-sol', serviceTier: 'priority', fastActive: true,
-  };
-
-  it('never leaks a Codex snapshot onto a non-Codex card', () => {
-    expect(codexFastBadgeActive('codex', fast)).toBe(true);
-    expect(codexFastBadgeActive('claude-code', fast)).toBe(false);
-    expect(codexFastBadgeActive('codex', undefined)).toBe(false);
   });
 });
