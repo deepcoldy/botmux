@@ -231,22 +231,6 @@ describe('stripWrapperUnsafeArgs', () => {
       .toEqual(['--model', 'm']);
   });
 
-  it('strips the botmux-injected Session service tier override', () => {
-    expect(stripWrapperUnsafeArgs([
-      '-c', 'service_tier="default"',
-      '-c', 'service_tier="fast"',
-      '-c', 'service_tier="priority"',
-      '--model', 'm',
-    ], 'priority')).toEqual(['--model', 'm']);
-  });
-
-  it('does not claim an arbitrary catalog tier unless the caller says Botmux injected it', () => {
-    expect(stripWrapperUnsafeArgs([
-      '-c', 'service_tier="priority"',
-      '--model', 'm',
-    ])).toEqual(['-c', 'service_tier="priority"', '--model', 'm']);
-  });
-
   it('leaves a user-supplied -c (non-botmux config override) untouched', () => {
     expect(stripWrapperUnsafeArgs(['-c', 'model_reasoning_effort="high"', '--model', 'm']))
       .toEqual(['-c', 'model_reasoning_effort="high"', '--model', 'm']);
@@ -320,16 +304,6 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
   });
 
-  it('strips the exact dynamic Fast tier injected by Botmux', () => {
-    const out = buildWrappedLaunch(
-      'aiden x codex',
-      ['-c', 'service_tier="priority"', '--no-alt-screen'],
-      (bin) => bin,
-      { codexServiceTier: 'priority' },
-    );
-    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
-  });
-
   it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
     const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
     expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
@@ -366,16 +340,6 @@ describe('buildWrappedLaunch', () => {
       'check_for_update_on_startup=false',
     ]);
     expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
-  });
-
-  it('rewrites the exact dynamic Fast tier injected by Botmux for cjadk', () => {
-    const out = buildWrappedLaunch(
-      'cjadk codex',
-      ['-c', 'service_tier="priority"', '--no-alt-screen'],
-      (bin) => bin,
-      { codexServiceTier: 'priority' },
-    );
-    expect(out.args).toEqual(['codex', '--config', 'service_tier="priority"', '--no-alt-screen']);
   });
 
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {

@@ -111,10 +111,6 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
-import {
-  acknowledgeFastModeResult,
-  isFastModeResultPending,
-} from './fast-mode-handshake.js';
 import { recordDispatchInputCommit } from './dispatch.js';
 
 type WindowsForkOptions = ForkOptions & { windowsHide?: boolean };
@@ -2386,11 +2382,6 @@ export function forkWorker(
     wrapperCli: agentCfg.wrapperCli,
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
-    // Fast Mode is frozen on the Session rather than inherited from Codex's
-    // CODEX_HOME. Missing means the Session has never opted in → standard.
-    fastMode: agentCfg.cliId === 'codex' ? ds.session.fastMode === true : undefined,
-    fastServiceTier: agentCfg.cliId === 'codex' ? ds.session.fastServiceTier : undefined,
-    fastModeStateVersion: agentCfg.cliId === 'codex' ? ds.session.fastModeStateVersion : undefined,
     reasoningEffort: agentCfg.reasoningEffort,
     disableCliBypass: botCfg.disableCliBypass === true,
     codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
@@ -2721,58 +2712,6 @@ function setupWorkerHandlers(
           break;
         }
         acknowledgeSessionReady(msg.requestId);
-        break;
-      }
-      case 'fast_mode_result': {
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session.workerGeneration !== workerGeneration
-        ) {
-          logger.warn(`[${t}] Ignored fast_mode_result from stale worker generation`);
-          break;
-        }
-        // Persistence and waiter resolution form one exact-request commit. A
-        // result arriving after the daemon deadline cannot mutate the Session,
-        // even when it came from the current worker generation.
-        if (!isFastModeResultPending(msg.requestId)) {
-          logger.warn(`[${t}] Ignored stale fast_mode_result request=${msg.requestId.slice(0, 8)}`);
-          break;
-        }
-        if (msg.ok) {
-          ds.session.fastMode = msg.enabled;
-          ds.session.fastServiceTier = msg.serviceTier;
-          ds.session.fastModeStateVersion = 1;
-          if (ds.initConfig) {
-            ds.initConfig.fastMode = msg.enabled;
-            ds.initConfig.fastServiceTier = msg.serviceTier;
-            ds.initConfig.fastModeStateVersion = 1;
-          }
-          sessionStore.updateSession(ds.session);
-        }
-        acknowledgeFastModeResult(msg);
-        break;
-      }
-      case 'fast_mode_state': {
-        if (
-          ds.worker !== worker
-          || ds.workerGeneration !== workerGeneration
-          || ds.session.workerGeneration !== workerGeneration
-        ) {
-          logger.warn(`[${t}] Ignored fast_mode_state from stale worker generation`);
-          break;
-        }
-        // Only cold/legacy launch reconciliation has no command requestId.
-        // Runtime changes commit through the exact fast_mode_result case above.
-        ds.session.fastMode = msg.enabled;
-        ds.session.fastServiceTier = msg.serviceTier;
-        ds.session.fastModeStateVersion = 1;
-        if (ds.initConfig) {
-          ds.initConfig.fastMode = msg.enabled;
-          ds.initConfig.fastServiceTier = msg.serviceTier;
-          ds.initConfig.fastModeStateVersion = 1;
-        }
-        sessionStore.updateSession(ds.session);
         break;
       }
       case 'local_process_attestation': {

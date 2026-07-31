@@ -1,13 +1,10 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { chmodSync, mkdirSync, writeFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  CodexRpcEngine,
-  CodexRpcFastModeCancelledError,
-} from '../src/codex-rpc-engine.js';
+import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -23,136 +20,7 @@ function makeEngine(over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0
   });
 }
 
-function readRpcLog(path: string): Array<{ method?: string; params?: Record<string, unknown> }> {
-  return readFileSync(path, 'utf8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map(line => JSON.parse(line));
-}
-
-async function waitForRpcCount(path: string, method: string, count: number): Promise<void> {
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    if (existsSync(path) && readRpcLog(path).filter(entry => entry.method === method).length >= count) {
-      return;
-    }
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error(`Timed out waiting for ${count} ${method} request(s)`);
-}
-
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
-  it('resolves the model catalog Fast tier and pins it on thread/start + turn/start', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-fast-rpc-'));
-    const rpcLog = join(dir, 'rpc.jsonl');
-    const engine = makeEngine({
-      model: 'gpt-fast',
-      fastMode: true,
-      env: { ...process.env, FAKE_RPC_LOG: rpcLog },
-    });
-
-    try {
-      await engine.start();
-      await engine.startThread();
-      await engine.sendTurn('run fast');
-
-      const requests = readRpcLog(rpcLog);
-      expect(requests.find(entry => entry.method === 'model/list')).toBeDefined();
-      expect(requests.find(entry => entry.method === 'thread/start')?.params).toMatchObject({
-        serviceTier: 'priority',
-      });
-      expect(requests.find(entry => entry.method === 'turn/start')?.params).toMatchObject({
-        serviceTier: 'priority',
-      });
-    } finally {
-      engine.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 20_000);
-
-  it('pins Fast on thread/resume and applies runtime changes through acknowledged thread settings', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-fast-rpc-update-'));
-    const rpcLog = join(dir, 'rpc.jsonl');
-    const engine = makeEngine({
-      model: 'gpt-fast',
-      env: { ...process.env, FAKE_RPC_LOG: rpcLog },
-    });
-
-    try {
-      await engine.start();
-      await engine.resumeThread('thread-fast-resume');
-      await engine.setFastMode(true);
-      await engine.sendTurn('fast turn');
-      await engine.setFastMode(false);
-      await engine.sendTurn('default turn');
-
-      const requests = readRpcLog(rpcLog);
-      const resume = requests.find(entry => entry.method === 'thread/resume');
-      expect(resume?.params).toMatchObject({ serviceTier: null });
-      const updates = requests.filter(entry => entry.method === 'thread/settings/update');
-      expect(updates.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
-      const turns = requests.filter(entry => entry.method === 'turn/start');
-      expect(turns.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
-    } finally {
-      engine.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 20_000);
-
-  it('compensates to the previous tier when a settings ACK arrives after cancellation', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-fast-rpc-cancel-'));
-    const rpcLog = join(dir, 'rpc.jsonl');
-    const engine = makeEngine({
-      model: 'gpt-fast',
-      env: {
-        ...process.env,
-        FAKE_RPC_LOG: rpcLog,
-        FAKE_SETTINGS_UPDATE_ACK_DELAY_MS: '100',
-      },
-    });
-    const controller = new AbortController();
-
-    try {
-      await engine.start();
-      await engine.resumeThread('thread-fast-cancel');
-
-      const applying = engine.setFastMode(true, { signal: controller.signal });
-      await waitForRpcCount(rpcLog, 'thread/settings/update', 1);
-      controller.abort();
-
-      await expect(applying).rejects.toBeInstanceOf(CodexRpcFastModeCancelledError);
-      await waitForRpcCount(rpcLog, 'thread/settings/update', 2);
-
-      const updates = readRpcLog(rpcLog)
-        .filter(entry => entry.method === 'thread/settings/update');
-      expect(updates.map(entry => entry.params?.serviceTier)).toEqual(['priority', null]);
-      expect(engine.activeServiceTier).toBeUndefined();
-    } finally {
-      engine.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 20_000);
-
-  it('rejects Fast before thread creation when the selected model has no Fast tier', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'botmux-fast-rpc-unsupported-'));
-    const rpcLog = join(dir, 'rpc.jsonl');
-    const engine = makeEngine({
-      model: 'gpt-standard',
-      fastMode: true,
-      env: { ...process.env, FAKE_RPC_LOG: rpcLog },
-    });
-
-    try {
-      await engine.start();
-      await expect(engine.startThread()).rejects.toThrow(/Fast Mode is not supported/);
-      expect(readRpcLog(rpcLog).some(entry => entry.method === 'thread/start')).toBe(false);
-    } finally {
-      engine.stop();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 20_000);
-
   it('start (spawn → /readyz → connect → initialize) then startThread → sendTurn → stop', async () => {
     const engine = makeEngine();
     await engine.start();

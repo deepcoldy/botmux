@@ -11,8 +11,8 @@
 //                                  (lets a test assert model/effort are SUPPRESSED
 //                                   on resume)
 import { createServer } from 'node:http';
-import { appendFileSync, writeFileSync } from 'node:fs';
 import { WebSocketServer } from 'ws';
+import { writeFileSync } from 'node:fs';
 
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
@@ -23,8 +23,6 @@ const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
 const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
 const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
 const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
-const SETTINGS_UPDATE_ACK_DELAY_MS = Number(process.env.FAKE_SETTINGS_UPDATE_ACK_DELAY_MS ?? '0');
-const RPC_LOG = process.env.FAKE_RPC_LOG;
 let threadReadAttempt = 0;
 let currentThreadName;
 const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
@@ -38,7 +36,6 @@ wss.on('connection', (ws) => {
   let pendingTurnReply;
   ws.on('message', (data) => {
     let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
-    if (RPC_LOG) appendFileSync(RPC_LOG, `${JSON.stringify(msg)}\n`);
     if (REQUEST_USER_INPUT && msg.id === 900 && (msg.result !== undefined || msg.error !== undefined)) {
       if (!pendingTurnReply) return;
       // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
@@ -60,25 +57,6 @@ wss.on('connection', (ws) => {
     const reply = (result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
     switch (msg.method) {
       case 'initialize': return reply({ ok: true });
-      case 'model/list': return reply({
-        data: [
-          {
-            id: 'gpt-fast',
-            model: 'gpt-fast',
-            isDefault: true,
-            serviceTiers: [
-              { id: 'priority', name: 'Fast', description: 'faster' },
-            ],
-          },
-          {
-            id: 'gpt-standard',
-            model: 'gpt-standard',
-            isDefault: false,
-            serviceTiers: [],
-          },
-        ],
-        nextCursor: null,
-      });
       case 'thread/start': {
         if (process.env.FAKE_THREAD_CONFIG_FILE) {
           try { writeFileSync(process.env.FAKE_THREAD_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
@@ -91,11 +69,6 @@ wss.on('connection', (ws) => {
         }
         return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
       }
-      case 'thread/settings/update':
-        if (SETTINGS_UPDATE_ACK_DELAY_MS > 0) {
-          return setTimeout(() => reply({}), SETTINGS_UPDATE_ACK_DELAY_MS);
-        }
-        return reply({});
       case 'thread/read':
         threadReadAttempt += 1;
         return reply({ thread: {

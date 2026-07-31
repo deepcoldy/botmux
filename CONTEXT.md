@@ -19,10 +19,6 @@ _Avoid_: agent, app
 A continuing conversation between one chat anchor and one **Agent CLI**.
 _Avoid_: thread, task
 
-**Fast Mode**:
-A per-**Session** opt-in to a faster Agent CLI service tier. Every new Session starts with Fast Mode disabled, and changing it never changes another Session.
-_Avoid_: global fast setting, Bot-level fast mode
-
 **Token Usage**:
 Token counts reported by an **Agent CLI** or its persisted transcript for a
 **Session**. Token In is the Agent CLI's native input-side total, including

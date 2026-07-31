@@ -458,7 +458,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolveAdapterDefaultPassthroughCommands, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -579,11 +579,6 @@ function makeDeps(ds?: DaemonSession): CommandHandlerDeps {
     getActiveCount: vi.fn(() => activeSessions.size),
     lastRepoScan: new Map(),
     prewarmDocCommentSession: vi.fn(async () => {}),
-    applyFastMode: vi.fn(async (_session, enabled) => (
-      enabled
-        ? { ok: true as const, enabled: true, serviceTier: 'priority' }
-        : { ok: true as const, enabled: false }
-    )),
   };
 }
 
@@ -610,7 +605,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/restart', '/status', '/fast', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
+    const expected = ['/close', '/restart', '/status', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/group', '/g', '/relay', '/card', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/vc-auth'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -643,11 +638,10 @@ describe('DAEMON_COMMANDS set', () => {
   });
 
   it('should have the correct size', () => {
-    // 31 = current master command set without the removed /land command, plus
-    // the session-scoped /fast control command.
+    // 30 = current master command set without the removed /land command.
     // /subscribe-lark-doc remains
     // as its original per-file API subscription command rather than an alias.
-    expect(DAEMON_COMMANDS.size).toBe(31);
+    expect(DAEMON_COMMANDS.size).toBe(30);
   });
 
   it('contains the /list-slash-command lister and its /slash alias', () => {
@@ -987,14 +981,6 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
-  });
-
-  it('keeps /fast daemon-owned instead of exposing it as raw Codex passthrough', () => {
-    expect(DAEMON_COMMANDS.has('/fast')).toBe(true);
-    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(false);
-    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
-    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast');
-    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(false);
   });
 
   it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
@@ -1645,223 +1631,6 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('没有活跃的会话');
       expect(replyContent).toContain('v1.0.42');
-    });
-  });
-
-  // ─── /fast ──────────────────────────────────────────────────────────────
-
-  describe('/fast', () => {
-    function makeCodexFastSession(enabled: boolean | undefined, running = true): DaemonSession {
-      const session = makeSession({ cliId: 'codex' });
-      if (enabled !== undefined) session.fastMode = enabled;
-      return makeDaemonSession({
-        larkAppId: 'app-2',
-        session,
-        worker: running ? ({ killed: false, send: vi.fn() } as any) : null,
-      });
-    }
-
-    it('enables Fast Mode for only the current Session and replies in Lark', async () => {
-      const ds = makeCodexFastSession(false);
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
-
-      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
-      expect(ds.worker?.send).not.toHaveBeenCalled();
-      expect(ds.session.fastMode).toBe(true);
-      expect(ds.session.fastServiceTier).toBe('priority');
-      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringMatching(/Fast Mode.*已开启.*当前话题/s),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-    });
-
-    it('stores the setting without spawning a CLI when /fast starts a new topic', async () => {
-      const ds = makeCodexFastSession(false, false);
-      ds.session.fastModeStateVersion = 1;
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
-
-      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
-      expect(ds.session.fastMode).toBe(true);
-      expect(ds.session.fastServiceTier).toBe('priority');
-      expect(ds.session.fastModeStateVersion).toBeUndefined();
-      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
-      expect(deps.sessionReply).toHaveBeenCalled();
-    });
-
-    it('re-applies an enabled legacy Session until an executor confirms it', async () => {
-      const ds = makeCodexFastSession(true);
-      ds.session.fastServiceTier = 'priority';
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
-
-      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
-    });
-
-    it('re-applies a disabled legacy Session until an executor confirms default tier', async () => {
-      const ds = makeCodexFastSession(false);
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast off'), deps, 'app-2');
-
-      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, false);
-    });
-
-    it('persists and reports success only after the worker ACKs the change', async () => {
-      const ds = makeCodexFastSession(false);
-      const deps = makeDeps(ds);
-      let resolveApply!: (value: { ok: true; enabled: true; serviceTier: string }) => void;
-      deps.applyFastMode = vi.fn(() => new Promise(resolve => { resolveApply = resolve; }));
-
-      const pending = handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
-      await Promise.resolve();
-
-      expect(ds.session.fastMode).toBe(false);
-      expect(sessionStore.updateSession).not.toHaveBeenCalled();
-      expect(deps.sessionReply).not.toHaveBeenCalled();
-
-      resolveApply({ ok: true, enabled: true, serviceTier: 'priority' });
-      await pending;
-
-      expect(ds.session.fastMode).toBe(true);
-      expect(ds.session.fastServiceTier).toBe('priority');
-      expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringMatching(/Fast Mode.*已开启/s),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-    });
-
-    it('keeps persisted state unchanged when applying Fast Mode fails', async () => {
-      const ds = makeCodexFastSession(false);
-      const deps = makeDeps(ds);
-      deps.applyFastMode = vi.fn(async () => ({
-        ok: false as const,
-        reason: 'unsupported_model' as const,
-      }));
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), deps, 'app-2');
-
-      expect(ds.session.fastMode).toBe(false);
-      expect(ds.session.fastServiceTier).toBeUndefined();
-      expect(sessionStore.updateSession).not.toHaveBeenCalled();
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('当前模型不支持'),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-    });
-
-    it('reports Session state without toggling Codex', async () => {
-      const ds = makeCodexFastSession(true);
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast status'), deps, 'app-2');
-
-      expect(ds.worker?.send).not.toHaveBeenCalled();
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringMatching(/Fast Mode.*已开启.*当前话题/s),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-    });
-
-    it('keeps /fast off idempotent and does not toggle the native CLI', async () => {
-      const ds = makeCodexFastSession(false);
-      ds.session.fastModeStateVersion = 1;
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast off'), deps, 'app-2');
-
-      expect(deps.applyFastMode).not.toHaveBeenCalled();
-      expect(ds.worker?.send).not.toHaveBeenCalled();
-      expect(ds.session.fastMode).toBe(false);
-      expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringMatching(/Fast Mode.*已关闭.*当前话题/s),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-    });
-
-    it('uses bare /fast as a toggle', async () => {
-      const ds = makeCodexFastSession(false);
-      const deps = makeDeps(ds);
-
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast'), deps, 'app-2');
-
-      expect(ds.session.fastMode).toBe(true);
-      expect(deps.applyFastMode).toHaveBeenCalledWith(ds, true);
-      expect(ds.worker?.send).not.toHaveBeenCalled();
-    });
-
-    it('rejects unsupported arguments and non-Codex Sessions explicitly', async () => {
-      const codex = makeCodexFastSession(false);
-      const codexDeps = makeDeps(codex);
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast turbo'), codexDeps, 'app-2');
-      expect(codexDeps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('/fast on'),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-      expect(codex.worker?.send).not.toHaveBeenCalled();
-
-      const claude = makeDaemonSession();
-      const claudeDeps = makeDeps(claude);
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), claudeDeps, LARK_APP_ID);
-      expect(claudeDeps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('仅支持由 Botmux 管理'),
-        undefined,
-        LARK_APP_ID,
-        'msg_001',
-      );
-
-      const aiden = makeCodexFastSession(false);
-      aiden.session.wrapperCli = 'aiden x codex';
-      aiden.session.agentFrozen = true;
-      const aidenDeps = makeDeps(aiden);
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), aidenDeps, 'app-2');
-      expect(aiden.worker?.send).not.toHaveBeenCalled();
-      expect(aidenDeps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('Aiden'),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
-
-      const riff = makeCodexFastSession(false);
-      riff.session.cliId = 'riff';
-      riff.session.backendType = 'riff';
-      const riffDeps = makeDeps(riff);
-      await handleCommand('/fast', ROOT_ID, makeLarkMessage('/fast on'), riffDeps, 'app-2');
-      expect(riffDeps.applyFastMode).not.toHaveBeenCalled();
-      expect(riffDeps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID,
-        expect.stringContaining('仅支持由 Botmux 管理'),
-        undefined,
-        'app-2',
-        'msg_001',
-      );
     });
   });
 

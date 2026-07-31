@@ -101,11 +101,6 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
-    /** Session-scoped Fast Mode. Codex consumes this as a process-level service
-     * tier override; other adapters ignore it. Missing/false means standard. */
-    fastMode?: boolean;
-    /** Concrete Fast tier id resolved from Codex's model catalog. */
-    fastServiceTier?: string;
     /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
      *  Only codex/codex-app adapters honor it; others ignore. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';

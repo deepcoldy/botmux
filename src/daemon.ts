@@ -3,7 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
-import { join, dirname, delimiter } from 'node:path';
+import { join, dirname } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { fileURLToPath } from 'node:url';
@@ -108,15 +108,6 @@ import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
-import { redactChildEnv } from './utils/child-env.js';
-import {
-  fastModeSessionSupported,
-  parseFastModeAction,
-  probeCodexFastServiceTier,
-  requestWorkerFastModeChange,
-} from './core/fast-mode-control.js';
-import type { FastModeApplyResult } from './types.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -204,7 +195,7 @@ import {
   resolvePairedSpawnBackendType,
   type PersistentBackendType,
 } from './core/persistent-backend.js';
-import type { BackendType, PersistentBackendTarget } from './adapters/backend/types.js';
+import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
 import {
@@ -3810,100 +3801,6 @@ async function prewarmDocCommentSession(ds: DaemonSession, sub: DocSubscription)
   logger.info(`[${tag(ds)}] doc-comment watch prewarm injected file=${sub.fileToken.slice(0, 12)}`);
 }
 
-function fastModeTargetConfig(larkAppId: string, ds?: DaemonSession): {
-  cliId: CliId;
-  cliPathOverride?: string;
-  wrapperCli?: string;
-  model?: string;
-  backendType: BackendType;
-  env?: Record<string, string | number | boolean>;
-} {
-  const botCfg = getBot(larkAppId).config;
-  const frozen = ds?.session.agentFrozen === true;
-  const cliId = ds?.session.cliId ?? botCfg.cliId;
-  return {
-    cliId,
-    cliPathOverride: frozen
-      ? ds?.session.cliPathOverride
-      : (ds?.session.cliPathOverride ?? botCfg.cliPathOverride),
-    wrapperCli: frozen
-      ? ds?.session.wrapperCli
-      : (ds?.session.wrapperCli ?? botCfg.wrapperCli),
-    model: frozen
-      ? ds?.session.model
-      : (ds?.session.model ?? botCfg.model),
-    backendType: resolvePairedSpawnBackendType(
-      cliId,
-      ds?.session.backendType,
-      botCfg.backendType,
-      config.daemon.backendType,
-    ),
-    env: botCfg.env,
-  };
-}
-
-async function probeFastModeForTarget(
-  larkAppId: string,
-  workingDir: string,
-  ds?: DaemonSession,
-): Promise<FastModeApplyResult> {
-  const target = fastModeTargetConfig(larkAppId, ds);
-  if (!fastModeSessionSupported({
-    cliId: target.cliId,
-    wrapperCli: target.wrapperCli,
-    adopted: !!ds?.adoptedFrom,
-    backendType: target.backendType,
-  })) {
-    return { ok: false, reason: 'unsupported_session' };
-  }
-  const env: NodeJS.ProcessEnv = {
-    ...redactChildEnv(process.env),
-    ...sanitizePerBotEnv(target.env),
-  };
-  env.PATH = `${join(homedir(), '.botmux', 'bin')}${delimiter}${env.PATH ?? ''}`;
-  const cliBin = createCliAdapterSync(target.cliId, target.cliPathOverride).resolvedBin;
-  return probeCodexFastServiceTier({
-    cliBin,
-    cwd: workingDir,
-    env,
-    model: target.model,
-    log: message => logger.info(`[fast-probe:${larkAppId}] ${message}`),
-  });
-}
-
-async function applyFastModeForSession(
-  ds: DaemonSession,
-  enabled: boolean,
-): Promise<FastModeApplyResult> {
-  const target = fastModeTargetConfig(ds.larkAppId, ds);
-  if (!fastModeSessionSupported({
-    cliId: target.cliId,
-    wrapperCli: target.wrapperCli,
-    adopted: !!ds.adoptedFrom,
-    backendType: target.backendType,
-  })) {
-    return { ok: false, reason: 'unsupported_session' };
-  }
-  if (ds.worker && !ds.worker.killed) {
-    return requestWorkerFastModeChange(ds.worker, enabled);
-  }
-  if (!enabled) return { ok: true, enabled: false };
-  if (ds.session.fastServiceTier) {
-    return {
-      ok: true,
-      enabled: true,
-      serviceTier: ds.session.fastServiceTier,
-    };
-  }
-  return probeFastModeForTarget(ds.larkAppId, getSessionWorkingDir(ds), ds);
-}
-
-function fastModeFailureReplyKey(result: FastModeApplyResult): string {
-  if (!result.ok && result.reason === 'unsupported_session') return 'cmd.fast.unsupported';
-  if (!result.ok && result.reason === 'unsupported_model') return 'cmd.fast.unsupported_model';
-  return 'cmd.fast.apply_failed';
-}
-
 // Dependencies passed to command-handler
 const commandDeps: CommandHandlerDeps = {
   activeSessions,
@@ -3911,7 +3808,6 @@ const commandDeps: CommandHandlerDeps = {
   getActiveCount,
   lastRepoScan,
   prewarmDocCommentSession,
-  applyFastMode: applyFastModeForSession,
 };
 
 /**
@@ -15371,47 +15267,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         fireSessionlessCommandDetached(cmd, anchor, { ...parsed, content: commandContent, chatId }, larkAppId);
         return;
       }
-      let coldFastServiceTier: string | undefined;
-      let coldFastWorkingDir: string | undefined;
-      if (cmd === '/fast') {
-        const action = parseFastModeAction(commandContent);
-        // Only a valid enable request may open a Session. Status/off/invalid
-        // are routed session-less so they can report their result without
-        // polluting the dashboard.
-        if (action !== 'toggle' && action !== 'on') {
-          await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
-          return;
-        }
-        const target = fastModeTargetConfig(larkAppId);
-        if (!fastModeSessionSupported({
-          cliId: target.cliId,
-          wrapperCli: target.wrapperCli,
-          backendType: target.backendType,
-        })) {
-          await sessionReply(anchor, tr('cmd.fast.unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
-          return;
-        }
-        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({
-          scope,
-          anchor,
-          chatId,
-          chatType,
-          larkAppId,
-        });
-        coldFastWorkingDir = pinnedWorkingDir
-          ?? expandHome(effectiveDefaultWorkingDir(botCfg) ?? botCfg.workingDir ?? config.daemon.workingDir);
-        const preflight = await probeFastModeForTarget(larkAppId, coldFastWorkingDir);
-        if (!preflight.ok || !preflight.serviceTier) {
-          await sessionReply(
-            anchor,
-            tr(fastModeFailureReplyKey(preflight), undefined, localeForBot(larkAppId)),
-            'text',
-            larkAppId,
-          );
-          return;
-        }
-        coldFastServiceTier = preflight.serviceTier;
-      }
       // `/rename` renames an EXISTING session; a brand-new topic has none. Route
       // straight to handleCommand (its `!ds` branch replies no_active_session)
       // so the pre-create block below doesn't spawn a worker:null phantom
@@ -15419,7 +15274,7 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       // and /term special cases, but UNLIKE those (which carry their own
       // permission gates inside their handlers) this branch MUST stay after
       // the canOperate gate above — the /rename handler itself has no gate.
-      if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd) && cmd !== '/fast') {
+      if (EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, commandDeps, larkAppId);
         return;
       }
@@ -15443,10 +15298,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
       session.lastCallerOpenId = senderOpenId;
       session.lastMessageAt = new Date(now).toISOString();
       session.scope = scope;
-      if (coldFastServiceTier) {
-        session.fastServiceTier = coldFastServiceTier;
-        session.workingDir = coldFastWorkingDir;
-      }
 
       // First-message `/repo`: seed the same pending-repo state the card flow
       // uses, so the `/repo` handler launches the CLI straight away —
@@ -15478,7 +15329,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
         lastMessageAt: now,
         hasHistory: false,
         ownerOpenId: senderOpenId,
-        ...(coldFastWorkingDir ? { workingDir: coldFastWorkingDir } : {}),
         ...cmdPending,
       });
       // Pass mention-stripped content so /command argument parsing works.
@@ -16259,51 +16109,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return;
       }
-      let coldFastServiceTier: string | undefined;
-      let coldFastWorkingDir: string | undefined;
-      if (!existingDs && cmd === '/fast') {
-        const action = parseFastModeAction(commandContent);
-        if (action !== 'toggle' && action !== 'on') {
-          await handleCommand(
-            cmd,
-            anchor,
-            { ...parsed, content: commandContent, chatId: threadChatId },
-            commandDeps,
-            larkAppId,
-          );
-          return;
-        }
-        const target = fastModeTargetConfig(larkAppId);
-        if (!fastModeSessionSupported({
-          cliId: target.cliId,
-          wrapperCli: target.wrapperCli,
-          backendType: target.backendType,
-        })) {
-          await sessionReply(anchor, tr('cmd.fast.unsupported', undefined, localeForBot(larkAppId)), 'text', larkAppId);
-          return;
-        }
-        const { pinnedWorkingDir } = await resolvePinnedWorkingDir({
-          scope,
-          anchor,
-          chatId: threadChatId,
-          chatType: ctxChatType,
-          larkAppId,
-        });
-        const fastBotCfg = getBot(larkAppId).config;
-        coldFastWorkingDir = pinnedWorkingDir
-          ?? expandHome(effectiveDefaultWorkingDir(fastBotCfg) ?? fastBotCfg.workingDir ?? config.daemon.workingDir);
-        const preflight = await probeFastModeForTarget(larkAppId, coldFastWorkingDir);
-        if (!preflight.ok || !preflight.serviceTier) {
-          await sessionReply(
-            anchor,
-            tr(fastModeFailureReplyKey(preflight), undefined, localeForBot(larkAppId)),
-            'text',
-            larkAppId,
-          );
-          return;
-        }
-        coldFastServiceTier = preflight.serviceTier;
-      }
       // First message of a fresh thread carrying a session-needing daemon command
       // — e.g. another bot dispatched `/repo <path>` into a brand-new thread.
       // Without a session, handleCommand gets ds=undefined and `/repo` (and other
@@ -16314,7 +16119,7 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
       // would be a phantom conversation that only exists to be renamed. Let
       // handleCommand's `!ds` branch reply no_active_session instead.
       if (!existingDs && threadChatId && !isSessionlessCommandInvocation(cmd, commandContent)
-        && (!EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd) || cmd === '/fast')) {
+        && !EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has(cmd)) {
         const session = sessionStore.createSession(threadChatId, anchor, cmdContent.substring(0, 50), ctxChatType);
         const now = Date.now();
         if (ctxChatType === 'p2p') {
@@ -16331,10 +16136,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
         session.lastCallerOpenId = threadSenderOpenId;
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
-        if (coldFastServiceTier) {
-          session.fastServiceTier = coldFastServiceTier;
-          session.workingDir = coldFastWorkingDir;
-        }
         let cmdPending: Partial<DaemonSession> | undefined;
         if (cmd === '/repo') {
           const { pinnedWorkingDir } = await resolvePinnedWorkingDir({ scope, anchor, chatId: threadChatId, chatType: ctxChatType, larkAppId });
@@ -16356,7 +16157,6 @@ async function handleThreadReply(data: any, ctx: RoutingContext): Promise<void> 
           lastMessageAt: now,
           hasHistory: false,
           ownerOpenId: threadSenderOpenId,
-          ...(coldFastWorkingDir ? { workingDir: coldFastWorkingDir } : {}),
           ...cmdPending,
         });
       }
