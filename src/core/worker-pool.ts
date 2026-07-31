@@ -1643,36 +1643,68 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
   });
 }
 
+type CloseFence = {
+  sessionId: string;
+  workerGeneration: number;
+  promise: Promise<void>;
+  resolve: () => void;
+  worker: ChildProcess;
+};
+
+const closeFences = new Map<string, CloseFence>();
+
+function closeFenceGeneration(ds: DaemonSession): number {
+  return ds.workerGeneration ?? ds.session.workerGeneration ?? 0;
+}
+
+function closeFenceKey(sessionId: string, workerGeneration: number): string {
+  return `${sessionId}:${workerGeneration}`;
+}
+
+function closeFenceFor(sessionId: string, workerGeneration: number | undefined): Promise<void> | undefined {
+  if (workerGeneration === undefined) return undefined;
+  return closeFences.get(closeFenceKey(sessionId, workerGeneration))?.promise;
+}
+
 function armCloseFence(ds: DaemonSession, worker: ChildProcess): Promise<void> {
-  const existing = ds.closeFence;
-  if (existing) return existing;
+  const sessionId = ds.session.sessionId;
+  const workerGeneration = closeFenceGeneration(ds);
+  const key = closeFenceKey(sessionId, workerGeneration);
+  const existing = closeFences.get(key);
+  if (existing) return existing.promise;
+
   let resolveFence!: () => void;
-  const fence = new Promise<void>(resolve => { resolveFence = resolve; });
-  ds.closeFence = fence;
-  ds.closeFenceResolve = resolveFence;
-  sessionStore.registerSessionBridgeSendMarkerCleanupFence(ds.session.sessionId, fence);
+  const promise = new Promise<void>(resolve => { resolveFence = resolve; });
+  const fence: CloseFence = {
+    sessionId,
+    workerGeneration,
+    promise,
+    resolve: resolveFence,
+    worker,
+  };
+  closeFences.set(key, fence);
+  sessionStore.registerSessionBridgeSendMarkerCleanupFence(sessionId, promise);
   const timer = setTimeout(() => {
-    logger.warn(`[${tag(ds)}] worker close fence still waiting; bridge markers remain until ACK or worker exit`);
+    logger.warn(
+      `[${sessionId.substring(0, 8)}] worker close fence still waiting; `
+      + `generation=${workerGeneration}; bridge markers remain until ACK or worker exit`,
+    );
   }, CLOSE_FENCE_WARN_MS);
   timer.unref?.();
   worker.once('exit', resolveFence);
   if (worker.exitCode != null || worker.signalCode != null) {
     queueMicrotask(resolveFence);
   }
-  void fence.finally(() => {
+  void promise.finally(() => {
     clearTimeout(timer);
     worker.off('exit', resolveFence);
-    if (ds.closeFence === fence) {
-      ds.closeFence = undefined;
-      ds.closeFenceResolve = undefined;
-    }
+    if (closeFences.get(key) === fence) closeFences.delete(key);
   });
-  return fence;
+  return promise;
 }
 
-function resolveCloseFence(ds: DaemonSession): void {
-  const resolve = ds.closeFenceResolve;
-  if (resolve) resolve();
+function resolveCloseFence(sessionId: string, workerGeneration: number): void {
+  closeFences.get(closeFenceKey(sessionId, workerGeneration))?.resolve();
 }
 
 // ─── Idempotent session close (dashboard IPC) ───────────────────────────────
@@ -1694,6 +1726,7 @@ export async function closeSession(
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
+  const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -1741,8 +1774,8 @@ export async function closeSession(
     );
   }
 
-  if (wasOpen && hadLiveWorker && ds) {
-    await ds.closeFence;
+  if (wasOpen && hadLiveWorker) {
+    await closeFenceFor(sessionId, closeWorkerGeneration);
     sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
   }
 
@@ -3958,11 +3991,7 @@ function setupWorkerHandlers(
       }
 
       case 'session_close_ready': {
-        if (msg.sessionId !== ds.session.sessionId) {
-          logger.warn(`[${t}] Dropped session_close_ready with mismatched sessionId`);
-          break;
-        }
-        resolveCloseFence(ds);
+        resolveCloseFence(msg.sessionId, workerGeneration);
         break;
       }
 

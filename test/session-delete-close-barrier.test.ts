@@ -174,7 +174,7 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
       expect(existsSync(markerPath)).toBe(true);
 
-      ds.closeFenceResolve();
+      worker.emit('exit');
       await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });
       expect(existsSync(markerPath)).toBe(false);
     } finally {
@@ -233,7 +233,7 @@ describe('daemon close barrier used by botmux delete', () => {
       sessionStore.closeSession(session.sessionId);
       expect(existsSync(markerPath)).toBe(true);
 
-      ds.closeFenceResolve();
+      worker.emit('exit');
       await Promise.resolve();
       expect(existsSync(markerPath)).toBe(false);
     } finally {
@@ -299,6 +299,105 @@ describe('daemon close barrier used by botmux delete', () => {
       expect(existsSync(markerPath)).toBe(false);
     } finally {
       vi.useRealTimers();
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('creates an independent fence when a repo switch reuses the DaemonSession for a new session generation', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-generation-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence-generation');
+
+    try {
+      const oldSession = sessionStore.createSession(
+        'oc_generation',
+        'om_generation_old',
+        'old generation',
+        'group',
+      );
+      oldSession.larkAppId = 'app-close-fence-generation';
+      oldSession.workerGeneration = 1;
+      sessionStore.updateSession(oldSession);
+      const newSession = sessionStore.createSession(
+        'oc_generation',
+        'om_generation_new',
+        'new generation',
+        'group',
+      );
+      newSession.larkAppId = 'app-close-fence-generation';
+      newSession.workerGeneration = 2;
+      sessionStore.updateSession(newSession);
+
+      const markerDir = join(dataDir, 'turn-sends');
+      const oldMarkerPath = join(markerDir, `${oldSession.sessionId}.jsonl`);
+      const newMarkerPath = join(markerDir, `${newSession.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(oldMarkerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'old generation send',
+      })}\n`);
+      writeFileSync(newMarkerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'new generation send',
+      })}\n`);
+
+      const oldWorker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const newWorker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session: oldSession,
+        worker: oldWorker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence-generation',
+        chatId: oldSession.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        workerGeneration: 1,
+        initConfig: { backendType: 'riff' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      expect(ds.worker).toBeNull();
+      sessionStore.closeSession(oldSession.sessionId);
+      expect(existsSync(oldMarkerPath)).toBe(true);
+
+      // Repo/card switch reuses the same DaemonSession object for a new
+      // Session + worker generation while the old riff close fence is still
+      // unresolved. The new close must NOT reuse the old fence: it needs a
+      // fence registered under newSession.sessionId, otherwise default
+      // sessionStore.closeSession() would unlink the new marker immediately.
+      ds.session = newSession;
+      ds.worker = newWorker;
+      ds.workerPort = 23456;
+      ds.workerGeneration = 2;
+
+      workerPool.killWorker(ds);
+      sessionStore.closeSession(newSession.sessionId);
+      expect(existsSync(oldMarkerPath)).toBe(true);
+      expect(existsSync(newMarkerPath)).toBe(true);
+
+      oldWorker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(oldMarkerPath)).toBe(false);
+      expect(existsSync(newMarkerPath)).toBe(true);
+
+      newWorker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(newMarkerPath)).toBe(false);
+    } finally {
       config.session.dataDir = previousDataDir;
     }
   });
