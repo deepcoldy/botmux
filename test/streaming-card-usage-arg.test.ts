@@ -37,7 +37,11 @@ function buildStreamingCardCallSites(source: string): string[] {
 }
 
 describe('streaming-card usage arg (source lock — PR #637 regression guard)', () => {
-  for (const rel of ['src/core/worker-pool.ts', 'src/im/lark/card-handler.ts']) {
+  for (const rel of [
+    'src/core/worker-pool.ts',
+    'src/im/lark/card-handler.ts',
+    'src/daemon.ts',
+  ]) {
     it(`every buildStreamingCard() call in ${rel} forwards a usage snapshot`, () => {
       const source = readFileSync(resolve(rel), 'utf8');
       const sites = buildStreamingCardCallSites(source);

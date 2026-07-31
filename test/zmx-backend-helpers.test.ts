@@ -355,7 +355,13 @@ describe('zmx backend pure helpers', () => {
       cwd: '/tmp/work',
       cols: 80,
       rows: 24,
-      env: { PATH: '/bin', ZMX_SESSION: 'outer', BOTMUX_SESSION_ID: 'session-secret' },
+      env: {
+        PATH: '/bin',
+        ZMX_SESSION: 'outer',
+        BOTMUX_SESSION_ID: 'session-secret',
+        BOTMUX_CORE_ONLY: '1',
+        SESSION_DATA_DIR: '/tmp/core-only/data',
+      },
       injectEnv: {
         ZMX_SESSION: 'evil',
         ZMX_SESSION_PREFIX: 'evil-',
@@ -385,6 +391,12 @@ describe('zmx backend pure helpers', () => {
     expect(files.bootstrap).not.toContain('private prompt');
     expect(files.bootstrap).not.toContain('session-secret');
     expect(files.bootstrap).not.toContain("yes ' quoted");
+    // The pane scrubs BOTMUX_CORE_ONLY / SESSION_DATA_DIR before launching the
+    // CLI, so ZMX must bake the host-resolved dedicated wrapper dir into its
+    // shell script just like tmux does. Otherwise a same-HOME shared wrapper
+    // could shadow this core-only daemon's build.
+    expect(files.bootstrap).toContain('/tmp/core-only/data/bin');
+    expect(files.bootstrap).not.toContain('/.botmux/bin');
     expect(files.bootstrap).toContain(payloadPath);
     expect(files.bootstrap).toContain(readyPath);
     expect(files.bootstrap).toContain(releasePath);

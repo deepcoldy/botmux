@@ -108,7 +108,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
 import { homedir, tmpdir } from 'node:os';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   acceptVcMeetingDelivery,
@@ -1439,7 +1439,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
         'app_test',
         'claude',
         'projects',
-        '-tmp',
+        realpathSync('/tmp').replace(/[^A-Za-z0-9-]/g, '-'),
       );
       mkdirSync(transcriptDir, { recursive: true });
       writeFileSync(

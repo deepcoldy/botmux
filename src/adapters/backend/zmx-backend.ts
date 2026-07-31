@@ -35,8 +35,9 @@ import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
   resolveUserShell,
-  SHELL_WRAPPER_SCRIPT,
+  shellWrapperScript,
 } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
 import { logger } from '../../utils/logger.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -2324,9 +2325,10 @@ export function buildZmxLaunchFiles(
   const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv)
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
   const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+  const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
   const wrapped = debugKeepShell
-    ? buildDebugKeepShellScript(shellSpec.shell)
-    : SHELL_WRAPPER_SCRIPT;
+    ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir)
+    : shellWrapperScript(wrapperBinDir);
   const payloadArgv = [opts.cwd, ...envAssignments, bin, ...args];
   const payload = `set -- ${payloadArgv.map(shellSingleQuote).join(' ')}\n`;
   const userScript = [

@@ -135,6 +135,7 @@ import {
   readableTerminalUrlFor,
   findActiveBySessionId,
   getDaemonBootId,
+  getDaemonStreamingCardUsageSnapshot,
   isSessionTransferring,
   type WorkerSessionReplyOptions,
 } from './core/worker-pool.js';
@@ -3952,6 +3953,7 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
       isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
+      getDaemonStreamingCardUsageSnapshot(ds, dsBotCfg.cliId, { fresh: true }),
     );
     scheduleCardPatch(ds, frozenCard);
 
