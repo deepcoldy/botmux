@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -47,6 +47,13 @@ describe('daemon close barrier used by botmux delete', () => {
       );
       session.larkAppId = 'app-delete-barrier';
       sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'private closed reply',
+      })}\n`);
       const ds = {
         session,
         worker: null,
@@ -72,6 +79,7 @@ describe('daemon close barrier used by botmux delete', () => {
       // logical close barrier must already be fully visible.
       expect(active.has(activeSessionKey(ds))).toBe(false);
       expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(existsSync(markerPath)).toBe(false);
 
       releaseCleanup();
       await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });

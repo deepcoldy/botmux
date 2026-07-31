@@ -22,7 +22,6 @@ export function markSessionActivity(ds: DaemonSession, at: number = Date.now()):
       sessionId: ds.session.sessionId,
       patch: {
         lastMessageAt: at,
-        ...buildSessionMessagePreview(ds.session),
       },
     },
   });

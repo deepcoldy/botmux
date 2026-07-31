@@ -100,13 +100,16 @@ describe('dashboard sessions filters', () => {
     expect(page).toContain("t('sessions.history.bot')");
     expect(page).toContain('className="session-card-exchange-tooltip"');
     expect(page).toContain('role="tooltip"');
-    expect(page).toContain('aria-describedby={open ? tooltipId : undefined}');
+    expect(page).toContain('className="session-card-exchange-details"');
+    expect(page).toContain("t('sessions.preview.showFull')");
+    expect(page).toContain('aria-expanded={open}');
     expect(page).toContain('onPointerEnter={event => {');
     expect(page).toContain("if (event.key === 'Escape') hide();");
     expect(page).toContain('<p>{exchange.userFullText}</p>');
     expect(page).toContain('<p>{exchange.botFullText}</p>');
     expect(css).toContain('.session-card-exchange-line > p');
     expect(css).toContain('-webkit-line-clamp: 2');
+    expect(css).toContain('.session-card-exchange-details {');
     expect(css).toContain('.session-card-exchange-tooltip {');
     expect(css).toContain('position: fixed;');
     expect(css).toContain('.session-card-exchange-tooltip-scroll {');

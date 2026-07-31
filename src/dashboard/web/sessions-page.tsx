@@ -1005,6 +1005,7 @@ type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): JSX.Element | null {
   const { exchange } = props;
   const triggerRef = useRef<HTMLDivElement>(null);
+  const detailsRef = useRef<HTMLButtonElement>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
   const hideTimerRef = useRef<number | null>(null);
   const [open, setOpen] = useState(false);
@@ -1070,38 +1071,82 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
     };
   }, [exchange.botFullText, exchange.userFullText, open, updatePosition]);
   useEffect(() => () => clearHide(), [clearHide]);
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (
+        triggerRef.current?.contains(target)
+        || detailsRef.current?.contains(target)
+        || tooltipRef.current?.contains(target)
+      ) return;
+      hide();
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') hide();
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [hide, open]);
 
   if (!exchange.userText && !exchange.botText) return null;
   return (
     <>
-      <div
-        ref={triggerRef}
-        className="session-card-exchange"
-        tabIndex={0}
-        aria-label={t('sessions.preview.latestExchange')}
-        aria-describedby={open ? tooltipId : undefined}
-        onPointerEnter={event => {
-          if (event.pointerType !== 'touch') show();
-        }}
-        onPointerLeave={scheduleHide}
-        onFocus={show}
-        onBlur={scheduleHide}
-        onKeyDown={event => {
-          if (event.key === 'Escape') hide();
-        }}
-      >
-        {exchange.userText ? (
-          <div className="session-card-exchange-line">
-            <span>{t('sessions.history.user')}</span>
-            <p>{exchange.userText}</p>
-          </div>
-        ) : null}
-        {exchange.botText ? (
-          <div className="session-card-exchange-line bot">
-            <span>{t('sessions.history.bot')}</span>
-            <p>{exchange.botText}</p>
-          </div>
-        ) : null}
+      <div className="session-card-exchange-wrap">
+        <div
+          ref={triggerRef}
+          className="session-card-exchange"
+          aria-label={t('sessions.preview.latestExchange')}
+          onPointerEnter={event => {
+            if (event.pointerType !== 'touch') show();
+          }}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+        >
+          {exchange.userText ? (
+            <div className="session-card-exchange-line">
+              <span>{t('sessions.history.user')}</span>
+              <p>{exchange.userText}</p>
+            </div>
+          ) : null}
+          {exchange.botText ? (
+            <div className="session-card-exchange-line bot">
+              <span>{t('sessions.history.bot')}</span>
+              <p>{exchange.botText}</p>
+            </div>
+          ) : null}
+        </div>
+        <button
+          ref={detailsRef}
+          type="button"
+          className="session-card-exchange-details"
+          aria-label={t('sessions.preview.showFull')}
+          aria-describedby={open ? tooltipId : undefined}
+          aria-expanded={open}
+          onClick={event => {
+            event.stopPropagation();
+          show();
+          }}
+          onFocus={show}
+          onBlur={scheduleHide}
+          onPointerEnter={event => {
+            if (event.pointerType !== 'touch') show();
+          }}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
+          onKeyDown={event => {
+            if (event.key === 'Escape') hide();
+          }}
+        >
+          <span aria-hidden="true">•••</span>
+        </button>
       </div>
       {open && typeof document !== 'undefined' ? createPortal(
         <div
@@ -1116,7 +1161,9 @@ function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }
             visibility: position ? 'visible' : 'hidden',
           }}
           onPointerEnter={clearHide}
-          onPointerLeave={scheduleHide}
+          onPointerLeave={event => {
+            if (event.pointerType !== 'touch') scheduleHide();
+          }}
         >
           <div className="session-card-exchange-tooltip-scroll">
             {exchange.userFullText ? (

@@ -100,6 +100,49 @@ describe('buildSessionMessagePreview', () => {
     });
   });
 
+  it('does not attach a newer chat-scope queue message to a closed session', () => {
+    writeJsonl('queues/oc_chat.jsonl', [
+      { senderType: 'user', content: 'new session message', createTime: '8000' },
+    ]);
+    writeJsonl('turn-sends/session-1.jsonl', [
+      { sentAtMs: 7_100, previewText: 'closed session answer' },
+    ]);
+
+    expect(buildSessionMessagePreview(session({
+      scope: 'chat',
+      status: 'closed',
+      lastUserPrompt: 'closed session question',
+      lastMessageAt: new Date(7_000).toISOString(),
+      closedAt: new Date(7_500).toISOString(),
+    }))).toMatchObject({
+      previewUserText: 'closed session question',
+      previewBotText: 'closed session answer',
+      previewUserAt: 7_000,
+      previewBotAt: 7_100,
+      previewBotState: 'replied',
+    });
+  });
+
+  it('invalidates the bounded tail cache when an append changes the file', () => {
+    writeJsonl('queues/om_root.jsonl', [
+      { senderType: 'user', content: 'first question', createTime: '9000' },
+    ]);
+    expect(buildSessionMessagePreview(session())).toMatchObject({
+      previewUserText: 'first question',
+      previewBotState: 'waiting',
+    });
+
+    appendFileSync(
+      join(dataDir, 'queues', 'om_root.jsonl'),
+      JSON.stringify({ senderType: 'user', content: 'second question', createTime: '9100' }) + '\n',
+    );
+    expect(buildSessionMessagePreview(session())).toMatchObject({
+      previewUserText: 'second question',
+      previewUserAt: 9_100,
+      previewBotState: 'waiting',
+    });
+  });
+
   it('skips malformed and legacy marker rows without breaking the session list', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'safe question', createTime: '6000' },

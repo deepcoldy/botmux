@@ -6694,7 +6694,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           const markerDir = join(resolveDataDir(), 'turn-sends');
           if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
           const marker: Record<string, unknown> = { sentAtMs, messageId };
-          const previewText = buildBridgeSendPreviewText(canonicalOutput.content);
+          const previewText = buildBridgeSendPreviewText(content);
           if (previewText) marker.previewText = previewText;
           appendFileSync(join(markerDir, `${sid}.jsonl`), JSON.stringify(marker) + '\n');
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }

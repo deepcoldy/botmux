@@ -2,14 +2,29 @@ import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import type { Session } from '../types.js';
+import { BoundedMap } from '../utils/bounded-map.js';
 
 const PREVIEW_TAIL_BYTES = 64 * 1024;
 const PREVIEW_TAIL_ROWS = 40;
 const USER_PREVIEW_LENGTH = 120;
 const BOT_PREVIEW_LENGTH = 220;
 const FULL_PREVIEW_LENGTH = 4_000;
+const PREVIEW_FILE_CACHE_MAX_ENTRIES = 2_048;
 
 type JsonRow = Record<string, unknown>;
+type PreviewRowKind = 'bot' | 'user';
+type PreviewFileCacheEntry = {
+  mtimeMs: number;
+  row?: JsonRow;
+  size: number;
+};
+
+/** Dashboard snapshots may compose hundreds of rows at once. Keep parsed tails
+ * behind a bounded stat-keyed cache so an unchanged `/api/sessions` refresh
+ * does not synchronously reread up to 64 KiB twice per session. */
+const previewFileCache = new BoundedMap<string, PreviewFileCacheEntry>(
+  PREVIEW_FILE_CACHE_MAX_ENTRIES,
+);
 
 export interface SessionMessagePreview {
   previewUserText?: string;
@@ -29,13 +44,19 @@ function compactText(value: unknown, limit: number): string {
 
 /** Read a bounded JSONL tail. A partial first line is discarded when the file
  * is larger than the read window; malformed/truncated rows are skipped. */
-function readJsonlTail(path: string, limit = PREVIEW_TAIL_ROWS): JsonRow[] {
-  if (!existsSync(path)) return [];
+function readLatestJsonlRow(path: string, kind: PreviewRowKind): JsonRow | undefined {
+  if (!existsSync(path)) return undefined;
   let fd: number | undefined;
   try {
     fd = openSync(path, 'r');
-    const size = fstatSync(fd).size;
-    if (size <= 0) return [];
+    const stat = fstatSync(fd);
+    const size = stat.size;
+    if (size <= 0) return undefined;
+    const cacheKey = `${kind}:${path}`;
+    const cached = previewFileCache.get(cacheKey);
+    if (cached && cached.size === size && cached.mtimeMs === stat.mtimeMs) {
+      return cached.row;
+    }
     const length = Math.min(size, PREVIEW_TAIL_BYTES);
     const start = size - length;
     const buffer = Buffer.allocUnsafe(length);
@@ -55,9 +76,36 @@ function readJsonlTail(path: string, limit = PREVIEW_TAIL_ROWS): JsonRow[] {
         // Best-effort presentation data: skip malformed or concurrently-written rows.
       }
     }
-    return rows.slice(-limit);
+    const matches = kind === 'user'
+      ? (row: JsonRow) => row.senderType === 'user'
+      : (row: JsonRow) => typeof row.sentAtMs === 'number' && typeof row.previewText === 'string';
+    let latest: JsonRow | undefined;
+    for (let i = rows.length - 1, seen = 0; i >= 0 && seen < PREVIEW_TAIL_ROWS; i--, seen++) {
+      if (matches(rows[i])) {
+        latest = rows[i];
+        break;
+      }
+    }
+    const row = latest
+      ? kind === 'user'
+        ? {
+            senderType: 'user',
+            content: compactText(latest.content, FULL_PREVIEW_LENGTH),
+            createTime: latest.createTime,
+          }
+        : {
+            previewText: compactText(latest.previewText, FULL_PREVIEW_LENGTH),
+            sentAtMs: latest.sentAtMs,
+          }
+      : undefined;
+    previewFileCache.set(cacheKey, {
+      mtimeMs: stat.mtimeMs,
+      row,
+      size,
+    });
+    return row;
   } catch {
-    return [];
+    return undefined;
   } finally {
     if (fd !== undefined) {
       try { closeSync(fd); } catch { /* best effort */ }
@@ -94,18 +142,25 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
   const queueAnchor = session.deferredScheduleRun?.routingAnchor
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
   const safeQueueAnchor = safeJsonlKey(queueAnchor);
-  const queueRows = safeQueueAnchor
-    ? readJsonlTail(join(config.session.dataDir, 'queues', `${safeQueueAnchor}.jsonl`))
-    : [];
-  const latestUser = queueRows.filter(row => row.senderType === 'user').at(-1);
+  // Chat-scope queues are shared by every historical session for that chat.
+  // Once a session is closed, reading the queue tail would attach a newer
+  // session's prompt to the old card. Closed rows therefore use their own
+  // persisted lastUserPrompt; active rows keep the live queue source.
+  const sharedClosedChatQueue = session.status === 'closed' && session.scope === 'chat';
+  const latestUser = !sharedClosedChatQueue && safeQueueAnchor
+    ? readLatestJsonlRow(
+        join(config.session.dataDir, 'queues', `${safeQueueAnchor}.jsonl`),
+        'user',
+      )
+    : undefined;
 
   const safeSessionId = safeJsonlKey(session.sessionId);
-  const markerRows = safeSessionId
-    ? readJsonlTail(join(config.session.dataDir, 'turn-sends', `${safeSessionId}.jsonl`))
-    : [];
-  const latestBot = markerRows
-    .filter(row => typeof row.sentAtMs === 'number' && typeof row.previewText === 'string')
-    .at(-1);
+  const latestBot = safeSessionId
+    ? readLatestJsonlRow(
+        join(config.session.dataDir, 'turn-sends', `${safeSessionId}.jsonl`),
+        'bot',
+      )
+    : undefined;
 
   const userFullText = compactText(
     latestUser?.content ?? session.lastUserPrompt ?? '',

@@ -212,6 +212,26 @@ describe('session presentation redaction', () => {
     expect(updated.patch).toEqual({ webPort: 3007 });
     expect(updateBody.patch.riffAccessUrl).toBe('https://def456.sandbox.example/term');
   });
+
+  it('fails closed for future preview-prefixed fields on anonymous REST and SSE surfaces', () => {
+    const future = {
+      sessionId: 's-future',
+      status: 'idle',
+      previewUserMarkdown: 'future private user field',
+      previewBotRichText: 'future private bot field',
+    };
+    const rest = redactSessionsForPublic([future]) as any[];
+    expect(rest[0]).toEqual({ sessionId: 's-future', status: 'idle' });
+
+    const update = redactSessionEventForPublic('session.update', {
+      sessionId: 's-future',
+      patch: {
+        status: 'working',
+        previewUserMarkdown: 'future private patch',
+      },
+    }) as any;
+    expect(update.patch).toEqual({ status: 'working' });
+  });
 });
 
 describe('redactSettingsForPublic', () => {

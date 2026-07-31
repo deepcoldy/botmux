@@ -38,6 +38,7 @@ describe('buildBridgeSendMarkerContent', () => {
   it('can add preview text without changing legacy marker suppression semantics', () => {
     expect(buildBridgeSendPreviewText('  spoken\nreply  ')).toBe('spoken reply');
   });
+
 });
 
 describe('shouldSuppressBridgeEmit', () => {

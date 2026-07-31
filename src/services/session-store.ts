@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -231,6 +231,11 @@ export function closeSession(sessionId: string): void {
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();
+    // turn-sends was originally a transient bridge-dedup file cleaned by a
+    // live worker's close handler. Message previews now make its bounded tail
+    // user-visible, so workerless/forced closes must apply the same cleanup;
+    // otherwise closed sessions retain private reply text indefinitely.
+    try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }
