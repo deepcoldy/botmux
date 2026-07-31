@@ -1003,7 +1003,7 @@ function SessionsTable(props: {
 
 type SessionExchangePreviewValue = ReturnType<typeof sessionExchangePreview>;
 
-function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): JSX.Element | null {
+function SessionExchangePreview(props: { exchange: SessionExchangePreviewValue }): React.JSX.Element | null {
   const { exchange } = props;
   const triggerRef = useRef<HTMLDivElement>(null);
   const detailsRef = useRef<HTMLButtonElement>(null);
