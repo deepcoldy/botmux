@@ -995,6 +995,19 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(persistedStates).toEqual(['pending', 'clean']);
   });
 
+  it('keeps a transport-failed active submission pending when success is later confirmed', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('ambiguous prompt')).toBe(false);
+    expect(backend.confirmAmbiguousSubmission(fence)).toBe('recovery-pending');
+    expect(readRecoveryState(recoveryStateDir).state).toBe('pending');
+    expect(() => backend.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-pending/);
+  });
+
   it.each([
     ['abnormal stdout', false],
     ['timeout', true],
