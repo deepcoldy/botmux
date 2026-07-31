@@ -181,4 +181,125 @@ describe('daemon close barrier used by botmux delete', () => {
       config.session.dataDir = previousDataDir;
     }
   });
+
+  it('defers default session-store marker cleanup after killWorker already nulled the live worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-kill-then-close-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-kill-then-close');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_kill_then_close',
+        'om_kill_then_close',
+        'kill then close',
+        'group',
+      );
+      session.larkAppId = 'app-kill-then-close';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'sent before slash close',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-kill-then-close',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'tmux' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      expect(ds.worker).toBeNull();
+
+      sessionStore.closeSession(session.sessionId);
+      expect(existsSync(markerPath)).toBe(true);
+
+      ds.closeFenceResolve();
+      await Promise.resolve();
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('does not clean markers on the close-fence warning timer while the worker is still alive', async () => {
+    vi.useFakeTimers();
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-timeout-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence-timeout');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_close_fence_timeout',
+        'om_close_fence_timeout',
+        'close fence timeout',
+        'group',
+      );
+      session.larkAppId = 'app-close-fence-timeout';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'sent before slow close',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence-timeout',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'riff' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      sessionStore.closeSession(session.sessionId);
+      expect(existsSync(markerPath)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(existsSync(markerPath)).toBe(true);
+
+      worker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      config.session.dataDir = previousDataDir;
+    }
+  });
 });

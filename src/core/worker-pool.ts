@@ -131,7 +131,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
-const CLOSE_FENCE_TIMEOUT_MS = 8_000;
+const CLOSE_FENCE_WARN_MS = 8_000;
 const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1650,12 +1650,15 @@ function armCloseFence(ds: DaemonSession, worker: ChildProcess): Promise<void> {
   const fence = new Promise<void>(resolve => { resolveFence = resolve; });
   ds.closeFence = fence;
   ds.closeFenceResolve = resolveFence;
+  sessionStore.registerSessionBridgeSendMarkerCleanupFence(ds.session.sessionId, fence);
   const timer = setTimeout(() => {
-    logger.warn(`[${tag(ds)}] worker close fence timed out; cleaning bridge markers after bounded wait`);
-    resolveFence();
-  }, CLOSE_FENCE_TIMEOUT_MS);
+    logger.warn(`[${tag(ds)}] worker close fence still waiting; bridge markers remain until ACK or worker exit`);
+  }, CLOSE_FENCE_WARN_MS);
   timer.unref?.();
   worker.once('exit', resolveFence);
+  if (worker.exitCode != null || worker.signalCode != null) {
+    queueMicrotask(resolveFence);
+  }
   void fence.finally(() => {
     clearTimeout(timer);
     worker.off('exit', resolveFence);
@@ -1740,7 +1743,7 @@ export async function closeSession(
 
   if (wasOpen && hadLiveWorker && ds) {
     await ds.closeFence;
-    sessionStore.cleanupSessionBridgeSendMarkers(sessionId);
+    sessionStore.cleanupSessionBridgeSendMarkersNow(sessionId);
   }
 
   if (ds) {

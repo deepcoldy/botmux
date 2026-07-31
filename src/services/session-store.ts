@@ -190,6 +190,27 @@ export function getSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
 }
 
+const bridgeMarkerCleanupFences = new Map<string, Promise<void>>();
+
+export function registerSessionBridgeSendMarkerCleanupFence(
+  sessionId: string,
+  fence: Promise<void>,
+): void {
+  bridgeMarkerCleanupFences.set(sessionId, fence);
+  void fence.then(
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+  );
+}
+
 /**
  * Search all session files for a session not found in the current file.
  *
@@ -215,8 +236,20 @@ function findInOtherFiles(sessionId: string): Session | undefined {
   return undefined;
 }
 
-export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
   try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+}
+
+export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+  const fence = bridgeMarkerCleanupFences.get(sessionId);
+  if (fence) {
+    void fence.then(
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+    );
+    return;
+  }
+  cleanupSessionBridgeSendMarkersNow(sessionId);
 }
 
 export function closeSession(
