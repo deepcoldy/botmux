@@ -15362,7 +15362,6 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const codexAppQuoteContext = ctx.forwardSeedData
     ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId));
-  const codexAppMessageContext = codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const codexAppApplicationContext = vcMeetingApplicationContext(ctx);
   // 普通群「对已有消息发起话题再 @」：入站是话题内回复（root_id 指向另一条更早
   // 的话题根消息），bot 从未留存该话题历史。首轮拉取整条话题上下文（根 + 本条
@@ -15373,6 +15372,10 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
   const topicThreadContext = (parsed.rootId && parsed.rootId !== parsed.messageId && !ctx.forwardSeedData)
     ? await buildTopicThreadContext(larkAppId, chatId, parsed.rootId, parsed.messageId, localeForBot(larkAppId))
     : '';
+  // 话题上下文同样前置到 codex-app 结构化 sidecar lane（与 quote hint 一致双 lane
+  // 下发），否则 codex-app（clean input）bot 走 sidecar 时会静默丢掉话题历史，
+  // 正是本 PR 要修的 bug。
+  const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');
   const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;
 
   // Resolve sender identity for <sender> tag injection. The first call to
