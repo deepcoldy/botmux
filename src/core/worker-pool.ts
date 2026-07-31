@@ -1563,6 +1563,7 @@ export function killWorker(ds: DaemonSession): void {
   // must be invalidated so a late click cannot inject keys into a replacement
   // worker (or into nothing, if no replacement comes).
   invalidateStuckWarning(ds, 'killWorker');
+  invalidateTuiPrompt(ds, 'killWorker');
   if (!ds.worker || ds.worker.killed) {
     // No live worker to receive {type:'close'}, so its destroySession() — which
     // tears down the persistent backing session (tmux/herdr/zellij/zmx) — never
@@ -1602,6 +1603,7 @@ function clearTransferWorkerState(
   ds.localProcessAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
+  invalidateTuiPrompt(ds, reason);
   if (!worker || ds.worker === worker || ds.worker === null) {
     ds.worker = null;
     ds.workerPort = null;
@@ -1909,6 +1911,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
     ds.workerReady = false;
     // There is no live generation that can still own this capability.
     ds.managedTurnOrigin = undefined;
+    invalidateTuiPrompt(ds, 'suspendWorker:no_worker');
     return false;
   }
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) return false;
@@ -1933,6 +1936,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // later. Invalidate any stuck-warning card so a late click cannot inject keys
   // after the CLI is gone (or into a different CLI on resume).
   invalidateStuckWarning(ds, 'suspendWorker');
+  invalidateTuiPrompt(ds, 'suspendWorker');
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
@@ -3827,6 +3831,58 @@ export function invalidateStuckWarning(ds: DaemonSession, reason: string): void 
   clearStuckWarningAuthority(ds);
 }
 
+function hasTuiPromptAuthority(ds: DaemonSession): boolean {
+  return ds.tuiPromptCardId !== undefined
+    || ds.tuiPromptOptions !== undefined
+    || ds.tuiPromptMultiSelect !== undefined
+    || ds.tuiToggledIndices !== undefined
+    || !!ds.tuiPromptProcessing;
+}
+
+/**
+ * Drop every daemon-side marker owned by one interactive TUI prompt. The
+ * processing flag and option metadata are part of the same authority as the
+ * card ID: retaining any subset lets a dead generation block or mutate the
+ * next prompt.
+ */
+function clearTuiPromptAuthority(ds: DaemonSession): void {
+  ds.tuiPromptCardId = undefined;
+  ds.tuiPromptOptions = undefined;
+  ds.tuiPromptMultiSelect = undefined;
+  ds.tuiToggledIndices = undefined;
+  ds.tuiPromptProcessing = false;
+}
+
+/**
+ * Retire an outstanding TUI prompt when its worker/CLI lifetime ends. A worker
+ * can die after receiving a card click but before acknowledging backend
+ * delivery; resolving the card and clearing all authority here prevents that
+ * narrow window from permanently occupying the session's prompt slot.
+ */
+function invalidateTuiPrompt(
+  ds: DaemonSession,
+  reason: string,
+  outcome: 'failed' | 'resolved' = 'failed',
+): void {
+  if (!hasTuiPromptAuthority(ds)) return;
+  const t = tag(ds);
+  if (ds.tuiPromptCardId) {
+    const locDs = localeForBot(ds.larkAppId);
+    const cliId = ds.session.cliId ?? ds.initConfig?.cliId;
+    const terminalCard = outcome === 'resolved'
+      ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs)
+      : buildTuiPromptFailedCard(tr('worker.tui_submit_failed', {
+        cliName: cliId ? getCliDisplayName(cliId as CliId) : 'CLI',
+      }, locDs), locDs);
+    updateMessage(ds.larkAppId, ds.tuiPromptCardId, terminalCard).catch(err =>
+      logger.debug(`[${t}] Failed to update terminal TUI prompt card (${reason}): ${err}`),
+    );
+  }
+  logger.debug(`[${t}] invalidateTuiPrompt (${reason}): card=${ds.tuiPromptCardId ?? 'none'}`);
+  clearTuiPromptAuthority(ds);
+  publishAttentionPatch(ds);
+}
+
 function setupWorkerHandlers(
   ds: DaemonSession,
   worker: ChildProcess,
@@ -3865,6 +3921,7 @@ function setupWorkerHandlers(
   // exit paths should already have done this, but fork/refork/takeover paths
   // can leave a stale card that would otherwise inject keys into the new CLI.
   invalidateStuckWarning(ds, 'new_worker_generation');
+  invalidateTuiPrompt(ds, 'new_worker_generation');
   // Managed turn authority is issued by one concrete worker lifetime. A
   // replacement must advertise a fresh capability before daemon-mediated
   // exits may use it; carrying the old value across a restore/refork would
@@ -4371,6 +4428,7 @@ function setupWorkerHandlers(
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');
+        invalidateTuiPrompt(ds, 'prompt_ready', 'resolved');
         break;
       }
 
@@ -4653,16 +4711,16 @@ function setupWorkerHandlers(
 
       case 'tui_prompt': {
         // AI detected an interactive TUI prompt — post card to thread
-        // Dedup: if a card is already posted for this session, skip
-        if (ds.tuiPromptCardId) {
+        if (!ownsLifecycleMutation()) {
+          logger.info(`[${t}] Ignored TUI prompt from stale worker generation`);
+          break;
+        }
+        // Dedup across both posted and in-flight/cardless prompt state.
+        if (hasTuiPromptAuthority(ds)) {
           logger.debug(`[${t}] TUI prompt card already posted, skipping duplicate`);
           break;
         }
         logger.info(`[${t}] TUI prompt detected: ${msg.description}${msg.multiSelect ? ' (multi-select)' : ''}`);
-        ds.tuiPromptOptions = msg.options;
-        ds.tuiPromptMultiSelect = msg.multiSelect;
-        ds.tuiToggledIndices = [];
-        ds.tuiPromptProcessing = false;
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'tui_prompt',
           description: msg.description,
@@ -4680,16 +4738,25 @@ function setupWorkerHandlers(
         // would temporarily overwrite a user-issued /rename until refresh.
         ds.currentTurnTitle = msg.description;
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          logger.info(`[${t}] Managed/silent turn — TUI prompt kept in dashboard/audit only`);
+          logger.info(`[${t}] Managed/silent turn — TUI prompt kept in lifecycle audit only`);
           break;
         }
         // Document-native sessions have no Lark chat/thread destination. Keep
-        // the dashboard/lifecycle attention state above, but never send a card
-        // to their internal `doc:<token>` routing anchor.
+        // the lifecycle audit/title above, but never send a card to their
+        // internal `doc:<token>` routing anchor.
         if (isDocNativeSession(ds)) {
           logger.info(`[${t}] Doc-native session — suppressing TUI prompt card`);
           break;
         }
+        // The array identity acts as this prompt's in-memory ownership token.
+        // Clearing/replacing the prompt changes it, so a late card POST cannot
+        // reclaim authority after prompt_ready, worker exit, or replacement.
+        // Cardless silent/document prompts deliberately never occupy this slot.
+        const promptOptions = msg.options;
+        ds.tuiPromptOptions = promptOptions;
+        ds.tuiPromptMultiSelect = msg.multiSelect;
+        ds.tuiToggledIndices = [];
+        ds.tuiPromptProcessing = false;
         try {
           const cardJson = buildTuiPromptCard(
             sessionAnchorId(ds),
@@ -4701,15 +4768,39 @@ function setupWorkerHandlers(
             loc,
           );
           const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          const stillOwnsLifecycle = ownsLifecycleMutation();
+          if (!stillOwnsLifecycle || ds.tuiPromptOptions !== promptOptions) {
+            const terminalCard = stillOwnsLifecycle
+              ? buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, loc), loc)
+              : buildTuiPromptFailedCard(tr('worker.tui_submit_failed', {
+                cliName: getCliDisplayName(effectiveCliId),
+              }, loc), loc);
+            updateMessage(handlerLarkAppId, cardMsgId, terminalCard).catch(err =>
+              logger.debug(`[${t}] Failed to resolve late TUI prompt card: ${err}`),
+            );
+            break;
+          }
           ds.tuiPromptCardId = cardMsgId;
           publishAttentionPatch(ds);
         } catch (err) {
           logger.warn(`[${t}] Failed to post TUI prompt card: ${err}`);
+          if (ownsLifecycleMutation() && ds.tuiPromptOptions === promptOptions) {
+            clearTuiPromptAuthority(ds);
+            publishAttentionPatch(ds);
+          }
         }
         break;
       }
 
       case 'tui_prompt_resolved': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.info(`[${t}] Ignored TUI resolved ACK from stale worker generation`);
+          break;
+        }
         // TUI prompt is no longer showing — update card if it exists
         logger.info(`[${t}] TUI prompt resolved${msg.selectedText ? `: ${msg.selectedText}` : ''}`);
         if (msg.cardMessageId && ds.tuiPromptCardId !== msg.cardMessageId) {
@@ -4719,10 +4810,10 @@ function setupWorkerHandlers(
           );
           break;
         }
+        const hadAuthority = hasTuiPromptAuthority(ds);
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptProcessing = false;
+          clearTuiPromptAuthority(ds);
+          if (hadAuthority) publishAttentionPatch(ds);
           break;
         }
         if (ds.tuiPromptCardId) {
@@ -4730,16 +4821,18 @@ function setupWorkerHandlers(
           updateMessage(ds.larkAppId, ds.tuiPromptCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update TUI prompt card: ${err}`),
           );
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptProcessing = false;
-          publishAttentionPatch(ds);
         }
+        clearTuiPromptAuthority(ds);
+        if (hadAuthority) publishAttentionPatch(ds);
         break;
       }
 
       case 'tui_prompt_submit_failed': {
-        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) break;
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) break;
         const matchesTuiCard = !!msg.cardMessageId
           && ds.tuiPromptCardId === msg.cardMessageId;
         const matchesStuckCard = msg.stuckNonce !== undefined
@@ -4774,11 +4867,7 @@ function setupWorkerHandlers(
         }
 
         if (matchesTuiCard) {
-          ds.tuiPromptCardId = undefined;
-          ds.tuiPromptOptions = undefined;
-          ds.tuiPromptMultiSelect = undefined;
-          ds.tuiToggledIndices = undefined;
-          ds.tuiPromptProcessing = false;
+          clearTuiPromptAuthority(ds);
         }
         if (matchesStuckCard) clearStuckWarningAuthority(ds);
         publishAttentionPatch(ds);
@@ -4942,6 +5031,7 @@ function setupWorkerHandlers(
         // card before any replacement worker can be attached; otherwise a late
         // click could inject its keys into the replacement CLI.
         invalidateStuckWarning(ds, 'claude_exit');
+        invalidateTuiPrompt(ds, 'claude_exit');
         logger.info(`[${t}] ${getCliDisplayName(effectiveCliId)} exited (code: ${msg.code}, signal: ${msg.signal})`);
         ds.hasHistory = true;
         try {
@@ -5437,6 +5527,7 @@ function setupWorkerHandlers(
       // This worker generation is gone. Invalidate any stuck-warning card it
       // posted so a late click cannot inject keys into a replacement worker.
       invalidateStuckWarning(ds, 'worker_exit');
+      invalidateTuiPrompt(ds, 'worker_exit');
       // Fence this lifetime before a polling dispatcher can observe its last
       // ACK. Keeping the old receipt is useful audit evidence, but the
       // persisted current generation advances immediately so it cannot count
@@ -5969,6 +6060,7 @@ function deliverFinalOutput(
  *  fork. Intentionally underscored to discourage non-test callers. */
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
+export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 
@@ -5992,6 +6084,10 @@ function reserveWorkerGeneration(ds: DaemonSession): number {
     else ds.session.workerGeneration = previousSessionGeneration;
     throw error;
   }
+  // Reservation is the first durable proof that the previous generation has
+  // lost authority. Clear its TUI slot before any environment check, adapter
+  // creation, or fork can throw and strand a clicked card in "processing".
+  invalidateTuiPrompt(ds, 'reserve_worker_generation');
   return workerGeneration;
 }
 
