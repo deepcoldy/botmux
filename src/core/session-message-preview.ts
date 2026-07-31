@@ -27,14 +27,24 @@ const previewFileCache = new BoundedMap<string, PreviewFileCacheEntry>(
 );
 
 export interface SessionMessagePreview {
-  previewUserText?: string;
-  previewBotText?: string;
-  previewUserFullText?: string;
-  previewBotFullText?: string;
-  previewUserAt?: number;
-  previewBotAt?: number;
-  previewBotState?: 'replied' | 'waiting';
+  previewUserText?: string | null;
+  previewBotText?: string | null;
+  previewUserFullText?: string | null;
+  previewBotFullText?: string | null;
+  previewUserAt?: number | null;
+  previewBotAt?: number | null;
+  previewBotState?: 'replied' | 'waiting' | null;
 }
+
+const CLEARED_SESSION_MESSAGE_PREVIEW: SessionMessagePreview = {
+  previewUserText: null,
+  previewBotText: null,
+  previewUserFullText: null,
+  previewBotFullText: null,
+  previewUserAt: null,
+  previewBotAt: null,
+  previewBotState: null,
+};
 
 function compactText(value: unknown, limit: number): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -139,15 +149,17 @@ function safeJsonlKey(value: unknown): string | undefined {
  * cannot break `/api/sessions`.
  */
 export function buildSessionMessagePreview(session: Session): SessionMessagePreview {
+  if (session.status === 'closed') {
+    return { ...CLEARED_SESSION_MESSAGE_PREVIEW };
+  }
+
   const queueAnchor = session.deferredScheduleRun?.routingAnchor
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
   const safeQueueAnchor = safeJsonlKey(queueAnchor);
   // Queue files are keyed by routing anchor, not session id. Both chat-scope
   // (chatId) and thread-scope (rootMessageId) anchors can be re-used after an
-  // old session closes, so reading the live tail for a closed row can attach a
-  // later session's prompt to the historical card. Closed rows therefore use
-  // their own persisted lastUserPrompt; active rows keep the live queue source.
-  const latestUser = session.status !== 'closed' && safeQueueAnchor
+  // old session closes, so closed rows are handled by the early return above.
+  const latestUser = safeQueueAnchor
     ? readLatestJsonlRow(
         join(config.session.dataDir, 'queues', `${safeQueueAnchor}.jsonl`),
         'user',

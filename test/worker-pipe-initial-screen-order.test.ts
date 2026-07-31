@@ -22,6 +22,33 @@ describe('worker pipe initial screen ordering', () => {
     );
   });
 
+  it('fences bridge markers before worker-side close teardown can race fallback reads', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const readMarkersStart = source.indexOf('function readSendMarkers');
+    const readMarkersEnd = source.indexOf('function submitActivityEvidenceSince', readMarkersStart);
+    const readMarkers = source.slice(readMarkersStart, readMarkersEnd);
+    expect(readMarkers).toContain('if (closeRequested) return []');
+    const sendStart = source.indexOf('function send(msg: WorkerToDaemon)');
+    const sendEnd = source.indexOf('function acknowledgeTurnInputCommitted', sendStart);
+    const sendBody = source.slice(sendStart, sendEnd);
+    expect(sendBody).toContain("if (closeRequested && msg.type === 'final_output')");
+
+    const closeCase = source.slice(
+      source.indexOf("case 'close':"),
+      source.indexOf("case 'suspend':", source.indexOf("case 'close':")),
+    );
+    const setCloseIdx = closeCase.indexOf('closeRequested = true;');
+    const ackIdx = closeCase.indexOf("send({ type: 'session_close_ready', sessionId });");
+    const stopBridgeIdx = closeCase.indexOf('stopBridgeWatcher();');
+    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();');
+    const clearIdx = closeCase.indexOf('clearSendMarkers();');
+    expect(setCloseIdx).toBeGreaterThan(-1);
+    expect(ackIdx).toBeGreaterThan(setCloseIdx);
+    expect(stopBridgeIdx).toBeGreaterThan(ackIdx);
+    expect(teardownIdx).toBeGreaterThan(stopBridgeIdx);
+    expect(clearIdx).toBeGreaterThan(teardownIdx);
+  });
+
   it('captures pipe initial screen after idle detector is registered', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     // The inline `const initial = backend.captureCurrentScreen()` was refactored

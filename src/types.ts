@@ -684,6 +684,9 @@ export type WorkerToDaemon =
   | { type: 'cli_session_id'; cliSessionId: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'native_session_title_generated'; title: string }
   | { type: 'claude_exit'; code: number | null; signal: string | null; logTail?: string; canParkDiagnostic?: boolean; turnId?: string; dispatchAttempt?: number }
+  /** Worker-side close handler has crossed the point where it will no longer
+   * read bridge send markers or emit transcript fallback for this session. */
+  | { type: 'session_close_ready'; sessionId: string }
   | { type: 'prompt_ready' }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {

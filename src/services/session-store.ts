@@ -215,7 +215,14 @@ function findInOtherFiles(sessionId: string): Session | undefined {
   return undefined;
 }
 
-export function closeSession(sessionId: string): void {
+export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+  try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+}
+
+export function closeSession(
+  sessionId: string,
+  opts: { cleanupBridgeMarkers?: boolean } = {},
+): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
@@ -235,7 +242,7 @@ export function closeSession(sessionId: string): void {
     // live worker's close handler. Message previews now make its bounded tail
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
-    try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+    if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

@@ -301,6 +301,12 @@ export interface DaemonSession {
    *  publishes `status=dormant`. The later child-process exit must not emit a
    *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
+  /** Resolves when the current worker ACKs that its close handler has fenced
+   * bridge fallback reads, or when the worker exits. Used only by close paths
+   * that need to delete bridge marker files after the worker can no longer use
+   * them for duplicate-suppression. */
+  closeFence?: Promise<void>;
+  closeFenceResolve?: () => void;
   /** Present when this session was created via /adopt (shared observation mode).
    *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
   adoptedFrom?: {

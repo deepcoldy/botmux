@@ -136,6 +136,26 @@ describe('dashboard sessions filters', () => {
     });
   });
 
+  it('does not resurrect private text from legacy fallback fields after close preview cleanup', () => {
+    expect(sessionExchangePreview({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+      lastUserPrompt: 'private closed question',
+      currentTurnTitle: 'private closed title',
+    })).toEqual({
+      userText: '',
+      userFullText: '',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
   it('renders accessible user and bot preview lines on session cards', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
     const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');

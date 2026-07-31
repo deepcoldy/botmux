@@ -131,6 +131,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const WORKER_SIGTERM_BACKSTOP_MS = 2_000;
 const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
+const CLOSE_FENCE_TIMEOUT_MS = 8_000;
 const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN'] as const;
 
 function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1357,6 +1358,7 @@ export function killWorker(ds: DaemonSession): void {
     ds.worker.send({ type: 'close' } as DaemonToWorker);
   } catch { /* IPC already closed */ }
   const w = ds.worker;
+  armCloseFence(ds, w);
   // riff：worker close 分支要有界 await 远端 task-cancel（destroySession 5s×2 重试，
   // 外层 race 8s）。默认 2s SIGTERM backstop 会在取消发出前掐死进程，已关闭话题
   // 的远端任务照跑——冻结为 riff 的会话放宽到 24s（层级：destroy 20s < worker 22s
@@ -1641,6 +1643,35 @@ function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number
   });
 }
 
+function armCloseFence(ds: DaemonSession, worker: ChildProcess): Promise<void> {
+  const existing = ds.closeFence;
+  if (existing) return existing;
+  let resolveFence!: () => void;
+  const fence = new Promise<void>(resolve => { resolveFence = resolve; });
+  ds.closeFence = fence;
+  ds.closeFenceResolve = resolveFence;
+  const timer = setTimeout(() => {
+    logger.warn(`[${tag(ds)}] worker close fence timed out; cleaning bridge markers after bounded wait`);
+    resolveFence();
+  }, CLOSE_FENCE_TIMEOUT_MS);
+  timer.unref?.();
+  worker.once('exit', resolveFence);
+  void fence.finally(() => {
+    clearTimeout(timer);
+    worker.off('exit', resolveFence);
+    if (ds.closeFence === fence) {
+      ds.closeFence = undefined;
+      ds.closeFenceResolve = undefined;
+    }
+  });
+  return fence;
+}
+
+function resolveCloseFence(ds: DaemonSession): void {
+  const resolve = ds.closeFenceResolve;
+  if (resolve) resolve();
+}
+
 // ─── Idempotent session close (dashboard IPC) ───────────────────────────────
 
 /**
@@ -1659,6 +1690,7 @@ export async function closeSession(
   // 会话关闭即可回收其崩溃重启计数；否则每个曾崩溃过的 session 会在 daemon
   // 生命周期内永久占位（restartCounts 此前无任何 delete）。
   restartCounts.delete(sessionId);
+  const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   if (ds) {
     // Usage ledger: flush the final delta before the worker goes away (a
     // crash/limited turn may never have reached an idle edge).
@@ -1677,7 +1709,11 @@ export async function closeSession(
   // restore a session that was already explicitly closed.
   const stored = sessionStore.getSession(sessionId);
   const wasOpen = !!stored && stored.status !== 'closed';
-  if (wasOpen) sessionStore.closeSession(sessionId);
+  if (wasOpen) {
+    sessionStore.closeSession(sessionId, {
+      cleanupBridgeMarkers: !hadLiveWorker,
+    });
+  }
 
   if (ds) {
     if (!ds.exitEventEmitted) {
@@ -1700,6 +1736,11 @@ export async function closeSession(
       after?.closedAt ? Date.parse(after.closedAt) : undefined,
       { tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null },
     );
+  }
+
+  if (wasOpen && hadLiveWorker && ds) {
+    await ds.closeFence;
+    sessionStore.cleanupSessionBridgeSendMarkers(sessionId);
   }
 
   if (ds) {
@@ -3910,6 +3951,15 @@ function setupWorkerHandlers(
           break;
         }
         ds.managedTurnOrigin = undefined;
+        break;
+      }
+
+      case 'session_close_ready': {
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped session_close_ready with mismatched sessionId`);
+          break;
+        }
+        resolveCloseFence(ds);
         break;
       }
 

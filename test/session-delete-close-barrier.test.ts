@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -115,6 +116,68 @@ describe('daemon close barrier used by botmux delete', () => {
       );
     } finally {
       releaseCleanup();
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('keeps bridge send markers until the live worker acknowledges close', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_close_fence',
+        'om_close_fence',
+        'close fence',
+        'group',
+      );
+      session.larkAppId = 'app-close-fence';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'already sent answer',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'tmux' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+
+      const pending = workerPool.closeSession(session.sessionId);
+
+      expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+      expect(active.has(activeSessionKey(ds))).toBe(false);
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(existsSync(markerPath)).toBe(true);
+
+      ds.closeFenceResolve();
+      await expect(pending).resolves.toEqual({ ok: true, alreadyClosed: false });
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
       config.session.dataDir = previousDataDir;
     }
   });

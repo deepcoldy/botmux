@@ -38,8 +38,6 @@ export function sessionExchangePreview(row: Record<string, any>): SessionExchang
   const userFullText = compactPreviewText(
     row.previewUserFullText
       ?? row.previewUserText
-      ?? row.lastUserPrompt
-      ?? row.currentTurnTitle
       ?? '',
     4_000,
   );

@@ -1207,6 +1207,7 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
  *  持久化。仅有写权限的 dashboard 视图可见。 */
@@ -2160,6 +2161,7 @@ function bridgeMarkerPath(): string | undefined {
 }
 
 function readSendMarkers(): BridgeSendMarker[] {
+  if (closeRequested) return [];
   const path = bridgeMarkerPath();
   if (!path || !existsSync(path)) return [];
   try {
@@ -10062,6 +10064,10 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 }
 
 function send(msg: WorkerToDaemon): void {
+  if (closeRequested && msg.type === 'final_output') {
+    log('Dropped final_output after close fence');
+    return;
+  }
   const payload = workerIpcPayload(msg);
   if (isWorkflowWorker() && payload.type === 'final_output') {
     workflowFinalOutputSent = true;
@@ -10841,7 +10847,11 @@ process.on('message', async (raw: unknown) => {
 
     case 'close': {
       log('Close requested');
+      closeRequested = true;
+      send({ type: 'session_close_ready', sessionId });
       stopScreenshotLoop();
+      stopBridgeWatcher();
+      stopCodexBridge();
       // destroySession kills tmux session permanently; kill() only detaches.
       // riff 的 destroySession 是异步远端取消——必须有界 await：紧跟着的
       // process.exit 会掐断未发出的 fetch，让已关闭话题的远端 agent 继续跑。

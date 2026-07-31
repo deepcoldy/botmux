@@ -79,7 +79,7 @@ describe('buildSessionMessagePreview', () => {
     });
   });
 
-  it('uses chatId for chat-scope queues and persisted prompt as fallback', () => {
+  it('uses chatId for chat-scope queues and persisted prompt as active fallback', () => {
     writeJsonl('queues/oc_chat.jsonl', [
       { senderType: 'user', content: 'chat scope message', createTime: '4000' },
     ]);
@@ -100,7 +100,7 @@ describe('buildSessionMessagePreview', () => {
     });
   });
 
-  it('does not attach a newer chat-scope queue message to a closed session', () => {
+  it('clears previews for a closed chat-scope session even when stale fields remain persisted', () => {
     writeJsonl('queues/oc_chat.jsonl', [
       { senderType: 'user', content: 'new session message', createTime: '8000' },
     ]);
@@ -114,16 +114,18 @@ describe('buildSessionMessagePreview', () => {
       lastUserPrompt: 'closed session question',
       lastMessageAt: new Date(7_000).toISOString(),
       closedAt: new Date(7_500).toISOString(),
-    }))).toMatchObject({
-      previewUserText: 'closed session question',
-      previewBotText: 'closed session answer',
-      previewUserAt: 7_000,
-      previewBotAt: 7_100,
-      previewBotState: 'replied',
+    }))).toEqual({
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
     });
   });
 
-  it('does not attach a newer thread-scope queue message to a closed session', () => {
+  it('clears previews for a closed thread-scope session even when stale fields remain persisted', () => {
     writeJsonl('queues/om_root.jsonl', [
       { senderType: 'user', content: 'new thread session message', createTime: '8500' },
     ]);
@@ -136,12 +138,14 @@ describe('buildSessionMessagePreview', () => {
       lastUserPrompt: 'closed thread question',
       lastMessageAt: new Date(8_000).toISOString(),
       closedAt: new Date(8_300).toISOString(),
-    }))).toMatchObject({
-      previewUserText: 'closed thread question',
-      previewBotText: 'closed thread answer',
-      previewUserAt: 8_000,
-      previewBotAt: 8_100,
-      previewBotState: 'replied',
+    }))).toEqual({
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
     });
   });
 
