@@ -906,45 +906,56 @@ describe('claude-code writeInput submission confirmation', () => {
   });
 
   it('pid resolver: polls rotated JSONL from its own baseline when append follows pid update', async () => {
-    const cwd = '/tmp/pid-resolver-rotate-delayed';
-    const startSessionId = '99999999-9999-4999-8999-999999999999';
-    const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
-    const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
-    // Make the starting transcript larger than the rotated one. A stale
-    // baseByte from startPath would otherwise hide the delayed append.
-    writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
-    writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
+    // Keep the intended 800ms → 850ms ordering deterministic under full-suite
+    // CPU pressure. With scaled real timers the gap is only 2.5ms, so the
+    // shared event loop can cross the tiny observation window before running
+    // the append callback and make this synchronous memfs test flaky.
+    vi.useFakeTimers();
+    try {
+      const cwd = '/tmp/pid-resolver-rotate-delayed';
+      const startSessionId = '99999999-9999-4999-8999-999999999999';
+      const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
+      const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
+      // Make the starting transcript larger than the rotated one. A stale
+      // baseByte from startPath would otherwise hide the delayed append.
+      writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
+      writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
 
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    let scheduledAppend = false;
-    const pty: PtyHandle = {
-      claudeJsonlPath: startPath,
-      cliPid: 12345,
-      cliCwd: cwd,
-      write: vi.fn(),
-      sendText: vi.fn(),
-      sendSpecialKeys: vi.fn((key: string) => {
-        if (key !== 'Enter' || scheduledAppend) return;
-        scheduledAppend = true;
-        writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
-        // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken) confirm
-        // budget — the append must still land WITHIN the poll window, as it does
-        // in production where the real 850ms < the real 4×800ms budget.
-        setTimeout(() => {
-          appendFileSync(
-            rotatedPath,
-            JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
-          );
-        }, 850 * TIME_SCALE);
-      }),
-    };
+      const adapter = createClaudeCodeAdapter('/bin/claude');
+      let scheduledAppend = false;
+      const pty: PtyHandle = {
+        claudeJsonlPath: startPath,
+        cliPid: 12345,
+        cliCwd: cwd,
+        write: vi.fn(),
+        sendText: vi.fn(),
+        sendSpecialKeys: vi.fn((key: string) => {
+          if (key !== 'Enter' || scheduledAppend) return;
+          scheduledAppend = true;
+          writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+          // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken)
+          // confirm budget. The append deliberately follows the first 800ms
+          // poll, then lands inside the rotated-path poll window.
+          setTimeout(() => {
+            appendFileSync(
+              rotatedPath,
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+            );
+          }, 850 * TIME_SCALE);
+        }),
+      };
 
-    const result = await adapter.writeInput(pty, 'delayed append after pid rotate');
+      const resultPromise = adapter.writeInput(pty, 'delayed append after pid rotate');
+      await vi.runAllTimersAsync();
+      const result = await resultPromise;
 
-    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
-    expect(pty.claudeJsonlPath).toBe(rotatedPath);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+      expect(pty.claudeJsonlPath).toBe(rotatedPath);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('pid resolver: missing pid file → falls back to fingerprint search', async () => {

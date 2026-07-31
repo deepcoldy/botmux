@@ -19,6 +19,7 @@
  *
  * Run:  pnpm vitest run test/card-integration.test.ts
  */
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, beforeEach, vi, type Mock } from 'vitest';
 import { FakeLarkClient } from './fixtures/fake-lark-client.js';
 import {
@@ -193,6 +194,23 @@ const NONCE_CURRENT = 'nonce_abc1';
 const NONCE_OLD = 'nonce_old_xyz';
 
 function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
+  const worker = Object.assign(new EventEmitter(), {
+    killed: false,
+    send: vi.fn(),
+    kill: vi.fn(),
+    exitCode: null as number | null,
+    signalCode: null as NodeJS.Signals | null,
+  });
+  worker.send.mockImplementation((message: { type?: string }) => {
+    if (message.type === 'close') {
+      queueMicrotask(() => {
+        worker.exitCode = 0;
+        worker.emit('exit', 0, null);
+      });
+    }
+    return true;
+  });
+
   return {
     session: {
       sessionId: 'uuid-integ-test',
@@ -206,14 +224,7 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
       chatType: 'group',
       scope: 'chat',
     },
-    worker: {
-      killed: false,
-      send: vi.fn(),
-      once: vi.fn(),
-      kill: vi.fn(),
-      exitCode: null,
-      signalCode: null,
-    } as any,
+    worker: worker as any,
     workerPort: 8080,
     workerToken: 'tok_secret',
     larkAppId: APP_ID,
@@ -532,7 +543,10 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
 
-      expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(sessionStore.closeSession).toHaveBeenCalledWith(
+        ds.session.sessionId,
+        { cleanupBridgeMarkers: false },
+      );
       expect(ds.session.status).toBe('closed');
       expect(sessions.has(sKey)).toBe(false);
       // Closed reply is an interactive card with a Resume button, delivered
@@ -596,7 +610,10 @@ describe('Card integration: full event flow', () => {
 
         await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner'), deps, APP_ID);
 
-        expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+        expect(sessionStore.closeSession).toHaveBeenCalledWith(
+          ds.session.sessionId,
+          { cleanupBridgeMarkers: false },
+        );
         expect(ds.session.status).toBe('closed');
         expect(sessions.has(sKey)).toBe(false);
         // Closed card goes ephemeral to the owner …
@@ -638,7 +655,10 @@ describe('Card integration: full event flow', () => {
 
         await handleCardAction(makeCloseEvent(ROOT_ID, 'ou_owner', 'private'), deps, APP_ID);
 
-        expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+        expect(sessionStore.closeSession).toHaveBeenCalledWith(
+          ds.session.sessionId,
+          { cleanupBridgeMarkers: false },
+        );
         expect(ds.session.status).toBe('closed');
         // Closed card still goes ephemeral to the owner …
         expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
@@ -872,7 +892,10 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeCloseEvent(ROOT_ID), deps, APP_ID);
 
-      expect(sessionStore.closeSession).toHaveBeenCalledWith(ds.session.sessionId);
+      expect(sessionStore.closeSession).toHaveBeenCalledWith(
+        ds.session.sessionId,
+        { cleanupBridgeMarkers: false },
+      );
       expect(ds.session.status).toBe('closed');
       expect(sessions.has(sKey)).toBe(false);
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
