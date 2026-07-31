@@ -1009,6 +1009,23 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/goal');
   });
 
+  it('forwards /fast to the CLI (Codex native tier toggle) — NOT a daemon command', () => {
+    // 只读方案的主入口:botmux 不接管 /fast,原样透传给 Codex 让它自己切 service_tier,
+    // 卡片只读展示当前档位。回归护栏:如果 /fast 只从 DAEMON_COMMANDS 删掉却没进
+    // 全局 PASSTHROUGH_COMMANDS,飞书发 /fast 会走普通 wrapped prompt、永不触发原生切档,
+    // 整个功能失效(正是首版只读实现的 P1-1)。
+    expect(DAEMON_COMMANDS.has('/fast')).toBe(false);
+    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(true);
+    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true); // codex
+    expect(resolvePassthroughCommands(undefined).has('/fast')).toBe(true);
+  });
+
+  it('keeps /fast OUT of the adapter default layer so it never gains cold-start', () => {
+    // 同 /effort:/fast 是「调档」而非「开一段工作」,空话题单发 /fast 不该凭空拉起会话。
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast'); // codex
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast'); // claude-code
+  });
+
   it('does not expose Codex interactive /title through the Lark channel', () => {
     expect(PASSTHROUGH_COMMANDS.has('/title')).toBe(false);
     expect(DAEMON_COMMANDS.has('/title')).toBe(false);

@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexServiceTier, isCodexFastServiceTier, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexServiceTier, isCodexNonDefaultServiceTier, codexServiceTierBadge, CodexServiceTierTracker, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -416,18 +416,122 @@ describe('scanCodexServiceTier (read-only Fast Mode detection)', () => {
     }));
     expect(scanCodexServiceTier(path)).toBeUndefined();
   });
-});
 
-describe('isCodexFastServiceTier', () => {
-  it('treats default / empty / undefined as NOT fast', () => {
-    expect(isCodexFastServiceTier('default')).toBe(false);
-    expect(isCodexFastServiceTier('')).toBe(false);
-    expect(isCodexFastServiceTier(undefined)).toBe(false);
+  it('finds the latest tier without reading the whole file (large rollout, bounded)', () => {
+    // A large early history, then the last settings switch near the END followed
+    // by a few turns. A bounded reverse scan finds it without a whole-file read.
+    const filler = ev(assistantFinalResponseItem('x'.repeat(4000)));
+    const head = ev(threadSettingsApplied('default')) + ev(userResponseItem('start'));
+    const lastSwitch = ev(threadSettingsApplied('priority', '2026-04-29T08:00:00.000Z'));
+    // >3 MiB of history, THEN the switch, THEN a little more output.
+    writeFileSync(path, head + filler.repeat(800) + lastSwitch + filler.repeat(3));
+    expect(statSync(path).size).toBeGreaterThan(3 * 1024 * 1024);
+    expect(scanCodexServiceTier(path)).toBe('priority');
   });
 
-  it('treats any non-default tier as fast (provider-specific id not hardcoded)', () => {
-    expect(isCodexFastServiceTier('priority')).toBe(true);
-    expect(isCodexFastServiceTier('fast')).toBe(true);
-    expect(isCodexFastServiceTier('flex')).toBe(true);
+  it('returns undefined when the only settings event is far beyond the scan budget', () => {
+    // Settings event at the very top, then >2 MiB (the scan cap) of turns.
+    // The bounded scan intentionally stops rather than reading the whole file;
+    // the worker keeps its last-known value in that case (does not downgrade).
+    const filler = ev(assistantFinalResponseItem('y'.repeat(4000)));
+    writeFileSync(path, ev(threadSettingsApplied('priority')) + filler.repeat(700));
+    expect(statSync(path).size).toBeGreaterThan(2 * 1024 * 1024);
+    expect(scanCodexServiceTier(path)).toBeUndefined();
+  });
+});
+
+describe('isCodexNonDefaultServiceTier', () => {
+  it('treats default / empty / undefined as default (no badge)', () => {
+    expect(isCodexNonDefaultServiceTier('default')).toBe(false);
+    expect(isCodexNonDefaultServiceTier('')).toBe(false);
+    expect(isCodexNonDefaultServiceTier(undefined)).toBe(false);
+  });
+
+  it('treats any non-default tier id as non-default', () => {
+    expect(isCodexNonDefaultServiceTier('priority')).toBe(true);
+    expect(isCodexNonDefaultServiceTier('flex')).toBe(true);
+  });
+});
+
+describe('codexServiceTierBadge', () => {
+  it('has no badge for default / empty / undefined', () => {
+    expect(codexServiceTierBadge('default')).toBeUndefined();
+    expect(codexServiceTierBadge('')).toBeUndefined();
+    expect(codexServiceTierBadge(undefined)).toBeUndefined();
+  });
+
+  it('shows the ACTUAL tier id, not a hardcoded "Fast" (flex stays flex)', () => {
+    // The rollout records only the tier id, never the catalog display name, so
+    // the badge must not assert "Fast" — flex is a distinct non-default tier.
+    expect(codexServiceTierBadge('priority')).toBe('⚡ priority');
+    expect(codexServiceTierBadge('flex')).toBe('⚡ flex');
+    expect(codexServiceTierBadge('flex')).not.toContain('Fast');
+  });
+});
+
+describe('CodexServiceTierTracker (badge cache invalidation)', () => {
+  const P1 = '/roll/a.jsonl';
+  const P2 = '/roll/b.jsonl';
+
+  it('reports a change once, then suppresses unchanged ticks (throttled scan)', () => {
+    const t = new CodexServiceTierTracker(1_000);
+    const scan = () => 'priority';
+    // First tick: reports the tier.
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan })).toBe('priority');
+    // Within the window, unchanged: no re-report.
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 100, scan })).toBeUndefined();
+    // After the window, still unchanged: still no re-report (value didn't move).
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 2_000, scan })).toBeUndefined();
+  });
+
+  it('does not re-scan inside the throttle window but converges on the NEXT tick (trailing scan)', () => {
+    let tier: string | undefined = 'default';
+    let scans = 0;
+    const scan = () => { scans++; return tier; };
+    const t = new CodexServiceTierTracker(1_000);
+    // scanner returns the literal 'default' tier → reported as 'default' (no badge).
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan })).toBe('default');
+    expect(scans).toBe(1);
+    // Tier flips to priority, but we tick again inside the window: no scan yet,
+    // and a trailing scan is armed.
+    tier = 'priority';
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 200, scan })).toBeUndefined();
+    expect(scans).toBe(1);
+    // Next tick (still inside window): the armed trailing scan fires and the
+    // change is picked up even though the screen went quiet.
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 300, scan })).toBe('priority');
+    expect(scans).toBe(2);
+  });
+
+  it('maps a not-yet-scanned rollout (scanner → undefined) to the explicit-default "" clear', () => {
+    const t = new CodexServiceTierTracker(1_000);
+    // No settings event yet → scanner returns undefined → tracker reports '' so
+    // the daemon shows no badge (rather than undefined = "keep last").
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan: () => undefined })).toBe('');
+  });
+
+  it('invalidates when the rollout PATH changes (no leak across sessions)', () => {
+    const t = new CodexServiceTierTracker(1_000);
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan: () => 'priority' })).toBe('priority');
+    // A brand-new rollout (fresh session / relay) that is still on default must
+    // NOT keep showing the previous session's priority.
+    expect(t.current({ isCodex: true, rolloutPath: P2, nowMs: 100, scan: () => 'default' })).toBe('default');
+  });
+
+  it('clears the badge once when the session is no longer codex (e.g. /role → Claude)', () => {
+    const t = new CodexServiceTierTracker(1_000);
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan: () => 'priority' })).toBe('priority');
+    // Switched to a non-codex CLI: clear the stale ⚡ badge exactly once...
+    expect(t.current({ isCodex: false, rolloutPath: undefined, nowMs: 100, scan: () => 'priority' })).toBe('');
+    // ...then stay quiet (no repeated clears every tick).
+    expect(t.current({ isCodex: false, rolloutPath: undefined, nowMs: 200, scan: () => 'priority' })).toBeUndefined();
+  });
+
+  it('reset() drops all state', () => {
+    const t = new CodexServiceTierTracker(1_000);
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 0, scan: () => 'priority' })).toBe('priority');
+    t.reset();
+    // After reset the same tier reads as a fresh change again.
+    expect(t.current({ isCodex: true, rolloutPath: P1, nowMs: 100, scan: () => 'priority' })).toBe('priority');
   });
 });

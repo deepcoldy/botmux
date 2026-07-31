@@ -358,7 +358,7 @@ describe('restoreUsageLimitRuntimeState', () => {
       ds.usageLimit,
       undefined,
       false,
-      false,
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

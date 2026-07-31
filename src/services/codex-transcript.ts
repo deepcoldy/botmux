@@ -352,32 +352,79 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
  *   `event_msg` → `payload.type === 'thread_settings_applied'`
  * line whose `thread_settings.service_tier` reflects the tier the session is
  * actually running at (`"default"`, or a catalog id such as `"priority"` when
- * the user turns on Fast Mode via the native `/fast`). Botmux never writes this
- * value — it only surfaces it (e.g. a Fast badge on the streaming card), so a
+ * the user turns on the faster tier via the native `/fast`). Botmux never writes
+ * this value — it only surfaces it (a tier badge on the streaming card), so a
  * plain read of the last applied setting is the single source of truth and
  * cannot disagree with what Codex is doing.
  *
- * Returns the latest `service_tier` string, or undefined when the rollout has
- * no applied-settings record yet (fresh session before its first settings
- * event). Pure I/O; whole-file scan is fine for the low call rate (once per
- * card render, not per token).
+ * Reads the file back-to-front in bounded chunks (`TIER_SCAN_CHUNK_BYTES`, up to
+ * `TIER_SCAN_MAX_BYTES` total) so a large rollout — real sessions reach tens of
+ * MiB — never forces a whole-file read on the caller's hot path. The last
+ * applied setting wins, and settings events are sparse, so the first hit while
+ * walking backwards is authoritative; the cap bounds the worst case where a
+ * session applied settings once and then produced megabytes of turns.
+ *
+ * Returns the latest `service_tier` string, or undefined when no applied-settings
+ * record is found within the scan budget (fresh session, or the only settings
+ * event predates the budget — in which case the caller keeps its last-known
+ * value rather than downgrading the badge).
  */
+const TIER_SCAN_CHUNK_BYTES = 64 * 1024;
+const TIER_SCAN_MAX_BYTES = 2 * 1024 * 1024;
+
 export function scanCodexServiceTier(path: string): string | undefined {
-  if (!existsSync(path)) return undefined;
-  let text: string;
+  let size: number;
   try {
-    const size = statSync(path).size;
-    if (size === 0) return undefined;
-    const buf = Buffer.alloc(size);
-    const fd = openSync(path, 'r');
-    try { readSync(fd, buf, 0, size, 0); } finally { closeSync(fd); }
-    text = buf.toString('utf8');
+    const st = statSync(path);
+    size = st.size;
   } catch {
     return undefined;
   }
-  // Scan tail-first: the last applied setting wins, and most sessions have only
-  // a couple of settings events near the top, so this returns quickly either way.
-  const lines = text.split('\n');
+  if (size === 0) return undefined;
+
+  let fd: number;
+  try { fd = openSync(path, 'r'); }
+  catch { return undefined; }
+  try {
+    const budget = Math.min(size, TIER_SCAN_MAX_BYTES);
+    let readSoFar = 0;
+    let carry = '';   // bytes from the previous (later) chunk that belong to a line straddling the boundary
+    while (readSoFar < budget) {
+      const chunk = Math.min(TIER_SCAN_CHUNK_BYTES, budget - readSoFar);
+      const start = size - readSoFar - chunk;
+      const buf = Buffer.alloc(chunk);
+      readSync(fd, buf, 0, chunk, start);
+      readSoFar += chunk;
+      // Prepend this earlier chunk to the carry from the chunk after it.
+      const text = buf.toString('utf8') + carry;
+      // The first newline splits an incomplete leading line (its head lives in
+      // the next, earlier chunk) from the complete lines we can parse now.
+      const firstNl = text.indexOf('\n');
+      const parseable = firstNl >= 0 ? text.slice(firstNl + 1) : '';
+      carry = firstNl >= 0 ? text.slice(0, firstNl + 1) : text;
+      const tier = lastServiceTierInBlock(parseable);
+      if (tier !== undefined) return tier;
+      // If we've consumed the whole budget, also try the still-buffered head
+      // (only complete when we've reached the file start).
+      if (readSoFar >= budget) {
+        const headTier = start === 0 ? lastServiceTierInBlock(carry) : undefined;
+        if (headTier !== undefined) return headTier;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try { closeSync(fd); } catch { /* best effort */ }
+  }
+}
+
+/** Scan a text block (already newline-complete on both ends, or a file-start
+ *  head) for the LAST `thread_settings_applied.service_tier`. Returns undefined
+ *  when the block has none. */
+function lastServiceTierInBlock(block: string): string | undefined {
+  if (block.indexOf('thread_settings_applied') < 0) return undefined;
+  const lines = block.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     if (!line || line.indexOf('thread_settings_applied') < 0) continue;
@@ -392,11 +439,106 @@ export function scanCodexServiceTier(path: string): string | undefined {
   return undefined;
 }
 
-/** Whether a detected Codex `service_tier` denotes the faster (non-default)
- *  tier that the native `/fast` toggle selects. Anything other than the
- *  standard `"default"` (empty/undefined included as NOT fast) is treated as a
- *  faster tier — the concrete id is provider-specific (`"priority"` for OpenAI
- *  models) and must not be hardcoded. */
-export function isCodexFastServiceTier(tier: string | undefined): boolean {
+/** Whether a detected Codex `service_tier` denotes a non-default (faster) tier.
+ *  The rollout only records the tier ID (`"priority"`, `"flex"`, …), NOT the
+ *  catalog display name, so read-only code cannot prove a given id IS the "Fast"
+ *  tier — only that it differs from `"default"`. The card therefore shows the
+ *  actual tier id (see codexServiceTierBadge) rather than asserting "Fast",
+ *  which would mislabel other non-default tiers such as `flex`. Empty/undefined
+ *  → default (no badge). */
+export function isCodexNonDefaultServiceTier(tier: string | undefined): boolean {
   return !!tier && tier !== 'default';
+}
+
+/** Card badge text for a detected tier, or undefined for default/unknown. The
+ *  badge names the concrete tier id Codex is actually running at (`⚡ priority`)
+ *  — truthful and provider-agnostic — instead of hardcoding "Fast". */
+export function codexServiceTierBadge(tier: string | undefined): string | undefined {
+  if (!isCodexNonDefaultServiceTier(tier)) return undefined;
+  return `⚡ ${tier}`;
+}
+
+/** Throttled, path-keyed cache for the read-only service-tier badge.
+ *
+ * The worker calls {@link current} on every screen_update (per PTY tick). This
+ * tracker keeps the file scan off that hot path and, critically, prevents a
+ * detected tier from leaking across session identity changes:
+ *   - keyed to the rollout PATH → a fresh session / relay respawn / role switch
+ *     to a different rollout invalidates the cache;
+ *   - a non-codex tick (e.g. `/role` switched this session to Claude) reports
+ *     `''` once to clear the badge, then stays quiet;
+ *   - scans are throttled to `minIntervalMs`; a tick inside the window arms a
+ *     trailing scan so a quick toggle that then goes silent still converges on
+ *     the next tick instead of sticking until the user types again.
+ *
+ * Return contract of {@link current}:
+ *   - non-empty tier id (`"priority"`) or `''` (explicit default) → the daemon
+ *     should reflect this exact state (including clearing the badge);
+ *   - `undefined` → "no change this tick" → the daemon keeps its last value.
+ *
+ * Pure of node globals (time + scan injected) so the invalidation logic is
+ * directly unit-testable. */
+export class CodexServiceTierTracker {
+  private cache: string | undefined;
+  private cachedPath: string | undefined;
+  private scannedAtMs = 0;
+  private pendingScan = false;
+  private clearedForNonCodex = false;
+
+  constructor(private readonly minIntervalMs = 3_000) {}
+
+  /** Drop all state — call on bridge stop / generation reset. */
+  reset(): void {
+    this.cache = undefined;
+    this.cachedPath = undefined;
+    this.scannedAtMs = 0;
+    this.pendingScan = false;
+    this.clearedForNonCodex = false;
+  }
+
+  current(input: {
+    isCodex: boolean;
+    rolloutPath: string | undefined;
+    nowMs: number;
+    scan: (path: string) => string | undefined;
+  }): string | undefined {
+    if (!input.isCodex || !input.rolloutPath) {
+      // Not (or no longer) a codex rollout: clear the badge exactly once.
+      if (this.clearedForNonCodex) return undefined;
+      this.reset();
+      this.clearedForNonCodex = true;
+      this.cache = '';
+      return '';
+    }
+    this.clearedForNonCodex = false;
+    if (this.cachedPath !== input.rolloutPath) {
+      // New rollout under us — invalidate so a prior session's tier can't leak,
+      // and force the first scan of this rollout to run now (arm pendingScan
+      // rather than relying on the throttle clock, which may not have elapsed).
+      this.cache = undefined;
+      this.cachedPath = input.rolloutPath;
+      this.scannedAtMs = 0;
+      this.pendingScan = true;
+    }
+    const due = this.pendingScan
+      || input.nowMs - this.scannedAtMs >= this.minIntervalMs;
+    if (due) {
+      this.scannedAtMs = input.nowMs;
+      this.pendingScan = false;
+      // scan() returns undefined only when NO settings event exists yet; treat
+      // that as '' (default / no badge) so a session that never leaves default
+      // still reports a concrete state rather than undefined.
+      const scanned = input.scan(input.rolloutPath) ?? '';
+      if (scanned !== this.cache) {
+        this.cache = scanned;
+        return scanned;
+      }
+      return undefined;  // unchanged since last report — nothing new to send
+    }
+    // Inside the throttle window: don't re-read, but arm a trailing scan so a
+    // change we might have just missed is picked up next tick even if the
+    // screen then goes quiet.
+    this.pendingScan = true;
+    return undefined;
+  }
 }

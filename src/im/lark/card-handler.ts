@@ -10,7 +10,7 @@ import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { canOperate, canTalk } from './event-dispatcher.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildTuiPromptResolvedCard, buildGrantResultCard, buildGrantNotifyCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
-import { isCodexFastServiceTier } from '../../services/codex-transcript.js';
+import { codexServiceTierBadge } from '../../services/codex-transcript.js';
 import { findConfigField, applyConfigField, coerceConfigValue, getConfigCardData } from '../../services/bot-config-store.js';
 import { updateBotGrantPrefs } from '../../services/grant-prefs-store.js';
 import { writeTeamRoleFile, deleteTeamRoleFile } from '../../core/role-resolver.js';
@@ -1939,7 +1939,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           undefined,
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: sessionCliId(ds) }),
-          isCodexFastServiceTier(ds.fastServiceTier),
+          codexServiceTierBadge(ds.fastServiceTier),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -2270,7 +2270,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               cardUsageLimit(ds),
               writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-              isCodexFastServiceTier(ds.fastServiceTier),
+              codexServiceTierBadge(ds.fastServiceTier),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -2314,7 +2314,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          isCodexFastServiceTier(ds.fastServiceTier),
+          codexServiceTierBadge(ds.fastServiceTier),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -2356,7 +2356,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          isCodexFastServiceTier(ds.fastServiceTier),
+          codexServiceTierBadge(ds.fastServiceTier),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2423,7 +2423,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          isCodexFastServiceTier(ds.fastServiceTier),
+          codexServiceTierBadge(ds.fastServiceTier),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -2465,7 +2465,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
-          isCodexFastServiceTier(ds.fastServiceTier),
+          codexServiceTierBadge(ds.fastServiceTier),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

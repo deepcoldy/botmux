@@ -118,7 +118,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexServiceTier, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexServiceTier, CodexServiceTierTracker, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -2058,24 +2058,23 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
-/** Read-only Fast Mode badge: cache the last tier scanned from the rollout so a
- *  per-PTY-tick screen_update doesn't re-read the file each time. Re-scanned at
- *  most once per CODEX_TIER_SCAN_MIN_INTERVAL_MS. Only meaningful for codex. */
-let codexServiceTierCache: string | undefined;
-let codexServiceTierScannedAtMs = 0;
-const CODEX_TIER_SCAN_MIN_INTERVAL_MS = 3_000;
-/** Detected Codex service tier for the CURRENT screen_update, or undefined when
- *  this isn't a codex session / the rollout has no applied-settings record yet.
- *  Undefined is NOT sent (leaves the daemon's last-known value intact); an empty
- *  string is never produced. Cheap-cached to survive high-frequency updates. */
+/** Read-only tier badge: throttled, path-keyed tracker keeps the rollout scan
+ *  off the per-tick screen_update path and stops a detected tier from leaking
+ *  across session identity changes (fresh session / relay / role switch). See
+ *  CodexServiceTierTracker. */
+const codexServiceTierTracker = new CodexServiceTierTracker(3_000);
+function resetCodexServiceTierCache(): void {
+  codexServiceTierTracker.reset();
+}
+/** Tier for the CURRENT screen_update: a tier id / `''` (send it) or undefined
+ *  (no change, keep last). Scan + time injected into the tracker. */
 function currentCodexServiceTier(nowMs: number): string | undefined {
-  if (lastInitConfig?.cliId !== 'codex' || !codexBridgeRolloutPath) return undefined;
-  if (nowMs - codexServiceTierScannedAtMs >= CODEX_TIER_SCAN_MIN_INTERVAL_MS) {
-    codexServiceTierScannedAtMs = nowMs;
-    const tier = scanCodexServiceTier(codexBridgeRolloutPath);
-    if (tier) codexServiceTierCache = tier;
-  }
-  return codexServiceTierCache;
+  return codexServiceTierTracker.current({
+    isCodex: lastInitConfig?.cliId === 'codex',
+    rolloutPath: codexBridgeRolloutPath,
+    nowMs,
+    scan: scanCodexServiceTier,
+  });
 }
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
@@ -3982,6 +3981,7 @@ function stopCodexBridge(): void {
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
+  resetCodexServiceTierCache();
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
   hermesBridgeSourceSessionId = undefined;

@@ -532,21 +532,22 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    // ── Read-only Fast Mode badge (17th positional arg) ────────────────────
-    it('omits the ⚡Fast badge by default', () => {
+    // ── Read-only service-tier badge (17th positional arg) ─────────────────
+    it('omits the tier badge by default', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', 'codex'));
-      expect(card.header.title.content).not.toContain('Fast');
+      expect(card.header.title.content).not.toContain('⚡');
     });
 
-    it('renders the ⚡Fast badge after the CLI name when fastActive is true', () => {
+    it('renders the actual tier id after the CLI name (not a hardcoded "Fast")', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'working', 'codex',
         'hidden', undefined, undefined, false, false, undefined, undefined, undefined, false,
-        true, // fastActive
+        '⚡ priority', // serviceTierBadge
       ));
-      expect(card.header.title.content).toContain('⚡Fast');
+      expect(card.header.title.content).toContain('⚡ priority');
       // Badge sits between the CLI name and the ` · title` separator.
-      expect(card.header.title.content).toMatch(/Codex ⚡Fast · /);
+      expect(card.header.title.content).toMatch(/Codex ⚡ priority · /);
+      expect(card.header.title.content).not.toContain('Fast');
     });
 
     it('should show red usage-limit status with retry time', () => {

@@ -709,7 +709,7 @@ export function buildStreamingCard(
   usageLimit?: CliUsageLimitState,
   writableTerminalUrl?: string,
   localCliReady = false,
-  fastActive = false,
+  serviceTierBadge?: string,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = getCliDisplayName(effectiveCliId);
@@ -841,7 +841,7 @@ export function buildStreamingCard(
   const card = {
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: `🖥️ ${cliName}${fastActive ? ' ⚡Fast' : ''} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
+      title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${escapeMd(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
       template: STREAM_TEMPLATE_MAP[displayStatus],
     },
     elements,
