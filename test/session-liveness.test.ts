@@ -39,19 +39,23 @@ describe('isSessionStopped — botmux-suspended sessions are not zombies', () =>
     expect(isSessionStopped(session({ suspendedColdResume: undefined, pid: undefined }))).toBe(true);
   });
 
-  it('keeps a workerless live shared Herdr agent out of destructive zombie cleanup', () => {
+  it.each([
+    ['exists', false],
+    ['unknown', false],
+    ['missing', true],
+  ] as const)('treats a workerless Herdr %s probe as stopped=%s', (probe, stopped) => {
     const persistentBackendTarget = {
       backendType: 'herdr' as const,
       sessionName: 'botmux',
       agentName: 'botmux-01234567',
     };
-    persistentProbe.mockReturnValueOnce('exists');
+    persistentProbe.mockReturnValueOnce(probe);
 
     expect(isSessionStopped(session({
       backendType: 'herdr',
       persistentBackendTarget,
       pid: undefined,
-    }))).toBe(false);
+    }))).toBe(stopped);
     expect(persistentProbe).toHaveBeenCalledWith(persistentBackendTarget);
   });
 
