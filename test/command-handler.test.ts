@@ -473,6 +473,7 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -1424,12 +1425,34 @@ describe('handleCommand', () => {
     it('should kill worker and remove session when session exists', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
+      const events: DashboardEvent[] = [];
+      const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      try {
+        await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      } finally {
+        unsubscribe();
+      }
 
       expect(killWorker).toHaveBeenCalledWith(ds);
       expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
       expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
+      expect(events).toContainEqual({
+        type: 'session.update',
+        body: {
+          sessionId: 'sess-001',
+          patch: expect.objectContaining({
+            status: 'closed',
+            previewUserText: null,
+            previewBotText: null,
+            previewUserFullText: null,
+            previewBotFullText: null,
+            previewUserAt: null,
+            previewBotAt: null,
+            previewBotState: null,
+          }),
+        },
+      });
       // The「会话已关闭」card is delivered「仅自己可见」-first: it routes through
       // deliverEphemeralOrReply targeting the user who ran /close (message.senderId),
       // so plain groups get an ephemeral (visible-to-you) card and topic groups

@@ -72,7 +72,7 @@ import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-sto
 import { forkWorker, sendWorkerInput, killWorker, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart } from '../../core/worker-pool.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
-import { publishAttentionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
 import { fallbackTurnId } from '../../core/reply-target.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
@@ -614,6 +614,10 @@ export async function commitRepoSelection(
     // stays in the thread instead of vanishing prematurely.
     parkStreamCard(ds);
     sessionStore.closeSession(ds.session.sessionId);
+    publishClosedSessionPatch(
+      ds.session.sessionId,
+      ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+    );
 
     await deliverEphemeralOrReply(
       ds,
@@ -1832,6 +1836,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       const card = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
       activeSessions.delete(sKey);
       // The closed card carries session title / CLI name / workingDir / resume
       // command. In private-card mode those must not leak to the group — send the
@@ -1885,6 +1893,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     if (actionType === 'disconnect' && ds) {
       killWorker(ds);
       sessionStore.closeSession(ds.session.sessionId);
+      publishClosedSessionPatch(
+        ds.session.sessionId,
+        ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+      );
       activeSessions.delete(sKey);
       await sessionReply(rootId, t('card.action.disconnected', undefined, localeForBot(ds.larkAppId)));
       logger.info(`[${tag(ds)}] Disconnected (adopt) via card button`);

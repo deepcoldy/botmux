@@ -70,7 +70,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
-import { publishAttentionPatch } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
 import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
@@ -1695,24 +1695,11 @@ export async function closeSession(
   // above as part of the close barrier.
   if (wasOpen) {
     const after = sessionStore.getSession(sessionId);
-    dashboardEventBus.publish({
-      type: 'session.update',
-      body: {
-        sessionId,
-        patch: {
-          status: 'closed',
-          closedAt: after?.closedAt ? Date.parse(after.closedAt) : Date.now(),
-          tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null,
-          previewUserText: null,
-          previewBotText: null,
-          previewUserFullText: null,
-          previewBotFullText: null,
-          previewUserAt: null,
-          previewBotAt: null,
-          previewBotState: null,
-        },
-      },
-    });
+    publishClosedSessionPatch(
+      sessionId,
+      after?.closedAt ? Date.parse(after.closedAt) : undefined,
+      { tokenUsage: after ? composeRowFromClosed(after).tokenUsage : null },
+    );
   }
 
   if (ds) {

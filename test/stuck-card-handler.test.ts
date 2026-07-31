@@ -83,6 +83,7 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
 
 vi.mock('../src/core/session-activity.js', () => ({
   publishAttentionPatch: vi.fn(),
+  publishClosedSessionPatch: vi.fn(),
   announcePendingRepoSession: vi.fn(),
 }));
 

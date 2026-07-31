@@ -67,7 +67,7 @@ import {
 import { resolveCliId, findInvalidAllowedUserEntries } from '../setup/bot-config-editor.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
-import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
 import { canOperate } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
@@ -1279,6 +1279,10 @@ export async function handleCommand(
           const card = buildClosedSessionCard(ds, loc);
           killWorker(ds);
           sessionStore.closeSession(ds.session.sessionId);
+          publishClosedSessionPatch(
+            ds.session.sessionId,
+            ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+          );
           activeSessions.delete(sessionKey(rootId, larkAppId!));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群里走 ephemeral 只发给执行
           // /close 的本人；话题群不支持 ephemeral(18053) 时回退为正常的群内可见回复
@@ -1338,6 +1342,10 @@ export async function handleCommand(
         const closedSessionId = ds.session.sessionId;
         killWorker(ds);
         sessionStore.closeSession(closedSessionId);
+        publishClosedSessionPatch(
+          closedSessionId,
+          ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+        );
         activeSessions.delete(sessionKey(rootId, larkAppId!));
         await sessionReply(rootId, t('cmd.detach.success', undefined, loc));
         logger.info(`[${logTag}] Detached (adopt) by ${cmd} command`);
@@ -1628,6 +1636,10 @@ export async function handleCommand(
             const closedCard = buildClosedSessionCard(ds!, loc);
             killWorker(ds!);
             sessionStore.closeSession(ds!.session.sessionId);
+            publishClosedSessionPatch(
+              ds!.session.sessionId,
+              ds!.session.closedAt ? Date.parse(ds!.session.closedAt) : undefined,
+            );
             await deliverEphemeralOrReply(
               ds!,
               message.senderId,

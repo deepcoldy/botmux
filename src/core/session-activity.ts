@@ -40,6 +40,38 @@ export function publishSessionMessagePreviewPatch(ds: DaemonSession): void {
   });
 }
 
+/** Publish the persisted close state and explicitly clear message previews.
+ *
+ * Dashboard clients merge `session.update` patches into their current row.
+ * Deleting the turn-send marker therefore is not enough: every live close
+ * entrypoint must overwrite preview fields or an already-open dashboard keeps
+ * rendering the last private exchange until its next full hydrate.
+ */
+export function publishClosedSessionPatch(
+  sessionId: string,
+  closedAt?: number,
+  extraPatch?: { tokenUsage: unknown },
+): void {
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: {
+      sessionId,
+      patch: {
+        status: 'closed',
+        closedAt: closedAt ?? Date.now(),
+        ...extraPatch,
+        previewUserText: null,
+        previewBotText: null,
+        previewUserFullText: null,
+        previewBotFullText: null,
+        previewUserAt: null,
+        previewBotAt: null,
+        previewBotState: null,
+      },
+    },
+  });
+}
+
 /** Publish the latest inbound sender kind after quoteTarget* has been updated.
  *
  * `markSessionActivity()` runs before some routing paths finish writing their

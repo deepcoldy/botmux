@@ -17,6 +17,7 @@ import {
   announceSessionRow,
   clearAgentAttention,
   publishAttentionPatch,
+  publishClosedSessionPatch,
   publishLastInputFromBotPatch,
   publishSessionMessagePreviewPatch,
 } from '../src/core/session-activity.js';
@@ -176,6 +177,31 @@ describe('attention signals', () => {
       if (previousDataDir === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = previousDataDir;
     }
+  });
+
+  it('publishClosedSessionPatch clears every merged preview field', () => {
+    const seen = collectEvents();
+
+    publishClosedSessionPatch('sess-1', 2_000, { tokenUsage: null });
+
+    expect(seen).toEqual([{
+      type: 'session.update',
+      body: {
+        sessionId: 'sess-1',
+        patch: {
+          status: 'closed',
+          closedAt: 2_000,
+          tokenUsage: null,
+          previewUserText: null,
+          previewBotText: null,
+          previewUserFullText: null,
+          previewBotFullText: null,
+          previewUserAt: null,
+          previewBotAt: null,
+          previewBotState: null,
+        },
+      },
+    }]);
   });
 
   it('publishAttentionPatch emits session.update derived from session state', () => {

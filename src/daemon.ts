@@ -332,6 +332,7 @@ import {
   publishAttentionPatch,
   publishLastInputFromBotPatch,
   publishSessionMessagePreviewPatch,
+  publishClosedSessionPatch,
   clearAgentAttention,
 } from './core/session-activity.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
@@ -14859,6 +14860,10 @@ async function replyInvalidWorkingDirs(
   ds.pendingRepo = false;
   activeSessions.delete(sessionKey(anchor, larkAppId));
   sessionStore.closeSession(ds.session.sessionId);
+  publishClosedSessionPatch(
+    ds.session.sessionId,
+    ds.session.closedAt ? Date.parse(ds.session.closedAt) : undefined,
+  );
   const msg = tr('cmd.repo.working_dir_not_exist', {
     dirs: invalid.map(d => `\`${d}\``).join(', '),
   }, localeForBot(larkAppId));
