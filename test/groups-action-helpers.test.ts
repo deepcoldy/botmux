@@ -32,6 +32,7 @@ function makeDeps(over: Partial<GroupsActionDeps> = {}): GroupsActionDeps {
     proxyToDaemon: vi.fn(async () => makeRes(200, { ok: true })),
     closeSessionsMatching: vi.fn(async () => []),
     fetch: vi.fn(async () => makeRes(200, { inChat: true })),
+    invalidateGroups: vi.fn(),
     ...over,
   };
 }
@@ -52,6 +53,7 @@ describe('addBotsToGroup', () => {
     expect(r.body).toEqual({ ok: true, added: ['cli_x'] });
     // membership probe + add-bots
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns no_proxy_bot when no online daemon is in chat', async () => {
@@ -63,6 +65,7 @@ describe('addBotsToGroup', () => {
     const r = await addBotsToGroup('oc_demo', '{}', deps);
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: false, error: 'no_proxy_bot' });
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 
   it('returns bad_json when body is not valid JSON', async () => {
@@ -101,6 +104,7 @@ describe('disbandGroup', () => {
     expect(r.status).toBe(200);
     expect(r.body).toEqual({ ok: true, closedSessions: closedReturn });
     expect(deps.closeSessionsMatching).toHaveBeenCalledOnce();
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns larkAppId_required when body lacks the field', async () => {
@@ -119,6 +123,7 @@ describe('disbandGroup', () => {
     expect(r.status).toBe(500);
     expect(r.body).toEqual({ ok: false, error: 'lark_denied', closedSessions: [] });
     expect(deps.closeSessionsMatching).not.toHaveBeenCalled();
+    expect(deps.invalidateGroups).not.toHaveBeenCalled();
   });
 });
 
@@ -174,6 +179,7 @@ describe('leaveGroup', () => {
 
     // Cascade close called only for cli_a (the only successful leave).
     expect(closedSpy).toHaveBeenCalledOnce();
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('returns larkAppIds_required when body lacks the array or it is empty', async () => {
@@ -230,6 +236,7 @@ describe('bindOncall', () => {
     expect(call[1]).toBe('/api/oncall/oc_demo');
     expect((call[2] as RequestInit).method).toBe('PUT');
     expect((call[2] as RequestInit).body).toBe('{"workingDir":"/repo/x"}');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 
   it('uses "{}" body when raw body is empty', async () => {
@@ -251,5 +258,6 @@ describe('unbindOncall', () => {
     expect(call[0]).toBe('cli_owner');
     expect(call[1]).toBe('/api/oncall/oc_demo');
     expect((call[2] as RequestInit).method).toBe('DELETE');
+    expect(deps.invalidateGroups).toHaveBeenCalledOnce();
   });
 });

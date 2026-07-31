@@ -32,6 +32,8 @@ export interface GroupsActionDeps {
   closeSessionsMatching: (predicate: (s: SessionLikeForClose) => boolean) => Promise<unknown[]>;
   /** Override for tests; defaults to global fetch in production. */
   fetch?: typeof fetch;
+  /** Drop the central read snapshot after a successful membership/config mutation. */
+  invalidateGroups?: () => void;
 }
 
 export interface HandlerResult {
@@ -83,6 +85,7 @@ export async function addBotsToGroup(
     { method: 'POST', headers: { 'content-type': 'application/json' }, body: bodyRaw },
   );
   const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
   return { status: upstream.status, body: json ?? text };
 }
 
@@ -111,6 +114,7 @@ export async function disbandGroup(
 
   let closedSessions: unknown[] = [];
   if (json?.ok) {
+    deps.invalidateGroups?.();
     closedSessions = await deps.closeSessionsMatching(s => s.chatId === chatId);
   }
   return { status: upstream.status, body: { ...(json ?? {}), closedSessions } };
@@ -165,6 +169,7 @@ export async function leaveGroup(
       closedSessions,
     };
   }));
+  if (result.some(item => item.ok)) deps.invalidateGroups?.();
   return ok({ result });
 }
 
@@ -184,6 +189,7 @@ export async function bindOncall(
     { method: 'PUT', headers: { 'content-type': 'application/json' }, body: bodyRaw || '{}' },
   );
   const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
   return { status: upstream.status, body: json ?? text };
 }
 
@@ -200,5 +206,6 @@ export async function unbindOncall(
     appId, `/api/oncall/${encodeURIComponent(chatId)}`, { method: 'DELETE' },
   );
   const { text, json } = await parseUpstream(upstream);
+  if (upstream.ok && json?.ok !== false) deps.invalidateGroups?.();
   return { status: upstream.status, body: json ?? text };
 }
