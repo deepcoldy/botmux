@@ -344,3 +344,59 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
   }
   return { events, newOffset, pendingTail };
 }
+
+/**
+ * Read-only detection of the session's current Codex service tier.
+ *
+ * Codex records every applied thread setting as an
+ *   `event_msg` → `payload.type === 'thread_settings_applied'`
+ * line whose `thread_settings.service_tier` reflects the tier the session is
+ * actually running at (`"default"`, or a catalog id such as `"priority"` when
+ * the user turns on Fast Mode via the native `/fast`). Botmux never writes this
+ * value — it only surfaces it (e.g. a Fast badge on the streaming card), so a
+ * plain read of the last applied setting is the single source of truth and
+ * cannot disagree with what Codex is doing.
+ *
+ * Returns the latest `service_tier` string, or undefined when the rollout has
+ * no applied-settings record yet (fresh session before its first settings
+ * event). Pure I/O; whole-file scan is fine for the low call rate (once per
+ * card render, not per token).
+ */
+export function scanCodexServiceTier(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  let text: string;
+  try {
+    const size = statSync(path).size;
+    if (size === 0) return undefined;
+    const buf = Buffer.alloc(size);
+    const fd = openSync(path, 'r');
+    try { readSync(fd, buf, 0, size, 0); } finally { closeSync(fd); }
+    text = buf.toString('utf8');
+  } catch {
+    return undefined;
+  }
+  // Scan tail-first: the last applied setting wins, and most sessions have only
+  // a couple of settings events near the top, so this returns quickly either way.
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line || line.indexOf('thread_settings_applied') < 0) continue;
+    let obj: any;
+    try { obj = JSON.parse(line); } catch { continue; }
+    if (obj?.type !== 'event_msg') continue;
+    const payload = obj.payload;
+    if (!payload || payload.type !== 'thread_settings_applied') continue;
+    const tier = payload.thread_settings?.service_tier;
+    if (typeof tier === 'string' && tier) return tier;
+  }
+  return undefined;
+}
+
+/** Whether a detected Codex `service_tier` denotes the faster (non-default)
+ *  tier that the native `/fast` toggle selects. Anything other than the
+ *  standard `"default"` (empty/undefined included as NOT fast) is treated as a
+ *  faster tier — the concrete id is provider-specific (`"priority"` for OpenAI
+ *  models) and must not be hardcoded. */
+export function isCodexFastServiceTier(tier: string | undefined): boolean {
+  return !!tier && tier !== 'default';
+}

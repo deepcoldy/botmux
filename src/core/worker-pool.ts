@@ -22,6 +22,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { fallbackTurnId, isSubstituteTurn } from './reply-target.js';
 import { updateMessage, deleteMessage, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, MessageWithdrawnError } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildRelayedFrozenCard, getCliDisplayName } from '../im/lark/card-builder.js';
+import { isCodexFastServiceTier } from '../services/codex-transcript.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog, cancelRiffTaskById } from '../adapters/backend/riff-backend.js';
 import { logger } from '../utils/logger.js';
@@ -383,6 +384,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     status === 'limited' ? ds.usageLimit : undefined,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    isCodexFastServiceTier(ds.fastServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -433,6 +435,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     status === 'limited' ? ds.usageLimit : undefined,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    isCodexFastServiceTier(ds.fastServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -590,6 +593,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     ds.usageLimit,
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    isCodexFastServiceTier(ds.fastServiceTier),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -781,6 +785,7 @@ export async function postFreshStreamingCard(
     cardUsageLimit(ds),
     writableTerminalLinkFor(ds),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+    isCodexFastServiceTier(ds.fastServiceTier),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   try {
@@ -2846,6 +2851,7 @@ function setupWorkerHandlers(
               initStatus === 'limited' ? ds.usageLimit : undefined,
               writableTerminalLinkFor(ds),
               localCliReadyAtBuild,
+              isCodexFastServiceTier(ds.fastServiceTier),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             // Worker IPC handlers may run while the direct restore PATCH is in
@@ -2908,6 +2914,7 @@ function setupWorkerHandlers(
             initStatus === 'limited' ? ds.usageLimit : undefined,
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            isCodexFastServiceTier(ds.fastServiceTier),
           );
           ds.streamCardId = await scopedReply(streamCardJson, 'interactive', msg.turnId);
           // This card IS the current turn's live card — clear the new-turn flag
@@ -3104,6 +3111,9 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
+        // Read-only Fast Mode reflection: the worker reports the tier it read
+        // from the Codex rollout. Latest-wins; only present for codex sessions.
+        if (msg.fastServiceTier !== undefined) ds.fastServiceTier = msg.fastServiceTier;
         ds.lastScreenStatus = (msg.usageLimit ?? ds.usageLimit) ? 'limited' : msg.status;
 
         // Dashboard: publish a patch only when status truly transitioned, so
@@ -3196,6 +3206,7 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            isCodexFastServiceTier(ds.fastServiceTier),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -3248,6 +3259,7 @@ function setupWorkerHandlers(
             cardUsageLimit(ds),
             writableTerminalLinkFor(ds),
             isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+            isCodexFastServiceTier(ds.fastServiceTier),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
         }
@@ -3290,6 +3302,7 @@ function setupWorkerHandlers(
           cardUsageLimit(ds),
           writableTerminalLinkFor(ds),
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+          isCodexFastServiceTier(ds.fastServiceTier),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -3548,6 +3561,7 @@ function setupWorkerHandlers(
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+              isCodexFastServiceTier(ds.fastServiceTier),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -3589,6 +3603,7 @@ function setupWorkerHandlers(
               ds.displayMode ?? 'hidden', ds.streamCardNonce, ds.currentImageKey,
               isAdopt, showTakeover, loc, undefined, writableTerminalLinkFor(ds),
               isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+              isCodexFastServiceTier(ds.fastServiceTier),
             );
             scheduleCardPatch(ds, frozenCard);
           }

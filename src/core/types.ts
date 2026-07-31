@@ -188,6 +188,11 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
+  /** Codex service tier detected read-only from the session rollout
+   *  (`thread_settings_applied.service_tier`). Drives the ⚡Fast badge on the
+   *  streaming card. Botmux never sets the tier — the user does via native
+   *  `/fast`; this only reflects it. `default`/undefined → standard (no badge). */
+  fastServiceTier?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the

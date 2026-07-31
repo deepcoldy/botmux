@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexServiceTier, isCodexFastServiceTier, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -353,5 +353,81 @@ describe('drainCodexRollout', () => {
     const r2 = drainCodexRollout(path, r1.newOffset);
     expect(r2.events).toHaveLength(1);
     expect(r2.events[0].text).toBe('s');
+  });
+});
+
+function threadSettingsApplied(serviceTier: string, ts = '2026-04-29T07:00:00.000Z') {
+  return {
+    timestamp: ts,
+    type: 'event_msg',
+    payload: {
+      type: 'thread_settings_applied',
+      thread_settings: {
+        model: 'gpt-5.6-sol',
+        model_provider_id: 'byteseed',
+        service_tier: serviceTier,
+      },
+    },
+  };
+}
+
+describe('scanCodexServiceTier (read-only Fast Mode detection)', () => {
+  it('returns undefined when the rollout has no applied-settings record yet', () => {
+    writeFileSync(path,
+      ev(userResponseItem('hi')) + ev(assistantFinalResponseItem('hello')));
+    expect(scanCodexServiceTier(path)).toBeUndefined();
+  });
+
+  it('returns undefined for a missing / empty rollout file', () => {
+    expect(scanCodexServiceTier(join(dir, 'does-not-exist.jsonl'))).toBeUndefined();
+    writeFileSync(path, '');
+    expect(scanCodexServiceTier(path)).toBeUndefined();
+  });
+
+  it('reads the applied service tier', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default')) + ev(userResponseItem('hi')));
+    expect(scanCodexServiceTier(path)).toBe('default');
+  });
+
+  it('returns the LATEST applied tier when the session switched mid-way', () => {
+    writeFileSync(path,
+      ev(threadSettingsApplied('default', '2026-04-29T07:00:00.000Z')) +
+      ev(userResponseItem('go fast')) +
+      ev(threadSettingsApplied('priority', '2026-04-29T07:05:00.000Z')) +
+      ev(assistantFinalResponseItem('done')));
+    expect(scanCodexServiceTier(path)).toBe('priority');
+  });
+
+  it('ignores non-settings lines and tolerates malformed json', () => {
+    writeFileSync(path,
+      'not json at all\n' +
+      ev(userResponseItem('hi')) +
+      ev(threadSettingsApplied('priority')) +
+      'still garbage\n');
+    expect(scanCodexServiceTier(path)).toBe('priority');
+  });
+
+  it('does not confuse a settings event that carries no service_tier', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:00.000Z',
+      type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'x' } },
+    }));
+    expect(scanCodexServiceTier(path)).toBeUndefined();
+  });
+});
+
+describe('isCodexFastServiceTier', () => {
+  it('treats default / empty / undefined as NOT fast', () => {
+    expect(isCodexFastServiceTier('default')).toBe(false);
+    expect(isCodexFastServiceTier('')).toBe(false);
+    expect(isCodexFastServiceTier(undefined)).toBe(false);
+  });
+
+  it('treats any non-default tier as fast (provider-specific id not hardcoded)', () => {
+    expect(isCodexFastServiceTier('priority')).toBe(true);
+    expect(isCodexFastServiceTier('fast')).toBe(true);
+    expect(isCodexFastServiceTier('flex')).toBe(true);
   });
 });

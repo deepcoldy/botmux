@@ -532,6 +532,23 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
+    // ── Read-only Fast Mode badge (17th positional arg) ────────────────────
+    it('omits the ⚡Fast badge by default', () => {
+      const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', 'codex'));
+      expect(card.header.title.content).not.toContain('Fast');
+    });
+
+    it('renders the ⚡Fast badge after the CLI name when fastActive is true', () => {
+      const card = parse(buildStreamingCard(
+        SID, ROOT, URL, TITLE, '', 'working', 'codex',
+        'hidden', undefined, undefined, false, false, undefined, undefined, undefined, false,
+        true, // fastActive
+      ));
+      expect(card.header.title.content).toContain('⚡Fast');
+      // Badge sits between the CLI name and the ` · title` separator.
+      expect(card.header.title.content).toMatch(/Codex ⚡Fast · /);
+    });
+
     it('should show red usage-limit status with retry time', () => {
       const card = parse(buildStreamingCard(
         SID,

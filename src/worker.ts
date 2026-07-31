@@ -118,7 +118,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexServiceTier, type CodexBridgeEvent } from './services/codex-transcript.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -2058,6 +2058,25 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
+/** Read-only Fast Mode badge: cache the last tier scanned from the rollout so a
+ *  per-PTY-tick screen_update doesn't re-read the file each time. Re-scanned at
+ *  most once per CODEX_TIER_SCAN_MIN_INTERVAL_MS. Only meaningful for codex. */
+let codexServiceTierCache: string | undefined;
+let codexServiceTierScannedAtMs = 0;
+const CODEX_TIER_SCAN_MIN_INTERVAL_MS = 3_000;
+/** Detected Codex service tier for the CURRENT screen_update, or undefined when
+ *  this isn't a codex session / the rollout has no applied-settings record yet.
+ *  Undefined is NOT sent (leaves the daemon's last-known value intact); an empty
+ *  string is never produced. Cheap-cached to survive high-frequency updates. */
+function currentCodexServiceTier(nowMs: number): string | undefined {
+  if (lastInitConfig?.cliId !== 'codex' || !codexBridgeRolloutPath) return undefined;
+  if (nowMs - codexServiceTierScannedAtMs >= CODEX_TIER_SCAN_MIN_INTERVAL_MS) {
+    codexServiceTierScannedAtMs = nowMs;
+    const tier = scanCodexServiceTier(codexBridgeRolloutPath);
+    if (tier) codexServiceTierCache = tier;
+  }
+  return codexServiceTierCache;
+}
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -5285,7 +5304,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, fastServiceTier: currentCodexServiceTier(Date.now()) });
   }
   // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
   // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
@@ -6087,7 +6106,7 @@ function startScreenUpdates(): void {
       const usageAware = usageLimitTracker.classify(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
-        send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+        send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, fastServiceTier: currentCodexServiceTier(Date.now()) });
       }
     })();
   }, SCREEN_UPDATE_INTERVAL_MS);
