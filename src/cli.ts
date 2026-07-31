@@ -34,7 +34,7 @@ import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, appendDispatchReportProtocol, appendLegacyDispatchReportProtocol, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, findDispatchRegistryEntry, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveReportTarget, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import { pickTurnReplyTarget } from './core/reply-target.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { enableAutostart, disableAutostart, autostartStatus, refreshAutostart } from './autostart.js';
@@ -5407,7 +5407,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        v2 历史 run 私有静态归档；retire 在维护窗双验后原子迁入 quarantine
   （完整参数见 \`botmux workflow help\` / \`botmux template help\`）
   dispatch --bot <name> [...]          多话题编排：开子话题并把 bot 派进去（详见 \`botmux dispatch --help\`）
-  report [...]                         v3/编排场景向上汇报进度或结果（详见 \`botmux report --help\`）
+  report [...]                         交接 Review / 进展 / 结果并继承会话位置（详见 \`botmux report --help\`）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -8526,40 +8526,69 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 }
 
 /**
- * `botmux report` — delivery / progress report.
+ * `botmux report` — delivery / progress report, then hand Review/progress/results
+ * back to the stable recipient.
  *
  * Two paths:
  * 1) Platform Issue 领取群：session 有活跃 issue binding → enqueue+write `in_review`
  *    (待验收). This is what kickoff means by 「完成后执行 botmux report」.
- * 2) 多话题协作：dispatched sub-bot reports back to the orchestrator session.
- *    The sub-bot lives in its own sub-topic where the orchestrator has no session;
- *    @-ing the orchestrator there would spawn a fresh context-less one. Instead this
- *    routes INTO the orchestrator's thread (orchestrate-dispatch.json) and @-s it there.
+ * 2) 交接回报：recipient and placement are separate decisions. Registry-backed
+ *    multi-topic dispatches keep their exact orchestrator-session route. Ordinary
+ *    development handoffs inherit the executing turn's visible position with the
+ *    same turn-id gate as `botmux send`, so a later turn cannot reuse a stale
+ *    topic anchor.
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 交付回报（issue 待验收 / 多话题协作回主编排）
+    console.log(`botmux report — 交付回报（issue 待验收 / 交接 Review·进展·结果并保持自然会话位置）
 
 用法:
-  botmux report "子项目X 完成，产出在 …"
-  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
   botmux report --content-file <path>
+  botmux report --into <om_root> --content-file <path>
+  botmux report --top-level "子项目X 完成，产出在 …"
+  botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
+  botmux report "子项目X 完成，产出在 …" --legacy-dispatch
 
 说明:
   1) 平台 Issue 领取群：本会话绑定了平台 issue 时，把 issue 推到「待验收」(in_review)。
      kickoff 里「完成后执行 botmux report」指的就是这条路径。
-  2) 多话题协作：被 botmux dispatch 派活的子话题里，把回报发回主编排会话并 @ 主 bot
-     （不要在子话题里 @ 主 bot——会另起无上下文会话）。
+  2) 交接 / 协作回报：接收者与消息落点独立解析——接收者仍是原 Reviewer / orchestrator；
+     消息默认依次采用显式 --into / --top-level、dispatch 注册表、legacy dispatch 兼容回退、
+     当前轮次位置，最后才回退到会话默认位置。
+     当前轮次在群顶层就留在群顶层，在话题里就留在原话题；过期轮次的话题目标会被忽略。
+     dispatch 注册表命中时仍回到原主编排会话，并唤醒其已有上下文。
+     legacy / 跨机器 dispatch 没有本机注册表时仍回退群顶层，避免在子话题唤醒无上下文会话。
+
+  代码 Review 交接建议明确写出：首次 Review / 复审、MR、本轮改动、验证、风险，
+  以及希望 Reviewer 采取的动作。
 
 选项:
   --content-file <path>  从文件读取回报内容
+  --into <root_id>       显式发进指定话题（覆盖默认落点）
+  --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
+  --legacy-dispatch      legacy / 跨机器 dispatch 自动注入的兼容标记
   --session-id <id>      指定来源会话（默认自动推断）`);
     return;
   }
 
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sessionIdArg = argValue(rest, '--session-id');
+  if (flagPresentButValueMissing(rest, '--into')) {
+    console.error('--into 需要一个 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitInto = argValue(rest, '--into')?.trim();
+  if (explicitInto && !/^om_[A-Za-z0-9_-]{1,128}$/.test(explicitInto)) {
+    console.error('--into 必须是有效的 om_ 话题根消息 id。');
+    process.exit(1);
+  }
+  const explicitTopLevel = rest.includes('--top-level');
+  const legacyDispatch = rest.includes('--legacy-dispatch');
+  if (explicitInto && explicitTopLevel) {
+    console.error('--into 与 --top-level 不能同时使用。');
+    process.exit(1);
+  }
   if (flagPresentButValueMissing(rest, '--dispatch-root')) {
     console.error('--dispatch-root 需要一个 om_ 消息 id。');
     process.exit(1);
@@ -8576,7 +8605,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest);
+    const pos = positionals(rest, ['--top-level', '--legacy-dispatch']);
     content = pos.length ? pos.join(' ') : await readStdin();
   }
   if (!contentFile) rejectLikelyWindowsStdinMojibake(content);
@@ -8585,11 +8614,21 @@ async function cmdReport(rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const sid = sessionIdArg ?? findAncestorSessionId();
+  // The process-tree marker carries the executing turn. Do not revive the
+  // spawn-time BOTMUX_TURN_ID here: it is stale in a long-lived or detached
+  // CLI and could make an old topic target look current.
+  const reportContext = resolveSessionContext(
+    resolveDataDir(),
+    process.env.BOTMUX_SESSION_ID,
+  );
+  const sid = sessionIdArg ?? reportContext?.sessionId;
   if (!sid) {
-    console.error('无法推断 session-id。请在 issue 领取群 / 被 dispatch 派活的会话里运行，或传 --session-id <id>。');
+    console.error('无法推断 session-id。请在当前 Botmux 会话（issue 领取群 / 被 dispatch 派活的会话）里运行，或传 --session-id <id>。');
     process.exit(1);
   }
+  const currentTurnId = reportContext?.sessionId === sid
+    ? reportContext.turnId
+    : undefined;
   const sessions = loadSessions();
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
@@ -8680,34 +8719,60 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
   }
 
-  // Resolve where the report goes + who to @. Same-machine: the dispatch registry
-  // (keyed by this sub-bot's thread root) carries the orchestrator's exact coords.
-  // CROSS-MACHINE: the orchestrator is on another machine, so its registry isn't
-  // on THIS one — resolveReportTarget falls back to this sub-bot's own session
-  // (report top-level into its chat, @ the dispatcher via creatorOpenId). See
-  // resolveReportTarget / Session.creatorOpenId.
+  // Recipient and visible placement are independent. creatorOpenId remains the
+  // stable Reviewer/orchestrator identity; current-turn routing controls where
+  // an ordinary report appears.
+  const reportRecipient = resolveReportRecipient({
+    creatorOpenId: s.creatorOpenId,
+    ownerOpenId: s.ownerOpenId,
+    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
+  });
+  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const validatedTurnReplyTarget = currentTurnId
+    && turnReplyTarget?.turnId === currentTurnId
+    ? turnReplyTarget
+    : undefined;
+
+  // Same-machine dispatches retain their exact orchestrator registry route.
+  // A chat-scope target may participate only when it belongs to this executing
+  // turn; historical aliases have no turn id and are intentionally ignored.
   const regPath = join(resolveDataDir(), 'orchestrate-dispatch.json');
   let reg: Record<string, any> = {};
   try { if (existsSync(regPath)) reg = JSON.parse(readFileSync(regPath, 'utf-8')); } catch { /* */ }
   const registryMatch = findDispatchRegistryEntry({
     registry: reg,
     dispatchRootId: explicitDispatchRoot,
+    sessionScope: s.scope ?? 'thread',
     rootMessageId: s.rootMessageId,
-    currentReplyTargetRootId: s.currentReplyTarget?.rootMessageId,
-    replyThreadAliases: s.replyThreadAliases,
+    currentReplyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    currentReplyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    currentTurnId,
   });
   if (explicitDispatchRoot && registryMatch?.key !== explicitDispatchRoot) {
     console.error(`精确 dispatch root ${explicitDispatchRoot} 在本机注册表中不存在；为避免串到其他 PM 会话，本次回报已停止。`);
     process.exit(1);
   }
   const entry = registryMatch?.entry as any;
+  const dispatchCoords = resolveReportTarget({
+    registryEntry: entry,
+    sessionChatId: s.chatId,
+  });
+  const registryTarget = registryMatch
+    ? dispatchCoords.orchScope !== 'chat' && dispatchCoords.orchRoot
+      ? { mode: 'thread' as const, rootMessageId: dispatchCoords.orchRoot }
+      : dispatchCoords.orchChatId
+        ? { mode: 'plain' as const, chatId: dispatchCoords.orchChatId }
+        : undefined
+    : undefined;
+  const hasExplicitPlacement = !!explicitInto || explicitTopLevel;
 
   // Same-host dispatches carry the exact source session. Inject the report into
   // that live PM context through its own daemon instead of trying to make the
   // resident app post into the PM's source chat (which may be a P2P the
   // resident app cannot access). The report body remains untrusted envelope
-  // data; only the fixed consolidation instruction is trusted.
-  if (entry?.orchAppId && entry?.orchSessionId) {
+  // data; only the fixed consolidation instruction is trusted. An explicit
+  // visible placement overrides this registry delivery by design.
+  if (!hasExplicitPlacement && entry?.orchAppId && entry?.orchSessionId) {
     const daemon = findDaemon(entry.orchAppId);
     if (!daemon) {
       console.error('主编排 Bot daemon 不在线；回报未发送，可稍后重试同一 botmux report。');
@@ -8758,24 +8823,42 @@ async function cmdReport(rest: string[]): Promise<void> {
       delivery: 'orchestrator-session',
       reportedTo: entry.orchSessionId,
       viaRegistry: true,
+      recipient: {
+        kind: 'orchestrator-session',
+        botAppId: entry.orchAppId,
+        sessionId: entry.orchSessionId,
+        ...(reportRecipient ? { openId: reportRecipient } : {}),
+      },
+      placementSource: 'dispatch-registry',
+      messageTarget: {
+        mode: 'orchestrator-session',
+        sessionId: entry.orchSessionId,
+        botAppId: entry.orchAppId,
+      },
       triggerId: triggerBody.triggerId,
     }));
     return;
   }
 
-  const tgt = resolveReportTarget({
-    registryEntry: entry,
-    sessionChatId: s.chatId,
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
-  });
-  if (!tgt.orchOpenId || !tgt.orchChatId) {
+  if (!reportRecipient) {
     console.error(
-      '找不到主编排坐标：本会话没记录派活者（creatorOpenId/ownerOpenId 都空）或缺 chatId——大概不是被 botmux dispatch 派活的会话。\n' +
-      '若确需回报，请改用 `botmux send` 或显式 @ 对应的人/ bot。');
+      '找不到 Review / 回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
+      '若确需交接，请改用 `botmux send --mention <open_id:名字>` 明确指定接收者。');
     process.exit(1);
   }
+  const placement = resolveReportPlacement({
+    into: explicitInto,
+    topLevel: explicitTopLevel,
+    registryTarget,
+    legacyDispatch,
+    chatScope: (s.scope ?? 'thread') === 'chat',
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    replyTargetRootId: validatedTurnReplyTarget?.rootMessageId,
+    replyTargetTurnId: validatedTurnReplyTarget?.turnId,
+    replyTargetQuoteOnly: validatedTurnReplyTarget?.quoteOnly,
+    currentTurnId,
+  });
 
   const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
   try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
@@ -8783,25 +8866,36 @@ async function cmdReport(rest: string[]): Promise<void> {
   const { sendMessage, replyMessage } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
 
-  const paras = buildReportContent({ orchOpenId: tgt.orchOpenId, content });
+  const paras = buildReportContent({ orchOpenId: reportRecipient, content });
   const postJson = JSON.stringify({ zh_cn: { title: '', content: paras } });
 
   try {
     let msgId: string;
-    if (tgt.orchScope === 'chat' || !tgt.orchRoot) {
-      // Orchestrator at chat scope, or cross-machine fallback → post top-level
-      // into the chat (the sub-topic's chat = the orchestrator's chat).
-      msgId = await sendMessage(appId, tgt.orchChatId, postJson, 'post');
+    if (placement.target.mode === 'plain') {
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
     } else {
-      // Same-machine thread-scope orchestrator → reply into its thread so its
-      // existing context-rich session (anchored on orchRoot) receives the report.
-      msgId = await replyMessage(appId, tgt.orchRoot, postJson, 'post', true);
+      msgId = await replyMessage(
+        appId,
+        placement.target.rootMessageId,
+        postJson,
+        'post',
+        placement.target.mode === 'thread',
+      );
     }
+    const messageTarget = placement.target.mode === 'plain'
+      ? { mode: 'top-level', chatId: placement.target.chatId }
+      : { mode: placement.target.mode, rootMessageId: placement.target.rootMessageId };
     console.log(JSON.stringify({
       success: true,
-      reportedTo: tgt.orchRoot || tgt.orchChatId,
-      orchestrator: tgt.orchOpenId,
+      delivery: 'lark-message',
+      reportedTo: placement.target.mode === 'plain'
+        ? placement.target.chatId
+        : placement.target.rootMessageId,
+      orchestrator: reportRecipient,
+      recipient: { kind: 'mention', openId: reportRecipient },
       viaRegistry: !!registryMatch,
+      placementSource: placement.source,
+      messageTarget,
       messageId: msgId,
     }));
   } catch (err: any) {
