@@ -1126,7 +1126,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
   const memResult = ds && memTriggerId ? ds.asyncTriggerResults?.get(memTriggerId) : undefined;
 
-  return resolveAsyncTriggerState({
+  const resolved = resolveAsyncTriggerState({
     sessionId,
     liveActive: !!ds,
     chatId: ds?.chatId ?? stored?.chatId,
@@ -1137,6 +1137,18 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     closedAt: stored?.closedAt,
     requestedTriggerId: triggerId,
   });
+
+  // Form C: attach the read-only web-terminal URL when a LIVE worker terminal
+  // exists (workerPort bound + view capability minted). This lets an async
+  // caller open a live view of the visible CLI TUI while the turn runs. Gated
+  // on the live `ds` — a closed/restored session has no reachable terminal, so
+  // we never advertise a stale URL. buildTerminalUrl carries the ?viewToken=
+  // inline; in core-only the host is frozen to 127.0.0.1 (see index-core-only).
+  if (ds && ds.workerPort && ds.workerViewToken) {
+    resolved.readOnlyUrl = buildTerminalUrl(ds);
+    resolved.viewToken = ds.workerViewToken;
+  }
+  return resolved;
 }
 
 // 看板放置：dashboard 看板视图拖拽卡片后持久化列 + 列内排序位置。

@@ -3115,4 +3115,53 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect(res.status).toBe(200);
     expect((await res.json()).ok).toBe(true);
   });
+
+  // Form C: trigger-result carries a read-only web-terminal URL while a live
+  // worker terminal exists, so an async caller (riff's task-runner) can open
+  // the visible CLI TUI in the sandbox browser.
+  it('trigger-result exposes readOnlyUrl + viewToken when a live worker terminal is up', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    setCoreOnlyReady();
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-term', chatId: 'http_async_x', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'http_async_x',
+      larkAppId: 'local_smoke',
+      workerPort: 4321,
+      workerToken: 'write-tok',
+      workerViewToken: 'view-cap-abc',
+      asyncTriggerResults: new Map(),
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-term/trigger-result`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(typeof body.readOnlyUrl).toBe('string');
+    // Carries the read capability inline, NOT the write token.
+    expect(body.readOnlyUrl).toContain('viewToken=view-cap-abc');
+    expect(body.readOnlyUrl).not.toContain('write-tok');
+    expect(body.viewToken).toBe('view-cap-abc');
+    findSpy.mockRestore();
+  });
+
+  it('trigger-result omits readOnlyUrl when the live session has no worker terminal yet', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    setCoreOnlyReady();
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-noterm', chatId: 'http_async_y', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'http_async_y',
+      larkAppId: 'local_smoke',
+      workerPort: null,          // worker web server not up yet
+      workerViewToken: null,
+      asyncTriggerResults: new Map(),
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-noterm/trigger-result`);
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.readOnlyUrl).toBeUndefined();
+    expect(body.viewToken).toBeUndefined();
+    findSpy.mockRestore();
+  });
 });
