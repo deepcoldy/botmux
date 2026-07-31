@@ -983,6 +983,14 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
   });
 
+  it('exposes /fast only to Codex and grants it cold-start semantics', () => {
+    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(false);
+    expect(resolvePassthroughCommands('app-1').has('/fast')).toBe(false);
+    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast');
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/fast');
+  });
+
   it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
     // /effort 放在全局 PASSTHROUGH_COMMANDS,而非某个 adapter 的 defaultPassthroughCommands
     // ——所有 CLI 都尽力透传(Claude 家族 / Codex 原生支持;其它 CLI 认不得顶多回
@@ -1007,23 +1015,6 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     // /goal 相反:它是「开启目标工作」的命令,刻意留在 adapter 层保留冷启动语义。
     expect(resolveAdapterDefaultPassthroughCommands('app-1')).toContain('/goal');
     expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/goal');
-  });
-
-  it('forwards /fast to the CLI (Codex native tier toggle) — NOT a daemon command', () => {
-    // 只读方案的主入口:botmux 不接管 /fast,原样透传给 Codex 让它自己切 service_tier,
-    // 卡片只读展示当前档位。回归护栏:如果 /fast 只从 DAEMON_COMMANDS 删掉却没进
-    // 全局 PASSTHROUGH_COMMANDS,飞书发 /fast 会走普通 wrapped prompt、永不触发原生切档,
-    // 整个功能失效(正是首版只读实现的 P1-1)。
-    expect(DAEMON_COMMANDS.has('/fast')).toBe(false);
-    expect(PASSTHROUGH_COMMANDS.has('/fast')).toBe(true);
-    expect(resolvePassthroughCommands('app-2').has('/fast')).toBe(true); // codex
-    expect(resolvePassthroughCommands(undefined).has('/fast')).toBe(true);
-  });
-
-  it('keeps /fast OUT of the adapter default layer so it never gains cold-start', () => {
-    // 同 /effort:/fast 是「调档」而非「开一段工作」,空话题单发 /fast 不该凭空拉起会话。
-    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/fast'); // codex
-    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/fast'); // claude-code
   });
 
   it('does not expose Codex interactive /title through the Lark channel', () => {

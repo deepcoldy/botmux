@@ -402,6 +402,49 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('routes Codex /fast verbatim for both live and cold sessions', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+
+    const send = vi.fn();
+    const live = seedLiveChatSession(send);
+    live.session.cliId = 'codex';
+    await handleThreadReply(
+      makeEventData('om_fast_live', '/fast', 'om_fast_reply_root'),
+      {
+        chatId: CHAT,
+        messageId: 'om_fast_live',
+        chatType: 'group',
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'om_fast_reply_root',
+        larkAppId: APP,
+      },
+    );
+    expect(send).toHaveBeenCalledWith({
+      type: 'raw_input',
+      content: '/fast',
+      turnId: 'om_fast_live',
+    });
+
+    activeSessions.clear();
+    mocks.forkWorker.mockClear();
+    await handleThreadReply(
+      makeEventData('om_fast_cold', '/fast', 'om_fast_cold_root'),
+      makeCtx('om_fast_cold_root', 'om_fast_cold'),
+    );
+    const cold = activeSessions.get(sessionKey('om_fast_cold_root', APP));
+    expect(cold?.pendingRawInput).toBe('/fast');
+    expect(cold?.pendingRawTurnId).toBe('om_fast_cold');
+    expect(mocks.forkWorker).toHaveBeenCalledWith(cold, '', false);
+  });
+
   it('pending raw same-caller follow-up rotates both staged turns to the latest message', async () => {
     const anchor = 'om_pending_raw_root';
     const ds = seedPendingRawSession(anchor);

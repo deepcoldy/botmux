@@ -3,6 +3,7 @@ import type { BotSkillPolicy } from './core/skills/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
 
 /** Managed meeting sinks supported by the first multi-consumer slice. */
 export type VcMeetingConsumerManagedSink = 'meeting_text' | 'meeting_voice';
@@ -690,7 +691,10 @@ export type WorkerToDaemon =
   /** Worker 已处理 SessionStart 信号并建立 post-hook prompt evidence fence。
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number; fastServiceTier?: string }
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number }
+  /** Executor-observed Codex tier, bound to this worker + rollout generation.
+   * `null` explicitly clears any previous generation's snapshot. */
+  | { type: 'codex_service_tier'; snapshot: CodexServiceTierSnapshot | null }
   | { type: 'error'; message: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'bridge_source_session'; bridge: 'hermes'; sourceSessionId: string }
   | { type: 'tui_prompt'; description: string; options: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>; multiSelect?: boolean; turnId?: string; dispatchAttempt?: number }

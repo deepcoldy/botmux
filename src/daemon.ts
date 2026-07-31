@@ -104,8 +104,8 @@ import type { CliId } from './adapters/cli/types.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
+import { codexFastBadgeActive } from './services/codex-service-tier.js';
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
-import { codexServiceTierBadge } from './services/codex-transcript.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
@@ -3699,27 +3699,31 @@ function beginNewTurn(ds: DaemonSession, title: string): void {
   if (ds.streamCardId && ds.workerPort) {
     const readUrl = buildTerminalUrl(ds);
     const dsBotCfg = getBot(ds.larkAppId).config;
-    const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(dsBotCfg.cliId);
+    const effectiveCliId = ds.session.cliId ?? dsBotCfg.cliId;
+    const prevTitle = ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId);
     const prevMode = ds.displayMode ?? 'hidden';
+    const previousCodexFastActive = codexFastBadgeActive(effectiveCliId, ds.codexServiceTier);
     const frozenCard = buildStreamingCard(
       ds.session.sessionId, sessionAnchorId(ds), readUrl, prevTitle,
-      ds.lastScreenContent ?? '', previousStatus, dsBotCfg.cliId,
+      ds.lastScreenContent ?? '', previousStatus, effectiveCliId,
       prevMode, ds.streamCardNonce, ds.currentImageKey,
       !!ds.adoptedFrom, false, localeForBot(ds.larkAppId), previousUsageLimit,
       writableTerminalLinkFor(ds),
-      isLocalCliOpenReady(ds, { cliId: dsBotCfg.cliId }),
-      codexServiceTierBadge(ds.fastServiceTier),
+      isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
+      previousCodexFastActive,
     );
     scheduleCardPatch(ds, frozenCard);
 
     if (ds.streamCardNonce && ds.streamCardId !== CARD_POSTING_SENTINEL) {
       if (!ds.frozenCards) ds.frozenCards = new Map();
+      ds.parkedStreamCardNonce = ds.streamCardNonce;
       ds.frozenCards.set(ds.streamCardNonce, {
         messageId: ds.streamCardId,
         content: ds.lastScreenContent ?? '',
         title: prevTitle,
         displayMode: prevMode,
         imageKey: ds.currentImageKey,
+        ...(previousCodexFastActive ? { codexFastActive: true } : {}),
       });
       saveFrozenCards(ds.session.sessionId, ds.frozenCards);
     }

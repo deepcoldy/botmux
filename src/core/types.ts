@@ -10,6 +10,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import type { CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import type { CodexServiceTierSnapshot } from '../services/codex-service-tier.js';
 
 /** Frozen card state — cached content for historical streaming cards that can still be toggled. */
 export interface FrozenCard {
@@ -22,6 +23,8 @@ export interface FrozenCard {
   displayMode?: DisplayMode;
   /** Latest uploaded image_key for the frozen card (only when displayMode === 'screenshot'). */
   imageKey?: string;
+  /** Whether this historical Codex card was in the catalog-defined Fast tier. */
+  codexFastActive?: boolean;
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -188,11 +191,13 @@ export interface DaemonSession {
   currentImageKey?: string;
   lastScreenContent?: string;    // last screen_update content — used to freeze card at idle
   lastScreenStatus?: StreamStatus;  // last screen_update status
-  /** Codex service tier detected read-only from the session rollout
-   *  (`thread_settings_applied.service_tier`). Drives the ⚡Fast badge on the
-   *  streaming card. Botmux never sets the tier — the user does via native
-   *  `/fast`; this only reflects it. `default`/undefined → standard (no badge). */
-  fastServiceTier?: string;
+  /** Executor-observed Codex settings for this worker/rollout generation. */
+  codexServiceTier?: CodexServiceTierSnapshot;
+  /** Tier change arrived while a card POST was in-flight. */
+  pendingCodexTierCardRefresh?: boolean;
+  /** The currently referenced card has been frozen/parked for handoff. Tier
+   * updates belong to the successor card and must not rewrite this snapshot. */
+  parkedStreamCardNonce?: string;
   /** Riff AIO Sandbox web terminal link. When set, buildTerminalUrl returns
    *  this URL directly (bypassing the local terminal proxy) so the dashboard
    *  "Web终端" button opens the riff sandbox. In-memory only — re-sent by the

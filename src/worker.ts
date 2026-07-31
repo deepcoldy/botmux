@@ -118,7 +118,8 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexServiceTier, CodexServiceTierTracker, type CodexBridgeEvent } from './services/codex-transcript.js';
+import { drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, scanCodexThreadSettings, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid } from './services/traex-transcript.js';
 import { parseTraexUserInputQuestions } from './services/traex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -2058,24 +2059,13 @@ let codexBridgeBaselineDone = false;
 const codexBridgeQueue = new CodexBridgeQueue();
 let codexBridgeWatcher: FSWatcher | null = null;
 let codexBridgeTimer: NodeJS.Timeout | null = null;
-/** Read-only tier badge: throttled, path-keyed tracker keeps the rollout scan
- *  off the per-tick screen_update path and stops a detected tier from leaking
- *  across session identity changes (fresh session / relay / role switch). See
- *  CodexServiceTierTracker. */
-const codexServiceTierTracker = new CodexServiceTierTracker(3_000);
-function resetCodexServiceTierCache(): void {
-  codexServiceTierTracker.reset();
-}
-/** Tier for the CURRENT screen_update: a tier id / `''` (send it) or undefined
- *  (no change, keep last). Scan + time injected into the tracker. */
-function currentCodexServiceTier(nowMs: number): string | undefined {
-  return codexServiceTierTracker.current({
-    isCodex: lastInitConfig?.cliId === 'codex',
-    rolloutPath: codexBridgeRolloutPath,
-    nowMs,
-    scan: scanCodexServiceTier,
-  });
-}
+/** Settings are observed on the same append-only cursor as bridge output.
+ *  The tracker owns rollout-generation clear/update semantics and publishes a
+ *  dedicated IPC event, independent of PTY redraw frequency. */
+const codexServiceTierTracker = new CodexServiceTierTracker(
+  resolveCodexServiceTierSnapshot,
+  snapshot => send({ type: 'codex_service_tier', snapshot }),
+);
 let hermesBridgeOffset = 0;
 let hermesBridgeBaselineDone = false;
 let hermesBridgeDbPath: string | undefined;
@@ -3542,6 +3532,7 @@ function mtrBridgeIngest(): void {
 
 function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'baseline-existing-skip-tail' | 'fresh-empty' | 'split-live'): void {
   codexBridgeRolloutPath = rolloutPath;
+  if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
     // way we want to ingest from offset 0 — pending turns marked before
@@ -3568,6 +3559,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgeOffset = result.newOffset;
     codexBridgePendingTail = result.pendingTail;
     codexBridgeBaselineDone = true;
+    if (structuredBridgeIsCodex()) {
+      codexServiceTierTracker.observe(
+        rolloutPath,
+        (result as CodexDrainResult).latestThreadSettings,
+      );
+    }
     log(`Codex bridge split-live: ${rolloutPath} (history=${history.length}, live=${live.length}, cutoff=${cutoff}, offset=${codexBridgeOffset})`);
     maybeEmitCodexAdoptPreamble(history);
   } else if (mode === 'split-live') {
@@ -3599,6 +3596,13 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     codexBridgePendingTail = '';
     codexBridgeBaselineDone = true;
     log(`Codex bridge transcript not yet present at ${rolloutPath}; treating as fresh`);
+  }
+  if (
+    structuredBridgeIsCodex()
+    && mode !== 'fresh-empty'
+    && mode !== 'split-live'
+  ) {
+    codexServiceTierTracker.observe(rolloutPath, scanCodexThreadSettings(rolloutPath));
   }
   try {
     codexBridgeWatcher = fsWatch(rolloutPath, { persistent: false }, () => {
@@ -3830,6 +3834,12 @@ function codexBridgeIngest(opts: { signalIdle?: boolean } = {}): void {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset);
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
+  if (structuredBridgeIsCodex()) {
+    codexServiceTierTracker.observe(
+      codexBridgeRolloutPath,
+      (result as CodexDrainResult).latestThreadSettings,
+    );
+  }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
   codexBridgeQueue.ingest(result.events);
   // Transcript-driven idle: an `assistant_final` event is the CLI declaring
@@ -3977,11 +3987,11 @@ function stopCodexBridge(): void {
     clearInterval(codexBridgeTimer);
     codexBridgeTimer = null;
   }
+  codexServiceTierTracker.detach();
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
-  resetCodexServiceTierCache();
   hermesBridgeOffset = 0;
   hermesBridgeBaselineDone = false;
   hermesBridgeSourceSessionId = undefined;
@@ -5304,7 +5314,7 @@ function markPromptReady(): void {
   // (where the initial prompt is queued before the CLI becomes idle).
   if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, fastServiceTier: currentCodexServiceTier(Date.now()) });
+    send({ type: 'screen_update', content, ...usageLimitTracker.classify(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }
   // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
   // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
@@ -6106,7 +6116,7 @@ function startScreenUpdates(): void {
       const usageAware = usageLimitTracker.classify(content, status);
       if (changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;
-        send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt, fastServiceTier: currentCodexServiceTier(Date.now()) });
+        send({ type: 'screen_update', content, ...usageAware, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
       }
     })();
   }, SCREEN_UPDATE_INTERVAL_MS);

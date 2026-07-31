@@ -37,12 +37,6 @@ export const PASSTHROUGH_COMMANDS = new Set([
   //      「调档」而非「开一段工作」的命令，空话题里单发 /effort 不应凭空拉起会话。
   //      对照 /goal（开启目标工作）仍留在 adapter 层，保留其冷启动语义。
   '/effort',
-  // Codex 原生 /fast 切换 service_tier（快/默认档）。放全局 passthrough（同 /effort）
-  // 是刻意的：botmux 不接管 Fast 语义，只把命令原样透传给 Codex 让它自己切档，并在
-  // 流式卡片上只读展示当前档位（见 codexServiceTierBadge）。不进 adapter 冷启动集合
-  // ——/fast 是「调档」而非「开一段工作」，空话题里单发 /fast 不应凭空拉起会话。
-  // Codex 不认（例如别的 CLI）时顶多回一句 unknown-command，不崩溃 / 不泄露。
-  '/fast',
 ]);
 
 /**
