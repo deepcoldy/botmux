@@ -5,11 +5,13 @@ import {
   spawnSync,
   type ChildProcess,
 } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
+  existsSync,
   fstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
@@ -21,7 +23,13 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import {
+  AmbiguousSubmissionBlockedError,
+  type AmbiguousSubmissionRecoveryFailure,
+  type SessionBackend,
+  type SpawnOpts,
+  type SessionProbe,
+} from './types.js';
 import { zmxEnv, probeZmxFunctional } from '../../setup/ensure-zmx.js';
 import {
   buildBotmuxEnvAssignments,
@@ -31,6 +39,8 @@ import {
 } from './tmux-backend.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from './critical-control-key.js';
 import { logger } from '../../utils/logger.js';
+import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
 
 const EARLY_BUFFER_MAX = 1024 * 1024;
 const HISTORY_TAIL_DEBOUNCE_MS = 50;
@@ -47,6 +57,7 @@ const TAIL_RECOVERY_DELAY_MAX_MS = 2000;
 const FRESH_READY_TIMEOUT_MS = 5000;
 const FRESH_RELEASE_TIMEOUT_MS = 12_000;
 const FRESH_CLI_PID_TIMEOUT_MS = 3000;
+const FRESH_RELEASE_ACK_TIMEOUT_MS = 3000;
 // ZMX removes history as soon as the PTY root exits. Keep the private launch
 // shell alive briefly after the real CLI finishes so the history-only output
 // path can publish the final bytes before the daemon unlinks the session.
@@ -73,9 +84,12 @@ const ZMX_TRANSPORT_LABEL = 'botmux.transport';
 const ZMX_TRANSPORT = 'tail-send-v1';
 const ZMX_SESSION_LABEL = 'botmux.session';
 const ZMX_LAUNCH_PID_LABEL = 'botmux.launch_pid';
+const ZMX_GATE_NONCE_LABEL = 'botmux.gate_nonce';
+const ZMX_GATE_PROCESS_MARKER_PREFIX = 'botmux-zmx-private-release-gate-v1:';
 
 type BackendState = 'idle' | 'observing' | 'recovering' | 'stopped' | 'exited';
 type ZmxSendIntent = 'text' | 'control';
+type ZmxComposerRecoveryState = 'clean' | 'pending' | 'unconfirmed';
 
 function bytesMatchAt(bytes: Buffer, marker: Buffer, cursor: number, boundary: number): boolean {
   if (cursor + marker.length > boundary) return false;
@@ -198,6 +212,32 @@ function readProcessParentPid(pid: number): number | null {
   return null;
 }
 
+/** Read one same-user process command line without a shell. The private gate
+ * marker is random per launch, so a substring check remains unambiguous on
+ * macOS where `ps` cannot preserve argv boundaries. */
+function readProcessCommandLine(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  if (process.platform === 'linux') {
+    try {
+      const raw = readFileSync(`/proc/${pid}/cmdline`);
+      if (raw.length === 0) return null;
+      return raw.toString('utf8').replace(/\0/g, ' ');
+    } catch { return null; }
+  }
+  for (const ps of ['/usr/bin/ps', '/bin/ps']) {
+    try {
+      const raw = execFileSync(ps, ['-ww', '-o', 'command=', '-p', String(pid)], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
+        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+      }).trim();
+      if (raw) return raw;
+    } catch { /* try the other standard BSD/GNU location */ }
+  }
+  return null;
+}
+
 /** Convert plain line feeds into terminal-safe CRLF without doubling CRLF. */
 export function normaliseZmxHistory(text: string): string {
   // ZMX history emits LF while tail can expose CRLF, and high-throughput tail
@@ -264,8 +304,20 @@ export class ZmxBackend implements SessionBackend {
   private launchPid: number | null = null;
   /** Monotonic generation of compatible, transport-ambiguous text writes. */
   private ambiguousTextFailureSequence = 0;
-  /** Highest ambiguous text generation covered by any Ctrl+C attempt. */
+  /** Highest ambiguous text generation confirmed covered by Ctrl+C. */
   private cancelledAmbiguousTextFailureSequence = 0;
+  /** Highest ambiguous text generation for which Ctrl+C was actually attempted. */
+  private attemptedAmbiguousTextRecoverySequence = 0;
+  /** A recovery Ctrl+C may have landed, so retrying or appending is unsafe. */
+  private ambiguousTextRecoveryUnconfirmed = false;
+  /** Recovery must leave bracketed-paste mode before injecting Ctrl+C. */
+  private ambiguousTextRecoveryNeedsPasteClose = false;
+  /** Worker-level transaction spanning all adapter chunks and its submit key. */
+  private activeSubmissionFence: number | null = null;
+  private activeSubmissionGeneration: number | null = null;
+  private activeSubmissionTextTouched = false;
+  private activeSubmissionTransportFailed = false;
+  private activeSubmissionControlAccepted = false;
   /** Completion-time timestamp: a timed-out Ctrl+C may have landed just before return. */
   private lastInjectedCancelAtMs = 0;
 
@@ -279,12 +331,14 @@ export class ZmxBackend implements SessionBackend {
       ownsSession?: boolean;
       isReattach?: boolean;
       sessionId?: string;
+      recoveryStateDir?: string;
     } = {},
   ) {
     this.reattaching = opts.isReattach ?? false;
     let hash = 0;
     for (const char of sessionName) hash = ((hash * 33) + char.charCodeAt(0)) >>> 0;
     this.historyColdJitterMs = hash % (HISTORY_COLD_JITTER_MAX_MS + 1);
+    this.restoreAmbiguousRecoveryState();
   }
 
   static isAvailable(): boolean {
@@ -364,6 +418,7 @@ export class ZmxBackend implements SessionBackend {
     name: string,
     expectedSessionId: string | undefined,
     env: NodeJS.ProcessEnv = zmxEnv(),
+    opts: { allowGated?: boolean } = {},
   ): ZmxManagedSessionProbe {
     const beforeSnapshot = ZmxBackend.probeSessions(env);
     if (!beforeSnapshot.ok) {
@@ -379,6 +434,8 @@ export class ZmxBackend implements SessionBackend {
 
     let transport: string;
     let sessionId = '';
+    let launchPidRaw: string;
+    let gateNonce: string;
     try {
       transport = execFileSync('zmx', ['get', name, ZMX_TRANSPORT_LABEL], {
         encoding: 'utf8',
@@ -394,10 +451,33 @@ export class ZmxBackend implements SessionBackend {
           env,
         }).trim();
       }
+      launchPidRaw = execFileSync('zmx', ['get', name, ZMX_LAUNCH_PID_LABEL], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 3000,
+        env,
+      }).trim();
     } catch (err) {
       return {
         state: 'unknown',
         reason: `无法读取 ZMX 会话 ${name} 的所有权标签：${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    try {
+      gateNonce = execFileSync('zmx', ['get', name, ZMX_GATE_NONCE_LABEL], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 3000,
+        env,
+      }).trim();
+    } catch (err) {
+      return {
+        state: 'unknown',
+        // Sessions created before the gated-generation protocol cannot prove
+        // whether their labelled launch child is still waiting for a private
+        // release file. Preserve them for one-time manual cleanup rather than
+        // reattaching or deleting by name.
+        reason: `ZMX 会话 ${name} 缺少启动门禁标签；已保留，请手动关闭旧会话后重试：${err instanceof Error ? err.message : String(err)}`,
       };
     }
 
@@ -421,6 +501,38 @@ export class ZmxBackend implements SessionBackend {
         clients: after.clients,
         reason: 'session-label',
       };
+    }
+    const launchPid = Number(launchPidRaw);
+    if (
+      !Number.isSafeInteger(launchPid)
+      || launchPid <= 0
+      || readProcessParentPid(launchPid) !== after.pid
+    ) {
+      return {
+        state: 'unknown',
+        reason: `ZMX 会话 ${name} 的 launch PID 标签无效或已脱离 PTY root`,
+      };
+    }
+    if (!/^[0-9a-f]{32}$/.test(gateNonce)) {
+      return {
+        state: 'unknown',
+        reason: `ZMX 会话 ${name} 的启动门禁标签无效`,
+      };
+    }
+    if (!opts.allowGated) {
+      const commandLine = readProcessCommandLine(launchPid);
+      if (!commandLine) {
+        return {
+          state: 'unknown',
+          reason: `无法确认 ZMX 会话 ${name} 的 launch 子进程状态`,
+        };
+      }
+      if (commandLine.includes(`${ZMX_GATE_PROCESS_MARKER_PREFIX}${gateNonce}`)) {
+        return {
+          state: 'unknown',
+          reason: `ZMX 会话 ${name} 仍在等待私有启动门禁放行`,
+        };
+      }
     }
     return { state: 'compatible', pid: after.pid, clients: after.clients };
   }
@@ -450,7 +562,13 @@ export class ZmxBackend implements SessionBackend {
     expectedPid?: number,
     env: NodeJS.ProcessEnv = zmxEnv(),
   ): void {
-    const probe = ZmxBackend.probeManagedSession(name, expectedSessionId, env);
+    const allowGated = expectedPid !== undefined;
+    const probe = ZmxBackend.probeManagedSession(
+      name,
+      expectedSessionId,
+      env,
+      { allowGated },
+    );
     if (probe.state === 'missing') return;
     if (probe.state !== 'compatible') {
       throw new Error(
@@ -475,7 +593,12 @@ export class ZmxBackend implements SessionBackend {
     const deadline = Date.now() + MANAGED_KILL_TIMEOUT_MS;
     let lastUnknownReason: string | null = null;
     while (Date.now() < deadline) {
-      const after = ZmxBackend.probeManagedSession(name, expectedSessionId, env);
+      const after = ZmxBackend.probeManagedSession(
+        name,
+        expectedSessionId,
+        env,
+        { allowGated },
+      );
       if (after.state === 'missing') return;
       // A just-removed socket may briefly remain visible while its control
       // endpoint already rejects get/list. Treat that as convergence, not as a
@@ -515,18 +638,92 @@ export class ZmxBackend implements SessionBackend {
   }
 
   captureAmbiguousSubmissionFence(): number {
-    return this.ambiguousTextFailureSequence;
+    const fence = this.ambiguousTextFailureSequence;
+    if (this.ambiguousTextRecoveryUnconfirmed) {
+      throw new AmbiguousSubmissionBlockedError('recovery-unconfirmed');
+    }
+    if (this.hasAmbiguousRecoveryDebt()) {
+      throw new AmbiguousSubmissionBlockedError('recovery-pending');
+    }
+    if (this.activeSubmissionGeneration != null) {
+      this.markActiveSubmissionUnconfirmed();
+      throw new AmbiguousSubmissionBlockedError('recovery-unconfirmed');
+    }
+    const generation = this.armAmbiguousTextGeneration();
+    if (generation == null) {
+      throw new AmbiguousSubmissionBlockedError('recovery-unconfirmed');
+    }
+    this.activeSubmissionFence = fence;
+    this.activeSubmissionGeneration = generation;
+    this.activeSubmissionTextTouched = false;
+    this.activeSubmissionTransportFailed = false;
+    this.activeSubmissionControlAccepted = false;
+    return fence;
   }
 
-  cancelAmbiguousSubmission(fence: number): void {
-    const failedThrough = this.ambiguousTextFailureSequence;
+  confirmAmbiguousSubmission(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined {
+    if (this.ambiguousTextRecoveryUnconfirmed) return 'recovery-unconfirmed';
     if (
-      failedThrough <= fence
-      || failedThrough <= this.cancelledAmbiguousTextFailureSequence
+      this.activeSubmissionGeneration != null
+      && this.activeSubmissionFence !== fence
     ) {
-      return;
+      // A stale caller must never commit another logical transaction. The
+      // worker mutex makes this unreachable in the normal path, but keeping the
+      // backend contract fail-closed prevents a future caller from silently
+      // leaving an armed generation writable.
+      this.markActiveSubmissionUnconfirmed();
+      return 'recovery-unconfirmed';
     }
-    this.abortPartialSend(false);
+    if (
+      this.activeSubmissionFence !== fence
+      || this.activeSubmissionGeneration == null
+    ) {
+      return this.hasAmbiguousRecoveryDebt() ? 'recovery-pending' : undefined;
+    }
+    if (this.activeSubmissionTransportFailed) return 'recovery-pending';
+    return this.markAmbiguousGenerationCovered(this.activeSubmissionGeneration)
+      ? undefined
+      : 'recovery-unconfirmed';
+  }
+
+  cancelAmbiguousSubmission(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined {
+    if (this.ambiguousTextRecoveryUnconfirmed) return 'recovery-unconfirmed';
+    if (
+      this.activeSubmissionGeneration != null
+      && this.activeSubmissionFence !== fence
+    ) {
+      // Do not let a stale cancellation abort a newer transaction or inject
+      // Ctrl+C into its composer. Freeze it for explicit fresh-generation
+      // recovery instead.
+      this.markActiveSubmissionUnconfirmed();
+      return 'recovery-unconfirmed';
+    }
+    if (
+      this.activeSubmissionFence === fence
+      && this.activeSubmissionGeneration != null
+    ) {
+      if (!this.activeSubmissionTextTouched) {
+        return this.markAmbiguousGenerationCovered(this.activeSubmissionGeneration)
+          ? undefined
+          : 'recovery-unconfirmed';
+      }
+      // Once a control key was accepted, a later adapter exception cannot
+      // prove whether that key submitted the prompt. Never inject Ctrl+C into
+      // a possibly running turn; freeze until the user inspects/restarts it.
+      if (this.activeSubmissionControlAccepted) {
+        this.markActiveSubmissionUnconfirmed();
+        return 'recovery-unconfirmed';
+      }
+      return this.abortPartialSend(false);
+    }
+    const failedThrough = this.ambiguousTextFailureSequence;
+    if (failedThrough <= this.cancelledAmbiguousTextFailureSequence) return undefined;
+    if (failedThrough <= fence) return 'recovery-pending';
+    return this.abortPartialSend(false);
   }
 
   /**
@@ -541,12 +738,215 @@ export class ZmxBackend implements SessionBackend {
     }
   }
 
-  /** Record which ambiguous generation the imminent Ctrl+C can clean. */
-  private markAmbiguousGenerationCovered(): void {
+  private hasPendingAmbiguousTextRecovery(): boolean {
+    return this.ambiguousTextFailureSequence
+      > this.cancelledAmbiguousTextFailureSequence;
+  }
+
+  private activeSubmissionCanWrite(): boolean {
+    return this.activeSubmissionGeneration != null
+      && !this.activeSubmissionTransportFailed
+      && !this.ambiguousTextRecoveryUnconfirmed;
+  }
+
+  private hasAmbiguousRecoveryDebt(): boolean {
+    return this.hasPendingAmbiguousTextRecovery()
+      && !this.activeSubmissionCanWrite();
+  }
+
+  private composerRecoveryStatePath(): string | null {
+    if (!this.opts.recoveryStateDir || !this.opts.sessionId) return null;
+    const key = createHash('sha256').update(this.opts.sessionId).digest('hex');
+    return join(
+      this.opts.recoveryStateDir,
+      'zmx-composer-recovery',
+      `${key}.json`,
+    );
+  }
+
+  private readComposerRecoveryState(): ZmxComposerRecoveryState {
+    const path = this.composerRecoveryStatePath();
+    if (!path) return 'clean';
+    try {
+      const parsed = JSON.parse(readFileSync(path, 'utf8')) as {
+        version?: unknown;
+        sessionId?: unknown;
+        state?: unknown;
+      };
+      if (
+        parsed.version !== 1
+        || parsed.sessionId !== this.opts.sessionId
+        || !['clean', 'pending', 'unconfirmed'].includes(String(parsed.state))
+      ) {
+        return 'unconfirmed';
+      }
+      return parsed.state as ZmxComposerRecoveryState;
+    } catch (err) {
+      if (
+        err
+        && typeof err === 'object'
+        && 'code' in err
+        && err.code === 'ENOENT'
+      ) {
+        return 'clean';
+      }
+      logger.error(
+        `[zmx:${this.sessionName}] composer recovery journal unreadable; ` +
+        `failing closed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 'unconfirmed';
+    }
+  }
+
+  private writeComposerRecoveryState(state: ZmxComposerRecoveryState): boolean {
+    const path = this.composerRecoveryStatePath();
+    if (!path) return true;
+    try {
+      const journalDir = join(
+        this.opts.recoveryStateDir!,
+        'zmx-composer-recovery',
+      );
+      const created = mkdirSync(journalDir, {
+        recursive: true,
+        mode: 0o700,
+      });
+      if (created !== undefined) {
+        // fsyncing the journal directory below makes its file entries durable,
+        // but a first-ever mkdir is itself an entry in recoveryStateDir. Publish
+        // that parent entry before arming the WAL, or a power loss could erase
+        // the entire pending journal and make reattach fail open as `clean`.
+        try {
+          fsyncDirectorySyncPortable(this.opts.recoveryStateDir!);
+        } catch (err) {
+          // Do not leave an empty, never-confirmed directory behind: a later
+          // retry would otherwise see mkdir as pre-existing, skip this parent
+          // durability barrier, and incorrectly trust it.
+          try { rmdirSync(journalDir); } catch { /* fail-closed below */ }
+          throw err;
+        }
+      }
+      atomicWriteFileSync(
+        path,
+        `${JSON.stringify({ version: 1, sessionId: this.opts.sessionId, state })}\n`,
+        {
+          mode: 0o600,
+          durable: true,
+          followTargetSymlink: false,
+        },
+      );
+      return true;
+    } catch (err) {
+      logger.error(
+        `[zmx:${this.sessionName}] unable to persist composer recovery state ` +
+        `${state}; failing closed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
+  private restoreAmbiguousRecoveryState(): void {
+    const state = this.readComposerRecoveryState();
+    if (state === 'clean') return;
+    this.ambiguousTextFailureSequence = 1;
+    // A new worker cannot reconstruct whether bracketed-paste mode was open
+    // or whether a cleanup key landed before the old process died. Restore
+    // every non-clean journal entry as sticky poison, never as retryable debt.
+    this.attemptedAmbiguousTextRecoverySequence = 1;
+    this.ambiguousTextRecoveryUnconfirmed = true;
+    logger.error(
+      `[zmx:${this.sessionName}] restored ${state} composer recovery state; ` +
+      'automatic input remains blocked until a fresh backend generation',
+    );
+  }
+
+  /**
+   * Write-ahead arm one text transport generation before `zmx send` can touch
+   * the PTY. A worker killed after the daemon consumes stdin but before the
+   * synchronous client returns will therefore leave `pending` for reattach to
+   * restore as poison instead of trusting a stale `clean` marker.
+   */
+  private armAmbiguousTextGeneration(): number | null {
+    const generation = this.ambiguousTextFailureSequence + 1;
+    if (!this.writeComposerRecoveryState('pending')) {
+      // No bytes have been sent, but this worker can no longer uphold the
+      // recovery journal contract. Keep it fail-closed until a fresh process.
+      this.ambiguousTextFailureSequence = generation;
+      this.ambiguousTextRecoveryUnconfirmed = true;
+      return null;
+    }
+    this.ambiguousTextFailureSequence = generation;
+    return generation;
+  }
+
+  private markArmedTextFailure(closeOpenPaste: boolean): void {
+    this.ambiguousTextRecoveryNeedsPasteClose ||= closeOpenPaste;
+    if (this.activeSubmissionGeneration != null) {
+      this.activeSubmissionTransportFailed = true;
+    }
+  }
+
+  private markActiveSubmissionUnconfirmed(): void {
+    // `pending` already survives a failed atomic replacement, so even a failed
+    // unconfirmed write remains fail-closed on the next worker.
+    this.writeComposerRecoveryState('unconfirmed');
+    this.ambiguousTextRecoveryUnconfirmed = true;
+  }
+
+  /** Record that a recovery Ctrl+C is now transport-ambiguous itself. */
+  private markAmbiguousRecoveryAttempted(): number | null {
+    if (!this.writeComposerRecoveryState('unconfirmed')) {
+      this.ambiguousTextRecoveryUnconfirmed = true;
+      return null;
+    }
+    const generation = this.ambiguousTextFailureSequence;
+    this.attemptedAmbiguousTextRecoverySequence = Math.max(
+      this.attemptedAmbiguousTextRecoverySequence,
+      generation,
+    );
+    return generation;
+  }
+
+  /**
+   * Clear only the exact write-ahead generation whose send or recovery was
+   * accepted. Persistence is committed before the in-memory covered marker.
+   */
+  private markAmbiguousGenerationCovered(generation: number): boolean {
+    if (!this.writeComposerRecoveryState('clean')) {
+      this.ambiguousTextRecoveryUnconfirmed = true;
+      return false;
+    }
     this.cancelledAmbiguousTextFailureSequence = Math.max(
       this.cancelledAmbiguousTextFailureSequence,
-      this.ambiguousTextFailureSequence,
+      generation,
     );
+    this.ambiguousTextRecoveryUnconfirmed = false;
+    if (!this.hasPendingAmbiguousTextRecovery()) {
+      this.ambiguousTextRecoveryNeedsPasteClose = false;
+    }
+    if (this.activeSubmissionGeneration === generation) {
+      this.activeSubmissionFence = null;
+      this.activeSubmissionGeneration = null;
+      this.activeSubmissionTextTouched = false;
+      this.activeSubmissionTransportFailed = false;
+      this.activeSubmissionControlAccepted = false;
+    }
+    return true;
+  }
+
+  private resetAmbiguousRecoveryForFreshSession(): void {
+    if (!this.writeComposerRecoveryState('clean')) {
+      throw new Error('ZMX composer recovery journal could not be reset');
+    }
+    this.ambiguousTextFailureSequence = 0;
+    this.cancelledAmbiguousTextFailureSequence = 0;
+    this.attemptedAmbiguousTextRecoverySequence = 0;
+    this.ambiguousTextRecoveryUnconfirmed = false;
+    this.ambiguousTextRecoveryNeedsPasteClose = false;
+    this.activeSubmissionFence = null;
+    this.activeSubmissionGeneration = null;
+    this.activeSubmissionTextTouched = false;
+    this.activeSubmissionTransportFailed = false;
+    this.activeSubmissionControlAccepted = false;
   }
 
   /** Start the next terminal-side cooldown after this attempt has settled. */
@@ -754,7 +1154,8 @@ export class ZmxBackend implements SessionBackend {
 
   private createFreshSession(bin: string, args: string[], opts: SpawnOpts): void {
     const launch = createZmxLaunchPayload(bin, args, opts);
-    let released = false;
+    let managedIdentityVerified = false;
+    let protocolStampAttempted = false;
     try {
       const result = spawnSync('zmx', buildFreshAttachArgs(this.sessionName, launch.bootstrapPath), {
         cwd: opts.cwd,
@@ -790,39 +1191,65 @@ export class ZmxBackend implements SessionBackend {
       this.launchPid = launchPid;
       this.cliPid = launchPid;
 
-      this.stampProtocolLabels(opts, launchPid);
+      // `zmx set` is transport-ambiguous: the daemon may have committed every
+      // label even if the one-shot client times out or reports an error. From
+      // this point onward, failure cleanup must attempt the same exact
+      // UUID/PID-guarded kill used after an explicit verification.
+      protocolStampAttempted = true;
+      this.stampProtocolLabels(opts, launchPid, launch.readyNonce);
       const managed = ZmxBackend.probeManagedSession(
         this.sessionName,
         this.opts.sessionId,
         zmxControlEnv(opts),
+        { allowGated: true },
       );
       if (managed.state !== 'compatible' || managed.pid !== this.backingPid) {
         this.preserveSessionOnDestroy = true;
         throw new Error(`ZMX 会话 ${this.sessionName} 在 release 前未通过完整身份校验`);
       }
+      managedIdentityVerified = true;
       this.startTail();
       if (!this.waitForTailClient()) {
         throw new Error(`ZMX tail 未能连接会话 ${this.sessionName}`);
       }
+
+      // Prove the fresh generation's clean journal can be persisted before the
+      // bootstrap is allowed to exec the real CLI. Some adapters bake the first
+      // prompt into argv; releasing first would let that prompt run before a
+      // journal failure tears the session down, making an automatic retry
+      // capable of repeating side effects. The full managed identity and tail
+      // client are already verified above, so the old composer's debt belongs
+      // to a generation that can no longer receive input.
+      this.resetAmbiguousRecoveryForFreshSession();
 
       // The bootstrap performs one read after observing the release file. A
       // direct write has an open-before-content race, so publish a complete
       // token atomically within the same private directory.
       writeFileSync(launch.releaseTempPath, `${launch.releaseToken}\n`, { mode: 0o600, flag: 'wx' });
       renameSync(launch.releaseTempPath, launch.releasePath);
-      released = true;
+      if (!this.waitForFreshReleaseConsumption(launch, launchPid)) {
+        throw new Error(
+          `ZMX 会话 ${this.sessionName} 的 CLI release 未被稳定 launch 子进程确认`,
+        );
+      }
       // The bootstrap can now launch the CLI. Polling is required even when
       // tail emits no bytes: upstream currently drops pure UTF-8 output while
       // stripping ANSI, whereas history preserves it.
       this.requestHistoryCapture(0, true, true);
     } catch (err) {
       this.stopTailAfterLaunchFailure();
-      launch.cleanup();
-      // Before release, never kill by name: the bounded private bootstrap exits
-      // on its own and a same-name race winner must be preserved. After release
-      // the CLI may already be running, so tear down only through the frozen
-      // full-session identity and PTY-root PID.
-      if (released && this.opts.sessionId && this.backingPid != null) {
+      // Before full identity verification, never kill by name: the bounded
+      // private bootstrap exits on its own and a same-name race winner must be
+      // preserved. Once the complete UUID + frozen PTY-root PID have both been
+      // verified, tear down that exact generation even if release was never
+      // published. Otherwise an automatic retry can mistake the still-gated
+      // bootstrap for a healthy reattach target and lose input in its unread
+      // PTY before the release timeout expires.
+      if (
+        (managedIdentityVerified || protocolStampAttempted)
+        && this.opts.sessionId
+        && this.backingPid != null
+      ) {
         try {
           ZmxBackend.killManagedSession(
             this.sessionName,
@@ -833,11 +1260,15 @@ export class ZmxBackend implements SessionBackend {
         } catch (killErr) {
           this.preserveSessionOnDestroy = true;
           logger.warn(
-            `[zmx:${this.sessionName}] failed to tear down released launch after handshake error: ` +
+            `[zmx:${this.sessionName}] failed to tear down verified fresh launch after handshake error: ` +
             `${killErr instanceof Error ? killErr.message : String(killErr)}`,
           );
         }
       }
+      // Keep cli-pid available until the exact kill has signalled the PTY-root
+      // bootstrap: its HUP trap uses that file to forward termination to the
+      // gated/exec'd child. Cleanup before the kill could orphan that child.
+      launch.cleanup();
       this.lastOpts = null;
       this.backingPid = null;
       this.launchPid = null;
@@ -875,6 +1306,50 @@ export class ZmxBackend implements SessionBackend {
       sleepSync(25);
     }
     return null;
+  }
+
+  /**
+   * Do not report a fresh spawn until the gate has consumed the atomically
+   * published release token. The original child must remain attached to the
+   * frozen PTY root throughout the wait; otherwise a dead gate can leave a
+   * fully labelled, apparently compatible session that silently drops the
+   * argv-baked first prompt on an automatic reattach.
+   */
+  private waitForFreshReleaseConsumption(
+    launch: ZmxLaunchPayload,
+    expectedLaunchPid: number,
+  ): boolean {
+    const deadline = Date.now() + FRESH_RELEASE_ACK_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      const releasePending = existsSync(launch.releasePath);
+      try {
+        const observedLaunchPid = Number(
+          readFileSync(launch.cliPidPath, 'utf8').trim(),
+        );
+        if (
+          observedLaunchPid !== expectedLaunchPid
+          || this.backingPid == null
+          || readProcessParentPid(observedLaunchPid) !== this.backingPid
+        ) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      if (!releasePending) {
+        const commandLine = readProcessCommandLine(expectedLaunchPid);
+        if (!commandLine) return false;
+        if (
+          !commandLine.includes(
+            `${ZMX_GATE_PROCESS_MARKER_PREFIX}${launch.readyNonce}`,
+          )
+        ) {
+          return true;
+        }
+      }
+      sleepSync(25);
+    }
+    return false;
   }
 
   private readManagedLaunchPid(opts: SpawnOpts, expectedBackingPid: number): number {
@@ -955,10 +1430,15 @@ export class ZmxBackend implements SessionBackend {
     return false;
   }
 
-  private stampProtocolLabels(opts: SpawnOpts, launchPid: number): void {
+  private stampProtocolLabels(
+    opts: SpawnOpts,
+    launchPid: number,
+    gateNonce: string,
+  ): void {
     const labels = [`${ZMX_TRANSPORT_LABEL}=${ZMX_TRANSPORT}`];
     if (this.opts.sessionId) labels.push(`${ZMX_SESSION_LABEL}=${this.opts.sessionId}`);
     labels.push(`${ZMX_LAUNCH_PID_LABEL}=${launchPid}`);
+    labels.push(`${ZMX_GATE_NONCE_LABEL}=${gateNonce}`);
     const stdout = execFileSync('zmx', ['set', this.sessionName, ...labels], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1408,10 +1888,36 @@ export class ZmxBackend implements SessionBackend {
         '当前 send 协议没有 ACK/backpressure，已在写入任何前缀前拒绝',
       );
     }
+    const isRecoveryCtrlC = intent === 'control'
+      && bytes.length === 1
+      && bytes[0] === 0x03;
+    if (this.hasAmbiguousRecoveryDebt()) {
+      if (intent === 'text' || !isRecoveryCtrlC || this.ambiguousTextRecoveryUnconfirmed) {
+        logger.error(
+          `[zmx:${this.sessionName}] input blocked: ambiguous composer recovery is ` +
+          `${this.ambiguousTextRecoveryUnconfirmed ? 'unconfirmed' : 'pending'}`,
+        );
+        return false;
+      }
+    }
+
+    const ownsTextGeneration = intent === 'text'
+      && this.activeSubmissionGeneration == null;
+    const textGeneration = intent === 'text'
+      ? (this.activeSubmissionGeneration ?? this.armAmbiguousTextGeneration())
+      : 0;
+    if (textGeneration == null) return false;
+
+    // Arm first, then perform the one complete backing-identity probe nearest
+    // the PTY write. A crash before the probe only leaves a conservative
+    // pending marker; no replacement session can receive the bytes.
     const identity = this.verifyBackingIdentity('send');
     if (identity.state !== 'compatible') {
       if (identity.state === 'unknown') {
         logger.warn(`[zmx:${this.sessionName}] send blocked: ${identity.reason}`);
+      }
+      if (ownsTextGeneration && textGeneration > 0) {
+        this.markAmbiguousGenerationCovered(textGeneration);
       }
       return false;
     }
@@ -1424,7 +1930,7 @@ export class ZmxBackend implements SessionBackend {
       // ZMX strips exactly one trailing LF from piped stdin. Appending our own
       // framing LF therefore preserves the caller's original bytes exactly,
       // including an original trailing LF, while keeping secrets out of argv.
-      const input = Buffer.concat([chunk, Buffer.from('\n')]);
+      let input = Buffer.concat([chunk, Buffer.from('\n')]);
       // A failed send has no PTY-level ACK: the current chunk may or may not
       // have reached the CLI. Track both possible states. Looking only at the
       // confirmed prefix misses an opening marker in a first ambiguous frame;
@@ -1434,8 +1940,12 @@ export class ZmxBackend implements SessionBackend {
       const mayHaveOpenPasteAfterAmbiguousSend = bracketedPaste
         || explicitPasteOpenAtBoundary?.[chunkIndex] === true
         || explicitPasteOpenAtBoundary?.[chunkIndex + 1] === true;
+      let injectedCancelAttempt = false;
+      let recoveryGeneration = 0;
       try {
-        let injectedCancelAttempt = false;
+        if (intent === 'text' && this.activeSubmissionGeneration != null) {
+          this.activeSubmissionTextTouched = true;
+        }
         if (intent === 'control' && chunk.includes(0x03)) {
           this.waitForInjectedCancelCooldown();
           const postCooldownIdentity = this.verifyBackingIdentity('control-key cooldown');
@@ -1446,7 +1956,27 @@ export class ZmxBackend implements SessionBackend {
             );
             return false;
           }
-          this.markAmbiguousGenerationCovered();
+          if (this.hasAmbiguousRecoveryDebt()) {
+            if (
+              this.attemptedAmbiguousTextRecoverySequence
+              >= this.ambiguousTextFailureSequence
+            ) {
+              logger.error(
+                `[zmx:${this.sessionName}] refused duplicate ambiguous composer recovery`,
+              );
+              return false;
+            }
+            const startedRecovery = this.markAmbiguousRecoveryAttempted();
+            if (startedRecovery == null) return false;
+            recoveryGeneration = startedRecovery;
+            if (this.ambiguousTextRecoveryNeedsPasteClose) {
+              input = Buffer.concat([
+                Buffer.from(BRACKETED_PASTE_END),
+                chunk,
+                Buffer.from('\n'),
+              ]);
+            }
+          }
           injectedCancelAttempt = true;
         }
         let stdout: string;
@@ -1465,12 +1995,20 @@ export class ZmxBackend implements SessionBackend {
         // Several ZMX control-plane failures are reported on stdout with exit
         // status 0. Empty stdout is part of the transport contract.
         if (stdout.trim()) {
+          if (recoveryGeneration > 0) {
+            this.ambiguousTextRecoveryUnconfirmed = true;
+          } else if (
+            intent === 'control'
+            && this.activeSubmissionGeneration != null
+          ) {
+            this.markActiveSubmissionUnconfirmed();
+          }
           logger.warn(`[zmx:${this.sessionName}] send rejected: ${stdout.trim()}`);
+          if (intent === 'text') {
+            this.markArmedTextFailure(mayHaveOpenPasteAfterAmbiguousSend);
+          }
           const probe = this.verifyBackingIdentity('send rejection');
           const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
-          if (probe.state === 'compatible' && intent === 'text') {
-            this.ambiguousTextFailureSequence += 1;
-          }
           if (closeOpenPaste || offset > 0) {
             if (probe.state === 'compatible') {
               this.abortPartialSend(closeOpenPaste);
@@ -1483,7 +2021,32 @@ export class ZmxBackend implements SessionBackend {
           }
           return false;
         }
+        if (recoveryGeneration > 0) {
+          // ZMX v0.7 reports only control-client acceptance, not a PTY ACK; it
+          // may still drop a byte when its pty_write_buf is full. Keep the
+          // durable state unconfirmed even after empty stdout so later prompts
+          // cannot append to a composer that Ctrl+C may not have cleared.
+          this.ambiguousTextRecoveryUnconfirmed = true;
+          return false;
+        } else if (
+          intent === 'control'
+          && this.activeSubmissionGeneration != null
+          && this.activeSubmissionTextTouched
+        ) {
+          this.activeSubmissionControlAccepted = true;
+        }
       } catch (err) {
+        if (recoveryGeneration > 0) {
+          this.ambiguousTextRecoveryUnconfirmed = true;
+        } else if (
+          intent === 'control'
+          && this.activeSubmissionGeneration != null
+        ) {
+          this.markActiveSubmissionUnconfirmed();
+        }
+        if (intent === 'text') {
+          this.markArmedTextFailure(mayHaveOpenPasteAfterAmbiguousSend);
+        }
         const probe = this.verifyBackingIdentity('send failure');
         logger.warn(
           `[zmx:${this.sessionName}] send failed (${probe.state}): ` +
@@ -1492,9 +2055,6 @@ export class ZmxBackend implements SessionBackend {
         // Never retry an ambiguous send: ZMX has no PTY-level ACK, so retrying
         // can duplicate a prompt that the daemon already queued.
         const closeOpenPaste = mayHaveOpenPasteAfterAmbiguousSend;
-        if (probe.state === 'compatible' && intent === 'text') {
-          this.ambiguousTextFailureSequence += 1;
-        }
         if (closeOpenPaste || offset > 0) {
           if (probe.state === 'compatible') {
             this.abortPartialSend(closeOpenPaste);
@@ -1508,27 +2068,46 @@ export class ZmxBackend implements SessionBackend {
         return false;
       }
     }
+    if (ownsTextGeneration
+      && textGeneration > 0
+      && !this.markAmbiguousGenerationCovered(textGeneration)) {
+      return false;
+    }
     this.requestHistoryCapture(HISTORY_TAIL_DEBOUNCE_MS, true);
     return true;
   }
 
-  private abortPartialSend(closeOpenPaste: boolean): void {
-    if (!this.lastOpts) return;
+  private abortPartialSend(
+    closeOpenPaste: boolean,
+  ): AmbiguousSubmissionRecoveryFailure | undefined {
+    if (this.ambiguousTextRecoveryUnconfirmed) return 'recovery-unconfirmed';
+    if (!this.hasPendingAmbiguousTextRecovery()) return undefined;
+    if (!this.lastOpts) return 'recovery-pending';
+    if (
+      this.attemptedAmbiguousTextRecoverySequence
+      >= this.ambiguousTextFailureSequence
+    ) {
+      this.ambiguousTextRecoveryUnconfirmed = true;
+      return 'recovery-unconfirmed';
+    }
     // A failed multi-frame paste may have delivered the opening marker but not
     // its close. Best-effort close it first, then cancel the partial composer
     // so a later retry cannot append to/trivially submit truncated input.
-    const recovery = closeOpenPaste ? `${BRACKETED_PASTE_END}\x03` : '\x03';
+    const recovery = closeOpenPaste || this.ambiguousTextRecoveryNeedsPasteClose
+      ? `${BRACKETED_PASTE_END}\x03`
+      : '\x03';
+    this.waitForInjectedCancelCooldown();
+    const postCooldownIdentity = this.verifyBackingIdentity('partial-send recovery cooldown');
+    if (postCooldownIdentity.state !== 'compatible') {
+      logger.warn(
+        `[zmx:${this.sessionName}] skipped partial-send recovery after cooldown: ` +
+        `backing identity is ${postCooldownIdentity.state}`,
+      );
+      return 'recovery-pending';
+    }
+    const recoveryGeneration = this.markAmbiguousRecoveryAttempted();
+    if (recoveryGeneration == null) return 'recovery-unconfirmed';
     try {
-      this.waitForInjectedCancelCooldown();
-      const postCooldownIdentity = this.verifyBackingIdentity('partial-send recovery cooldown');
-      if (postCooldownIdentity.state !== 'compatible') {
-        logger.warn(
-          `[zmx:${this.sessionName}] skipped partial-send recovery after cooldown: ` +
-          `backing identity is ${postCooldownIdentity.state}`,
-        );
-        return;
-      }
-      this.markAmbiguousGenerationCovered();
       let stdout: string;
       try {
         stdout = execFileSync('zmx', ['send', this.sessionName], {
@@ -1545,14 +2124,25 @@ export class ZmxBackend implements SessionBackend {
         this.noteInjectedCancelAttemptSettled();
       }
       if (stdout.trim()) throw new Error(stdout.trim());
-      logger.warn(`[zmx:${this.sessionName}] cancelled a partially delivered input sequence`);
+      // Empty stdout confirms only that the one-shot client was accepted. ZMX
+      // has no daemon→PTY ACK and can silently drop a full-buffer write, so the
+      // recovery remains poisoned until a fresh backend generation.
+      this.ambiguousTextRecoveryUnconfirmed = true;
+      logger.warn(
+        `[zmx:${this.sessionName}] attempted partial-input cancellation; ` +
+        'PTY delivery remains unconfirmed and automatic input stays blocked',
+      );
     } catch (err) {
+      this.ambiguousTextRecoveryUnconfirmed = true;
       logger.error(
         `[zmx:${this.sessionName}] unable to cancel partially delivered input; ` +
         `manual session recovery may be required: ${err instanceof Error ? err.message : String(err)}`,
       );
+      this.requestHistoryCapture(0, true, true);
+      return 'recovery-unconfirmed';
     }
     this.requestHistoryCapture(0, true, true);
+    return 'recovery-unconfirmed';
   }
 
   private startTail(): void {
@@ -1786,7 +2376,7 @@ export function buildZmxLaunchFiles(
   const gateCommand = [
     '/bin/sh',
     '-c', shellSingleQuote(gateScript),
-    '_',
+    shellSingleQuote(`${ZMX_GATE_PROCESS_MARKER_PREFIX}${readyNonce}`),
     '"$payload_path"',
     '"$ready_path"',
     '"$release_path"',

@@ -51,20 +51,45 @@ export interface SpawnOpts {
   launchShell?: string;
 }
 
+export type AmbiguousSubmissionRecoveryFailure =
+  | 'recovery-pending'
+  | 'recovery-unconfirmed';
+
+/** Raised before a logical write when an older ambiguous composer transaction
+ * already owns the backend. Callers must not rotate turn attribution or touch
+ * the terminal after this error. */
+export class AmbiguousSubmissionBlockedError extends Error {
+  constructor(readonly failure: AmbiguousSubmissionRecoveryFailure) {
+    super(`ambiguous submission blocked: ${failure}`);
+    this.name = 'AmbiguousSubmissionBlockedError';
+  }
+}
+
 export interface SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   write(data: string): void;
   /**
-   * Snapshot the backend's text-write failure generation before one logical
-   * adapter submission. Backends without ambiguous transport writes omit it.
+   * Begin one logical adapter submission and return its recovery fence.
+   * Backends with a persistent ambiguity journal may arm it here so all
+   * adapter-level text chunks plus the final submit key share one transaction.
    */
   captureAmbiguousSubmissionFence?(): number;
   /**
-   * Best-effort cleanup for a text write that became ambiguous after `fence`.
-   * The backend owns deduplication against any frame-level recovery it already
-   * injected. Control/navigation-key failures are deliberately excluded.
+   * Commit a logical adapter submission after its write call returns. A
+   * recovery failure keeps the backend fail-closed and must be surfaced by the
+   * worker instead of treating the adapter result as safely delivered.
    */
-  cancelAmbiguousSubmission?(fence: number): void;
+  confirmAmbiguousSubmission?(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined;
+  /**
+   * Best-effort cleanup for a logical write that failed after `fence`. The
+   * backend owns deduplication against frame-level recovery and must poison
+   * control-key outcomes that cannot safely be retried.
+   */
+  cancelAmbiguousSubmission?(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): void;
   /**

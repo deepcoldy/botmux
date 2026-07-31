@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync, writeFileSync, writeSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const childMocks = vi.hoisted(() => {
   class FakeStream {
@@ -66,7 +77,14 @@ const childMocks = vi.hoisted(() => {
 
 const fsMocks = vi.hoisted(() => ({
   readFileSync: vi.fn(),
+  renameSync: vi.fn(),
   actualReadFileSync: null as null | ((...args: any[]) => any),
+  actualRenameSync: null as null | ((...args: any[]) => any),
+}));
+
+const durabilityMocks = vi.hoisted(() => ({
+  fsyncDirectorySyncPortable: vi.fn(),
+  actualFsyncDirectorySyncPortable: null as null | ((path: string) => void),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -83,14 +101,25 @@ vi.mock('node:child_process', async (importOriginal) => {
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>();
   fsMocks.actualReadFileSync = actual.readFileSync as (...args: any[]) => any;
+  fsMocks.actualRenameSync = actual.renameSync as (...args: any[]) => any;
   return {
     ...actual,
     readFileSync: fsMocks.readFileSync,
+    renameSync: fsMocks.renameSync,
+  };
+});
+
+vi.mock('../src/utils/fs-durability.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/utils/fs-durability.js')>();
+  durabilityMocks.actualFsyncDirectorySyncPortable =
+    actual.fsyncDirectorySyncPortable;
+  return {
+    ...actual,
+    fsyncDirectorySyncPortable: durabilityMocks.fsyncDirectorySyncPortable,
   };
 });
 
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
-import { TERMINAL_CANCEL_COOLDOWN_MS } from '../src/adapters/backend/critical-control-key.js';
 
 const SESSION = 'bmx-test0001';
 const SESSION_ID = 'test0001-1111-2222-3333-444444444444';
@@ -104,6 +133,9 @@ interface FakeZmxState {
   transport: string;
   sessionId: string;
   launchPid: number;
+  launchParentPid: number;
+  launchCommand: string;
+  gateNonce: string;
   history: string;
   historyStderr: string;
   sendInputs: Buffer[];
@@ -111,12 +143,18 @@ interface FakeZmxState {
   failSendAt: number | null;
   throwOnFailedSend: boolean;
   replaceOnFailedSend: boolean;
+  failGetsAfterSend: number;
+  failedGetAfterSendCount: number;
   deferHistory: boolean;
   readyPath: string | null;
+  releasePath: string | null;
+  cliPidPath: string | null;
+  releaseBehavior: 'consume' | 'leave' | 'die';
 }
 
 let state: FakeZmxState;
 const backends: ZmxBackend[] = [];
+const recoveryStateDirs: string[] = [];
 
 function zmxList(): string {
   if (!state.exists) return '';
@@ -129,14 +167,34 @@ function extractShellAssignment(script: string, name: string): string {
   return match[1]!;
 }
 
-function makeBackend(opts: { reattach?: boolean } = {}): ZmxBackend {
+function makeBackend(opts: { reattach?: boolean; recoveryStateDir?: string } = {}): ZmxBackend {
   const backend = new ZmxBackend(SESSION, {
     ownsSession: true,
     isReattach: opts.reattach ?? false,
     sessionId: SESSION_ID,
+    recoveryStateDir: opts.recoveryStateDir,
   });
   backends.push(backend);
   return backend;
+}
+
+function makeRecoveryStateDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-zmx-recovery-'));
+  recoveryStateDirs.push(dir);
+  return dir;
+}
+
+function recoveryStatePath(dir: string): string {
+  const key = createHash('sha256').update(SESSION_ID).digest('hex');
+  return join(dir, 'zmx-composer-recovery', `${key}.json`);
+}
+
+function readRecoveryState(dir: string): {
+  version: number;
+  sessionId: string;
+  state: string;
+} {
+  return JSON.parse(readFileSync(recoveryStatePath(dir), 'utf8'));
 }
 
 function spawnBackend(backend = makeBackend()): ZmxBackend {
@@ -186,6 +244,9 @@ describe('ZmxBackend history-authoritative transport', () => {
       transport: '',
       sessionId: '',
       launchPid: process.pid,
+      launchParentPid: process.ppid,
+      launchCommand: '/bin/sh -c echo ready',
+      gateNonce: '0123456789abcdef0123456789abcdef',
       history: '',
       historyStderr: '',
       sendInputs: [],
@@ -193,8 +254,13 @@ describe('ZmxBackend history-authoritative transport', () => {
       failSendAt: null,
       throwOnFailedSend: false,
       replaceOnFailedSend: false,
+      failGetsAfterSend: 0,
+      failedGetAfterSendCount: 0,
       deferHistory: false,
       readyPath: null,
+      releasePath: null,
+      cliPidPath: null,
+      releaseBehavior: 'consume',
     };
     backends.length = 0;
     childMocks.children.length = 0;
@@ -203,21 +269,53 @@ describe('ZmxBackend history-authoritative transport', () => {
     childMocks.spawn.mockReset();
     childMocks.spawnSync.mockReset();
     fsMocks.readFileSync.mockReset();
-    fsMocks.readFileSync.mockImplementation((...args: any[]) => fsMocks.actualReadFileSync!(...args));
+    fsMocks.readFileSync.mockImplementation((...args: any[]) => {
+      if (String(args[0]) === `/proc/${state.launchPid}/cmdline`) {
+        return Buffer.from(`${state.launchCommand}\0`, 'utf8');
+      }
+      return fsMocks.actualReadFileSync!(...args);
+    });
+    fsMocks.renameSync.mockReset();
+    fsMocks.renameSync.mockImplementation((...args: any[]) => {
+      const result = fsMocks.actualRenameSync!(...args);
+      const destination = String(args[1]);
+      if (state.releasePath && destination === state.releasePath) {
+        if (state.releaseBehavior === 'consume') {
+          rmSync(destination, { force: true });
+          state.launchCommand = '/bin/sh -c echo ready';
+        } else if (state.releaseBehavior === 'die' && state.cliPidPath) {
+          rmSync(state.cliPidPath, { force: true });
+        }
+      }
+      return result;
+    });
+    durabilityMocks.fsyncDirectorySyncPortable.mockReset();
+    durabilityMocks.fsyncDirectorySyncPortable.mockImplementation(
+      (path: string) => durabilityMocks.actualFsyncDirectorySyncPortable!(path),
+    );
 
     childMocks.execFileSync.mockImplementation((_file: string, argv: string[], options?: any) => {
-      if (_file === '/usr/bin/ps') {
+      if (_file === '/usr/bin/ps' || _file === '/bin/ps') {
         const pid = Number(argv.at(-1));
-        return pid === state.launchPid ? `${state.pid}\n` : '';
+        if (pid !== state.launchPid) return '';
+        return argv.includes('command=')
+          ? `${state.launchCommand}\n`
+          : `${state.launchParentPid}\n`;
       }
       const [command, ...args] = argv;
       if (command === 'list' && args[0] === '--short') return state.exists ? `${SESSION}\n` : '';
       if (command === 'list') return zmxList();
       if (command === 'get') {
+        if (state.failGetsAfterSend > 0 && state.sendInputs.length > 0) {
+          state.failGetsAfterSend -= 1;
+          state.failedGetAfterSendCount += 1;
+          throw new Error(`zmx get ${SESSION} timed out`);
+        }
         if (args[1] === 'botmux.transport') return state.transport;
         if (args[1] === 'botmux.session') return state.sessionId;
         if (args[1] === 'botmux.launch_pid') return `${state.launchPid}\n`;
-        return `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\n`;
+        if (args[1] === 'botmux.gate_nonce') return `${state.gateNonce}\n`;
+        return `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\nbotmux.gate_nonce=${state.gateNonce}\n`;
       }
       if (command === 'set') {
         for (const assignment of args.slice(1)) {
@@ -225,6 +323,7 @@ describe('ZmxBackend history-authoritative transport', () => {
           if (key === 'botmux.transport') state.transport = value;
           if (key === 'botmux.session') state.sessionId = value;
           if (key === 'botmux.launch_pid') state.launchPid = Number(value);
+          if (key === 'botmux.gate_nonce') state.gateNonce = value;
         }
         return '';
       }
@@ -260,7 +359,7 @@ describe('ZmxBackend history-authoritative transport', () => {
         }
         callback(
           null,
-          `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\n`,
+          `botmux.transport=${state.transport}\nbotmux.session=${state.sessionId}\nbotmux.launch_pid=${state.launchPid}\nbotmux.gate_nonce=${state.gateNonce}\n`,
           '',
         );
       });
@@ -271,9 +370,15 @@ describe('ZmxBackend history-authoritative transport', () => {
       const bootstrapPath = argv.at(-1)!;
       const bootstrap = readFileSync(bootstrapPath, 'utf8');
       const readyPath = extractShellAssignment(bootstrap, 'ready_path');
+      const releasePath = extractShellAssignment(bootstrap, 'release_path');
       const cliPidPath = extractShellAssignment(bootstrap, 'cli_pid_path');
       const readyNonce = extractShellAssignment(bootstrap, 'ready_nonce');
       state.readyPath = readyPath;
+      state.releasePath = releasePath;
+      state.cliPidPath = cliPidPath;
+      state.gateNonce = readyNonce;
+      state.launchCommand =
+        `sh -c gate botmux-zmx-private-release-gate-v1:${readyNonce}`;
       state.exists = true;
       state.command = `/bin/sh ${bootstrapPath}`;
       writeFileSync(cliPidPath, `${state.launchPid}\n`, { mode: 0o600 });
@@ -307,6 +412,9 @@ describe('ZmxBackend history-authoritative transport', () => {
 
   afterEach(() => {
     for (const backend of backends) backend.kill();
+    for (const dir of recoveryStateDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
     vi.useRealTimers();
   });
 
@@ -323,6 +431,94 @@ describe('ZmxBackend history-authoritative transport', () => {
 
     expect(() => spawnBackend()).not.toThrow();
     expect(readyReads).toBe(3);
+  });
+
+  it('reports a fresh spawn only after the gate consumes the release token', () => {
+    expect(() => spawnBackend()).not.toThrow();
+    expect(state.releasePath).not.toBeNull();
+    expect(existsSync(state.releasePath!)).toBe(false);
+    expect(state.cliPidPath).not.toBeNull();
+    expect(readFileSync(state.cliPidPath!, 'utf8').trim())
+      .toBe(String(state.launchPid));
+  });
+
+  it('tears down an exact fresh session when the gate dies before release acknowledgement', () => {
+    state.releaseBehavior = 'die';
+
+    expect(() => spawnBackend())
+      .toThrow(/CLI release 未被稳定 launch 子进程确认/);
+    expect(state.exists).toBe(false);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) =>
+      argv[0] === 'kill' && argv[1] === SESSION && argv[2] === '--force',
+    )).toBe(true);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('times out and tears down an exact fresh session when no gate consumes the release token', () => {
+    state.releaseBehavior = 'leave';
+    let now = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => {
+      now += 1_000;
+      return now;
+    });
+    try {
+      expect(() => spawnBackend())
+        .toThrow(/CLI release 未被稳定 launch 子进程确认/);
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(state.exists).toBe(false);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) =>
+      argv[0] === 'kill' && argv[1] === SESSION && argv[2] === '--force',
+    )).toBe(true);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('refuses to reattach a fully labelled generation that is still waiting at the private gate', () => {
+    state.exists = true;
+    state.command = '/bin/sh private-gate';
+    state.transport = 'tail-send-v1';
+    state.sessionId = SESSION_ID;
+    state.launchParentPid = state.pid;
+    state.launchCommand =
+      `sh -c gate botmux-zmx-private-release-gate-v1:${state.gateNonce}`;
+
+    const probe = ZmxBackend.probeManagedSession(SESSION, SESSION_ID);
+    expect(probe).toMatchObject({
+      state: 'unknown',
+      reason: expect.stringMatching(/仍在等待私有启动门禁放行/),
+    });
+
+    expect(() => spawnBackend(makeBackend({ reattach: true })))
+      .toThrow(/仍在等待私有启动门禁放行/);
+    expect(() => ZmxBackend.killManagedSession(SESSION, SESSION_ID))
+      .toThrow(/仍在等待私有启动门禁放行/);
+    expect(state.exists).toBe(true);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) => argv[0] === 'kill'))
+      .toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('does not trust fully stamped same-name pollution whose launch PID is not a child', () => {
+    state.exists = true;
+    state.pid = process.pid;
+    state.command = '/usr/bin/foreign-agent';
+    state.transport = 'tail-send-v1';
+    state.sessionId = SESSION_ID;
+    state.launchParentPid = process.ppid;
+    state.launchCommand = '/usr/bin/foreign-agent';
+
+    const probe = ZmxBackend.probeManagedSession(SESSION, SESSION_ID);
+    expect(probe).toMatchObject({
+      state: 'unknown',
+      reason: expect.stringMatching(/launch PID 标签无效或已脱离 PTY root/),
+    });
+    expect(() => ZmxBackend.killManagedSession(SESSION, SESSION_ID))
+      .toThrow(/launch PID 标签无效或已脱离 PTY root/);
+    expect(state.exists).toBe(true);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) => argv[0] === 'kill'))
+      .toBe(false);
   });
 
   it('uses tail only as a change signal and publishes Unicode from history', async () => {
@@ -503,20 +699,26 @@ describe('ZmxBackend history-authoritative transport', () => {
 
   it('returns false on a rejected single-frame send without emitting a generic compensation frame', () => {
     const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
 
     state.failSendAt = 1;
     expect(backend.sendText('short input')).toBe(false);
     expect(state.sendInputs).toHaveLength(1);
     expect(state.sendInputs[0]!.subarray(0, -1).toString()).toBe('short input');
 
+    state.failSendAt = null;
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    expect(backend.sendText('must remain blocked')).toBe(false);
+
+    const controlBackend = spawnBackend(makeBackend({ reattach: true }));
     state.sendInputs.length = 0;
     state.failSendAt = 1;
-    expect(backend.sendSpecialKeys('Enter')).toBe(false);
+    expect(controlBackend.sendSpecialKeys('Enter')).toBe(false);
     expect(state.sendInputs).toHaveLength(1);
     expect(state.sendInputs[0]!.subarray(0, -1).toString()).toBe('\r');
   });
 
-  it('cancels a logical prompt whose later independent sendText call fails ambiguously', () => {
+  it('attempts cancellation and freezes a logical prompt whose later sendText fails ambiguously', () => {
     const backend = spawnBackend();
     const fence = backend.captureAmbiguousSubmissionFence();
 
@@ -526,148 +728,586 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(backend.sendText('ambiguous third chunk')).toBe(false);
     expect(state.sendInputs).toHaveLength(3);
 
-    backend.cancelAmbiguousSubmission(fence);
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
     expect(state.sendInputs).toHaveLength(4);
     expect(state.sendInputs[3]!.toString()).toBe('\x03\n');
 
-    backend.cancelAmbiguousSubmission(fence);
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    expect(backend.sendText('must remain blocked')).toBe(false);
     expect(state.sendInputs).toHaveLength(4);
   });
 
-  it('does not let a previous failure cancellation suppress a new ambiguous generation', () => {
-    const backend = spawnBackend();
-    const firstFence = backend.captureAmbiguousSubmissionFence();
-
-    state.failSendAt = 1;
-    expect(backend.sendText('first ambiguous prompt')).toBe(false);
-    backend.cancelAmbiguousSubmission(firstFence);
-    expect(state.sendInputs.map(input => input.toString())).toEqual([
-      'first ambiguous prompt\n',
-      '\x03\n',
-    ]);
-
-    const secondFence = backend.captureAmbiguousSubmissionFence();
-    state.failSendAt = 4;
-    expect(backend.sendText('second confirmed prefix')).toBe(true);
-    expect(backend.sendText('second ambiguous suffix')).toBe(false);
-    backend.cancelAmbiguousSubmission(secondFence);
-
-    expect(state.sendInputs.map(input => input.toString())).toEqual([
-      'first ambiguous prompt\n',
-      '\x03\n',
-      'second confirmed prefix\n',
-      'second ambiguous suffix\n',
-      '\x03\n',
-    ]);
-    expect(state.sendTimes[4]! - state.sendTimes[1]!).toBeGreaterThanOrEqual(
-      TERMINAL_CANCEL_COOLDOWN_MS,
-    );
-  });
-
   it.each([
-    'logical recovery',
-    'adapter control',
+    ['stdout rejection', false],
+    ['timeout', true],
   ] as const)(
-    'starts the next cancel cooldown after a slow $firstAttempt settles',
-    (firstAttempt) => {
+    'keeps cancellation debt after %s when the post-send identity probe is unknown',
+    (_failureKind, throwOnFailedSend) => {
       const backend = spawnBackend();
-      const originalExecFileSync = childMocks.execFileSync.getMockImplementation()!;
-      let now = 10_000;
-      let firstRecoverySettledAt = 0;
-      let delayedFirstRecovery = false;
-      const dateNow = vi.spyOn(Date, 'now').mockImplementation(() => now);
-      const atomicsWait = vi.spyOn(Atomics, 'wait').mockImplementation(
-        (_array, _index, _value, timeout) => {
-          now += typeof timeout === 'number' ? timeout : 0;
-          return 'timed-out';
-        },
-      );
-      childMocks.execFileSync.mockImplementation((...args: any[]) => {
-        const result = originalExecFileSync(...args);
-        const input = Buffer.from(args[2]?.input ?? '');
-        if (args[1]?.[0] === 'send' && input.includes(0x03) && !delayedFirstRecovery) {
-          delayedFirstRecovery = true;
-          now += TERMINAL_CANCEL_COOLDOWN_MS + 100;
-          firstRecoverySettledAt = now;
-        }
-        return result;
-      });
+      const fence = backend.captureAmbiguousSubmissionFence();
 
-      try {
-        const firstFence = backend.captureAmbiguousSubmissionFence();
-        state.failSendAt = 1;
-        expect(backend.sendText('first ambiguous prompt')).toBe(false);
-        if (firstAttempt === 'logical recovery') {
-          backend.cancelAmbiguousSubmission(firstFence);
-        } else {
-          state.failSendAt = null;
-          expect(backend.sendSpecialKeys('C-c')).toBe(true);
-          backend.cancelAmbiguousSubmission(firstFence);
-        }
+      state.failSendAt = 1;
+      state.throwOnFailedSend = throwOnFailedSend;
+      state.failGetsAfterSend = 1;
+      expect(backend.sendText('ambiguous prompt')).toBe(false);
+      expect(state.failedGetAfterSendCount).toBe(1);
 
-        const secondFence = backend.captureAmbiguousSubmissionFence();
-        state.failSendAt = 4;
-        expect(backend.sendText('second confirmed prefix')).toBe(true);
-        expect(backend.sendText('second ambiguous suffix')).toBe(false);
-        backend.cancelAmbiguousSubmission(secondFence);
-
-        expect(firstRecoverySettledAt).toBeGreaterThan(0);
-        expect(state.sendTimes[4]! - firstRecoverySettledAt).toBeGreaterThanOrEqual(
-          TERMINAL_CANCEL_COOLDOWN_MS,
-        );
-      } finally {
-        childMocks.execFileSync.mockImplementation(originalExecFileSync);
-        atomicsWait.mockRestore();
-        dateNow.mockRestore();
-      }
+      state.failSendAt = null;
+      state.throwOnFailedSend = false;
+      expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+      expect(state.sendInputs.map(input => input.toString())).toEqual([
+        'ambiguous prompt\n',
+        '\x03\n',
+      ]);
+      expect(backend.sendText('must remain blocked')).toBe(false);
+      expect(state.sendInputs).toHaveLength(2);
     },
   );
 
-  it('treats an adapter Ctrl+C after a text failure as recovery for that generation', () => {
+  it('keeps text blocked when both post-send and cancellation probes are unknown', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    state.failGetsAfterSend = 2;
+    expect(backend.sendText('ambiguous prompt')).toBe(false);
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-pending');
+    expect(state.failedGetAfterSendCount).toBe(2);
+
+    state.failSendAt = null;
+    expect(backend.sendText('must not append')).toBe(false);
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'ambiguous prompt\n',
+    ]);
+  });
+
+  it('remembers to close bracketed paste when the post-send probe is unknown', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    state.failGetsAfterSend = 1;
+    expect(() => backend.pasteText('ambiguous paste')).toThrow(/粘贴发送失败/);
+    expect(state.failedGetAfterSendCount).toBe(1);
+
+    state.failSendAt = null;
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    expect(state.sendInputs).toHaveLength(2);
+    expect(state.sendInputs[0]!.subarray(0, 6).toString()).toBe('\x1b[200~');
+    expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+    expect(backend.sendText('must remain blocked')).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
+  });
+
+  it('closes a possibly open paste before an explicit recovery Ctrl+C', () => {
+    const backend = spawnBackend();
+
+    state.failSendAt = 1;
+    state.failGetsAfterSend = 1;
+    expect(() => backend.pasteText('ambiguous paste')).toThrow(/粘贴发送失败/);
+
+    state.failSendAt = null;
+    expect(backend.sendSpecialKeys('C-c')).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
+    expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
+    expect(() => backend.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+    expect(backend.sendText('must remain blocked')).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
+  });
+
+  it('does not treat a combined control payload as recovery Ctrl+C', () => {
     const backend = spawnBackend();
     const fence = backend.captureAmbiguousSubmissionFence();
 
     state.failSendAt = 1;
     expect(backend.sendText('ambiguous prompt')).toBe(false);
     state.failSendAt = null;
-    expect(backend.sendSpecialKeys('C-c')).toBe(true);
-    backend.cancelAmbiguousSubmission(fence);
+    expect(backend.sendSpecialKeys('Enter', 'C-c')).toBe(false);
+    expect(state.sendInputs).toHaveLength(1);
+
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    expect(state.sendInputs[1]!.toString()).toBe('\x03\n');
+    expect(backend.sendText('must remain blocked')).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
+  });
+
+  it.each([
+    ['abnormal stdout', false],
+    ['timeout', true],
+  ] as const)(
+    'poisons further input when partial-send recovery has %s',
+    (_failureKind, throwOnFailedSend) => {
+      const backend = spawnBackend();
+      const fence = backend.captureAmbiguousSubmissionFence();
+
+      state.failSendAt = 1;
+      expect(backend.sendText('ambiguous prompt')).toBe(false);
+
+      state.failSendAt = 2;
+      state.throwOnFailedSend = throwOnFailedSend;
+      expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+      expect(state.sendInputs.map(input => input.toString())).toEqual([
+        'ambiguous prompt\n',
+        '\x03\n',
+      ]);
+
+      state.failSendAt = null;
+      state.throwOnFailedSend = false;
+      expect(backend.sendText('must not append')).toBe(false);
+      expect(backend.sendSpecialKeys('C-c')).toBe(false);
+      expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+      expect(state.sendInputs.map(input => input.toString())).toEqual([
+        'ambiguous prompt\n',
+        '\x03\n',
+      ]);
+    },
+  );
+
+  it.each([
+    ['abnormal stdout', false],
+    ['timeout', true],
+  ] as const)(
+    'poisons an explicit recovery Ctrl+C after %s',
+    (_failureKind, throwOnFailedSend) => {
+      const backend = spawnBackend();
+      const fence = backend.captureAmbiguousSubmissionFence();
+
+      state.failSendAt = 1;
+      expect(backend.sendText('ambiguous prompt')).toBe(false);
+
+      state.failSendAt = 2;
+      state.throwOnFailedSend = throwOnFailedSend;
+      expect(backend.sendSpecialKeys('C-c')).toBe(false);
+      expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+
+      state.failSendAt = null;
+      state.throwOnFailedSend = false;
+      expect(backend.sendText('must not append')).toBe(false);
+      expect(state.sendInputs.map(input => input.toString())).toEqual([
+        'ambiguous prompt\n',
+        '\x03\n',
+      ]);
+    },
+  );
+
+  it.each([
+    ['pending debt', false],
+    ['unconfirmed recovery', true],
+  ] as const)(
+    'restores %s as poison when a new worker reattaches',
+    (_journalState, attemptRecovery) => {
+      const recoveryStateDir = makeRecoveryStateDir();
+      const first = spawnBackend(makeBackend({ recoveryStateDir }));
+      const fence = first.captureAmbiguousSubmissionFence();
+
+      state.failSendAt = 1;
+      expect(first.sendText('ambiguous prompt')).toBe(false);
+      if (attemptRecovery) {
+        state.failSendAt = 2;
+        expect(first.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+      }
+      first.kill();
+
+      state.failSendAt = null;
+      const reattached = spawnBackend(makeBackend({
+        reattach: true,
+        recoveryStateDir,
+      }));
+      expect(reattached.sendText('must remain blocked')).toBe(false);
+      expect(() => reattached.captureAmbiguousSubmissionFence())
+        .toThrow(/recovery-unconfirmed/);
+      expect(state.sendInputs.map(input => input.toString())).toEqual(
+        attemptRecovery
+          ? ['ambiguous prompt\n', '\x03\n']
+          : ['ambiguous prompt\n'],
+      );
+    },
+  );
+
+  it('write-ahead arms before every chunk can return and a crash observer stays poisoned', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const first = spawnBackend(makeBackend({ recoveryStateDir }));
+    const originalExecFileSync = childMocks.execFileSync.getMockImplementation()!;
+    const observedStates: string[] = [];
+    let crashObserver: ZmxBackend | undefined;
+    childMocks.execFileSync.mockImplementation((...args: any[]) => {
+      const result = originalExecFileSync(...args);
+      if (args[1]?.[0] === 'send') {
+        observedStates.push(readRecoveryState(recoveryStateDir).state);
+        crashObserver ??= makeBackend({
+          reattach: true,
+          recoveryStateDir,
+        });
+      }
+      return result;
+    });
+
+    try {
+      expect(first.sendText('x'.repeat(2_049))).toBe(true);
+    } finally {
+      childMocks.execFileSync.mockImplementation(originalExecFileSync);
+    }
+
+    expect(observedStates).toEqual(['pending', 'pending', 'pending']);
+    expect(readRecoveryState(recoveryStateDir)).toMatchObject({
+      version: 1,
+      sessionId: SESSION_ID,
+      state: 'clean',
+    });
+
+    spawnBackend(crashObserver!);
+    expect(crashObserver!.sendText('must remain blocked')).toBe(false);
+    expect(() => crashObserver!.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+    expect(state.sendInputs).toHaveLength(3);
+  });
+
+  it('keeps one journal transaction pending across adapter chunks until logical confirmation', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+    const persistedStates: string[] = [];
+    const persist = (backend as any).writeComposerRecoveryState.bind(backend);
+    vi.spyOn(backend as any, 'writeComposerRecoveryState').mockImplementation(
+      (nextState: string) => {
+        persistedStates.push(nextState);
+        return persist(nextState);
+      },
+    );
+
+    const fence = backend.captureAmbiguousSubmissionFence();
+    expect(readRecoveryState(recoveryStateDir).state).toBe('pending');
+    expect(backend.sendText('first adapter chunk')).toBe(true);
+    expect(readRecoveryState(recoveryStateDir).state).toBe('pending');
+
+    const crashObserver = makeBackend({
+      reattach: true,
+      recoveryStateDir,
+    });
+    expect(() => crashObserver.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+
+    expect(backend.sendText('second adapter chunk')).toBe(true);
+    expect(backend.sendSpecialKeys('Enter')).toBe(true);
+    expect(readRecoveryState(recoveryStateDir).state).toBe('pending');
+    expect(backend.confirmAmbiguousSubmission(fence)).toBeUndefined();
+    expect(readRecoveryState(recoveryStateDir).state).toBe('clean');
+    expect(persistedStates).toEqual(['pending', 'clean']);
+  });
+
+  it.each([
+    ['abnormal stdout', false],
+    ['timeout', true],
+  ] as const)(
+    'poisons a logical submission when its Enter has %s',
+    (_failureKind, throwOnFailedSend) => {
+      const recoveryStateDir = makeRecoveryStateDir();
+      const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+      const fence = backend.captureAmbiguousSubmissionFence();
+
+      expect(backend.sendText('fully typed prompt')).toBe(true);
+      state.failSendAt = 2;
+      state.throwOnFailedSend = throwOnFailedSend;
+      expect(backend.sendSpecialKeys('Enter')).toBe(false);
+      expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+
+      state.failSendAt = null;
+      state.throwOnFailedSend = false;
+      expect(backend.sendText('must not append or replay')).toBe(false);
+      expect(backend.sendSpecialKeys('C-c')).toBe(false);
+      expect(state.sendInputs.map(input => input.toString())).toEqual([
+        'fully typed prompt\n',
+        '\r\n',
+      ]);
+
+      const reattached = makeBackend({
+        reattach: true,
+        recoveryStateDir,
+      });
+      expect(() => reattached.captureAmbiguousSubmissionFence())
+        .toThrow(/recovery-unconfirmed/);
+    },
+  );
+
+  it('does not inject Ctrl+C after a submit key landed but the adapter later threw', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    expect(backend.sendText('possibly submitted prompt')).toBe(true);
+    expect(backend.sendSpecialKeys('Enter')).toBe(true);
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'possibly submitted prompt\n',
+      '\r\n',
+    ]);
+    expect(backend.sendText('must remain blocked')).toBe(false);
+  });
+
+  it('does not touch ZMX when the write-ahead pending state cannot be persisted', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+    vi.spyOn(backend as any, 'writeComposerRecoveryState').mockReturnValueOnce(false);
+    expect(() => backend.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+    expect(state.sendInputs).toEqual([]);
+    expect(backend.sendSpecialKeys('Enter')).toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('keeps pending durable and poisons reattach when the success clear cannot persist', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const first = spawnBackend(makeBackend({ recoveryStateDir }));
+    const persist = (first as any).writeComposerRecoveryState.bind(first);
+    vi.spyOn(first as any, 'writeComposerRecoveryState').mockImplementation(
+      (nextState: string) => nextState === 'clean' ? false : persist(nextState),
+    );
+
+    expect(first.sendText('transport accepted but journal clear failed')).toBe(false);
+    expect(state.sendInputs).toHaveLength(1);
+    expect(readRecoveryState(recoveryStateDir).state).toBe('pending');
+    expect(() => first.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+
+    const reattached = spawnBackend(makeBackend({
+      reattach: true,
+      recoveryStateDir,
+    }));
+    expect(reattached.sendText('must remain blocked')).toBe(false);
+    expect(state.sendInputs).toHaveLength(1);
+  });
+
+  it('fails closed on an unknown recovery journal schema version', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    mkdirSync(join(recoveryStateDir, 'zmx-composer-recovery'), {
+      recursive: true,
+      mode: 0o700,
+    });
+    writeFileSync(
+      recoveryStatePath(recoveryStateDir),
+      `${JSON.stringify({
+        version: 2,
+        sessionId: SESSION_ID,
+        state: 'clean',
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    const reattached = makeBackend({
+      reattach: true,
+      recoveryStateDir,
+    });
+    expect(() => reattached.captureAmbiguousSubmissionFence())
+      .toThrow(/recovery-unconfirmed/);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('clears a stale recovery journal only after creating a fresh session', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const first = spawnBackend(makeBackend({ recoveryStateDir }));
+    const fence = first.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(first.sendText('ambiguous prompt')).toBe(false);
+    state.failSendAt = 2;
+    expect(first.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
+    first.kill();
+
+    state.exists = false;
+    state.clients = 0;
+    state.failSendAt = null;
+    const fresh = spawnBackend(makeBackend({ recoveryStateDir }));
+    expect(fresh.sendText('safe fresh prompt')).toBe(true);
+    expect(state.sendInputs.at(-1)!.toString()).toBe('safe fresh prompt\n');
+  });
+
+  it('persists a clean fresh journal before publishing the CLI release token', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = makeBackend({ recoveryStateDir });
+    let releaseExistedAtReset = true;
+    vi.spyOn(backend as any, 'resetAmbiguousRecoveryForFreshSession')
+      .mockImplementation(() => {
+        releaseExistedAtReset = state.releasePath
+          ? existsSync(state.releasePath)
+          : true;
+        throw new Error('simulated journal reset failure');
+      });
+
+    expect(() => spawnBackend(backend)).toThrow(/simulated journal reset failure/);
+    expect(releaseExistedAtReset).toBe(false);
+    expect(state.exists).toBe(false);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) =>
+      argv[0] === 'kill' && argv[1] === SESSION && argv[2] === '--force',
+    )).toBe(true);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it.each([
+    ['complete session identity', () => { state.sessionId = 'replacement-session-id'; }],
+    ['PTY root PID', () => { state.pid += 1; }],
+  ] as const)('does not tear down a pre-release same-name replacement with changed %s', (
+    _replacementKind,
+    replace,
+  ) => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = makeBackend({ recoveryStateDir });
+    vi.spyOn(backend as any, 'resetAmbiguousRecoveryForFreshSession')
+      .mockImplementation(() => {
+        replace();
+        throw new Error('simulated journal reset failure after replacement');
+      });
+
+    expect(() => spawnBackend(backend))
+      .toThrow(/simulated journal reset failure after replacement/);
+    expect(state.exists).toBe(true);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) => argv[0] === 'kill'))
+      .toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('tears down an exact gate when protocol labels commit before zmx set times out', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = makeBackend({ recoveryStateDir });
+    const runZmx = childMocks.execFileSync.getMockImplementation()!;
+    childMocks.execFileSync.mockImplementation((...args: any[]) => {
+      const result = runZmx(...args);
+      if (args[1]?.[0] === 'set') {
+        throw Object.assign(new Error('simulated zmx set timeout after commit'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+      return result;
+    });
+
+    expect(() => spawnBackend(backend))
+      .toThrow(/simulated zmx set timeout after commit/);
+    expect(state.exists).toBe(false);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) =>
+      argv[0] === 'kill' && argv[1] === SESSION && argv[2] === '--force',
+    )).toBe(true);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it.each([
+    [
+      'partial labels',
+      () => {
+        state.transport = 'tail-send-v1';
+      },
+    ],
+    [
+      'same-name replacement identity and PID',
+      () => {
+        state.transport = 'tail-send-v1';
+        state.sessionId = 'replacement-session-id';
+        state.pid += 1;
+      },
+    ],
+  ] as const)('does not tear down %s after an ambiguous protocol stamp', (
+    _failureKind,
+    applyAmbiguousStamp,
+  ) => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = makeBackend({ recoveryStateDir });
+    const runZmx = childMocks.execFileSync.getMockImplementation()!;
+    childMocks.execFileSync.mockImplementation((...args: any[]) => {
+      if (args[1]?.[0] === 'set') {
+        applyAmbiguousStamp();
+        throw Object.assign(new Error('simulated ambiguous zmx set failure'), {
+          code: 'ETIMEDOUT',
+        });
+      }
+      return runZmx(...args);
+    });
+
+    expect(() => spawnBackend(backend))
+      .toThrow(/simulated ambiguous zmx set failure/);
+    expect(state.exists).toBe(true);
+    expect(childMocks.execFileSync.mock.calls.some(([, argv]) => argv[0] === 'kill'))
+      .toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('fsyncs the recovery root only when first publishing the journal directory', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+
+    expect(durabilityMocks.fsyncDirectorySyncPortable)
+      .toHaveBeenCalledTimes(1);
+    expect(durabilityMocks.fsyncDirectorySyncPortable)
+      .toHaveBeenCalledWith(recoveryStateDir);
+
+    const fence = backend.captureAmbiguousSubmissionFence();
+    expect(backend.cancelAmbiguousSubmission(fence)).toBeUndefined();
+    expect(durabilityMocks.fsyncDirectorySyncPortable)
+      .toHaveBeenCalledTimes(1);
+  });
+
+  it('does not publish the CLI release or write a WAL when recovery-root fsync fails', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    let releaseExistedAtFsync = true;
+    durabilityMocks.fsyncDirectorySyncPortable.mockImplementationOnce(() => {
+      releaseExistedAtFsync = state.releasePath
+        ? existsSync(state.releasePath)
+        : true;
+      throw Object.assign(new Error('simulated parent fsync failure'), {
+        code: 'EIO',
+      });
+    });
+
+    expect(() => spawnBackend(makeBackend({ recoveryStateDir })))
+      .toThrow(/journal could not be reset/);
+    expect(releaseExistedAtFsync).toBe(false);
+    expect(existsSync(join(recoveryStateDir, 'zmx-composer-recovery')))
+      .toBe(false);
+    expect(existsSync(recoveryStatePath(recoveryStateDir))).toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('poisons a stale confirmation fence instead of committing the active generation', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    expect(backend.sendText('active prompt')).toBe(true);
+    expect(backend.confirmAmbiguousSubmission(fence + 1))
+      .toBe('recovery-unconfirmed');
+    expect(readRecoveryState(recoveryStateDir).state).toBe('unconfirmed');
+    expect(backend.sendText('must remain blocked')).toBe(false);
+    expect(state.sendInputs.map(input => input.toString())).toEqual([
+      'active prompt\n',
+    ]);
+  });
+
+  it('poisons a stale cancellation fence without aborting the active generation', () => {
+    const recoveryStateDir = makeRecoveryStateDir();
+    const backend = spawnBackend(makeBackend({ recoveryStateDir }));
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    expect(backend.cancelAmbiguousSubmission(fence + 1))
+      .toBe('recovery-unconfirmed');
+    expect(readRecoveryState(recoveryStateDir).state).toBe('unconfirmed');
+    expect(state.sendInputs).toEqual([]);
+    expect(backend.sendSpecialKeys('C-c')).toBe(false);
+    expect(state.sendInputs).toEqual([]);
+  });
+
+  it('keeps a successful-looking recovery Ctrl+C sticky and refuses later input', () => {
+    const backend = spawnBackend();
+    const fence = backend.captureAmbiguousSubmissionFence();
+
+    state.failSendAt = 1;
+    expect(backend.sendText('ambiguous prompt')).toBe(false);
+    state.failSendAt = null;
+    expect(backend.sendSpecialKeys('C-c')).toBe(false);
+    expect(backend.cancelAmbiguousSubmission(fence)).toBe('recovery-unconfirmed');
 
     expect(state.sendInputs.map(input => input.toString())).toEqual([
       'ambiguous prompt\n',
       '\x03\n',
     ]);
-  });
-
-  it('does not pay a pending cancellation debt into a replacement session', () => {
-    const backend = spawnBackend();
-    const firstFence = backend.captureAmbiguousSubmissionFence();
-
-    state.failSendAt = 1;
-    expect(backend.sendText('first ambiguous prompt')).toBe(false);
-    backend.cancelAmbiguousSubmission(firstFence);
-
-    const secondFence = backend.captureAmbiguousSubmissionFence();
-    state.failSendAt = 4;
-    expect(backend.sendText('second confirmed prefix')).toBe(true);
-    expect(backend.sendText('second ambiguous suffix')).toBe(false);
-
-    const wait = vi.spyOn(Atomics, 'wait').mockImplementation(() => {
-      state.sessionId = 'replacement-session-id';
-      return 'timed-out';
-    });
-    try {
-      backend.cancelAmbiguousSubmission(secondFence);
-    } finally {
-      wait.mockRestore();
-    }
-
-    expect(state.sendInputs.map(input => input.toString())).toEqual([
-      'first ambiguous prompt\n',
-      '\x03\n',
-      'second confirmed prefix\n',
-      'second ambiguous suffix\n',
-    ]);
+    expect(backend.sendText('must remain blocked')).toBe(false);
+    expect(backend.sendSpecialKeys('C-c')).toBe(false);
+    expect(state.sendInputs).toHaveLength(2);
   });
 
   it('does not cancel a failed control key as though it were prompt text', () => {
@@ -752,7 +1392,7 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.sendInputs).toHaveLength(2);
   });
 
-  it('spaces frame recovery cancels across consecutive ambiguous generations', () => {
+  it('does not start another paste generation after frame recovery is unconfirmed', () => {
     const backend = spawnBackend();
     const ompStylePaste = `\x1b[200~${'中'.repeat(512)}\x1b[201~`;
 
@@ -761,12 +1401,8 @@ describe('ZmxBackend history-authoritative transport', () => {
     state.failSendAt = 3;
     expect(backend.sendText(ompStylePaste)).toBe(false);
 
-    expect(state.sendInputs).toHaveLength(4);
+    expect(state.sendInputs).toHaveLength(2);
     expect(state.sendInputs[1]!.toString()).toBe('\x1b[201~\x03\n');
-    expect(state.sendInputs[3]!.toString()).toBe('\x1b[201~\x03\n');
-    expect(state.sendTimes[3]! - state.sendTimes[1]!).toBeGreaterThanOrEqual(
-      TERMINAL_CANCEL_COOLDOWN_MS,
-    );
   });
 
   it('detects an opening paste marker split across an ambiguous chunk boundary', () => {

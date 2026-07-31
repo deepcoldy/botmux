@@ -59,6 +59,7 @@ import { CodexUpdateDialogGuard } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import {
+  handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
@@ -209,7 +210,12 @@ import {
   backendSupportsWebTerminal,
 } from './adapters/backend/capabilities.js';
 import { zellijEnv } from './setup/ensure-zellij.js';
-import { isObserveBackend, type ObserveBackend } from './adapters/backend/types.js';
+import {
+  AmbiguousSubmissionBlockedError,
+  isObserveBackend,
+  type AmbiguousSubmissionRecoveryFailure,
+  type ObserveBackend,
+} from './adapters/backend/types.js';
 import {
   backendGateUserMessage,
   backendSandboxCompatibilityError,
@@ -1499,20 +1505,49 @@ async function sendRawCommandLine(be: NonNullable<typeof backend>, content: stri
   }
 }
 
-/** Serialize only the literal command-line write window (text -> beat -> Enter).
- * raw_input deliberately keeps its legacy "send while busy" behaviour; this
- * narrow mutex merely prevents concurrent IPC handlers (or native /rename)
- * from splicing keystrokes into one another. */
+/** Serialize one complete raw command-line transaction (fence -> text -> Enter
+ * -> commit/cancel). raw_input deliberately keeps its legacy "send while busy"
+ * behaviour; this narrow mutex merely prevents concurrent IPC handlers (or
+ * native /rename) from splicing keystrokes into one another. */
 let commandLineWriteTail: Promise<void> = Promise.resolve();
 let commandLineWritesPending = 0;
-async function sendRawCommandLineSerially(be: NonNullable<typeof backend>, content: string): Promise<void> {
+
+class SubmissionWriteError extends Error {
+  constructor(
+    message: string,
+    readonly recoveryFailureReason?: string,
+    /** False only when the logical transaction was rejected before its write
+     * callback ran, so the current input is known not to have reached the PTY. */
+    readonly submissionStarted = true,
+  ) {
+    super(message);
+    this.name = 'SubmissionWriteError';
+  }
+}
+
+async function sendRawCommandLineWithRecoveryFence(
+  be: NonNullable<typeof backend>,
+  content: string,
+  beforeWrite?: () => void,
+): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
   commandLineWriteTail = new Promise<void>(resolve => { release = resolve; });
   commandLineWritesPending += 1;
   await previous;
   try {
-    await sendRawCommandLine(be, content);
+    const transaction = await runAmbiguousSubmissionTransaction(
+      be,
+      () => sendRawCommandLine(be, content),
+      undefined,
+      beforeWrite,
+    );
+    if (transaction.recoveryFailureReason) {
+      throw new SubmissionWriteError(
+        `backend could not commit the command submission journal; ${transaction.recoveryFailureReason}`,
+        transaction.recoveryFailureReason,
+      );
+    }
   } finally {
     commandLineWritesPending -= 1;
     release();
@@ -1556,7 +1591,7 @@ async function runStartupCommands(): Promise<void> {
   for (const cmd of cmds) {
     if (!backend) break;
     try {
-      await sendRawCommandLineSerially(backend, cmd);
+      await sendRawCommandLineWithRecoveryFence(backend, cmd);
       await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
       log(`Startup command sent: ${cmd}`);
     } catch (e: any) {
@@ -1667,25 +1702,29 @@ function armSessionRenameIdleTimeout(): void {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
-  renderer?.markNewTurn();
-  usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-  if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
   const targetBackend = backend;
   if (!targetBackend) return;
 
-  // A passthrough is still an accepted input boundary. Rotate (or revoke) the
-  // marker immediately before the literal command reaches the CLI so it can
-  // never inherit a previous human turn. System-generated raw commands omit
-  // turnId and therefore publish an explicitly unattributed marker.
-  currentBotmuxTurnId = msg.turnId;
-  currentBotmuxDispatchAttempt = undefined;
-  currentVcMeetingImTurnOrigin = undefined;
-  writeCliPidMarker();
-  publishSandboxRelayCapability();
-
   let sent = false;
+  let recoveryFailureReason: string | undefined;
   try {
-    await sendRawCommandLineSerially(targetBackend, msg.content);
+    await sendRawCommandLineWithRecoveryFence(
+      targetBackend,
+      msg.content,
+      () => {
+        renderer?.markNewTurn();
+        usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+        // Rotate (or revoke) attribution only after both submission locks are
+        // held and immediately before the literal command reaches the CLI.
+        // A queued passthrough must not steal output from the preceding turn.
+        currentBotmuxTurnId = msg.turnId;
+        currentBotmuxDispatchAttempt = undefined;
+        currentVcMeetingImTurnOrigin = undefined;
+        writeCliPidMarker();
+        publishSandboxRelayCapability();
+      },
+    );
     sent = true;
     isPromptReady = false;
     idleDetector?.reset();
@@ -1695,20 +1734,30 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
     // `/effort` opens a level picker (unknown target) and is left alone.
     if (isEffortLevelCommand(msg.content)) armEffortConfirm();
   } catch (err: any) {
+    recoveryFailureReason = err instanceof SubmissionWriteError
+      ? err.recoveryFailureReason
+      : undefined;
     // Do not send another queued command against a backend whose write failed.
     isPromptReady = false;
     log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
     const failedTurnId = msg.followUpTurnId ?? msg.turnId;
-    if (failedTurnId) {
+    if (failedTurnId && !recoveryFailureReason) {
       emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
     }
     const failureMessageKey = msg.followUpContent
-      ? 'worker.raw_input_failed'
-      : 'worker.raw_input_failed_command_only';
+      ? (recoveryFailureReason
+          ? 'worker.raw_input_failed_recovery'
+          : 'worker.raw_input_failed')
+      : (recoveryFailureReason
+          ? 'worker.raw_input_failed_command_only_recovery'
+          : 'worker.raw_input_failed_command_only');
     send({
       type: 'user_notify',
       ...(failedTurnId ? { turnId: failedTurnId } : {}),
-      message: t(failureMessageKey, { cliName: cliName() }),
+      message: t(failureMessageKey, {
+        cliName: cliName(),
+        reason: recoveryFailureReason ?? '',
+      }),
     });
   }
 
@@ -4686,16 +4735,22 @@ async function handleTermAction(key: TermActionKey): Promise<void> {
 
   const criticalInterrupt = isCriticalInterruptKey(key);
   let delivered = false;
-  if (criticalInterrupt) {
-    delivered = await sendCriticalControlKey(() => {
-      // Never retry an old interrupt into a replacement CLI generation.
-      if (backend !== targetBackend) return true;
-      return sendTermActionOnce(targetBackend, key);
-    });
-  } else {
-    try {
-      delivered = sendTermActionOnce(targetBackend, key) !== false;
-    } catch (err) {
+  try {
+    delivered = await runAfterAmbiguousSubmissionWrites(
+      targetBackend,
+      async () => {
+        if (criticalInterrupt) {
+          return sendCriticalControlKey(key, () => {
+            // Never retry an old interrupt into a replacement CLI generation.
+            if (backend !== targetBackend) return true;
+            return sendTermActionOnce(targetBackend, key);
+          });
+        }
+        return sendTermActionOnce(targetBackend, key) !== false;
+      },
+    );
+  } catch (err) {
+    if (backend === targetBackend) {
       log(`Term action ${key} failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
@@ -4749,10 +4804,12 @@ const KEY_TO_ANSI: Record<string, string> = {
  * @returns true if all keys were written successfully; false if backend is gone
  *          or a write threw (caller must NOT send tui_keys_delivered on false).
  */
-async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
-  if (!backend || keys.length === 0) return false;
-  const targetBackend = backend;
-
+async function handleTuiKeysDirect(
+  targetBackend: SessionBackend,
+  keys: string[],
+  isFinal: boolean,
+): Promise<boolean> {
+  if (keys.length === 0) return false;
   try {
     const delivered = await sendTuiKeySequence(
       targetBackend,
@@ -4781,6 +4838,24 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
   return true;
 }
 
+async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean> {
+  if (!backend || keys.length === 0) return false;
+  const targetBackend = backend;
+  try {
+    return await runAfterAmbiguousSubmissionWrites(
+      targetBackend,
+      () => handleTuiKeysDirect(targetBackend, keys, isFinal),
+    );
+  } catch (err) {
+    logError(
+      `handleTuiKeys queued write failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+}
+
 // 待注入的 TUI 命令队列。生命周期绑定当前 CLI 进程：killCli() 会清空它，
 // 防止 restart 后残留命令重放进新 CLI——新增清理状态时记得同步那里。
 // barrier 语义：barrier=true 的注入必须先于本次 pending 用户消息落地。历史上
@@ -4792,7 +4867,7 @@ async function handleTuiKeys(keys: string[], isFinal: boolean): Promise<boolean>
 const pendingInjections: PendingInjection[] = [];
 let injectionFlushing = false;
 
-/** 排队注入一行 TUI 命令：idle（isPromptReady）时经 sendRawCommandLineSerially 敲入。 */
+/** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
@@ -4841,7 +4916,7 @@ async function flushPendingInjections(): Promise<void> {
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
         // 字面命令行写入互斥链（text → beat → Enter 窗口不被拼接）。
-        await sendRawCommandLineSerially(backend, cmd);
+        await sendRawCommandLineWithRecoveryFence(backend, cmd);
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
         log(`Injected command: ${cmd}`);
       } catch (e: any) {
@@ -4875,20 +4950,44 @@ async function handleTuiTextInput(keys: string[], text: string): Promise<boolean
 
   log(`TUI text input: writing "${text.substring(0, 80)}" to PTY (after ${navKeyCount} nav keys)`);
   try {
-    const delivered = await submitTuiTextInput({
-      target: strictInputHandle(targetBackend),
-      keys,
-      text,
-      keyToAnsi: KEY_TO_ANSI,
-      isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter,
-      writeInput: (target, content) => targetAdapter.writeInput(target, content),
-    });
-    if (!delivered) {
+    const transaction = await runAmbiguousSubmissionTransaction(
+      targetBackend,
+      () => submitTuiTextInput({
+        target: strictInputHandle(targetBackend),
+        keys,
+        text,
+        keyToAnsi: KEY_TO_ANSI,
+        isCurrent: () => backend === targetBackend && cliAdapter === targetAdapter,
+        writeInput: async (target, content) => {
+          const result = await targetAdapter.writeInput(target, content);
+          if (targetBackend.captureAmbiguousSubmissionFence) {
+            await settleVerifiableSubmissionForJournal(result);
+          }
+          return result;
+        },
+      }),
+      delivered => delivered,
+    );
+    if (transaction.recoveryFailureReason) {
+      throw new SubmissionWriteError(
+        `backend could not commit the TUI text submission journal; ${transaction.recoveryFailureReason}`,
+        transaction.recoveryFailureReason,
+      );
+    }
+    if (!transaction.result) {
       logError('TUI text input was rejected, unconfirmed, or crossed a backend replacement');
       return false;
     }
   } catch (err: any) {
     logError(`TUI text input write failed: ${err?.message ?? err}`);
+    if (err instanceof SubmissionWriteError && err.recoveryFailureReason) {
+      send({
+        type: 'user_notify',
+        turnId: currentBotmuxTurnId,
+        dispatchAttempt: currentBotmuxDispatchAttempt,
+        message: err.recoveryFailureReason,
+      });
+    }
     return false;
   }
 
@@ -4973,33 +5072,49 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
     // multi-question this only fills the first question (logged limitation).
     log(`coco_drive_picker: free-text answer (${navKeys.length} nav keys)${needsReviewSubmit ? ' [multi-question — partial]' : ''}`);
     try {
-      const navigated = await sendTuiKeySequence(
+      const transaction = await runAmbiguousSubmissionTransaction(
         targetBackend,
-        navKeys,
-        KEY_TO_ANSI,
-        { isCurrent: () => backend === targetBackend },
+        async () => {
+          const navigated = await sendTuiKeySequence(
+            targetBackend,
+            navKeys,
+            KEY_TO_ANSI,
+            { isCurrent: () => backend === targetBackend },
+          );
+          if (!navigated) {
+            throw new Error('backend rejected free-text navigation');
+          }
+          await new Promise(r => setTimeout(r, 150));
+          if (backend !== targetBackend) {
+            throw new Error('backend changed before free-text input');
+          }
+          const input = strictInputHandle(targetBackend as SessionBackend & PtyHandle);
+          if (typeof input.sendText === 'function') input.sendText(comment);
+          else input.write(comment);
+          await new Promise(r => setTimeout(r, 200));
+          if (backend !== targetBackend) {
+            throw new Error('backend changed before free-text submit');
+          }
+          if (!await handleTuiKeysDirect(targetBackend, ['Enter'], true)) {
+            throw new Error('backend rejected free-text submit key');
+          }
+        },
       );
-      if (!navigated) {
-        reportFailure();
-        return;
-      }
-      await new Promise(r => setTimeout(r, 150));
-      if (backend !== targetBackend) {
-        reportFailure();
-        return;
-      }
-      const input = strictInputHandle(targetBackend as SessionBackend & PtyHandle);
-      if (typeof input.sendText === 'function') input.sendText(comment);
-      else input.write(comment);
-      await new Promise(r => setTimeout(r, 200));
-      if (backend !== targetBackend) {
-        reportFailure();
-        return;
-      }
-      if (!await handleTuiKeys(['Enter'], true)) {
-        reportFailure();
+      if (transaction.recoveryFailureReason) {
+        throw new SubmissionWriteError(
+          `backend could not commit the free-text submission journal; ${transaction.recoveryFailureReason}`,
+          transaction.recoveryFailureReason,
+        );
       }
     } catch (err) {
+      if (err instanceof SubmissionWriteError && err.recoveryFailureReason) {
+        send({
+          type: 'user_notify',
+          turnId: currentBotmuxTurnId,
+          dispatchAttempt: currentBotmuxDispatchAttempt,
+          message: err.recoveryFailureReason,
+        });
+      }
       reportFailure(err);
     }
     return;
@@ -5401,24 +5516,188 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
+let ambiguousSubmissionWriteTail: Promise<void> = Promise.resolve();
+/** A logical input that was definitely not written because this exact backend
+ * already carried older composer-recovery debt. Keep it queued, but freeze all
+ * further flushes until a fresh backend generation proves the composer clean. */
+let ambiguousSubmissionRecoveryHold: {
+  backend: SessionBackend;
+  item: PendingCliInput;
+} | null = null;
+
+/** Queue an external control action behind any in-flight ZMX text transaction
+ * without opening a new composer journal. This keeps card quick-actions from
+ * landing between adapter text chunks and their submit key. */
+async function runAfterAmbiguousSubmissionWrites<T>(
+  target: SessionBackend,
+  action: () => Promise<T> | T,
+): Promise<T> {
+  if (!target.captureAmbiguousSubmissionFence) return await action();
+
+  const previous = ambiguousSubmissionWriteTail;
+  let release!: () => void;
+  ambiguousSubmissionWriteTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+  try {
+    if (backend !== target) {
+      throw new Error('backend changed before queued terminal action');
+    }
+    return await action();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Serialize every logical submission for backends that expose the ambiguity
+ * fence contract. ZMX permits only one durable pending composer transaction at
+ * a time; this lock covers structured adapter writes, adopt writes and raw
+ * commands alike while leaving every other backend's concurrency unchanged.
+ */
+async function runAmbiguousSubmissionTransaction<T>(
+  target: SessionBackend,
+  write: () => Promise<T>,
+  submissionAccepted: (result: T) => boolean | Promise<boolean> = () => true,
+  beforeWrite?: () => void | Promise<void>,
+): Promise<{ result: T; recoveryFailureReason?: string }> {
+  if (!target.captureAmbiguousSubmissionFence) {
+    await beforeWrite?.();
+    return { result: await write() };
+  }
+
+  const previous = ambiguousSubmissionWriteTail;
+  let release!: () => void;
+  ambiguousSubmissionWriteTail = new Promise<void>(resolve => { release = resolve; });
+  await previous;
+
+  let submissionFence: number | undefined;
+  let submissionStarted = false;
+  try {
+    if (backend !== target) {
+      throw new Error('backend changed before logical submission');
+    }
+    submissionFence = captureAmbiguousSubmissionFence(target);
+    await beforeWrite?.();
+    submissionStarted = true;
+    const result = await write();
+    const accepted = await submissionAccepted(result);
+    const recoveryFailureReason = accepted
+      ? confirmAmbiguousSubmissionAfterSuccess(target, submissionFence)
+      : cancelAmbiguousSubmissionAfterFailure(target, submissionFence);
+    return { result, recoveryFailureReason };
+  } catch (err) {
+    const recoveryFailureReason = err instanceof AmbiguousSubmissionBlockedError
+      ? ambiguousSubmissionRecoveryMessage(err.failure)
+      : cancelAmbiguousSubmissionAfterFailure(target, submissionFence);
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new SubmissionWriteError(
+      recoveryFailureReason ? `${detail}; ${recoveryFailureReason}` : detail,
+      recoveryFailureReason,
+      submissionStarted,
+    );
+  } finally {
+    release();
+  }
+}
+
+type VerifiableSubmissionResult = void | {
+  submitted: boolean;
+  cliSessionId?: string;
+  failureReason?: string;
+  recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
+};
+
+/**
+ * A false adapter result can mean only that its short in-band transcript check
+ * expired; slow startup hooks may append the authoritative record seconds
+ * later. While the ZMX submission mutex and pending journal are still held,
+ * give that recheck the same bounded settle window used by the legacy warning
+ * path. Only a confirmed transcript clears the WAL; a still-missing record is
+ * cancelled/poisoned before any later input can be written.
+ */
+async function settleVerifiableSubmissionForJournal(
+  result: VerifiableSubmissionResult,
+): Promise<boolean> {
+  if (result?.submitted !== false) return true;
+  if (result.failureReason || !result.recheck) return false;
+
+  await new Promise(resolve => setTimeout(resolve, SUBMIT_DEFERRED_RECHECK_MS));
+  try {
+    const recheck = await result.recheck();
+    const submitted = typeof recheck === 'boolean'
+      ? recheck
+      : recheck.submitted === true;
+    if (!submitted) return false;
+    result.submitted = true;
+    if (
+      typeof recheck === 'object'
+      && recheck
+      && typeof recheck.cliSessionId === 'string'
+    ) {
+      result.cliSessionId = recheck.cliSessionId;
+    }
+    return true;
+  } catch (err) {
+    log(
+      `Deferred submission journal recheck failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return false;
+  }
+}
+
 function captureAmbiguousSubmissionFence(target: SessionBackend): number | undefined {
   try {
     return target.captureAmbiguousSubmissionFence?.();
   } catch (err) {
     log(`Unable to capture ambiguous-submission fence: ${err instanceof Error ? err.message : String(err)}`);
-    return undefined;
+    throw err;
+  }
+}
+
+function ambiguousSubmissionRecoveryMessage(
+  failure: AmbiguousSubmissionRecoveryFailure,
+): string {
+  const key: Record<AmbiguousSubmissionRecoveryFailure, string> = {
+    'recovery-pending': 'worker.zmx_recovery_pending',
+    'recovery-unconfirmed': 'worker.zmx_recovery_unconfirmed',
+  };
+  return t(key[failure]);
+}
+
+function confirmAmbiguousSubmissionAfterSuccess(
+  target: SessionBackend | null,
+  fence: number | undefined,
+): string | undefined {
+  if (!target || fence === undefined) return undefined;
+  if (backend !== target) {
+    return ambiguousSubmissionRecoveryMessage('recovery-unconfirmed');
+  }
+  try {
+    const failure = target.confirmAmbiguousSubmission?.(fence);
+    return failure ? ambiguousSubmissionRecoveryMessage(failure) : undefined;
+  } catch (err) {
+    log(`Unable to confirm ambiguous submission: ${err instanceof Error ? err.message : String(err)}`);
+    return ambiguousSubmissionRecoveryMessage('recovery-unconfirmed');
   }
 }
 
 function cancelAmbiguousSubmissionAfterFailure(
   target: SessionBackend | null,
   fence: number | undefined,
-): void {
-  if (!target || fence === undefined || backend !== target) return;
+): string | undefined {
+  if (!target || fence === undefined) return undefined;
+  if (backend !== target) {
+    return ambiguousSubmissionRecoveryMessage('recovery-unconfirmed');
+  }
   try {
-    target.cancelAmbiguousSubmission?.(fence);
+    const failure = target.cancelAmbiguousSubmission?.(fence);
+    if (!failure) return undefined;
+    return ambiguousSubmissionRecoveryMessage(failure);
   } catch (err) {
     log(`Unable to cancel ambiguous submission: ${err instanceof Error ? err.message : String(err)}`);
+    return ambiguousSubmissionRecoveryMessage('recovery-unconfirmed');
   }
 }
 
@@ -5800,6 +6079,26 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
  *  both without being so long that a true failure goes unsurfaced. */
 const SUBMIT_DEFERRED_RECHECK_MS = 20_000;
 
+/**
+ * A recovery fence failure means the prompt may already be running. Keep its
+ * bridge mark and durable turn open so a real later final can still resolve it;
+ * only freeze further input and tell the user how to recover. Treating this as
+ * a hard non-submit would drop attribution and could replay a live turn.
+ */
+function notifyAmbiguousSubmissionRecovery(
+  recoveryReason: string,
+  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+): void {
+  log(`Submission recovery remains ambiguous: ${recoveryReason}`);
+  send({
+    type: 'user_notify',
+    turnId: turnIdentity?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt:
+      turnIdentity?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message: recoveryReason,
+  });
+}
+
 /** Worker-side handler for `submitted: false`. Defers the user-facing
  *  warning and runs the adapter-supplied `recheck` closure first; if the
  *  message has shown up in the transcript by then (slow path, hook delay),
@@ -5820,11 +6119,17 @@ function scheduleSubmitFailureNotify(
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
   turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+  durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
 ): void {
   const preview = msg.length > 60 ? msg.slice(0, 60) + '…' : msg;
-  const emitDurableFailure = (errorCode: string): void => {
+  const emitDurableTerminal = (errorCode: string): void => {
     if (turnIdentity?.turnId && turnIdentity.dispatchAttempt !== undefined) {
-      emitTurnTerminal(turnIdentity.turnId, 'failed', errorCode, turnIdentity.dispatchAttempt);
+      emitTurnTerminal(
+        turnIdentity.turnId,
+        durableTerminalStatus,
+        errorCode,
+        turnIdentity.dispatchAttempt,
+      );
     }
   };
   const dropBridgeMark = (): void => {
@@ -5844,7 +6149,7 @@ function scheduleSubmitFailureNotify(
     dropBridgeMark();
     const reason = action.kind === 'notify-hard-failure' ? action.reason : failureReason;
     log(`writeInput: submit impossible — notifying user immediately. reason="${reason}" preview="${preview}"`);
-    emitDurableFailure(`submit_impossible:${reason}`);
+    emitDurableTerminal(`submit_impossible:${reason}`);
     if (turnIdentity?.dispatchAttempt === undefined) {
       send({
         type: 'user_notify',
@@ -5891,7 +6196,7 @@ function scheduleSubmitFailureNotify(
       case 'suppress-usage-limit':
         dropBridgeMark();
         log(`Deferred recheck missing but usage limit was detected for this turn — suppressing submit warning. preview="${preview}"`);
-        emitDurableFailure('submit_usage_limit');
+        emitDurableTerminal('submit_usage_limit');
         return;
       case 'suppress-active':
         log(`Deferred recheck missing but later ${action.evidence} shows ${cliName()} is active — suppressing submit warning. preview="${preview}"`);
@@ -5907,6 +6212,7 @@ function scheduleSubmitFailureNotify(
             undefined,
             turnSeq,
             turnIdentity,
+            durableTerminalStatus,
           );
         }
         return;
@@ -5919,7 +6225,7 @@ function scheduleSubmitFailureNotify(
 
     dropBridgeMark();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
-    emitDurableFailure('submit_unconfirmed');
+    emitDurableTerminal('submit_unconfirmed');
     if (turnIdentity?.dispatchAttempt === undefined) {
       send({
         type: 'user_notify',
@@ -6045,6 +6351,15 @@ async function flushPending(): Promise<void> {
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
+  if (
+    ambiguousSubmissionRecoveryHold
+    && ambiguousSubmissionRecoveryHold.backend !== backend
+  ) {
+    // A restart installed a fresh backend generation. The held item stayed at
+    // the queue head and may now be delivered under its original attempt.
+    ambiguousSubmissionRecoveryHold = null;
+  }
+  if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
   if (pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -6182,7 +6497,7 @@ async function flushPending(): Promise<void> {
       pendingSessionRename = null;
       sessionRenameInFlight = true;
       try {
-        await sendRawCommandLineSerially(backend, buildRename(title));
+        await sendRawCommandLineWithRecoveryFence(backend, buildRename(title));
         armSessionRenameIdleTimeout();
         idleDetector?.reset();
         log(`Native session rename command sent (${cliName()}): ${title}`);
@@ -6203,72 +6518,65 @@ async function flushPending(): Promise<void> {
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       const durableWrite = item.dispatchAttempt !== undefined;
-      if (durableWrite) durableTurnInFlight = true;
-      // Track as in-flight until the CLI returns to idle (markPromptReady).
-      // If the CLI exits first, onExit stashes these for re-queue on respawn.
-      // EXCEPT in RPC mode: the app-server (not the pane) owns turn execution, so
-      // once turn/start is sent the turn runs regardless of the pane. Re-queuing
-      // it on a pane restart would RE-SEND an already-accepted turn → double
-      // execution (same class as #443's double-submit). So RPC turns are never
-      // auto-re-queued: a lost/late ack surfaces as a submit-failure the user can
-      // resend manually, and the stable clientUserMessageId lets codex dedupe a
-      // resend (Codex delta P1-1).
-      if (!codexRpcEngine) {
-        inflightInputs.onWrite(item);
-        stuckDetector?.arm();
-      }
       const msg = item.content;
       const logicalMsg = item.logicalContent ?? msg;
-      currentBotmuxTurnId = item.turnId;
-      currentBotmuxDispatchAttempt = item.dispatchAttempt;
-      currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
-      writeCliPidMarker();
-      publishSandboxRelayCapability();
-      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
-      // Bridge fallback: mark immediately before writeInput. Doing it here
-      // (instead of at enqueue time) means markTimeMs anchors to the
-      // moment the message actually starts hitting the PTY — so any
-      // `botmux send` whose sentAtMs lands during turn N's processing
-      // falls inside [markTimeMs(N), markTimeMs(N+1)). Marking earlier
-      // (at IPC arrival) would let a slow-finishing turn N's send leak
-      // into turn N+1's window and falsely suppress its emit.
+      let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
-      if (claudeBridgeActive) {
-        try { bridgeIngest(); } catch { /* best-effort */ }
-        bridgeTurnId = bridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
-      } else if (codexBridgeActive) {
-        // Codex mark works even before the rollout path is known: the
-        // queue is path-agnostic, and the late-attach below will start
-        // ingest from offset 0 so the user_message that lands shortly
-        // after still fingerprint-matches this turn.
-        codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
-      }
-      if (durableWrite
-        && cliAdapter.reliableTurnTerminal === true
-        && lastInitConfig?.cliId === 'claude-code'
-        && (!item.turnId || !bridgeTurnId)) {
-        // The advertised Claude contract is transcript-backed. If we cannot
-        // establish the mark before touching the PTY, fail without submitting;
-        // otherwise this real delivery would have no attributable final edge.
-        if (item.turnId) {
-          emitTurnTerminal(
+      let normalWritePrepared = false;
+      let submissionPreparationFailed = false;
+      const prepareNormalWrite = (): void => {
+        if (normalWritePrepared) return;
+        normalWritePrepared = true;
+        renderer?.markNewTurn();
+        currentBotmuxTurnId = item.turnId;
+        currentBotmuxDispatchAttempt = item.dispatchAttempt;
+        currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
+        // Acquire durable HOL ownership only after this turn owns the backend
+        // submission mutex. If an older ZMX recovery debt rejects capture,
+        // this input is known not to have started and must not leave a latch
+        // whose attribution still points at the previous turn.
+        if (durableWrite) durableTurnInFlight = true;
+        // Track only after the backend accepts this logical transaction. If an
+        // older ZMX recovery debt rejects capture, this item never became
+        // in-flight and must not participate in restart replay. RPC mode is
+        // excluded: the app-server owns an accepted turn independently of the
+        // viewer pane, so replaying it after a pane restart could run it twice.
+        if (!codexRpcEngine) {
+          inflightInputs.onWrite(item);
+          stuckDetector?.arm();
+        }
+        writeCliPidMarker();
+        publishSandboxRelayCapability();
+        turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+        // Anchor the bridge baseline only after this turn owns the ZMX
+        // submission lock, immediately before its literal write.
+        if (claudeBridgeActive) {
+          try { bridgeIngest(); } catch { /* best-effort */ }
+          bridgeTurnId = bridgeMarkPendingTurn(
+            logicalMsg,
             item.turnId,
-            'failed',
-            'terminal_bridge_unavailable',
             item.dispatchAttempt,
           );
+        } else if (codexBridgeActive) {
+          codexBridgeMarkPendingTurn(logicalMsg, item.turnId, item.dispatchAttempt);
         }
-        log('Refused durable Claude submit: transcript terminal bridge is unavailable');
-        break;
-      }
-      if (lastInitConfig?.cliId === 'codex-app') {
-        log(
-          `Writing Codex App input to PTY (flush): `
-          + `replyTurn=${shortCorrelationId(item.turnId)} chars=${msg.length}`,
-        );
-      } else {
-        log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
-      }
+        if (durableWrite
+          && cliAdapter!.reliableTurnTerminal === true
+          && lastInitConfig?.cliId === 'claude-code'
+          && (!item.turnId || !bridgeTurnId)) {
+          submissionPreparationFailed = true;
+          log('Refused durable Claude submit: transcript terminal bridge is unavailable');
+          throw new Error('terminal bridge unavailable before submission');
+        }
+        if (lastInitConfig?.cliId === 'codex-app') {
+          log(
+            `Writing Codex App input to PTY (flush): `
+            + `replyTurn=${shortCorrelationId(item.turnId)} chars=${msg.length}`,
+          );
+        } else {
+          log(`Writing to PTY (flush): "${msg.substring(0, 80)}"`);
+        }
+      };
       // Defense in depth: TmuxPipeBackend's send methods no longer throw on a
       // dead pane (they fire onExit instead), but writeInput can still throw
       // for other reasons (fs errors while resolving the JSONL, a future
@@ -6277,7 +6585,7 @@ async function flushPending(): Promise<void> {
       // worker — exactly the failure mode this change is closing. Contain it.
       let result: Awaited<ReturnType<typeof cliAdapter.writeInput>> | undefined;
       let submissionBackend: SessionBackend | null = null;
-      let submissionFence: number | undefined;
+      let recoveryFailureReason: string | undefined;
       try {
         if (codexRpcEngine) {
           // RPC input mode: deliver via JSON-RPC turn/start (its ack IS the
@@ -6285,31 +6593,84 @@ async function flushPending(): Promise<void> {
           // renders. No tmux paste → the history.jsonl verify/retry/recover
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
-          await codexRpcEngine.sendTurn(msg, item.turnId);
+          const targetBackend = backend;
+          await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
+            prepareNormalWrite();
+            await codexRpcEngine!.sendTurn(msg, item.turnId);
+          });
           result = { submitted: true };
         } else if (item.codexAppInput && cliAdapter.writeStructuredInput) {
-          submissionBackend = backend;
-          submissionFence = captureAmbiguousSubmissionFence(backend);
-          result = await cliAdapter.writeStructuredInput(
-            adapterInputHandle(backend),
-            msg,
-            item.codexAppInput,
-            { turnId: item.turnId },
+          const targetBackend = backend;
+          const targetAdapter = cliAdapter;
+          submissionBackend = targetBackend;
+          const transaction = await runAmbiguousSubmissionTransaction(
+            targetBackend,
+            () => targetAdapter.writeStructuredInput!(
+              adapterInputHandle(targetBackend),
+              msg,
+              item.codexAppInput!,
+              { turnId: item.turnId },
+            ),
+            settleVerifiableSubmissionForJournal,
+            prepareNormalWrite,
           );
+          result = transaction.result;
+          recoveryFailureReason = transaction.recoveryFailureReason;
         } else {
-          submissionBackend = backend;
-          submissionFence = captureAmbiguousSubmissionFence(backend);
-          result = await cliAdapter.writeInput(
-            adapterInputHandle(backend),
-            msg,
-            { turnId: item.turnId },
+          const targetBackend = backend;
+          const targetAdapter = cliAdapter;
+          submissionBackend = targetBackend;
+          const transaction = await runAmbiguousSubmissionTransaction(
+            targetBackend,
+            () => targetAdapter.writeInput(
+              adapterInputHandle(targetBackend),
+              msg,
+              { turnId: item.turnId },
+            ),
+            settleVerifiableSubmissionForJournal,
+            prepareNormalWrite,
           );
+          result = transaction.result;
+          recoveryFailureReason = transaction.recoveryFailureReason;
+        }
+        if (recoveryFailureReason) {
+          result = { ...result, submitted: false };
         }
         scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
       } catch (err: any) {
-        cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
+        recoveryFailureReason = err instanceof SubmissionWriteError
+          ? err.recoveryFailureReason
+          : recoveryFailureReason;
+        const blockedBeforeWrite = err instanceof SubmissionWriteError
+          && !!err.recoveryFailureReason
+          && !err.submissionStarted;
+        if (submissionPreparationFailed) {
+          if (item.turnId) {
+            emitTurnTerminal(
+              item.turnId,
+              'failed',
+              'terminal_bridge_unavailable',
+              item.dispatchAttempt,
+            );
+          }
+          break;
+        }
         log(`writeInput threw: ${err?.message ?? err}`);
-        if (durableWrite && item.turnId) {
+        if (blockedBeforeWrite && submissionBackend) {
+          // This exact item is known not to have touched the PTY. Keep its
+          // original durable attempt (and ordinary IM content) queued, but do
+          // not hammer the same sticky journal or burn receiver retry budget.
+          // A user /restart installs a fresh backend and releases the hold.
+          pendingMessages.unshift(item);
+          ambiguousSubmissionRecoveryHold = {
+            backend: submissionBackend,
+            item,
+          };
+          log('Held definitely-unwritten input until ZMX recovery restart');
+        } else if (recoveryFailureReason) {
+          inflightInputs.retire(item);
+        }
+        if (durableWrite && item.turnId && !recoveryFailureReason) {
           // A throwing backend cannot prove whether bytes reached the CLI.
           // Reconcile as ambiguous (not a definitive failure) so the receiver
           // can replay the same frozen delivery behind the action gate.
@@ -6319,15 +6680,22 @@ async function flushPending(): Promise<void> {
         // nulled `backend` and told the user the CLI exited) — nothing more to
         // do. Otherwise surface it as a submit failure so the message isn't
         // silently lost.
-        if (backend) scheduleSubmitFailureNotify(
-          logicalMsg,
-          undefined,
-          '会话 JSONL',
-          bridgeTurnId,
-          undefined,
-          turnSeq,
-          item,
-        );
+        if (backend) {
+          if (recoveryFailureReason) {
+            notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
+          } else {
+            scheduleSubmitFailureNotify(
+              logicalMsg,
+              undefined,
+              '会话 JSONL',
+              bridgeTurnId,
+              undefined,
+              turnSeq,
+              item,
+              'ambiguous',
+            );
+          }
+        }
         break;
       }
       if (lastInitConfig?.cliId === 'codex-app'
@@ -6356,16 +6724,24 @@ async function flushPending(): Promise<void> {
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
       if (result && result.submitted === false && backend) {
-        cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
-        scheduleSubmitFailureNotify(
-          logicalMsg,
-          result.recheck,
-          '会话 JSONL',
-          bridgeTurnId,
-          result.failureReason,
-          turnSeq,
-          item,
-        );
+        if (recoveryFailureReason) {
+          inflightInputs.retire(item);
+          notifyAmbiguousSubmissionRecovery(recoveryFailureReason, item);
+          // The current item may have landed, so never requeue it. Preserve
+          // every later batch item untouched for an explicit fresh generation.
+          break;
+        } else {
+          scheduleSubmitFailureNotify(
+            logicalMsg,
+            result.recheck,
+            '会话 JSONL',
+            bridgeTurnId,
+            result.failureReason,
+            turnSeq,
+            item,
+            'failed',
+          );
+        }
       }
       // All structured bridges now drain every pending message in one flush:
       // Claude's BridgeTurnQueue handles `attachment(queued_command)` events
@@ -7321,6 +7697,7 @@ async function spawnCli(
     hasExistingSession: effectiveBackend === 'zmx'
       ? resolvedZmxSessionProbe === 'exists'
       : undefined,
+    zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
   let selectedBackend = selectBackend();
   isTmuxMode = selectedBackend.isTmuxMode;
@@ -9088,6 +9465,24 @@ async function spawnCli(
     if (backend !== observedBackend) {
       log(`Ignored stale backend exit (code: ${code}, signal: ${signal})`);
       return;
+    }
+    const recoveryHeld = ambiguousSubmissionRecoveryHold;
+    const handedOffDurable = handoffQueuedDurableInputsOnBackendExit(
+      pendingMessages,
+      { intentionalRestart },
+    );
+    if (handedOffDurable.length > 0) {
+      // onCliExit reconciles every durable receipt owned by this worker
+      // generation to ambiguous, including items still queued behind an
+      // ordinary turn. Drop all of their definitely-unwritten local copies so
+      // a fresh backend cannot execute attempt N while the hub dispatches N+1.
+      // Ordinary IM inputs have no external replay owner and remain queued.
+      if (recoveryHeld && handedOffDurable.includes(recoveryHeld.item)) {
+        ambiguousSubmissionRecoveryHold = null;
+      }
+      log(
+        `Handed ${handedOffDurable.length} queued durable input(s) to daemon replay after CLI exit`,
+      );
     }
     stopSessionMcpGatewayHost();
     const exitedTurnId = currentBotmuxTurnId;
@@ -11051,9 +11446,11 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
-      // Mark new turn baseline so the streaming card only shows this turn's content
-      renderer?.markNewTurn();
-      const turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+      const messageAdoptMode = lastInitConfig?.adoptMode === true;
+      // Adopt IPC handlers can overlap. Delay their turn baseline until the
+      // submission mutex is held so a queued message cannot steal attribution
+      // from the write/verification already in flight.
+      let turnSeq = usageLimitTracker.currentTurn();
       if (
         msg.nativeSessionTitlePrompt
         && msg.nativeSessionTitle
@@ -11071,7 +11468,7 @@ process.on('message', async (raw: unknown) => {
         if (threadId) void syncFreshCodexNativeSessionTitle(threadId, codexRpcEngine);
       }
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
-      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+      if (tmuxScrolledHalfPages > 0 && !messageAdoptMode) exitTmuxScrollMode();
       let content = msg.content;
       let codexAppInput = msg.codexAppInput;
       if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
@@ -11109,40 +11506,33 @@ process.on('message', async (raw: unknown) => {
         }
       }
       if (lastInitConfig?.adoptMode) {
-        // Adopt writes immediately below, so this turn really becomes current
-        // now. Non-adopt messages update the marker only when flushPending
-        // dequeues/writes them; doing it at IPC arrival lets a queued IM turn
-        // steal the identity of a still-running durable delivery.
-        currentBotmuxTurnId = msg.turnId;
-        currentBotmuxDispatchAttempt = msg.dispatchAttempt;
-        currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
-        writeCliPidMarker();
-        publishSandboxRelayCapability();
-        // Bridge mode: capture transcript baseline BEFORE writing to the pane,
-        // so any assistant uuids appended after this point are attributed to
-        // *this* Lark turn (not local user activity in the pane). Mark may
-        // return false (baseline not ready) — we still write to the pane;
-        // user just won't get a final_output for this message.
-        if (bridgeJsonlPath) {
-          try { bridgeIngest(); } catch { /* best effort */ }
-          bridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
-        } else if (codexBridgeFallbackActive()) {
-          // Codex adopt: same idea, different bridge. ingest first so any
-          // in-flight events from a local-typed prior turn close before
-          // this Lark turn's fingerprint window opens. Mark works even
-          // pre-attach (queue is path-agnostic).
-          if (codexBridgeIsCursor()) {
-            // Cursor may append the current Lark/user line to its transcript
-            // before this IPC message is handled. Mark first so that preexisting
-            // current-line can still fingerprint-match instead of being marked
-            // seen as an unmatched event.
-            codexBridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
-            try { codexBridgeIngest(); } catch { /* best effort */ }
-          } else {
-            try { codexBridgeIngest(); } catch { /* best effort */ }
-            codexBridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
+        let adoptWritePrepared = false;
+        const prepareAdoptWrite = (): void => {
+          if (adoptWritePrepared) return;
+          adoptWritePrepared = true;
+          renderer?.markNewTurn();
+          turnSeq = usageLimitTracker.beginTurn(currentUsageLimitSnapshot());
+          if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+          currentBotmuxTurnId = msg.turnId;
+          currentBotmuxDispatchAttempt = msg.dispatchAttempt;
+          currentVcMeetingImTurnOrigin = msg.vcMeetingImTurnOrigin;
+          writeCliPidMarker();
+          publishSandboxRelayCapability();
+          // Capture the transcript baseline only after this turn owns the
+          // submission lock and immediately before its literal write.
+          if (bridgeJsonlPath) {
+            try { bridgeIngest(); } catch { /* best effort */ }
+            bridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
+          } else if (codexBridgeFallbackActive()) {
+            if (codexBridgeIsCursor()) {
+              codexBridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
+              try { codexBridgeIngest(); } catch { /* best effort */ }
+            } else {
+              try { codexBridgeIngest(); } catch { /* best effort */ }
+              codexBridgeMarkPendingTurn(content, msg.turnId, msg.dispatchAttempt);
+            }
           }
-        }
+        };
         // Adopt mode write:
         //   - Structured-bridge adopt-input CLIs (codex/traex/pi/grok/mtr)
         //     route through cliAdapter.writeInput so paste+Enter-retry +
@@ -11157,41 +11547,178 @@ process.on('message', async (raw: unknown) => {
         if (backend) {
           if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
             // writeInput is async but we're already inside an async
-            // message handler. Errors are best-effort logged; the bridge
-            // ingest path is unaffected because mark already happened
-            // above (codexBridgeMarkPendingTurn / bridgeMarkPendingTurn).
+            // message handler. Errors are best-effort logged; attribution and
+            // bridge baselines are prepared only after the submission lock is
+            // held, immediately before the adapter write.
             const submissionBackend = backend;
-            const submissionFence = captureAmbiguousSubmissionFence(backend);
+            const submissionAdapter = cliAdapter;
+            let recoveryFailureReason: string | undefined;
             try {
-              const result = await cliAdapter.writeInput(adapterInputHandle(backend), content);
+              const transaction = await runAmbiguousSubmissionTransaction(
+                submissionBackend,
+                () => submissionAdapter.writeInput(
+                  adapterInputHandle(submissionBackend),
+                  content,
+                ),
+                settleVerifiableSubmissionForJournal,
+                prepareAdoptWrite,
+              );
+              const result = transaction.result;
+              recoveryFailureReason = transaction.recoveryFailureReason;
               if (result?.cliSessionId) {
                 persistCliSessionId(result.cliSessionId);
                 codexBridgeNotifyCliSessionId(result.cliSessionId);
               }
-              if (result && result.submitted === false) {
-                cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
-                scheduleSubmitFailureNotify(content, result.recheck, 'submit history', undefined, result.failureReason, turnSeq);
+              if (result?.submitted === false || recoveryFailureReason) {
+                if (recoveryFailureReason) {
+                  notifyAmbiguousSubmissionRecovery(
+                    recoveryFailureReason,
+                    msg,
+                  );
+                } else {
+                  scheduleSubmitFailureNotify(
+                    content,
+                    result?.recheck,
+                    'submit history',
+                    undefined,
+                    result?.failureReason,
+                    turnSeq,
+                    msg,
+                    'failed',
+                  );
+                }
               } else {
                 acknowledgeTurnInputCommitted(msg.turnId);
               }
             } catch (err: any) {
-              cancelAmbiguousSubmissionAfterFailure(submissionBackend, submissionFence);
+              recoveryFailureReason = err instanceof SubmissionWriteError
+                ? err.recoveryFailureReason
+                : recoveryFailureReason;
+              const blockedBeforeWrite = err instanceof SubmissionWriteError
+                && !!err.recoveryFailureReason
+                && !err.submissionStarted;
               log(`Adopt writeInput error (${lastInitConfig?.cliId}): ${err.message}`);
+              if (
+                msg.turnId
+                && msg.dispatchAttempt !== undefined
+                && blockedBeforeWrite
+              ) {
+                emitTurnTerminal(
+                  msg.turnId,
+                  'failed',
+                  'zmx_recovery_blocked_before_write',
+                  msg.dispatchAttempt,
+                );
+              } else if (
+                msg.turnId
+                && msg.dispatchAttempt !== undefined
+                && !recoveryFailureReason
+              ) {
+                emitTurnTerminal(
+                  msg.turnId,
+                  'ambiguous',
+                  'write_input_threw',
+                  msg.dispatchAttempt,
+                );
+              }
+              if (backend) {
+                if (recoveryFailureReason) {
+                  notifyAmbiguousSubmissionRecovery(
+                    recoveryFailureReason,
+                    msg,
+                  );
+                } else {
+                  scheduleSubmitFailureNotify(
+                    content,
+                    undefined,
+                    'submit history',
+                    undefined,
+                    undefined,
+                    turnSeq,
+                    msg,
+                    'ambiguous',
+                  );
+                }
+              }
             }
           } else if ('sendText' in backend && 'sendSpecialKeys' in backend) {
-            (backend as any).sendText(content);
-            // Beat between text and Enter so the adopted CLI's input layer
-            // has time to register the typed chars before submit. Without
-            // this, Ink-based TUIs (CoCo, Claude Code) flag the rapid
-            // input+Enter as paste continuation and treat the trailing
-            // Enter as a soft-newline, leaving the message stranded in the
-            // input box. 200ms mirrors the per-adapter writeInput delay
-            // that fresh-spawn mode goes through and matches the slash-
-            // command (raw_input) fix.
-            await new Promise(r => setTimeout(r, 200));
-            (backend as any).sendSpecialKeys('Enter');
-            acknowledgeTurnInputCommitted(msg.turnId);
+            const submissionBackend = backend;
+            let recoveryFailureReason: string | undefined;
+            try {
+              const transaction = await runAmbiguousSubmissionTransaction(
+                submissionBackend,
+                async () => {
+                  const input = adapterInputHandle(submissionBackend);
+                  input.sendText!(content);
+                  // Beat between text and Enter so the adopted CLI's input
+                  // layer registers the typed chars before submit.
+                  await new Promise(r => setTimeout(r, 200));
+                  input.sendSpecialKeys!('Enter');
+                },
+                undefined,
+                prepareAdoptWrite,
+              );
+              recoveryFailureReason = transaction.recoveryFailureReason;
+              if (recoveryFailureReason) {
+                throw new SubmissionWriteError(
+                  `backend could not commit the adopt submission journal; ${recoveryFailureReason}`,
+                  recoveryFailureReason,
+                );
+              }
+              acknowledgeTurnInputCommitted(msg.turnId);
+            } catch (err: any) {
+              recoveryFailureReason = err instanceof SubmissionWriteError
+                ? err.recoveryFailureReason
+                : recoveryFailureReason;
+              const blockedBeforeWrite = err instanceof SubmissionWriteError
+                && !!err.recoveryFailureReason
+                && !err.submissionStarted;
+              log(`Adopt raw input error (${lastInitConfig?.cliId}): ${err.message}`);
+              if (
+                msg.turnId
+                && msg.dispatchAttempt !== undefined
+                && blockedBeforeWrite
+              ) {
+                emitTurnTerminal(
+                  msg.turnId,
+                  'failed',
+                  'zmx_recovery_blocked_before_write',
+                  msg.dispatchAttempt,
+                );
+              } else if (
+                msg.turnId
+                && msg.dispatchAttempt !== undefined
+                && !recoveryFailureReason
+              ) {
+                emitTurnTerminal(
+                  msg.turnId,
+                  'ambiguous',
+                  'write_input_threw',
+                  msg.dispatchAttempt,
+                );
+              }
+              if (backend) {
+                if (recoveryFailureReason) {
+                  notifyAmbiguousSubmissionRecovery(
+                    recoveryFailureReason,
+                    msg,
+                  );
+                } else {
+                  scheduleSubmitFailureNotify(
+                    content,
+                    undefined,
+                    'submit history',
+                    undefined,
+                    undefined,
+                    turnSeq,
+                    msg,
+                    'ambiguous',
+                  );
+                }
+              }
+            }
           } else {
+            prepareAdoptWrite();
             backend.write(content + '\r');
             acknowledgeTurnInputCommitted(msg.turnId);
           }
@@ -11382,6 +11909,28 @@ process.on('message', async (raw: unknown) => {
         }
       }
       if (removedPending > 0) {
+        if (
+          ambiguousSubmissionRecoveryHold?.backend === backend
+          && !lastInitConfig?.adoptMode
+        ) {
+          // A recovery-held item at the queue head blocked this durable
+          // attempt from ever reaching the PTY. It may be this exact delivery
+          // or an ordinary IM immediately ahead of it; either way, hub replay
+          // must not hit the same poisoned generation. Fence it now, preserve
+          // every other queued item, then admit the next attempt to the fresh
+          // session.
+          ambiguousSubmissionRecoveryHold = null;
+          log(
+            `Expiring recovery-held durable input turn=${msg.turnId.slice(0, 12)} `
+            + `attempt=${msg.dispatchAttempt}; fencing poisoned backend`,
+          );
+          await restartCliProcess(
+            'ZMX recovery hold blocked durable lease',
+            { immediate: true, preservePending: true },
+          );
+          acknowledge('cli_fenced');
+          break;
+        }
         log(
           `Expired ${removedPending} queued durable input(s) turn=${msg.turnId.slice(0, 12)} `
           + `attempt=${msg.dispatchAttempt}`,

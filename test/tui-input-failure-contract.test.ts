@@ -33,8 +33,8 @@ describe('TUI input failure contract wiring', () => {
       '/**\n * Drive CoCo',
     );
     const writeIndex = Math.max(
-      region.indexOf('await cliAdapter.writeInput'),
-      region.indexOf('await submitTuiTextInput'),
+      region.indexOf('targetAdapter.writeInput'),
+      region.indexOf('submitTuiTextInput'),
     );
     const clearIndex = region.indexOf('tuiPromptBlocking = false');
 

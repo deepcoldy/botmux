@@ -763,6 +763,8 @@ export const messages: Record<string, string> = {
   'worker.tui_submit_failed': '⚠️ TUI 答案未能确认送达 {cliName}。CLI 可能仍在等待输入；请打开本机终端处理，或发送一条新消息解除并继续。',
   'worker.raw_input_failed': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。请检查当前终端状态后重发。',
   'worker.raw_input_failed_command_only': '⚠️ Slash 命令未能确认送达 {cliName}。请检查当前终端状态后重发。',
+  'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
+  'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
@@ -1141,11 +1143,13 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': '外部事件触发',
 
   // Worker-side submit / notify messages
-  'worker.submit_impossible': '⚠️ 刚才那条消息没有写入 {cliName}，因为当前按键配置无法从终端自动提交。\n原因：{reason}\n请调整 Claude Code Chat keybinding 后重发。\n开头：{preview}',
+  'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
   'worker.submit_unconfirmed': '⚠️ 刚才那条消息发给 {cliName} 后没能确认提交（重试 Enter 后等了 {secs}s 仍未在{transcriptLabel}里看到新记录）。可能卡在输入框里——请去 Web 终端看一下，手动按 Enter 或重发。\n开头：{preview}',
-  'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。ZMX 不提供 Web 终端；请重发，或在本机运行 botmux list 进入该会话检查。\n开头：{preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ 刚才那条消息没能确认写入 {cliName}（等待 {secs}s 后仍无提交证据）。不要直接重发；请在本机运行 botmux list 进入该 ZMX 会话检查输入框。\n开头：{preview}',
+  'worker.zmx_recovery_pending': 'ZMX 控制面暂时无法确认会话身份，自动清理没有执行。不要直接重发；请在本机运行 botmux list 进入会话，检查并按 Ctrl+C 清空输入框，然后用 /restart 重启会话后再试。',
+  'worker.zmx_recovery_unconfirmed': 'ZMX 自动清理 Ctrl+C 的结果无法确认；为避免重复、拼接或截断输入，本会话已停止自动写入。不要直接重发；请在本机运行 botmux list 进入会话检查并手动清空输入框，然后用 /restart 重启会话后再试。',
   'worker.interrupt_unconfirmed': '⚠️ 中断键 {key} 连续两次未送达 {cliName}，CLI 可能仍在运行；卡片不会把这次操作标成已停止。{recovery}',
-  'worker.interrupt_recovery_zmx': '请重试；也可在本机运行 botmux list，进入该 ZMX 会话后手动中断。',
+  'worker.interrupt_recovery_zmx': '请在本机运行 botmux list，进入该 ZMX 会话检查并手动中断；如果状态仍不确定，请用 /restart 重启会话。',
   'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',

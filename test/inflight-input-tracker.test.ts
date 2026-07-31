@@ -126,6 +126,19 @@ describe('InflightInputTracker', () => {
     expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
   });
 
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
+    const t = new InflightInputTracker();
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
+
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
+  });
+
   it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('first'));

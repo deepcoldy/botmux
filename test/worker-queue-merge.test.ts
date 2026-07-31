@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  handoffQueuedDurableInputsOnBackendExit,
   mergeQueuedCliInput,
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
@@ -74,6 +75,38 @@ describe('mergeQueuedCliInput', () => {
       turnId: 'im-2',
       vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
     })).toBe(true);
+  });
+});
+
+describe('handoffQueuedDurableInputsOnBackendExit', () => {
+  it('hands off every queued durable generation while preserving ordinary input order', () => {
+    const ordinaryBefore = { content: 'ordinary before', turnId: 'im-1' };
+    const durableOne = { content: 'delivery one', turnId: 'delivery-1', dispatchAttempt: 1 };
+    const ordinaryAfter = { content: 'ordinary after', turnId: 'im-2' };
+    const durableTwo = { content: 'delivery two', turnId: 'delivery-2', dispatchAttempt: 4 };
+    const pending = [ordinaryBefore, durableOne, ordinaryAfter, durableTwo];
+
+    const handedOff = handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: false },
+    );
+
+    expect(handedOff).toEqual([durableOne, durableTwo]);
+    expect(pending).toEqual([ordinaryBefore, ordinaryAfter]);
+  });
+
+  it('preserves the complete queue for an intentional in-worker restart', () => {
+    const pending = [
+      { content: 'ordinary', turnId: 'im-1' },
+      { content: 'delivery', turnId: 'delivery-1', dispatchAttempt: 2 },
+    ];
+    const snapshot = [...pending];
+
+    expect(handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: true },
+    )).toEqual([]);
+    expect(pending).toEqual(snapshot);
   });
 });
 

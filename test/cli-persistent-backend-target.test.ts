@@ -203,6 +203,10 @@ if (args.join(' ') === 'list --short') {
   process.stdout.write('tail-send-v1\\n');
 } else if (args[0] === 'get' && args[2] === 'botmux.session') {
   process.stdout.write('different-complete-session-id\\n');
+} else if (args[0] === 'get' && args[2] === 'botmux.launch_pid') {
+  process.stdout.write('5151\\n');
+} else if (args[0] === 'get' && args[2] === 'botmux.gate_nonce') {
+  process.stdout.write('0123456789abcdef0123456789abcdef\\n');
 } else if (args[0] === 'kill') {
   process.stderr.write('must not kill a mismatched owner\\n');
   process.exitCode = 9;

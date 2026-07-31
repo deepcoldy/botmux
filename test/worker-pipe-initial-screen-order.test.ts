@@ -63,12 +63,13 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    // The backend is now wrapped by adapterInputHandle() so ZMX can turn an
-    // explicit false send result into a submission failure. Pin the call site,
-    // rather than its argument formatting, while preserving the ordering
-    // contract this test protects.
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(');
-    const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
+    const flushStart = source.indexOf('async function flushPending(): Promise<void>');
+    const flushEnd = source.indexOf('function sendToPty(', flushStart);
+    const flush = source.slice(flushStart, flushEnd);
+    // Attribution and ZMX's recovery journal now wrap the adapter call. Anchor
+    // the literal write inside flushPending, then preserve the probe ordering.
+    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);

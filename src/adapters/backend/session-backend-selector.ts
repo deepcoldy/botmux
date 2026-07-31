@@ -241,6 +241,8 @@ export function selectSessionBackend(opts: {
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
   hasExistingSession?: boolean;
+  /** Host-persistent journal for fail-closed ZMX composer recovery. */
+  zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
   if (opts.backendType === 'riff') {
     if (!opts.backendConfig) {
@@ -262,6 +264,7 @@ export function selectSessionBackend(opts: {
         ownsSession: true,
         isReattach: reattach,
         sessionId: opts.sessionId,
+        recoveryStateDir: opts.zmxRecoveryStateDir,
       }),
       isTmuxMode: false,
       // ZMX is observed out-of-band (`zmx tail`) and driven independently

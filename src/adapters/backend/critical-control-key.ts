@@ -7,7 +7,9 @@
  */
 export const TERMINAL_CANCEL_COOLDOWN_MS = 550;
 
-export function isCriticalInterruptKey(key: string): boolean {
+export type CriticalInterruptKey = 'ctrlc' | 'esc';
+
+export function isCriticalInterruptKey(key: string): key is CriticalInterruptKey {
   return key === 'ctrlc' || key === 'esc';
 }
 
@@ -19,6 +21,7 @@ export function isCriticalInterruptKey(key: string): boolean {
  * stay outside this helper and retain best-effort semantics.
  */
 export async function sendCriticalControlKey(
+  key: CriticalInterruptKey,
   sendOnce: () => void | boolean,
   wait: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
 ): Promise<boolean> {
@@ -28,7 +31,9 @@ export async function sendCriticalControlKey(
     } catch {
       // A synchronous transport failure is retryable for interrupt keys only.
     }
-    if (attempt === 0) await wait(100);
+    if (attempt === 0) {
+      await wait(key === 'ctrlc' ? TERMINAL_CANCEL_COOLDOWN_MS : 100);
+    }
   }
   return false;
 }

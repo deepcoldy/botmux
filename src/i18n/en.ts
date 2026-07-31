@@ -760,6 +760,8 @@ export const messages: Record<string, string> = {
   'worker.tui_submit_failed': '⚠️ The TUI answer could not be confirmed as delivered to {cliName}. The CLI may still be waiting for input; open the local terminal or send a new message to recover.',
   'worker.raw_input_failed': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted. Check the terminal state, then resend.',
   'worker.raw_input_failed_command_only': '⚠️ The slash command could not be confirmed as delivered to {cliName}. Check the terminal state, then resend.',
+  'worker.raw_input_failed_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}, so the follow-up text in the same message was not submitted.\nReason: {reason}',
+  'worker.raw_input_failed_command_only_recovery': '⚠️ The slash command could not be confirmed as delivered to {cliName}.\nReason: {reason}',
   'worker.empty_final_completed': '⚠️ {cliName} reported this turn as completed, but botmux captured no final text from the terminal transcript and saw no tracked reply for this turn. If you already replied via a redirected send (--top-level / --into / --override-chat), you can ignore this. Otherwise open the web terminal to inspect the last output, or resend a message to continue the session.',
 
   // ─── CLI setup wizard / pm2 lifecycle (no per-bot context) ───────────────
@@ -1138,11 +1140,13 @@ export const messages: Record<string, string> = {
   'trigger.external_event_clean': 'External event',
 
   // Worker-side submit / notify messages
-  'worker.submit_impossible': '⚠️ Your last message was NOT delivered to {cliName}: the current keybinding config can’t auto-submit from the terminal.\nReason: {reason}\nAdjust the Claude Code Chat keybinding, then resend.\nStart: {preview}',
+  'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.submit_unconfirmed': '⚠️ Your last message was sent to {cliName} but submission couldn’t be confirmed (after retrying Enter and waiting {secs}s, no new entry showed up in {transcriptLabel}). It may be stuck in the input box — check the Web terminal and press Enter manually or resend.\nStart: {preview}',
-  'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. ZMX has no Web Terminal; resend it, or run botmux list locally and inspect the session.\nStart: {preview}',
+  'worker.submit_unconfirmed_zmx': '⚠️ Your last message could not be confirmed as written to {cliName} after {secs}s. Do not resend it blindly; run botmux list locally, enter the ZMX session, and inspect its composer.\nStart: {preview}',
+  'worker.zmx_recovery_pending': 'The ZMX control plane could not verify the session identity, so automatic cleanup did not run. Do not resend blindly; run botmux list locally, inspect the session, press Ctrl+C to clear the composer, then use /restart before trying again.',
+  'worker.zmx_recovery_unconfirmed': 'The ZMX cleanup Ctrl+C could not be confirmed. To prevent duplicate, concatenated, or truncated input, automatic writes to this session are now blocked. Do not resend blindly; run botmux list locally, inspect and clear the composer, then use /restart before trying again.',
   'worker.interrupt_unconfirmed': '⚠️ Interrupt key {key} could not be delivered to {cliName} after two attempts. The CLI may still be running, and the card will not claim it stopped. {recovery}',
-  'worker.interrupt_recovery_zmx': 'Retry, or run botmux list locally, enter the ZMX session, and interrupt it there.',
+  'worker.interrupt_recovery_zmx': 'Run botmux list locally, enter the ZMX session, and inspect and interrupt it manually. If its state is still uncertain, use /restart.',
   'worker.interrupt_recovery_web': 'Retry, or open the Web Terminal and interrupt it manually.',
   'worker.skill_delivery_failed': '⚠️ This bot’s Skill delivery config blocked the new session: {reason}\nSet skills.delivery to auto/prompt, or switch to a CLI that supports native skill delivery, then retry.',
   'worker.coco_session_dir_gone': '⚠️ The current CoCo session directory was deleted (e2e cleanup or a manual rm). Content written to events.jsonl lands on a stale inode the bridge can’t read. Restart CoCo and run /adopt again.',

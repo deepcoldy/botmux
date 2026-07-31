@@ -277,9 +277,14 @@ describe('zmx backend pure helpers', () => {
   it('waits through a transient stale socket when confirming a managed kill', () => {
     const name = 'bmx-abcd1234';
     const sessionId = 'abcd1234-1111-2222-3333-444444444444';
+    const rootPid = process.ppid;
+    const launchPid = process.pid;
     let killed = false;
     let staleProbe = true;
-    execFileSyncMock.mockImplementation((_file, argv) => {
+    execFileSyncMock.mockImplementation((file, argv) => {
+      if (file === '/usr/bin/ps' || file === '/bin/ps') {
+        return `${rootPid}\n`;
+      }
       const [command, ...args] = argv as string[];
       if (command === 'list' && args[0] === '--short') {
         if (killed && staleProbe) {
@@ -289,10 +294,14 @@ describe('zmx backend pure helpers', () => {
         return killed ? '' : `${name}\n`;
       }
       if (command === 'list') {
-        return killed ? '' : `  name=${name}\tpid=4242\tclients=0\tcmd=codex\n`;
+        return killed ? '' : `  name=${name}\tpid=${rootPid}\tclients=0\tcmd=codex\n`;
       }
       if (command === 'get' && args[1] === 'botmux.transport') return 'tail-send-v1\n';
       if (command === 'get' && args[1] === 'botmux.session') return `${sessionId}\n`;
+      if (command === 'get' && args[1] === 'botmux.launch_pid') return `${launchPid}\n`;
+      if (command === 'get' && args[1] === 'botmux.gate_nonce') {
+        return '0123456789abcdef0123456789abcdef\n';
+      }
       if (command === 'kill') {
         killed = true;
         return `killed session ${name}\n`;
@@ -300,7 +309,7 @@ describe('zmx backend pure helpers', () => {
       throw new Error(`unexpected zmx command: ${argv.join(' ')}`);
     });
 
-    expect(() => ZmxBackend.killManagedSession(name, sessionId, 4242)).not.toThrow();
+    expect(() => ZmxBackend.killManagedSession(name, sessionId, rootPid)).not.toThrow();
     expect(killed).toBe(true);
     expect(staleProbe).toBe(false);
   });
@@ -308,17 +317,26 @@ describe('zmx backend pure helpers', () => {
   it('fails closed when a managed session is replaced during kill confirmation', () => {
     const name = 'bmx-abcd1234';
     const sessionId = 'abcd1234-1111-2222-3333-444444444444';
+    const rootPid = process.ppid;
+    const launchPid = process.pid;
     let killed = false;
-    execFileSyncMock.mockImplementation((_file, argv) => {
+    execFileSyncMock.mockImplementation((file, argv) => {
+      if (file === '/usr/bin/ps' || file === '/bin/ps') {
+        return `${rootPid}\n`;
+      }
       const [command, ...args] = argv as string[];
       if (command === 'list' && args[0] === '--short') return `${name}\n`;
       if (command === 'list') {
-        const pid = killed ? 5252 : 4242;
+        const pid = killed ? rootPid + 1 : rootPid;
         return `  name=${name}\tpid=${pid}\tclients=0\tcmd=codex\n`;
       }
       if (command === 'get' && args[1] === 'botmux.transport') return 'tail-send-v1\n';
       if (command === 'get' && args[1] === 'botmux.session') {
         return killed ? 'abcd1234-9999-8888-7777-666666666666\n' : `${sessionId}\n`;
+      }
+      if (command === 'get' && args[1] === 'botmux.launch_pid') return `${launchPid}\n`;
+      if (command === 'get' && args[1] === 'botmux.gate_nonce') {
+        return '0123456789abcdef0123456789abcdef\n';
       }
       if (command === 'kill') {
         killed = true;
@@ -327,7 +345,8 @@ describe('zmx backend pure helpers', () => {
       throw new Error(`unexpected zmx command: ${argv.join(' ')}`);
     });
 
-    expect(() => ZmxBackend.killManagedSession(name, sessionId, 4242)).toThrow(/同名会话替换/);
+    expect(() => ZmxBackend.killManagedSession(name, sessionId, rootPid))
+      .toThrow(/同名会话替换/);
     expect(killed).toBe(true);
   });
 
@@ -371,6 +390,8 @@ describe('zmx backend pure helpers', () => {
     expect(files.bootstrap).toContain(releasePath);
     expect(files.bootstrap).toContain(readyNonce);
     expect(files.bootstrap).toContain(releaseToken);
+    expect(files.bootstrap)
+      .toContain(`botmux-zmx-private-release-gate-v1:${readyNonce}`);
     // The ZMX forkpty child already owns the correct slave descriptor. Reopening
     // `/dev/tty` changes fd 0 into a Darwin kqueue-incompatible descriptor.
     expect(files.bootstrap).not.toContain('exec </dev/tty');
