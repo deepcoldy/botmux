@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, isCodexRateLimitEvent, splitCodexEventsByCutoff, extractLastCodexTurn, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -267,7 +267,7 @@ describe('drainCodexRollout', () => {
     expect(r.events[0].text).toBe('done');
   });
 
-  it('skips reasoning / function_call / function_call_output / event_msg', () => {
+  it('skips reasoning / function_call / function_call_output / successful event_msg', () => {
     writeFileSync(path,
       ev({ type: 'response_item', payload: { type: 'reasoning' } }) +
       ev({ type: 'response_item', payload: { type: 'function_call', name: 'shell' } }) +
@@ -278,6 +278,55 @@ describe('drainCodexRollout', () => {
     expect(r.events).toHaveLength(1);
     expect(r.events[0].kind).toBe('user');
     expect(r.events[0].text).toBe('actual prompt');
+  });
+
+  it('turns a structured 429 task failure into an empty failed terminal', () => {
+    writeFileSync(path,
+      ev(userResponseItem('retryable prompt')) +
+      ev({
+        timestamp: '2026-04-29T07:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'task_complete',
+          last_agent_message: null,
+          error: {
+            message: 'exceeded retry limit, last status: 429 Too Many Requests',
+            codex_error_info: {
+              response_too_many_failed_attempts: { http_status_code: 429 },
+            },
+          },
+        },
+      }));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events).toHaveLength(2);
+    expect(result.events[1]).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_RATE_LIMIT_ERROR_CODE,
+    });
+    expect(isCodexRateLimitEvent(result.events[1])).toBe(true);
+  });
+
+  it('settles a non-rate task failure without classifying it as limited', () => {
+    writeFileSync(path, ev({
+      timestamp: '2026-04-29T07:00:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'task_complete',
+        error: { message: 'connection closed unexpectedly' },
+      },
+    }));
+
+    const result = drainCodexRollout(path, 0);
+    expect(result.events[0]).toMatchObject({
+      kind: 'assistant_final',
+      text: '',
+      terminalStatus: 'failed',
+      terminalErrorCode: CODEX_TASK_FAILED_ERROR_CODE,
+    });
+    expect(isCodexRateLimitEvent(result.events[0])).toBe(false);
   });
 
   it('skips messages with no input_text/output_text content', () => {

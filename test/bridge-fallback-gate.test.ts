@@ -4,6 +4,7 @@ import {
   buildBridgeSendMarkerContent,
   buildBridgeSendPreviewText,
   shouldEmitEmptyCompletedBridgeFallback,
+  shouldEmitFailedBridgeFallback,
   shouldSuppressBridgeEmit,
   type BridgeSendMarker,
 } from '../src/services/bridge-fallback-gate.js';
@@ -313,6 +314,44 @@ describe('shouldEmitEmptyCompletedBridgeFallback', () => {
       undefined,
       [],
       false,
+    )).toBe(false);
+  });
+});
+
+describe('shouldEmitFailedBridgeFallback', () => {
+  it('emits a visible diagnostic for an empty failed turn without a send marker', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(true);
+  });
+
+  it('does not duplicate an explicit reply or affect completed, local, or adopt turns', () => {
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      200,
+      [markerForContent(150, 'failure already reported')],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'completed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100, true), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      false,
+    )).toBe(false);
+    expect(shouldEmitFailedBridgeFallback(
+      { ...turn(100), finalText: '', terminalStatus: 'failed' },
+      undefined,
+      [],
+      true,
     )).toBe(false);
   });
 });

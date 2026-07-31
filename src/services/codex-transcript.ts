@@ -4,14 +4,18 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. Inside, the bridge
- * fallback only cares about two `response_item.payload.type === 'message'`
+ * fallback primarily cares about two `response_item.payload.type === 'message'`
  * shapes:
  *
  *   - role=user             → the user's prompt text (input_text content)
  *   - role=assistant +
  *     phase=final_answer    → the model's final reply (output_text content)
  *
- * Why these and not `event_msg`:
+ * 同时读取失败的 `event_msg.payload.type === 'task_complete'`。Codex 失败
+ * 时可能没有最终回复；若忽略该终态，Lark 回合会一直卡在队列里，限流或错误
+ * 状态也无法同步到群内。
+ *
+ * 其余 `event_msg` 仍忽略：
  *   - `response_item` is the canonical transcript record; `event_msg` is a
  *     UI-event stream that can carry the same final text via two channels
  *     (`agent_message phase=final_answer` AND `task_complete.last_agent_message`).
@@ -123,6 +127,28 @@ export interface CodexBridgeEvent {
    *  transcript user timestamp. Used by bridges whose committed user
    *  timestamp can lag behind in-turn delivery markers. */
   preserveMarkTimeMs?: boolean;
+}
+
+export const CODEX_RATE_LIMIT_ERROR_CODE = 'codex_rate_limited';
+export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
+
+function codexTaskFailureCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return CODEX_TASK_FAILED_ERROR_CODE;
+  const value = error as any;
+  const status = value.codex_error_info
+    ?.response_too_many_failed_attempts
+    ?.http_status_code;
+  const message = typeof value.message === 'string' ? value.message : '';
+  if (status === 429 || /\b429\b.*too many requests|too many requests.*\b429\b/i.test(message)) {
+    return CODEX_RATE_LIMIT_ERROR_CODE;
+  }
+  return CODEX_TASK_FAILED_ERROR_CODE;
+}
+
+export function isCodexRateLimitEvent(event: CodexBridgeEvent): boolean {
+  return event.kind === 'assistant_final'
+    && event.terminalStatus === 'failed'
+    && event.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
 }
 
 /** Extract the last completed user/assistant turn from a Codex / CoCo bridge
@@ -324,11 +350,22 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     cursor += lineByteLen;
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    if (obj?.type !== 'response_item') continue;
     const p = obj.payload;
-    if (!p || typeof p !== 'object' || p.type !== 'message') continue;
+    if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    if (obj?.type === 'event_msg' && p.type === 'task_complete' && p.error) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'assistant_final',
+        text: '',
+        terminalStatus: 'failed',
+        terminalErrorCode: codexTaskFailureCode(p.error),
+      });
+      continue;
+    }
+    if (obj?.type !== 'response_item' || p.type !== 'message') continue;
     if (p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;

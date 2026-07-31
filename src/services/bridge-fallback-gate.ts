@@ -200,3 +200,17 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   if ((turn.finalText ?? '').trim().length > 0) return false;
   return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
 }
+
+/** 结构化失败回合没有显式回复时补发可见结果；限流由调用方改用专用卡片。 */
+export function shouldEmitFailedBridgeFallback(
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+): boolean {
+  if (adoptMode) return false;
+  if (turn.isLocal) return false;
+  if (turn.terminalStatus !== 'failed') return false;
+  if ((turn.finalText ?? '').trim().length > 0) return false;
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+}
