@@ -3,21 +3,26 @@
  *
  * Four modes — unifies #116 + #131 into one knob so a chat resolves
  * to EXACTLY ONE mode and the two thread-reply mechanisms can never compete:
- *   • chat        — flat chat-scope replies in the group (default). A native
- *                    Lark topic the user opens here folds back into this one
- *                    chat-scope session too (see maybeFoldMentionedRegularGroupThreadToChat).
+ *   • chat        — flat chat-scope replies in the group. A native Lark topic
+ *                    the user opens here folds back into this one chat-scope
+ *                    session too (see maybeFoldMentionedRegularGroupThreadToChat).
  *   • topic/shared — 话题展示但复用同一个 session: reuse the bot's existing
  *                    chat-scope session/worker/cwd, but route this turn's reply
- *                    into the trigger message's thread (#131).
+ *                    into the trigger message's thread (#131). A native topic
+ *                    seed also folds into the shared session, not an independent one.
  *   • new-topic    — explicit fork mode: each top-level @mention opens a fresh
  *                    thread-scope session under the trigger (its own worker/cwd/context).
- *   • chat-topic   — hybrid: top-level @mentions stay flat in the one chat-scope
- *                    session (like `chat`), BUT a native Lark topic the user opens
- *                    runs its own independent thread-scope session (NOT folded).
+ *   • chat-topic   — hybrid (default): top-level @mentions stay flat in the one
+ *                    chat-scope session (like `chat`), BUT a native Lark topic the
+ *                    user opens runs its own independent thread-scope session (NOT
+ *                    folded), whether the bot enters on the seed or a later reply.
  *                    "顶层平铺连续会话；群内原生话题各自独立会话".
  *
+ * Native-topic isolation is chat-topic-only, honoring the /reply-mode config:
+ * chat / shared deliberately fold native topics into the group session.
+ *
  * Resolution: per-chat override (`chatReplyModes[chatId]`) wins; otherwise fall
- * back to the per-bot default (`regularGroupReplyMode`, default 'chat'). The
+ * back to the per-bot default (`regularGroupReplyMode`, default 'chat-topic'). The
  * setting is bot-scoped: Bot A can prefer topic replies in one group while Bot B
  * or another group stays flat.
  */
@@ -45,12 +50,12 @@ export function replyModeLabel(mode: ChatReplyMode): 'chat' | 'topic' | 'new-top
   return 'chat';
 }
 
-/** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat'). */
+/** Per-bot default regular-group mode (`regularGroupReplyMode`, default 'chat-topic'). */
 function regularGroupDefaultMode(larkAppId: string): ChatReplyMode {
   try {
-    return getBot(larkAppId).config.regularGroupReplyMode ?? 'chat';
+    return getBot(larkAppId).config.regularGroupReplyMode ?? 'chat-topic';
   } catch {
-    return 'chat';
+    return 'chat-topic';
   }
 }
 

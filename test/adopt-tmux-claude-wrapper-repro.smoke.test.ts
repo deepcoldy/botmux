@@ -27,9 +27,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, copyFileSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { discoverAdoptableSessions } from '../src/core/session-discovery.js';
+import { isProcessAlive } from '../src/core/session-liveness.js';
 
 const SID_WRAPPED = 'adoptwr1-pr02-93aa-bbbb-ccccddddeeee';
 const SID_DIRECT = 'adoptdi1-pr02-93aa-bbbb-ccccddddeeee';
@@ -59,9 +60,9 @@ function waitForPidFile(pidFile: string, deadlineMs: number): Promise<number | u
     const deadline = Date.now() + deadlineMs;
     while (Date.now() < deadline) {
       if (existsSync(pidFile)) {
-        const raw = spawnSync('cat', [pidFile], { encoding: 'utf-8' }).stdout.trim();
+        const raw = readFileSync(pidFile, 'utf-8').trim();
         const pid = Number(raw);
-        if (Number.isInteger(pid) && pid > 0 && existsSync(`/proc/${pid}`)) return resolve(pid);
+        if (isProcessAlive(pid)) return resolve(pid);
       }
       await new Promise(r => setTimeout(r, 100));
     }
@@ -83,19 +84,24 @@ beforeAll(async () => {
   mkdirSync(wrappedWorkDir, { recursive: true });
   mkdirSync(directWorkDir, { recursive: true });
 
-  // A binary literally named `claude` so /proc/<pid>/comm === 'claude'.
+  // A portable long-running fixture whose OS process title/comm is literally
+  // `claude`. Copying /bin/sleep works on Linux but macOS kills the copied
+  // platform binary because it no longer has its trusted system-path identity.
   fakeClaude = join(dir, 'claude');
-  const sleepBin = spawnSync('sh', ['-c', 'command -v sleep'], { encoding: 'utf-8' }).stdout.trim();
-  copyFileSync(sleepBin || '/bin/sleep', fakeClaude);
-  execFileSync('chmod', ['+x', fakeClaude]);
+  writeFileSync(
+    fakeClaude,
+    `process.title = 'claude';\n` +
+      `const i = process.argv.indexOf('--pid-file');\n` +
+      `if (i >= 0) require('node:fs').writeFileSync(process.argv[i + 1], String(process.pid));\n` +
+      `setTimeout(() => {}, 600_000);\n`,
+  );
 
   // ── Case A: wrapped (node → fake claude) ──────────────────────────────────
   const wrapJs = join(dir, 'wrap.js');
   writeFileSync(
     wrapJs,
     `const { spawn } = require('child_process');\n` +
-      `const c = spawn(process.argv[2], ['600'], { stdio: 'ignore', cwd: process.argv[3] });\n` +
-      `require('fs').writeFileSync(process.argv[4], String(c.pid));\n` +
+      `const c = spawn(process.execPath, [process.argv[2], '--pid-file', process.argv[4]], { stdio: 'ignore', cwd: process.argv[3] });\n` +
       `process.on('SIGTERM', () => { try { c.kill('SIGKILL'); } catch {} process.exit(0); });\n` +
       `setTimeout(() => {}, 600000);\n`,
   );
@@ -108,11 +114,12 @@ beforeAll(async () => {
   ]);
 
   // ── Case B: direct (fake claude straight in the pane) ─────────────────────
-  // Wrap in a tiny shell that records the claude pid so we can key its JSON.
+  // The fixture records its own pid after setting process.title, so the pane has
+  // no extra launcher/subshell and discovery must keep this exact pid.
   const directPidFile = join(dir, 'direct-child.pid');
   execFileSync('tmux', [
-    'new-session', '-d', '-s', TMUX_DIRECT, '-x', '200', '-y', '50',
-    'sh', '-c', `cd ${directWorkDir} && ${fakeClaude} 600 & echo $! > ${directPidFile}; wait`,
+    'new-session', '-d', '-s', TMUX_DIRECT, '-c', directWorkDir, '-x', '200', '-y', '50',
+    nodeBin, fakeClaude, '--pid-file', directPidFile,
   ]);
 
   wrappedClaudePid = await waitForPidFile(wrappedPidFile, 5000);

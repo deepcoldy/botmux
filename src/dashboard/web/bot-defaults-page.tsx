@@ -21,12 +21,14 @@ import {
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import { store } from './store.js';
+import type { RoleInjectMode } from './roles.js';
 import {
   CreateActionButton,
   DropdownMenu,
   Html,
   InfoTip as BaseInfoTip,
   LoadingState,
+  OverflowText,
   RefreshIconButton,
   dropdownLabel,
 } from './dashboard-components.js';
@@ -56,6 +58,181 @@ type BotProfileRoleState = {
   error?: string;
   items: BotProfileRoleItem[];
 };
+
+export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
+
+export const BOT_DEFAULTS_TABS: readonly BotDefaultsTab[] = [
+  'common',
+  'sessions',
+  'security',
+  'cards',
+  'advanced',
+];
+
+export function BotDefaultsTabs(props: {
+  active: BotDefaultsTab;
+  onChange(tab: BotDefaultsTab): void;
+}) {
+  const tr = useT();
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const labels: Record<BotDefaultsTab, string> = {
+    common: tr('botDefaults.tabCommon'),
+    sessions: tr('botDefaults.tabSessions'),
+    security: tr('botDefaults.tabSecurity'),
+    cards: tr('botDefaults.tabCards'),
+    advanced: tr('botDefaults.tabAdvanced'),
+  };
+
+  function selectAt(index: number): void {
+    const nextIndex = (index + BOT_DEFAULTS_TABS.length) % BOT_DEFAULTS_TABS.length;
+    const next = BOT_DEFAULTS_TABS[nextIndex]!;
+    props.onChange(next);
+    tabRefs.current[nextIndex]?.focus();
+  }
+
+  return (
+    <nav className="bd-tab-bar" aria-label={tr('botDefaults.tabNavigation')}>
+      <div className="bd-tabs" role="tablist">
+        {BOT_DEFAULTS_TABS.map((tab, index) => (
+          <button
+            ref={node => { tabRefs.current[index] = node; }}
+            key={tab}
+            id={`bd-tab-${tab}`}
+            type="button"
+            role="tab"
+            className={`bd-tab${props.active === tab ? ' active' : ''}`}
+            aria-selected={props.active === tab}
+            aria-controls={`bd-panel-${tab}`}
+            tabIndex={props.active === tab ? 0 : -1}
+            data-bd-tab={tab}
+            onClick={() => props.onChange(tab)}
+            onKeyDown={event => {
+              if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                selectAt(index + 1);
+              } else if (event.key === 'ArrowLeft') {
+                event.preventDefault();
+                selectAt(index - 1);
+              } else if (event.key === 'Home') {
+                event.preventDefault();
+                selectAt(0);
+              } else if (event.key === 'End') {
+                event.preventDefault();
+                selectAt(BOT_DEFAULTS_TABS.length - 1);
+              }
+            }}
+          >
+            {labels[tab]}
+          </button>
+        ))}
+      </div>
+      <small className="bd-tab-hint">{tr('botDefaults.tabHint')}</small>
+    </nav>
+  );
+}
+
+// Two-column waterfall (masonry) for the task panels. A plain row-major grid
+// locks each row to its tallest tile, stranding a short tile beside a tall one
+// with a dead gap below. This lays tiles out by greedily dropping each into the
+// currently shortest column and writing back an inline grid-column /
+// grid-row-start over the CSS 1px row track. Tiles stay direct grid children —
+// never reparented into per-column wrappers — so their unsaved form drafts
+// (the whole point of the focused editor) never remount. Degrades to the plain
+// auto-fill grid when there is only one column (mobile / narrow) or before the
+// first measure.
+const BD_GRID_ROW_PX = 1; // must match grid-auto-rows in style.css
+const BD_GRID_GAP_PX = 14; // must match .bd-tab-grid gap
+
+export function BdTabGrid(props: { children: ReactNode; className?: string }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const grid = ref.current;
+    if (!grid || typeof window === 'undefined') return undefined;
+
+    const clearPlacement = (tiles: HTMLElement[]) => {
+      for (const tile of tiles) {
+        tile.style.gridColumn = '';
+        tile.style.gridRowStart = '';
+        tile.style.gridRowEnd = '';
+      }
+    };
+
+    const layout = () => {
+      const tiles = Array.from(grid.children).filter(
+        (n): n is HTMLElement => n instanceof HTMLElement,
+      );
+      if (!tiles.length) return;
+
+      // A hidden panel (display:none) reports 0 width — skip; the ResizeObserver
+      // re-fires with real geometry the moment the tab becomes visible.
+      const gridWidth = grid.clientWidth;
+      if (gridWidth <= 0) return;
+
+      // Decide the column count from the SAME width the CSS @container rule keys
+      // off (the .bd-detail container), instead of parsing
+      // getComputedStyle().gridTemplateColumns — that value contains spaces
+      // inside minmax(...) and, once we write an inline grid-column, can report a
+      // stale/implicit extra track, which previously produced a rogue 3rd column.
+      // Reading the container keeps JS placement and the CSS track count in lockstep.
+      const container = grid.closest<HTMLElement>('.bd-detail');
+      const decideWidth = container?.clientWidth ?? gridWidth;
+      const columns = decideWidth >= 1024 ? 2 : 1;
+
+      // Single column (mobile / narrow): normal flow already stacks with no gap.
+      if (columns < 2) { clearPlacement(tiles); return; }
+
+      const rowStep = BD_GRID_ROW_PX + BD_GRID_GAP_PX;
+      const colBottom = new Array<number>(columns).fill(0); // running bottom, row units
+
+      for (const tile of tiles) {
+        const spanRows = Math.max(
+          1,
+          Math.ceil((tile.getBoundingClientRect().height + BD_GRID_GAP_PX) / rowStep),
+        );
+        if (tile.classList.contains('bd-tile-wide')) {
+          // full-width tile: start below the tallest column, then level every
+          // column to its bottom so following tiles pack beneath it evenly.
+          const start = Math.max(...colBottom);
+          tile.style.gridColumn = '1 / -1';
+          tile.style.gridRowStart = String(start + 1);
+          tile.style.gridRowEnd = String(start + 1 + spanRows);
+          colBottom.fill(start + spanRows);
+          continue;
+        }
+        // drop into the currently shortest column (true waterfall)
+        let target = 0;
+        for (let c = 1; c < columns; c++) if (colBottom[c]! < colBottom[target]!) target = c;
+        const start = colBottom[target]!;
+        tile.style.gridColumn = String(target + 1);
+        tile.style.gridRowStart = String(start + 1);
+        tile.style.gridRowEnd = String(start + 1 + spanRows);
+        colBottom[target] = start + spanRows;
+      }
+    };
+
+    // Measure after paint; re-run on any tile resize (content toggles, textarea
+    // growth, async loads, tab becoming visible) and on viewport resize.
+    const raf = window.requestAnimationFrame(layout);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => layout()) : null;
+    if (ro) {
+      ro.observe(grid);
+      for (const child of Array.from(grid.children)) ro.observe(child);
+    }
+    window.addEventListener('resize', layout);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      ro?.disconnect();
+      window.removeEventListener('resize', layout);
+    };
+  });
+
+  return (
+    <div ref={ref} className={props.className ? `bd-tab-grid ${props.className}` : 'bd-tab-grid'}>
+      {props.children}
+    </div>
+  );
+}
 
 function statusClass(status: StatusMessage, extra = ''): string {
   const suffix = status ? ` ${status.ok ? 'hint-ok' : 'hint-warn-inline'}` : '';
@@ -255,6 +432,7 @@ function sessionCapStateLabel(cap: number | null, tr: ReturnType<typeof useT>): 
 function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow {
   return {
     ...bot,
+    usageDisplay: body.usageDisplay,
     disableStreamingCard: body.disableStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -287,6 +465,7 @@ export function BotDefaultsPage() {
   const [profileRoleVersion, setProfileRoleVersion] = useState(0);
   const [, setAvatarVersion] = useState(0);
   const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [activeTab, setActiveTab] = useState<BotDefaultsTab>('common');
 
   const refresh = useCallback(async (clearProfileRoles = false) => {
     if (clearProfileRoles) setProfileRoleVersion(version => version + 1);
@@ -381,6 +560,8 @@ export function BotDefaultsPage() {
         bot={selectedBot}
         cliState={cliState}
         patchBot={patchBot}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
       />
     );
   } else {
@@ -421,6 +602,12 @@ export function BotDefaultsPage() {
               onChange={event => setQuery(event.currentTarget.value)}
             />
           </form>
+          <div className="bd-roster-meta">
+            <span>{tr('botDefaults.rosterCount', { count: filtered.length })}</span>
+            {query.trim() && filtered.length !== bots.length ? (
+              <span>{tr('botDefaults.rosterFiltered', { total: bots.length })}</span>
+            ) : null}
+          </div>
           <div className="bd-roster-list">
             {!loadError && filtered.map(bot => (
               <RosterItem
@@ -458,7 +645,7 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
     >
       <Html html={botAvatarHtml({ name, larkAppId: bot.larkAppId, size: 'sm' })} />
       <div className="bd-roster-tx">
-        <b>{name}</b>
+        <b><OverflowText text={name} showPopover={false} textClassName="bd-roster-name" /></b>
         <span>{cli || bot.larkAppId.slice(0, 14)}</span>
       </div>
       {bot.defaultOncall?.enabled ? <span className="bd-roster-flag">oncall</span> : null}
@@ -466,7 +653,13 @@ function RosterItem(props: { bot: BotDefaultsRow; selected: boolean; onSelect():
   );
 }
 
-function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState; patchBot: PatchBot }) {
+function BotDefaultsCard(props: {
+  bot: BotDefaultsRow;
+  cliState: CliOptionsState;
+  patchBot: PatchBot;
+  activeTab: BotDefaultsTab;
+  onTabChange(tab: BotDefaultsTab): void;
+}) {
   const tr = useT();
   const { bot, cliState, patchBot } = props;
   const name = bot.botName ?? bot.larkAppId;
@@ -499,55 +692,113 @@ function BotDefaultsCard(props: { bot: BotDefaultsRow; cliState: CliOptionsState
 
   return (
     <article className="bd-card bd-profile" data-appid={bot.larkAppId}>
-      <header className="bd-profile-head">
-        <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
-        <div className="bd-profile-main">
-          <BotProfileIdentity
-            bot={bot}
-            cli={cli}
-            patchBot={patchBot}
-            meta={(
-              <>
-                <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
-                <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small>
-                <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small>
-              </>
-            )}
-          />
+      <div className="bd-profile-chrome">
+        <header className="bd-profile-head">
+          <BotAvatarControl bot={bot} name={name} patchBot={patchBot} />
+          <div className="bd-profile-main">
+            <BotProfileIdentity
+              bot={bot}
+              cli={cli}
+              patchBot={patchBot}
+              meta={(
+                <>
+                  <small className="bd-meta-ok">● {tr('botDefaults.metaOnline')}</small>
+                  {(def.since ?? 0) > 0 ? <small data-oncall-since>{tr('botDefaults.lastEnabled')}: {fmtSince(def.since ?? 0)}</small> : null}
+                  {(bot.autoboundChatCount ?? 0) > 0 ? <small>{tr('botDefaults.autobound', { count: bot.autoboundChatCount ?? 0 })}</small> : null}
+                </>
+              )}
+            />
+          </div>
+        </header>
+        <BotDefaultsTabs active={props.activeTab} onChange={props.onTabChange} />
+      </div>
+      <div className="bd-body bd-tab-panels">
+        <div
+          id="bd-panel-common"
+          role="tabpanel"
+          aria-labelledby="bd-tab-common"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'common'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile">
+              <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
+            </section>
+            <section className="bd-tile">
+              <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+            </section>
+            <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
         </div>
-      </header>
-      <div className="bd-body bd-grid">
-        <div className="bd-column">
-          <section className="bd-tile">
-            <BotAgentSection bot={bot} sessionFallback={cli} cliState={cliState} patchBot={patchBot} />
-            <WorkingDirSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
+        <div
+          id="bd-panel-sessions"
+          role="tabpanel"
+          aria-labelledby="bd-tab-sessions"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'sessions'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile"><SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><SubstituteModeSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile">
+              <CrossBotSection bot={bot} putCardPref={putCardPref} />
+            </section>
+            <section className="bd-tile"><SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><StartupCommandsSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SummaryTriggerSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-security"
+          role="tabpanel"
+          aria-labelledby="bd-tab-security"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'security'}
+        >
+          <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
-            {bot.cliId !== 'riff' && <SandboxSection bot={bot} patchBot={patchBot} />}
-            {bot.cliId !== 'riff' && bot.sandbox === true && <SandboxPathsSection bot={bot} patchBot={patchBot} />}
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {bot.cliId !== 'riff' && bot.sandbox === true ? (
+              <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-cards"
+          role="tabpanel"
+          aria-labelledby="bd-tab-cards"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'cards'}
+        >
+          <BdTabGrid>
+            <section className="bd-tile"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
+            <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
+        </div>
+        <div
+          id="bd-panel-advanced"
+          role="tabpanel"
+          aria-labelledby="bd-tab-advanced"
+          className="bd-tab-panel"
+          hidden={props.activeTab !== 'advanced'}
+        >
+          <BdTabGrid>
             {/* riff：backendType 与 CLI 选择 1:1 绑定（spawn 层强制配对），
                 手动切 pty/tmux 只会制造坏组合，隐藏该区块。 */}
-            {bot.cliId !== 'riff' && <BackendTypeSection bot={bot} patchBot={patchBot} />}
-          </section>
-          <section className="bd-tile">
-            <RuntimeEnvironmentSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><GrantSection bot={bot} patchBot={patchBot} /></section>
-          <section className="bd-tile"><SlashCommandPermissionsSection bot={bot} patchBot={patchBot} /></section>
-        </div>
-        <div className="bd-column">
-          <section className="bd-tile">
-            <SessionModeSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-            <SubstituteModeSection bot={bot} patchBot={patchBot} />
-            <CrossBotSection bot={bot} putCardPref={putCardPref} />
-            <SessionCapSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} />
-          </section>
-          <section className="bd-tile">
-            <CardBehaviorSection bot={bot} putCardPref={putCardPref} />
-            <CodexAppDisplaySection bot={bot} putCardPref={putCardPref} />
-            <SummaryTriggerSection bot={bot} patchBot={patchBot} />
-            <BrandSection bot={bot} patchBot={patchBot} />
-          </section>
-          <section className="bd-tile"><RoleSection bot={bot} patchBot={patchBot} /></section>
+            {bot.cliId !== 'riff' ? (
+              <section className="bd-tile"><BackendTypeSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
+            {/* Codex App 历史显示只对 codex-app agent 有意义（其它 CLI 无此渲染通道），
+                选了别的 agent 就隐藏，避免无效开关。 */}
+            {bot.cliId === 'codex-app' ? (
+              <section className="bd-tile"><CodexAppDisplaySection bot={bot} putCardPref={putCardPref} /></section>
+            ) : null}
+            <section className="bd-tile"><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} /></section>
+          </BdTabGrid>
         </div>
       </div>
     </article>
@@ -559,7 +810,6 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
   return (
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
-      <StartupCommandsSection bot={props.bot} patchBot={props.patchBot} />
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
     </section>
@@ -654,6 +904,7 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
   }
 
   return (
+    <>
     <div className="bd-profile-avatar bd-avatar-editable" data-avatar-control>
       <button
         type="button"
@@ -679,14 +930,6 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
           void handleFile(file);
         }}
       />
-      {status ? (
-        <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
-          {status.text}
-          {loginVisible ? (
-            <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
-          ) : null}
-        </small>
-      ) : null}
       {loginOpen ? (
         <FeishuLoginModal
           onClose={() => setLoginOpen(false)}
@@ -698,6 +941,18 @@ function BotAvatarControl(props: { bot: BotDefaultsRow; name: string; patchBot: 
         />
       ) : null}
     </div>
+    {/* Status renders as a full-width in-flow strip on the header's second grid
+        row (not absolutely positioned under the avatar), so it never overlaps
+        the name-status or the tab bar below. */}
+    {status ? (
+      <small className={statusClass(status, 'bd-avatar-status')} data-avatar-status>
+        {status.text}
+        {loginVisible ? (
+          <button type="button" className="bd-feishu-login" data-action="feishu-login-avatar" onClick={() => setLoginOpen(true)}>{tr('feishuLogin.entry')}</button>
+        ) : null}
+      </small>
+    ) : null}
+    </>
   );
 }
 
@@ -786,7 +1041,12 @@ function BotProfileIdentity(props: { bot: BotDefaultsRow; cli: string; patchBot:
             aria-label={tr('botDefaults.renameTitle')}
             onClick={() => setEditMode(true)}
           >
-            {tr('botDefaults.renameAction')}
+            {/* Inline pencil SVG instead of a ✎ text glyph: the glyph's ink is
+                asymmetric within its em-box so flexbox centering left it visibly
+                off-center. An SVG centers by geometry. */}
+            <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+            </svg>
           </button>
         </div>
       ) : (
@@ -1670,6 +1930,7 @@ const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
   { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
   { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
   { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
+  { value: 'zmx', labelKey: 'botDefaults.backendZmx' },
   { value: 'pty', labelKey: 'botDefaults.backendPty' },
 ];
 
@@ -1734,6 +1995,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const { bot, patchBot } = props;
   const [loaded, setLoaded] = useState(typeof bot.teamRole === 'string');
   const [role, setRole] = useState(typeof bot.teamRole === 'string' ? bot.teamRole : '');
+  const [injectMode, setInjectMode] = useState<RoleInjectMode>('every');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -1759,6 +2021,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         if (r.ok && body.ok) {
           const next = body.role ?? '';
           setRole(next);
+          setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
           setLoaded(true);
           patchBot(bot.larkAppId, { teamRole: next });
         } else {
@@ -1771,15 +2034,31 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     return () => { active = false; };
   }, [bot.larkAppId, bot.teamRole, patchBot, tr]);
 
-  async function putRole(nextRole: string, deleted: boolean): Promise<void> {
+  // injectMode isn't cached on the bot row, so when the team role is already
+  // resolved (cache hit above skips the GET) fetch just the mode once per bot.
+  useEffect(() => {
+    let active = true;
+    if (typeof bot.teamRole !== 'string') return () => { active = false; };
+    void (async () => {
+      try {
+        const r = await fetch(`/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`);
+        const body = await r.json().catch(() => ({}));
+        if (active && r.ok && body.ok) setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
+      } catch { /* keep default 'every' */ }
+    })();
+    return () => { active = false; };
+  }, [bot.larkAppId]);
+
+  async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
     if (!loaded) return;
     setStatus(null);
     setBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole });
+      const res = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode });
       if (res.ok && res.body.ok) {
         const stored = nextRole.trim();
         setRole(stored);
+        if (res.body.injectMode === 'once' || res.body.injectMode === 'every') setInjectMode(res.body.injectMode);
         patchBot(bot.larkAppId, { teamRole: stored });
         setStatus({ text: `✓ ${deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved')}`, ok: true });
       } else {
@@ -1792,6 +2071,11 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  const injectOptions: Array<{ value: RoleInjectMode; label: string }> = [
+    { value: 'every', label: tr('roles.injectModeEvery') },
+    { value: 'once', label: tr('roles.injectModeOnce') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.roleHelp')}>{tr('botDefaults.sectionRole')}</FieldTitle></h3>
@@ -1803,6 +2087,19 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         value={role}
         onChange={event => setRole(event.currentTarget.value)}
       />
+      <div className="bd-role-inject">
+        <span className="bd-subsection-title"><FieldTitle help={tr('roles.injectModeHint')}>{tr('roles.injectModeLabel')}</FieldTitle></span>
+        <DropdownMenu<RoleInjectMode>
+          id={`bd-role-inject-${bot.larkAppId}`}
+          className="bd-role-inject-menu"
+          ariaLabel={tr('roles.injectModeLabel')}
+          disabled={!loaded || busy}
+          label={dropdownLabel(injectOptions, injectMode)}
+          value={injectMode}
+          options={injectOptions}
+          onChange={mode => { const next = mode === 'once' ? 'once' : 'every'; setInjectMode(next); void putRole(role, role.trim() === '', next); }}
+        />
+      </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />
@@ -1904,9 +2201,10 @@ function ProfileRoles(props: { appId: string }) {
   );
 }
 
-function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [usageDisplay, setUsageDisplay] = useState<'streaming' | 'footer' | 'off'>(bot.usageDisplay ?? 'streaming');
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -1915,28 +2213,64 @@ function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(patch: Ca
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setUsageDisplay(bot.usageDisplay ?? 'streaming');
     setDisableStreaming(bot.disableStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-  }, [bot.disableStreamingCard, bot.privateCard, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+  }, [bot.disableStreamingCard, bot.privateCard, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
-  async function savePatch(patch: CardPrefPatch, key: string): Promise<void> {
+  async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
     setStatus(null);
     try {
       const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        rollback?.();
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
     } catch (e: any) {
+      rollback?.();
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
       setBusy(null);
     }
   }
 
+  const usageDisplayOptions: DropdownFieldOption<'streaming' | 'footer' | 'off'>[] = [
+    { value: 'streaming', label: tr('botDefaults.usageDisplayStreaming') },
+    { value: 'footer', label: tr('botDefaults.usageDisplayFooter') },
+    { value: 'off', label: tr('botDefaults.usageDisplayOff') },
+  ];
+
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionCard')}</h3>
+      {bot.usageSupported === true && (
+        <div className="bd-row">
+          <div className="bd-field">
+            <FieldTitle help={tr('botDefaults.usageDisplayHelp')}>{tr('botDefaults.usageDisplay')}</FieldTitle>
+            <DropdownField
+              dataInput="usageDisplay"
+              ariaLabel={tr('botDefaults.usageDisplay')}
+              value={usageDisplay}
+              disabled={busy === 'usage'}
+              options={usageDisplayOptions}
+              onChange={next => {
+                const previous = usageDisplay;
+                setUsageDisplay(next);
+                void savePatch(
+                  { usageDisplay: next },
+                  'usage',
+                  () => setUsageDisplay(previous),
+                );
+              }}
+            />
+          </div>
+        </div>
+      )}
       <div className="bd-toggle-grid bd-card-behavior-grid">
         <ToggleRow
           checked={disableStreaming}
@@ -2157,7 +2491,7 @@ function SessionModeSection(props: {
   putCardPref(patch: CardPrefPatch): Promise<JsonResponse>;
 }) {
   const tr = useT();
-  const [p2p, setP2p] = useState(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+  const [p2p, setP2p] = useState(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2168,7 +2502,7 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
-    setP2p(props.bot.p2pMode === 'chat' ? 'chat' : 'thread');
+    setP2p(props.bot.p2pMode === 'thread' ? 'thread' : 'chat');
     setRegular(regularGroupMode(props.bot));
     setMention(mentionMode(props.bot));
     setDocMode(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
@@ -2187,7 +2521,7 @@ function SessionModeSection(props: {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/p2p-mode`, { p2pMode: mode });
       if (res.ok && res.body.ok) {
-        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'chat' ? 'chat' : 'thread' });
+        props.patchBot(props.bot.larkAppId, { p2pMode: res.body.p2pMode === 'thread' ? 'thread' : 'chat' });
         setP2pStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setP2pStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -2322,6 +2656,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const [replyMode, setReplyMode] = useState<'thread' | 'quote'>(initial?.replyMode === 'quote' ? 'quote' : 'thread');
   const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
   const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
+  const [excludedChatsText, setExcludedChatsText] = useState(() => formatSubstituteChats(initial?.excludedChats));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -2415,13 +2750,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
     setControlCard(next?.disableControlCard !== true);
     setChatsText(formatSubstituteChats(next?.chats));
+    setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -2442,6 +2778,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         setReplyMode(next?.replyMode === 'quote' ? 'quote' : 'thread');
         setControlCard(next?.disableControlCard !== true);
         setChatsText(formatSubstituteChats(next?.chats));
+        setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -2514,7 +2851,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -2597,6 +2934,19 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
             value={chatsText}
             disabled={busy}
             onChange={event => setChatsText(event.currentTarget.value)}
+          />
+        </label>
+      </div>
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteExcludedChatsHelp')}>{tr('botDefaults.substituteExcludedChats')}</FieldTitle>
+          <textarea
+            data-input="substituteExcludedChats"
+            rows={3}
+            placeholder={tr('botDefaults.substituteExcludedChatsPlaceholder')}
+            value={excludedChatsText}
+            disabled={busy}
+            onChange={event => setExcludedChatsText(event.currentTarget.value)}
           />
         </label>
       </div>
@@ -2720,9 +3070,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
 }
 
 function regularGroupMode(bot: BotDefaultsRow): string {
-  return bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared' || bot.regularGroupReplyMode === 'chat-topic'
+  return bot.regularGroupReplyMode === 'chat' || bot.regularGroupReplyMode === 'new-topic' || bot.regularGroupReplyMode === 'shared'
     ? bot.regularGroupReplyMode
-    : 'chat';
+    : 'chat-topic';
 }
 
 function mentionMode(bot: BotDefaultsRow): string {

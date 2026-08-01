@@ -101,6 +101,55 @@ function emitTurnCompletion(threadId, turnId, outputSchema) {
       text: answer,
     },
   });
+  // Opt-in: emit a token-usage notification (as the real app-server does) so the
+  // runner's per-turn accumulator has something to fold. cumulative `total`,
+  // last-completion `last`. input includes cache read+write per codex semantics.
+  if (process.env.FAKE_TOKEN_USAGE === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId,
+      turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        modelContextWindow: 272000,
+      },
+    });
+  }
+  // Opt-in: a MALFORMED usage notification first, then a valid one, same turn.
+  // Exercises the runner's sticky-poison path — usage must end up OMITTED.
+  if (process.env.FAKE_TOKEN_USAGE_POISON === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: { total: { totalTokens: 'bad' }, last: {} }, // malformed → poison
+    });
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 10 },
+      },
+    });
+  }
+  // Opt-in: ASYMMETRIC cacheWrite first (total has it, last omits it), then a
+  // valid symmetric packet, same turn. The asymmetry must poison the turn (a
+  // 0-default on the missing side would misattribute cache-create into fresh
+  // input); the later valid packet must NOT resurrect usage. Final marker OMITs.
+  if (process.env.FAKE_TOKEN_USAGE_ASYM === '1') {
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 30, reasoningOutputTokens: 10 },
+        last: { totalTokens: 130, inputTokens: 100, cachedInputTokens: 40, /* cacheWrite MISSING */ outputTokens: 30, reasoningOutputTokens: 10 },
+      },
+    });
+    notify('thread/tokenUsage/updated', {
+      threadId, turnId,
+      tokenUsage: {
+        total: { totalTokens: 200, inputTokens: 150, cachedInputTokens: 40, cacheWriteInputTokens: 40, outputTokens: 60, reasoningOutputTokens: 10 },
+        last: { totalTokens: 70, inputTokens: 50, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 30, reasoningOutputTokens: 0 },
+      },
+    });
+  }
   notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed' } });
 }
 

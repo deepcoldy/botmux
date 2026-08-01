@@ -1,15 +1,16 @@
 /**
  * Shared "is this session a stopped zombie?" predicate — the same notion the
- * `botmux delete stopped` CLI subcommand uses (dead CLI process + no tmux pane),
- * factored out so the host-overload alert's "清僵尸" button can reuse the exact
- * semantics server-side without duplicating (or drifting from) the CLI logic.
+ * `botmux delete stopped` CLI subcommand uses (dead CLI process + no exact
+ * persistent backing), factored out so the host-overload alert's "清僵尸"
+ * button can reuse the exact semantics server-side without duplicating (or
+ * drifting from) the CLI logic.
  *
  * A zombie = a session the store still marks `active`, but whose CLI process is
- * gone and has no backing tmux session — i.e. nothing is actually running, it's
- * just a stale record holding a slot. Intentionally-suspended sessions are NOT
+ * gone and has no recoverable backing target — i.e. nothing is actually
+ * running, it's just a stale record holding a slot. Intentionally-suspended sessions are NOT
  * zombies: they're worker-less on purpose and cold-resume on the next message.
  * botmux's own cap-suspend deliberately clears the pid AND destroys the backing
- * CLI/tmux (that's how it reclaims memory), so the pid/tmux probe alone can't
+ * CLI/backend (that's how it reclaims memory), so the pid/backend probe alone can't
  * tell such a session apart from a true zombie — it would classify the just-
  * suspended session as stopped and let the sweep permanently close it. The
  * persisted `suspendedColdResume` marker is therefore authoritative and short-
@@ -18,6 +19,11 @@
  */
 import { execFileSync } from 'node:child_process';
 import type { Session } from '../types.js';
+import {
+  isSuspendableBackendType,
+  probePersistentBackendTarget,
+  resolvePersistentBackendTarget,
+} from './persistent-backend.js';
 
 /** Liveness check for an arbitrary pid without signalling it (signal 0). */
 export function isProcessAlive(pid: number): boolean {
@@ -31,7 +37,7 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** True when a `bmx-<prefix>` tmux session exists. Best-effort; tmux missing
+/** True when a `bmx-<prefix>` legacy tmux session exists. Best-effort; tmux missing
  *  or any error → treated as "no pane". */
 export function tmuxSessionExists(name: string): boolean {
   try {
@@ -51,10 +57,11 @@ function adoptedCliPid(s: Session): number | undefined {
 
 /**
  * True when a session record is a stopped zombie: no live CLI process and no
- * tmux pane. Mirrors cli.ts `delete stopped`. For adopted sessions the original
- * CLI pid is authoritative (we never spawned a botmux worker); for normal
- * sessions, both the recorded worker pid and the `bmx-<id8>` tmux pane must be
- * dead. Caller is responsible for the `status === 'active'` gate.
+ * recoverable backing target. Mirrors cli.ts `delete stopped`. For adopted
+ * sessions the original CLI pid is authoritative (we never spawned a botmux
+ * worker); for normal sessions, both the recorded worker pid and the exact
+ * persisted backend target must be gone. Caller is responsible for the
+ * `status === 'active'` gate.
  */
 export function isSessionStopped(s: Session): boolean {
   // botmux cap-suspended a session on purpose: pid cleared + backing CLI/tmux
@@ -70,6 +77,28 @@ export function isSessionStopped(s: Session): boolean {
   // runs for sessions whose pid is already dead. Keeps counts/sweep from
   // spawning a tmux child per live session and stalling the daemon loop.
   if (s.pid && isProcessAlive(s.pid)) return false;
-  const hasTmux = tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
-  return !hasTmux;
+
+  // Remote Riff tasks have no local worker/backing process to prove dead.
+  // ZMX likewise owns one independent daemon per session: a missing backing
+  // daemon can mean a normal process/host restart, and the transcript-backed
+  // row remains recoverable by a lazy cold-resume. Neither backend is safe to
+  // permanently close from this local zombie heuristic.
+  if (s.backendType === 'riff' || s.backendType === 'zmx') return false;
+  if (s.backendType === 'pty') return true;
+
+  // Rows created before backend stamping used tmux as their only externally
+  // recoverable backing. Preserve that compatibility probe.
+  if (s.backendType === undefined) {
+    return !tmuxSessionExists(`bmx-${s.sessionId.substring(0, 8)}`);
+  }
+
+  if (!isSuspendableBackendType(s.backendType)) return true;
+  const target = resolvePersistentBackendTarget(
+    s.backendType,
+    s.sessionId,
+    s.persistentBackendTarget,
+  );
+  // Only positive absence is safe to sweep. A transient backend/control-plane
+  // failure must not turn a live persistent CLI into a destructive "zombie".
+  return probePersistentBackendTarget(target) === 'missing';
 }

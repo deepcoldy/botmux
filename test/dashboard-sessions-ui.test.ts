@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { store } from '../src/dashboard/web/store.js';
 import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
 import {
   canRestartSession,
@@ -11,6 +12,7 @@ import {
   restartConfirmMessage,
   historySenderKey,
   sessionLocationText,
+  sessionExchangePreview,
   sessionTopicKey,
   shouldOpenWritableTerminal,
 } from '../src/dashboard/web/sessions.js';
@@ -23,6 +25,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
     details: '<svg></svg>',
     feishu: '<svg></svg>',
     history: '<svg></svg>',
+    key: '<svg></svg>',
     lock: '<svg></svg>',
     restart: '<svg></svg>',
     terminal: '<svg></svg>',
@@ -36,6 +39,7 @@ const kanbanCallbacks: SessionsKanbanCallbacks = {
   onNeedTeamBoard: () => {},
   onNeedTeams: () => {},
   onOpenTerminal: () => {},
+  onOpenWritableTerminal: () => {},
   onRename: () => {},
   onRestart: () => {},
   onTeamScope: () => {},
@@ -63,6 +67,122 @@ function renderKanban(state: Partial<SessionsKanbanState>): string {
 }
 
 describe('dashboard sessions filters', () => {
+  it('shows only a current bot reply in the latest exchange preview', () => {
+    expect(sessionExchangePreview({
+      previewUserFullText: 'latest question',
+      previewBotFullText: 'latest answer',
+      previewBotState: 'replied',
+    })).toEqual({
+      userText: 'latest question',
+      userFullText: 'latest question',
+      botText: 'latest answer',
+      botFullText: 'latest answer',
+    });
+
+    expect(sessionExchangePreview({
+      previewUserText: 'follow-up',
+      previewBotText: 'stale answer',
+      previewBotState: 'waiting',
+    })).toEqual({
+      userText: 'follow-up',
+      userFullText: 'follow-up',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('clears merged preview fields when a close SSE patch explicitly sends nulls', () => {
+    store.replaceSnapshot([{
+      sessionId: 'closing-preview',
+      status: 'idle',
+      previewUserText: 'private question',
+      previewBotText: 'private answer',
+      previewUserFullText: 'private question in full',
+      previewBotFullText: 'private answer in full',
+      previewUserAt: 100,
+      previewBotAt: 200,
+      previewBotState: 'replied',
+    }], []);
+
+    store.applySse('session.update', {
+      sessionId: 'closing-preview',
+      patch: {
+        status: 'closed',
+        previewUserText: null,
+        previewBotText: null,
+        previewUserFullText: null,
+        previewBotFullText: null,
+        previewUserAt: null,
+        previewBotAt: null,
+        previewBotState: null,
+      },
+    });
+
+    expect(store.sessions.get('closing-preview')).toMatchObject({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+    });
+    expect(sessionExchangePreview(store.sessions.get('closing-preview') ?? {})).toEqual({
+      userText: '',
+      userFullText: '',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('does not resurrect private text from legacy fallback fields after close preview cleanup', () => {
+    expect(sessionExchangePreview({
+      status: 'closed',
+      previewUserText: null,
+      previewBotText: null,
+      previewUserFullText: null,
+      previewBotFullText: null,
+      previewUserAt: null,
+      previewBotAt: null,
+      previewBotState: null,
+      lastUserPrompt: 'private closed question',
+      currentTurnTitle: 'private closed title',
+    })).toEqual({
+      userText: '',
+      userFullText: '',
+      botText: '',
+      botFullText: '',
+    });
+  });
+
+  it('renders accessible user and bot preview lines on session cards', () => {
+    const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
+    const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+
+    expect(page).toContain('className="session-card-exchange"');
+    expect(page).toContain("t('sessions.preview.latestExchange')");
+    expect(page).toContain("t('sessions.history.user')");
+    expect(page).toContain("t('sessions.history.bot')");
+    expect(page).toContain('className="session-card-exchange-tooltip"');
+    expect(page).toContain('role="tooltip"');
+    expect(page).toContain('className="session-card-exchange-details"');
+    expect(page).toContain("t('sessions.preview.showFull')");
+    expect(page).toContain('aria-expanded={open}');
+    expect(page).toContain('onPointerEnter={event => {');
+    expect(page).toContain("if (event.key === 'Escape') hide();");
+    expect(page).toContain('<p>{exchange.userFullText}</p>');
+    expect(page).toContain('<p>{exchange.botFullText}</p>');
+    expect(css).toContain('.session-card-exchange-line > p');
+    expect(css).toContain('-webkit-line-clamp: 2');
+    expect(css).toContain('.session-card-exchange-details {');
+    expect(css).toContain('.session-card-exchange-tooltip {');
+    expect(css).toContain('position: fixed;');
+    expect(css).toContain('.session-card-exchange-tooltip-scroll {');
+    expect(css).toContain('.session-card-exchange-tooltip-line > p');
+    expect(css).toContain('user-select: text;');
+  });
+
   it('wires @ completion and pasted-image previews into the create-session composer', () => {
     const page = readFileSync(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url), 'utf8');
 
@@ -406,6 +526,7 @@ describe('dashboard sessions kanban react view', () => {
       host: null,
       ...kanbanCallbacks,
       onOpenTerminal: undefined,
+      onOpenWritableTerminal: undefined,
       rows: [{
         sessionId: 'embedded-session',
         status: 'working',
@@ -424,5 +545,23 @@ describe('dashboard sessions kanban react view', () => {
     }));
 
     expect(html).not.toContain('data-action="terminal"');
+    expect(html).not.toContain('data-action="write-link"');
+  });
+
+  it('renders separate read-only and writable terminal actions when both are available', () => {
+    const html = renderKanban({
+      rows: [{
+        sessionId: 'dual-terminal-session',
+        status: 'working',
+        cliId: 'codex',
+        title: 'Dual terminal',
+        botName: 'Bot A',
+        lastMessageAt: 1000,
+        webPort: 3001,
+      }],
+    });
+
+    expect(html).toContain('data-action="terminal"');
+    expect(html).toContain('data-action="write-link"');
   });
 });

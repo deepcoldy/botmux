@@ -24,13 +24,28 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync, openSync, readSync, closeSync, readdirSync, readlinkSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readdirSync,
+  readlinkSync,
+  readSync,
+  statSync,
+  type Dirent,
+} from 'node:fs';
 import { execSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { join } from 'node:path';
 import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
 
 const IS_LINUX = platform() === 'linux';
+const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
+const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
 /** Extract the cliSessionId encoded in a rollout filename. Codex's session
  *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
@@ -189,24 +204,72 @@ export interface CodexDrainResult {
  *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
  *  directory tree is small (year/month/day) — a one-shot recursive scan
  *  is cheap enough that we don't bother caching. */
-export function findCodexRolloutBySessionId(cliSessionId: string): string | undefined {
-  const sessionsRoot = codexSessionsRoot();
-  if (!cliSessionId || !existsSync(sessionsRoot)) return undefined;
+export function findCodexRolloutBySessionId(
+  cliSessionId: string,
+  opts?: { codexHome?: string; noFollow?: boolean },
+): string | undefined {
+  const sessionsRoot = opts?.codexHome
+    ? join(opts.codexHome, 'sessions')
+    : codexSessionsRoot();
+  if (!cliSessionId) return undefined;
+  try {
+    // BOT_HOME is untrusted and requires no-follow roots. A normal CODEX_HOME
+    // remains compatible with legitimate user-managed symlinks.
+    if (opts?.noFollow && opts.codexHome && !lstatSync(opts.codexHome).isDirectory()) return undefined;
+    const rootStat = opts?.noFollow ? lstatSync(sessionsRoot) : statSync(sessionsRoot);
+    if (!rootStat.isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
   const suffix = `-${cliSessionId}.jsonl`;
-  const stack: string[] = [sessionsRoot];
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
+  let visitedEntries = 0;
   while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const name of entries) {
-      const full = join(dir, name);
-      let st: ReturnType<typeof statSync>;
-      try { st = statSync(full); } catch { continue; }
-      if (st.isDirectory()) {
-        stack.push(full);
-      } else if (st.isFile() && name.endsWith(suffix)) {
-        return full;
+    const { dir, depth } = stack.pop()!;
+    try {
+      const dirStat = opts?.noFollow ? lstatSync(dir) : statSync(dir);
+      if (!dirStat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    let directory: ReturnType<typeof opendirSync>;
+    try { directory = opendirSync(dir); } catch { continue; }
+    try {
+      let entry: Dirent | null;
+      while ((entry = directory.readSync()) !== null) {
+        visitedEntries++;
+        if (opts?.noFollow && visitedEntries > UNTRUSTED_SESSION_SCAN_MAX_ENTRIES) {
+          return undefined;
+        }
+        const full = join(dir, entry.name);
+        let isDirectory = entry.isDirectory();
+        let isFile = entry.isFile();
+        // Some filesystems report DT_UNKNOWN. Resolve those with the same trust
+        // policy, but never stat through a known symlink in untrusted BOT_HOME.
+        if (!isDirectory && !isFile && !entry.isSymbolicLink()) {
+          try {
+            const stat = opts?.noFollow ? lstatSync(full) : statSync(full);
+            isDirectory = stat.isDirectory();
+            isFile = stat.isFile();
+          } catch {
+            continue;
+          }
+        }
+        if (isDirectory) {
+          if (!opts?.noFollow || depth < UNTRUSTED_SESSION_SCAN_MAX_DEPTH) {
+            stack.push({ dir: full, depth: depth + 1 });
+          }
+        } else if (isFile && entry.name.endsWith(suffix)) {
+          try {
+            const fileStat = opts?.noFollow ? lstatSync(full) : statSync(full);
+            if (fileStat.isFile()) return full;
+          } catch {
+            continue;
+          }
+        }
       }
+    } finally {
+      try { directory.closeSync(); } catch { /* already closed */ }
     }
   }
   return undefined;
@@ -228,23 +291,34 @@ const HISTORY_TAIL_BYTES = 4 * 1024 * 1024;
  *  between the two. Only the trailing `maxTailBytes` of the file is scanned. */
 export function findCodexSessionIdByBotmuxSessionId(
   botmuxSessionId: string,
-  opts?: { maxTailBytes?: number },
+  opts?: { maxTailBytes?: number; codexHome?: string; noFollow?: boolean },
 ): string | undefined {
   if (!botmuxSessionId) return undefined;
-  const historyPath = codexHistoryPath();
-  if (!existsSync(historyPath)) return undefined;
+  const historyPath = opts?.codexHome
+    ? join(opts.codexHome, 'history.jsonl')
+    : codexHistoryPath();
+  let fd: number | undefined;
   try {
-    const size = statSync(historyPath).size;
+    // O_NOFOLLOW rejects a symlink swapped in after lstat; O_NONBLOCK keeps a
+    // malicious FIFO from blocking the daemon. fstat then accepts only regular
+    // files. (O_NOFOLLOW is available on the supported Linux/macOS targets.)
+    if (opts?.noFollow && opts.codexHome && !lstatSync(opts.codexHome).isDirectory()) return undefined;
+    const pathStat = opts?.noFollow ? lstatSync(historyPath) : statSync(historyPath);
+    if (!pathStat.isFile()) return undefined;
+    fd = openSync(
+      historyPath,
+      constants.O_RDONLY
+        | (opts?.noFollow ? (constants.O_NOFOLLOW ?? 0) : 0)
+        | (constants.O_NONBLOCK ?? 0),
+    );
+    const opened = fstatSync(fd);
+    if (!opened.isFile()) return undefined;
+    const size = opened.size;
     const maxTailBytes = Math.max(1, opts?.maxTailBytes ?? HISTORY_TAIL_BYTES);
     const start = Math.max(0, size - maxTailBytes);
     const length = size - start;
-    const fd = openSync(historyPath, 'r');
     const buf = Buffer.alloc(length);
-    try {
-      readSync(fd, buf, 0, length, start);
-    } finally {
-      closeSync(fd);
-    }
+    readSync(fd, buf, 0, length, start);
     let text = buf.toString('utf8');
     if (start > 0) {
       // The window almost certainly opens mid-line — drop the partial line.
@@ -267,6 +341,10 @@ export function findCodexSessionIdByBotmuxSessionId(
     }
   } catch {
     return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed / invalid fd */ }
+    }
   }
   return undefined;
 }

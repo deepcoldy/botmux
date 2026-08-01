@@ -30,10 +30,11 @@ import { shouldAutoForkOnRestore, staggeredRecoveryFork } from '../src/core/sess
 import type { DaemonSession } from '../src/core/types.js';
 
 describe('shouldAutoForkOnRestore', () => {
-  it('eagerly re-forks every persistent backend (tmux/herdr/zellij)', () => {
+  it('eagerly re-forks every persistent backend (tmux/herdr/zellij/zmx)', () => {
     expect(shouldAutoForkOnRestore('tmux')).toBe(true);
     expect(shouldAutoForkOnRestore('herdr')).toBe(true);
     expect(shouldAutoForkOnRestore('zellij')).toBe(true);
+    expect(shouldAutoForkOnRestore('zmx')).toBe(true);
   });
 
   it('never eagerly forks the pty backend — it has no pane to re-attach', () => {

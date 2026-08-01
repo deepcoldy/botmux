@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
@@ -190,6 +190,37 @@ export function getSession(sessionId: string): Session | undefined {
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
 }
 
+const bridgeMarkerCleanupFences = new Map<string, Promise<void>>();
+
+export function registerSessionBridgeSendMarkerCleanupFence(
+  sessionId: string,
+  fence: Promise<void>,
+): void {
+  bridgeMarkerCleanupFences.set(sessionId, fence);
+  void fence.then(
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+    () => {
+      if (bridgeMarkerCleanupFences.get(sessionId) === fence) {
+        bridgeMarkerCleanupFences.delete(sessionId);
+      }
+    },
+  );
+}
+
+/**
+ * Return a row only when it belongs to this process's currently-initialised
+ * bot store. Mutating daemon endpoints must use this instead of getSession(),
+ * whose cross-file fallback is intentionally read-only discovery.
+ */
+export function getOwnedSession(sessionId: string): Session | undefined {
+  load();
+  return sessions.get(sessionId);
+}
+
 /**
  * Search all session files for a session not found in the current file.
  *
@@ -215,7 +246,26 @@ function findInOtherFiles(sessionId: string): Session | undefined {
   return undefined;
 }
 
-export function closeSession(sessionId: string): void {
+export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
+  try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+}
+
+export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
+  const fence = bridgeMarkerCleanupFences.get(sessionId);
+  if (fence) {
+    void fence.then(
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+      () => cleanupSessionBridgeSendMarkersNow(sessionId),
+    );
+    return;
+  }
+  cleanupSessionBridgeSendMarkersNow(sessionId);
+}
+
+export function closeSession(
+  sessionId: string,
+  opts: { cleanupBridgeMarkers?: boolean } = {},
+): void {
   load();
   const session = sessions.get(sessionId);
   if (session) {
@@ -231,6 +281,11 @@ export function closeSession(sessionId: string): void {
     session.status = 'closed';
     session.closedAt = new Date().toISOString();
     save();
+    // turn-sends was originally a transient bridge-dedup file cleaned by a
+    // live worker's close handler. Message previews now make its bounded tail
+    // user-visible, so workerless/forced closes must apply the same cleanup;
+    // otherwise closed sessions retain private reply text indefinitely.
+    if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

@@ -96,15 +96,76 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
 const FULL_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
+ * 手机号 allowedUsers 条目。飞书 batch_get_id 的 `mobiles` 字段：中国大陆号
+ * 可直接填 11 位（无需 +86）；非大陆号必须带 `+` 国家/地区码。为避免把邮箱
+ * 前缀/随手输入误判成手机号，规则收紧为二选一：
+ *   - `+` 开头的 E.164：`+` 后跟 6–15 位数字（E.164 规范上限 15 位，如
+ *     +14155550123、+8613011112222、+123456789012345）
+ *   - 纯 11 位大陆号，以 1 开头（如 13011112222）
+ * 允许中间出现空格/连字符，判定前先归一化掉。
+ */
+const MOBILE_RE = /^(?:\+\d{6,15}|1\d{10})$/;
+
+/** 去掉手机号里的空格与连字符（用户可能填 "+86 130-1111-2222"），便于校验/解析。 */
+export function normalizeMobileEntry(entry: string): string {
+  return entry.trim().replace(/[\s-]/g, '');
+}
+
+/** 是否是手机号形式的 allowedUsers 条目（已归一化空格/连字符后判定）。 */
+export function isMobileEntry(entry: string): boolean {
+  return MOBILE_RE.test(normalizeMobileEntry(entry));
+}
+
+/**
+ * 手机号规范化匹配键：把一个已归一化的手机号折叠成**唯一**的 E.164 数字键，用于
+ * 把飞书 `batch_get_id` 响应里回带的号码对回本地请求的号码。请求侧和响应侧都过
+ * 本函数，键相等即同一号码。
+ *
+ * 规则（**不能像早期实现那样无脑剥 `+` 再一律当中国裸号**——那会让美国 `+1 3XX…`
+ * 与中国裸号 `13X…` 折叠成同键，把 owner 绑到错的人 / 顶掉另一个 owner）：
+ *   - `+` 开头：`+` 是权威国家码，直接剥掉 `+` 得到「国家码+号码」的 E.164 数字串
+ *     （`+8613011112222`→`8613011112222`，`+14155550123`→`14155550123`）。
+ *   - 无 `+` 的纯 11 位、以 1 开头：按配置契约（MOBILE_RE：裸号只接受中国 11 位）
+ *     判定为中国大陆号，补 `86`（`13011112222`→`8613011112222`），从而与带 `+86`
+ *     的请求/响应对齐。
+ *   - 其它（已带 `86` 前缀等）：原样。
+ *
+ * 安全取舍：若飞书对海外号回带时**丢掉了 `+`**，海外裸号会被误判成中国号而与请求
+ * 不等 → 判 definitive miss（owner 用邮箱/union_id 兜底），这是 fail-closed 的**漏配**；
+ * 绝不会把两个不同的人折叠成同一 owner（那才是危险的错配）。宁可漏配不可错配。
+ */
+export function canonicalMobileKey(normalized: string): string {
+  if (normalized.startsWith('+')) return normalized.slice(1);
+  if (/^1\d{10}$/.test(normalized)) return '86' + normalized; // 中国大陆裸号 → 补国家码
+  return normalized;
+}
+
+/**
+ * 单个 allowedUsers 条目是否需要「启动/刷新时经飞书 contact API 解析成本 app
+ * 的 open_id」。运行时权限（canTalk/canOperate）只认原生 ou_，故 email / union_id
+ * (on_) / 手机号 / 甚至字面 ou_（要做跨 app 诊断）都要走一次解析；只有无法寻址
+ * 的裸串（邮箱前缀等）不需要。
+ *
+ * 这是解析闸的**唯一真源**——daemon 启动闸、throw 兜底、allowed-users-apply 的
+ * needsContactResolve 全都调它，避免「新增一种身份格式后各处平行谓词漏改」导致
+ * 该格式在入口校验通过、却在某个解析闸被静默跳过（手机号 owner 冷启动自锁即
+ * 此类 bug）。新增身份格式时**只改这里**。
+ */
+export function entryNeedsContactResolve(entry: string): boolean {
+  return entry.includes('@') || entry.startsWith('on_') || entry.startsWith('ou_') || isMobileEntry(entry);
+}
+
+/**
  * 合法的 allowedUsers 条目：
  *   - on_xxx  union_id  — 跨应用稳定，推荐
  *   - 完整邮箱          — 人类可读，推荐
+ *   - 手机号            — 大陆号直填 11 位；海外号带 + 区号。适合无企业邮箱的个人用户
  *   - ou_xxx  open_id   — 仅对签发该 ID 的同一应用有效，不推荐跨 bot 复用
- * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_/on_ 或完整邮箱。
+ * 裸邮箱前缀（如 "alice"）不合法：解析器只认 ou_/on_、完整邮箱或手机号。
  */
 export function isValidAllowedUserEntry(entry: string): boolean {
   const s = entry.trim();
-  return s.startsWith('ou_') || s.startsWith('on_') || FULL_EMAIL_RE.test(s);
+  return s.startsWith('ou_') || s.startsWith('on_') || FULL_EMAIL_RE.test(s) || isMobileEntry(s);
 }
 
 /** 返回非法的 allowedUsers 条目（既不是 ou_ 也不是完整邮箱，典型是裸邮箱前缀）。 */
@@ -400,8 +461,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'riff') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", or "riff": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", or "riff": ${backendType}`);
       }
       out.backendType = backendType;
     }
@@ -419,7 +480,7 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
       const invalid = findInvalidAllowedUserEntries(entries);
       if (invalid.length > 0) {
         throw new Error(
-          `allowedUsers 条目必须是完整邮箱（如 alice@example.com）或 open_id（ou_xxx），不能是邮箱前缀: ${invalid.join(', ')}`,
+          `allowedUsers 条目必须是完整邮箱（如 alice@example.com）、手机号（大陆号直填 11 位，海外号带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx），不能是邮箱前缀: ${invalid.join(', ')}`,
         );
       }
       out.allowedUsers = entries;

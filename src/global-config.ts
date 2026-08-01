@@ -178,8 +178,9 @@ export interface DashboardGlobalConfig {
   openTerminalInFeishu?: boolean;
   /** Opt in to native "Open <CLI>" buttons on supported desktop hosts.
    *  Default false. When enabled, localCliOpenMode defaults to 'attach' so a
-   *  botmux-managed persistent backend attaches to the same I/O/history and
-   *  preserves Feishu continuity; 'resume' starts a separate CLI resume process
+   *  botmux-managed persistent backend enters the same underlying CLI and
+   *  preserves Feishu continuity. ZMX uses its native local terminal while
+   *  Feishu remains plain text; 'resume' starts a separate CLI resume process
    *  and may break that continuity. */
   enableLocalCliOpen?: boolean;
   /** How native "Open <CLI>" buttons launch on macOS. Missing defaults to
@@ -203,6 +204,13 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Experimental: inject the "no visible output" anti-resend guidance into the
+   *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
+   *  that make a model resend after a silent `botmux send`-only turn. Default OFF
+   *  (absent ⇒ off): mainly helps when Claude Code drives a non-Claude backend
+   *  model; harmless but unnecessary otherwise. Read live — see config.ts
+   *  `noVisibleOutputHint`. */
+  noVisibleOutputHint?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -329,6 +337,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

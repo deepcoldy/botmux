@@ -3,7 +3,17 @@
  * Run: pnpm vitest run test/grant-pending.test.ts
  */
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { openPending, checkNonce, clearPending, markDenied, isThrottled, _resetForTest, _tableSizeForTest } from '../src/im/lark/grant-pending.js';
+import {
+  openPending,
+  checkNonce,
+  clearPending,
+  getPendingGrantLimits,
+  markDenied,
+  isThrottled,
+  updatePendingGrantLimits,
+  _resetForTest,
+  _tableSizeForTest,
+} from '../src/im/lark/grant-pending.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
@@ -20,6 +30,22 @@ describe('grant-pending', () => {
   it('no entry → not throttled, nonce invalid', () => {
     expect(isThrottled('a1', 'oc_x', 'ou_g')).toBe(false);
     expect(checkNonce('a1', 'oc_x', 'ou_g', 'whatever')).toBe(false);
+  });
+
+  it('defaults to one hour + three messages and stages both limits under the nonce', () => {
+    const nonce = openPending('a1', 'oc_1', 'ou_g');
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({
+      quota: 3,
+      durationMs: 60 * 60 * 1000,
+    });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: 10, durationMs: 8 * 60 * 60 * 1000 })).toBe(true);
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({
+      quota: 10,
+      durationMs: 8 * 60 * 60 * 1000,
+    });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], nonce, { quota: null, durationMs: null })).toBe(true);
+    expect(getPendingGrantLimits('a1', 'oc_1', 'ou_g')).toEqual({ quota: undefined, durationMs: undefined });
+    expect(updatePendingGrantLimits('a1', 'oc_1', ['ou_g'], 'wrong', { quota: 20 })).toBe(false);
   });
 
   it('clearPending lifts throttle', () => {

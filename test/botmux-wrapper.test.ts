@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { prependBotmuxBin, botmuxWrapperFiles } from '../src/core/botmux-wrapper.js';
+import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
+
+describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
+  it('core-only → dedicated <SESSION_DATA_DIR>/bin (never shared ~/.botmux/bin)', () => {
+    expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u' }))
+      .toBe('/srv/co/data/bin');
+  });
+  it('normal fleet → shared ~/.botmux/bin', () => {
+    expect(resolveBotmuxWrapperBinDir({ HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
+  });
+  it('core-only WITHOUT SESSION_DATA_DIR falls back to shared (defensive; entrypoint always sets it)', () => {
+    expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
+  });
+});
 
 describe('prependBotmuxBin', () => {
   it('uses : on POSIX', () => {

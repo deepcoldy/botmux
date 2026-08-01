@@ -22,6 +22,15 @@ export interface CodexAppFinalMarker {
   replyTurnId?: string;
   /** Pre-steer Codex App and Mira markers used one id for both domains. */
   legacyTurnId?: string;
+  /** Per-turn token usage (four mutually-exclusive buckets), when the turn's
+   *  thread/tokenUsage/updated notifications yielded a coherent total. Omitted
+   *  when no usage was observed / a protocol anomaly was detected. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
 }
 
 interface CodexAppLifecycleBase {
@@ -142,7 +151,23 @@ export function normalizeAppRunnerFinalMarker(payload: unknown): CodexAppFinalMa
     appTurnId: optionalNonEmptyString(payload.appTurnId),
     replyTurnId: optionalNonEmptyString(payload.replyTurnId),
     legacyTurnId: optionalNonEmptyString(payload.turnId),
+    usage: normalizeFinalUsage(payload.usage),
   };
+}
+
+/** Accept the four-bucket usage only when every field is a non-negative integer
+ *  (a token count), else drop it (daemon omits usage rather than persisting a
+ *  negative/fractional/partial value that a compromised or buggy runner sent). */
+function normalizeFinalUsage(raw: unknown): CodexAppFinalMarker['usage'] | undefined {
+  if (!isRecord(raw)) return undefined;
+  const keys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
+  const out = {} as NonNullable<CodexAppFinalMarker['usage']>;
+  for (const k of keys) {
+    const v = raw[k];
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) return undefined;
+    out[k] = v;
+  }
+  return out;
 }
 
 export function normalizeCodexAppLifecycleEvent(payload: unknown): CodexAppLifecycleEvent | undefined {

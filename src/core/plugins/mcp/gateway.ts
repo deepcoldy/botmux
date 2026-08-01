@@ -35,7 +35,7 @@ import {
   type ClientCapabilities,
   type ServerCapabilities,
 } from '@modelcontextprotocol/sdk/types.js';
-import { config } from '../../../config.js';
+import { resolveBotmuxDataDir } from '../../data-dir.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
@@ -151,7 +151,7 @@ function gatewayPluginIds(env: NodeJS.ProcessEnv = process.env): string[] {
 }
 
 function gatewayDataDir(env: NodeJS.ProcessEnv): string {
-  return env.SESSION_DATA_DIR?.trim() || config.session.dataDir;
+  return resolveBotmuxDataDir({ env });
 }
 
 function gatewayDescriptors(pluginIds: readonly string[]): GatewayDescriptor[] {

@@ -2708,6 +2708,161 @@ button.primary {
   white-space: nowrap;
 }
 
+.session-card-exchange-wrap {
+  position: relative;
+  min-width: 0;
+}
+
+.session-card-exchange {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 7px 32px 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface) 78%, transparent);
+}
+
+.session-card-exchange:hover,
+.session-card-exchange:focus-visible {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--border));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface));
+}
+
+.session-card-exchange:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  outline-offset: 2px;
+}
+
+.session-card-exchange-details {
+  position: absolute;
+  top: 9px;
+  right: 7px;
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -1px;
+  cursor: pointer;
+}
+
+.session-card-exchange-details:hover,
+.session-card-exchange-details:focus-visible,
+.session-card-exchange-details[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
+.session-card-exchange-details:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 58%, transparent);
+  outline-offset: 1px;
+}
+
+.session-card-exchange-line {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  min-width: 0;
+}
+
+.session-card-exchange-line > span {
+  padding-top: 1px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.session-card-exchange-line.bot > span {
+  color: var(--accent);
+}
+
+.session-card-exchange-line > p {
+  display: -webkit-box;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.session-card-exchange-tooltip {
+  position: fixed;
+  z-index: 10020;
+  display: grid;
+  gap: 10px;
+  width: min(520px, calc(100vw - 24px));
+  max-height: min(420px, calc(100vh - 24px));
+  padding: 12px 13px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--surface-raised) 96%, transparent);
+  color: var(--fg);
+  box-shadow: 0 16px 44px rgba(3, 7, 18, 0.34);
+  cursor: text;
+  overscroll-behavior: contain;
+}
+
+.session-card-exchange-tooltip-scroll {
+  display: grid;
+  gap: 10px;
+  max-height: min(394px, calc(100vh - 50px));
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.session-card-exchange-tooltip-line {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+}
+
+.session-card-exchange-tooltip-line + .session-card-exchange-tooltip-line {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.session-card-exchange-tooltip-line > span {
+  padding-top: 2px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+
+.session-card-exchange-tooltip-line.bot > span {
+  color: var(--accent);
+}
+
+.session-card-exchange-tooltip-line > p {
+  min-width: 0;
+  margin: 0;
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
 .session-card-time {
   justify-content: space-between;
   color: var(--muted);
@@ -3687,11 +3842,11 @@ button.primary {
 }
 .card-act:active { transform: scale(0.9); }
 
-/* 单一终端入口：私有 dashboard 默认打开可写终端；显式开启公共只读时，
-   同一个图标降级为只读链接，避免并排「终端 + 钥匙」造成两个主操作。 */
+/* 终端与可操作 Web 终端分成两个明确入口：钥匙按钮只在有写权限时显示。 */
 .term-pill {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
 }
 .term-pill .term-btn {
   width: 30px;
@@ -9618,7 +9773,8 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 .bd-roster-tx { min-width: 0; flex: 1; }
-.bd-roster-tx b { display: block; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bd-roster-tx b { display: block; font-size: 13px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bd-roster-tx b .ui-overflow-text { display: block; font-weight: 600; }
 .bd-roster-tx span { display: block; color: var(--faint); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .bd-roster-flag {
   flex: none;
@@ -9919,20 +10075,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   color: var(--success);
 }
 
-/* 配置 tile 两栏 */
-.bd-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-  align-items: start;
-  margin-top: 14px;
-}
-.bd-column {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-  min-width: 0;
-}
 .bd-tile {
   border-radius: var(--radius-xl);
   border: 1px solid var(--border-soft);
@@ -11923,7 +12065,6 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   .bd-layout { grid-template-columns: 1fr; }
   .bd-roster { position: static; display: flex; overflow-x: auto; }
   .bd-roster-item { flex: 0 0 auto; }
-  .bd-grid { grid-template-columns: 1fr; }
   .bd-profile-head { grid-template-columns: auto minmax(0, 1fr); }
   .bd-profile-meta {
     grid-column: 1 / -1;
@@ -21578,6 +21719,15 @@ dialog select[multiple]:hover:not(:disabled) {
   box-shadow: none;
 }
 
+.bot-defaults-page .bd-layout {
+  grid-template-columns: 232px minmax(0, 1fr);
+}
+
+.bot-defaults-page .bd-detail {
+  min-width: 0;
+  container-type: inline-size;
+}
+
 :root[data-theme="dark"] .bot-defaults-page .bd-card.bd-profile {
   background: transparent;
   border-color: transparent;
@@ -21585,12 +21735,294 @@ dialog select[multiple]:hover:not(:disabled) {
   background-image: none;
 }
 
+.bot-defaults-page .bd-profile-chrome {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
 .bot-defaults-page .bd-profile-head {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    "avatar main"
+    "status status";
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   margin-bottom: 0;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.bot-defaults-page .bd-profile-head > .bd-profile-avatar { grid-area: avatar; }
+.bot-defaults-page .bd-profile-head > .bd-profile-main { grid-area: main; }
+
+/* Avatar status is a full-width in-flow strip on the header's 2nd row — no
+   longer absolutely positioned under the small avatar (which overlapped the
+   name-status and bled into the tab bar). */
+.bot-defaults-page .bd-profile-head > .bd-avatar-status {
+  grid-area: status;
+  position: static;
+  min-width: 0;
+  max-width: none;
+  margin: 2px 0 0;
+  box-shadow: none;
+}
+.bot-defaults-page .bd-profile-head > .bd-avatar-status:empty { display: none; }
+
+:root[data-theme="dark"] .bot-defaults-page .bd-profile-head {
+  border-color: transparent;
+  background: transparent;
+  backdrop-filter: none;
+}
+
+.bot-defaults-page .bd-profile-avatar {
+  width: 50px;
+  height: 50px;
+}
+
+.bot-defaults-page .bd-profile-head .orb-avatar {
+  width: 42px;
+  height: 42px;
+}
+
+.bot-defaults-page .bd-profile-title-row {
+  min-height: 28px;
+  padding-right: 42px;
+}
+
+.bot-defaults-page .bd-profile-title-content > strong {
+  min-height: 24px;
+  font-size: 16px;
+}
+
+.bot-defaults-page .bd-profile-id .mate-role,
+.bot-defaults-page .bd-profile-meta small {
+  min-height: 24px;
+  padding: 0 9px;
+  font-size: 10.5px;
+}
+
+.bot-defaults-page .bd-name-edit {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  /* icon-only button: an inline SVG pencil (centered by flex on the base rule) */
+  font-size: 0;
+}
+
+.bot-defaults-page .bd-name-edit > svg {
+  display: block;
+}
+
+.bot-defaults-page .bd-tab-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--surface-muted);
+}
+
+.bot-defaults-page .bd-tabs {
+  display: flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-width: 0;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.bot-defaults-page .bd-tab::after {
+  position: absolute;
+  right: 9px;
+  bottom: -1px;
+  left: 9px;
+  height: 2px;
+  border-radius: 2px 2px 0 0;
+  background: transparent;
+  content: "";
+  transform: scaleX(0.55);
+  transition: background-color 150ms ease, transform 180ms ease;
+}
+
+.bot-defaults-page .bd-tab:hover {
+  color: var(--fg);
+}
+
+.bot-defaults-page .bd-tab.active {
+  color: var(--accent-strong);
+}
+
+.bot-defaults-page .bd-tab.active::after {
+  background: var(--accent);
+  transform: scaleX(1);
+}
+
+.bot-defaults-page .bd-tab:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 66%, transparent);
+  outline-offset: -4px;
+}
+
+.bot-defaults-page .bd-tab-hint {
+  flex: none;
+  color: var(--faint);
+  font-size: 10.5px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-tab-panels {
+  margin-top: 14px;
+}
+
+.bot-defaults-page .bd-tab-panel[hidden] {
+  display: none;
+}
+
+.bot-defaults-page .bd-tab-panel:not([hidden]) {
+  animation: bd-tab-enter 180ms ease-out both;
+}
+
+@keyframes bd-tab-enter {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bot-defaults-page .bd-tab-panel:not([hidden]) {
+    animation: none;
+  }
+
+  .bot-defaults-page .bd-tab::after {
+    transition: none;
+  }
+}
+
+.bot-defaults-page .bd-tab-grid {
+  /* Two-column waterfall (masonry). A plain row-major grid locks each row to
+     the tallest tile, so a short tile beside a tall one leaves a dead vertical
+     gap below it. At ≥2 columns the JS in the BdTabGrid component measures every
+     tile and greedily assigns each to the currently shortest column via inline
+     grid-column / grid-row over a fine 1px row track, so a short tile packs
+     directly under its neighbour. Tiles stay direct grid children (never
+     reparented into per-column wrappers) so their unsaved form drafts survive.
+     Default is a single column with normal auto rows (no 1px track, or
+     auto-placed tiles would collapse onto 1px rows and overlap); the fine row
+     track is only switched on inside the 2-column container query below. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-rows: auto;
+  gap: 14px;
+  align-items: start;
+}
+
+/* Two columns only once the detail pane is wide enough that each column stays
+   comfortable (~500px); below that, one column — avoids the cramped narrow
+   cards. Threshold matches the column-count decision in the BdTabGrid JS so CSS
+   tracks and JS placement never disagree. Uses the .bd-detail container query
+   (container-type: inline-size). The 1px auto-row track that the JS masonry
+   spans over is scoped here so the single-column fallback keeps auto rows. */
+@container (min-width: 1024px) {
+  .bot-defaults-page .bd-tab-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: 1px;
+  }
+}
+
+.bot-defaults-page .bd-tab-grid > .bd-tile-wide {
+  /* full-bleed tile (e.g. sandbox paths) spans every column */
+  grid-column: 1 / -1;
+}
+
+.bot-defaults-page .bd-tab-grid > .bd-tile {
+  min-width: 0;
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+:root[data-theme="dark"] .bot-defaults-page .bd-tab-grid > .bd-tile {
+  border-color: var(--border-soft);
+  background: var(--surface);
+  backdrop-filter: none;
+}
+
+.bot-defaults-page .bd-tab-grid .bd-section-title::before,
+.bot-defaults-page .bd-tab-grid .bd-section > .bd-section-title::before,
+.bot-defaults-page .bd-tab-grid .bd-subsection > .bd-subsection-title::before {
+  display: none;
+}
+
+.bot-defaults-page .bd-tab-grid :where(.bd-section-title, .bd-subsection-title) {
+  gap: 6px;
+  font-weight: 650;
+}
+
+.bot-defaults-page .bd-tab-grid .bd-section-title {
+  font-size: 13px;
+}
+
+.bot-defaults-page .bd-tab-grid .bd-subsection-title {
+  font-size: 12px;
+}
+
+/* Inside a tile, a section note is a descriptive paragraph, not a short inline
+   caption. The global rule makes a title-followed-by-note render inline
+   (title inline-flex + note inline-block, left-margin) — fine for a short note,
+   but a long paragraph (e.g. the sandbox deny-by-default explainer) then wraps
+   cramped beside the title. Force them to stack: title on its own line, note
+   as a full-width block below it. */
+.bot-defaults-page .bd-tab-grid :where(.bd-section-title, .bd-subsection-title):has(+ .bd-section-note) {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.bot-defaults-page .bd-tab-grid :where(.bd-section-title, .bd-subsection-title) + .bd-section-note {
+  display: block;
+  max-width: none;
+  margin: 0 0 8px;
+}
+
+/* A .bd-subsection carries a dashed top border to divide it from a sibling
+   subsection WITHIN a section. When it is promoted to be a tile's own content
+   (e.g. 会话常驻上限 / 启动命令 as standalone tiles), that top divider is
+   spurious — the tile border already frames it. Drop it. */
+.bot-defaults-page .bd-tab-grid > .bd-tile > .bd-subsection:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
 }
 
 .bot-defaults-page .bd-profile-head > .bd-profile-meta {
@@ -21609,6 +22041,18 @@ dialog select[multiple]:hover:not(:disabled) {
   margin-bottom: 5px;
 }
 
+.bot-defaults-page .bd-roster-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+  padding: 2px 5px 3px;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
 .bot-defaults-page #bd-filters > input[type="search"] {
   box-sizing: border-box;
   flex: 1 1 auto;
@@ -21620,7 +22064,7 @@ dialog select[multiple]:hover:not(:disabled) {
   max-height: var(--button-height);
   padding: 0 var(--button-padding-x);
   border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
+  border-radius: var(--radius-md);
   background: var(--surface);
   color: var(--fg);
   font-size: 12px;
@@ -21645,20 +22089,51 @@ dialog select[multiple]:hover:not(:disabled) {
 }
 
 @media (max-width: 980px) {
+  .bot-defaults-page .bd-layout {
+    grid-template-columns: 1fr;
+  }
+
   .bot-defaults-page .bd-roster {
     display: grid;
-    overflow: visible;
+    grid-template-rows: auto auto minmax(0, 1fr);
+    max-height: min(340px, 42vh);
+    overflow: hidden;
   }
 
   .bot-defaults-page .bd-roster-list {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 3px;
-    overflow-x: auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
     padding-bottom: 2px;
+    overscroll-behavior: contain;
   }
 
   .bot-defaults-page .bd-roster-list .bd-roster-item {
+    min-width: 0;
+  }
+
+  .bot-defaults-page .bd-profile-chrome {
+    position: static;
+  }
+
+  .bot-defaults-page .bd-tab-bar {
+    align-items: stretch;
+    padding-right: 0;
+    padding-left: 0;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+  }
+
+  .bot-defaults-page .bd-tabs {
     flex: 0 0 auto;
+    padding: 0 6px;
+  }
+
+  .bot-defaults-page .bd-tab-hint {
+    display: none;
   }
 }
 
@@ -21795,6 +22270,15 @@ dialog select[multiple]:hover:not(:disabled) {
   margin: 12px 0 0;
 }
 
+/* .bd-row (display:grid) and .toggle-row (display:flex) both override the UA
+   [hidden] { display:none }, so rows the React code marks hidden (e.g. the
+   working-dir 目录 input in repo-picker "off" mode, or the auto-worktree toggle
+   outside "default" mode) stayed visible. Restore [hidden] for these rows. */
+.bot-defaults-page .bd-body .bd-row[hidden],
+.bot-defaults-page .bd-body .toggle-row[hidden] {
+  display: none;
+}
+
 .bot-defaults-page .bd-body .bd-row + .bd-row,
 .bot-defaults-page .bd-body .toggle-row + .bd-row,
 .bot-defaults-page .bd-body .bd-row + .toggle-row {
@@ -21805,7 +22289,7 @@ dialog select[multiple]:hover:not(:disabled) {
   margin: 0;
   color: var(--muted);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: 1.35;
 }
 
@@ -21912,6 +22396,24 @@ dialog select[multiple]:hover:not(:disabled) {
   border-top: 0;
 }
 
+/* Default-role injection mode selector (once / every) — a compact labelled row
+   between the role textarea and its save button. */
+.bot-defaults-page .bd-role-inject {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.bot-defaults-page .bd-role-inject > .bd-subsection-title {
+  margin: 0;
+}
+
+.bot-defaults-page .bd-role-inject-menu {
+  min-width: 148px;
+}
+
 .bot-defaults-page .bd-tile :where(input[type="text"], input[type="number"], textarea) {
   box-sizing: border-box;
   width: 100%;
@@ -21927,9 +22429,9 @@ dialog select[multiple]:hover:not(:disabled) {
   min-height: var(--button-height);
   max-height: var(--button-height);
   padding: 0 var(--button-padding-x);
-  border-radius: var(--radius-full);
+  border-radius: var(--radius-md);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: normal;
 }
 
@@ -21949,11 +22451,11 @@ dialog select[multiple]:hover:not(:disabled) {
   max-height: var(--button-height);
   padding: 0 var(--button-padding-x);
   border: 1px solid var(--border-soft);
-  border-radius: var(--radius-full);
+  border-radius: var(--radius-md);
   background: var(--surface);
   color: var(--fg);
   font-size: 12px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: normal;
   box-shadow: none;
   outline: none;
@@ -22183,6 +22685,7 @@ dialog select[multiple]:hover:not(:disabled) {
   min-height: var(--button-height);
   max-height: var(--button-height);
   box-sizing: border-box;
+  border-radius: var(--radius-md);
   line-height: 1;
 }
 

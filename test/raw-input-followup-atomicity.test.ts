@@ -61,12 +61,12 @@ describe('worker raw_input handler', () => {
     expect(gate).toContain('shouldDeferUserFlush(pendingInjections)');
   });
 
-  it('also defers across the bounded launch-settle window and after a confirmed bare-shell block', () => {
+  it('also defers across the bounded launch-settle window and while the bare-shell hold is active', () => {
     // PR #570 二审阻塞项：detectBareShellLaunch() 采到裸 shell 后 await
     // settleLaunchComm() 让出事件循环最长 2s；IPC handler 不串行，raw_input
     // 若在此窗口放行会打进尚未 `exec <cli>` 的临时 shell。isFlushing 挡不住它
     // （raw_input 刻意保留 busy 直送）——须用专用 bareShellCheckInProgress latch
-    // 覆盖"检查进行中"，并用 bareShellLaunchBlocked 覆盖"已确认失败"。
+    // 覆盖“检查进行中”，并用 bareShellLaunchBlocked 覆盖“仍停在裸 shell”。
     const gate = region.slice(
       region.indexOf('if (cliRestartInProgress'),
       region.indexOf('freshnessInputQueue.enqueueRaw(msg)'),
@@ -90,10 +90,10 @@ describe('worker raw_input handler', () => {
 });
 
 describe('worker raw_input delivery', () => {
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 2600);
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 3800);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
-    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
+    const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
     const followIdx = region.indexOf('msg.followUpContent');
     expect(sendIdx).toBeGreaterThanOrEqual(0);
     expect(followIdx).toBeGreaterThanOrEqual(0);
@@ -106,14 +106,16 @@ describe('worker raw_input delivery', () => {
   });
 
   it('rotates or revokes the marker immediately before writing the raw command', () => {
+    const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
+    const callbackIdx = region.indexOf('() => {', sendIdx);
     const bindIdx = region.indexOf('currentBotmuxTurnId = msg.turnId');
     const markerIdx = region.indexOf('writeCliPidMarker()');
     const capabilityIdx = region.indexOf('publishSandboxRelayCapability()');
-    const sendIdx = region.indexOf('await sendRawCommandLineSerially(targetBackend, msg.content)');
-    expect(bindIdx).toBeGreaterThanOrEqual(0);
+    expect(sendIdx).toBeGreaterThanOrEqual(0);
+    expect(callbackIdx).toBeGreaterThan(sendIdx);
+    expect(bindIdx).toBeGreaterThan(callbackIdx);
     expect(markerIdx).toBeGreaterThan(bindIdx);
     expect(capabilityIdx).toBeGreaterThan(markerIdx);
-    expect(sendIdx).toBeGreaterThan(capabilityIdx);
   });
 
   it('holds ordinary prompt flushes only for the text-to-Enter critical window', () => {
@@ -122,22 +124,70 @@ describe('worker raw_input delivery', () => {
     expect(region).not.toContain('if (!isPromptReady)');
     expect(region).not.toContain('if (isPromptReady)');
   });
+
+  it('surfaces an ambiguous terminal and user notice when the literal command write fails', () => {
+    const transactionIdx = region.indexOf(
+      'await sendRawCommandLineWithRecoveryFence(',
+    );
+    const catchIdx = region.indexOf('catch (err');
+    const recoveryIdx = region.indexOf('err instanceof SubmissionWriteError', catchIdx);
+    const terminalIdx = region.indexOf(
+      "emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed')",
+      catchIdx,
+    );
+    const notifyIdx = region.indexOf("type: 'user_notify'", catchIdx);
+
+    expect(transactionIdx).toBeGreaterThanOrEqual(0);
+    expect(catchIdx).toBeGreaterThan(transactionIdx);
+    expect(recoveryIdx).toBeGreaterThan(catchIdx);
+    expect(terminalIdx).toBeGreaterThan(catchIdx);
+    expect(notifyIdx).toBeGreaterThan(terminalIdx);
+  });
+
+  it('only claims follow-up text was skipped when that IPC actually carried one', () => {
+    const catchIdx = region.indexOf('catch (err');
+    const conditionIdx = region.indexOf('msg.followUpContent', catchIdx);
+    const followUpKeyIdx = region.indexOf("'worker.raw_input_failed'", conditionIdx);
+    const commandOnlyKeyIdx = region.indexOf("'worker.raw_input_failed_command_only'", conditionIdx);
+    const recoveryFollowUpKeyIdx = region.indexOf(
+      "'worker.raw_input_failed_recovery'",
+      conditionIdx,
+    );
+    const recoveryCommandOnlyKeyIdx = region.indexOf(
+      "'worker.raw_input_failed_command_only_recovery'",
+      conditionIdx,
+    );
+    const notifyIdx = region.indexOf("type: 'user_notify'", catchIdx);
+
+    expect(conditionIdx).toBeGreaterThan(catchIdx);
+    expect(followUpKeyIdx).toBeGreaterThan(conditionIdx);
+    expect(commandOnlyKeyIdx).toBeGreaterThan(followUpKeyIdx);
+    expect(recoveryFollowUpKeyIdx).toBeGreaterThan(conditionIdx);
+    expect(recoveryCommandOnlyKeyIdx).toBeGreaterThan(recoveryFollowUpKeyIdx);
+    expect(notifyIdx).toBeGreaterThan(commandOnlyKeyIdx);
+  });
 });
 
 describe('worker command-line write mutex', () => {
-  const serialized = caseRegion(workerSrc, 'async function sendRawCommandLineSerially', 1200);
+  const serialized = caseRegion(
+    workerSrc,
+    'async function sendRawCommandLineWithRecoveryFence',
+    1400,
+  );
 
-  it('serializes concurrent raw command keystrokes without waiting for turn idle', () => {
+  it('serializes the whole raw recovery transaction without waiting for turn idle', () => {
     expect(serialized).toContain('const previous = commandLineWriteTail');
     expect(serialized).toContain('commandLineWritesPending += 1');
     expect(serialized).toContain('await previous');
-    expect(serialized).toContain('await sendRawCommandLine(be, content)');
+    expect(serialized).toContain('runAmbiguousSubmissionTransaction(');
+    expect(serialized).toContain('() => sendRawCommandLine(be, content)');
+    expect(serialized).toContain('beforeWrite');
     expect(serialized).toContain('release()');
   });
 });
 
 describe('worker sendRawCommandLine helper', () => {
-  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 2200);
+  const helper = caseRegion(workerSrc, 'async function sendRawCommandLine', 3000);
 
   it('generic CLIs: literal text → 200ms beat → Enter in order (slash-picker safe)', () => {
     const textIdx = helper.indexOf('sendText(content)');
@@ -172,6 +222,33 @@ describe('worker sendRawCommandLine helper', () => {
     expect(returnIdx).toBeGreaterThan(cocoEnterIdx);
     expect(returnIdx).toBeLessThan(genericTextIdx);
   });
+
+  it('fails before Enter when a backend explicitly rejects the generic text write', () => {
+    const textIdx = helper.indexOf('sendText(content)');
+    const rejectionIdx = helper.indexOf("throw new Error('backend rejected command text input')", textIdx);
+    const beatIdx = helper.indexOf('setTimeout(r, 200)', textIdx);
+    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", textIdx);
+
+    expect(helper.slice(textIdx - 30, rejectionIdx)).toContain('=== false');
+    expect(rejectionIdx).toBeGreaterThan(textIdx);
+    expect(rejectionIdx).toBeLessThan(beatIdx);
+    expect(rejectionIdx).toBeLessThan(enterIdx);
+  });
+
+  it('stops CoCo typing immediately on rejection and also checks the submit key', () => {
+    const cocoIdx = helper.indexOf("cliId === 'coco'");
+    const charIdx = helper.indexOf('sendText(ch)', cocoIdx);
+    const charRejectionIdx = helper.indexOf("throw new Error('backend rejected command text input')", charIdx);
+    const throttleIdx = helper.indexOf('COCO_SLASH_TYPE_THROTTLE_MS', charIdx);
+    const enterIdx = helper.indexOf("sendSpecialKeys('Enter')", throttleIdx);
+    const enterRejectionIdx = helper.indexOf("throw new Error('backend rejected command submit key')", enterIdx);
+
+    expect(helper.slice(charIdx - 30, charRejectionIdx)).toContain('=== false');
+    expect(charRejectionIdx).toBeGreaterThan(charIdx);
+    expect(charRejectionIdx).toBeLessThan(throttleIdx);
+    expect(helper.slice(enterIdx - 30, enterRejectionIdx)).toContain('=== false');
+    expect(enterRejectionIdx).toBeGreaterThan(enterIdx);
+  });
 });
 
 describe('daemon prompt_ready dispatch', () => {
@@ -193,17 +270,19 @@ describe('post-settle restart fence', () => {
   // async 化扩出的第二个窗口。三处 source-level 顺序断言钉死修复。
 
   it('flushPending re-checks cliRestartInProgress AFTER the awaited detector, BEFORE any write', () => {
-    const flush = caseRegion(workerSrc, 'async function flushPending()', 15000);
+    const flush = caseRegion(workerSrc, 'async function flushPending()', 24000);
     const detector = flush.indexOf('if (await detectBareShellLaunch())');
     const fence = flush.indexOf('if (cliRestartInProgress) return;', detector);
     const startup = flush.indexOf('await runStartupCommands()', detector);
     const rawShift = flush.indexOf('freshnessInputQueue.takeRaw()', detector);
-    const writeInput = flush.indexOf('cliAdapter.writeInput(backend', detector);
+    const writeStructuredInput = flush.indexOf('targetAdapter.writeStructuredInput!(', detector);
+    const writeInput = flush.indexOf('targetAdapter.writeInput(', detector);
     expect(detector).toBeGreaterThanOrEqual(0);
     expect(fence).toBeGreaterThan(detector);
     // Fence must precede every downstream write/shift the settle await exposed.
     expect(startup).toBeGreaterThan(fence);
     expect(rawShift).toBeGreaterThan(fence);
+    expect(writeStructuredInput).toBeGreaterThan(fence);
     expect(writeInput).toBeGreaterThan(fence);
   });
 
@@ -230,5 +309,72 @@ describe('post-settle restart fence', () => {
     expect(restartCheck).toBeGreaterThan(settle);
     expect(classify).toBeGreaterThan(restartCheck);
     expect(block).toBeGreaterThan(restartCheck);
+  });
+});
+
+describe('late bare-shell launch recovery', () => {
+  it('releases the launch block only after PTY readiness and a non-shell pane leaf', () => {
+    const helper = caseRegion(workerSrc, 'function recoverBareShellLaunchFromPty(observedBackend:', 1600);
+    const generationFence = helper.indexOf('if (backend !== observedBackend)');
+    const read = helper.indexOf('readPaneLeafComm(observedBackend)');
+    const rejectBare = helper.indexOf('if (!comm || isBareShellComm(comm))', read);
+    const release = helper.indexOf('bareShellLaunchBlocked = false', rejectBare);
+
+    expect(generationFence).toBeGreaterThanOrEqual(0);
+    expect(read).toBeGreaterThan(generationFence);
+    expect(rejectBare).toBeGreaterThan(read);
+    expect(release).toBeGreaterThan(rejectBare);
+
+    const ptyReady = caseRegion(workerSrc, 'function markPromptReadyFromPty(observedBackend:', 600);
+    const recover = ptyReady.indexOf('if (!recoverBareShellLaunchFromPty(observedBackend)) return;');
+    const mark = ptyReady.indexOf('markPromptReady()', recover);
+    expect(recover).toBeGreaterThanOrEqual(0);
+    expect(mark).toBeGreaterThan(recover);
+  });
+
+  it('turns an injection-first shell verdict back into a non-ready state', () => {
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 4300);
+    const block = detect.indexOf('bareShellLaunchBlocked = true');
+    const clearReady = detect.indexOf('isPromptReady = false', block);
+    const resetIdle = detect.indexOf('idleDetector?.reset()', clearReady);
+    const notify = detect.indexOf("type: 'user_notify'", resetIdle);
+
+    expect(block).toBeGreaterThanOrEqual(0);
+    expect(clearReady).toBeGreaterThan(block);
+    expect(resetIdle).toBeGreaterThan(clearReady);
+    expect(notify).toBeGreaterThan(resetIdle);
+  });
+
+  it('generation-fences PTY data before it can feed the active idle detector', () => {
+    const wiring = caseRegion(workerSrc, 'const observedBackend = backend;', 2300);
+    const onData = wiring.indexOf('observedBackend.onData((data) =>');
+    const fence = wiring.indexOf('if (backend !== observedBackend) return;', onData);
+    const feed = wiring.indexOf('onPtyData(data)', fence);
+    const ptyReady = wiring.indexOf('markPromptReadyFromPty(observedBackend)');
+
+    expect(onData).toBeGreaterThanOrEqual(0);
+    expect(fence).toBeGreaterThan(onData);
+    expect(feed).toBeGreaterThan(fence);
+    expect(ptyReady).toBeGreaterThanOrEqual(0);
+  });
+
+  it('keeps non-PTY ready sources from stranding a blocked launch', () => {
+    const markReady = caseRegion(workerSrc, 'function markPromptReady(): void', 900);
+    const block = markReady.indexOf('if (bareShellLaunchBlocked)');
+    const duplicateReadyGuard = markReady.indexOf('if (isPromptReady) return', block);
+    expect(block).toBeGreaterThanOrEqual(0);
+    expect(duplicateReadyGuard).toBeGreaterThan(block);
+  });
+
+  it('reports an unresolved same-shell launch as delayed instead of naming stale causes', () => {
+    const detect = caseRegion(workerSrc, 'async function detectBareShellLaunch()', 5200);
+    expect(detect).toContain('启动时间较长');
+    expect(detect).toContain('检测到真实输入框后会自动继续投递');
+    expect(detect).toContain('仅凭进程仍是');
+    expect(detect).not.toContain('Oh My Zsh 升级提示');
+    expect(detect).not.toContain('GIT_TERMINAL_PROMPT');
+    expect(detect).not.toContain('可执行文件不在 PATH');
+    expect(detect).toContain('turnId: pendingTurn?.turnId ?? currentBotmuxTurnId');
+    expect(detect).toContain('dispatchAttempt: pendingTurn?.dispatchAttempt ?? currentBotmuxDispatchAttempt');
   });
 });

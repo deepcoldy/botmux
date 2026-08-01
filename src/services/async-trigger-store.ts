@@ -31,6 +31,14 @@ export interface PersistedAsyncTriggerResult {
   createdAt: number;
   completedAt?: number;
   content?: string;
+  /** Per-turn token usage captured at completion (codex-app). Optional — omitted
+   *  when the turn produced no coherent usage. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
 }
 
 /** On-disk shape: { ownerLarkAppId, latestTriggerId, results }. ownerLarkAppId
@@ -96,8 +104,15 @@ export function recordPending(sessionId: string, triggerId: string, createdAt: n
 }
 
 /** Mark an async trigger completed with its captured final output.
- *  `ownerLarkAppId` is REQUIRED (see recordPending). */
-export function recordCompleted(sessionId: string, triggerId: string, content: string, completedAt: number, ownerLarkAppId: string): void {
+ *  `ownerLarkAppId` is REQUIRED (see recordPending). `usage` optional per-turn tokens. */
+export function recordCompleted(
+  sessionId: string,
+  triggerId: string,
+  content: string,
+  completedAt: number,
+  ownerLarkAppId: string,
+  usage?: PersistedAsyncTriggerResult['usage'],
+): void {
   const file = load(sessionId);
   if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
   const prev = file.results[triggerId];
@@ -106,6 +121,7 @@ export function recordCompleted(sessionId: string, triggerId: string, content: s
     createdAt: prev?.createdAt ?? completedAt,
     completedAt,
     content,
+    ...(usage ? { usage } : {}),
   };
   if (!file.latestTriggerId) file.latestTriggerId = triggerId;
   save(sessionId, file);

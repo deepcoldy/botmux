@@ -120,7 +120,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --cli-path <path>          CLI 可执行文件路径覆盖
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
-  --backend <b>              会话后端 pty | tmux | herdr | zellij
+  --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx
                              traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
@@ -318,7 +318,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
-    throw new Error('--allowed-users 至少需要一个完整邮箱、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
+    throw new Error('--allowed-users 至少需要一个完整邮箱、手机号（大陆号直填，海外带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
   }
   assertOwnerWhenChatGroups(bot);
   return bot;

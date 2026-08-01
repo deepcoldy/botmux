@@ -29,6 +29,19 @@ export const BOT_BASELINE_APP_EVENTS = [
   'im.message.reaction.deleted_v1',
 ] as const;
 
+/**
+ * Best-effort app events: subscribed alongside the baseline but NEVER part of
+ * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
+ * Used for enhancements that degrade gracefully when unsubscribed — membership
+ * change events only drive chatStatsCache invalidation, whose 5-min TTL is the
+ * documented fallback. Some tenants cannot grant the underlying member-read
+ * scopes for user events; hard-requiring them would block bot onboarding.
+ */
+export const BOT_OPTIONAL_APP_EVENTS = [
+  'im.chat.member.user.added_v1',
+  'im.chat.member.user.deleted_v1',
+] as const;
+
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
 export const BOT_CRITICAL_APP_EVENTS = ['im.message.receive_v1'] as const;
 
@@ -762,7 +775,7 @@ export async function automateOpenPlatformSetup(
     eventWarnings.push(`读取当前事件订阅失败: ${safeErrorMessage(err)}`);
   }
   const hasEvent = (name: string) => Boolean(eventState?.events.includes(name));
-  const wantedAppEvents = [...BOT_BASELINE_APP_EVENTS, ...VC_MEETING_APP_EVENTS];
+  const wantedAppEvents = [...BOT_BASELINE_APP_EVENTS, ...BOT_OPTIONAL_APP_EVENTS, ...VC_MEETING_APP_EVENTS];
   const missingAppEvents = wantedAppEvents.filter(name => !hasEvent(name));
   const missingUserEvents = VC_MEETING_USER_EVENTS.filter(name => !hasEvent(name));
   if (missingAppEvents.length > 0 || missingUserEvents.length > 0) {
@@ -775,7 +788,8 @@ export async function automateOpenPlatformSetup(
         try {
           await addEvents([name], [], eventMode);
         } catch (err: any) {
-          eventWarnings.push(`订阅事件 ${name} 失败: ${safeErrorMessage(err)}`);
+          const optional = (BOT_OPTIONAL_APP_EVENTS as readonly string[]).includes(name) ? '（可选事件, 不影响核心功能）' : '';
+          eventWarnings.push(`订阅事件 ${name} 失败${optional}: ${safeErrorMessage(err)}`);
         }
       }
       for (const name of missingUserEvents) {

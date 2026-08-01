@@ -62,6 +62,13 @@ export function decideAsyncOwnership(inp: OwnershipInputs): OwnershipDecision {
 }
 
 
+export interface TurnUsageBuckets {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreateTokens: number;
+}
+
 export interface AsyncStateInputs {
   sessionId: string;
   /** Whether a live DaemonSession is currently registered for this id. */
@@ -69,13 +76,13 @@ export interface AsyncStateInputs {
   /** chatId from the live session or the stored record, if known. */
   chatId?: string;
   /** In-memory async result for the resolved trigger, if the session is live. */
-  memResult?: { status: 'pending' | 'completed'; content?: string; completedAt?: number };
+  memResult?: { status: 'pending' | 'completed'; content?: string; completedAt?: number; usage?: TurnUsageBuckets };
   /** triggerId the in-memory result is keyed under (latest or explicit). */
   memTriggerId?: string;
   /** Durable persisted result (survives restart), if any. */
   persisted?: {
     triggerId: string;
-    result: { status: 'pending' | 'completed'; content?: string; completedAt?: number };
+    result: { status: 'pending' | 'completed'; content?: string; completedAt?: number; usage?: TurnUsageBuckets };
   };
   /** On-disk session record status: 'open' (active), 'closed', or absent. */
   storedStatus?: 'open' | 'closed';
@@ -112,10 +119,10 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
 
   const completed =
     (inp.memResult?.status === 'completed' && inp.memTriggerId
-      ? { triggerId: inp.memTriggerId, content: inp.memResult.content, completedAt: inp.memResult.completedAt }
+      ? { triggerId: inp.memTriggerId, content: inp.memResult.content, completedAt: inp.memResult.completedAt, usage: inp.memResult.usage }
       : undefined) ??
     (inp.persisted?.result.status === 'completed'
-      ? { triggerId: inp.persisted.triggerId, content: inp.persisted.result.content, completedAt: inp.persisted.result.completedAt }
+      ? { triggerId: inp.persisted.triggerId, content: inp.persisted.result.content, completedAt: inp.persisted.result.completedAt, usage: inp.persisted.result.usage }
       : undefined);
 
   if (completed) {
@@ -127,6 +134,7 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       action: 'completed',
       target: { kind: 'turn', sessionId, chatId },
       output: completed.content !== undefined ? { content: completed.content } : undefined,
+      ...(completed.usage ? { usage: completed.usage } : {}),
       finishedAt,
       async: { status: 'completed', sessionId, completedAt: finishedAt },
       message: 'async trigger completed',

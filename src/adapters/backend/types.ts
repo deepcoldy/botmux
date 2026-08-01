@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff';
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -9,7 +9,7 @@ export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'riff';
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  | { backendType: 'tmux' | 'zellij' | 'zmx'; sessionName: string }
   | { backendType: 'herdr'; sessionName: string; agentName?: string };
 
 /**
@@ -34,7 +34,7 @@ export interface SpawnOpts {
   env: Record<string, string>;
   /**
    * Per-bot env (bots.json `env`) to inject into the CLI process ONLY. Kept
-   * separate from `env` on purpose: the persistent backends (tmux/zellij) must
+   * separate from `env` on purpose: the persistent backends (tmux/zellij/zmx) must
    * NOT put these into the shared backing-server global env — they inject them
    * via the per-pane `/usr/bin/env KEY=VAL` prefix so one bot's provider creds
    * can't leak into another bot's panes. The pty backend (no shared server)
@@ -43,7 +43,7 @@ export interface SpawnOpts {
   injectEnv?: Record<string, string>;
   /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
-   * backends (tmux/zellij) launch the CLI under this shell instead of `$SHELL`
+   * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`
    * — the escape hatch for a login `$SHELL` whose rcfile `exec`-trampolines into
    * another shell. Bare name (`zsh`) or absolute path; see resolveUserShell.
    * Ignored by the pty backend (no shell wrapper).
@@ -51,11 +51,56 @@ export interface SpawnOpts {
   launchShell?: string;
 }
 
+export type AmbiguousSubmissionRecoveryFailure =
+  | 'recovery-pending'
+  | 'recovery-unconfirmed';
+
+/** Raised before a logical write when an older ambiguous composer transaction
+ * already owns the backend. Callers must not rotate turn attribution or touch
+ * the terminal after this error. */
+export class AmbiguousSubmissionBlockedError extends Error {
+  constructor(readonly failure: AmbiguousSubmissionRecoveryFailure) {
+    super(`ambiguous submission blocked: ${failure}`);
+    this.name = 'AmbiguousSubmissionBlockedError';
+  }
+}
+
 export interface SessionBackend {
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   write(data: string): void;
+  /**
+   * Begin one logical adapter submission and return its recovery fence.
+   * Backends with a persistent ambiguity journal may arm it here so all
+   * adapter-level text chunks plus the final submit key share one transaction.
+   */
+  captureAmbiguousSubmissionFence?(): number;
+  /**
+   * Commit a logical adapter submission after its write call returns. A
+   * recovery failure keeps the backend fail-closed and must be surfaced by the
+   * worker instead of treating the adapter result as safely delivered.
+   */
+  confirmAmbiguousSubmission?(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined;
+  /**
+   * Best-effort cleanup for a logical write that failed after `fence`. The
+   * backend owns deduplication against frame-level recovery and must poison
+   * control-key outcomes that cannot safely be retried.
+   */
+  cancelAmbiguousSubmission?(
+    fence: number,
+  ): AmbiguousSubmissionRecoveryFailure | undefined;
   resize(cols: number, rows: number): void;
   onData(cb: (data: string) => void): void;
+  /**
+   * Replace the worker's derived screen state with an authoritative snapshot.
+   *
+   * Live-only observers use this after reconnecting: output may have been
+   * produced while the observer was offline, so replaying only subsequent
+   * chunks would leave idle detection and cards permanently stale. This is a
+   * reset/rebase signal, not another incremental PTY chunk.
+   */
+  onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
@@ -64,6 +109,12 @@ export interface SessionBackend {
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
   captureCurrentScreen?(): string;
+  /**
+   * Complete one authoritative screen refresh that starts after this call.
+   * Snapshot-only backends use this as a completion fence before the worker
+   * declares a turn idle, so a final burst cannot be lost to polling phase.
+   */
+  settleCurrentScreen?(): Promise<boolean>;
   captureViewport?(): string;
   getPaneSize?(): { cols: number; rows: number } | null;
   /**

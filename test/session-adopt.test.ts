@@ -35,6 +35,10 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   ),
   buildAdoptSelectCard: vi.fn(() => JSON.stringify({ type: 'adopt_select' })),
   buildCodexAppThreadSelectCard: vi.fn(() => JSON.stringify({ type: 'codex_app_thread_select' })),
+  buildAdoptBlockedCard: vi.fn((rootId: string, sessionId: string, cliId?: string) => JSON.stringify({
+    type: 'adopt_blocked',
+    elements: [{ tag: 'action', actions: [{ tag: 'button', value: { action: 'close', root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' } }] }],
+  })),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
 
@@ -57,6 +61,9 @@ vi.mock('../src/config.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   updateSession: vi.fn(),
   createSession: vi.fn(),
@@ -418,6 +425,41 @@ describe('Adopt card actions', () => {
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       expect(deleteMessage).toHaveBeenCalledWith(APP_ID, 'om_card_msg');
+    });
+
+    it('refuses a Codex App thread takeover while the session is still on the pendingRepo gate', async () => {
+      vi.mocked(getBot).mockReturnValue({
+        config: {
+          larkAppId: APP_ID,
+          larkAppSecret: 'secret',
+          cliId: 'codex-app',
+          cliPathOverride: '/opt/codex',
+        },
+        resolvedAllowedUsers: [],
+        botOpenId: 'ou_bot',
+      } as any);
+      vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
+        {
+          threadId: 'thread-1',
+          name: 'Existing Codex App thread',
+          preview: 'preview',
+          cwd: '/repo/codex-app',
+          updatedAtMs: 1780000000000,
+        },
+      ]);
+      const ds = makeDaemonSession({ pendingRepo: true, pendingPrompt: 'buffered' });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      await handleCardAction(makeCodexAppThreadSelectEvent(ROOT_ID, JSON.stringify({ threadId: 'thread-1' })), deps, APP_ID);
+      await flush();
+
+      // Refused: no takeover, pending gate untouched.
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.session.cliSessionId).not.toBe('thread-1');
     });
 
     it('should return early when rootId is missing', async () => {

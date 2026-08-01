@@ -169,21 +169,37 @@ export class CodexRpcEngine {
    *  so RPC mode stays engaged across daemon restarts instead of reverting to
    *  the paste path. */
   async resumeThread(threadId: string): Promise<string> {
-    const params: Json = { ...this.threadParams(), threadId, excludeTurns: true };
+    // forResume=true: a cold resume must NOT re-send ANY model-related override.
+    // The codex/TraeX app-server sees any single override (model OR
+    // model_reasoning_effort) as "caller is pinning config" and early-returns out
+    // of `merge_persisted_resume_metadata`, dropping the rest of the persisted
+    // {model, model_provider, reasoning_effort} triple back to the CURRENT
+    // process default. Re-sending only effort (per-turn override, new in PR #639)
+    // — or even the stable configured model (pre-existing on the shared engine) —
+    // therefore silently drifts model/provider whenever the app-server default
+    // changed between restarts. Verified on codex-cli 0.145.0 + traecli 0.200.19.
+    // The safe path is to send nothing model-related and let the app-server
+    // restore the full persisted triple. Fresh thread/start still stamps both.
+    const params: Json = { ...this.threadParams(true), threadId, excludeTurns: true };
     delete params.serviceName; // resume keeps the original thread's identity
     const r = await this.request('thread/resume', params);
     this.threadId = String(r?.thread?.id ?? threadId);
     return this.threadId;
   }
 
-  private threadParams(): Json {
+  private threadParams(forResume = false): Json {
     const config: Json = {
       // Forward the full env (incl. BOTMUX_SESSION_ID / BOTMUX_LARK_APP_ID) to
       // shell subprocesses so `botmux send` from within codex finds its bot.
       shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
     };
-    if (this.opts.model) config.model = this.opts.model;
-    if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    // Only stamp model/effort on a FRESH thread/start. On resume the app-server
+    // owns restoration of the persisted triple (see resumeThread) — sending
+    // either here would trip the app-server's model-resume-override short-circuit.
+    if (!forResume) {
+      if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
+    }
     return {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',

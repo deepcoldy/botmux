@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync }
 import { dirname, extname, basename, join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Client } from '@larksuiteoapi/node-sdk';
-import { getBotClient, getAllBots, getBot, formatLarkError } from '../../bot-registry.js';
+import { getBotClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
 import { loadBotConfigs } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent } from '../../services/hook-runner.js';
@@ -13,6 +13,8 @@ import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
+import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
+import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
 
 type LarkRequestParams = Record<string, string | number | boolean | undefined>;
 
@@ -90,12 +92,20 @@ let allBotClients: Array<{ appId: string; cliId: string; client: InstanceType<ty
 let allBotClientsFingerprint: string | null = null;
 
 function loadAllBotClientConfigs(): Array<{ larkAppId: string; larkAppSecret: string; cliId: string; brand?: string }> {
+  // Exclude apiOnly (core-only) bots from every Lark-client consumer: they have
+  // a synthetic appId + (possibly empty) secret and never connect to Feishu, so
+  // instantiating a Client for them is useless AND actively harmful — a NORMAL
+  // bot's roster probe (getAvailableBots → is_in_chat over getAllBotClients)
+  // would otherwise auth-fail against the synthetic app, adding latency+noise to
+  // the healthy bot path. Filtering here covers both discovery and the strict
+  // stable-App resolver from one place.
+  const notApiOnly = (c: { apiOnly?: boolean }) => c.apiOnly !== true;
   try {
-    return loadBotConfigs();
+    return loadBotConfigs().filter(notApiOnly);
   } catch {
     // riff sandbox：没有 bots.json，只有经 env 合成注册进 registry 的 bot——
     // 降级用注册表里的配置，`botmux bots list` 等只读探测照常可用。
-    return getAllBots().map((b) => b.config);
+    return getAllBots().map((b) => b.config).filter(notApiOnly);
   }
 }
 
@@ -139,6 +149,31 @@ export class MessageWithdrawnError extends Error {
     super(`Message ${messageId} has been withdrawn`);
     this.name = 'MessageWithdrawnError';
   }
+}
+
+/**
+ * Re-exported from bot-registry (defined there to avoid an import cycle with
+ * getBotClient). apiOnly bots throw this on any Feishu client request.
+ */
+export { LarkTransportDisabledError };
+
+/** Bot-level transport gate: an apiOnly bot must never make an outbound Feishu
+ * call. Called at the top of every write primitive. `op` names the primitive
+ * for diagnostics. Read-only lookups (message detail, chat members) intentionally
+ * do NOT call this — they are inert reads used by discovery, already filtered
+ * elsewhere; only side-effecting writes are hard-gated here. Exported so other
+ * modules with their OWN direct-Feishu implementations (e.g. doc-comment's
+ * drive API) can enforce the same bot-level boundary from one definition. */
+export function assertLarkTransport(larkAppId: string, op: string): void {
+  let apiOnly = false;
+  try {
+    apiOnly = getBot(larkAppId).config.apiOnly === true;
+  } catch {
+    // Bot not registered (e.g. a synthetic id from a cross-daemon fallback):
+    // leave the existing getBotClient error path to handle it, don't mask it.
+    return;
+  }
+  if (apiOnly) throw new LarkTransportDisabledError(larkAppId, op);
 }
 
 /**
@@ -194,8 +229,11 @@ export async function sendMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -254,8 +292,11 @@ export async function replyMessage(
   hookContext?: Record<string, unknown>,
   options?: OutboundMessageOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'replyMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
 
   let res: any;
   try {
@@ -299,6 +340,7 @@ export async function replyMessage(
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'addReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.create({
     path: { message_id: messageId },
@@ -313,6 +355,7 @@ export async function addReaction(larkAppId: string, messageId: string, emojiTyp
 }
 
 export async function removeReaction(larkAppId: string, messageId: string, reactionId: string): Promise<void> {
+  assertLarkTransport(larkAppId, 'removeReaction');
   const c = getBotClient(larkAppId);
   const res = await (c as any).im.v1.messageReaction.delete({
     path: { message_id: messageId, reaction_id: reactionId },
@@ -482,8 +525,19 @@ export async function sendUserMessage(
   uuid?: string,
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendUserMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  // Stamp callback-button ownership markers on interactive DMs too: this is the
+  // FIFTH card egress surface (config / write-link / substitute / overload / …
+  // cards all DM their callback buttons through here). Without it a peer bot
+  // reading such a DM via history flattens the buttons into its prompt, and —
+  // worse — a future botmux DM button with a new action would leak past the
+  // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
+  // create + deadline request), so one stamp covers both. Same total-function
+  // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
   const data = {
     receive_id: openId,
     msg_type: msgType as any,
@@ -741,6 +795,7 @@ export async function getChatMode(
  * fall back instead of assuming success. Fire-and-forget callers can ignore it.
  */
 export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'deleteMessage');
   const c = getBotClient(larkAppId);
   try {
     const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
@@ -770,10 +825,11 @@ export const LARK_CODE_EPHEMERAL_NOT_GROUP = 18053;
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
+  assertLarkTransport(larkAppId, 'sendEphemeralCard');
   const c = getBotClient(larkAppId);
   let card: unknown;
   try {
-    card = JSON.parse(cardJson);
+    card = JSON.parse(stampBotmuxCallbackMarkers(cardJson));
   } catch (err) {
     throw new Error(`Invalid ephemeral card JSON: ${err}`);
   }
@@ -790,13 +846,43 @@ export async function sendEphemeralCard(
   return messageId ?? '';
 }
 
+/**
+ * Delete a previously-sent ephemeral card (`ephemeral/v1/delete`). Ephemeral
+ * cards CANNOT be PATCH-updated (see {@link sendEphemeralCard}), so the picker's
+ * "in-place refresh" (page / search / select) is implemented as delete-then-
+ * resend; this is the delete half. Best-effort: returns false on any failure
+ * (already gone, network) rather than throwing — a stale ephemeral card lingering
+ * is a cosmetic issue, not a correctness one, and the caller has already sent the
+ * replacement by the time cleanup runs.
+ */
+export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'deleteEphemeralCard');
+  const c = getBotClient(larkAppId);
+  try {
+    const res: any = await (c as any).request({
+      method: 'POST',
+      url: '/open-apis/ephemeral/v1/delete',
+      data: { message_id: messageId },
+    });
+    if (res && typeof res.code === 'number' && res.code !== 0) {
+      logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
+    return false;
+  }
+}
+
 export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateMessage');
   const c = getBotClient(larkAppId);
   let res: any;
   try {
     res = await c.im.v1.message.patch({
       path: { message_id: messageId },
-      data: { content: cardJson },
+      data: { content: stampBotmuxCallbackMarkers(cardJson) },
     });
   } catch (err: any) {
     if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
@@ -866,6 +952,12 @@ export async function getMessageChatId(
 }
 
 export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+  // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
+  // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
+  // caught below as a "failed app download", and silently falls through to the
+  // raw user-token fetch — bypassing the boundary. A core-only bot has no
+  // Feishu resource to download; refuse up front.
+  assertLarkTransport(larkAppId, 'downloadMessageResource');
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -957,6 +1049,7 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
 };
 
 export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
+  assertLarkTransport(larkAppId, 'uploadImage');
   const c = getBotClient(larkAppId);
   const buf = readFileSync(imagePath);
   // SDK returns { image_key } directly (not wrapped in { code, data })
@@ -970,6 +1063,7 @@ export async function uploadImage(larkAppId: string, imagePath: string): Promise
 }
 
 export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+  assertLarkTransport(larkAppId, 'uploadFile');
   const c = getBotClient(larkAppId);
   const buf = readFileSync(filePath);
   const ext = extname(filePath).toLowerCase();
@@ -1034,6 +1128,13 @@ export async function resolveAllowedUsersWithMap(
   const openIds: string[] = [];
   const emails: string[] = [];
   const unionIds: string[] = [];
+  // Mobile entries: keep the raw config string as the map key (exact-match with
+  // allowedUsers), but remember the normalized (spaces/dashes stripped) form to
+  // send to the API. batch_get_id accepts `mobiles` under the same
+  // contact:user.id:readonly scope as emails. Lets phone-registered users with
+  // no corporate email be an owner.
+  const mobiles: string[] = [];
+  const mobileRawByNorm = new Map<string, string>();
   for (const v of raw) {
     if (v.startsWith('ou_')) {
       map.set(v, v);
@@ -1045,12 +1146,16 @@ export async function resolveAllowedUsersWithMap(
       // union_id (跨应用稳定)：运行时权限/私信/卡片全是 open_id 原生的，
       // 启动时用本 app 凭证把 on_ 翻成本 app 的 ou_，下游一律照旧用 open_id。
       unionIds.push(v);
+    } else if (isMobileEntry(v)) {
+      const norm = normalizeMobileEntry(v);
+      mobiles.push(norm);
+      mobileRawByNorm.set(norm, v);
     } else {
       emails.push(v);
     }
   }
 
-  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0) {
+  if (emails.length > 0 || unionIds.length > 0 || openIds.length > 0 || mobiles.length > 0) {
     const c = getBotClient(larkAppId);
 
     // Literal open_id is app-scoped. Keep it as-is for compatibility, but
@@ -1148,6 +1253,71 @@ export async function resolveAllowedUsersWithMap(
         errored = true;
         for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
+      }
+    }
+
+    if (mobiles.length > 0) {
+      // Mirror the email branch exactly (same transient/definitive contract),
+      // but over the `mobiles` field. Map keys are the RAW config entries (via
+      // mobileRawByNorm) so exact-match with allowedUsers holds even though the
+      // API is queried with the normalized number.
+      try {
+        const res = await (c as any).contact.v3.user.batchGetId({
+          params: { user_id_type: 'open_id' },
+          data: { mobiles, include_resigned: false },
+        });
+        if (res.code !== 0) {
+          // Whole-request failure — not a per-mobile verdict. Mark every
+          // requested mobile TRANSIENT so a real owner isn't fail-closed out.
+          errored = true;
+          for (const norm of mobiles) {
+            const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+            entryStatus.set(rawEntry, 'transient');
+          }
+          logger.warn(`Failed to resolve mobiles to open_ids: ${res.msg} (code: ${res.code})`);
+        } else {
+          const userList: any[] = res.data?.user_list ?? [];
+          // Index the API echo by a SINGLE canonical E.164 key. The API may echo
+          // a mobile with or without the leading `+`, and Feishu does NOT promise
+          // a byte-identical echo — canonicalMobileKey folds each number to one
+          // stable key (trusting `+` as the country code; only a genuinely-bare
+          // CN 11-digit number gets an 86 prefix). A single key per number, NOT a
+          // key SET: a set that stripped `+` and then treated every leading-1
+          // number as CN would collide a US `+1 3XX…` with a CN bare `13X…` and
+          // bind the owner to the wrong person / evict a co-owner on overwrite.
+          const byKey = new Map<string, string>();
+          for (const item of userList) {
+            if (item.user_id && item.mobile) {
+              byKey.set(canonicalMobileKey(normalizeMobileEntry(String(item.mobile))), item.user_id);
+            } else if (!item.user_id) {
+              logger.warn(`Could not resolve mobile: ${item.mobile}`);
+            }
+          }
+          for (const norm of mobiles) {
+            const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+            // Match the requested number by its canonical key. Covers CN bare-11
+            // ↔ +86 in both directions. If Feishu echoed an overseas number with
+            // the `+` dropped it becomes a safe MISS (definitive → owner falls
+            // back to email/union_id), never a cross-number mis-bind.
+            const uid = byKey.get(canonicalMobileKey(norm));
+            if (uid) {
+              map.set(rawEntry, uid);
+              entryStatus.set(rawEntry, 'resolved');
+              logger.info(`Resolved ${rawEntry} → ${uid}`);
+            } else {
+              // code-0 but this mobile absent from user_list → definitive miss
+              // (no such user / not visible), same as the email case.
+              entryStatus.set(rawEntry, 'definitive');
+            }
+          }
+        }
+      } catch (err: any) {
+        errored = true;
+        for (const norm of mobiles) {
+          const rawEntry = mobileRawByNorm.get(norm) ?? norm;
+          entryStatus.set(rawEntry, 'transient');
+        }
+        logger.warn(`resolveAllowedUsers (mobiles) failed: ${err.message}`);
       }
     }
   }

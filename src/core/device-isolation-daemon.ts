@@ -8,10 +8,16 @@
  */
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import type { BackendType, SessionProbe } from '../adapters/backend/types.js';
+import type {
+  BackendType,
+  PersistentBackendTarget,
+  SessionProbe,
+} from '../adapters/backend/types.js';
 import { deviceCredentialIsolationMarkerPath } from '../adapters/cli/read-isolation.js';
 import { config } from '../config.js';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
+import * as sessionStore from '../services/session-store.js';
+import type { Session } from '../types.js';
 import { logger } from '../utils/logger.js';
 import {
   acquireDeviceIsolationFreeze,
@@ -22,9 +28,9 @@ import {
   type DeviceIsolationFreezeLease,
 } from './device-isolation-activation.js';
 import {
-  killPersistentSession,
-  persistentSessionName,
-  probePersistentSession,
+  killPersistentBackendTarget,
+  probePersistentBackendTarget,
+  resolvePersistentBackendTarget,
 } from './persistent-backend.js';
 import { readProcessStartIdentity } from './session-marker.js';
 import type { DaemonSession } from './types.js';
@@ -34,7 +40,7 @@ export const DEVICE_ISOLATION_PREPARE_PATH = '/api/device-isolation/activation/p
 export const DEVICE_ISOLATION_COMMIT_PATH = '/api/device-isolation/activation/commit';
 export const DEVICE_ISOLATION_RELEASE_PATH = '/api/device-isolation/activation/release';
 
-type LocalPersistentBackend = 'tmux' | 'herdr' | 'zellij';
+type LocalPersistentBackend = 'tmux' | 'herdr' | 'zellij' | 'zmx';
 type InventoryBackend = BackendType | 'unknown';
 type ProcessIdentity = { pid: number; procStart: string };
 
@@ -52,6 +58,13 @@ export interface DeviceIsolationRuntimeSession {
   adopted: boolean;
   /** Backend stamped by daemon-owned state, if this session predates no stamp. */
   frozenBackend?: BackendType;
+  /** Exact worker-selected persistent resource. Shared Herdr carries both the
+   * host session and the one Botmux-owned agent inside it. */
+  persistentBackendTarget?: PersistentBackendTarget;
+  /** PID carried only by an unregistered persisted row. It has no process-start
+   * identity or worker-generation attestation, so a still-live/reused PID must
+   * block activation instead of being mistaken for a quiescent PTY session. */
+  unregisteredPid?: number;
   workerPresent: boolean;
   workerGeneration?: number;
   worker?: ProcessIdentity;
@@ -74,8 +87,7 @@ export interface DeviceIsolationInventoryEntry {
   cli?: ProcessIdentity;
   workerGeneration?: number;
   persistent?: {
-    backendType: LocalPersistentBackend;
-    name: string;
+    target: PersistentBackendTarget;
     probe: SessionProbe;
   };
   blocker?: DeviceIsolationBlocker;
@@ -98,8 +110,13 @@ export interface DeviceIsolationDaemonDependencies {
   processStart: (pid: number) => string | undefined;
   processExists: (pid: number) => boolean;
   signalProcess: (pid: number, signal: NodeJS.Signals) => void;
-  probePersistent: (backendType: LocalPersistentBackend, name: string) => SessionProbe;
-  killPersistent: (backendType: LocalPersistentBackend, name: string) => void;
+  probePersistent: (target: PersistentBackendTarget) => SessionProbe;
+  /** Full sessionId is mandatory so prefix-addressed backends such as ZMX can
+   * re-verify ownership before destructive teardown. */
+  killPersistent: (
+    target: PersistentBackendTarget,
+    sessionId: string,
+  ) => void;
   closeWorker: (session: DeviceIsolationRuntimeSession) => void;
   readMarker: () => string | null;
   sleep: (ms: number) => Promise<void>;
@@ -122,7 +139,7 @@ let daemonIdentity: DeviceIsolationDaemonIdentity | null = null;
 let transaction: ActivationTransaction | null = null;
 
 function isPersistentBackend(value: InventoryBackend): value is LocalPersistentBackend {
-  return value === 'tmux' || value === 'herdr' || value === 'zellij';
+  return value === 'tmux' || value === 'herdr' || value === 'zellij' || value === 'zmx';
 }
 
 function isLocalBackend(value: InventoryBackend): value is Exclude<BackendType, 'riff'> {
@@ -138,8 +155,60 @@ function safeProcessExists(pid: number): boolean {
   }
 }
 
+/**
+ * Add durable, persisted local-resource rows that startup restore intentionally
+ * kept active but could not safely register. Device isolation must see those
+ * ownership records even when the routing registry cannot: otherwise an
+ * inconclusive teardown could disappear from the activation inventory.
+ *
+ * Runtime state wins by complete session id because it carries the current
+ * worker generation and attestation. Queued rows and command scratches have no
+ * running local resource. Legacy rows with a CLI/PID/target marker are still
+ * evidence of a possibly-live local resource even when backendType was never
+ * stamped; include them as `unknown_backend` blockers instead of silently
+ * excluding them from a credential-isolation transaction.
+ */
+export function mergePersistedDeviceIsolationSessions(
+  runtimeSessions: readonly DeviceIsolationRuntimeSession[],
+  persistedSessions: readonly Session[],
+): DeviceIsolationRuntimeSession[] {
+  const merged = [...runtimeSessions];
+  const runtimeIds = new Set(runtimeSessions.map(session => session.sessionId));
+  for (const session of persistedSessions) {
+    if (
+      runtimeIds.has(session.sessionId)
+      || session.status !== 'active'
+      || session.queued
+    ) continue;
+    const adopted = !!session.adoptedFrom;
+    const frozenBackend =
+      session.backendType ?? session.persistentBackendTarget?.backendType;
+    const hasDurableLocalEvidence =
+      adopted
+      || !!session.persistentBackendTarget
+      || isPersistentBackend(frozenBackend ?? 'unknown')
+      || (typeof session.pid === 'number' && session.pid > 0)
+      || !!session.cliSessionId;
+    if (!hasDurableLocalEvidence) continue;
+    merged.push({
+      sessionId: session.sessionId,
+      adopted,
+      ...(frozenBackend ? { frozenBackend } : {}),
+      ...(session.persistentBackendTarget
+        ? { persistentBackendTarget: session.persistentBackendTarget }
+        : {}),
+      ...(typeof session.pid === 'number' && session.pid > 0
+        ? { unregisteredPid: session.pid }
+        : {}),
+      workerPresent: false,
+    });
+    runtimeIds.add(session.sessionId);
+  }
+  return merged;
+}
+
 function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
-  return listActiveSessions().map((ds) => {
+  const runtime = listActiveSessions().map((ds) => {
     const workerPresent = !!ds.worker && !ds.worker.killed;
     const workerPid = workerPresent ? ds.worker?.pid : undefined;
     const workerStart = workerPid ? readProcessStartIdentity(workerPid) : undefined;
@@ -147,10 +216,13 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
     const cli = attestation?.cliPid && attestation.cliProcStart
       ? { pid: attestation.cliPid, procStart: attestation.cliProcStart }
       : undefined;
+    const persistentBackendTarget =
+      ds.session.persistentBackendTarget ?? ds.initConfig?.persistentBackendTarget;
     return {
       sessionId: ds.session.sessionId,
       adopted: !!(ds.adoptedFrom || ds.initConfig?.adoptMode || ds.session.adoptedFrom),
       frozenBackend: ds.initConfig?.backendType ?? ds.session.backendType,
+      ...(persistentBackendTarget ? { persistentBackendTarget } : {}),
       workerPresent,
       ...(ds.workerGeneration !== undefined ? { workerGeneration: ds.workerGeneration } : {}),
       ...(workerPid && workerStart ? { worker: { pid: workerPid, procStart: workerStart } } : {}),
@@ -167,6 +239,9 @@ function defaultRuntimeSessions(): DeviceIsolationRuntimeSession[] {
       source: ds,
     };
   });
+  // sessionStore is initialized for this daemon's own bot partition. Do not
+  // scan sibling files: every daemon proves only the local resources it owns.
+  return mergePersistedDeviceIsolationSessions(runtime, sessionStore.listSessions());
 }
 
 const defaultDependencies: DeviceIsolationDaemonDependencies = {
@@ -175,8 +250,8 @@ const defaultDependencies: DeviceIsolationDaemonDependencies = {
   processStart: readProcessStartIdentity,
   processExists: safeProcessExists,
   signalProcess: (pid, signal) => { process.kill(pid, signal); },
-  probePersistent: probePersistentSession,
-  killPersistent: killPersistentSession,
+  probePersistent: probePersistentBackendTarget,
+  killPersistent: killPersistentBackendTarget,
   closeWorker: (session) => {
     if (!session.source) throw new Error('missing daemon session handle');
     killWorker(session.source);
@@ -224,6 +299,18 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
   ) {
     return blockerEntry(session, backendType, 'backend_inconsistent');
   }
+  if (session.unregisteredPid !== undefined) {
+    let processMayStillExist = true;
+    try {
+      processMayStillExist = dependencies.processExists(session.unregisteredPid);
+    } catch {
+      // Process inspection is itself part of the safety proof. An unavailable
+      // probe cannot authorize activation around an unregistered local PID.
+    }
+    if (processMayStillExist) {
+      return blockerEntry(session, backendType, 'process_identity_unavailable');
+    }
+  }
   if (backendType === 'riff') {
     return {
       sessionId: session.sessionId,
@@ -235,11 +322,17 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
     };
   }
 
-  const persistent = isPersistentBackend(backendType)
-    ? {
+  const persistentTarget = isPersistentBackend(backendType)
+    ? resolvePersistentBackendTarget(
       backendType,
-      name: persistentSessionName(backendType, session.sessionId),
-      probe: dependencies.probePersistent(backendType, persistentSessionName(backendType, session.sessionId)),
+      session.sessionId,
+      session.persistentBackendTarget,
+    )
+    : undefined;
+  const persistent = persistentTarget
+    ? {
+      target: persistentTarget,
+      probe: dependencies.probePersistent(persistentTarget),
     }
     : undefined;
 
@@ -254,6 +347,23 @@ function classifySession(session: DeviceIsolationRuntimeSession): DeviceIsolatio
     }
     if (persistent.probe === 'unknown') {
       return { ...blockerEntry(session, backendType, 'backend_probe_unknown'), persistent };
+    }
+    // A persisted shared-Herdr agent is an exact Botmux-owned resource even
+    // after its worker/viewer is gone. Keep it in the teardown inventory so
+    // activation closes only that agent and verifies its disappearance; never
+    // mistake a missing derived bmx-* host for quiescence while the real agent
+    // is still running inside a shared host session.
+    if (
+      persistent.target.backendType === 'herdr'
+      && persistent.target.agentName
+    ) {
+      return {
+        sessionId: session.sessionId,
+        backendType,
+        disposition: 'owned_local',
+        credentialIsolated: false,
+        persistent,
+      };
     }
     // A detached pane may still be executing a legacy unconfined CLI, but the
     // daemon no longer has a private-IPC attestation for its exact process.
@@ -452,9 +562,12 @@ async function quiesceOwnedSessions(
     for (const target of targets) {
       const session = sessions.get(target.sessionId);
       if (!session) return 'teardown_failed';
-      dependencies.closeWorker(session);
+      if (session.workerPresent) dependencies.closeWorker(session);
       if (target.persistent) {
-        dependencies.killPersistent(target.persistent.backendType, target.persistent.name);
+        dependencies.killPersistent(
+          target.persistent.target,
+          target.sessionId,
+        );
       }
     }
   } catch {
@@ -478,15 +591,15 @@ async function quiesceOwnedSessions(
         if (state === 'unknown') unknown = true;
       }
       if (target.persistent) {
-        const probe = dependencies.probePersistent(
-          target.persistent.backendType,
-          target.persistent.name,
-        );
+        const probe = dependencies.probePersistent(target.persistent.target);
         if (probe === 'unknown') unknown = true;
         if (probe === 'exists') {
           clean = false;
           try {
-            dependencies.killPersistent(target.persistent.backendType, target.persistent.name);
+            dependencies.killPersistent(
+              target.persistent.target,
+              target.sessionId,
+            );
           } catch { /* verified by the next probe */ }
         }
       }

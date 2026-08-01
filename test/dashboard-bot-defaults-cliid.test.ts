@@ -2,10 +2,61 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { displayCliId } from '../src/dashboard/web/bot-defaults.js';
-import { BotAgentSection, CodexAppDisplaySection } from '../src/dashboard/web/bot-defaults-page.js';
+import {
+  BOT_DEFAULTS_TABS,
+  BotAgentSection,
+  BotDefaultsTabs,
+  CardBehaviorSection,
+  CodexAppDisplaySection,
+  type BotDefaultsTab,
+} from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
+
+describe('bot defaults task tabs', () => {
+  it('renders five accessible categories and supports pointer selection', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    expect(BOT_DEFAULTS_TABS).toEqual(['common', 'sessions', 'security', 'cards', 'advanced']);
+    expect(tabs).toHaveLength(5);
+    expect(tabs[0]!.props['aria-selected']).toBe(true);
+    expect(tabs[1]!.props.tabIndex).toBe(-1);
+
+    act(() => tabs[2]!.props.onClick());
+    expect(onChange).toHaveBeenCalledWith('security');
+  });
+
+  it('wraps arrow-key navigation and supports Home / End', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(BotDefaultsTabs, {
+        active: 'common' satisfies BotDefaultsTab,
+        onChange,
+      }));
+    });
+    const tabs = renderer.root.findAllByProps({ role: 'tab' });
+    const event = (key: string) => ({ key, preventDefault: vi.fn() });
+
+    act(() => tabs[0]!.props.onKeyDown(event('ArrowLeft')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+    act(() => tabs[4]!.props.onKeyDown(event('ArrowRight')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('Home')));
+    expect(onChange).toHaveBeenLastCalledWith('common');
+    act(() => tabs[2]!.props.onKeyDown(event('End')));
+    expect(onChange).toHaveBeenLastCalledWith('advanced');
+  });
+});
 
 describe('bot defaults cli label', () => {
   it('prefers /api/bots cliId before session fallback', () => {
@@ -200,6 +251,65 @@ describe('Codex App history switch', () => {
 
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
+      .toContain('write_failed');
+  });
+});
+
+describe('reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, string>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    expect(menu().props.value).toBe('streaming');
+
+    await act(async () => {
+      menu().props.onChange('footer');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'footer' });
+    expect(menu().props.value).toBe('footer');
+
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenLastCalledWith({ usageDisplay: 'off' });
+    expect(menu().props.value).toBe('off');
+  });
+
+  it('rolls back when persistence fails', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      body: { error: 'write_failed' },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_usage', usageSupported: true },
+        putCardPref,
+      }));
+    });
+
+    const menu = () => renderer.root.findByProps({ id: 'bd-menu-usageDisplay' });
+    await act(async () => {
+      menu().props.onChange('off');
+      await Promise.resolve();
+    });
+
+    expect(menu().props.value).toBe('streaming');
+    expect(renderer.root.findByProps({ 'data-card-pref-status': '' }).children.join(''))
       .toContain('write_failed');
   });
 });

@@ -1,6 +1,6 @@
 # Web Terminal (interactive)
 
-Every session comes with an xterm.js-based Web Terminal, at an address like `http://<WEB_EXTERNAL_HOST>:<port>`.
+Every session except a ZMX-backed one comes with an xterm.js-based Web Terminal, at an address like `http://<WEB_EXTERNAL_HOST>:<port>`; for ZMX, use `botmux list` or `zmx attach` to enter a local terminal and see the [ZMX backend guide](/en/zmx).
 
 ![Web Terminal](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780033301701_web_terminal.gif)
 

@@ -13,9 +13,12 @@ import {
   compileToSeatbelt,
   compileToBwrap,
   migrateLegacySandboxFields,
+  computeNoTransportAuthorityRoots,
+  FsPolicyConfigError,
   type FsPolicyContext,
   type FsRule,
 } from '../src/adapters/cli/fs-policy.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -519,9 +522,17 @@ describe('compileToSeatbelt', () => {
     expect(prof).toContain('(allow network*)'); // net defaults true
   });
 
+  // Regression: bsd.sb carries no iokit rule, so without this grant `(deny default)`
+  // kills every IOServiceOpen — Chromium (headless screenshots) SIGSEGVs inside
+  // IOKit with no sandbox diagnostic. See the e2e for the live proof.
+  it('grants iokit-open (bsd.sb has none; missing it SIGSEGVs Chromium)', () => {
+    expect(compileToSeatbelt(policy())).toContain('(allow iokit-open)');
+  });
+
   it('omits network grants when net is disabled', () => {
     const prof = compileToSeatbelt(buildFsPolicy(ctx({ net: false })));
     expect(prof).not.toContain('(allow network*)');
+    expect(prof).toContain('(allow iokit-open)'); // not gated on net
   });
 
   it('deeper rules are emitted later (last-match wins)', () => {
@@ -743,5 +754,290 @@ describe('compiler parity with accessForPath', () => {
     const prof = compileToSeatbelt(p);
     expect(prof.indexOf('(deny file-read* (subpath "/srv/ref/private"))'))
       .toBeGreaterThan(prof.indexOf('(allow file-read* (subpath "/srv/ref"))'));
+  });
+});
+
+describe('no-Lark-transport credential profile (larkTransportEnabled=false)', () => {
+  // Worst case: workingDir defaults to $HOME, which would grant the whole home
+  // (bots.json + sibling BOT_HOMEs + lark-cli stores) readWrite. The mandatory
+  // no-transport denies must beat that broad grant — but ONLY for Feishu
+  // authority, never the model CLI's own auth. authPaths here uses the REAL
+  // codex-app adapter surface (~/.codex), not a fictional one.
+  const noTransport = (o: Partial<FsPolicyContext> = {}) => buildFsPolicy(ctx({
+    larkTransportEnabled: false,
+    workingDir: '/Users/u',                       // = homeDir (worst case)
+    redirectedCliData: false,
+    authPaths: ['/Users/u/.codex'],               // REAL codex-app CLI login/state surface
+    ...o,
+  }));
+
+  it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/sibling/send-cred.json').access).toBe('deny');
+  });
+
+  it('KEEPS the model CLI own auth (~/.codex) readWrite under no-transport — core functionality intact', () => {
+    // The regression codex caught: authPaths are the CLI's OWN login (not Feishu),
+    // so a core-only turn must still authenticate its CLI. ~/.codex stays RW even
+    // though it lives under the workingDir=~ home.
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.codex').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
+  it('own BOT_HOME stays writable but its send-cred.json is denied (Feishu secret)', () => {
+    const p = buildFsPolicy(ctx({ larkTransportEnabled: false, workingDir: '/Users/u/.botmux/bots/cli_self' }));
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/scratch.txt').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/send-cred.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+  });
+
+  it('a NORMAL (transport-enabled) bot gets its own lark-cli, authPaths, and keystore', () => {
+    const p = buildFsPolicy(ctx({ larkTransportEnabled: true, redirectedCliData: false, authPaths: ['/Users/u/.codex'] }));
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.codex/auth.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/Library/Application Support/lark-cli/master.key.file').access).toBe('readOnly');
+    // bots.json (sibling secrets) is baseline-denied for normal bots too.
+  });
+
+  it('denies the trusted-host HMAC + port table (escalation vector) even with workingDir=~', () => {
+    // .dashboard-secret is the trusted-host HMAC — reading it would let a
+    // no-transport agent sign sibling-daemon routes. dashboard-daemons is the
+    // port-table discovery half. Both must be denied; .bak/.tmp sidecars too.
+    const p = noTransport();
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-token').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/feishu-session.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.bak').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.tmp').access).toBe('deny');
+  });
+
+  it('a HOSTILE deeper user sandboxPaths.readWrite cannot re-open an authority path', () => {
+    // The deepest-prefix-wins semantics codex flagged: a nested user grant used
+    // to beat the shallower authority deny. dropAuthority now strips it pre-merge.
+    const p = noTransport({ userPaths: { readWrite: [
+      '/Users/u/.lark-cli-bots/cli_self',        // deeper than the authority root
+      '/Users/u/.botmux/.dashboard-secret',      // directly targets the HMAC
+      '/Users/u/.botmux/bots.json',
+    ] } });
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/x').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+  });
+
+  it('freezes BOTH the configured AND the default ~/.botmux root (custom SESSION_DATA_DIR, BOTS_CONFIG unset)', () => {
+    // codex P1: a custom data dir moves configuredBotmuxHome (=dirname(dataDir))
+    // but the default ~/.botmux still holds the live .dashboard-secret HMAC +
+    // bots.json. Denying only the configured root left the sibling-daemon
+    // escalation open. buildFsPolicy must deny BOTH from workingDir=~.
+    const p = buildFsPolicy(ctx({
+      larkTransportEnabled: false,
+      homeDir: '/home/u',
+      workingDir: '/home/u',                              // HTTP-trigger default
+      botmuxHome: '/srv/botmux',                          // configured (dirname of a custom dataDir)
+      sessionDataDir: '/srv/botmux/data',
+      defaultBotmuxHome: '/home/u/.botmux',               // the ALWAYS-frozen default root
+      botHome: '/srv/botmux/bots/cli_self',
+      redirectedCliData: false,
+      authPaths: ['/home/u/.codex'],
+    }));
+    // default root — was the leak
+    expect(accessForPath(p.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/home/u/.botmux/.dashboard-token').access).toBe('deny');
+    expect(accessForPath(p.rules, '/home/u/.botmux/feishu-session.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots.json').access).toBe('deny');
+    // configured root
+    expect(accessForPath(p.rules, '/srv/botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(p.rules, '/srv/botmux/bots.json').access).toBe('deny');
+    // own BOT_HOME (under the configured root) stays usable; ~/.codex kept
+    expect(accessForPath(p.rules, '/srv/botmux/bots/cli_self/scratch.txt').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+  });
+
+  it('freezes bare ~/.lark-cli as an authority root — a hostile nested user RW/RO cannot re-open it', () => {
+    // codex P1: ~/.lark-cli is repo-marked sensitive (isolated-bot-deploy.md) but
+    // was only baseline-denied, not a frozen no-transport authority root — so a
+    // deeper user grant re-opened it (deepest-prefix wins). Now it's an authority
+    // root and dropAuthority strips the nested grant pre-merge.
+    const p = noTransport({ userPaths: {
+      readWrite: ['/Users/u/.lark-cli/accounts/self'],
+      readOnly: ['/Users/u/.lark-cli/tokens'],
+    } });
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli/accounts/self/token.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli/tokens/t.json').access).toBe('deny');
+    // and the suppressed grants are RECORDED for the worker to log (not silent)
+    expect(p.suppressedAuthorityPaths).toEqual(
+      expect.arrayContaining(['/Users/u/.lark-cli/accounts/self', '/Users/u/.lark-cli/tokens']),
+    );
+  });
+
+  it('a loaded bots-config in a DENIED subtree of a frozen root builds (config + dir + sidecar all deny)', () => {
+    // Default layout: getLoadedConfigPath() = ~/.botmux/bots.json, denied wholesale
+    // by the authority-root deny (NOT re-opened by any carve-out) — no throw, and
+    // the post-merge self-check confirms config + dirname + sidecars are all deny.
+    const p = noTransport({ loadedBotsConfigPath: '/Users/u/.botmux/bots.json' });
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json.bak').access).toBe('deny');
+    // A config in a plain denied subdir (not a carve-out) also builds, dir denied.
+    const q = noTransport({ loadedBotsConfigPath: '/Users/u/.botmux/conf/bots.json' });
+    expect(accessForPath(q.rules, '/Users/u/.botmux/conf/bots.json').access).toBe('deny');
+    expect(accessForPath(q.rules, '/Users/u/.botmux/conf').access).toBe('deny');
+  });
+
+  it('a loaded bots-config that lands in a trusted CARVE-OUT FAILS CLOSED (inside-root is not sufficient)', () => {
+    // codex P1: white-in-black + deepest-prefix-wins means a deeper trusted
+    // carve-out (own BOT_HOME RW / bin RO / attachments RW / outbox / install-root)
+    // re-opens the config even though it's INSIDE a frozen authority root — which
+    // would re-expose every bot's secret + sidecars. The post-merge accessForPath
+    // self-check (config AND its dirname must be deny) catches every such case,
+    // including future carve-outs, without enumerating filenames.
+    const carve = (o: Partial<FsPolicyContext>) => noTransport({
+      botmuxInstallRoot: '/Users/u/.botmux/install',
+      outbox: '/Users/u/.botmux/data/sandboxes/s/outbox',
+      ...o,
+    });
+    for (const bad of [
+      '/Users/u/.botmux/bots/cli_self/bots.json',            // own BOT_HOME (readWrite)
+      '/Users/u/.botmux/bin/bots.json',                      // CLI bin (readOnly)
+      '/Users/u/.botmux/data/attachments/cli_self/bots.json',// own attachments (readWrite)
+      '/Users/u/.botmux/data/sandboxes/s/outbox/bots.json',  // relay outbox (readWrite)
+      '/Users/u/.botmux/install/bots.json',                  // install root (readOnly)
+    ]) {
+      expect(() => carve({ loadedBotsConfigPath: bad }), bad).toThrowError(FsPolicyConfigError);
+    }
+    // kind is machine-branchable
+    try {
+      carve({ loadedBotsConfigPath: '/Users/u/.botmux/bots/cli_self/bots.json' });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(FsPolicyConfigError);
+      expect((e as FsPolicyConfigError).kind).toBe('bots-config-in-carveout');
+    }
+    // a transport-ENABLED bot with the same carve-out placement does NOT throw
+    // (the self-check is no-transport-only).
+    expect(() => buildFsPolicy(ctx({
+      larkTransportEnabled: true, botmuxInstallRoot: '/Users/u/.botmux/install',
+      loadedBotsConfigPath: '/Users/u/.botmux/bots/cli_self/bots.json',
+    }))).not.toThrow();
+  });
+
+  it('an EXTERNAL loaded bots-config (outside every authority root) FAILS CLOSED — never silent parent-dir mask', () => {
+    // codex P1: BOTS_CONFIG allows any file. Silently masking dirname(config)
+    // would hide /tmp, /etc, or a project root and brick the core CLI. A
+    // no-transport turn must refuse the layout with a clear error instead.
+    for (const bad of ['/home/u/project/bots.json', '/tmp/bots.json', '/etc/bots.json']) {
+      expect(() => noTransport({ homeDir: '/home/u', workingDir: '/home/u', loadedBotsConfigPath: bad }))
+        .toThrowError(FsPolicyConfigError);
+    }
+    // the error carries a machine-branchable kind (not just a string message)
+    try {
+      noTransport({ homeDir: '/home/u', workingDir: '/home/u', loadedBotsConfigPath: '/tmp/bots.json' });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(FsPolicyConfigError);
+      expect((e as FsPolicyConfigError).kind).toBe('external-bots-config');
+    }
+    // transport-ENABLED bot with the same external config: no throw (gate is
+    // no-transport-only; a normal bot's config path isn't an authority concern here).
+    expect(() => buildFsPolicy(ctx({
+      larkTransportEnabled: true, homeDir: '/home/u', workingDir: '/home/u',
+      loadedBotsConfigPath: '/tmp/bots.json',
+    }))).not.toThrow();
+  });
+
+  it('a workingDir that IS a Feishu-authority root FAILS CLOSED (own BOT_HOME excepted, ~-ancestor allowed)', () => {
+    // codex P1: workingDir must be granted, so it can't be silently dropped. If it
+    // lives inside an authority root (own BOT_HOME excepted) the layout is
+    // unresolvable → throw. workingDir=~ (mere ancestor of the roots) is fine —
+    // the deeper parent deny masks the nested authority.
+    expect(() => noTransport({ workingDir: '/Users/u/.botmux/data' }))
+      .toThrowError(FsPolicyConfigError);
+    expect(() => noTransport({ workingDir: '/Users/u/.lark-cli-bots/cli_self' }))
+      .toThrowError(FsPolicyConfigError);
+    try {
+      noTransport({ workingDir: '/Users/u/.botmux' });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect((e as FsPolicyConfigError).kind).toBe('working-dir-is-authority');
+    }
+    // own BOT_HOME as workingDir is allowed (sanctioned carve-out, not a throw)
+    expect(() => buildFsPolicy(ctx({
+      larkTransportEnabled: false, workingDir: '/Users/u/.botmux/bots/cli_self',
+    }))).not.toThrow();
+    // workingDir=~ (ancestor) stays granted, nested authority still denied
+    const home = noTransport({ workingDir: '/Users/u' });
+    expect(accessForPath(home.rules, '/Users/u/proj/file').access).toBe('readWrite');
+    expect(accessForPath(home.rules, '/Users/u/.botmux/.dashboard-secret').access).toBe('deny');
+  });
+
+  it('computeNoTransportAuthorityRoots dedupes when configured === default and includes lark-cli stores', () => {
+    // Pure-helper unit lock: the provenance logic the worker's real assembly uses.
+    const roots = computeNoTransportAuthorityRoots({
+      homeDir: '/home/u', botmuxHome: '/home/u/.botmux', defaultBotmuxHome: '/home/u/.botmux',
+    });
+    expect(roots).toEqual(expect.arrayContaining([
+      '/home/u/.botmux', '/home/u/.lark-cli', '/home/u/.lark-cli-bots',
+    ]));
+    // configured === default → a single ~/.botmux entry, not two
+    expect(roots.filter(r => r === '/home/u/.botmux')).toHaveLength(1);
+    // distinct configured root is added too
+    const dual = computeNoTransportAuthorityRoots({
+      homeDir: '/home/u', botmuxHome: '/srv/botmux', defaultBotmuxHome: '/home/u/.botmux',
+    });
+    expect(dual).toEqual(expect.arrayContaining(['/srv/botmux', '/home/u/.botmux']));
+  });
+
+  it('CLI runtime still works under no-transport (.data-dir / bin / bots-info / own session)', () => {
+    const p = noTransport({ botmuxInstallRoot: '/opt/botmux' });
+    expect(accessForPath(p.rules, '/Users/u/.botmux/.data-dir').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/opt/botmux/dist/cli.js').access).toBe('readOnly');
+  });
+
+  it('the REAL codex-app adapter: own CODEX_HOME (redirected to BOT_HOME) usable, host ~/.codex dropped, all under no-transport', () => {
+    // codex P2: prior "codex-app" tests hand-wrote authPaths:['~/.codex'] and never
+    // touched the real adapter or the redirect→BOT_HOME path. Instantiate the ACTUAL
+    // adapter and run its declared authPaths through resolveRedirectedAdapterAuthPaths
+    // (the worker's single source of truth) for a redirected no-transport turn.
+    const adapter = createCodexAppAdapter();
+    expect(adapter.id).toBe('codex-app');
+    expect(adapter.authPaths).toEqual(['~/.codex']);
+    // Redirected: the host ~/.codex is rehomed into BOT_HOME's CODEX_HOME, so the
+    // host copy must be DROPPED (keeping it would be a leak) — its BOT_HOME copy is
+    // provisioned + covered readWrite by the botHome rule.
+    const survivors = resolveRedirectedAdapterAuthPaths({
+      declaredAuthPaths: (adapter.authPaths ?? []).map(a => a.replace(/^~/, '/home/u')),
+      willRedirectCliData: true,
+      rehomedHostRoots: ['/home/u/.codex'],
+    });
+    expect(survivors).toEqual([]);   // host ~/.codex NOT re-bound under redirect
+    // The redirected BOT_HOME CODEX_HOME (own bot's dir) stays usable under
+    // no-transport: BOT_HOME is readWrite (minus send-cred), and CODEX_HOME lives
+    // inside it, so the app-server's SQLite/state is writable.
+    const p = buildFsPolicy(ctx({
+      larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome: '/home/u/.botmux/bots/cli_self', defaultBotmuxHome: '/home/u/.botmux',
+      redirectedCliData: true, authPaths: survivors,
+    }));
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_self/.codex/state.sqlite').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/home/u/.botmux/bots/cli_self/send-cred.json').access).toBe('deny');
+    // NOT redirected (cold-start login): the real host ~/.codex IS kept readWrite
+    // even under no-transport (it's the model CLI's OWN auth, not Feishu).
+    const cold = buildFsPolicy(ctx({
+      larkTransportEnabled: false, homeDir: '/home/u', workingDir: '/home/u',
+      botmuxHome: '/home/u/.botmux', sessionDataDir: '/home/u/.botmux/data',
+      botHome: '/home/u/.botmux/bots/cli_self', defaultBotmuxHome: '/home/u/.botmux',
+      redirectedCliData: false, authPaths: ['/home/u/.codex'],
+    }));
+    expect(accessForPath(cold.rules, '/home/u/.codex/auth.json').access).toBe('readWrite');
+    // and the Feishu authority is still denied in both cases
+    expect(accessForPath(p.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
+    expect(accessForPath(cold.rules, '/home/u/.botmux/.dashboard-secret').access).toBe('deny');
   });
 });

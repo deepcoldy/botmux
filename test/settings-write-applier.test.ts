@@ -161,6 +161,13 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ chatBotDiscovery: false });
   });
 
+  it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
   it('writes herdrTraexPlugin opt-in and trims source/ref through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({
@@ -390,6 +397,15 @@ describe('applySettingsWrite — validation errors', () => {
     expect(r.ok).toBe(false);
     if (r.ok) throw new Error('expected failure');
     expect(r.error).toBe('invalid_chatBotDiscovery');
+  });
+
+  it('rejects non-boolean noVisibleOutputHint → invalid_noVisibleOutputHint', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ noVisibleOutputHint: 'yes' }, deps);
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error('expected failure');
+    expect(r.error).toBe('invalid_noVisibleOutputHint');
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it('rejects invalid herdrTraexPlugin payloads', async () => {

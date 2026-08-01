@@ -10,6 +10,12 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on a dropped write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /**
+   * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
+   * Snapshot transports record this before an ambiguous send so adapters with
+   * double-Ctrl+C exit gestures can keep their own recovery outside the window.
+   */
+  readonly lastInjectedCancelAt?: number;
   /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
   pasteText?(text: string): void;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
@@ -101,6 +107,9 @@ export interface CliAdapter {
      *  `--model` flag (or equivalent) inject it here; adapters whose CLI has no
      *  such concept simply ignore the field. Empty / undefined → CLI default. */
     model?: string;
+    /** Optional per-turn reasoning effort (codex `model_reasoning_effort`).
+     *  Only codex/codex-app adapters honor it; others ignore. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
     /** Optional session-scoped skill plugin/root prepared by botmux. */

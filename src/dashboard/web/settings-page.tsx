@@ -1,3 +1,4 @@
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { DropdownMenu, FieldTitle, LoadingState, dropdownLabel } from './dashboard-components.js';
 import { VcConsumerProfilesGate } from './vc-consumer-profiles-section.js';
@@ -43,6 +44,7 @@ interface DashboardSettings {
     workerOnline: boolean;
     lastError: { at: string; message: string; retryAt: string } | null;
   };
+  noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -158,6 +160,7 @@ function parseSettings(s: any): DashboardSettings {
         ? s.codexNotifier.lastError
         : null,
     },
+    noVisibleOutputHint: s?.noVisibleOutputHint === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -555,7 +558,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -698,6 +701,13 @@ function SettingsBody(props: {
             disabled={dis}
             saving={savingKey === 'codexNotifier'}
             onSave={saveCodexNotifier}
+          />
+          <ToggleRow
+            title={tr('settings.noVisibleOutputHint')}
+            help={tr('settings.noVisibleOutputHintHelp')}
+            checked={settings.noVisibleOutputHint}
+            disabled={dis || savingKey === 'noVisibleOutputHint'}
+            onChange={value => saveBoolean('noVisibleOutputHint', value)}
           />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>
@@ -884,7 +894,7 @@ function SettingsModule(props: {
   title: string;
   description: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-module', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -919,7 +929,7 @@ function LarkCliStatus(props: { settings: DashboardSettings['vcMeetingAgent'] })
 function SettingsGroup(props: {
   className?: string;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-group', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>
@@ -935,7 +945,7 @@ function SettingsBlock(props: {
   title: ReactNode;
   titleExtra?: ReactNode;
   children: ReactNode;
-}): JSX.Element {
+}): React.JSX.Element {
   const cls = ['settings-block', props.className].filter(Boolean).join(' ');
   return (
     <section className={cls}>

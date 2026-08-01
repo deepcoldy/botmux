@@ -6,7 +6,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
-import { resolveUserShell, buildBotmuxEnvAssignments, SHELL_WRAPPER_SCRIPT, shellLaunchArgv } from './tmux-backend.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellLaunchArgv } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 
 /**
@@ -323,7 +324,7 @@ export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts):
   // command; the rest are leading args before the wrapper script flags.
   const [cmd, ...launchArgs] = shellLaunchArgv(shellSpec.shell, shellSpec.flags);
   const paneArgs = [
-    ...launchArgs, '-c', SHELL_WRAPPER_SCRIPT, '_',
+    ...launchArgs, '-c', shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env)), '_',
     opts.cwd,
     ...envAssignments,
     bin, ...args,

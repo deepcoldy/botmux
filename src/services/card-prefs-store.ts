@@ -4,7 +4,11 @@
  * in-memory registry sync so the daemon's own card builders pick up the change
  * without a restart.
  *
- * Three independent toggles:
+ * Per-bot card and related session preferences:
+ *   • usageDisplay              — where to show native Context / Token usage:
+ *                                  'streaming' (default) = live streaming card
+ *                                  body, 'footer' = ordinary reply-card footer,
+ *                                  'off' = nowhere
  *   • disableStreamingCard      — suppress the live streaming session card
  *   • silentTurnReactions       — in card-off sessions, also drop the ✋→✅
  *                                  lightweight status reactions on the trigger
@@ -19,10 +23,20 @@
  *                                  (see chat-reply-mode-store). Default 'chat'.
  */
 import { rmwBotEntry } from './config-store.js';
-import { getBot, type ChatReplyMode } from '../bot-registry.js';
+import {
+  getBot,
+  normalizeUsageDisplay,
+  DEFAULT_USAGE_DISPLAY,
+  type ChatReplyMode,
+  type UsageDisplayMode,
+} from '../bot-registry.js';
 import { logger } from '../utils/logger.js';
 
 export interface BotCardPrefs {
+  /** Where to show native Context / Token usage:
+   *  'streaming' (default) = live streaming card body, 'footer' = ordinary
+   *  reply-card footer, 'off' = nowhere. */
+  usageDisplay: UsageDisplayMode;
   disableStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -53,11 +67,13 @@ export interface BotCardPrefs {
   docSubscribeDefaultMode: 'mention-only' | 'all';
 }
 
-/** Current card prefs for a bot (booleans default false, prompt defaults '' when unset). */
+/** Current card prefs for a bot (`usageDisplay` defaults to 'streaming';
+ * `botToBotSameDir` defaults true; other booleans default false). */
 export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
   try {
     const c = getBot(larkAppId).config;
     return {
+      usageDisplay: normalizeUsageDisplay(c),
       disableStreamingCard: c.disableStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -68,13 +84,14 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
-      regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat',
+      regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat-topic',
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
       docSubscribeDefaultMode: c.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only',
     };
   } catch {
     return {
+      usageDisplay: DEFAULT_USAGE_DISPLAY,
       disableStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -85,7 +102,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnNewTopic: false,
-      regularGroupReplyMode: 'chat',
+      regularGroupReplyMode: 'chat-topic',
       regularGroupMentionMode: 'always',
       docSubscribeDefaultMode: 'mention-only',
     };
@@ -123,11 +140,11 @@ export async function updateBotCardPrefs(
     if (val.trim()) entry[key] = val;
     else delete entry[key];
   };
-  // Regular-group default mode: store only the non-default modes; 'chat' (the
-  // default) drops the key so bots.json stays tidy (absent === 'chat').
+  // Regular-group default mode: store only the non-default modes; 'chat-topic'
+  // (the default) drops the key so bots.json stays tidy (absent === 'chat-topic').
   const applyMode = (entry: any, key: keyof BotCardPrefs, val: ChatReplyMode | undefined) => {
     if (val === undefined) return;
-    if (val === 'new-topic' || val === 'shared' || val === 'chat-topic') entry[key] = val;
+    if (val === 'chat' || val === 'new-topic' || val === 'shared') entry[key] = val;
     else delete entry[key];
   };
   // 4-tier @ policy: store only the non-default tiers; 'always' (default) drops
@@ -143,8 +160,16 @@ export async function updateBotCardPrefs(
     if (val === 'all') entry[key] = 'all';
     else delete entry[key];
   };
+  // 用量显示位置：只存非默认模式；'streaming'（默认）删键保持 bots.json 干净
+  // （absent === 'streaming'）。
+  const applyUsageDisplay = (entry: any, key: keyof BotCardPrefs, val: UsageDisplayMode | undefined) => {
+    if (val === undefined) return;
+    if (val === 'footer' || val === 'off') entry[key] = val;
+    else delete entry[key];
+  };
 
   const r = await rmwBotEntry<BotCardPrefs>(larkAppId, (entry) => {
+    applyUsageDisplay(entry, 'usageDisplay', patch.usageDisplay);
     apply(entry, 'disableStreamingCard', patch.disableStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -161,6 +186,7 @@ export async function updateBotCardPrefs(
     return {
       write: true,
       result: {
+        usageDisplay: normalizeUsageDisplay(entry),
         disableStreamingCard: entry.disableStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -171,9 +197,9 @@ export async function updateBotCardPrefs(
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
-        regularGroupReplyMode: (entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared' || entry.regularGroupReplyMode === 'chat-topic')
+        regularGroupReplyMode: (entry.regularGroupReplyMode === 'chat' || entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared')
           ? entry.regularGroupReplyMode
-          : 'chat',
+          : 'chat-topic',
         regularGroupMentionMode: (entry.regularGroupMentionMode === 'topic' || entry.regularGroupMentionMode === 'never' || entry.regularGroupMentionMode === 'ambient')
           ? entry.regularGroupMentionMode
           : 'always',
@@ -184,6 +210,12 @@ export async function updateBotCardPrefs(
   if (!r.ok) return { ok: false, reason: r.reason };
 
   // Sync in-memory config so live card builders / routing react without a restart.
+  if (patch.usageDisplay !== undefined) {
+    // Store only a non-default mode; 'streaming' (default) clears the key.
+    bot.config.usageDisplay = (patch.usageDisplay && patch.usageDisplay !== DEFAULT_USAGE_DISPLAY)
+      ? patch.usageDisplay
+      : undefined;
+  }
   if (patch.disableStreamingCard !== undefined) {
     bot.config.disableStreamingCard = patch.disableStreamingCard || undefined;
   }
@@ -216,7 +248,7 @@ export async function updateBotCardPrefs(
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
   if (patch.regularGroupReplyMode !== undefined) {
-    bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared' || patch.regularGroupReplyMode === 'chat-topic')
+    bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'chat' || patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared')
       ? patch.regularGroupReplyMode
       : undefined;
   }
@@ -229,7 +261,8 @@ export async function updateBotCardPrefs(
     bot.config.docSubscribeDefaultMode = patch.docSubscribeDefaultMode === 'all' ? 'all' : undefined;
   }
   logger.info(
-    `[card-prefs:${larkAppId}] disableStreamingCard=${r.result.disableStreamingCard} ` +
+    `[card-prefs:${larkAppId}] usageDisplay=${r.result.usageDisplay} ` +
+    `disableStreamingCard=${r.result.disableStreamingCard} ` +
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +

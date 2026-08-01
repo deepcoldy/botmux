@@ -390,6 +390,33 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
   });
 
+  it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('usageDisplay')!;
+    expect(spec.effect).toBe('immediate');
+    expect(spec.kind).toBe('enum');
+    expect(spec.clearable).toBe(true);
+    expect(spec.enumValues).toEqual(['streaming', 'footer', 'off']);
+
+    // coerce validates the enum (case-insensitive) and rejects nonsense.
+    expect(store.coerceConfigValue(spec, 'footer')).toEqual({ ok: true, value: 'footer' });
+    expect(store.coerceConfigValue(spec, 'nonsense')).toEqual({ ok: false, reason: 'invalid_enum' });
+
+    const toFooter = await store.applyConfigField('app_default', spec, 'footer');
+    expect(toFooter).toMatchObject({ ok: true, newText: 'footer', effect: 'immediate' });
+    expect(readConfig().usageDisplay).toBe('footer');
+    expect(registry.getBot('app_default').config.usageDisplay).toBe('footer');
+
+    const toOff = await store.applyConfigField('app_default', spec, 'off');
+    expect(toOff).toMatchObject({ ok: true, newText: 'off' });
+    expect(readConfig().usageDisplay).toBe('off');
+
+    // Clearing (unset) drops the key → back to the default 'streaming'.
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().usageDisplay).toBeUndefined();
+    expect(registry.getBot('app_default').config.usageDisplay).toBeUndefined();
+  });
+
   it('codexAppCleanInput is immediate, default-off, and deletes its key when disabled', async () => {
     const { registry, store } = await loaded({ cliId: 'codex-app' });
     const spec = store.findConfigField('codexAppCleanInput')!;

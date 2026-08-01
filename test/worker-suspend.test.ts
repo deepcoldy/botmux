@@ -3,6 +3,9 @@ import type { BackendType } from '../src/adapters/backend/types.js';
 import type { CliId } from '../src/adapters/cli/types.js';
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSessionPid: vi.fn(),
   updateSession: vi.fn(),
 }));
@@ -41,7 +44,7 @@ const CLI_IDS: CliId[] = [
   'copilot',
 ];
 
-const BACKENDS: BackendType[] = ['pty', 'tmux', 'herdr', 'zellij'];
+const BACKENDS: BackendType[] = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'];
 
 describe('worker suspend backend gating', () => {
   it.each(BACKENDS)('classifies %s correctly', (backend) => {
@@ -52,6 +55,7 @@ describe('worker suspend backend gating', () => {
     expect(isSuspendableBackendType('tmux')).toBe(true);
     expect(isSuspendableBackendType('herdr')).toBe(true);
     expect(isSuspendableBackendType('zellij')).toBe(true);
+    expect(isSuspendableBackendType('zmx')).toBe(true);
     expect(isSuspendableBackendType('pty')).toBe(false);
   });
 });

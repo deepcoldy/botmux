@@ -59,6 +59,7 @@ import {
   init,
   createSession,
   getSession,
+  getOwnedSession,
   listSessions,
   closeSession,
   updateSession,
@@ -90,6 +91,15 @@ afterEach(() => {
 // ─── init() ───────────────────────────────────────────────────────────────
 
 describe('init()', () => {
+  it('keeps cross-file discovery read-only and exposes owner-scoped lookup separately', () => {
+    init('app-A');
+    const ownedByA = createSession('chat1', 'root1', 'Bot A');
+
+    init('app-B');
+    expect(getSession(ownedByA.sessionId)?.sessionId).toBe(ownedByA.sessionId);
+    expect(getOwnedSession(ownedByA.sessionId)).toBeUndefined();
+  });
+
   it('should create the data directory on first operation if it does not exist', () => {
     const subDir = join(tempDir, 'nested', 'data');
     tempDir = subDir;

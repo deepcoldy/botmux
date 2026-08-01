@@ -13,20 +13,15 @@ import { describe, it, expect } from 'vitest';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { resolveRenderDimensions } from '../src/utils/render-dimensions.js';
 
-// xterm-headless processes writes asynchronously through an internal
-// queue. Accessing the buffer immediately after .write() can show stale
-// state; this helper writes via the callback overload + a microtask
-// flush so tests deterministically observe the post-write buffer.
-function writeAndFlush(r: TerminalRenderer, data: string): Promise<void> {
-  return new Promise(resolve => {
-    (r.xterm as any).write(data, () => resolve());
-  });
-}
-
 describe('resolveRenderDimensions (worker init helper)', () => {
   it('non-adopt sessions keep PTY_COLS/PTY_ROWS defaults (160x50)', () => {
     expect(resolveRenderDimensions({})).toEqual({ cols: 160, rows: 50 });
     expect(resolveRenderDimensions({ adoptMode: false, adoptPaneCols: 999 })).toEqual({ cols: 160, rows: 50 });
+  });
+
+  it('matches the fixed botmux-owned ZMX viewport (120x24)', () => {
+    expect(resolveRenderDimensions({ backendType: 'zmx' }))
+      .toEqual({ cols: 120, rows: 24 });
   });
 
   it('adopt sessions key off pane dimensions', () => {
@@ -57,6 +52,45 @@ describe('resolveRenderDimensions (worker init helper)', () => {
 });
 
 describe('TerminalRenderer width matches source pane', () => {
+  it('writeAndFlush resolves only after the xterm buffer contains the write', async () => {
+    const r = new TerminalRenderer(80, 24);
+    await r.writeAndFlush('FLUSHED_VIEWPORT');
+    expect(r.rawSnapshot()).toContain('FLUSHED_VIEWPORT');
+    r.dispose();
+  });
+
+  it('keeps dialog text above the 24-row ZMX viewport out of interaction snapshots', async () => {
+    const { cols, rows } = resolveRenderDimensions({ backendType: 'zmx' });
+    const r = new TerminalRenderer(cols, rows);
+    const history = [
+      'OLD TRUST DIALOG — PRESS ENTER',
+      ...Array.from({ length: 28 }, (_, i) => `history-${i}`),
+      'CURRENT ZMX PROMPT',
+    ].join('\r\n');
+
+    await r.writeAndFlush(history);
+
+    expect(r.rawSnapshot()).not.toContain('OLD TRUST DIALOG');
+    expect(r.rawSnapshot()).toContain('CURRENT ZMX PROMPT');
+    r.dispose();
+  });
+
+  it('rawSnapshot excludes stale scrollback that has moved above the current viewport', async () => {
+    const r = new TerminalRenderer(80, 3);
+    await r.writeAndFlush([
+      'STALE_STARTUP_TRUST_DIALOG',
+      'old output 1',
+      'old output 2',
+      'current output',
+      'CURRENT_PROMPT',
+    ].join('\r\n'));
+
+    const viewport = r.rawSnapshot();
+    expect(viewport).not.toContain('STALE_STARTUP_TRUST_DIALOG');
+    expect(viewport).toContain('CURRENT_PROMPT');
+    r.dispose();
+  });
+
   it('renderer cols/rows are honoured by the underlying xterm', () => {
     const r270 = new TerminalRenderer(270, 57);
     expect(r270.xterm.cols).toBe(270);
@@ -79,7 +113,7 @@ describe('TerminalRenderer width matches source pane', () => {
     const r = new TerminalRenderer(270, 5);
     const marker = 'BEYOND_OLD_CLAMP_MARKER';
     // 161 spaces, then a unique marker — its first char lands at col 161.
-    await writeAndFlush(r, ' '.repeat(161) + marker + '\r\n');
+    await r.writeAndFlush(' '.repeat(161) + marker + '\r\n');
     const snap = r.rawSnapshot();
     expect(snap).toContain(marker);
     r.dispose();
@@ -93,7 +127,7 @@ describe('TerminalRenderer width matches source pane', () => {
     // (cols 0..159) is therefore all spaces — must NOT contain the marker.
     // This is exactly the artefact that produced the duplicated /
     // stair-stepped screenshot in the live failure.
-    await writeAndFlush(r, ' '.repeat(161) + marker + '\r\n');
+    await r.writeAndFlush(' '.repeat(161) + marker + '\r\n');
     const snap = r.rawSnapshot();
     const firstRow = snap.split('\n')[0] ?? '';
     expect(firstRow).not.toContain(marker);

@@ -1,0 +1,39 @@
+/**
+ * Minimum spacing between botmux-generated Ctrl+C writes.
+ *
+ * Oh My Pi treats two Ctrl+C events within 500 ms as an exit gesture. Keep a
+ * small margin so backend recovery and adapter cleanup cannot accidentally
+ * terminate the CLI when consecutive transport failures happen quickly.
+ */
+export const TERMINAL_CANCEL_COOLDOWN_MS = 550;
+
+export type CriticalInterruptKey = 'ctrlc' | 'esc';
+
+export function isCriticalInterruptKey(key: string): key is CriticalInterruptKey {
+  return key === 'ctrlc' || key === 'esc';
+}
+
+/**
+ * Deliver an interrupt-class terminal key with one bounded retry.
+ *
+ * Duplicate C-c / Escape is safer than silently claiming a stopped CLI while
+ * an ambiguous transport keeps it running. Other navigation keys deliberately
+ * stay outside this helper and retain best-effort semantics.
+ */
+export async function sendCriticalControlKey(
+  key: CriticalInterruptKey,
+  sendOnce: () => void | boolean,
+  wait: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms)),
+): Promise<boolean> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      if (sendOnce() !== false) return true;
+    } catch {
+      // A synchronous transport failure is retryable for interrupt keys only.
+    }
+    if (attempt === 0) {
+      await wait(key === 'ctrlc' ? TERMINAL_CANCEL_COOLDOWN_MS : 100);
+    }
+  }
+  return false;
+}

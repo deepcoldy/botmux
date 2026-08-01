@@ -137,6 +137,9 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   createSession: vi.fn((_chatId: string, _rootId: string, title: string, chatType: string, scope?: 'thread' | 'chat') => ({
     sessionId: 'new-session-123',
@@ -191,13 +194,20 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildRepoSelectCard: vi.fn(() => '{"card":"json"}'),
   buildAdoptSelectCard: vi.fn(() => '{"card":"adopt-select"}'),
   buildCodexAppThreadSelectCard: vi.fn(() => '{"card":"codex-app-thread-select"}'),
+  buildAdoptBlockedCard: vi.fn((rootId: string, sessionId: string, cliId?: string) => JSON.stringify({
+    header: { title: { content: '⚠️ adopt blocked' } },
+    elements: [
+      { tag: 'markdown', content: 'waiting for repository selection' },
+      { tag: 'action', actions: [{ tag: 'button', type: 'danger', value: { action: 'close', root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' } }] },
+    ],
+  })),
   buildSessionClosedCard: vi.fn(
     (sid: string) =>
       `{"header":{"title":{"content":"🛑 会话已关闭"}},"action":"resume","cmd":"botmux resume ${sid.substring(0, 12)}"}`,
   ),
   buildSlashListCard: vi.fn((params: any) => JSON.stringify(params)),
   buildRelayPickerCard: vi.fn(
-    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string) => JSON.stringify({
+    (entries: any[], targetChatId: string, rootMessageId: string, _invokerOpenId?: string, _locale?: any, _state?: any, targetScope?: string, targetChatType?: string, visibility?: string) => JSON.stringify({
       schema: '2.0',
       body: {
         elements: entries.length === 0 ? [
@@ -206,7 +216,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
           tag: 'interactive_container',
           behaviors: [{
             type: 'callback',
-            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group' },
+            value: { action: 'relay_select', session_id: e.sessionId, target_chat_id: targetChatId, root_id: rootMessageId, target_scope: targetScope ?? 'chat', target_chat_type: targetChatType ?? 'group', visibility: visibility ?? 'public' },
           }],
           elements: [{ tag: 'markdown', content: `**${e.title}**\n${e.chatMode ?? 'group'}\n${e.chatLabel}` }],
         })),
@@ -240,6 +250,10 @@ vi.mock('../src/im/lark/client.js', () => ({
   // Default returns null so picker entries fall back to raw chatId.
   getChatName: vi.fn(async () => null),
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+  // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
+  // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
+  // scenarios override with mockRejectedValueOnce to exercise the fallback.
+  sendEphemeralCard: vi.fn(async () => 'eph_picker_msg_id'),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
@@ -270,6 +284,7 @@ vi.mock('../src/utils/logger.js', () => ({
 
 vi.mock('../src/core/worker-pool.js', () => ({
   killWorker: vi.fn(),
+  teardownAuthoritativePersistentBackingBeforeClose: vi.fn(),
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
@@ -279,6 +294,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     void observer.notify('in_progress');
     return { attemptId: 'attempt-test', joined: false };
   }),
+  isSessionTransferring: vi.fn(() => false),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)
@@ -454,7 +470,7 @@ vi.mock('../src/services/card-mode-store.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, startAdoptSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { writeRoleFile, deleteRoleFile, writeTeamRoleFile, deleteTeamRoleFile, resolveRole, resolveRoleFile } from '../src/core/role-resolver.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
@@ -468,7 +484,9 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { killWorker, suspendWorker, forkWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { closeSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart } from '../src/core/worker-pool.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots } from '../src/core/session-manager.js';
@@ -955,7 +973,7 @@ describe('/vc preparation command', () => {
 
 describe('PASSTHROUGH_COMMANDS set', () => {
   it('should contain expected slash commands forwarded to CLI', () => {
-    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw']) {
+    for (const cmd of ['/compact', '/model', '/clear', '/plugin', '/usage', '/context', '/cost', '/mcp', '/diff', '/btw', '/effort']) {
       expect(PASSTHROUGH_COMMANDS.has(cmd), `Expected PASSTHROUGH_COMMANDS to contain ${cmd}`).toBe(true);
     }
   });
@@ -977,6 +995,32 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(PASSTHROUGH_COMMANDS.has('/goal')).toBe(false);
     expect(resolvePassthroughCommands('app-1').has('/goal')).toBe(true);
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
+  });
+
+  it('exposes /effort globally to every CLI (best-effort passthrough)', () => {
+    // /effort 放在全局 PASSTHROUGH_COMMANDS,而非某个 adapter 的 defaultPassthroughCommands
+    // ——所有 CLI 都尽力透传(Claude 家族 / Codex 原生支持;其它 CLI 认不得顶多回
+    // unknown-command,不崩溃)。未来新 CLI 零改动自动继承。
+    expect(PASSTHROUGH_COMMANDS.has('/effort')).toBe(true);
+    expect(resolvePassthroughCommands('app-1').has('/effort')).toBe(true); // claude-code
+    expect(resolvePassthroughCommands('app-2').has('/effort')).toBe(true); // codex
+    // 无 bot 上下文时也回落到全局集合,仍含 /effort。
+    expect(resolvePassthroughCommands(undefined).has('/effort')).toBe(true);
+  });
+
+  it('keeps /effort OUT of the adapter default layer so it never gains cold-start', () => {
+    // 核心语义护栏:冷启动能力(空 topic 里发命令能否拉起新会话)只认 adapter 层的
+    // defaultPassthroughCommands(见 daemon.ts 的 isInitialSessionPassthrough →
+    // resolveAdapterDefaultPassthroughCommands),不认全局 PASSTHROUGH_COMMANDS。
+    // /effort 是「调档」而非「开一段工作」的命令,必须留在全局层、绝不进 adapter 层,
+    // 否则空话题单发 /effort 会凭空 spawn 一个没活干的会话。这条断言锁住该语义:
+    // 即使有人日后误把 /effort 加回某个 adapter 的 default,resolvePassthroughCommands
+    // 层的可见性测试仍会全绿(全局也有),唯有这里能抓住回归。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).not.toContain('/effort'); // claude-code
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).not.toContain('/effort'); // codex
+    // /goal 相反:它是「开启目标工作」的命令,刻意留在 adapter 层保留冷启动语义。
+    expect(resolveAdapterDefaultPassthroughCommands('app-1')).toContain('/goal');
+    expect(resolveAdapterDefaultPassthroughCommands('app-2')).toContain('/goal');
   });
 
   it('does not expose Codex interactive /title through the Lark channel', () => {
@@ -1076,6 +1120,14 @@ describe('parseForceTopicInvocation', () => {
 describe('handleCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(closeSession).mockImplementation(async (sessionId: string) => {
+      // Model the authoritative close lifecycle's dashboard contract. The
+      // command must delegate this side effect instead of publishing a second
+      // patch itself.
+      publishClosedSessionPatch(sessionId);
+      return { ok: true, alreadyClosed: false, known: true };
+    });
+    vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementation(() => undefined);
     vi.mocked(getBot).mockImplementation(defaultGetBot as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
     vi.mocked(resolveUserToken).mockResolvedValue(null);
@@ -1391,15 +1443,40 @@ describe('handleCommand', () => {
   // ─── /close ─────────────────────────────────────────────────────────────
 
   describe('/close', () => {
-    it('should kill worker and remove session when session exists', async () => {
+    it('closes through the authoritative worker-pool lifecycle and removes the session', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
+      const events: DashboardEvent[] = [];
+      const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
 
-      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      try {
+        await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      } finally {
+        unsubscribe();
+      }
 
-      expect(killWorker).toHaveBeenCalledWith(ds);
-      expect(sessionStore.closeSession).toHaveBeenCalledWith('sess-001');
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      // The command must not bypass closeSession's verified ZMX teardown by
+      // mutating worker/store state directly.
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
       expect(deps.activeSessions.has(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(false);
+      expect(events).toContainEqual({
+        type: 'session.update',
+        body: {
+          sessionId: 'sess-001',
+          patch: expect.objectContaining({
+            status: 'closed',
+            previewUserText: null,
+            previewBotText: null,
+            previewUserFullText: null,
+            previewBotFullText: null,
+            previewUserAt: null,
+            previewBotAt: null,
+            previewBotState: null,
+          }),
+        },
+      });
       // The「会话已关闭」card is delivered「仅自己可见」-first: it routes through
       // deliverEphemeralOrReply targeting the user who ran /close (message.senderId),
       // so plain groups get an ephemeral (visible-to-you) card and topic groups
@@ -1425,6 +1502,52 @@ describe('handleCommand', () => {
       const cardJson = replyArgs[1] as string;
       expect(cardJson).toContain('botmux resume');
       expect(cardJson).toContain('"action":"resume"');
+    });
+
+    it('keeps the active session and reports a visible failure when teardown is refused', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      vi.mocked(closeSession).mockRejectedValueOnce(new Error('ZMX ownership probe unavailable'));
+
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+
+      expect(closeSession).toHaveBeenCalledWith('sess-001');
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(ds);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(deliverEphemeralOrReply).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('会话关闭失败'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('ZMX ownership probe unavailable');
+    });
+
+    it('does not delete a replacement session that wins the anchor while close awaits cleanup', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      let releaseClose!: (value: { ok: true; alreadyClosed: boolean; known: boolean }) => void;
+      vi.mocked(closeSession).mockImplementationOnce(() => new Promise(resolve => {
+        releaseClose = resolve;
+      }));
+
+      const closing = handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith('sess-001'));
+
+      const replacement = makeDaemonSession();
+      replacement.session = {
+        ...replacement.session,
+        sessionId: 'sess-replacement',
+        title: 'replacement',
+      };
+      deps.activeSessions.set(sessionKey(ROOT_ID, LARK_APP_ID), replacement);
+      releaseClose({ ok: true, alreadyClosed: false, known: true });
+      await closing;
+
+      expect(deps.activeSessions.get(sessionKey(ROOT_ID, LARK_APP_ID))).toBe(replacement);
     });
 
     it('keeps ttadk non-interactive flags in the closed-card resume command', async () => {
@@ -1832,18 +1955,20 @@ describe('handleCommand', () => {
       expect(sessionStore.updateSession).not.toHaveBeenCalled();
     });
 
-    it('updates the session title without restarting the worker', async () => {
+    it('updates and flattens title metadata without restarting the worker', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);
 
-      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进  '), deps, LARK_APP_ID);
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename  ZMX 后端集成推进\n阶段二  '), deps, LARK_APP_ID);
 
-      expect(ds.session.title).toBe('ZMX 后端集成推进');
+      expect(ds.session.title).toBe('ZMX 后端集成推进 阶段二');
+      expect(ds.session.titleSource).toBe('user');
+      expect(ds.session.titleUpdatedAt).toEqual(expect.any(String));
       expect(killWorker).not.toHaveBeenCalled();
       expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent).toContain('会话标题已更新');
-      expect(replyContent).toContain('ZMX 后端集成推进');
+      expect(replyContent).toContain('ZMX 后端集成推进 阶段二');
       expect(replyContent).toContain('Agent 当前未运行');
     });
 
@@ -1948,6 +2073,31 @@ describe('handleCommand', () => {
       expect(ds.session.sessionId).toBe('new-session-123');
       expect(ds.hasHistory).toBe(false);
       expect(forkWorker).toHaveBeenCalledWith(ds, '', false);
+    });
+
+    it('keeps the old ZMX session active when repo-switch teardown is refused', async () => {
+      const oldSession = makeSession({ backendType: 'zmx', workingDir: '/home/testuser/project-a' });
+      const ds = makeDaemonSession({ pendingRepo: false, session: oldSession, repoCardMessageId: 'om_repo_card' });
+      const deps = makeDeps(ds);
+      deps.lastRepoScan.set(CHAT_ID, [
+        { name: 'project-b', path: '/home/testuser/project-b', branch: 'dev' },
+      ]);
+      vi.mocked(teardownAuthoritativePersistentBackingBeforeClose).mockImplementationOnce(() => {
+        throw new Error('zmx generation changed');
+      });
+
+      await handleCommand('/repo', ROOT_ID, makeLarkMessage('/repo 1'), deps, LARK_APP_ID);
+
+      expect(teardownAuthoritativePersistentBackingBeforeClose).toHaveBeenCalledWith(ds);
+      expect(killWorker).not.toHaveBeenCalled();
+      expect(sessionStore.closeSession).not.toHaveBeenCalled();
+      expect(sessionStore.createSession).not.toHaveBeenCalled();
+      expect(forkWorker).not.toHaveBeenCalled();
+      expect(ds.session).toBe(oldSession);
+      expect(ds.session.status).toBe('active');
+      expect(ds.session.workingDir).toBe('/home/testuser/project-a');
+      expect(ds.repoCardMessageId).toBe('om_repo_card');
+      expect(vi.mocked(deps.sessionReply).mock.calls.map(c => c[1]).join()).toContain('zmx generation changed');
     });
 
     it('mid-session chat switch preserves scope and the original message root', async () => {
@@ -3030,6 +3180,45 @@ describe('handleCommand', () => {
   // ─── /adopt ─────────────────────────────────────────────────────────────
 
   describe('/adopt', () => {
+    it('refuses adopt while the session is still on the pendingRepo gate and posts a close-session card', async () => {
+      const ds = makeDaemonSession({
+        pendingRepo: true,
+        pendingPrompt: 'buffered while picking repo',
+        pendingFollowUps: ['second buffered line'],
+        repoCardMessageId: 'om_repo_card',
+      });
+      const deps = makeDeps(ds);
+      const target = {
+        source: 'tmux' as const,
+        tmuxTarget: '0:1.0',
+        cliPid: 4242,
+        sessionId: 'host-cli',
+        cliId: 'claude-code' as const,
+        cwd: '/repo',
+        paneCols: 80,
+        paneRows: 24,
+      };
+
+      await startAdoptSession(target, ds, deps, LARK_APP_ID);
+
+      // Refused: no takeover, no state mutation — the pending gate is untouched
+      // so the session can still finish via /repo (or the card's close button).
+      expect(forkAdoptWorker).not.toHaveBeenCalled();
+      expect(ds.adoptedFrom).toBeUndefined();
+      expect(ds.pendingRepo).toBe(true);
+      expect(ds.pendingPrompt).toBe('buffered while picking repo');
+      expect(ds.pendingFollowUps).toEqual(['second buffered line']);
+
+      // Posted an interactive card carrying a close-session button bound to this session.
+      const replyArgs = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
+      expect(replyArgs[2]).toBe('interactive');
+      const card = JSON.parse(replyArgs[1] as string);
+      const buttons = card.elements.flatMap((el: any) => el.actions ?? []);
+      const closeBtn = buttons.find((b: any) => b.value?.action === 'close');
+      expect(closeBtn).toBeDefined();
+      expect(closeBtn.value.session_id).toBe(ds.session.sessionId);
+    });
+
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
       const ds = makeDaemonSession({
         adoptedFrom: {
@@ -3808,8 +3997,14 @@ describe('handleCommand', () => {
 
     it('renders the picker in a thread-mode DM with a thread-scope target seeded on the /relay message', async () => {
       // p2p detection is via ds.chatType (authoritative, no Lark API hit).
-      // Default DM mode is thread: the /relay message seeds a fresh DM 话题,
-      // so the baked target is thread-scope anchored at the message id.
+      // Thread mode is now the explicit DM opt-out (default is 'chat'): the
+      // /relay message seeds a fresh DM 话题, so the baked target is thread-scope
+      // anchored at the message id.
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).p2pMode = 'thread';
+        return bot;
+      }) as any);
       const { getChatNameAndMode } = await import('../src/im/lark/client.js');
       const ds = makeDaemonSession({
         session: makeSession({ ownerOpenId: 'ou_sender', chatType: 'p2p' }),
@@ -3908,6 +4103,138 @@ describe('handleCommand', () => {
       expect(containerValue?.target_scope).toBe('thread');
       // 话题群 top-level → anchor = the /relay message id (makeLarkMessage → 'msg_001').
       expect(containerValue?.root_id).toBe('msg_001');
+    });
+
+    // ── privateCard picker gate (PR #654 + 首审/复审修复) ────────────────────
+    // The picker exposes session title + source-chat name. When privateCard is
+    // on, a FLAT 普通群 (chat-scope) sends it as an ephemeral card (visible to the
+    // invoker only). But ephemeral has no thread anchor, so thread-scope targets
+    // must NOT use it (see the gate comment in command-handler + the REGRESSION
+    // in ephemeral-or-reply.test.ts). 申晗 (2026-07-29): 话题内公开可接受.
+
+    // Helper: bot with privateCard on.
+    const withPrivateCard = () => {
+      vi.mocked(getBot).mockImplementation(((id: string = 'app-1') => {
+        const bot = defaultGetBot(id);
+        (bot.config as any).privateCard = true;
+        return bot;
+      }) as any);
+    };
+
+    it('privateCard + flat 普通群 (chat-scope): sends the picker as an ephemeral card, NOT a visible reply', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral send to the invoker in the current chat — never a visible reply.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [appId, chatId, openId, cardJson] = vi.mocked(sendEphemeralCard).mock.calls[0];
+      expect(appId).toBe(LARK_APP_ID);
+      expect(chatId).toBe(CHAT_ID);
+      expect(openId).toBe('ou_sender');
+      expect(vi.mocked(replyMessage)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+      // The ephemeral card carries visibility='private' baked into its buttons.
+      const card = JSON.parse(cardJson as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('private');
+    });
+
+    it('REGRESSION: privateCard + thread-scope (话题群) does NOT go ephemeral — stays a visible in-thread reply (public card)', async () => {
+      // Ephemeral has no thread anchor: a 话题群 rejects with 18053 and a 话题
+      // inside a 普通群 would leak the card to the group top level. So thread-
+      // scope pickers must skip ephemeral entirely (guarded, not fallback).
+      withPrivateCard();
+      const { sendEphemeralCard, getChatNameAndMode } = await import('../src/im/lark/client.js');
+      vi.mocked(getChatNameAndMode).mockResolvedValueOnce({ name: 'Topic Room', mode: 'topic' });
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender' }) });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Ephemeral must NOT be attempted for a thread-scope target.
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      // Card goes out as a visible in-thread reply, and is PUBLIC (not private).
+      const [, anchorMsgId, replyContent, msgType, inThread] = vi.mocked(replyMessage).mock.calls[0];
+      expect(anchorMsgId).toBe('msg_001');
+      expect(inThread).toBe(true);
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.target_scope).toBe('thread');
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard + chat-scope: falls back to a visible reply when the ephemeral send fails (e.g. 18053)', async () => {
+      withPrivateCard();
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('chat can not be thread (code: 18053)'));
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'secret task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      // Attempted ephemeral, then fell back to the visible reply with a PUBLIC card.
+      expect(vi.mocked(sendEphemeralCard)).toHaveBeenCalledTimes(1);
+      const [, , replyContent, msgType] = vi.mocked(replyMessage).mock.calls[0];
+      expect(msgType).toBe('interactive');
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
+    });
+
+    it('privateCard OFF + flat 普通群: picker stays a visible reply (no ephemeral)', async () => {
+      // Default bot has no privateCard — the gate must not fire.
+      const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+      const ds = makeDaemonSession({ session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }), scope: 'chat' });
+      const otherDs: DaemonSession = {
+        ...makeDaemonSession(),
+        session: makeSession({
+          sessionId: 'sess-other', chatId: 'oc_other', rootMessageId: 'om_other_root',
+          title: 'other task', ownerOpenId: 'ou_sender',
+        }),
+        chatId: 'oc_other',
+      };
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey('om_other_root', LARK_APP_ID), otherDs);
+
+      await handleCommand('/relay', ROOT_ID, makeLarkMessage('/relay'), deps, LARK_APP_ID);
+
+      expect(vi.mocked(sendEphemeralCard)).not.toHaveBeenCalled();
+      const [, , replyContent] = vi.mocked(replyMessage).mock.calls[0];
+      const card = JSON.parse(replyContent as string);
+      const containerValue = card.body.elements.find((e: any) => e.tag === 'interactive_container')?.behaviors?.[0]?.value;
+      expect(containerValue?.visibility).toBe('public');
     });
 
     it('picker refuses upfront when this chat already has an active session for the bot', async () => {
@@ -4708,6 +5035,14 @@ describe('/term — operable terminal slash command (operator / canOperate)', ()
     await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('终端还没就绪');
+  });
+
+  it('backend without Web Terminal → unsupported notice', async () => {
+    vi.mocked(deliverWritableTerminalCardTo).mockResolvedValue('unsupported');
+    const deps = makeDeps(makeDaemonSession({ backendType: 'zmx' }));
+    await handleCommand('/term', ROOT_ID, ownerMsg(), deps, LARK_APP_ID);
+    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+    expect(reply).toContain('不提供 Web 终端');
   });
 
   it('delivery failure → failure notice', async () => {

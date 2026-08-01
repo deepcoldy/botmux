@@ -22,6 +22,33 @@ describe('worker pipe initial screen ordering', () => {
     );
   });
 
+  it('fences bridge markers before worker-side close teardown can race fallback reads', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const readMarkersStart = source.indexOf('function readSendMarkers');
+    const readMarkersEnd = source.indexOf('function submitActivityEvidenceSince', readMarkersStart);
+    const readMarkers = source.slice(readMarkersStart, readMarkersEnd);
+    expect(readMarkers).toContain('if (closeRequested) return []');
+    const sendStart = source.indexOf('function send(msg: WorkerToDaemon)');
+    const sendEnd = source.indexOf('function acknowledgeTurnInputCommitted', sendStart);
+    const sendBody = source.slice(sendStart, sendEnd);
+    expect(sendBody).toContain("if (closeRequested && msg.type === 'final_output')");
+
+    const closeCase = source.slice(
+      source.indexOf("case 'close':"),
+      source.indexOf("case 'suspend':", source.indexOf("case 'close':")),
+    );
+    const setCloseIdx = closeCase.indexOf('closeRequested = true;');
+    const ackIdx = closeCase.indexOf("send({ type: 'session_close_ready', sessionId });");
+    const stopBridgeIdx = closeCase.indexOf('stopBridgeWatcher();');
+    const teardownIdx = closeCase.indexOf('backend?.destroySession?.();');
+    const clearIdx = closeCase.indexOf('clearSendMarkers();');
+    expect(setCloseIdx).toBeGreaterThan(-1);
+    expect(ackIdx).toBeGreaterThan(setCloseIdx);
+    expect(stopBridgeIdx).toBeGreaterThan(ackIdx);
+    expect(teardownIdx).toBeGreaterThan(stopBridgeIdx);
+    expect(clearIdx).toBeGreaterThan(teardownIdx);
+  });
+
   it('captures pipe initial screen after idle detector is registered', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     // The inline `const initial = backend.captureCurrentScreen()` was refactored
@@ -36,8 +63,13 @@ describe('worker pipe initial screen ordering', () => {
 
   it('runs a busy-pattern idle probe after each submitted input', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-    const writeIdx = source.indexOf('result = await cliAdapter.writeStructuredInput(');
-    const probeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
+    const flushStart = source.indexOf('async function flushPending(): Promise<void>');
+    const flushEnd = source.indexOf('function sendToPty(', flushStart);
+    const flush = source.slice(flushStart, flushEnd);
+    // Attribution and ZMX's recovery journal now wrap the adapter call. Anchor
+    // the literal write inside flushPending, then preserve the probe ordering.
+    const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
+    const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);
@@ -100,7 +132,7 @@ describe('worker pipe initial screen ordering', () => {
       sessionReadyCase,
     );
     const resetEvidenceIdx = source.indexOf('idleDetector?.resetReadyEvidence();', waitDecisionIdx);
-    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty();');
+    const ptyReadyIdx = source.indexOf('markPromptReadyFromPty(observedBackend);');
     const screenEvidenceGuardIdx = source.indexOf("if (evidenceSource === 'screen')");
     const signalReleaseIdx = source.indexOf(
       "releaseReadyGate('SessionStart hook', { promptReadyAfterSettle: !waitForPostHookPrompt });",
@@ -174,10 +206,13 @@ describe('worker pipe initial screen ordering', () => {
   });
 
   it('forces the first prompt for non-type-ahead adapters at the hard timeout', () => {
-    // THE HERMES FIX (hard-timeout path): previously the hard cap only logged
-    // "forcing queued message flush" and flushed for type-ahead adapters only;
-    // non-type-ahead adapters (Hermes) never delivered. The release must now
-    // route non-type-ahead adapters to markPromptReady() (which then flushes).
+    // Hard-timeout path (originally "THE HERMES FIX"): previously the hard cap
+    // only logged "forcing queued message flush" and flushed for type-ahead
+    // adapters only; non-type-ahead adapters never delivered. The release must
+    // now route non-type-ahead adapters to markPromptReady() (which then
+    // flushes). (Hermes drove this originally; it no longer arms the gate — see
+    // hermes.ts — but the mechanism still guards any non-type-ahead ready-gated
+    // adapter.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const fallbackStart = source.indexOf('const releaseFirstPromptTimeout =');
     const decideIdx = source.indexOf("decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true)", fallbackStart);
@@ -192,15 +227,36 @@ describe('worker pipe initial screen ordering', () => {
     expect(markReadyIdx).toBeGreaterThan(flushIdx);
   });
 
+  it('keys overlapping authoritative screen settles by the idle-edge revision', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const settleStart = source.indexOf('function settleBackendScreenBeforeIdle');
+    const settleEnd = source.indexOf('/** Submission writes', settleStart);
+    const settle = source.slice(settleStart, settleEnd);
+    // Anchor on the async onIdle handler without pinning its parameter list —
+    // upstream has already renamed/extended it once (`(evidenceSource)`), and a
+    // stale anchor silently slices an empty string instead of failing loudly.
+    const idleStart = source.search(/idleDetector\.onIdle\(async \(/);
+    expect(idleStart).toBeGreaterThan(-1);
+    const idleEnd = source.indexOf('observedBackend.onData((data) =>', idleStart);
+    expect(idleEnd).toBeGreaterThan(idleStart);
+    const idle = source.slice(idleStart, idleEnd);
+
+    expect(settle).toContain('existing.revision >= requestedRevision');
+    expect(settle).toContain('if (existing) await existing.promise;');
+    expect(settle).toContain('revision: requestedRevision');
+    expect(idle).toContain('settleBackendScreenBeforeIdle(idleBackend, revisionBeforeSettle)');
+  });
+
   it('honors a true ready signal that arrives AFTER the timeout fallback (slow cold start)', () => {
     // ReadyGate.receive() is one-shot: once the 45s fallback fires, a later
-    // releaseReadyGate from the real signal is skipped entirely. A CLI whose
-    // cold start exceeds READY_SIGNAL_TIMEOUT_MS (Hermes: 2-3 min) would then
-    // never take the authoritative markPromptReady path. The session_ready case
-    // must detect the late arrival (gate armed + already received) and mark
-    // prompt-ready directly for authoritative non-Claude signals. Claude waits
-    // for post-hook prompt evidence instead. Both paths are limited to the
-    // first-prompt phase, so clear/compact SessionStart stays a no-op.
+    // releaseReadyGate from the real signal is skipped entirely. A ready-gated
+    // CLI whose cold start exceeds READY_SIGNAL_TIMEOUT_MS would then never take
+    // the authoritative markPromptReady path. The session_ready case must detect
+    // the late arrival (gate armed + already received) and mark prompt-ready
+    // directly for authoritative non-Claude signals. Claude waits for post-hook
+    // prompt evidence instead. Both paths are limited to the first-prompt phase,
+    // so clear/compact SessionStart stays a no-op. (Hermes drove this originally
+    // via its 2-3 min cold start; it no longer arms the gate — see hermes.ts.)
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const sessionReadyCase = source.indexOf("case 'session_ready'");
     const lateCheckIdx = source.indexOf('readyGate.isArmed && readyGate.isReceived', sessionReadyCase);
@@ -231,6 +287,25 @@ describe('worker pipe initial screen ordering', () => {
     expect(helper).toContain('const tailLineCount = Math.max(12, Math.ceil(lines.length / 3));');
     expect(probe).toContain('cliAdapter.busyPattern.test(busyProbeRegion(content))');
     expect(probe).not.toContain('cliAdapter.busyPattern.test(content)');
+  });
+
+  it('settles an authoritative screen before a busy-pattern probe marks the prompt ready', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    const probeStart = source.indexOf('function probeBusyPatternIdle');
+    const probeEnd = source.indexOf('function scheduleReattachIdleProbe', probeStart);
+    const probe = source.slice(probeStart, probeEnd);
+
+    const revisionIdx = probe.indexOf('const revisionBeforeSettle = backendScreenRevision;');
+    const settleIdx = probe.indexOf('settleBackendScreenBeforeIdle(be, revisionBeforeSettle)');
+    const backendFenceIdx = probe.indexOf('backend !== be', settleIdx);
+    const revisionFenceIdx = probe.indexOf('backendScreenRevision !== revisionBeforeSettle', settleIdx);
+    const markIdx = probe.indexOf('markPromptReady();', settleIdx);
+
+    expect(revisionIdx).toBeGreaterThan(-1);
+    expect(settleIdx).toBeGreaterThan(revisionIdx);
+    expect(backendFenceIdx).toBeGreaterThan(settleIdx);
+    expect(revisionFenceIdx).toBeGreaterThan(backendFenceIdx);
+    expect(markIdx).toBeGreaterThan(revisionFenceIdx);
   });
 
   it('limits the reattach idle probe to adapters with a busy marker', () => {

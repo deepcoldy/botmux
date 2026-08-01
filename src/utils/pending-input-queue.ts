@@ -12,6 +12,48 @@ export interface PendingCliInput {
   codexAppInput?: CodexAppTurnInput;
 }
 
+/**
+ * Run a synchronous CLI/backend reset without losing inputs that have not yet
+ * been dequeued for a PTY write. The reset path intentionally clears the live
+ * queue; restoring the snapshot afterwards keeps those messages distinct from
+ * InflightInputTracker carry-over, which spawnCli prepends ahead of them.
+ */
+export function resetPreservingPendingCliInputs(
+  pending: PendingCliInput[],
+  reset: () => void,
+): void {
+  const queued = pending.splice(0);
+  try {
+    reset();
+  } finally {
+    pending.unshift(...queued);
+  }
+}
+
+/**
+ * A natural managed-CLI exit transfers every durable receipt owned by that
+ * worker generation back to the daemon/hub replay loop. Remove those definitely
+ * unwritten queued copies before the same Node worker auto-restarts, otherwise
+ * attempt N can survive locally while the hub dispatches N+1. An intentional
+ * in-worker restart emits no generation-exit reconciliation, so it preserves
+ * the complete queue instead.
+ */
+export function handoffQueuedDurableInputsOnBackendExit(
+  pending: PendingCliInput[],
+  opts: { intentionalRestart: boolean },
+): PendingCliInput[] {
+  if (opts.intentionalRestart) return [];
+
+  const handedOff: PendingCliInput[] = [];
+  for (let index = pending.length - 1; index >= 0; index -= 1) {
+    const item = pending[index]!;
+    if (item.dispatchAttempt === undefined) continue;
+    pending.splice(index, 1);
+    handedOff.unshift(item);
+  }
+  return handedOff;
+}
+
 export function mergeQueuedCliInput(
   pending: PendingCliInput[],
   next: PendingCliInput,

@@ -8,6 +8,7 @@ import { BOTMUX_INJECTED_ENV_KEYS, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS } fro
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -316,9 +317,14 @@ export class TmuxBackend implements SessionBackend {
       // can't see the child-vs-exec distinction), so don't send messages
       // through the bot while in this mode — type into the web terminal directly.
       const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+      // Host-resolve the wrapper bin dir from opts.env (BOTMUX_CORE_ONLY /
+      // SESSION_DATA_DIR are scrubbed inside the pane before the script runs, so it
+      // MUST be baked in host-side — codex P1). opts.env is the authoritative
+      // per-session env the daemon assembled, not the scrubbed pane env.
+      const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
       const script = debugKeepShell
-        ? buildDebugKeepShellScript(shellSpec.shell)
-        : SHELL_WRAPPER_SCRIPT;
+        ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir)
+        : shellWrapperScript(wrapperBinDir);
       if (debugKeepShell) {
         logger.info(
           `[tmux:${this.sessionName}] BOTMUX_DEBUG_KEEP_SHELL=1 — CLI exit will drop ` +
@@ -700,8 +706,17 @@ export function buildBotmuxEnvAssignments(
  *
  * POSIX-syntax (works in bash/zsh/sh); fish/csh/nu users get remapped to
  * bash/zsh/sh by resolveUserShell() so they hit the same SCRIPT path.
+ *
+ * The wrapper bin dir is baked in as a HOST-RESOLVED LITERAL (codex P1): the pane
+ * cannot resolve it at runtime because tmuxEnv + PANE_ENV_UNSET_CLAUSE scrub
+ * BOTMUX_CORE_ONLY / SESSION_DATA_DIR BEFORE this script runs (and the argv env
+ * assignments only land at the final `exec /usr/bin/env`, too late). So the daemon
+ * computes it from opts.env via resolveBotmuxWrapperBinDir and single-quotes it in.
  */
-export const SHELL_WRAPPER_SCRIPT = `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH="$HOME/.botmux/bin:$PATH" && exec /usr/bin/env "$@"`;
+export function shellWrapperScript(binDir: string): string {
+  const q = `'${binDir.replace(/'/g, `'\\''`)}'`;
+  return `cd -- "$1" && shift && ${PANE_ENV_UNSET_CLAUSE} && ${NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE} && export PATH=${q}:"$PATH" && exec /usr/bin/env "$@"`;
+}
 
 export const DIAGNOSTIC_SHELL_SCRIPT = [
   'cd -- "$1" 2>/dev/null || cd "$HOME" 2>/dev/null || cd /',
@@ -724,19 +739,21 @@ export const DIAGNOSTIC_SHELL_SCRIPT = [
  *
  * `shellPath` is single-quoted into the script with `'` escaped, so it's
  * safe for paths containing spaces or quotes. Caller has already verified
- * it via accessSync().
+ * it via accessSync(). `binDir` is the HOST-RESOLVED wrapper bin dir (same
+ * literal-baking rationale as shellWrapperScript — pane can't resolve it).
  */
-export function buildDebugKeepShellScript(shellPath: string): string {
+export function buildDebugKeepShellScript(shellPath: string, binDir: string): string {
   const safeShell = shellPath.replace(/'/g, `'\\''`);
+  const qBin = `'${binDir.replace(/'/g, `'\\''`)}'`;
   return [
     'cd -- "$1" && shift',
-    // Same managed-env cleanup as SHELL_WRAPPER_SCRIPT — so neither the CLI nor
+    // Same managed-env cleanup as shellWrapperScript — so neither the CLI nor
     // the interactive debug shell sees stale server/rcfile-owned values.
     PANE_ENV_UNSET_CLAUSE,
     // The pre-rcfile launch override must not reach the CLI or debug shell.
     NON_INTERACTIVE_SHELL_ENV_UNSET_CLAUSE,
-    // Same PATH prepend as SHELL_WRAPPER_SCRIPT (wrapper build wins over stale npm-global).
-    'export PATH="$HOME/.botmux/bin:$PATH"',
+    // Same PATH prepend as shellWrapperScript (wrapper build wins over stale npm-global).
+    `export PATH=${qBin}:"$PATH"`,
     '/usr/bin/env "$@"',
     `printf '\\n[botmux debug] CLI exited (status %d) — interactive shell active. Type exit to close the session.\\n' "$?" >&2`,
     `exec '${safeShell}' -i`,

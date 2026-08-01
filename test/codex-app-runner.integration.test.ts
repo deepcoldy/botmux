@@ -42,6 +42,7 @@ function startRunner(
   logPath: string,
   version: string,
   behavior: string,
+  extraArgs: string[] = [],
 ): Harness {
   let stdout = '';
   let stderr = '';
@@ -55,6 +56,7 @@ function startRunner(
     fakeCodex,
     '--cwd',
     cwd,
+    ...extraArgs,
   ], {
     cwd: resolve('.'),
     env: {
@@ -372,6 +374,147 @@ describe('codex-app-runner app-server protocol integration', () => {
       expect(harness.stdout.match(/\x1b\]777;botmux:final:/g)).toHaveLength(1);
     } finally {
       await stopChild(harness.child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards --model + --reasoning-effort into thread/start (top-level model + config.model_reasoning_effort, xhigh verbatim)', async () => {
+    // Runs the REAL codex-app-runner against the fake app-server and asserts the
+    // actual thread/start params — the hop the adapter-flag test cannot cover.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-effort-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', [
+      '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh',
+    ]);
+    try {
+      await waitForOutput(harness, output => output.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, output => FINAL_MARKER.test(output));
+      const threadStart = readRequests(logPath).find(r => r.method === 'thread/start');
+      expect(threadStart).toBeTruthy();
+      expect(threadStart.params.model).toBe('gpt-5.6-terra');            // top-level model
+      expect(threadStart.params.config?.model_reasoning_effort).toBe('xhigh'); // NOT downgraded
+    } finally {
+      await stopChild(harness.child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('SUPPRESSES model/effort on thread/resume even when --model/--reasoning-effort are passed (no resume drift)', async () => {
+    // PR #639 P2 regression lock, runner side: a resume (--thread-id present)
+    // routes to thread/resume, and even though the adapter still forwards
+    // --model/--reasoning-effort on argv, the resume request must carry NEITHER
+    // top-level model NOR config.model_reasoning_effort — else the app-server's
+    // model-resume-override short-circuit drops the persisted triple to the
+    // current default. Fresh thread/start (the test above) still stamps both.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-resume-suppress-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', [
+      '--thread-id', 'thread-existing-1', '--model', 'gpt-5.6-terra', '--reasoning-effort', 'xhigh',
+    ]);
+    try {
+      await waitForOutput(harness, output => output.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, output => FINAL_MARKER.test(output));
+      const requests = readRequests(logPath);
+      const resume = requests.find(r => r.method === 'thread/resume');
+      const start = requests.find(r => r.method === 'thread/start');
+      expect(resume).toBeTruthy();          // routed to resume, not start
+      expect(start).toBeFalsy();            // a warm resume must not fresh-start
+      expect(resume.params.model).toBeUndefined();                          // no top-level model
+      expect(resume.params.config?.model_reasoning_effort).toBeUndefined(); // no effort
+    } finally {
+      await stopChild(harness.child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('folds thread/tokenUsage/updated into the final marker usage (four buckets)', async () => {
+    // Real runner + fake app-server emitting a token-usage notification; assert
+    // the emitted final marker carries the per-turn four-bucket usage.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-usage-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-int', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      // input=100 total incl cache; cached=40 → fresh input 60, output 30, cacheRead 40.
+      expect(final.usage).toEqual({ inputTokens: 60, outputTokens: 30, cacheReadTokens: 40, cacheCreateTokens: 0 });
+    } finally {
+      await stopChild(child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when a malformed tokenUsage notification poisons the turn (sticky)', async () => {
+    // malformed-then-valid same turn: the runner must NOT report only the later
+    // completion. Final marker usage is omitted.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-poison-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-poison', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE_POISON: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      expect(final.usage).toBeUndefined();
+    } finally {
+      await stopChild(child);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('omits usage when asymmetric cacheWrite poisons the turn, even after a later valid packet (codex P1)', async () => {
+    // First packet: total carries cacheWriteInputTokens but last omits it. A
+    // 0-default on the missing side would misattribute cache-create into fresh
+    // input; the runner must poison. A subsequent symmetric packet must not
+    // resurrect a plausible-looking wrong split → final marker usage OMITTED.
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-asym-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    let stdout = '';
+    const child = spawn(process.execPath, [
+      '--import', 'tsx', RUNNER_PATH, '--session-id', 'usage-asym', '--codex-bin', fakeCodex, '--cwd', dir,
+    ], { cwd: resolve('.'), env: { ...process.env, FAKE_CODEX_LOG: logPath, FAKE_CODEX_VERSION: '0.144.6', FAKE_CODEX_BEHAVIOR: 'success', FAKE_TOKEN_USAGE_ASYM: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    liveChildren.add(child);
+    child.stdout.on('data', c => { stdout += c.toString('utf8'); });
+    const harness: Harness = { child, get stdout() { return stdout; }, get stderr() { return ''; } };
+    try {
+      await waitForOutput(harness, o => o.includes('Codex App connected.'));
+      child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('hi', { text: 'hi' })}\r`);
+      await waitForOutput(harness, o => FINAL_MARKER.test(o));
+      const final = decodeFinalMarker(harness.stdout);
+      expect(final.usage).toBeUndefined();
+    } finally {
+      await stopChild(child);
       rmSync(dir, { recursive: true, force: true });
     }
   });

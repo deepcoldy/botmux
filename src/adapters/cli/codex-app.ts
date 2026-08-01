@@ -43,7 +43,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommand(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale }) {
+    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort }) {
       const args = [
         runnerPath(),
         '--session-id', sessionId,
@@ -54,6 +54,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
       pushOpt(args, '--locale', locale);
+      // Per-turn overrides (async trigger API). The runner injects them into the
+      // app-server thread/start (model + config.model_reasoning_effort).
+      pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
+      pushOpt(args, '--reasoning-effort', reasoningEffort);
       return args;
     },
 

@@ -4,7 +4,7 @@ import { createHmac, randomBytes } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -330,6 +330,69 @@ describe('PUT /api/bot-card-prefs — Codex App clean history', () => {
   });
 });
 
+describe('PUT /api/bot-card-prefs — reply-card usage display mode', () => {
+  it('defaults to streaming and persists explicit footer/off changes immediately', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-usage-display-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-usage-display-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.usageDisplay).toBe('streaming');
+
+      const footer = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'footer' }),
+      });
+      expect(footer.status).toBe(200);
+      expect(await footer.json()).toMatchObject({ ok: true, usageDisplay: 'footer' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('footer');
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'footer' });
+
+      // Back to the default 'streaming' → key dropped, GET reflects the default.
+      const streaming = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'streaming' }),
+      });
+      expect(streaming.status).toBe(200);
+      expect(await streaming.json()).toMatchObject({ ok: true, usageDisplay: 'streaming' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBeUndefined();
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ usageDisplay: 'streaming' });
+
+      // 'off' persists verbatim.
+      const off = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ usageDisplay: 'off' }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, usageDisplay: 'off' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].usageDisplay).toBe('off');
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('POST /api/grants/chat', () => {
   it('requires loopback HMAC before invoking the permission service', async () => {
     const handler = vi.fn();
@@ -628,6 +691,52 @@ describe('GET /api/sessions', () => {
     const body = await res.json();
     expect(Array.isArray(body.sessions)).toBe(true);
   });
+
+  it('shows an unregistered quarantined active row as dormant in list and detail', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-quarantined-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const registry = new Map<string, any>();
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init('cli_quarantined');
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_quarantined', 'om_quarantined', '待确认清理', 'group');
+      session.larkAppId = 'cli_quarantined';
+      session.scope = 'thread';
+      session.cliId = 'codex' as any;
+      session.backendType = 'zmx';
+      session.restoreQuarantinedAt = '2026-07-31T00:00:00.000Z';
+      sessionStore.updateSession(session);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const listRes = await fetch(`${base}/api/sessions`);
+      expect(listRes.status).toBe(200);
+      const listed = (await listRes.json()).sessions.find((row: any) => row.sessionId === session.sessionId);
+      expect(listed).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+        backendType: 'zmx',
+        webPort: null,
+      });
+      expect(listed).not.toHaveProperty('closedAt');
+
+      const detailRes = await fetch(`${base}/api/sessions/${session.sessionId}`);
+      expect(detailRes.status).toBe(200);
+      expect((await detailRes.json()).session).toMatchObject({
+        sessionId: session.sessionId,
+        status: 'dormant',
+        quarantined: true,
+      });
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      sessionStore.init();
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('GET /api/sessions/:sessionId', () => {
@@ -635,6 +744,74 @@ describe('GET /api/sessions/:sessionId', () => {
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/nonexistent-id`);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('GET /api/sessions/:sessionId/usage', () => {
+  it('returns the daemon-cached native usage snapshot for an active Session', async () => {
+    const ds = { session: { sessionId: 's-usage' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const usageSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-usage/usage`);
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: {
+          context: { usedTokens: 12_345, windowTokens: 100_000, percentUsed: 12 },
+          tokens: { in: 67_890, out: 123 },
+        },
+      });
+      expect(usageSpy).toHaveBeenCalledWith(ds);
+    } finally {
+      findSpy.mockRestore();
+      usageSpy.mockRestore();
+    }
+  });
+
+  it('returns the card-specific empty snapshot when footer usage is disabled', async () => {
+    const ds = { session: { sessionId: 's-usage-hidden' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const rawSpy = vi.spyOn(workerPool, 'getDaemonSessionUsageSnapshot').mockReturnValue({
+      context: { usedTokens: 12_345 },
+      tokens: { in: 67_890, out: 123 },
+    });
+    const cardSpy = vi.spyOn(workerPool, 'getDaemonReplyCardUsageSnapshot').mockReturnValue({
+      context: null,
+      tokens: null,
+    });
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(
+        `http://127.0.0.1:${handle.port}/api/sessions/s-usage-hidden/usage`,
+      );
+
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({
+        usage: { context: null, tokens: null },
+      });
+      expect(cardSpy).toHaveBeenCalledWith(ds);
+      expect(rawSpy).not.toHaveBeenCalled();
+    } finally {
+      findSpy.mockRestore();
+      rawSpy.mockRestore();
+      cardSpy.mockRestore();
+    }
+  });
+
+  it('returns 404 when the Session is not active', async () => {
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(undefined);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/missing/usage`);
+      expect(res.status).toBe(404);
+    } finally {
+      findSpy.mockRestore();
+    }
   });
 });
 
@@ -671,22 +848,45 @@ describe('POST /api/sessions/:sessionId/rename', () => {
       } as any;
       findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
 
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
-      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/rename`, {
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const renamePath = `/api/sessions/${session.sessionId}/rename`;
+      const res = await fetch(`http://127.0.0.1:${handle.port}${renamePath}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', renamePath, handle.port),
+        },
         body: JSON.stringify({ title: '  New\tTitle\u001b  ' }),
       });
 
       expect(res.status).toBe(200);
-      expect(await res.json()).toEqual({ ok: true, title: 'New Title', agentSync: 'requested' });
-      expect(sessionStore.getSession(session.sessionId)?.title).toBe('New Title');
-      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitle).toBe('New Title');
-      expect(sessionStore.getSession(session.sessionId)?.nativeSessionTitleUserDefined).toBe(true);
+      const renameResult = await res.json();
+      expect(renameResult).toEqual({
+        ok: true,
+        title: 'New Title',
+        titleUpdatedAt: expect.any(String),
+        titleSource: 'dashboard',
+        agentSync: 'requested',
+      });
+      expect(sessionStore.getSession(session.sessionId)).toMatchObject({
+        title: 'New Title',
+        titleUpdatedAt: renameResult.titleUpdatedAt,
+        titleSource: 'dashboard',
+        nativeSessionTitle: 'New Title',
+        nativeSessionTitleUserDefined: true,
+      });
       expect(send).toHaveBeenCalledWith({ type: 'rename_session', title: 'New Title' });
       expect(events).toContainEqual({
         type: 'session.update',
-        body: { sessionId: session.sessionId, patch: { title: 'New Title' } },
+        body: {
+          sessionId: session.sessionId,
+          patch: {
+            title: 'New Title',
+            titleUpdatedAt: renameResult.titleUpdatedAt,
+            titleSource: 'dashboard',
+          },
+        },
       });
     } finally {
       findSpy?.mockRestore();
@@ -1184,6 +1384,23 @@ describe('GET /api/sessions/:sessionId/write-link', () => {
     spy.mockRestore();
   });
 
+  it('reports Web Terminal as unsupported for the zmx backend', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-zmx', backendType: 'zmx', webPort: 4321 },
+      workerPort: 4321,
+      workerToken: 'stale-secret',
+      riffAccessUrl: 'https://stale-riff.example',
+    } as any);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-zmx/write-link`, {
+      headers: tokenAuthHeaders(),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('terminal_unsupported');
+    spy.mockRestore();
+  });
+
   it('returns 200 with a token-bearing url for a live session', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     const spy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
@@ -1505,16 +1722,18 @@ describe('PUT /api/bot-substitute-mode', () => {
           targets: [{ userId: 'u_alice', name: 'Alice' }],
           disclosure: 'prefix',
           replyMode: 'quote',
+          excludedChats: ['oc_x', ' oc_y ', '', 'oc_x'],
         }),
       });
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
-        substituteMode: { replyMode: 'quote' },
+        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'] },
       });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
         replyMode: 'quote',
+        excludedChats: ['oc_x', 'oc_y'],
       });
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
@@ -2546,5 +2765,63 @@ describe('role profile IPC routes', () => {
       config.session.dataDir = prevConfigDataDir;
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('core-only public routes + readiness barrier (behavioral)', () => {
+  afterEach(async () => {
+    __testOnly_resetCoreOnlyReadiness();
+    if (handle) { await handle.close(); handle = null; }
+  });
+
+  it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady(); // past the readiness barrier for this case
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Allowlisted (no auth header) → must NOT be 401 (reaches handler: 400 bad-shape / 200 / 404).
+    const trig = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(trig.status).not.toBe(401);
+    const tr = await fetch(`${base}/api/sessions/nope/trigger-result`);
+    expect(tr.status).not.toBe(401);
+    const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
+    expect(ins.status).not.toBe(401);
+    // NOT allowlisted (no auth header) → 401.
+    expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
+    expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
+    // /api/asks/answer is deliberately excluded from the allowlist → 401.
+    expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  it('readiness barrier: control routes AND /healthz return 503 until ready, without a healthz pre-check', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    armCoreOnlyReadinessGate(); // armed, NOT ready
+    const base = `http://127.0.0.1:${handle.port}`;
+    // Directly hit a control route WITHOUT probing /healthz first — must be 503.
+    const early = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(early.status).toBe(503);
+    expect((await early.json()).status).toBe('starting');
+    // /healthz also reports starting.
+    const h = await fetch(`${base}/healthz`);
+    expect(h.status).toBe(503);
+    expect((await h.json()).status).toBe('starting');
+    // After release: healthz 200 and the control route reaches its handler (not 503).
+    setCoreOnlyReady();
+    expect((await fetch(`${base}/healthz`)).status).toBe(200);
+    const afterReady = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    expect(afterReady.status).not.toBe(503);
+  });
+
+  it('does NOT gate a normal (non-core-only) server: /healthz is unconditional 200', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' }); // no coreOnlyPublicRoutes
+    // Even if some other test armed the gate, a server without coreOnlyPublicRoutes
+    // never 503s its control routes (they require HMAC anyway); /healthz stays 200
+    // because the gate is only consulted for the core-only public surface.
+    const res = await fetch(`http://127.0.0.1:${handle.port}/healthz`);
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
   });
 });

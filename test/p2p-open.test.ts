@@ -78,8 +78,11 @@ describe('p2pOpen', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     const block = source.slice(start, end);
+    // 只钉住 chatType 确实被传进这道复查（漏了它，p2pOpen 放行的私聊会在这里被丢掉）。
+    // 不锁它是不是最后一个实参——后面又追加了 botSender（bot 发送方走 evaluateBotTalk），
+    // 把「参数列表到此为止」写进断言只会让每次加参数都误报。
     expect(block).toMatch(
-      /consumeMessageQuotaOnce:\s*\(\)\s*=>\s*enforceMessageQuotaForCliInput\([\s\S]*memberUnionId,\s*chatType,\s*\)/,
+      /consumeMessageQuotaOnce:\s*\(\)\s*=>\s*enforceMessageQuotaForCliInput\([\s\S]*memberUnionId,\s*chatType,/,
     );
   });
 });

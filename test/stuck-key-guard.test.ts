@@ -9,8 +9,8 @@
  *   5. lifetime changed DURING capture (live getter re-read) → expired
  *   6. page type no longer matches after capture → expired
  *   7. write success → only delivered, keys written
- *   8. write returns false → only expired
- *   9. write throws → only expired
+ *   8. write returns false → only failed
+ *   9. write throws → only failed
  *  10. happy path → delivered
  *  11. expired carries correct nonce/turnId/dispatchAttempt
  *
@@ -39,6 +39,7 @@ function makeDeps(state: MutableState, overrides?: Partial<StuckKeyGuardDeps>): 
     writeKeys: vi.fn(async () => true),
     sendExpired: vi.fn(),
     sendDelivered: vi.fn(),
+    sendFailed: vi.fn(),
     log: vi.fn(),
     ...overrides,
   };
@@ -182,24 +183,26 @@ describe('processStuckWarningTuiKeys (worker fail-closed guard)', () => {
     expect(deps.writeKeys).toHaveBeenCalledWith(['Escape'], true);
   });
 
-  it('write returns false → expired, keys not written', async () => {
+  it('write returns false → failed, keys not written', async () => {
     const state = { backend: {}, lifetime: 1 };
     const deps = makeDeps(state, { writeKeys: vi.fn(async () => false) });
     const msg = makeMsg();
     const result = await processStuckWarningTuiKeys(msg, deps);
-    expect(result).toEqual({ sent: 'expired', wroteKeys: false });
-    expect(deps.sendExpired).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ sent: 'failed', wroteKeys: false });
+    expect(deps.sendFailed).toHaveBeenCalledTimes(1);
+    expect(deps.sendExpired).not.toHaveBeenCalled();
     expect(deps.sendDelivered).not.toHaveBeenCalled();
     expect(deps.writeKeys).toHaveBeenCalledTimes(1);
   });
 
-  it('write throws → expired, keys not written', async () => {
+  it('write throws → failed, keys not written', async () => {
     const state = { backend: {}, lifetime: 1 };
     const deps = makeDeps(state, { writeKeys: vi.fn(async () => { throw new Error('write failed'); }) });
     const msg = makeMsg();
     const result = await processStuckWarningTuiKeys(msg, deps);
-    expect(result).toEqual({ sent: 'expired', wroteKeys: false });
-    expect(deps.sendExpired).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({ sent: 'failed', wroteKeys: false });
+    expect(deps.sendFailed).toHaveBeenCalledTimes(1);
+    expect(deps.sendExpired).not.toHaveBeenCalled();
     expect(deps.sendDelivered).not.toHaveBeenCalled();
     expect(deps.writeKeys).toHaveBeenCalledTimes(1);
   });

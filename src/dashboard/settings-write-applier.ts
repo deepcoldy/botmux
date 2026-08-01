@@ -68,6 +68,7 @@ export interface ResolvedDashboardSettingsView {
     workerOnline?: boolean;
     lastError?: { at: string; message: string; retryAt: string } | null;
   };
+  noVisibleOutputHint: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -199,6 +200,7 @@ export type ApplySettingsWriteError =
   | 'codexNotifier_platform_unsupported'
   | 'codexNotifier_hook_install_failed'
   | 'codexNotifier_mixed_patch_unsupported'
+  | 'invalid_noVisibleOutputHint'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -359,6 +361,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_codexRpcInput' };
     }
     patch.codexRpcInput = obj.codexRpcInput;
+  }
+  if ('noVisibleOutputHint' in obj) {
+    if (typeof obj.noVisibleOutputHint !== 'boolean') {
+      return { ok: false, error: 'invalid_noVisibleOutputHint' };
+    }
+    patch.noVisibleOutputHint = obj.noVisibleOutputHint;
   }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;

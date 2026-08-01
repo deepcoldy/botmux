@@ -30,6 +30,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
 }));
@@ -57,6 +60,12 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return true;
   },
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
+  setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => {
+    if (map.has(key) && map.get(key) !== ds) return false;
+    map.set(key, ds);
+    return true;
+  },
+  closeSession: vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true })),
 }));
 
 const mockRememberLastCliInput = vi.fn();
@@ -166,6 +175,33 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
   });
 
+  it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    // xhigh preserved verbatim (no downgrade — codex 0.145 accepts it)
+    expect(ds?.session.model).toBe('gpt-5.6-terra');
+    expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
+    // Harness default bot is claude-code. The gate must keep the override from
+    // silently changing a non-codex bot's model.
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-4-8', reasoningEffort: 'high' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.session.model).toBeUndefined();
+    expect(ds?.session.reasoningEffort).toBeUndefined();
+  });
+
   it('uses a connector-owned custom topic seed when opening a new topic', async () => {
     const req = request({ rootMessageId: undefined });
     req.presentation = { topicMessage: 'CI 构建失败，请检查发布流水线' };
@@ -223,6 +259,28 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockCreateSession).not.toHaveBeenCalled();
     expect(mockForkWorker).not.toHaveBeenCalled();
     expect(send).toHaveBeenCalledWith({ type: 'message', content: expect.stringContaining('follow:') });
+  });
+
+  it('fold-in to a live session does NOT overwrite its frozen model/effort', async () => {
+    // A per-turn override only applies to a freshly-created session. Folding into
+    // an existing worker must never rewrite the session's frozen model/effort
+    // (the existing-worker branch returns before the stamp; this locks that in).
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex-app', workingDir: '/tmp' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { killed: false, send } as any });
+    ds.session.model = 'frozen-model';
+    ds.session.reasoningEffort = 'low';
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), ds]]);
+    const req = request();
+    (req.options as any) = { model: 'new-model', reasoningEffort: 'xhigh' };
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(mockCreateSession).not.toHaveBeenCalled(); // folded in, not new
+    expect(ds.session.model).toBe('frozen-model');
+    expect(ds.session.reasoningEffort).toBe('low');
   });
 
   it('uses an internal stable turn id without changing the public trigger schema', async () => {

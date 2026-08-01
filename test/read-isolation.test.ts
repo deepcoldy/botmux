@@ -207,7 +207,7 @@ describe('worker capability carve-out ordering', () => {
       'publishSandboxRelayCapability({ failClosed: true })',
       macPathAt,
     );
-    const policyAt = source.indexOf('const policy = buildFsPolicy({', macPublishAt);
+    const policyAt = source.indexOf('const fsPolicyCtx = {', macPublishAt);
     expect(macPathAt).toBeGreaterThanOrEqual(0);
     expect(macPublishAt).toBeGreaterThan(macPathAt);
     expect(policyAt).toBeGreaterThan(macPublishAt);
@@ -227,7 +227,7 @@ describe('worker capability carve-out ordering', () => {
       'mandatoryReadOnlyPaths.push(canonical(sessionMcpGatewayHost.socketDir))',
       regexAt,
     );
-    const profileAt = source.indexOf('const policy = buildFsPolicy({', allowAt);
+    const profileAt = source.indexOf('const fsPolicyCtx = {', allowAt);
     expect(regexAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeGreaterThanOrEqual(0);
     expect(denyAt).toBeLessThanOrEqual(regexAt);

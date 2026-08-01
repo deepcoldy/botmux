@@ -17,6 +17,12 @@ export interface FederatedBot {
   larkAppId: string;
   botName: string;
   cliId: string;
+  /** Whether this bot has real Feishu transport. A core-only (apiOnly) bot is
+   *  `false` — it has no Feishu identity, so it can be neither a group creator
+   *  nor an invited member cross-deployment. Explicitly true/false on new
+   *  versions; ABSENT means a pre-capability spoke → treated as legacy normal
+   *  (true) for backward compatibility. */
+  larkTransportEnabled?: boolean;
   /** Tenant-stable bot id (used by P2 拉群 to add the bot cross-app). */
   botUnionId?: string;
   capability?: string | null;

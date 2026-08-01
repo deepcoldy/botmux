@@ -10,6 +10,7 @@
  */
 
 import { config } from '../../config.js';
+import { formatUrlHost } from '../../core/dashboard-url.js';
 
 export const V3_LOOP_GRANT_ACTION = 'v3_loop_grant';
 
@@ -51,7 +52,7 @@ export function v3LoopGrantCardNonce(runId: string, loopId: string, iteration: n
 }
 
 function v3RunDetailUrl(runId: string): string {
-  return `http://${config.dashboard.externalHost}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
+  return `http://${formatUrlHost(config.dashboard.externalHost)}:${config.dashboard.port}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 export function buildV3LoopGrantCard(input: V3LoopGrantCardInput): string {

@@ -641,6 +641,29 @@ describe('RiffBackend', () => {
   });
 
   describe('prompt single @-rule (finding K/2)', () => {
+    it('escapes tag-like tokens in the built-in system prose without rewriting the heredoc', async () => {
+      const be = makeBackend({ injectStatusLines: false });
+      be.spawn('', [], {} as any);
+      be.write('hi');
+      await flush();
+      resolvers.shift()!(taskResponse('task-1'));
+      await flush();
+      const exec = calls.find(c => c.url.includes('/api/task-execute'))!;
+      const prompt = String(JSON.parse(String(exec.init?.body)).config.userPrompt);
+      const system = prompt.slice(
+        prompt.indexOf('<system>'),
+        prompt.indexOf('</system>') + '</system>'.length,
+      );
+      const systemProse = system.replace(/<\/?system>/g, '');
+
+      expect(system).toContain('&lt;message_id&gt;');
+      expect(system).toContain('&lt;open_id&gt;');
+      expect(system).toContain('&lt;sender&gt;');
+      expect(system).toContain("botmux send <<'EOF'");
+      expect(system).not.toContain("botmux send &lt;&lt;'EOF'");
+      expect(systemProse.match(/<[^<>\r\n]+>/g) ?? []).toEqual([]);
+    });
+
     it('payload prompt forbids mention-back and keeps mandatory routing under a custom systemPrompt', async () => {
       const be = makeBackend({ injectStatusLines: false, systemPrompt: '你是 QA 专家，回答尽量简短。' });
       be.spawn('', [], {} as any);

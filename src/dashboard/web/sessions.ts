@@ -7,6 +7,7 @@ import {
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
 import { sessionTerminalHref } from './session-terminal.js';
+import { copyText } from './clipboard.js';
 
 export function tokenCount(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -15,6 +16,40 @@ export function tokenCount(value: unknown): number | null {
 export function formatTokenCount(value: unknown): string {
   const n = tokenCount(value);
   return n === null ? '-' : n.toLocaleString('en-US');
+}
+
+export interface SessionExchangePreview {
+  userText: string;
+  userFullText: string;
+  botText: string;
+  botFullText: string;
+}
+
+function compactPreviewText(value: unknown, limit: number): string {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Latest user/bot exchange for a session card. A bot preview is shown only
+ * when it is newer than the latest user input; otherwise the card communicates
+ * the still-waiting state with the user line alone. */
+export function sessionExchangePreview(row: Record<string, any>): SessionExchangePreview {
+  const userFullText = compactPreviewText(
+    row.previewUserFullText
+      ?? row.previewUserText
+      ?? '',
+    4_000,
+  );
+  const botFullText = row.previewBotState === 'replied'
+    ? compactPreviewText(row.previewBotFullText ?? row.previewBotText ?? '', 4_000)
+    : '';
+  return {
+    userText: compactPreviewText(userFullText, 120),
+    userFullText,
+    botText: compactPreviewText(botFullText, 220),
+    botFullText,
+  };
 }
 
 // CLI 过滤选项从 setup 的单一事实源 CLI_OPTIONS 派生，新增 CLI 自动跟随，
@@ -302,17 +337,12 @@ export async function copySpawnCommand(s: any, btn?: HTMLButtonElement): Promise
       if (r.status !== 401) alert(`${t('sessions.copyCommandFail')}: ${body?.error ?? r.status}`);
       return;
     }
-    try {
-      await navigator.clipboard.writeText(body.command);
+    if (await copyText(body.command, t('sessions.copyCommand'))) {
       if (btn) {
         const prev = btn.textContent;
         btn.textContent = t('sessions.copyCommandDone');
         setTimeout(() => { if (prev !== null) btn.textContent = prev; }, 1500);
       }
-    } catch {
-      // Clipboard API unavailable (non-secure context) — fall back to a prompt
-      // so the user can still select + copy the command manually.
-      window.prompt(t('sessions.copyCommand'), body.command);
     }
   } catch (e) {
     alert(`${t('sessions.copyCommandFail')}: ${e}`);
