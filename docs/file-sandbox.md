@@ -13,6 +13,10 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+> ⚠️ **前置条件：这台机器要先做过「lark-cli 按 bot 拆配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。
+> 白名单 deny 掉了共享的 `~/.lark-cli`，只放行本 bot 的 `~/.lark-cli-bots/<自己appId>`；没配过的机器上，沙盒内所有 `lark-cli` 命令会以 `not configured` / `operation not permitted` 失败。
+> lark-cli 的密钥并**不**在 per-bot 目录里（那里只有 `config.json`），而在各平台共享的 keystore；两平台都是「整目录 deny + 只放行本 bot 自己的 master key 与 `appsecret_<自己>.enc`」，落点和文件名不同，见那篇的「平台差异」一节。
+
 ## Codex 的 per-bot 登录态
 
 `codexAuthSync` 控制 Codex 使用全局登录态还是该 bot 的独立登录态：
