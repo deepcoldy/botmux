@@ -527,7 +527,17 @@ export async function sendUserMessage(
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
   const c = getBotClient(larkAppId);
-  const body = msgType === 'text' ? JSON.stringify({ text: content }) : content;
+  // Stamp callback-button ownership markers on interactive DMs too: this is the
+  // FIFTH card egress surface (config / write-link / substitute / overload / …
+  // cards all DM their callback buttons through here). Without it a peer bot
+  // reading such a DM via history flattens the buttons into its prompt, and —
+  // worse — a future botmux DM button with a new action would leak past the
+  // parser's legacy wordlist. Shared `body` feeds BOTH branches below (plain
+  // create + deadline request), so one stamp covers both. Same total-function
+  // contract as send/reply/ephemeral/update: any JSON anomaly returns unchanged.
+  const body = msgType === 'text'
+    ? JSON.stringify({ text: content })
+    : msgType === 'interactive' ? stampBotmuxCallbackMarkers(content) : content;
   const data = {
     receive_id: openId,
     msg_type: msgType as any,
