@@ -795,6 +795,18 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
   });
 
+  it('withholds the role-library grant entirely (no Feishu sender identity → no role system)', () => {
+    // The role library is NOT one of the authority roots (those are Feishu-cred
+    // dirs), and roleLibAccess reads ctx.mandatoryDenyPaths — so dropAuthority/
+    // authorityRoots can't suppress it. It must be an EXPLICIT larkTransport gate.
+    const p = noTransport({ roleLibrarySubtree: '/Users/u/botmux-roles/cli_self' });
+    expect(p.rules.some(r => r.path === '/Users/u/botmux-roles/cli_self')).toBe(false);
+    // A transport-enabled bot with the SAME subtree DOES get the grant (proves it's
+    // the gate, not some unrelated suppression).
+    const on = buildFsPolicy(ctx({ larkTransportEnabled: true, roleLibrarySubtree: '/Users/u/botmux-roles/cli_self' }));
+    expect(on.rules.find(r => r.path === '/Users/u/botmux-roles/cli_self')?.access).toBe('readWrite');
+  });
+
   it('a NORMAL (transport-enabled) bot gets its own lark-cli, authPaths, and keystore', () => {
     const p = buildFsPolicy(ctx({ larkTransportEnabled: true, redirectedCliData: false, authPaths: ['/Users/u/.codex'] }));
     expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config').access).toBe('readWrite');

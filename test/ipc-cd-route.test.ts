@@ -320,8 +320,8 @@ describe('POST /api/sessions/:sessionId/cd', () => {
     expect(killSpy).not.toHaveBeenCalled();
   });
   // ── per-bot 收窄（ds.larkAppId → validateRoleLibraryPath 的 ownAppId）──
-  // 上面所有用例的 ds 都不带 larkAppId，走的是「不收窄」旧语义（存量人类 slug
-  // 布局的回落路径）；这两例覆盖 appId 命名下的收窄行为。
+  // 上面所有用例的 ds 都不带 larkAppId，走的是「不收窄」旧语义（内部/测试调用方）；
+  // 下面覆盖 appId 命名下的收窄行为，以及非 appId 布局的 fail-closed。
   it('403s a switch into ANOTHER bot\u2019s role subtree once the per-bot dir is named by appId', async () => {
     const rolesRoot = join(fakeHome, 'botmux-roles');
     const ownRole = join(rolesRoot, 'cli_self', 'shared', 'default');
@@ -343,6 +343,41 @@ describe('POST /api/sessions/:sessionId/cd', () => {
 
     expect(res.status).toBe(403);
     expect(await res.json()).toMatchObject({ ok: false, error: 'outside_own_role_library' });
+    expect(send).not.toHaveBeenCalled();
+    expect(repinSpy).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it('409s FAIL-CLOSED when the per-bot dir is NOT named by appId (legacy human-slug layout) \u2014 no fallback, zero side effects', async () => {
+    // \u5b58\u91cf\u90e8\u7f72\u8fd9\u4e00\u5c42\u7528\u4eba\u7c7b slug\uff08<root>/<\u672c bot appId> \u4e0d\u5b58\u5728\uff09\u3002\u66fe\u7ecf\u56de\u843d\u5168\u5c40\u6839 =
+    // fail-open\uff08\u53ef\u7ee7\u7eed\u8de8 bot \u5207 + \u7ecf workingDir \u62ff rw\uff09\uff1b\u73b0\u5728\u5fc5\u987b fail-closed\uff0c
+    // \u4e14 repin/kill/inject \u4e00\u4e2a\u90fd\u4e0d\u80fd\u53d1\u751f\uff08\u5426\u5219\u4f1a\u8bdd\u4ecd\u88ab\u9489\u8fdb\u76ee\u6807\u76ee\u5f55\uff09\u3002
+    // \u7528\u4e00\u4e2a\u524d\u9762\u7528\u4f8b\u6ca1\u5efa\u8fc7 appId \u76ee\u5f55\u7684 bot\uff08cli_legacy\uff09\uff0c\u786e\u4fdd <root>/cli_legacy \u4e0d\u5b58\u5728\u3002
+    const rolesRoot = join(fakeHome, 'botmux-roles');
+    const humanSelf = join(rolesRoot, 'human-legacy', 'shared', 'default');
+    const otherRole = join(rolesRoot, 'cli_other', 'shared', 'default'); // \u53e6\u4e00\u4e2a bot\uff08\u672c bot \u60f3\u5207\u8fdb\u53bb\uff09
+    mkdirSync(humanSelf, { recursive: true });
+    mkdirSync(otherRole, { recursive: true });
+    const send = vi.fn();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-legacy-noop', cliId: 'claude-code' },
+      managedTurnOrigin: { capability: CAP },
+      worker: { send, killed: false },
+      adoptedFrom: undefined,
+      larkAppId: 'cli_legacy',   // <root>/cli_legacy \u4e0d\u662f\u771f\u76ee\u5f55 \u2192 own_role_library_missing
+    } as any);
+    const repinSpy = vi.spyOn(sessionCwd, 'repinSessionWorkingDir').mockImplementation(() => {});
+    const killSpy = vi.spyOn(workerPool, 'killWorker').mockImplementation(() => {});
+
+    // \u8fde\u5207\u81ea\u5df1 human-slug \u76ee\u5f55\u90fd\u88ab\u62d2\uff08\u8fc1\u79fb\u524d\u529f\u80fd\u4e0d\u53ef\u7528\u662f fail-closed \u7684\u5df2\u77e5\u4ee3\u4ef7\uff09\u3002
+    const resOwn = await postCd('s-legacy-noop', humanSelf);
+    expect(resOwn.status).toBe(409);
+    expect(await resOwn.json()).toMatchObject({ ok: false, error: 'own_role_library_missing' });
+    // \u66f4\u91cd\u8981\uff1a\u4e0d\u80fd\u9760\u56de\u843d\u5168\u5c40\u6839\u5207\u8fdb\u522b\u7684 bot \u7684\u76ee\u5f55\u3002
+    const resCross = await postCd('s-legacy-noop', otherRole);
+    expect(resCross.status).toBe(409);
+    expect(await resCross.json()).toMatchObject({ ok: false, error: 'own_role_library_missing' });
+
     expect(send).not.toHaveBeenCalled();
     expect(repinSpy).not.toHaveBeenCalled();
     expect(killSpy).not.toHaveBeenCalled();

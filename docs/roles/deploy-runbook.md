@@ -63,8 +63,11 @@ echo '{"name": "默认助理"}' > ~/botmux-roles/<appId>/shared/default/.botmux-
 v0 硬编码约定、不接受配置），每个 bot 在其下各占一个以自己 `larkAppId` 命名的子目录。
 `botmux role switch` 的越界校验（`validateRoleLibraryPath()`）**按 `<根>/<appId>` 收窄到该
 bot 自己的子树**：切到别的 bot 的角色目录会被拒（`outside_own_role_library`，403）。
-存量部署若这一层不是 appId 命名，校验回落到「只按全局根判断」的旧行为（跨 bot 可切）并在
-daemon 日志打一行 deprecation —— 迁移见第 8 节。
+存量部署若这一层不是 appId 命名，`botmux role switch` **fail-closed 直接拒绝**
+（`own_role_library_missing`，409）并在 daemon 日志打一行迁移指引 —— 不回落全局根
+（回落是 fail-open：会让存量部署继续能跨 bot 切并经 workingDir 拿 rw）。沙盒下角色系统
+本就整体 EPERM 不可用，fail-closed 不额外损失可用功能；非沙盒部署迁移一次（见第 8 节）
+即恢复。
 
 > 注意：飞书 IM 里人工敲的 `/cd` 走的是通用工作目录校验（`validateWorkingDir`，允许任意
 > 已存在目录、可自动创建），**不经**角色库校验 —— 它的信任契约是「运营自己输入的目录」。
@@ -175,11 +178,13 @@ pnpm switch:here && botmux restart
 
 ## 8. 迁移：每-bot 目录名改为 appId
 
-存量部署（这一层曾用人类可读名）按下面改；**不改也不会崩**，但沙盒下角色系统不可用、
-且 `botmux role switch` 仍能切进别的 bot 的角色目录：
+存量部署（这一层曾用人类可读名）按下面改。**迁移前**：daemon 不会崩，但该 bot 的
+**角色系统不可用**——沙盒下整体 EPERM，且 `botmux role switch` 会 **fail-closed 拒绝**
+（不会误切进别的 bot 的角色目录，这正是 fail-closed 相对旧「回落全局根」的安全改进）：
 
 - 沙盒会话启动时 worker 日志会打 `[sandbox] role library dir mismatch: … is not a real directory`；
-- `/cd` 路由会打 `[role] 角色库每-bot 目录名不是 appId（…）——已回落到全局根校验`。
+- `botmux role switch` 会返回 `own_role_library_missing`（409），daemon 日志打
+  `[role] 角色库每-bot 目录名不是 appId（期望 ~/botmux-roles/<appId>）——role switch 已 fail-closed 拒绝`。
 
 ```bash
 APP=cli_xxxxxxxx            # 目标 bot 的 larkAppId

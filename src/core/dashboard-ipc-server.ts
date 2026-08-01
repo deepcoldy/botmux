@@ -987,12 +987,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   const v = validateRoleLibraryPath(body?.dir ?? '', undefined, ds.larkAppId);
   if (!v.ok) {
     const forbidden = v.error === 'outside_role_library' || v.error === 'outside_own_role_library';
+    // own_role_library_missing：本 bot 的 `<角色库根>/<appId>` 不是真目录（存量用
+    // 人类 slug 命名这一层，未按 deploy-runbook §8 迁移）。FAIL-CLOSED——不回落全局
+    // 根（回落是 fail-open，会让存量部署继续能跨 bot 切并经 workingDir 拿 rw）。回
+    // 409 + 迁移指引，让运营看得见查得到，而不是静默放行或静默拒绝。
+    if (v.error === 'own_role_library_missing') {
+      logger.warn(`[role] 角色库每-bot 目录名不是 appId（期望 ~/botmux-roles/${ds.larkAppId}）——`
+        + 'role switch 已 fail-closed 拒绝，避免跨 bot 越权。按 docs/roles/deploy-runbook.md '
+        + '§8「迁移：每-bot 目录名改为 appId」重命名该目录即恢复。');
+      return jsonRes(res, 409, { ok: false, error: v.error });
+    }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });
-  }
-  if (v.legacyRootFallback) {
-    // 存量人类 slug 布局：无法按 appId 收窄，退回全局根校验（= 旧行为，跨 bot 可切）。
-    logger.warn(`[role] 角色库每-bot 目录名不是 appId（${ds.larkAppId}）——已回落到全局根校验，跨 bot 切换未被拦住；`
-      + '按 docs/roles/deploy-runbook.md「迁移：每-bot 目录名改为 appId」重命名后即自动收窄。');
   }
   repinSessionWorkingDir(ds, v.resolvedPath);
   // ds.initConfig 与 repin 同步，且**无条件**（不只在 live-worker 分支里）：下次

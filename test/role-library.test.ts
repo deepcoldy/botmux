@@ -195,17 +195,26 @@ describe('validateRoleLibraryPath + ownAppId（收窄到本 bot 自己的子树�
     const { root, own } = twoBots();
     expect(validateRoleLibraryPath(own, root, 'cli_self').ok).toBe(false);
   });
-  it('存量人类 slug 布局 → 回落全局根校验 + legacyRootFallback 标记', () => {
+  it('存量人类 slug 布局（<root>/<appId> 不存在）→ FAIL-CLOSED own_role_library_missing（不回落全局根）', () => {
     const { root } = setup();  // 只有 users/ou_x/产品经理，没有 cli_* 目录
     const legacy = join(root, 'users', 'ou_x', '产品经理');
-    const r = validateRoleLibraryPath(legacy, root, 'cli_self');
-    expect(r).toEqual({ ok: true, resolvedPath: realpathSync(legacy), legacyRootFallback: true });
+    // 曾经回落全局根（fail-open：存量部署可继续跨 bot 切）；现在必须直接拒。
+    expect(validateRoleLibraryPath(legacy, root, 'cli_self'))
+      .toEqual({ ok: false, error: 'own_role_library_missing' });
   });
-  it('子树是符号链接时也算「不存在」→ 回落，且不会因跟链把别人的库当成自己的', () => {
+  it('子树是符号链接（roleLibrarySubtree 返 null）→ FAIL-CLOSED，绝不因跟链把别人的库当成自己的', () => {
     const { root, other } = twoBots();
+    // cli_link 指向别的 bot 的库：roleLibrarySubtree 对 symlink 子树返 null → 本应
+    // fail-closed，绝不能回落全局根后把 other 的库内目录判为「合法切换」。
     symlinkSync(other, join(root, 'cli_link'));
-    const r = validateRoleLibraryPath(join(other, 'shared', 'default'), root, 'cli_link');
-    expect(r.ok).toBe(true);                       // 回落全局根 → 库内即放行
-    expect((r as { legacyRootFallback?: true }).legacyRootFallback).toBe(true);
+    expect(validateRoleLibraryPath(join(other, 'shared', 'default'), root, 'cli_link'))
+      .toEqual({ ok: false, error: 'own_role_library_missing' });
+  });
+  it('fail-closed 只作用于传了 ownAppId 的调用；不传 ownAppId 仍是旧全局根语义', () => {
+    // 内部/测试调用方不传 ownAppId：<root>/<appId> 不存在也不影响，仍按全局根放行库内目录。
+    const { root } = setup();
+    const legacy = join(root, 'users', 'ou_x', '产品经理');
+    expect(validateRoleLibraryPath(legacy, root))
+      .toEqual({ ok: true, resolvedPath: realpathSync(legacy) });
   });
 });

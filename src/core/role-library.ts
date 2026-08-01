@@ -81,18 +81,25 @@ function isContainedIn(childReal: string, rootReal: string): boolean {
  *
  * 传了 `ownAppId` 时**收窄到该 bot 自己的子树** `<角色库根>/<appId>`：不传等同旧行为
  * （只 pin 全局根）。收窄的理由是不收窄就能切进**别的 bot 的角色目录**——`/cd` 路由随后
- * 把 `ds.workingDir` 钉过去（`dashboard-ipc-server.ts`），于是那个 bot 的沙盒会话拿到
- * 对方整棵角色库（含 `users/<别人 openId>/` 私有角色）的 readWrite。
+ * 把 `ds.workingDir` 钉过去（`dashboard-ipc-server.ts`），而 `ds.workingDir` 在 fs-policy
+ * 里**永远拿 readWrite**，于是那个 bot 的沙盒会话拿到对方角色目录（含 `users/<别人
+ * openId>/` 私有角色）的 readWrite——rw 从 workingDir 那条腿来，不是从角色库专用 grant
+ * （后者按本 bot appId keying，对错位目标返 null）。
  *
- * 存量兼容：`<根>/<appId>` 不是真目录时（旧 runbook 用人类 slug 命名这一层）**回落到
- * 全局根校验**并回 `legacyRootFallback: true` 让调用方打 deprecation 日志——否则一次
- * 收窄会让所有存量部署当场切不动角色。
+ * **FAIL-CLOSED（codex delta review）**：传了 `ownAppId` 但 `<根>/<appId>` 不是真目录
+ * （旧 runbook 用人类 slug 命名这一层，或被摆成符号链接）时**直接拒绝**
+ * （`own_role_library_missing`），**不回落全局根**。曾经的「回落全局根」是 fail-open：
+ * 存量非 appId 布局下它让 `botmux role switch` 继续能切进任意 bot 的库内目录并经
+ * workingDir 拿 rw，正是收窄要堵的越权。fail-closed 的代价是存量非 appId 部署在迁移
+ * （`docs/roles/deploy-runbook.md` §8：把这层目录名改成 appId）之前切不动角色——但
+ * 沙盒下角色系统本就 EPERM 不可用，fail-closed 不额外损失可用功能；非沙盒部署迁移一次
+ * 即恢复。人工 IM `/cd` 不走本校验（走 `validateWorkingDir`），不受影响。
  */
 export function validateRoleLibraryPath(
   input: string,
   rootOverride?: string,
   ownAppId?: string,
-): { ok: true; resolvedPath: string; legacyRootFallback?: true } | { ok: false; error: string } {
+): { ok: true; resolvedPath: string } | { ok: false; error: string } {
   const raw = (input ?? '').trim();
   if (!raw) return { ok: false, error: 'empty_path' };
   // 维持「单行注入」不变量（与 slash 校验的 multiline_rejected 对称）：拒绝内嵌
@@ -110,24 +117,35 @@ export function validateRoleLibraryPath(
   let rootReal: string;
   try { rootReal = realpathSync(rootOverride ?? roleLibraryRoot()); }
   catch { return { ok: false, error: 'role_library_missing' }; }
-  // 收窄边界：本 bot 自己的子树（存在则用它，否则回落全局根 + 标记 deprecation）。
-  const ownSubtree = ownAppId ? roleLibrarySubtree(ownAppId, rootOverride) : null;
-  const legacyRootFallback = !!ownAppId && !ownSubtree;
-  const boundary = ownSubtree ?? rootReal;
+  // 收窄边界：本 bot 自己的子树。传了 ownAppId 但子树不是真目录（缺失/文件/符号链接）
+  // → FAIL-CLOSED，绝不回落全局根（回落是 fail-open，见函数注释）。
+  if (ownAppId) {
+    const ownSubtree = roleLibrarySubtree(ownAppId, rootOverride);
+    if (!ownSubtree) return { ok: false, error: 'own_role_library_missing' };
+    let real: string;
+    try { real = realpathSync(expanded); }
+    catch { return { ok: false, error: 'dir_not_found' }; }
+    if (/[\x00-\x1f\x7f]/.test(real)) return { ok: false, error: 'invalid_path_chars' };
+    if (!isContainedIn(real, ownSubtree)) {
+      // 区分两种越界，便于运营自查：在库内但不在自己子树 → 跨 bot（同样 403）。
+      return {
+        ok: false,
+        error: isContainedIn(real, rootReal) ? 'outside_own_role_library' : 'outside_role_library',
+      };
+    }
+    try { if (!statSync(real).isDirectory()) return { ok: false, error: 'not_a_directory' }; }
+    catch { return { ok: false, error: 'dir_not_found' }; }
+    return { ok: true, resolvedPath: real };
+  }
+  // 未传 ownAppId：旧行为，只 pin 全局根（内部/测试调用方）。
   let real: string;
   try { real = realpathSync(expanded); }
   catch { return { ok: false, error: 'dir_not_found' }; }
   // 库内符号链接可能指向含换行等控制字符的目录名，把 raw 处的干净校验洗掉——
   // resolvedPath 是最终写回调用方（进而可能被注入）的值，必须同样校验。
   if (/[\x00-\x1f\x7f]/.test(real)) return { ok: false, error: 'invalid_path_chars' };
-  if (!isContainedIn(real, boundary)) {
-    // 区分两种越界，便于运营自查：在库内但不在自己子树 → 跨 bot（同样 403）。
-    return {
-      ok: false,
-      error: ownSubtree && isContainedIn(real, rootReal) ? 'outside_own_role_library' : 'outside_role_library',
-    };
-  }
+  if (!isContainedIn(real, rootReal)) return { ok: false, error: 'outside_role_library' };
   try { if (!statSync(real).isDirectory()) return { ok: false, error: 'not_a_directory' }; }
   catch { return { ok: false, error: 'dir_not_found' }; }
-  return legacyRootFallback ? { ok: true, resolvedPath: real, legacyRootFallback: true } : { ok: true, resolvedPath: real };
+  return { ok: true, resolvedPath: real };
 }
