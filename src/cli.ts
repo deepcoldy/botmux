@@ -3198,6 +3198,7 @@ interface SessionData {
   // here, so they're typed loosely. Used by cmdList to avoid reporting an
   // unconfirmed /adopt scratch as a crashed CLI session.
   cliId?: string;
+  model?: string;
   /** CLI-native resume id when it differs from botmux's Session id. */
   cliSessionId?: string;
   backendType?: BackendType;
@@ -3205,6 +3206,7 @@ interface SessionData {
    * may own one agent inside a shared host session rather than the host itself. */
   persistentBackendTarget?: PersistentBackendTarget;
   lastCliInput?: string;
+  footerTemplate?: string;
   adoptedFrom?: AdoptedFromData;
   /** Deliberately suspended by the resident-session cap. No process/backing
    * session is expected until the next message cold-resumes the CLI. */
@@ -4415,7 +4417,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename',
+  route: 'slash' | 'cd' | 'close' | 'chat-rename' | 'footer',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4440,6 +4442,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(route === 'footer' ? { signal: AbortSignal.timeout(2_000) } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -4494,6 +4497,56 @@ async function cmdChat(argv: string[]): Promise<void> {
   }
   console.error(out);
   process.exitCode = 1;
+}
+
+async function cmdFooter(argv: string[]): Promise<void> {
+  const action = argv[0] ?? 'get';
+  if (!['get', 'set', 'clear'].includes(action)) {
+    console.error('用法: botmux footer <get|set <模板>|clear>');
+    process.exitCode = 2;
+    return;
+  }
+  const template = action === 'set' ? argv.slice(1).join(' ').trim() : undefined;
+  if (action === 'set' && !template) {
+    console.error('用法: botmux footer set <模板>');
+    process.exitCode = 2;
+    return;
+  }
+  const sessionId = findAncestorSessionContext()?.sessionId ?? process.env.BOTMUX_SESSION_ID;
+  if (!sessionId) {
+    console.error(JSON.stringify({ ok: false, error: 'missing_session_context' }));
+    process.exitCode = 1;
+    return;
+  }
+  const ipcPort = (() => {
+    try {
+      return findDaemon(process.env.BOTMUX_LARK_APP_ID)?.ipcPort
+        ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+    } catch {
+      return resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+    }
+  })();
+  if (!ipcPort) {
+    console.error(JSON.stringify({ ok: false, error: 'daemon_offline' }));
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    const response = await postSessionCliIpc(ipcPort, sessionId, 'footer', {
+      action,
+      ...(template ? { template } : {}),
+    });
+    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+    if (!response.ok || body.ok !== true) {
+      console.error(JSON.stringify({ ok: false, error: body.error ?? `HTTP ${response.status}` }));
+      process.exitCode = 1;
+      return;
+    }
+    console.log(JSON.stringify(body));
+  } catch (err) {
+    console.error(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    process.exitCode = 1;
+  }
 }
 
 /** botmux slash "<斜杠命令>"：请求 daemon 在本会话 idle 后把命令敲入自己的 CLI。
@@ -5333,6 +5386,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
+  footer get|set <模板>|clear          配置当前会话回复卡片 statusline
+                                      支持 {cli} {model} {title} {cwdName} {cwd} {cwdUrl}
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
@@ -7934,10 +7989,15 @@ async function cmdSend(rest: string[]): Promise<void> {
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(resolveBrandLabel(appId), s.workingDir),
+        brand: renderBrandTemplate(s.footerTemplate ?? resolveBrandLabel(appId), s.workingDir, {
+          cli: s.cliId,
+          model: s.model,
+          title: s.title,
+        }),
         recipientOpenIds: footerRecipients,
         usage: usageSnapshot,
         locale: localeForBot(appId),
+        forceMarker: s.footerTemplate !== undefined,
       });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
       // share ONE row: footer text on the left (weighted, fills), button pinned
@@ -10800,6 +10860,8 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
+  case 'footer':
+  case 'statusline': await cmdFooter(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

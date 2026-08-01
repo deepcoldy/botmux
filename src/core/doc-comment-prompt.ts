@@ -4,7 +4,8 @@ import type { CliId } from '../adapters/cli/types.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import type { CliTurnPayload } from '../types.js';
 import type { DaemonSession } from './types.js';
-import { buildBridgeInputContent, buildFollowUpCliInput, buildReforkCliInput } from './session-manager.js';
+import { buildBridgeInputContent, buildFollowUpCliInput, buildNewTopicCliInput, buildReforkCliInput, promptInjectionModeForSession } from './session-manager.js';
+import type { PromptInjectionMode } from './prompt-bootstrap.js';
 
 export interface DocCommentPromptInput {
   fileToken: string;
@@ -108,6 +109,7 @@ export function buildDocWatchWarmupTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  promptInjectionMode?: PromptInjectionMode;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocWatchWarmupPrompt(promptInput);
@@ -127,7 +129,37 @@ export function buildDocWatchWarmupTurnInput(args: {
         whiteboardId: ds.session.whiteboardId,
         codexAppText,
         codexAppApplicationContext: promptContent,
+        promptInjectionMode: promptInjectionModeForSession(ds),
       }),
+    };
+  }
+  if (!ds.adoptedFrom && !ds.hasHistory && !ds.lastCliInput && !ds.session.lastCliInput) {
+    return {
+      promptContent,
+      cliInput: buildNewTopicCliInput(
+        promptContent,
+        ds.session.sessionId,
+        cliId,
+        cliPathOverride,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          name: args.botIdentity?.name ?? undefined,
+          openId: args.botIdentity?.openId ?? undefined,
+        },
+        promptInput.locale,
+        args.sender,
+        {
+          larkAppId: ds.larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          codexAppText,
+          codexAppApplicationContext: promptContent,
+          promptInjectionMode: args.promptInjectionMode,
+        },
+      ),
     };
   }
   return {
@@ -256,6 +288,7 @@ export function buildDocCommentTurnInput(args: {
   botIdentity?: { name?: string | null; openId?: string | null };
   sender?: ResolvedSender;
   mode: 'live' | 'refork';
+  promptInjectionMode?: PromptInjectionMode;
 }): { promptContent: string; cliInput: CliTurnPayload } {
   const { ds, promptInput } = args;
   const promptContent = buildDocCommentPrompt(promptInput);
@@ -278,6 +311,40 @@ export function buildDocCommentTurnInput(args: {
     codexAppApplicationContext: buildDocCommentApplicationContext(promptInput),
     codexAppMessageContext: buildDocCommentMessageContext(promptInput),
   };
+  if (
+    args.mode === 'refork'
+    && !ds.adoptedFrom
+    && !ds.hasHistory
+    && !ds.lastCliInput
+    && !ds.session.lastCliInput
+  ) {
+    return {
+      promptContent,
+      cliInput: buildNewTopicCliInput(
+        promptContent,
+        ds.session.sessionId,
+        cliId,
+        cliPathOverride,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          name: args.botIdentity?.name ?? undefined,
+          openId: args.botIdentity?.openId ?? undefined,
+        },
+        promptInput.locale,
+        args.sender,
+        {
+          larkAppId: ds.larkAppId,
+          chatId: ds.session.chatId,
+          whiteboardId: ds.session.whiteboardId,
+          ...cleanContext,
+          promptInjectionMode: args.promptInjectionMode,
+        },
+      ),
+    };
+  }
   if (args.mode === 'live') {
     return {
       promptContent,
@@ -290,6 +357,7 @@ export function buildDocCommentTurnInput(args: {
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
         ...cleanContext,
+        promptInjectionMode: promptInjectionModeForSession(ds),
       }),
     };
   }

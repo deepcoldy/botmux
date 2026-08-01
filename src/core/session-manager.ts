@@ -4,7 +4,7 @@
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { expandHome } from './working-dir.js';
 import { config } from '../config.js';
@@ -72,8 +72,22 @@ import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
 import { escapeXmlTagLikeTokens } from '../utils/xml.js';
+import { resolvePromptInjectionMode, type PromptInjectionMode } from './prompt-bootstrap.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
+
+export const PROMPT_BOOTSTRAP_VERSION = 'v1';
+
+/** Historical sessions never silently switch to compact follow-ups: without a
+ * persisted bootstrap marker there is no proof their provider saw the stable
+ * context. New sessions persist the marker with their opening input. */
+export function promptInjectionModeForSession(
+  ds: Pick<DaemonSession, 'session'>,
+): PromptInjectionMode {
+  const desired = resolvePromptInjectionMode(ds.session.promptInjectionMode);
+  if (desired === 'session-bootstrap' && !ds.session.promptBootstrapVersion) return 'legacy';
+  return desired;
+}
 
 function sessionCreatedAtMs(session: { createdAt?: string }): number {
   return session.createdAt ? (Date.parse(session.createdAt) || Date.now()) : Date.now();
@@ -445,9 +459,10 @@ function xmlEscape(s: string): string {
  * Returns empty string when no sender data is available so the prompt stays
  * clean for synthetic flows (scheduled tasks, no-op spawns).
  */
-export function renderSenderTag(sender?: ResolvedSender): string {
-  if (!sender || !sender.openId) return '';
-  const attrs: string[] = [`type="${xmlEscape(sender.type)}"`, `open_id="${xmlEscape(sender.openId)}"`];
+export function renderSenderTag(sender?: ResolvedSender, opts?: { compact?: boolean }): string {
+  if (!sender || (!sender.openId && !opts?.compact)) return '';
+  const attrs: string[] = [`type="${xmlEscape(sender.type)}"`];
+  if (!opts?.compact && sender.openId) attrs.push(`open_id="${xmlEscape(sender.openId)}"`);
   if (sender.name) attrs.push(`name="${xmlEscape(sender.name)}"`);
   return `<sender ${attrs.join(' ')} />`;
 }
@@ -640,10 +655,10 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string }): string {
  */
 const AVAILABLE_BOTS_INLINE_MAX = 3;
 
-function renderMentionBlock(mentions?: LarkMention[]): string {
+function renderMentionBlock(mentions?: LarkMention[], opts?: { compact?: boolean }): string {
   if (!mentions || mentions.length === 0) return '';
   const items = mentions.map(m => {
-    const oid = m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
+    const oid = !opts?.compact && m.openId ? ` open_id="${xmlEscape(m.openId)}"` : '';
     return `  <mention name="${xmlEscape(m.name)}"${oid} />`;
   });
   return `<mentions>\n${items.join('\n')}\n</mentions>`;
@@ -718,7 +733,7 @@ export function buildNewTopicPrompt(
   botIdentity?: { name?: string; openId?: string },
   locale?: Locale,
   sender?: ResolvedSender,
-  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger },
+  opts?: { larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; promptInjectionMode?: PromptInjectionMode },
 ): string {
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
@@ -795,6 +810,7 @@ export function buildNewTopicPrompt(
   }
   if (roleBlock) parts.push(roleBlock);
   if (whiteboardBlock) parts.push(whiteboardBlock);
+  if (opts?.promptInjectionMode === 'session-bootstrap' && botBlock) parts.push(botBlock);
 
   parts.push(userBlock);
 
@@ -813,7 +829,7 @@ export function buildNewTopicPrompt(
   // CLIs with injectsSessionContext (Claude Code) get Lark routing/identity
   // and session ID via system prompt, so skip those blocks here.
   if (mentionBlock) parts.push(mentionBlock);
-  if (botBlock) parts.push(botBlock);
+  if (opts?.promptInjectionMode !== 'session-bootstrap' && botBlock) parts.push(botBlock);
   // The per-session skill catalog block is appended later in the worker-pool
   // fork path (prepareSessionSkillPrompt), which also writes the manifest and
   // resolves delivery — keeping a single injection site avoids double-rendering.
@@ -848,15 +864,29 @@ export function buildNewTopicCliInput(
     codexAppMessageContext?: string;
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
+    promptInjectionMode?: PromptInjectionMode;
   },
 ): CliTurnPayload {
   const content = buildNewTopicPrompt(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
   );
+  const bootstrapEnabled = opts?.promptInjectionMode === 'session-bootstrap';
+  // Match the structural opening tag, not prose in routing hints that mentions
+  // `<user_message>`. No match means there is no reusable stable prefix.
+  const userMessageBoundary = bootstrapEnabled ? content.indexOf('\n\n<user_message>\n') : -1;
+  const sessionBootstrap = bootstrapEnabled
+    ? (userMessageBoundary > 0 ? content.slice(0, userMessageBoundary).trimEnd() : '')
+    : undefined;
+  const bootstrapPayload = sessionBootstrap !== undefined
+    ? {
+        sessionBootstrap,
+        sessionBootstrapVersion: `${PROMPT_BOOTSTRAP_VERSION}:${createHash('sha256').update(sessionBootstrap).digest('hex')}`,
+      }
+    : {};
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
-  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content };
+  if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) return { content, ...bootstrapPayload };
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const senderBlock = renderSenderTag(sender);
@@ -867,6 +897,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   return {
     content,
+    ...bootstrapPayload,
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
       roleBlock,
@@ -893,9 +924,10 @@ export function buildNewTopicCliInput(
 export function buildFollowUpContent(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string; promptInjectionMode?: PromptInjectionMode },
 ): string {
   const parts: string[] = [];
+  const sessionBootstrap = opts?.promptInjectionMode === 'session-bootstrap';
   const roleBlock = renderRoleContextBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts?.whiteboardId });
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
@@ -907,8 +939,8 @@ export function buildFollowUpContent(
   // per-turn available context, so place it right after <botmux_reminder> and
   // before <user_message> — consistent with new-topic/refork — not after the
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
-  if (!skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
-  if (roleBlock) parts.push(roleBlock);
+  if (!sessionBootstrap && !skipSessionId) parts.push(`<session_id>${xmlEscape(sessionId)}</session_id>`);
+  if (!sessionBootstrap && roleBlock) parts.push(roleBlock);
   if (opts?.cliId !== 'mira') {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
@@ -916,14 +948,16 @@ export function buildFollowUpContent(
     // (config.noVisibleOutputHint, default OFF); otherwise the reminder is
     // byte-for-byte the pre-feature baseline. Live-read so a Settings flip
     // applies to the next follow-up turn without a daemon restart.
-    const reminder = t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
+    const reminder = sessionBootstrap
+      ? t('ai.followup.session_bootstrap_reminder', undefined, opts?.locale)
+      : t(config.noVisibleOutputHint ? 'ai.followup.reminder_no_resend' : 'ai.followup.reminder', undefined, opts?.locale);
     parts.push(`<botmux_reminder>${reminder}</botmux_reminder>`);
   }
-  if (whiteboardBlock) parts.push(whiteboardBlock);
+  if (!sessionBootstrap && whiteboardBlock) parts.push(whiteboardBlock);
 
   parts.push(`<user_message>\n${content}\n</user_message>`);
 
-  const senderBlock = renderSenderTag(opts?.sender);
+  const senderBlock = renderSenderTag(opts?.sender, { compact: sessionBootstrap });
   if (senderBlock) parts.push(senderBlock);
 
   const substituteBlock = renderSubstituteTrigger(opts?.substituteTrigger);
@@ -937,7 +971,7 @@ export function buildFollowUpContent(
     : '';
   if (attachHint) parts.push(attachHint);
 
-  const mentionBlock = renderMentionBlock(opts?.mentions);
+  const mentionBlock = renderMentionBlock(opts?.mentions, { compact: sessionBootstrap });
   if (mentionBlock) parts.push(mentionBlock);
 
   return parts.join('\n\n');
@@ -947,17 +981,18 @@ export function buildFollowUpContent(
 export function buildFollowUpCliInput(
   content: string,
   sessionId: string,
-  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string },
+  opts?: { attachments?: LarkAttachment[]; mentions?: LarkMention[]; isAdoptMode?: boolean; cliId?: CliId; cliPathOverride?: string; locale?: Locale; sender?: ResolvedSender; larkAppId?: string; chatId?: string; whiteboardId?: string; substituteTrigger?: SubstituteTrigger; codexAppText?: string; codexAppApplicationContext?: string; codexAppMessageContext?: string; promptInjectionMode?: PromptInjectionMode },
 ): CliTurnPayload {
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) return { content: legacyContent };
-  const roleBlock = renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
-  const whiteboardBlock = renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
-  const senderBlock = renderSenderTag(opts.sender);
+  const sessionBootstrap = opts.promptInjectionMode === 'session-bootstrap';
+  const roleBlock = sessionBootstrap ? '' : renderRoleContextBlock(opts.larkAppId, opts.chatId, { followUp: true });
+  const whiteboardBlock = sessionBootstrap ? '' : renderWhiteboardBlock({ whiteboardId: opts.whiteboardId });
+  const senderBlock = renderSenderTag(opts.sender, { compact: sessionBootstrap });
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale);
-  const mentionBlock = renderMentionBlock(opts.mentions);
+  const mentionBlock = renderMentionBlock(opts.mentions, { compact: sessionBootstrap });
   return {
     content: legacyContent,
     codexAppInput: buildCodexAppTurnInput({
@@ -1110,6 +1145,7 @@ export function buildReforkPrompt(
     larkAppId: ds.larkAppId,
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
+    promptInjectionMode: promptInjectionModeForSession(ds),
   });
 }
 
@@ -1158,6 +1194,7 @@ export function buildReforkCliInput(
     codexAppText: opts?.codexAppText,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
+    promptInjectionMode: promptInjectionModeForSession(ds),
   });
 }
 
@@ -1223,6 +1260,11 @@ export function rememberLastCliInput(
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
+  if (normalized.sessionBootstrap !== undefined) {
+    ds.session.promptInjectionMode = 'session-bootstrap';
+    ds.session.promptSessionBootstrap = normalized.sessionBootstrap;
+    ds.session.promptBootstrapVersion = normalized.sessionBootstrapVersion;
+  }
   if (keepCodexAppInput && normalized.codexAppInput) ds.session.lastCodexAppInput = normalized.codexAppInput;
   else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
@@ -2317,6 +2359,7 @@ export async function executeScheduledTask(
       larkAppId,
       chatId: task.chatId,
       whiteboardId: existing.session.whiteboardId,
+      promptInjectionMode: promptInjectionModeForSession(existing),
     });
     rememberLastCliInput(existing, task.prompt, input);
     if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
@@ -2395,7 +2438,7 @@ export async function executeScheduledTask(
     sessionStore.updateSession(ds.session);
   }
   ensureSessionWhiteboard(ds);
-  const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId });
+  const prompt = buildNewTopicCliInput(firePrompt, session.sessionId, bot.config.cliId, bot.config.cliPathOverride, undefined, undefined, undefined, undefined, { name: bot.botName, openId: bot.botOpenId }, localeForBot(larkAppId), undefined, { larkAppId, chatId: task.chatId, whiteboardId: ds.session.whiteboardId, promptInjectionMode: resolvePromptInjectionMode(bot.config.promptInjectionMode) });
   if (!setActiveSessionIfActive(activeSessions, activeKey, ds)) {
     const winner = activeSessions.get(activeKey);
     await closeSession(session.sessionId);
@@ -2485,6 +2528,7 @@ async function forkOrShowRepoCard(ds: DaemonSession, userContent: string): Promi
       codexAppText: ds.pendingCodexAppText,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
+      promptInjectionMode: resolvePromptInjectionMode(bot.config.promptInjectionMode),
     },
   );
 

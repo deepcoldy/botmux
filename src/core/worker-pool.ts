@@ -59,6 +59,7 @@ import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBa
 import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
+import { resolvePromptInjectionMode } from './prompt-bootstrap.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -3387,6 +3388,10 @@ export function sendWorkerInput(
     type: 'message',
     content: normalized.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(normalized.sessionBootstrap !== undefined ? {
+      sessionBootstrap: normalized.sessionBootstrap,
+      sessionBootstrapVersion: normalized.sessionBootstrapVersion,
+    } : {}),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(turnId ? { turnId } : {}),
@@ -3736,6 +3741,14 @@ export function forkWorker(
     promptPayload.codexAppInput,
     initAttributionTurnId,
   );
+  const promptInjectionMode = ds.session.promptInjectionMode
+    ?? resolvePromptInjectionMode(botCfg.promptInjectionMode);
+  ds.session.promptInjectionMode = promptInjectionMode;
+  if (promptPayload.sessionBootstrap !== undefined && promptInjectionMode === 'session-bootstrap') {
+    ds.session.promptSessionBootstrap = promptPayload.sessionBootstrap;
+    ds.session.promptBootstrapVersion = promptPayload.sessionBootstrapVersion;
+  }
+  sessionStore.updateSession(ds.session);
   const runtimeIdentity = runtimeBuildIdentity();
   const initMsg: DaemonToWorker = {
     type: 'init',
@@ -3792,6 +3805,9 @@ export function forkWorker(
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
     backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    promptInjectionMode,
+    promptSessionBootstrap: ds.session.promptSessionBootstrap,
+    promptBootstrapVersion: ds.session.promptBootstrapVersion,
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
@@ -5675,11 +5691,16 @@ function setupWorkerHandlers(
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
-          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          brand: renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
+            cli: effectiveCliId,
+            model: ds.session.model,
+            title: ds.session.title,
+          }),
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
           usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
+          forceFooterMarker: ds.session.footerTemplate !== undefined,
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -6096,20 +6117,30 @@ function deliverFinalOutput(
             assistantText: safeAssistantText,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
-            brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+            brand: renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
+              cli: effectiveCliId,
+              model: ds.session.model,
+              title: ds.session.title,
+            }),
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
+            forceFooterMarker: ds.session.footerTemplate !== undefined,
           })
         : buildMarkdownCard(
             safeAssistantText,
             recipientOpenId,
-            renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+            renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
+              cli: effectiveCliId,
+              model: ds.session.model,
+              title: ds.session.title,
+            }),
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
             cardUsage,
+            ds.session.footerTemplate !== undefined,
           );
 
       const proposedOutput = {

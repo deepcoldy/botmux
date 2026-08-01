@@ -377,6 +377,7 @@ export function buildReplyCardFooter(opts: {
   recipientOpenIds?: readonly string[];
   usage?: CardUsageSnapshot;
   locale?: Locale;
+  forceMarker?: boolean;
 }): ReplyCardFooter | null {
   const parts: string[] = [];
   const brandSeg = brandFooterSegment(opts.brand);
@@ -406,7 +407,7 @@ export function buildReplyCardFooter(opts: {
   // ownership marker (the parser already treats a bare repo link as ordinary
   // content, matching the long-standing "brand-only is undecidable, keep it"
   // contract). Any footer carrying usage or a recipient is still signed.
-  const signMarker = hasUsage || hasRecipient;
+  const signMarker = hasUsage || hasRecipient || opts.forceMarker === true;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
@@ -887,6 +888,7 @@ export function buildMarkdownCard(
   workingDir?: string,
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   usage?: CardUsageSnapshot,
+  forceFooterMarker = false,
 ): string {
   const elements = md ? buildCardBodyElements(md, workingDir, localHomeLinkMode) : [];
   const footer = buildReplyCardFooter({
@@ -894,6 +896,7 @@ export function buildMarkdownCard(
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    forceMarker: forceFooterMarker,
   });
   // No brand, usage, or recipient → no footer at all (skip the orphan HR too).
   if (footer) {
@@ -942,6 +945,7 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  forceFooterMarker?: boolean;
 }): string {
   const {
     title,
@@ -987,6 +991,7 @@ export function buildContextualReplyCard(opts: {
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    forceMarker: opts.forceFooterMarker,
   });
   if (footer) {
     elements.push({ tag: 'hr' });

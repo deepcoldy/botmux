@@ -52,6 +52,7 @@ import {
   type V3BlockedCardHandlerDeps,
 } from './v3-blocked-card-handler.js';
 import type { V3BlockedActionValue, V3AskAnswerActionValue } from './v3-blocked-card.js';
+import { resolvePromptInjectionMode } from '../../core/prompt-bootstrap.js';
 import {
   handleV3LoopGrantAction,
   isV3LoopGrantAction,
@@ -499,6 +500,7 @@ export async function commitRepoSelection(
               codexAppMessageContext: ds.pendingCodexAppMessageContext,
               codexAppFollowUps: ds.pendingCodexAppFollowUps,
               codexAppFollowUpContexts: ds.pendingCodexAppFollowUpContexts,
+              promptInjectionMode: resolvePromptInjectionMode(botCfg.promptInjectionMode),
             },
           )
         : { content: '' };

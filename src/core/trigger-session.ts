@@ -8,7 +8,7 @@ import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode
 import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
-import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, promptInjectionModeForSession, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
 import { closeSession, forkWorker, getCurrentCliVersion, sendWorkerInput, setActiveSessionIfActive } from './worker-pool.js';
 import { armTriggerFinalSuppression, disarmTriggerFinalSuppression, inheritTriggerReplyAnchor } from './trigger-final-suppression.js';
@@ -18,6 +18,9 @@ import type { DaemonSession } from './types.js';
 import { sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import type { CliTurnPayload } from '../types.js';
+import { resolvePromptInjectionMode } from './prompt-bootstrap.js';
+import { config } from '../config.js';
+import { resolvePairedSpawnBackendType } from './persistent-backend.js';
 
 export interface TriggerSessionDeps {
   larkAppId: string;
@@ -270,6 +273,7 @@ function buildExistingSessionContent(
     // Only data enters untrusted structured context; connector-owner task and
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
+    promptInjectionMode: promptInjectionModeForSession(ds),
   });
 }
 
@@ -722,6 +726,7 @@ export async function triggerSessionTurn(
       codexAppText,
       codexAppApplicationContext,
       codexAppMessageContext,
+      promptInjectionMode: resolvePromptInjectionMode(bot.config.promptInjectionMode),
     },
   );
   // Register right before the fork branches (no await between here and forkWorker)

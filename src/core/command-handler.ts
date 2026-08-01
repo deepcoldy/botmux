@@ -19,6 +19,7 @@ import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCar
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
+import { resolvePromptInjectionMode } from './prompt-bootstrap.js';
 import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
 import { chatAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -1523,6 +1524,7 @@ export async function handleCommand(
                     codexAppMessageContext: ds!.pendingCodexAppMessageContext,
                     codexAppFollowUps: ds!.pendingCodexAppFollowUps,
                     codexAppFollowUpContexts: ds!.pendingCodexAppFollowUpContexts,
+                    promptInjectionMode: resolvePromptInjectionMode(botCfg.promptInjectionMode),
                   },
                 )
               : { content: '' };

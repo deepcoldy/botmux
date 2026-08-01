@@ -447,7 +447,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|chat-rename|footer)$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // Workflow v3 mutations carry their own domain-separated full-envelope
@@ -967,6 +967,52 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
     }
     return jsonRes(res, 200, { ...result, chatId: ds.chatId });
   });
+});
+
+/** Session-local statusline configured by the active agent. This deliberately
+ * stores a template rather than executing a shell command in the card hot path. */
+ipcRoute('POST', '/api/sessions/:sessionId/footer', async (req, res, params) => {
+  const body = await readJsonBody<{ action?: unknown; template?: unknown } & Record<string, unknown>>(req)
+    .catch(() => ({} as { action?: unknown; template?: unknown } & Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const action = typeof body.action === 'string' ? body.action : 'get';
+  if (action === 'get') {
+    return jsonRes(res, 200, { ok: true, template: ds.session.footerTemplate ?? null });
+  }
+  if (action === 'clear') {
+    ds.session.footerTemplate = undefined;
+    sessionStore.updateSession(ds.session);
+    return jsonRes(res, 200, { ok: true, template: null });
+  }
+  if (action !== 'set' || typeof body.template !== 'string') {
+    return jsonRes(res, 400, { ok: false, error: 'bad_action_or_template' });
+  }
+  const normalizedTemplate = body.template
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalizedTemplate) return jsonRes(res, 400, { ok: false, error: 'empty_template' });
+  if (normalizedTemplate.length > 256) return jsonRes(res, 400, { ok: false, error: 'template_too_long' });
+  // Preserve the supported status variables, but store every literal segment
+  // as pure text so an agent cannot inject Lark tags or card markdown.
+  const template = normalizedTemplate.replace(
+    /\{(?:cli|model|title|cwdName|cwd|cwdUrl)\}|[^{}]+|[{}]/g,
+    (segment) => /^\{(?:cli|model|title|cwdName|cwd|cwdUrl)\}$/.test(segment)
+      ? segment
+      : segment
+        .replace(/\\/g, '\\\\')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/([*_~`])/g, '\\$1')
+        .replace(/[\[\]()]/g, ''),
+  );
+  ds.session.footerTemplate = template;
+  sessionStore.updateSession(ds.session);
+  return jsonRes(res, 200, { ok: true, template });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）

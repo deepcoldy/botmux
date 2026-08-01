@@ -1298,6 +1298,9 @@ function ensureZellijAttachConfig(): string {
 
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
+/** Attach the stable bootstrap to the next real message after resume has
+ * explicitly degraded to a fresh provider conversation. */
+let promptBootstrapRequired = false;
 let closeRequested = false;
 /** Dashboard「复现命令」：session 冷启时最终交给 backend.spawn 的真实调用
  *  （bin + argv + cwd + 关键 env）。原样保留，worker `ready` 时随消息上报给 daemon
@@ -8219,6 +8222,21 @@ async function spawnCli(
     effectiveResume = false;
     effectiveCliSessionId = undefined;
     effectiveAdapterSessionId = cfg.sessionId;
+    if (cfg.promptInjectionMode === 'session-bootstrap' && cfg.promptSessionBootstrap) {
+      if (cfg.prompt) {
+        cfg.prompt = `${cfg.promptSessionBootstrap}\n\n${cfg.prompt}`;
+        if (cfg.promptCodexAppInput) {
+          cfg.promptCodexAppInput = withCodexAppContext(
+            cfg.promptCodexAppInput,
+            'botmux_session_bootstrap',
+            cfg.promptSessionBootstrap,
+            'application',
+          );
+        }
+      } else {
+        promptBootstrapRequired = true;
+      }
+    }
     // Recompute the claude-family JSONL path: it now targets the FRESH
     // sessionId (fresh spawn creates <newSid>.jsonl, not the old one).
     if (claudeDataDir) {
@@ -11431,6 +11449,7 @@ process.on('message', async (raw: unknown) => {
       const initStartedAtMs = Date.now();
       if (lastInitConfig) return;  // already initialized
       lastInitConfig = msg;
+      promptBootstrapRequired = false;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       refreshTerminalViewToken();
@@ -11634,6 +11653,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      if (msg.sessionBootstrap !== undefined && lastInitConfig?.promptInjectionMode === 'session-bootstrap') {
+        lastInitConfig.promptSessionBootstrap = msg.sessionBootstrap;
+        lastInitConfig.promptBootstrapVersion = msg.sessionBootstrapVersion;
+      }
       const messageAdoptMode = lastInitConfig?.adoptMode === true;
       // Adopt IPC handlers can overlap. Delay their turn baseline until the
       // submission mutex is held so a queued message cannot steal attribution
@@ -11657,8 +11680,24 @@ process.on('message', async (raw: unknown) => {
       }
       // Cancel any active tmux copy-mode scroll so user input reaches the CLI.
       if (tmuxScrolledHalfPages > 0 && !messageAdoptMode) exitTmuxScrollMode();
-      let content = msg.content;
+      const recoveryBootstrap = promptBootstrapRequired
+        && lastInitConfig?.promptInjectionMode === 'session-bootstrap'
+        && lastInitConfig.promptSessionBootstrap
+        ? lastInitConfig.promptSessionBootstrap
+        : undefined;
+      let content = recoveryBootstrap
+        ? `${recoveryBootstrap}\n\n${msg.content}`
+        : msg.content;
+      if (promptBootstrapRequired && content !== msg.content) promptBootstrapRequired = false;
       let codexAppInput = msg.codexAppInput;
+      if (recoveryBootstrap && codexAppInput) {
+        codexAppInput = withCodexAppContext(
+          codexAppInput,
+          'botmux_session_bootstrap',
+          recoveryBootstrap,
+          'application',
+        );
+      }
       if (deferredPluginSkillCatalog && !lastInitConfig?.adoptMode) {
         content = `${content}\n\n${deferredPluginSkillCatalog}`;
         if (codexAppInput) {

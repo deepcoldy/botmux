@@ -104,6 +104,7 @@ function safeUrl(v: unknown): string | undefined {
 export function renderBrandTemplate(
   brand: string | undefined,
   workingDir: string | undefined,
+  context?: { cli?: string; model?: string; title?: string },
 ): string | undefined {
   if (brand === undefined || !brand.includes('{')) return brand;
   const wd = workingDir ? expandHome(workingDir) : '';
@@ -113,9 +114,12 @@ export function renderBrandTemplate(
   // {cwdName}/{cwd} 落在链接的**文本位**，而它们的 fallback 来自**目录路径** —— 目录名本身
   // 就可以含 `]`（`mkdir 'a]b'` 完全合法），照样能击穿 `[...](...)`。所以路径派生的值也要消毒，
   // 不能只消毒 .botmux-dir.json 里的 name。
-  const rendered = brand.replace(/\{cwdName\}|\{cwdUrl\}|\{cwd\}/g, (m) =>
+  const rendered = brand.replace(/\{cwdName\}|\{cwdUrl\}|\{cwd\}|\{cli\}|\{model\}|\{title\}/g, (m) =>
     m === '{cwdName}' ? (wd ? (meta.name ?? safeText(basename(wd))) : '')
     : m === '{cwd}' ? safeText(wd)
-    : (meta.url ?? ''));
+    : m === '{cwdUrl}' ? (meta.url ?? '')
+    : m === '{cli}' ? safeText(context?.cli ?? '')
+    : m === '{model}' ? safeText(context?.model ?? '')
+    : safeText(context?.title ?? ''));
   return rendered.replace(/\[([^\]]*)\]\(\)/g, '$1');
 }

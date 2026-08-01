@@ -3,6 +3,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import type { PromptInjectionMode } from './core/prompt-bootstrap.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
 import { logger } from './utils/logger.js';
@@ -1109,6 +1110,8 @@ export interface BotConfig {
   /** LEGACY: extra read-deny paths — auto-migrated into sandboxPaths.deny. */
   readDenyExtraPaths?: string[];
   backendType?: BackendType;
+  /** Stable Botmux context once per provider conversation; explicit opt-in. */
+  promptInjectionMode?: PromptInjectionMode;
   /**
    * Configuration for the riff backend (agent-services platform). Required
    * when `backendType` is `'riff'`. Contains base URL, template ID, agent/model
@@ -2471,6 +2474,11 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
+      promptInjectionMode: entry.promptInjectionMode === 'session-bootstrap'
+        ? 'session-bootstrap'
+        : entry.promptInjectionMode === 'legacy'
+          ? 'legacy'
+          : undefined,
       riff: entry.riff && typeof entry.riff === 'object' ? entry.riff : undefined,
       // Positive integer only; ≤0 / non-int / absent → undefined (= no cap).
       maxLiveWorkers: typeof entry.maxLiveWorkers === 'number'

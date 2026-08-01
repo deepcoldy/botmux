@@ -40,6 +40,7 @@ export function buildBotmuxShellHints(locale?: Locale): string[] {
     t('ai.shell.multiline_heredoc', undefined, locale),
     t('ai.shell.heredoc_example', undefined, locale),
     t('ai.shell.helpers', undefined, locale),
+    t('ai.shell.footer', undefined, locale),
     t('ai.shell.when_to_send', undefined, locale),
     // Experimental anti-resend guidance — opt-in via dashboard Settings
     // (dashboard.noVisibleOutputHint). Default OFF, so the rendered hints match
@@ -149,6 +150,7 @@ export function buildBotmuxSystemPromptText(opts: {
     prose('ai.routing.usage_videos'),
     prose('ai.routing.usage_history'),
     prose('ai.routing.usage_bots_list'),
+    prose('ai.routing.usage_footer'),
     escapeXmlTagLikeTokens(workflowDiscoveryHint(locale)),
     hiddenContextDefense(locale),
     ...whiteboardRouting,

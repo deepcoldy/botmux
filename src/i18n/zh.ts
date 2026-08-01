@@ -616,6 +616,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_videos': '- 附带视频预览：`botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "预览"`',
   'ai.routing.usage_history': '- 需要上下文时用 `botmux history` 读取之前的对话。',
   'ai.routing.usage_bots_list': '- 查看可协作的机器人：`botmux bots list`',
+  'ai.routing.usage_footer': '- 用户要求定制回复卡片页脚时，用 `botmux footer set <模板>` 配置当前会话；支持 `{cli}`、`{model}`、`{title}`、`{cwdName}`、`{cwd}`、`{cwdUrl}`；`botmux footer clear` 恢复 bot 默认。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
@@ -639,6 +640,7 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '发送时机：关键结论、方案（等用户确认再动手）、最终结果、进度更新。只 print/echo 不算回复。若无需回复，不要解释沉默，也不要调用 `botmux send`；最终 assistant message 必须只输出 `BOTMUX_NO_REPLY`。',
+  'ai.shell.footer': '用户要求定制回复卡片页脚时，用 `botmux footer set <模板>` 配置当前会话；支持 `{cli}`、`{model}`、`{title}`、`{cwdName}`、`{cwd}`、`{cwdUrl}`；`botmux footer clear` 恢复 bot 默认。',
   'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名某人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回触发你的那条消息的发送者）/ `--no-mention`（不@）。按内容价值选：有实质结论要对方看/确认/决策→--mention-back；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。别把 --no-mention 当默认，也别无意义 @ 打扰。',
 
@@ -649,6 +651,7 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
   'ai.followup.reminder': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY',
+  'ai.followup.session_bootstrap_reminder': '这是同一会话的后续消息；需要回复时必须 botmux send，无需回复时 final 只输出 BOTMUX_NO_REPLY',
   'ai.followup.reminder_no_resend': '需要回复时必须 botmux send；无需回复时不要解释沉默，final 只输出 BOTMUX_NO_REPLY；send 成功即已送达，本轮无可见文本地结束是正常的，别因「无输出」提示重发',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
   'ai.bridge.attachments_label': '[附件]',
