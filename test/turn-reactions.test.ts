@@ -11,8 +11,9 @@
  *
  * Run:  pnpm vitest run test/turn-reactions.test.ts
  */
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { mkdtempSync } from 'fs';
+import { mkdtempSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -43,13 +44,21 @@ vi.mock('../src/im/lark/client.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { noteTurnReceived } from '../src/daemon.js';
-import { __testOnly_finishTurnReactions as finishTurnReactions } from '../src/core/worker-pool.js';
+import {
+  initWorkerPool,
+  __testOnly_finishTurnReactions as finishTurnReactions,
+  __testOnly_setupWorkerHandlers,
+} from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const APP = 'reaction_app';
 
 function makeDs(over: Partial<DaemonSession> = {}): DaemonSession {
-  const session: any = { sessionId: 'sess-' + Math.random().toString(36).slice(2), chatId: 'oc_x', rootMessageId: 'om_root' };
+  // status:'active' is required by the screen_update handler's ownsLifecycleMutation
+  // guard (added with the ZMX lifecycle-ownership work). Without it every
+  // screen_update breaks before lastScreenStatus updates, so the behavioral
+  // working→idle / working→limited flip tests below never see a real edge.
+  const session: any = { sessionId: 'sess-' + Math.random().toString(36).slice(2), chatId: 'oc_x', rootMessageId: 'om_root', status: 'active' };
   return { session, larkAppId: APP, chatId: 'oc_x', scope: 'chat', ...over } as unknown as DaemonSession;
 }
 
@@ -324,3 +333,180 @@ describe('two-phase turn reactions', () => {
     expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
   });
 });
+
+/**
+ * Source-level pin: the screen_update handler must only flip ✋→✅ after a real
+ * busy period (working/analyzing → idle|limited). Cold-start starting→idle
+ * (ready-gate settle before the turn has gone working) must leave GoGoGo alone
+ * — otherwise card-off Grok sessions DONE a message while the CLI is still
+ * chewing the first prompt.
+ */
+describe('turn reaction idle edge gate (source)', () => {
+  it('finishTurnReactions is gated on prevStatus working|analyzing', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'src/core/worker-pool.ts'),
+      'utf8',
+    );
+    // Anchor on the screen_update reaction comment — "// Usage ledger" alone
+    // also appears on the kill/close path and would pick the wrong block.
+    const blockStart = source.indexOf('// Usage ledger + turn reactions') >= 0
+      ? source.indexOf('// Usage ledger + turn reactions')
+      : source.indexOf('// Usage ledger: any settle-to-idle');
+    expect(blockStart).toBeGreaterThan(-1);
+    const block = source.slice(blockStart, blockStart + 900);
+    expect(block).toContain("prevStatus === 'working' || prevStatus === 'analyzing'");
+    expect(block).toContain('void finishTurnReactions(ds)');
+    // Must NOT call finishTurnReactions on every idle/limited edge unconditionally.
+    expect(block).not.toMatch(
+      /if \(ds\.lastScreenStatus === 'idle' \|\| ds\.lastScreenStatus === 'limited'\) \{\s*recordUsageForDaemonSession\(ds\);\s*void finishTurnReactions\(ds\);/,
+    );
+  });
+});
+
+/**
+ * Behavioral pin for PR #633 review P2: card-off finishTurnReactions requires a
+ * working→idle edge. Argv cold-start (Pi/Gemini) must seed working before idle
+ * (worker side); daemon-side, bare undefined→idle must NOT flip, while the
+ * seeded working→idle sequence must.
+ */
+describe('turn reaction screen_update behavioral gate', () => {
+  function makeFakeWorker() {
+    const worker = new EventEmitter() as any;
+    worker.killed = false;
+    worker.send = vi.fn();
+    worker.kill = vi.fn();
+    worker.pid = 4242;
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    return worker;
+  }
+
+  async function flush(): Promise<void> {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    // finishTurnReactions is fire-and-forget void; wait a tick for awaits
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-react-behav-'));
+    mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
+    mocks.removeReaction.mockResolvedValue(undefined);
+    registerWith(true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+  });
+
+  it('undefined→idle alone does not DONE pending GoGoGo (gate)', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      workerPort: 9999,
+      lastScreenStatus: undefined,
+      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'screen_update', content: 'done?', status: 'idle' });
+    await flush();
+
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+  });
+
+  it('working→idle flips pending GoGoGo to DONE (argv seed / flushPending path)', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      workerPort: 9999,
+      lastScreenStatus: undefined,
+      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    // Mirrors markPromptReady seeding working then idle for quiescence argv CLIs.
+    worker.emit('message', { type: 'screen_update', content: 'busy', status: 'working' });
+    await flush();
+    worker.emit('message', { type: 'screen_update', content: 'ready', status: 'idle' });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('working→limited flips DONE (rate-limit banner on settle; synthetic working must not be rewritten)', async () => {
+    // Review third round: if both seeds classify to limited, gate never sees
+    // working. Forced synthetic working + limited settle must still DONE.
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      workerPort: 9999,
+      lastScreenStatus: undefined,
+      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'screen_update',
+      content: 'Rate limit exceeded. Try again at 10:36 PM.',
+      status: 'working',
+    });
+    await flush();
+    worker.emit('message', {
+      type: 'screen_update',
+      content: 'Rate limit exceeded. Try again at 10:36 PM.',
+      status: 'limited',
+      usageLimit: {
+        limited: true,
+        kind: 'rate',
+        retryAtMs: Date.now() + 60_000,
+        retryLabel: '10:36 PM',
+        retryReady: false,
+      },
+    });
+    await flush();
+
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('limited→limited alone does not DONE (no working edge)', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({
+      worker,
+      workerPort: 9999,
+      lastScreenStatus: undefined,
+      pendingAckReactions: [{ messageId: 'om_a', reactionId: 'rid_om_a' }],
+    });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    const limitedMsg = {
+      type: 'screen_update' as const,
+      content: 'Rate limit exceeded. Try again at 10:36 PM.',
+      status: 'limited' as const,
+      usageLimit: {
+        limited: true as const,
+        kind: 'rate' as const,
+        retryAtMs: Date.now() + 60_000,
+        retryLabel: '10:36 PM',
+        retryReady: false,
+      },
+    };
+    worker.emit('message', limitedMsg);
+    await flush();
+    worker.emit('message', limitedMsg);
+    await flush();
+
+    expect(mocks.addReaction).not.toHaveBeenCalledWith(APP, 'om_a', 'DONE');
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_a']);
+  });
+});
+
+

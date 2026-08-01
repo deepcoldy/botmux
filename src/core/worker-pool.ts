@@ -4667,12 +4667,18 @@ function setupWorkerHandlers(
             source: 'screen_update',
             content: msg.content,
           });
-          // Usage ledger + turn reactions: idle/limited edges are turn
-          // boundaries. Append the token delta, and flip this turn's pending ✋
-          // reactions to ✅ (best-effort, never blocks the status pipeline).
+          // Usage ledger: any settle-to-idle/limited edge records the delta.
+          // Turn reactions are stricter — only flip ✋→✅ after a real busy
+          // period (working/analyzing). Cold-start starting→idle (or the first
+          // prompt-ready before the turn has gone working) must NOT DONE a
+          // message that is still about to be / just being processed. Grok
+          // card-off sessions hit this when the ready-gate settle fired idle
+          // ~seconds after GoGoGo while the CLI was still running the prompt.
           if (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited') {
             recordUsageForDaemonSession(ds);
-            void finishTurnReactions(ds);
+            if (prevStatus === 'working' || prevStatus === 'analyzing') {
+              void finishTurnReactions(ds);
+            }
           }
           if (
             ds.lastScreenStatus === 'idle'
@@ -5790,7 +5796,8 @@ function shouldDropMismatchedHermesFinalOutput(
 /**
  * Turn-end half of the two-phase turn reactions (auto-on for card-off sessions,
  * i.e. streaming card disabled). The 冲! "received" reactions are added per-message at the daemon
- * acceptance point (`noteTurnReceived`); when the worker next returns to idle we
+ * acceptance point (`noteTurnReceived`); the screen_update handler calls this
+ * only on working|analyzing → idle|limited (not cold-start starting→idle), to
  * flip every pending ✋ on this session to ✅ DONE and clear the list. When
  * silentTurnReactions is enabled after a ✋ has already landed, we only remove
  * that received reaction and do not add DONE. Binding the start to the message

@@ -61,31 +61,57 @@ describe('worker pipe initial screen ordering', () => {
     expect(captureIdx).toBeGreaterThan(idleIdx);
   });
 
-  it('runs a busy-pattern idle probe after each submitted input', () => {
+  it('cold-start argv prompts seed working for card-off; Grok holds busy, quiescence seeds idle', () => {
+    // Grok: argv + SessionStart → hold working until assistant_final.
+    // Pi/Gemini: argv but first ready IS turn end → seed working then idle.
+    // Arming is centralized (not bare preparedInitialPrompt) so Riff is safe.
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    expect(source).toContain('shouldArmSpawnArgvInitialPromptBusy');
+    expect(source).toContain('shouldTrackArgvBakedFirstPrompt');
+    expect(source).toContain('spawnArgvNeedsWorkingSeed');
+    expect(source).toContain('Spawn argv initial prompt still in flight — reporting working');
+    expect(source).toContain('Argv-baked first prompt completed — seeded working→idle');
+    expect(source).toContain("publishScreenStatus('working', { force: true })");
+    // Synthetic working must not be rewritten by classifyScreenUsageLimit
+    // (rate-limit banner would otherwise collapse seed to limited→limited).
+    expect(source).toContain('opts?.force');
+    // Short-turn fix: flushPending publishes working immediately on submit.
+    expect(source).toContain("// Immediate working for card-off reaction settle");
+  });
+
+  it('runs a busy-pattern idle probe after each submitted input — except reliableTurnTerminal CLIs', () => {
+    const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+    // Attribution and ZMX's recovery journal now wrap the adapter call inside
+    // flushPending. Anchor the literal write there, then confirm the probe is
+    // gated behind `reliableTurnTerminal !== true` (Grok/Codex own idle via
+    // assistant_final; a post-submit "busy absent" probe was flipping card-off
+    // DONE mid-turn because their busy markers lag after submit).
     const flushStart = source.indexOf('async function flushPending(): Promise<void>');
     const flushEnd = source.indexOf('function sendToPty(', flushStart);
     const flush = source.slice(flushStart, flushEnd);
-    // Attribution and ZMX's recovery journal now wrap the adapter call. Anchor
-    // the literal write inside flushPending, then preserve the probe ordering.
     const writeIdx = flush.indexOf('() => targetAdapter.writeInput(');
-    const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);');
+    const gateIdx = flush.indexOf('if (cliAdapter.reliableTurnTerminal !== true) {', writeIdx);
+    const probeIdx = flush.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);', writeIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);
     expect(writeIdx).toBeGreaterThan(-1);
-    expect(probeIdx).toBeGreaterThan(writeIdx);
+    expect(gateIdx).toBeGreaterThan(writeIdx);
+    expect(probeIdx).toBeGreaterThan(gateIdx);
+    expect(probeIdx).toBeLessThan(gateIdx + 250);
   });
 
-  it('rechecks busy-pattern adapters when a Lark message is queued while busy', () => {
+  it('rechecks busy-pattern adapters when a Lark message is queued while busy — except reliableTurnTerminal', () => {
     const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     const queueLogIdx = source.indexOf('Queued message (${pendingMessages.length} pending)');
-    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);');
+    const gateIdx = source.indexOf('if (cliAdapter?.reliableTurnTerminal !== true) {', queueLogIdx);
+    const queuedProbeIdx = source.indexOf('scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);', queueLogIdx);
     const helperIdx = source.indexOf('function scheduleBusyPatternIdleProbe(source: string): void');
 
     expect(helperIdx).toBeGreaterThan(-1);
     expect(queueLogIdx).toBeGreaterThan(-1);
-    expect(queuedProbeIdx).toBeGreaterThan(queueLogIdx);
+    expect(gateIdx).toBeGreaterThan(queueLogIdx);
+    expect(queuedProbeIdx).toBeGreaterThan(gateIdx);
   });
 
   it('rechecks busy-pattern adapters after first prompt timeout fallback unlocks startup', () => {

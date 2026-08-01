@@ -64,6 +64,8 @@ import {
   pendingInputMayFlush,
   pendingInputAllowsTypeAhead,
   resolveInitialPromptDelivery,
+  shouldArmSpawnArgvInitialPromptBusy,
+  shouldTrackArgvBakedFirstPrompt,
   shouldDeferArgsBakedDurablePrompt,
   shouldDeferInitialPromptForArgLimit,
   shouldStopPendingBatch,
@@ -1167,6 +1169,19 @@ let lastSpawnEffectiveCliSessionId: string | undefined;
 let lastSpawnDeferInitialPrompt = false;
 let lastSpawnQueuedInitialPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
+/**
+ * True only when {@link shouldArmSpawnArgvInitialPromptBusy} says so: argv-
+ * baked first prompt + SessionStart ready (Grok-class). First markPromptReady
+ * then reports working (not idle). Cleared on first consume. Must stay false
+ * for Riff/queue-after-spawn and for quiescence-only argv adapters.
+ */
+let spawnArgvInitialPromptBusy = false;
+/**
+ * True when spawn baked first prompt into argv (any such adapter, incl. Pi /
+ * Gemini). Card-off reactions need a working→idle edge: Grok uses the busy
+ * arm above; quiescence argv adapters seed working then idle at first ready.
+ */
+let spawnArgvNeedsWorkingSeed = false;
 let idleDetector: IdleDetector | null = null;
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -5881,6 +5896,31 @@ function markPromptReadyFromPty(observedBackend: SessionBackend): void {
   }
 }
 
+/**
+ * Push a coarse screen status to the daemon without waiting for the 2s sampler.
+ * Used so card-off reactions see working→idle even on short turns.
+ *
+ * @param force - When true, send `status` as-is and skip classifyScreenUsageLimit.
+ *   Synthetic "working" seeds for card-off reactions MUST force: if the first
+ *   screen already shows a rate-limit banner, classify would rewrite working→
+ *   limited and the seed collapses to limited→limited (no working edge →
+ *   finishTurnReactions never runs). Review: PR #633 third round.
+ */
+function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean }): void {
+  if (!renderer) return;
+  const { content } = renderer.snapshot();
+  const statusPayload = opts?.force
+    ? { status }
+    : classifyScreenUsageLimit(content, status);
+  send({
+    type: 'screen_update',
+    content,
+    ...statusPayload,
+    turnId: currentBotmuxTurnId,
+    dispatchAttempt: currentBotmuxDispatchAttempt,
+  });
+}
+
 function markPromptReady(): void {
   // Only screen readiness plus a non-shell pane leaf may release a launch that
   // was previously blocked. Transcript/task callbacks can arrive while the
@@ -5988,14 +6028,48 @@ function markPromptReady(): void {
       log('prompt-ready with no backend installed — deferring restart success receipt');
     }
   }
-  // Send immediate idle snapshot so Lark card reflects idle status.
-  // BUT: skip when messages are pending — flushPending() will immediately
-  // make the CLI busy, so the idle state is transient and shouldn't appear
-  // in the card.  This avoids a false "就绪" flash on daemon restart
-  // (where the initial prompt is queued before the CLI becomes idle).
-  if (renderer && pendingMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
-    const { content } = renderer.snapshot();
-    send({ type: 'screen_update', content, ...classifyScreenUsageLimit(content, 'idle'), turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  // Send an immediate status snapshot so Lark card / card-off reactions track
+  // real work. Skip pure idle when:
+  //  - messages are pending — flushPending() will immediately make the CLI
+  //    busy (avoids a false "就绪" flash on daemon restart);
+  //  - Grok-class argv+SessionStart arming: first ready is pre-execution, so
+  //    park as working until assistant_final/fireIdle;
+  //  - quiescence argv CLIs (Pi/Gemini/MTR/OpenCode): first ready IS turn end
+  //    — seed working then idle so card-off gets working→idle (review P2).
+  const hasPendingWork =
+    pendingMessages.length > 0
+    || pendingRawInputs.length > 0
+    || pendingSessionRename !== null
+    || isFlushing;
+  if (renderer && !hasPendingWork) {
+    if (spawnArgvInitialPromptBusy) {
+      spawnArgvInitialPromptBusy = false;
+      spawnArgvNeedsWorkingSeed = false;
+      // Stay non-ready so the next genuine end-of-turn idle is a real edge.
+      isPromptReady = false;
+      idleDetector?.reset();
+      // force: rate-limit banner must not rewrite synthetic working → limited
+      publishScreenStatus('working', { force: true });
+      log('Spawn argv initial prompt still in flight — reporting working (not idle) so turn reactions can settle later');
+    } else if (spawnArgvNeedsWorkingSeed) {
+      // First ready = true completion for quiescence argv adapters. Seed a
+      // working edge before idle/limited so daemon finishTurnReactions (gated
+      // on working→idle|limited) still flips card-off GoGoGo on cold-start
+      // one-shots — including when the terminal already shows a rate-limit
+      // banner (classify would otherwise collapse both seeds to limited).
+      spawnArgvNeedsWorkingSeed = false;
+      publishScreenStatus('working', { force: true });
+      // Second tick may classify to limited when the banner is visible — that
+      // is fine: gate allows working→limited.
+      publishScreenStatus('idle');
+      log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
+    } else {
+      publishScreenStatus('idle');
+    }
+  } else if (hasPendingWork) {
+    // Queued path will flip busy via flushPending; drop argv seed flags.
+    spawnArgvInitialPromptBusy = false;
+    spawnArgvNeedsWorkingSeed = false;
   }
   // barrier 注入必须先于本次 pending 用户消息落地（现存发送方均 barrier=false，
   // 该分支目前不触发；机制保留见 pendingInjections 声明处注释）。跳过本次
@@ -6446,6 +6520,11 @@ async function flushPending(): Promise<void> {
   if (isPromptReady) {
     isPromptReady = false;
     idleDetector?.reset();
+    // Immediate working for card-off reaction settle (PR #633 P2): the screen
+    // sampler is 2s — without this a short turn can complete before any
+    // working status is observed, leaving idle→idle and GoGoGo uncleared.
+    // force: same rate-limit rewrite trap as argv seed (review third round).
+    publishScreenStatus('working', { force: true });
   }
 
   try {
@@ -6636,7 +6715,16 @@ async function flushPending(): Promise<void> {
         if (recoveryFailureReason) {
           result = { ...result, submitted: false };
         }
-        scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
+        // Transcript-backed CLIs (Grok/Codex/… reliableTurnTerminal) own idle via
+        // assistant_final → fireIdle. Their busyPattern is often missing for
+        // several seconds after submit (or never matches the current TUI chrome),
+        // so a post-submit "busy marker absent" probe falsely marks prompt ready
+        // and the card-off DONE reaction lands while the turn is still running
+        // (seen live on Grok: GoGoGo → +7s post-submit probe → DONE, then
+        // deferred recheck still saw active PTY output).
+        if (cliAdapter.reliableTurnTerminal !== true) {
+          scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
+        }
       } catch (err: any) {
         recoveryFailureReason = err instanceof SubmissionWriteError
           ? err.recoveryFailureReason
@@ -6844,7 +6932,11 @@ function sendToPty(
     flushPending();  // fire-and-forget async; no-op if already flushing
   } else {
     if (!mergedQueued) log(`Queued message (${pendingMessages.length} pending): "${content.substring(0, 80)}" — ${cliName()} ${awaitingFirstPrompt ? 'still booting' : 'is busy'}`);
-    scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
+    // Same false-idle trap as post-submit (see flushPending): do not let
+    // "busy marker absent" declare ready for transcript-backed CLIs.
+    if (cliAdapter?.reliableTurnTerminal !== true) {
+      scheduleBusyPatternIdleProbe(`${cliName()} queued-message`);
+    }
   }
   return true;
 }
@@ -8187,6 +8279,21 @@ async function spawnCli(
   preparedInitialPrompt = initialPromptDelivery.argvPrompt;
   lastSpawnQueuedInitialPrompt = initialPromptDelivery.queuedContent;
   lastSpawnQueuedInitialPromptLogicalContent = initialPromptDelivery.logicalContent;
+  // Argv-baked first prompt tracking (PR #633 P2 / second-round review):
+  //  - needsWorkingSeed: any argv CLI (Pi/Gemini/MTR/OpenCode/Grok) so card-off
+  //    reactions can form working→idle (seeded at first ready or Grok arm).
+  //  - busy arm: only Grok-class SessionStart (first ready ≠ turn end).
+  const argvBakedOpts = {
+    passesInitialPromptViaArgs: cliAdapter.passesInitialPromptViaArgs === true,
+    preparedInitialPrompt,
+    queuedInitialPrompt: lastSpawnQueuedInitialPrompt,
+  };
+  spawnArgvNeedsWorkingSeed = shouldTrackArgvBakedFirstPrompt(argvBakedOpts);
+  spawnArgvInitialPromptBusy = shouldArmSpawnArgvInitialPromptBusy({
+    ...argvBakedOpts,
+    injectsReadyHook: cliAdapter.injectsReadyHook === true,
+    reliableTurnTerminal: cliAdapter.reliableTurnTerminal === true,
+  });
   if (deferInitialPrompt && preparedDeferredInput) {
     piInitialPromptAdditionalArgs = [...(preparedDeferredInput.additionalArgs ?? [])];
     piInitialPromptEnv = { ...(preparedDeferredInput.env ?? {}) };
