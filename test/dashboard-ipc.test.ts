@@ -19,7 +19,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied } from '../src/services/message-listener-run-preview-store.js';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot, getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { sessionKey } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
@@ -2592,6 +2592,73 @@ describe('role profile IPC routes', () => {
       expect(messageChatSpy).toHaveBeenCalledWith('cli_listener_run', 'om_match_run');
       expect(forkSpy).toHaveBeenCalledTimes(1);
       expect(forkSpy.mock.calls[0][2]).toMatch(/^mlrp_turn_/);
+    } finally {
+      workerPool.setActiveSessionsRegistry(new Map());
+      forkSpy.mockRestore();
+      messageChatSpy.mockRestore();
+      chatModeSpy.mockRestore();
+      inChatSpy.mockRestore();
+      historySpy.mockRestore();
+    }
+  });
+
+  it('does not match or fork a run-preview session for a history message that explicitly @mentions this bot', async () => {
+    setLarkAppId('cli_listener_run');
+    registerBot({
+      larkAppId: 'cli_listener_run',
+      larkAppSecret: 'secret',
+      cliId: 'codex',
+      workingDir: process.cwd(),
+    });
+    getBot('cli_listener_run').botOpenId = 'ou_this_bot';
+    const activeSessions = new Map<string, any>();
+    const now = Date.now();
+    // Same allowed sender + type as the happy path, but the message explicitly
+    // @mentions THIS bot → realtime/poll routing hands it to normal @-routing,
+    // so preview must NOT match it and run-preview must NOT fork a session.
+    const historySpy = vi.spyOn(larkClient, 'listChatMessagesUntil').mockResolvedValue([
+      {
+        message_id: 'om_mention_run',
+        create_time: String(now - 5_000),
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '@bot CPU 告警' }) },
+        sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
+        mentions: [{ id: { open_id: 'ou_this_bot' }, id_type: 'open_id', name: 'bot' }],
+      },
+    ]);
+    const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const chatModeSpy = vi.spyOn(larkClient, 'getChatMode').mockResolvedValue('topic');
+    const messageChatSpy = vi.spyOn(larkClient, 'getMessageChatId').mockResolvedValue('oc_alerts');
+    const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
+    try {
+      workerPool.setActiveSessionsRegistry(activeSessions);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const res = await fetch(`${base}/api/message-listeners/oc_alerts/run-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          limit: 5,
+          listener: {
+            enabled: true,
+            prompt: '分析告警',
+            senderPolicy: {
+              mode: 'include_only',
+              includeSenderOpenIds: ['ou_allowed'],
+              includeSenderTypes: ['user'],
+            },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          },
+        }),
+      });
+
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.ok).toBe(true);
+      expect(body.matches).toEqual([]);
+      expect(body.results).toEqual([]);
+      // The explicit @mention hands off to normal routing → no session spawned.
+      expect(forkSpy).not.toHaveBeenCalled();
     } finally {
       workerPool.setActiveSessionsRegistry(new Map());
       forkSpy.mockRestore();

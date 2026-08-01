@@ -114,6 +114,45 @@ export function mentionIdentity(m: {
   return out;
 }
 
+/**
+ * Whether a message explicitly @mentions the given bot. SHARED single source of
+ * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
+ * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
+ * "explicit @ hands off to normal routing, not the listener" rule can never
+ * diverge between legs. Matches by open_id OR by app_id (some Lark payloads
+ * identify a bot mention as `{ id_type:'app_id', id:'cli_…' }`), and also scans
+ * post-content inline `at` tags (post messages may not populate `mentions`).
+ */
+export function messageMentionsBot(
+  message: { mentions?: any[]; content?: string } | null | undefined,
+  larkAppId: string | undefined,
+  botOpenId: string | undefined,
+): boolean {
+  if (!botOpenId && !larkAppId) return false;
+  const mentions: any[] = message?.mentions ?? [];
+  for (const m of mentions) {
+    const ident = mentionIdentity(m);
+    if (botOpenId && ident.openId === botOpenId) return true;
+    if (larkAppId && ident.appId === larkAppId) return true;
+  }
+  // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
+  if (botOpenId) {
+    try {
+      const content = JSON.parse(message?.content ?? '{}');
+      const inner = content.zh_cn ?? content.en_us ?? content;
+      if (Array.isArray(inner?.content)) {
+        for (const paragraph of inner.content) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const node of paragraph) {
+            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+          }
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }
+  return false;
+}
+
 export function extractMentionIdentities(message: {
   mentions?: Array<{
     key?: string;

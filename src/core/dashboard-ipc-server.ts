@@ -72,7 +72,7 @@ import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
 import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
-import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent } from '../im/lark/message-parser.js';
+import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
 import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, suspendActiveSessionsForBot } from './session-manager.js';
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -2531,6 +2531,11 @@ async function collectMessageListenerPreviewMatches(
     limit,
     senderForMessage: dashboardHistoryMessageSender,
     appIdToOpenId,
+    // Mirror realtime/poll routing: a message that explicitly @mentions this bot
+    // hands off to normal @-routing, NOT the listener — so preview/run-preview
+    // must apply the same gate (else preview over-counts and run-preview would
+    // spawn a session for a message live routing never sends to the listener).
+    explicitlyMentionedThisBot: (message) => messageMentionsBot(message, larkAppId, bot.botOpenId),
   });
 }
 

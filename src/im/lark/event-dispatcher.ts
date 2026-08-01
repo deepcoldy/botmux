@@ -16,7 +16,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -1025,39 +1025,18 @@ export function isBotMentioned(larkAppId: string, message: any, _senderOpenId: s
     return false;
   }
 
-  // 1. Check message.mentions array (populated for user-sent text messages).
-  //    mentionOpenId() tolerates both the WS event object shape and the REST
-  //    string shape, so a Lark mention-shape change can't silently break
-  //    @-detection (which would make the bot ignore every @ with no error).
-  const mentions: any[] = message.mentions ?? [];
   // Early-warning: today's WS events carry mention.id as an object; the REST
   // API carries a bare string. A string-form id on the event path means Lark
   // has converged the event onto the REST shape — surface it (once) so a silent
-  // @-routing regression announces itself even though mentionOpenId absorbs it.
+  // @-routing regression announces itself even though the shared gate absorbs it.
+  const mentions: any[] = message?.mentions ?? [];
   if (!warnedStringMentionShape && mentions.some((m: any) => typeof m?.id === 'string')) {
     warnedStringMentionShape = true;
     logger.warn(`[${larkAppId}] mention.id arrived in string form on the event path — Lark may have converged the WS event onto the REST shape. mentionOpenId() absorbs it, but verify group @-routing. (logged once per process)`);
   }
-  if (mentions.some((m: any) => mentionMatchesBot(m, larkAppId, botOpenId))) {
-    return true;
-  }
 
-  // 2. Check post content for inline at tags (bot-sent post messages may not
-  //    populate message.mentions — the @mention is embedded in the content structure)
-  try {
-    const content = JSON.parse(message.content ?? '{}');
-    const inner = content.zh_cn ?? content.en_us ?? content;
-    if (Array.isArray(inner?.content)) {
-      for (const paragraph of inner.content) {
-        if (!Array.isArray(paragraph)) continue;
-        for (const node of paragraph) {
-          if (node.tag === 'at' && node.user_id === botOpenId) return true;
-        }
-      }
-    }
-  } catch { /* ignore parse errors */ }
-
-  return false;
+  // Single source of truth shared with the poll + dashboard-preview legs.
+  return messageMentionsBot(message, larkAppId, botOpenId);
 }
 
 /** Does this message @mention a *specific other member* (a person or bot that
