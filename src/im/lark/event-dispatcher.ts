@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, findOncallChat, getOwnerOpenId, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatBotMembers, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -58,7 +58,7 @@ import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
-import { evaluateMessageListener, type MessageListenerMatch } from '../../services/message-listener.js';
+import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
   VC_BOT_MEETING_ACTIVITY_EVENT,
@@ -1835,53 +1835,6 @@ async function dispatchPolledMessageListenerMatch(input: {
   }));
 }
 
-/**
- * Canonicalize a polled-history sender to the identity domain the listener
- * config is keyed on (open_id). The message-list API reports bot senders by
- * app_id, but listener sender filters store per-app open_ids. We resolve a bot
- * app_id → open_id via the chat's bot roster (configured siblings + observed +
- * live members/bots). A bot we cannot map stays unverified so the matcher can
- * fail closed on open_id-based exclusion. Non-bot senders (open_id already)
- * pass through verified.
- */
-function resolvePolledSenderIdentity(
-  sender: { senderOpenId?: string; senderTypeRaw?: string; senderIdType?: string },
-  appIdToOpenId: Map<string, string>,
-): { senderOpenId?: string; identityUnverified: boolean } {
-  const isBotAppId = sender.senderIdType === 'app_id'
-    || sender.senderTypeRaw === 'app'
-    || sender.senderTypeRaw === 'bot';
-  if (!isBotAppId || !sender.senderOpenId) {
-    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
-  }
-  // Already an open_id (some history rows carry open_id for bots) → verified.
-  if (sender.senderOpenId.startsWith('ou_')) {
-    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
-  }
-  const mapped = appIdToOpenId.get(sender.senderOpenId);
-  if (mapped) return { senderOpenId: mapped, identityUnverified: false };
-  // Third-party bot with no known app_id→open_id mapping: keep the app_id but
-  // flag it unverified so exclusion fails closed.
-  return { senderOpenId: sender.senderOpenId, identityUnverified: true };
-}
-
-async function buildChatBotAppIdToOpenId(larkAppId: string, chatId: string): Promise<Map<string, string>> {
-  const map = new Map<string, string>();
-  try {
-    for (const member of await listChatBotMembers(larkAppId, chatId)) {
-      // openId is the observer-scoped open_id; larkAppId here is the peer bot's
-      // app_id. Only record real open_id handles (skip the app_id fallback that
-      // listChatBotMembers uses when no open_id is known).
-      if (member.larkAppId && member.openId && member.openId.startsWith('ou_')) {
-        map.set(member.larkAppId, member.openId);
-      }
-    }
-  } catch (err) {
-    logger.debug(`[message-listener:${larkAppId}] bot roster unavailable for ${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return map;
-}
-
 async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
   const bot = getBot(larkAppId);
   const chatIds = enabledMessageListenerChatIds(bot);
@@ -1906,13 +1859,11 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
       continue;
     }
 
-    // Build the app_id→open_id map once per chat so bot senders (reported by
-    // app_id in history) match sender filters keyed on open_id, and unmappable
-    // third-party bots fail closed on exclusion. Only paid for when this chat
-    // actually has messages to consider.
-    const appIdToOpenId = messages.length > 0
-      ? await buildChatBotAppIdToOpenId(larkAppId, chatId)
-      : new Map<string, string>();
+    // Build the app_id→open_id map once per chat (shared with the dashboard
+    // preview leg) so bot senders (reported by app_id in history) match sender
+    // filters keyed on open_id, and unprovable bots fail closed on exclusion.
+    const candidateBotAppIds = collectListenerBotAppIds(messages, historyMessageSender);
+    const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
 
     for (const message of messages) {
       const messageId = String(message?.message_id ?? '');
@@ -1922,7 +1873,7 @@ async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandle
 
       const data = larkReceiveEventFromHistoryMessage(message, chatId);
       const rawSender = historyMessageSender(message);
-      const resolved = resolvePolledSenderIdentity(rawSender, appIdToOpenId);
+      const resolved = resolveListenerSenderIdentity(rawSender, appIdToOpenId);
       const match = evaluateMessageListener({
         bot,
         chatId,

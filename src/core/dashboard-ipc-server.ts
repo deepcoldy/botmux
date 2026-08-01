@@ -103,6 +103,8 @@ import {
   MAX_MESSAGE_LISTENER_PROMPT_BYTES,
   normalizeMessageListenerPreviewLimit,
   previewMessageListenerMatches,
+  buildListenerBotAppIdToOpenId,
+  collectListenerBotAppIds,
   renderMessageListenerInstruction,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
@@ -2447,7 +2449,7 @@ ipcRoute('PUT', '/api/message-listeners/:chatId', async (req, res, p) => {
   jsonRes(res, 200, { ok: true, listener: result.listener });
 });
 
-function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string } {
+function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string; senderIdType?: string } {
   const sender = message?.sender ?? {};
   const senderId = sender.id ?? sender.open_id ?? sender.user_id ?? sender.app_id
     ?? message?.sender_id?.open_id ?? message?.sender_id?.user_id ?? message?.sender_id?.app_id;
@@ -2458,6 +2460,7 @@ function dashboardHistoryMessageSender(message: any): { senderOpenId?: string; s
     senderOpenId: typeof senderId === 'string' ? senderId : undefined,
     senderName: typeof senderName === 'string' && senderName.trim() ? senderName.trim() : undefined,
     senderTypeRaw: typeof senderTypeRaw === 'string' ? senderTypeRaw : undefined,
+    senderIdType: typeof senderIdType === 'string' ? senderIdType : undefined,
   };
 }
 
@@ -2519,12 +2522,15 @@ async function collectMessageListenerPreviewMatches(
         (Number.isFinite(createdAt) && (createdAt as number) < cutoff);
     },
   });
+  const candidateBotAppIds = collectListenerBotAppIds(messages, dashboardHistoryMessageSender);
+  const appIdToOpenId = await buildListenerBotAppIdToOpenId(larkAppId, chatId, candidateBotAppIds);
   return previewMessageListenerMatches({
     bot: previewBot,
     chatId,
     messages,
     limit,
     senderForMessage: dashboardHistoryMessageSender,
+    appIdToOpenId,
   });
 }
 

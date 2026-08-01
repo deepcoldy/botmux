@@ -5360,15 +5360,21 @@ function handleCodexAppMarker(body: string): void {
         );
       }
       const dispatchAttempt = currentBotmuxDispatchAttempt;
-      if (startedAtMs !== undefined && shouldSuppressBridgeEmit(
-        { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content },
-        completedAtMs + 5_001,
-        readSendMarkers(),
-        false,
-      )) {
-        log(`${cliName()} final_output suppressed (model already called botmux send)`);
-        emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
-        return;
+      if (startedAtMs !== undefined) {
+        const markers = readSendMarkers();
+        const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: marker.content };
+        if (shouldSuppressBridgeEmit(gateInput, completedAtMs + 5_001, markers, false)) {
+          log(`${cliName()} final_output suppressed (model already called botmux send)`);
+          // Symmetric with the legacy final branch: tell observers (e.g. the
+          // message-listener run-preview lifecycle) that this turn's reply was
+          // the model's explicit botmux send, so it stops showing "running".
+          notifyExplicitReplyObserved(
+            identity.turnId,
+            explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, markers, false),
+          );
+          emitTurnTerminal(identity.turnId, 'completed', undefined, dispatchAttempt);
+          return;
+        }
       }
       send({
         type: 'final_output',

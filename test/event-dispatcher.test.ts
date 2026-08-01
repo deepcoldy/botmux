@@ -60,6 +60,9 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
+const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
+  ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
+} as { ok: true; mappings: Array<{ larkAppId: string; subjectOpenId: string }> } | { ok: false; error: string; message: string }));
 const mockResolveSiblingBot = vi.fn(async () => ({ ok: false, reason: 'default_no_sibling' } as
   { ok: true; larkAppId: string; botName: string; senderOpenId: string } | { ok: false; reason: string }));
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
@@ -88,6 +91,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
   listChatMessages: (...args: any[]) => mockListChatMessages(...args),
   listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
+  resolveCurrentChatBotOpenIdsByLarkAppIds: (...args: any[]) => mockResolveCurrentChatBotOpenIds(...(args as [string, string, string[]])),
   listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
   getUserProfile: (...args: any[]) => mockGetUserProfile(...args),
 }));
@@ -164,6 +168,7 @@ beforeEach(() => {
   mockReadFileSync.mockReset().mockReturnValue('[]');
   mockListChatMessages.mockReset().mockResolvedValue([]);
   mockListChatMessagesUntil.mockReset().mockResolvedValue([]);
+  mockResolveCurrentChatBotOpenIds.mockReset().mockResolvedValue({ ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution' });
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
@@ -1634,10 +1639,18 @@ describe('message listener polling backfill', () => {
       },
     });
     handlers = makeHandlers();
-    // Chat bot roster provides the app_id -> open_id mapping.
-    mockListChatBotMembers.mockResolvedValue([
-      { larkAppId: OTHER_BOT_APP_ID, openId: OTHER_BOT_OPEN_ID, name: 'BotB', displayName: 'Argos', source: 'configured', hasTeamRole: false, mentionable: true, mentionSource: 'cross-ref' },
+    // app-bot-b is a CONFIGURED sibling bot (so it passes the configured filter
+    // before the strict resolver is consulted).
+    mockGetAllBots.mockReturnValue([
+      { config: { larkAppId: MY_APP_ID } },
+      { config: { larkAppId: OTHER_BOT_APP_ID } },
     ] as any);
+    // The STRICT resolver (three-signal agreement) provides the app_id→open_id
+    // mapping — NOT the discovery helper listChatBotMembers.
+    mockResolveCurrentChatBotOpenIds.mockResolvedValue({
+      ok: true,
+      mappings: [{ larkAppId: OTHER_BOT_APP_ID, subjectOpenId: OTHER_BOT_OPEN_ID }],
+    });
     const card = makeHistoryMessage({
       senderAppId: OTHER_BOT_APP_ID,
       senderType: 'app',
@@ -1676,8 +1689,9 @@ describe('message listener polling backfill', () => {
       },
     });
     handlers = makeHandlers();
-    // Empty roster: the third-party bot's app_id cannot be resolved to open_id.
-    mockListChatBotMembers.mockResolvedValue([] as any);
+    // A genuine third-party app_id is not configured, so it is never even sent
+    // to the strict resolver (which would reject the whole batch anyway) and
+    // stays unverified. Assert the resolver is not consulted for it.
     const card = makeHistoryMessage({
       senderAppId: 'app-third-party',
       senderType: 'app',
@@ -1694,6 +1708,8 @@ describe('message listener polling backfill', () => {
 
     // Cannot prove it is not the excluded bot → must not trigger.
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    // A non-configured third-party app_id is never sent to the strict resolver.
+    expect(mockResolveCurrentChatBotOpenIds).not.toHaveBeenCalled();
   });
 
   it('starts polling after a listener is enabled at runtime', async () => {

@@ -262,6 +262,82 @@ describe('message listener evaluation', () => {
     });
   });
 
+  it('preview resolves a bot app_id to open_id via the shared map and fails closed without it', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: '分析卡片',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: ['ou_argos'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+    const messages = [{
+      message_id: 'om_card',
+      create_time: '3000',
+      msg_type: 'interactive',
+      body: { content: JSON.stringify({ header: { title: { content: '告警' } }, body: { elements: [] } }) },
+      sender: { id: 'cli_argos', id_type: 'app_id', sender_type: 'app', sender_name: 'Argos' },
+    }];
+    const senderForMessage = (m: any) => ({
+      senderOpenId: m.sender.id,
+      senderIdType: m.sender.id_type,
+      senderTypeRaw: m.sender.sender_type,
+      senderName: m.sender.sender_name,
+    });
+
+    // Without a map: app_id stays unverified → include-only (open_id list) does not match.
+    expect(previewMessageListenerMatches({ bot: state, chatId: 'oc_chat', limit: 5, messages, senderForMessage })).toHaveLength(0);
+
+    // With the strict app_id→open_id map: resolves to ou_argos → matches include-only.
+    const withMap = previewMessageListenerMatches({
+      bot: state,
+      chatId: 'oc_chat',
+      limit: 5,
+      messages,
+      senderForMessage,
+      appIdToOpenId: new Map([['cli_argos', 'ou_argos']]),
+    });
+    expect(withMap).toHaveLength(1);
+    expect(withMap[0]).toMatchObject({ messageId: 'om_card', senderName: 'Argos' });
+  });
+
+  it('preview fails closed for an unresolved bot app_id under an open_id exclusion', () => {
+    const state = bot({
+      messageListeners: {
+        oc_chat: {
+          enabled: true,
+          prompt: 'listen',
+          senderPolicy: {
+            mode: 'all_except_excluded',
+            excludeSenderOpenIds: ['ou_muted'],
+            includeSenderTypes: ['bot'],
+          },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+        },
+      },
+    });
+    const messages = [{
+      message_id: 'om_x',
+      create_time: '3000',
+      msg_type: 'interactive',
+      body: { content: JSON.stringify({ header: { title: { content: 'x' } }, body: { elements: [] } }) },
+      sender: { id: 'cli_unknown', id_type: 'app_id', sender_type: 'app' },
+    }];
+    const senderForMessage = (m: any) => ({
+      senderOpenId: m.sender.id,
+      senderIdType: m.sender.id_type,
+      senderTypeRaw: m.sender.sender_type,
+    });
+    // No map → unverified bot + non-empty open_id exclude → fail closed (no preview match).
+    expect(previewMessageListenerMatches({ bot: state, chatId: 'oc_chat', limit: 5, messages, senderForMessage })).toHaveLength(0);
+  });
+
   it('does not hijack explicit mentions or existing topics', () => {
     const state = bot({
       messageListeners: {

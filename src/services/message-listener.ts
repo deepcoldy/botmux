@@ -1,5 +1,7 @@
-import type { BotState, MessageListenerConfig } from '../bot-registry.js';
+import { getAllBots, type BotState, type MessageListenerConfig } from '../bot-registry.js';
 import { extractCardContent, unwrapUserDslContent } from '../im/lark/message-parser.js';
+import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
+import { logger } from '../utils/logger.js';
 
 export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 
@@ -237,6 +239,106 @@ export function evaluateMessageListener(input: {
   };
 }
 
+/** Raw sender fields as parsed from a message (realtime event or REST history). */
+export interface ListenerRawSender {
+  senderOpenId?: string;
+  senderName?: string;
+  senderTypeRaw?: string;
+  senderIdType?: string;
+}
+
+/**
+ * Canonicalize a message sender to the identity domain listener configs are
+ * keyed on (open_id). SHARED by every leg that feeds evaluateMessageListener
+ * (30s poll backfill AND dashboard preview/run-preview) so they can never
+ * diverge on identity handling.
+ *
+ * Bots are reported by app_id in the REST message-history API; a listener's
+ * sender filters store per-app open_ids. We map app_id → open_id ONLY via an
+ * authorization-grade map (see buildListenerBotAppIdToOpenId, which uses the
+ * strict resolver). A bot we cannot prove stays `identityUnverified`, so the
+ * matcher fails closed on open_id-based exclusion. Non-bot senders and bots
+ * already carrying an open_id pass through verified.
+ */
+export function resolveListenerSenderIdentity(
+  sender: ListenerRawSender,
+  appIdToOpenId: Map<string, string>,
+): { senderOpenId?: string; identityUnverified: boolean } {
+  const isBotAppId = sender.senderIdType === 'app_id'
+    || sender.senderTypeRaw === 'app'
+    || sender.senderTypeRaw === 'bot';
+  if (!isBotAppId) {
+    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
+  }
+  // A bot with no sender id at all cannot be evaluated against open_id filters.
+  if (!sender.senderOpenId) {
+    return { senderOpenId: undefined, identityUnverified: true };
+  }
+  // Already an open_id (some history rows carry open_id for bots) → verified.
+  if (sender.senderOpenId.startsWith('ou_')) {
+    return { senderOpenId: sender.senderOpenId, identityUnverified: false };
+  }
+  const mapped = appIdToOpenId.get(sender.senderOpenId);
+  if (mapped) return { senderOpenId: mapped, identityUnverified: false };
+  // app_id-form bot we could not strictly resolve: keep the app_id but flag it
+  // unverified so open_id-based exclusion fails closed.
+  return { senderOpenId: sender.senderOpenId, identityUnverified: true };
+}
+
+/**
+ * Build an authorization-grade app_id → open_id map for the candidate bot
+ * senders. Uses the STRICT resolver (three-signal agreement, never the stale
+ * discovery stores) and only asks about CONFIGURED app_ids (the strict resolver
+ * rejects the whole batch on any non-configured subject, and a genuine
+ * third-party bot must stay unverified regardless). Anything unproven is absent
+ * from the map → resolveListenerSenderIdentity marks it unverified.
+ *
+ * SHARED by the poll and preview legs so both resolve identity identically.
+ */
+export async function buildListenerBotAppIdToOpenId(
+  larkAppId: string,
+  chatId: string,
+  candidateAppIds: Set<string>,
+): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  if (candidateAppIds.size === 0) return map;
+  const configuredAppIds = new Set(getAllBots().map(b => b.config.larkAppId).filter(Boolean));
+  const subjectAppIds = [...candidateAppIds].filter(appId => configuredAppIds.has(appId));
+  if (subjectAppIds.length === 0) return map;
+  try {
+    const resolution = await resolveCurrentChatBotOpenIdsByLarkAppIds(larkAppId, chatId, subjectAppIds);
+    if (resolution.ok) {
+      for (const mapping of resolution.mappings) {
+        if (mapping.larkAppId && mapping.subjectOpenId) {
+          map.set(mapping.larkAppId, mapping.subjectOpenId);
+        }
+      }
+    } else {
+      logger.debug(`[message-listener:${larkAppId}] strict bot-id resolution declined for ${chatId.substring(0, 12)}: ${resolution.error}`);
+    }
+  } catch (err) {
+    logger.debug(`[message-listener:${larkAppId}] strict bot-id resolution threw for ${chatId.substring(0, 12)}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return map;
+}
+
+/** Collect the app_id-form bot senders present in a message batch (the only
+ *  subjects worth asking the strict resolver about). */
+export function collectListenerBotAppIds(
+  messages: any[],
+  senderForMessage: (message: any) => ListenerRawSender,
+): Set<string> {
+  const appIds = new Set<string>();
+  for (const message of messages) {
+    const s = senderForMessage(message);
+    const isBotAppId = s.senderIdType === 'app_id' || s.senderTypeRaw === 'app' || s.senderTypeRaw === 'bot';
+    if (isBotAppId && s.senderOpenId && !s.senderOpenId.startsWith('ou_')) {
+      appIds.add(s.senderOpenId);
+    }
+  }
+  return appIds;
+}
+
 export function normalizeMessageListenerPreviewLimit(raw: unknown): number {
   const value = typeof raw === 'number' ? raw : Number(raw);
   if (!Number.isFinite(value)) return DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT;
@@ -248,23 +350,29 @@ export function previewMessageListenerMatches(input: {
   chatId: string;
   messages: any[];
   limit: number;
-  senderForMessage(message: any): { senderOpenId?: string; senderName?: string; senderTypeRaw?: string };
+  senderForMessage(message: any): ListenerRawSender;
+  /** Authorization-grade app_id → open_id map (see buildListenerBotAppIdToOpenId).
+   *  Omitted → every bot sender in app_id form is treated as unverified. */
+  appIdToOpenId?: Map<string, string>;
   explicitlyMentionedThisBot?: (message: any, senderOpenId?: string) => boolean;
 }): MessageListenerPreviewMatch[] {
   const limit = normalizeMessageListenerPreviewLimit(input.limit);
+  const appIdToOpenId = input.appIdToOpenId ?? new Map<string, string>();
   const matches: MessageListenerPreviewMatch[] = [];
   for (const message of input.messages) {
     const messageId = String(message?.message_id ?? '');
     if (!messageId) continue;
     const sender = input.senderForMessage(message);
+    const resolved = resolveListenerSenderIdentity(sender, appIdToOpenId);
     const match = evaluateMessageListener({
       bot: input.bot,
       chatId: input.chatId,
       message,
-      senderOpenId: sender.senderOpenId,
+      senderOpenId: resolved.senderOpenId,
       senderName: sender.senderName,
       senderTypeRaw: sender.senderTypeRaw,
-      explicitlyMentionedThisBot: input.explicitlyMentionedThisBot?.(message, sender.senderOpenId) ?? false,
+      senderIdentityUnverified: resolved.identityUnverified,
+      explicitlyMentionedThisBot: input.explicitlyMentionedThisBot?.(message, resolved.senderOpenId) ?? false,
     });
     if (!match) continue;
     matches.push({
