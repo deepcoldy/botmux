@@ -27,9 +27,11 @@ mkdir -p ~/botmux-roles/<appId>/shared/default/knowledge
 `<角色库根>/<larkAppId>` 纳入白名单（`src/adapters/cli/fs-policy.ts`），`botmux role switch`
 的越界校验也按它收窄到本 bot 自己的子树（`validateRoleLibraryPath()` 的 `ownAppId`）。
 目录名换成别的，开了 `sandbox: true` 的 bot 角色系统会**整体 EPERM**（列/切/新建角色、
-切换后写 knowledge 全部失败），跨 bot 切换也拦不住。appId 同时是 botmux 其余每-bot 资源的
-统一 key（`~/.botmux/bots/<appId>`、`data/sessions-<appId>.json`、`data/attachments/<appId>`、
-`~/.lark-cli-bots/<appId>`），角色库对齐它而非另起一套命名。
+切换后写 knowledge 全部失败），且 `botmux role switch` 对这个 bot **fail-closed 拒绝**
+（`own_role_library_missing`，不会误切进别的 bot 的目录）——迁移后恢复，见第 8 节。appId
+同时是 botmux 其余每-bot 资源的统一 key（`~/.botmux/bots/<appId>`、
+`data/sessions-<appId>.json`、`data/attachments/<appId>`、`~/.lark-cli-bots/<appId>`），
+角色库对齐它而非另起一套命名。
 
 人类可读名不写在目录名里——写在各角色目录 `.botmux-dir.json` 的 `name`（卡片脚注与
 「切到XX」匹配都读它）。同理下一层角色目录名也必须是 ASCII slug，见下。
