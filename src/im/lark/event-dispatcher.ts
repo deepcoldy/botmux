@@ -16,7 +16,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseForceTopicInvocation } from '../../core/command-handler.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
@@ -1146,23 +1146,6 @@ function mentionMatchesBot(m: any, larkAppId: string, botOpenId?: string): boole
   // flow through mentionOpenId(), which is persisted and used as an open_id.
   const appId = mentionAppId(m);
   return Boolean(larkAppId && appId === larkAppId);
-}
-
-function mentionIdType(m: any): string | undefined {
-  if (!m || typeof m !== 'object') return undefined;
-  if (typeof m.id_type === 'string') return m.id_type;
-  if (typeof m.idType === 'string') return m.idType;
-  return undefined;
-}
-
-function mentionAppId(m: any): string | undefined {
-  if (!m || typeof m !== 'object') return undefined;
-  if (typeof m.appId === 'string') return m.appId;
-  if (typeof m.app_id === 'string') return m.app_id;
-  const idType = mentionIdType(m);
-  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
-  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
-  return undefined;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────

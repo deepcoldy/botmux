@@ -616,7 +616,7 @@ describe('message listener evaluation', () => {
           '服务: bytedance.abase2.ecom_alliance_ai',
           '集群: China-North: ecom_alliance_ai',
           'WriteRUUsage: 88.677',
-          '<font color="grey">botmux https://github.com/deepcoldy/botmux</font>',
+          '<font color="grey">[·](https://github.com/deepcoldy/botmux#reply-card-footer-v1)</font>',
           '</card>',
         ].join('\n'),
       }),
@@ -628,7 +628,9 @@ describe('message listener evaluation', () => {
     expect(match?.messageText).toContain('[卡片: [critical] abase2 写流量使用率超过阈值]');
     expect(match?.messageText).toContain('服务: bytedance.abase2.ecom_alliance_ai');
     expect(match?.messageText).toContain('WriteRUUsage: 88.677');
-    expect(match?.messageText).not.toContain('github.com/deepcoldy/botmux');
+    // The botmux reply-card footer signature (grey-font marker anchor) is stripped.
+    expect(match?.messageText).not.toContain('reply-card-footer');
+    expect(match?.messageText).not.toContain('<font');
   });
 
   it('renders listener prompt with separate instruction and observed message blocks', () => {

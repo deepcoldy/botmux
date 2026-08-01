@@ -114,31 +114,63 @@ export function mentionIdentity(m: {
   return out;
 }
 
+/** id_type across both shapes Lark uses (snake_case REST, camelCase legacy). */
+export function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+/**
+ * Extract a bot mention's app_id across ALL shapes Lark has been observed to
+ * use. app_id-form bot mentions must never flow through mentionOpenId() (which
+ * is persisted/used as an open_id), so they are matched separately:
+ *   1. top-level camelCase `m.appId`
+ *   2. top-level snake_case `m.app_id`
+ *   3. string `m.id` with id_type === 'app_id' (REST bare-string OR legacy)
+ *   4. object `m.id.app_id`
+ * Keep this exhaustive: the realtime @-gate (isBotMentioned) depends on it, so
+ * dropping a shape silently un-@'s a bot in that shape.
+ */
+export function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
+}
+
 /**
  * Whether a message explicitly @mentions the given bot. SHARED single source of
  * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
  * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
  * "explicit @ hands off to normal routing, not the listener" rule can never
- * diverge between legs. Matches by open_id OR by app_id (some Lark payloads
- * identify a bot mention as `{ id_type:'app_id', id:'cli_…' }`), and also scans
- * post-content inline `at` tags (post messages may not populate `mentions`).
+ * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
+ * covers every observed app_id shape), and also scans post-content inline `at`
+ * tags (post messages may not populate `mentions`).
  */
 export function messageMentionsBot(
-  message: { mentions?: any[]; content?: string } | null | undefined,
+  message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
   larkAppId: string | undefined,
   botOpenId: string | undefined,
 ): boolean {
   if (!botOpenId && !larkAppId) return false;
   const mentions: any[] = message?.mentions ?? [];
   for (const m of mentions) {
-    const ident = mentionIdentity(m);
-    if (botOpenId && ident.openId === botOpenId) return true;
-    if (larkAppId && ident.appId === larkAppId) return true;
+    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (larkAppId && mentionAppId(m) === larkAppId) return true;
   }
   // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
+  // Realtime events carry the body in `content`; the REST message-list API
+  // (poll + dashboard preview/run-preview) carries it in `body.content` — read
+  // both so the @-gate is identical across all three legs.
   if (botOpenId) {
+    const rawContent = message?.content ?? message?.body?.content;
     try {
-      const content = JSON.parse(message?.content ?? '{}');
+      const content = JSON.parse(rawContent ?? '{}');
       const inner = content.zh_cn ?? content.en_us ?? content;
       if (Array.isArray(inner?.content)) {
         for (const paragraph of inner.content) {
@@ -766,7 +798,7 @@ function extractRenderedCardContent(rawContent: string): string | undefined {
   const body = match[2]
     .split('\n')
     .map(line => line.trimEnd())
-    .filter(line => !isBotmuxFooterLine(line))
+    .filter(line => !isSignedFormatBFooterLine(line))
     .join('\n')
     .trim();
   return [

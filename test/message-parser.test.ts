@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -1354,5 +1354,55 @@ describe('parseEventMessage: mention identity formats', () => {
       idType: 'app_id',
     });
     expect(parsed.mentions?.[0].openId).toBeUndefined();
+  });
+});
+
+// ─── messageMentionsBot: single-source @-gate across realtime/poll/preview ──
+// Regression guard: this replaced three ad-hoc @-detections. It MUST recognize
+// every mention shape the old realtime code did (5 app_id forms + open_id, WS
+// object + REST bare-string) and scan inline `at` tags in BOTH content (realtime
+// event) and body.content (REST message-list). Table-driven so a dropped shape
+// announces itself.
+describe('messageMentionsBot', () => {
+  const BOT_OPEN = 'ou_this_bot';
+  const BOT_APP = 'cli_this_bot';
+
+  const matchCases: Array<[string, any]> = [
+    ['WS object open_id', { mentions: [{ id: { open_id: BOT_OPEN } }] }],
+    ['REST bare-string open_id + id_type', { mentions: [{ id: BOT_OPEN, id_type: 'open_id' }] }],
+    ['REST bare-string open_id (no id_type)', { mentions: [{ id: BOT_OPEN }] }],
+    ['app_id: top-level snake_case', { mentions: [{ app_id: BOT_APP }] }],
+    ['app_id: top-level camelCase', { mentions: [{ appId: BOT_APP }] }],
+    ['app_id: id string + id_type', { mentions: [{ id: BOT_APP, id_type: 'app_id' }] }],
+    ['app_id: id string + camelCase idType', { mentions: [{ id: BOT_APP, idType: 'app_id' }] }],
+    ['app_id: id object', { mentions: [{ id: { app_id: BOT_APP } }] }],
+    ['inline at in realtime content', { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) }],
+    ['inline at in REST body.content', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: BOT_OPEN }]] } }) } }],
+  ];
+  for (const [label, message] of matchCases) {
+    it(`matches: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(true);
+    });
+  }
+
+  const noMatchCases: Array<[string, any]> = [
+    ['a different user open_id', { mentions: [{ id: { open_id: 'ou_someone_else' } }] }],
+    ['a different bot app_id', { mentions: [{ app_id: 'cli_other_bot' }] }],
+    ['no mentions and no inline at', { content: JSON.stringify({ text: 'hello' }) }],
+    ['inline at for another user', { body: { content: JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: 'ou_someone_else' }]] } }) } }],
+    ['empty message', {}],
+  ];
+  for (const [label, message] of noMatchCases) {
+    it(`does not match: ${label}`, () => {
+      expect(messageMentionsBot(message, BOT_APP, BOT_OPEN)).toBe(false);
+    });
+  }
+
+  it('returns false when neither botOpenId nor larkAppId is known', () => {
+    expect(messageMentionsBot({ mentions: [{ id: { open_id: BOT_OPEN } }] }, undefined, undefined)).toBe(false);
+  });
+
+  it('matches an app_id mention even when botOpenId is not yet resolved', () => {
+    expect(messageMentionsBot({ mentions: [{ app_id: BOT_APP }] }, BOT_APP, undefined)).toBe(true);
   });
 });

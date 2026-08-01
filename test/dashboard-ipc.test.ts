@@ -2623,7 +2623,9 @@ describe('role profile IPC routes', () => {
         msg_type: 'text',
         body: { content: JSON.stringify({ text: '@bot CPU 告警' }) },
         sender: { id: 'ou_allowed', sender_type: 'user', sender_name: '张三' },
-        mentions: [{ id: { open_id: 'ou_this_bot' }, id_type: 'open_id', name: 'bot' }],
+        // REST message-list shape: mention id is a bare string + id_type (not
+        // the WS object form) — this is what listChatMessagesUntil returns.
+        mentions: [{ key: '@_user_1', id: 'ou_this_bot', id_type: 'open_id', name: 'bot' }],
       },
     ]);
     const inChatSpy = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
