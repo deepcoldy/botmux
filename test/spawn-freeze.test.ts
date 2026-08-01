@@ -241,22 +241,34 @@ describe('spawn freeze declaration', () => {
 });
 
 describe('deferred spawns', () => {
-  it('queues only the first spawn per session and replays it on release', async () => {
+  it('parks the first spawn and FOLDS later turns into it, replaying one merged opening', async () => {
     const dir = freshDir();
     writeDeclaration(dir, { reason: 'cred-refresh', deadline: NOW + 60_000 });
     const d = deps(dir);
 
-    const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('first') }, d))
-      .toMatchObject({ parked: true });
+    const replays: Array<{ session: string; folded: string[] }> = [];
+    const record = (session: string) => (foldedTurns: { content: string }[]) =>
+      replays.push({ session, folded: foldedTurns.map(t => t.content) });
+
+    // First turn parks.
+    expect(deferSpawnDuringFreeze(
+      { sessionId: 's1', hasPayload: true, foldTurn: { content: 'first' }, replay: record('s1') }, d))
+      .toMatchObject({ disposition: 'parked' });
     // A second turn for the same session must NOT queue a second fork (replaying
-    // two forks would kill and replace the first new worker). `parked: false` is
-    // how the caller learns THIS turn is dropped and has to be reported — the
-    // barrier is a delay, not a queue.
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('second') }, d))
-      .toMatchObject({ parked: false });
-    expect(deferSpawnDuringFreeze({ sessionId: 's2', hasPayload: true, replay: () => replays.push('other') }, d))
-      .toMatchObject({ parked: true });
+    // two forks would kill and replace the first new worker). Instead it is
+    // FOLDED into the parked spawn — retained, not dropped.
+    expect(deferSpawnDuringFreeze(
+      { sessionId: 's1', hasPayload: true, foldTurn: { content: 'second' }, replay: record('s1-again') }, d))
+      .toMatchObject({ disposition: 'folded' });
+    // A third turn folds too.
+    expect(deferSpawnDuringFreeze(
+      { sessionId: 's1', hasPayload: true, foldTurn: { content: 'third' }, replay: record('s1-more') }, d))
+      .toMatchObject({ disposition: 'folded' });
+    // A different session parks independently.
+    expect(deferSpawnDuringFreeze(
+      { sessionId: 's2', hasPayload: true, foldTurn: { content: 'other' }, replay: record('s2') }, d))
+      .toMatchObject({ disposition: 'parked' });
+    // Only two entries — one per session; folds do not add entries.
     expect(deferredSpawnCount()).toBe(2);
     expect(replays).toEqual([]);
 
@@ -266,8 +278,37 @@ describe('deferred spawns', () => {
 
     clearSpawnFreeze(d);
     await waitForPolls();
-    expect(replays.sort()).toEqual(['first', 'other']);
     expect(deferredSpawnCount()).toBe(0);
+    // s1 replayed exactly once (the parked entry), handed the two folded turns
+    // in arrival order; s2 replayed with nothing folded.
+    const s1 = replays.find(r => r.session === 's1');
+    const s2 = replays.find(r => r.session === 's2');
+    expect(replays).toHaveLength(2);
+    expect(s1?.folded).toEqual(['second', 'third']);
+    expect(s2?.folded).toEqual([]);
+  });
+
+  it('hands the parked replay the full folded payloads (structured sidecar, not just text)', async () => {
+    const dir = freshDir();
+    writeDeclaration(dir, { reason: 'cred-refresh', deadline: NOW + 60_000 });
+    const d = deps(dir);
+
+    // A codex-app turn carries its user text in codexAppInput.text (which that
+    // CLI reads INSTEAD of .content). The fold must keep the whole payload so
+    // the sidecar of a later turn is not silently lost.
+    let received: Array<{ content: string; codexAppInput?: { text: string } }> = [];
+    deferSpawnDuringFreeze(
+      { sessionId: 's1', hasPayload: true, foldTurn: { content: 'open', codexAppInput: { text: 'open-text' } },
+        replay: (folded) => { received = folded as typeof received; } }, d);
+    expect(deferSpawnDuringFreeze(
+      { sessionId: 's1', hasPayload: true, foldTurn: { content: 'more', codexAppInput: { text: 'more-text' } },
+        replay: () => {} }, d))
+      .toMatchObject({ disposition: 'folded' });
+
+    clearSpawnFreeze(d);
+    await waitForPolls();
+    // The parked replay gets the folded turn's whole payload, sidecar included.
+    expect(received).toEqual([{ content: 'more', codexAppInput: { text: 'more-text' } }]);
   });
 
   it('releases each session against its own scope', async () => {
@@ -276,10 +317,10 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', hasPayload: true, replay: () => replays.push('a') }, d))
-      .toMatchObject({ parked: true });
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', larkAppId: 'cli_a', hasPayload: true, foldTurn: { content: 'a' }, replay: () => replays.push('a') }, d))
+      .toMatchObject({ disposition: 'parked' });
     // Out of scope: never deferred in the first place.
-    expect(deferSpawnDuringFreeze({ sessionId: 's2', larkAppId: 'cli_b', hasPayload: true, replay: () => replays.push('b') }, d)).toBeNull();
+    expect(deferSpawnDuringFreeze({ sessionId: 's2', larkAppId: 'cli_b', hasPayload: true, foldTurn: { content: 'b' }, replay: () => replays.push('b') }, d)).toBeNull();
     expect(deferredSpawnCount()).toBe(1);
 
     clearSpawnFreeze(d);
@@ -292,22 +333,46 @@ describe('deferred spawns', () => {
     writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 60_000 });
     const d = deps(dir);
 
-    const replays: string[] = [];
+    const replays: Array<{ tag: string; folded: string[] }> = [];
+    const record = (tag: string) => (foldedTurns: { content: string }[]) =>
+      replays.push({ tag, folded: foldedTurns.map(t => t.content) });
     // A warm-up / re-attach parks (some of those exist so a queued raw command
     // reaches a ready CLI — skipping them outright would strand it)…
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup') }, d))
-      .toMatchObject({ parked: true });
-    // …but the first real turn takes the slot from it.
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('real') }, d))
-      .toMatchObject({ parked: true, superseded: true });
-    // A later promptless spawn must NOT displace the real turn.
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup2') }, d))
-      .toMatchObject({ parked: false });
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: record('warmup') }, d))
+      .toMatchObject({ disposition: 'parked' });
+    // …but the first real turn takes the slot from it (displaces, not folds —
+    // the warm-up carried no user content worth keeping).
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, foldTurn: { content: 'real' }, replay: record('real') }, d))
+      .toMatchObject({ disposition: 'superseded' });
+    // A later promptless spawn must NOT displace the real turn, and folds
+    // nothing — it just waits on what is parked (no notice for a warm-up).
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: record('warmup2') }, d))
+      .toMatchObject({ disposition: 'waiting' });
     expect(deferredSpawnCount()).toBe(1);
 
     clearSpawnFreeze(d);
     await waitForPolls();
-    expect(replays).toEqual(['real']);
+    // Only the real turn's replay ran, with nothing folded onto it.
+    expect(replays).toEqual([{ tag: 'real', folded: [] }]);
+  });
+
+  it('a promptless spawn behind another promptless one just waits (no fold, no displace)', async () => {
+    const dir = freshDir();
+    writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 60_000 });
+    const d = deps(dir);
+
+    const replays: string[] = [];
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup1') }, d))
+      .toMatchObject({ disposition: 'parked' });
+    // A second warm-up must not add an entry, fold, or displace — it waits.
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: false, replay: () => replays.push('warmup2') }, d))
+      .toMatchObject({ disposition: 'waiting' });
+    expect(deferredSpawnCount()).toBe(1);
+
+    clearSpawnFreeze(d);
+    await waitForPolls();
+    // The first parked warm-up replays; the second was never queued.
+    expect(replays).toEqual(['warmup1']);
   });
 
   it('drops a parked spawn when its session is closed', async () => {
@@ -316,7 +381,7 @@ describe('deferred spawns', () => {
     const d = deps(dir);
 
     const replays: string[] = [];
-    deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('s1') }, d);
+    deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, foldTurn: { content: 's1' }, replay: () => replays.push('s1') }, d);
     forgetDeferredSpawn('s1');
     expect(deferredSpawnCount()).toBe(0);
 
@@ -332,8 +397,8 @@ describe('deferred spawns', () => {
     const d = { dataDir: () => dir, now: () => now, processAlive: () => true, pollMs: POLL_MS };
 
     const replays: string[] = [];
-    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, replay: () => replays.push('s1') }, d))
-      .toMatchObject({ parked: true });
+    expect(deferSpawnDuringFreeze({ sessionId: 's1', hasPayload: true, foldTurn: { content: 's1' }, replay: () => replays.push('s1') }, d))
+      .toMatchObject({ disposition: 'parked' });
 
     now = NOW + 2_001;
     await waitForPolls();
@@ -351,9 +416,10 @@ describe('freeze announcements', () => {
     // A different session in the same group has its own anchor and must still be
     // told — keying by chat id would silence whoever is waiting in it.
     expect(shouldAnnounceSpawnFreeze(first, 'anchor-2')).toBe(true);
-    // "parked" and "dropped" are different messages, one each.
-    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'dropped')).toBe(true);
-    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'dropped')).toBe(false);
+    // "parked" and "folded" are different messages, one each — the first turn's
+    // "held, continues after release" vs a later turn's "also received".
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'folded')).toBe(true);
+    expect(shouldAnnounceSpawnFreeze(first, 'anchor-1', 'folded')).toBe(false);
 
     // A NEW declaration is a new window: the same chat is told again.
     writeDeclaration(dir, { reason: 'claude-update', deadline: NOW + 400_000, notify: true });
@@ -364,6 +430,6 @@ describe('freeze announcements', () => {
     writeDeclaration(dir, { reason: 'quiet', deadline: NOW + 60_000 });
     const quiet = readActiveSpawnFreeze(deps(dir))!;
     expect(shouldAnnounceSpawnFreeze(quiet, 'anchor-1')).toBe(false);
-    expect(shouldAnnounceSpawnFreeze(quiet, 'anchor-1', 'dropped')).toBe(false);
+    expect(shouldAnnounceSpawnFreeze(quiet, 'anchor-1', 'folded')).toBe(false);
   });
 });

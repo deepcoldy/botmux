@@ -2080,6 +2080,53 @@ export function sendWorkerInput(
   return true;
 }
 
+/**
+ * Merge the turns the user sent while a spawn-freeze held this session into the
+ * one opening turn that gets replayed on release. Only one fork may replay, so
+ * later turns are folded here rather than dropped.
+ *
+ * Both channels are merged, blank-line separated in arrival order:
+ *  - `.content` — the built prompt envelope most CLIs read;
+ *  - `codexAppInput.text` — the structured sidecar codex-app reads INSTEAD of
+ *    `.content`; folding only one channel would silently lose the later turns on
+ *    whichever CLI reads the other.
+ *
+ * The first turn's metadata (attachments, additionalContext, images, ids) is
+ * kept as-is; only the user-visible text of the follow-ups is appended, matching
+ * how `mergeQueuedCodexAppTurn` and the /repo-pending fold treat a merged
+ * opening as one turn with a repeated-metadata-free body.
+ */
+export function foldReplayPayload(
+  first: string | CliTurnPayload,
+  foldedTurns: CliTurnPayload[],
+): string | CliTurnPayload {
+  if (foldedTurns.length === 0) return first;
+  const firstPayload: CliTurnPayload = typeof first === 'string' ? { content: first } : first;
+  const mergedContent = [firstPayload.content, ...foldedTurns.map(t => t.content)]
+    .filter(part => part && part.trim() !== '')
+    .join('\n\n');
+  // A codex-app sidecar is present when either the opening or any folded turn
+  // carried one. Merge its text so codex-app (which reads `.text`, not
+  // `.content`) sees every turn too.
+  const anyCodexApp = firstPayload.codexAppInput
+    ?? foldedTurns.find(t => t.codexAppInput)?.codexAppInput;
+  if (!anyCodexApp) {
+    return typeof first === 'string' && foldedTurns.every(t => !t.codexAppInput)
+      ? mergedContent
+      : { content: mergedContent };
+  }
+  const mergedText = [firstPayload.codexAppInput?.text, ...foldedTurns.map(t => t.codexAppInput?.text)]
+    .filter((part): part is string => !!part && part.trim() !== '')
+    .join('\n\n');
+  return {
+    content: mergedContent,
+    codexAppInput: {
+      ...anyCodexApp,
+      text: mergedText || anyCodexApp.text,
+    },
+  };
+}
+
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -2129,44 +2176,70 @@ export function forkWorker(
     sessionId: deferredSessionId,
     larkAppId: ds.larkAppId,
     hasPayload: gateHasPayload,
-    replay: () => {
+    // Only a payload-bearing turn contributes a foldable payload. The full
+    // payload (not just `.content`) is kept so a codex-app structured sidecar
+    // folds too — its `.text`, not `.content`, is what that CLI consumes.
+    ...(gateHasPayload
+      ? { foldTurn: typeof promptInput === 'string' ? { content: promptInput } : promptInput }
+      : {}),
+    replay: (foldedTurns: CliTurnPayload[]) => {
       // Replay only when this ds is STILL the live session it was queued for:
       // closed, replaced or transferred sessions must never be revived.
       if (
         ds.session.sessionId === deferredSessionId
         && findActiveBySessionId(deferredSessionId) === ds
       ) {
-        forkWorker(ds, promptInput, resumeOrTurnId);
+        // Fold every turn the user sent while frozen into the single opening
+        // (blank-line separated, arrival order). Only one fork may replay — a
+        // second would kill and replace the first new worker — so the merged
+        // payload carries them all rather than dropping the later ones. This
+        // mirrors how the /repo-pending path folds buffered follow-ups into one
+        // <user_message>. Per-message turn-id attribution collapses to this
+        // turn's, which is acceptable for a maintenance-window replay.
+        //
+        // Both channels are merged: `.content` (the built envelope, what most
+        // CLIs read) and `codexAppInput.text` (the structured sidecar codex-app
+        // reads INSTEAD of content). Merging only one would silently drop the
+        // folded turns on whichever CLI reads the other — the very loss this
+        // change removes. With no folded turns the helper returns promptInput
+        // untouched.
+        forkWorker(ds, foldReplayPayload(promptInput, foldedTurns), resumeOrTurnId);
       }
     },
   });
   if (opsFreeze) {
-    const { freeze, parked } = opsFreeze;
+    const { freeze, disposition } = opsFreeze;
     const remainingSec = Math.max(1, Math.ceil((freeze.effectiveUntil - Date.now()) / 1000));
     const anchor = sessionAnchorId(ds);
-    // `parked: false` means this session already has a spawn waiting, so THIS
-    // turn will not be replayed — it is dropped. Say so loudly: the reaction
-    // bookkeeping settles pending turns when the replayed one finishes, so an
-    // unreported drop would show up to the user as "handled".
-    if (parked) {
+    // A folded turn is delayed exactly like the parked one — it rides the same
+    // replay — so both are honest "will be handled after release". `superseded`
+    // displaced only a promptless warm-up, so it behaves like the first parked
+    // payload turn. `waiting` is a promptless spawn arriving behind one already
+    // parked: nothing to fold or displace and no user turn to acknowledge, so it
+    // logs quietly and sends NO notice.
+    const folded = disposition === 'folded';
+    if (disposition === 'waiting') {
       logger.info(
-        `[${tag(ds)}] worker spawn parked by spawn-freeze (reason=${freeze.reason}, `
-        + `~${remainingSec}s left${opsFreeze.superseded ? ', superseded a promptless spawn' : ''})`,
+        `[${tag(ds)}] promptless spawn waiting on an already-parked spawn-freeze entry `
+        + `(reason=${freeze.reason}, ~${remainingSec}s left)`,
       );
-    } else {
-      logger.warn(
-        `[${tag(ds)}] spawn-freeze (reason=${freeze.reason}) already holds a parked spawn for this `
-        + `session — THIS turn will not be replayed and must be re-sent after release `
-        + `(~${remainingSec}s left)`,
-      );
+      return;
     }
-    if (shouldAnnounceSpawnFreeze(freeze, anchor, parked ? 'parked' : 'dropped')) {
+    logger.info(
+      `[${tag(ds)}] worker spawn ${folded ? 'folded into parked spawn' : 'parked'} by spawn-freeze `
+      + `(reason=${freeze.reason}, ~${remainingSec}s left`
+      + `${disposition === 'superseded' ? ', superseded a promptless spawn' : ''})`,
+    );
+    if (shouldAnnounceSpawnFreeze(freeze, anchor, folded ? 'folded' : 'parked')) {
       const gateTurnId = typeof resumeOrTurnId === 'string'
         ? resumeOrTurnId
         : (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null ? resumeOrTurnId.turnId : undefined);
-      const notice = parked
-        ? `🔧 维护中（${freeze.reason}），暂不启动新的 CLI 会话；约 ${remainingSec} 秒后自动继续处理这条消息。`
-        : `🔧 维护中（${freeze.reason}），这条消息不会被自动处理——本会话已有一条在排队。请在约 ${remainingSec} 秒后重发。`;
+      // Transparent delay: the message is retained and replayed after release,
+      // so both notices promise continuation — never "re-send". The folded
+      // notice differs only to acknowledge that a follow-up landed too.
+      const notice = folded
+        ? `🔧 维护中（${freeze.reason}），后续消息也已收到，会和前一条一起在约 ${remainingSec} 秒后自动继续处理。`
+        : `🔧 维护中（${freeze.reason}），暂不启动新的 CLI 会话；消息已收到，约 ${remainingSec} 秒后自动继续处理。`;
       try {
         void requireCallbacks().sessionReply(
           anchor,

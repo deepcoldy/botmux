@@ -4,11 +4,11 @@
  * A maintenance script — credential refresh, `claude` upgrade, workspace
  * rebuild — declares a freeze by writing `<dataDir>/spawn-freeze.json`, and
  * every daemon reads that declaration immediately before it would start a CLI.
- * While the declaration is effective `forkWorker` parks at most one cold spawn
- * per logical session and replays it on release.
+ * While the declaration is effective `forkWorker` parks a session's cold spawn
+ * and replays it on release.
  *
  * What that does and does NOT guarantee, precisely — this is a delay, not a
- * queue:
+ * drop:
  *
  *  - the FIRST message that would have started a CLI in a session is replayed
  *    after release, so it is delayed rather than dropped;
@@ -16,19 +16,21 @@
  *    a queued raw command can be written once the CLI is ready) parks like any
  *    other, but a payload-bearing turn SUPERSEDES it, so a warm-up cannot
  *    consume the slot the first real turn needs;
- *  - a SECOND message to that same session in the same window is NOT parked
- *    (replaying two forks would kill and replace the first new worker), and
- *    nothing else is holding it either: the worker never started, so the
- *    worker-side pre-ready input buffer that normally absorbs follow-up turns
- *    does not exist yet. Such a turn is reported — log, plus a chat notice when
- *    `notify` is on — and has to be re-sent;
- *  - a daemon restart inside the window loses the parked spawns. The
- *    declaration is on disk; the parked closures are not.
+ *  - SUBSEQUENT payload-bearing messages to that same session in the same window
+ *    are FOLDED into that one parked spawn (blank-line separated, in arrival
+ *    order): only one fork may be replayed — a second would kill and replace the
+ *    first new worker — so the turns are merged into it rather than dropped. The
+ *    replayed opening therefore carries every message the user sent while
+ *    frozen; per-message turn-id attribution collapses to the first turn, which
+ *    is the same shape the repo already uses for messages buffered behind a
+ *    pending /repo card;
+ *  - a daemon restart inside the window loses the parked spawn. The declaration
+ *    is on disk; the parked closure is not.
  *
- * Buffering whole turns durably (message id, attachments, reaction settlement,
- * structured CLI input) would make this a delivery queue rather than a gate;
- * that is deliberately out of scope. The limits above are surfaced instead of
- * papered over — keep maintenance windows short.
+ * Persisting the folded turns across a restart (so even a mid-window daemon
+ * bounce loses nothing) would need durable per-turn storage; that is a possible
+ * later step, called out rather than papered over. Keep maintenance windows
+ * short regardless.
  *
  * `pid` is a cooperative identity, not a security boundary: it is only checked
  * for liveness, so a same-user caller could name somebody else's pid (and one
@@ -75,6 +77,7 @@
 import { linkSync, lstatSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from './data-dir.js';
+import type { CliTurnPayload } from '../types.js';
 
 export const SPAWN_FREEZE_FILENAME = 'spawn-freeze.json';
 
@@ -276,14 +279,17 @@ export function activeSpawnFreezeFor(
 
 export interface SpawnFreezeDeferral {
   freeze: ActiveSpawnFreeze;
-  /** False when this session already had a payload-bearing spawn parked — i.e.
-   *  THIS request will not be replayed and the turn behind it is lost unless
-   *  re-sent. */
-  parked: boolean;
-  /** True when parking this request displaced a promptless one (warm-up /
-   *  re-attach). Nothing is lost — that spawn carried no turn — but it is worth
-   *  a log line. */
-  superseded?: boolean;
+  /** How this request was absorbed:
+   *   - `'parked'`      — it became the session's single parked spawn;
+   *   - `'folded'`      — the session already had a payload-bearing spawn parked,
+   *                       so this turn's content was merged into it (replayed as
+   *                       one opening turn, nothing dropped);
+   *   - `'superseded'`  — it displaced a promptless spawn (warm-up / re-attach)
+   *                       that carried no user turn;
+   *   - `'waiting'`     — a promptless spawn arrived behind one already parked;
+   *                       nothing to fold, nothing displaced, no user turn to
+   *                       acknowledge — the caller stays silent. */
+  disposition: 'parked' | 'folded' | 'superseded' | 'waiting';
 }
 
 interface DeferredSpawn {
@@ -291,7 +297,13 @@ interface DeferredSpawn {
   /** A promptless spawn (empty prompt, no structured input) carries no user turn
    *  and may be displaced by one that does. */
   hasPayload: boolean;
-  replay: () => void;
+  /** Extra payload-bearing turns that arrived while this spawn was parked, in
+   *  arrival order. The replay folds them into the opening turn so nothing the
+   *  user sent during the window is dropped. Full payloads (not just text) so a
+   *  codex-app structured sidecar folds too — it, not `.content`, is what that
+   *  CLI actually consumes. */
+  foldedTurns: CliTurnPayload[];
+  replay: (foldedTurns: CliTurnPayload[]) => void;
 }
 
 const deferredSpawns = new Map<string, DeferredSpawn>();
@@ -311,7 +323,8 @@ function flushReleasedSpawns(deps: SpawnFreezeDeps = {}): void {
     // declaration still covers a different one.
     if (activeSpawnFreezeFor(entry.larkAppId, deps)) continue;
     deferredSpawns.delete(sessionId);
-    setImmediate(entry.replay);
+    const folded = entry.foldedTurns;
+    setImmediate(() => entry.replay(folded));
   }
   if (deferredSpawns.size === 0) stopPoll();
 }
@@ -324,36 +337,75 @@ function ensurePoll(deps: SpawnFreezeDeps = {}): void {
 
 /**
  * Park a cold spawn while a freeze applies. Returns null when not frozen (the
- * caller proceeds to spawn), otherwise the freeze plus whether THIS request is
- * the one that got parked.
+ * caller proceeds to spawn), otherwise the freeze plus how THIS request was
+ * absorbed.
  *
- * Only the first request per logical session can be parked: replaying several
- * fork requests would kill and replace the first new worker. Same invariant as
- * `deferWorkerSpawnDuringDeviceIsolation` — and, as the module header spells
- * out, a later turn is genuinely dropped rather than queued elsewhere, so
- * `parked: false` is something the caller must surface, not swallow.
+ * Only one fork per logical session may ever be replayed — replaying two would
+ * kill and replace the first new worker. So the FIRST payload-bearing request is
+ * parked, and every payload-bearing request after it is FOLDED into that parked
+ * spawn (arrival order). The parked replay is handed the folded turns so the
+ * opening it replays carries everything the user sent during the window — the
+ * same "buffer-then-fold-into-one-opening" shape the /repo-pending path uses.
+ *
+ * A promptless spawn (warm-up / re-attach) still parks, but it carries no user
+ * turn, so the first payload-bearing request DISPLACES it (its payload becomes
+ * the new parked spawn; nothing is folded because a promptless spawn has no
+ * content worth keeping).
  */
 export function deferSpawnDuringFreeze(
-  input: { sessionId: string; larkAppId?: string; hasPayload: boolean; replay: () => void },
+  input: {
+    sessionId: string;
+    larkAppId?: string;
+    hasPayload: boolean;
+    /** This turn's payload, folded into an already-parked spawn when one exists.
+     *  Omitted for promptless spawns. */
+    foldTurn?: CliTurnPayload;
+    replay: (foldedTurns: CliTurnPayload[]) => void;
+  },
   deps: SpawnFreezeDeps = {},
 ): SpawnFreezeDeferral | null {
   const freeze = activeSpawnFreezeFor(input.larkAppId, deps);
   if (!freeze) return null;
   const existing = deferredSpawns.get(input.sessionId);
-  // A promptless spawn still has to be parked — some of them exist precisely so
-  // a queued raw command or a dashboard wake gets a CLI — but it must not shut
-  // out the first real turn, so a payload-bearing request displaces it.
-  const superseded = existing !== undefined && !existing.hasPayload && input.hasPayload;
-  const parked = existing === undefined || superseded;
-  if (parked) {
+  ensurePoll(deps);
+
+  // Nothing parked yet: this request becomes the parked spawn.
+  if (existing === undefined) {
     deferredSpawns.set(input.sessionId, {
       larkAppId: input.larkAppId,
       hasPayload: input.hasPayload,
+      foldedTurns: [],
       replay: input.replay,
     });
+    return { freeze, disposition: 'parked' };
   }
-  ensurePoll(deps);
-  return { freeze, parked, ...(superseded ? { superseded: true } : {}) };
+
+  // A payload-bearing request that arrives behind a promptless one takes over:
+  // the warm-up/re-attach carried no user turn, so replacing it loses nothing
+  // and guarantees the first REAL turn owns the replay slot.
+  if (!existing.hasPayload && input.hasPayload) {
+    deferredSpawns.set(input.sessionId, {
+      larkAppId: input.larkAppId,
+      hasPayload: true,
+      foldedTurns: [],
+      replay: input.replay,
+    });
+    return { freeze, disposition: 'superseded' };
+  }
+
+  // The slot is already held by a payload-bearing spawn. Fold this turn's
+  // payload into it so it is delayed, not dropped. A promptless spawn arriving
+  // behind a real one adds nothing to fold (and must not displace it).
+  if (existing.hasPayload && input.hasPayload && input.foldTurn) {
+    existing.foldedTurns.push(input.foldTurn);
+    return { freeze, disposition: 'folded' };
+  }
+
+  // A promptless spawn behind an already-parked spawn (of either kind): keep
+  // waiting on what is parked, fold nothing, displace nothing. There is no user
+  // turn here to acknowledge, so the caller must NOT emit a "message received"
+  // notice for it.
+  return { freeze, disposition: 'waiting' };
 }
 
 /** Drop a parked spawn without replaying it (session closed while frozen). */
@@ -376,13 +428,15 @@ export function deferredSpawnCount(): number {
  * anchor, NOT its chat id): keyed by chat, a second topic in the same group
  * would be silenced even though a different person is waiting in it.
  *
- * `kind` separates the two things worth saying once each: "parked, it continues
- * by itself" and "this one was dropped, re-send it".
+ * `kind` separates the two things worth saying once each: the first turn is
+ * "parked, it continues by itself after release"; a later turn is "folded" —
+ * also received and delayed, worth one distinct acknowledgement so the user
+ * knows the follow-up landed too.
  */
 export function shouldAnnounceSpawnFreeze(
   freeze: ActiveSpawnFreeze,
   anchor: string,
-  kind: 'parked' | 'dropped' = 'parked',
+  kind: 'parked' | 'folded' = 'parked',
 ): boolean {
   if (!freeze.notify) return false;
   if (noticeFreezeId !== freeze.freezeId) {

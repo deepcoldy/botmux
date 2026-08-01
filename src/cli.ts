@@ -4118,8 +4118,8 @@ async function cmdFreeze(): Promise<void> {
   const usage = (): never => {
     console.error('用法: botmux freeze --reason <说明> [--for 120s] [--pid <pid>] [--notify] [--bot <appId>]... [--force]');
     console.error('      botmux freeze --status | --release [--pid <pid>]');
-    console.error('  维护期间禁止本机起新的 CLI 会话；每个会话的第一条消息解冻后自动重放');
-    console.error('  ⚠️ 同一会话在窗口内的后续消息不会排队（会打日志/发提示，需恢复后重发）');
+    console.error('  维护期间禁止本机起新的 CLI 会话；期间消息解冻后自动重放，不会丢');
+    console.error('  ℹ️ 同一会话窗口内的后续消息会折叠进这次重放（一起作为首轮发出），无需重发');
     console.error('  --for     默认 120s，支持 90s / 5m / 裸数字(秒)；上限 10m（daemon 侧硬截断）');
     console.error('  --pid     声明进程 pid（脚本里传 $$）：进程一死立即解冻；--release 带上它只删自己的声明');
     console.error('  --notify  冻结期收到消息时回一条「维护中」；建议 deadline > 30s 才开');
@@ -4996,8 +4996,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --bot <appId>   挂起该 bot 的全部活跃会话
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）
        --dry-run       只列出目标，不执行
-  freeze --reason <说明>  维护窗口内禁止本机起新 CLI 会话（每会话第一条消息解冻后自动重放；
-                   同会话后续消息不排队，会发提示并需重发）
+  freeze --reason <说明>  维护窗口内禁止本机起新 CLI 会话（期间消息解冻后自动重放，不丢；
+                   同会话后续消息折叠进同一次重放，无需重发）
        --for 120s      冻结时长（默认 120s，上限 10m）
        --pid <pid>     声明进程（脚本传 $$）：进程一死立即解冻
        --notify        冻结期回一条「维护中」（deadline > 30s 建议开）
