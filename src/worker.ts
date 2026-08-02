@@ -8377,6 +8377,12 @@ async function spawnCli(
     resume: effectiveResume,
     workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
+    // Native session fork (Claude --fork-session / codex fork): resume the
+    // source transcript but branch into a fresh CLI-minted id. Only on the
+    // child's first spawn (cfg.forkSession) AND only when we actually resume —
+    // if the resume target was dropped (fallBackToFresh), there is nothing to
+    // fork from, so a fresh session is spawned instead.
+    forkSession: cfg.forkSession === true && effectiveResume,
     initialPrompt: preparedInitialPrompt,
     botName: cfg.botName,
     botOpenId: cfg.botOpenId,

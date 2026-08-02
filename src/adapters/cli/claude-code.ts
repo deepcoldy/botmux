@@ -828,10 +828,23 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, disableCliBypass, skillPluginDir }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
+        // Session fork: resume the source transcript but write forward into a
+        // fresh CLI-minted session id, leaving the source untouched. Claude's
+        // interactive `/fork` refuses when the session was launched with
+        // restriction flags (skip-permissions / custom system prompt / tool
+        // allowlist), but the cold-start `--fork-session` flag does NOT — botmux
+        // re-passes those same flags to the forked spawn, so the copy runs with
+        // identical restrictions and the anti-privilege-escalation guard never
+        // fires (verified 2026-08-02, claude 2.1.220). Claude mints the new id
+        // and rewrites the copy's internal per-line ids itself; botmux reads the
+        // new id back from the fresh transcript (resolveJsonlFromPid).
+        if (forkSession) {
+          args.push('--fork-session');
+        }
       } else {
         args.push('--session-id', sessionId);
       }

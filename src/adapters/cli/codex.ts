@@ -154,7 +154,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, disableCliBypass, readIsolation, remoteWsUrl, remoteThreadId }) {
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -219,8 +219,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const codexSessionId = resume
         ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)
         : undefined;
+      // Session fork: `codex fork <id>` copies the source rollout up to its tip
+      // into a NEW rollout + session id (session_meta records forked_from_id),
+      // leaving the source rollout untouched. Unlike Claude, Codex has no
+      // privilege-escalation guard on fork. Falls back to plain `resume` when we
+      // somehow lack a source id (nothing to fork from).
       const codexArgs = codexSessionId
-        ? ['resume', ...baseArgs, codexSessionId]
+        ? [forkSession ? 'fork' : 'resume', ...baseArgs, codexSessionId]
         : freshArgs;
       return codexArgs;
     },
