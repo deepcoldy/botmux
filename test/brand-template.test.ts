@@ -20,6 +20,13 @@ describe('renderBrandTemplate', () => {
       .toBe('[botmux](https://github.com/deepcoldy/botmux)');
   });
 
+  it('statusline variables render agent, model, title and context percentage', () => {
+    expect(renderBrandTemplate('{agent} · {model} · {title} · Context {contextPercent}', '/tmp/x', {
+      agent: '客服 Agent', model: 'sonnet', title: '回复用户', contextPercent: 37.4,
+    })).toBe('客服 Agent · sonnet · 回复用户 · Context 37%');
+    expect(renderBrandTemplate('Context {contextPercent}', '/tmp/x')).toBe('Context —');
+  });
+
   it('{cwdName} 取目录 basename，{cwd} 取全路径', () => {
     const dir = mkdtempSync(join(tmpdir(), 'brand-'));
     expect(renderBrandTemplate('{cwdName}', dir)).toBe(escText(basename(dir)));

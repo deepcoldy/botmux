@@ -139,10 +139,16 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 
 ## Cards and terminal
 
+Minimal opt-in configuration (omit `template` to use the default `agent · model · Context percentage` footer):
+
+```json
+"statusline": { "enabled": true }
+```
+
 | Field | Description |
 |------|------|
 | `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
-| Session statusline | A user can ask the agent to run `botmux footer set '<template>'` to override the current session footer; `botmux footer clear` restores the bot-level `brandLabel`. Variables: `{cli}`, `{model}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. Card rendering only reads the stored template and never executes an external command |
+| `statusline` | **Off by default**. Explicitly set `{ "enabled": true }` to enable the dynamic footer; the default template is `{agent} · {model} · Context {contextPercent}`, and `template` can override it. Variables: `{agent}`, `{model}`, `{contextPercent}`, `{cli}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. In a session, ask the agent to run `botmux statusline set '<template>'`; `botmux statusline clear` restores the bot default. When disabled, stale session templates are not rendered |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
 | `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |

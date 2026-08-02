@@ -99,6 +99,8 @@ import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import {
   loadBotConfigs,
   resolveBrandLabel,
+  resolveStatusline,
+  resolveStatuslineAgentName,
   resolveUsageDisplay,
   type BotConfig,
 } from './bot-registry.js';
@@ -7652,7 +7654,11 @@ async function spawnCli(
       BOTMUX_CHAT_ID: cfg.chatId,
       BOTMUX_LARK_APP_ID: cfg.larkAppId,
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
+      BOTMUX_STATUSLINE_ENABLED: resolveStatusline(cfg.larkAppId) ? '1' : '0',
+      BOTMUX_AGENT_NAME: cfg.statuslineAgentName ?? resolveStatuslineAgentName(cfg.larkAppId),
     };
+    const riffStatusline = resolveStatusline(cfg.larkAppId);
+    if (riffStatusline) sessionEnv.BOTMUX_STATUSLINE_TEMPLATE = riffStatusline.template;
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
     // rebuilds a synthetic BotConfig from env (no bots.json), and would otherwise
     // drop apiOnly → getBotClient would not throw → `botmux send` could reach
@@ -8518,6 +8524,11 @@ async function spawnCli(
     if (typeof bl === 'string') childEnv.BOTMUX_BRAND_LABEL = bl;
   }
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
+  const childStatusline = resolveStatusline(cfg.larkAppId);
+  childEnv.BOTMUX_STATUSLINE_ENABLED = childStatusline ? '1' : '0';
+  childEnv.BOTMUX_AGENT_NAME = cfg.statuslineAgentName ?? resolveStatuslineAgentName(cfg.larkAppId);
+  if (childStatusline) childEnv.BOTMUX_STATUSLINE_TEMPLATE = childStatusline.template;
+  else delete childEnv.BOTMUX_STATUSLINE_TEMPLATE;
   // NOTE: under read isolation `botmux send` gets this bot's secret from the worker-
   // written cred FILE in its BOT_HOME (send-cred.json, see sendCredFilePath) located
   // via the BOTMUX_LARK_APP_ID above — NOT from the env. The secret is deliberately kept OUT

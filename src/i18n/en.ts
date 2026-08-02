@@ -613,7 +613,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_videos': '- Attach video previews: `botmux send --videos /path/to/replay.mp4 --video-covers /path/to/cover.png --no-mention "preview"`',
   'ai.routing.usage_history': '- Need prior context? Use `botmux history` to read this session\'s history.',
   'ai.routing.usage_bots_list': '- List collaborator bots in the group: `botmux bots list`',
-  'ai.routing.usage_footer': '- When the user asks to customize reply-card footer status, run `botmux footer set <template>` for this session. Variables: `{cli}`, `{model}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. `botmux footer clear` restores the bot default.',
+  'ai.routing.usage_footer': '- When the user asks to customize reply-card statusline, run `botmux statusline set <template>` for this session. Variables: `{agent}`, `{model}`, `{contextPercent}`, `{cli}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. `botmux statusline clear` restores the bot default.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
@@ -637,7 +637,7 @@ export const messages: Record<string, string> = {
   'ai.shell.heredoc_example': "Correct multi-line example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'When to send: key conclusions, plans (wait for user approval before acting), final results, progress updates. A bare `print`/`echo` does NOT count as a reply. If no reply is needed, do not explain the silence and do not call `botmux send`; the final assistant message must be exactly `BOTMUX_NO_REPLY`.',
-  'ai.shell.footer': 'When the user asks to customize reply-card footer status, run `botmux footer set <template>` for this session. Variables: `{cli}`, `{model}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. `botmux footer clear` restores the bot default.',
+  'ai.shell.footer': 'When the user asks to customize reply-card statusline, run `botmux statusline set <template>` for this session. Variables: `{agent}`, `{model}`, `{contextPercent}`, `{cli}`, `{title}`, `{cwdName}`, `{cwd}`, `{cwdUrl}`. `botmux statusline clear` restores the bot default.',
   'ai.shell.no_visible_output_ok': 'A successful `botmux send` (exit code 0) means it reached the user; ending a turn with no visible terminal text is normal. If you see a note like "your previous response had no visible output, please continue and produce a user-visible response", that is a false alarm from the underlying CLI — do NOT resend unless `botmux send` itself errored.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the sender of the message you are replying to) / `--no-mention` (none). Choose by VALUE: substantive conclusion the other party should read/confirm/decide → --mention-back; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Do not default to --no-mention, and do not @ people for nothing.',
 

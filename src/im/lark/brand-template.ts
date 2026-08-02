@@ -4,6 +4,12 @@ import { basename, join } from 'node:path';
 
 export interface DirMeta { url?: string; name?: string }
 
+/** The opt-in statusline shown in reply-card footers. */
+export const DEFAULT_STATUSLINE_TEMPLATE = '{agent} · {model} · Context {contextPercent}';
+
+const SUPPORTED_TEMPLATE_VARIABLE = /\{(?:cli|model|title|agent|contextPercent|cwdName|cwd|cwdUrl)\}/;
+const SUPPORTED_TEMPLATE_VARIABLE_GLOBAL = /\{(?:cli|model|title|agent|contextPercent|cwdName|cwd|cwdUrl)\}|[^{}]+|[{}]/g;
+
 let cache: { path: string; mtimeMs: number; meta: DirMeta } | null = null;
 
 /**
@@ -95,7 +101,8 @@ function safeUrl(v: unknown): string | undefined {
 }
 
 /**
- * brandLabel 变量替换：{cwdName}（元数据 name → basename）、{cwd}、{cwdUrl}。
+ * brand/statusline 变量替换：{cwdName}（元数据 name → basename）、{cwd}、{cwdUrl}，以及
+ * {agent}、{cli}、{model}、{title}、{contextPercent}。
  * 仅当模板含 '{' 时激活（存量签名零影响）；替换后空链接 [x]() 降级为纯文本 x。
  *
  * workingDir 先 expandHome 一次，三个变量共用 —— 否则 {cwdName} 的 basename fallback
@@ -104,7 +111,13 @@ function safeUrl(v: unknown): string | undefined {
 export function renderBrandTemplate(
   brand: string | undefined,
   workingDir: string | undefined,
-  context?: { cli?: string; model?: string; title?: string },
+  context?: {
+    cli?: string;
+    model?: string;
+    title?: string;
+    agent?: string;
+    contextPercent?: number;
+  },
 ): string | undefined {
   if (brand === undefined || !brand.includes('{')) return brand;
   const wd = workingDir ? expandHome(workingDir) : '';
@@ -114,12 +127,38 @@ export function renderBrandTemplate(
   // {cwdName}/{cwd} 落在链接的**文本位**，而它们的 fallback 来自**目录路径** —— 目录名本身
   // 就可以含 `]`（`mkdir 'a]b'` 完全合法），照样能击穿 `[...](...)`。所以路径派生的值也要消毒，
   // 不能只消毒 .botmux-dir.json 里的 name。
-  const rendered = brand.replace(/\{cwdName\}|\{cwdUrl\}|\{cwd\}|\{cli\}|\{model\}|\{title\}/g, (m) =>
+  const rendered = brand.replace(/\{cwdName\}|\{cwdUrl\}|\{cwd\}|\{cli\}|\{model\}|\{title\}|\{agent\}|\{contextPercent\}/g, (m) =>
     m === '{cwdName}' ? (wd ? (meta.name ?? safeText(basename(wd))) : '')
     : m === '{cwd}' ? safeText(wd)
     : m === '{cwdUrl}' ? (meta.url ?? '')
     : m === '{cli}' ? safeText(context?.cli ?? '')
     : m === '{model}' ? safeText(context?.model ?? '')
-    : safeText(context?.title ?? ''));
+    : m === '{title}' ? safeText(context?.title ?? '')
+    : m === '{agent}' ? safeText(context?.agent ?? '')
+    : context?.contextPercent !== undefined && Number.isFinite(context.contextPercent)
+      ? `${Math.max(0, Math.min(100, Math.round(context.contextPercent)))}%`
+      : '—');
   return rendered.replace(/\[([^\]]*)\]\(\)/g, '$1');
+}
+
+/** Normalize a statusline template from JSON or the session IPC command.
+ * Literal text is inert markdown; only the supported variables remain active. */
+export function normalizeStatuslineTemplate(input: string): string | undefined {
+  const normalized = input
+    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!normalized || normalized.length > 256) return undefined;
+  return normalized.replace(
+    SUPPORTED_TEMPLATE_VARIABLE_GLOBAL,
+    (segment) => SUPPORTED_TEMPLATE_VARIABLE.test(segment)
+      ? segment
+      : segment
+        .replace(/\\/g, '\\\\')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/([*_~`])/g, '\\$1')
+        .replace(/[\[\]()]/g, ''),
+  );
 }

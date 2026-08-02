@@ -17,6 +17,10 @@ import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
 import { normalizeVcMeetingProfileInstructions } from './services/vc-meeting-profile-instructions.js';
+import {
+  DEFAULT_STATUSLINE_TEMPLATE,
+  normalizeStatuslineTemplate,
+} from './im/lark/brand-template.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -51,6 +55,11 @@ export type ChatReplyMode = 'chat' | 'new-topic' | 'shared' | 'chat-topic';
 export type UsageDisplayMode = 'streaming' | 'footer' | 'off';
 /** Default when a bot sets nothing: usage rides the live streaming card. */
 export const DEFAULT_USAGE_DISPLAY: UsageDisplayMode = 'streaming';
+/** Opt-in reply-card statusline. Missing/disabled means no dynamic footer. */
+export interface StatuslineConfig {
+  enabled: true;
+  template: string;
+}
 export type ContentTriggerScope = 'topic' | 'regularGroup' | 'both';
 export type ContentTriggerMatchType = 'keyword' | 'regex';
 export type ContentTriggerActionType = 'start-or-wake-session';
@@ -1320,6 +1329,11 @@ export interface BotConfig {
    */
   brandLabel?: string;
   /**
+   * Opt-in dynamic reply-card statusline. When enabled without a template,
+   * the default contains agent, model, and context-window percentage.
+   */
+  statusline?: StatuslineConfig;
+  /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
    *   • `'footer'`                      → in the ordinary reply-card footer
@@ -1538,6 +1552,7 @@ export function __testOnly_resetBotRegistry(): void {
   oncallChatCache = null;
   brandLabelCache = null;
   usageDisplayCache = null;
+  statuslineCache = null;
 }
 
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
@@ -1860,6 +1875,20 @@ export function isChatOncallBoundForAnyBot(chatId: string): boolean {
 // the configured value (undefined when the bot has no brandLabel key).
 let brandLabelCache: { mtimeMs: number; map: Map<string, string | undefined> } | null = null;
 let usageDisplayCache: { mtimeMs: number; map: Map<string, UsageDisplayMode> } | null = null;
+let statuslineCache: { mtimeMs: number; map: Map<string, StatuslineConfig | undefined> } | null = null;
+
+export function normalizeStatuslineConfig(raw: unknown): StatuslineConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || (raw as any).enabled !== true) {
+    return undefined;
+  }
+  const configured = typeof (raw as any).template === 'string'
+    ? normalizeStatuslineTemplate((raw as any).template)
+    : undefined;
+  return {
+    enabled: true,
+    template: configured ?? DEFAULT_STATUSLINE_TEMPLATE,
+  };
+}
 
 /** Normalize a raw bots.json entry's usage-display intent to the enum, applying
  *  backward compat: an explicit `usageDisplay` wins; otherwise a legacy
@@ -1926,6 +1955,53 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Resolve the opt-in statusline for daemon and one-shot `botmux send` paths. */
+export function resolveStatusline(larkAppId: string): StatuslineConfig | undefined {
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && 'BOTMUX_STATUSLINE_ENABLED' in process.env) {
+    if (process.env.BOTMUX_STATUSLINE_ENABLED !== '1') return undefined;
+    return normalizeStatuslineConfig({
+      enabled: true,
+      template: process.env.BOTMUX_STATUSLINE_TEMPLATE,
+    });
+  }
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.statusline;
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (!path) return undefined;
+  try {
+    const stat = statSync(path);
+    if (!statuslineCache || statuslineCache.mtimeMs !== stat.mtimeMs) {
+      const raw = JSON.parse(readFileSync(path, 'utf-8'));
+      const map = new Map<string, StatuslineConfig | undefined>();
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (entry && typeof entry.larkAppId === 'string') {
+            map.set(entry.larkAppId, normalizeStatuslineConfig(entry.statusline));
+          }
+        }
+      }
+      statuslineCache = { mtimeMs: stat.mtimeMs, map };
+    }
+    return statuslineCache.map.get(larkAppId);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Display name used by the default statusline. Env wins for isolated/remote
+ * one-shot sends, where the worker cannot read the daemon registry. */
+export function resolveStatuslineAgentName(larkAppId: string): string {
+  if (process.env.BOTMUX_LARK_APP_ID === larkAppId
+    && typeof process.env.BOTMUX_AGENT_NAME === 'string'
+    && process.env.BOTMUX_AGENT_NAME.trim()) {
+    return process.env.BOTMUX_AGENT_NAME.trim();
+  }
+  const inMem = bots.get(larkAppId);
+  if (inMem) return effectiveBotDisplayName(inMem);
+  return larkAppId;
 }
 
 /**
@@ -2531,6 +2607,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Preserve '' distinctly from undefined: '' means "brand off", undefined
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
+      statusline: normalizeStatuslineConfig(entry.statusline),
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.

@@ -4417,7 +4417,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'chat-rename' | 'footer',
+  route: 'slash' | 'cd' | 'close' | 'chat-rename' | 'statusline',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -4442,7 +4442,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
-    ...(route === 'footer' ? { signal: AbortSignal.timeout(2_000) } : {}),
+    ...(route === 'statusline' ? { signal: AbortSignal.timeout(2_000) } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -4499,16 +4499,16 @@ async function cmdChat(argv: string[]): Promise<void> {
   process.exitCode = 1;
 }
 
-async function cmdFooter(argv: string[]): Promise<void> {
+async function cmdStatusline(argv: string[]): Promise<void> {
   const action = argv[0] ?? 'get';
   if (!['get', 'set', 'clear'].includes(action)) {
-    console.error('用法: botmux footer <get|set <模板>|clear>');
+    console.error('用法: botmux statusline <get|set <模板>|clear>');
     process.exitCode = 2;
     return;
   }
   const template = action === 'set' ? argv.slice(1).join(' ').trim() : undefined;
   if (action === 'set' && !template) {
-    console.error('用法: botmux footer set <模板>');
+    console.error('用法: botmux statusline set <模板>');
     process.exitCode = 2;
     return;
   }
@@ -4532,7 +4532,7 @@ async function cmdFooter(argv: string[]): Promise<void> {
     return;
   }
   try {
-    const response = await postSessionCliIpc(ipcPort, sessionId, 'footer', {
+    const response = await postSessionCliIpc(ipcPort, sessionId, 'statusline', {
       action,
       ...(template ? { template } : {}),
     });
@@ -4747,7 +4747,7 @@ async function readCardUsageSnapshotForSend(
   // This send path renders into the reply-card FOOTER, so only the 'footer'
   // display mode surfaces usage here; 'streaming' shows it on the daemon's live
   // card (absent on this offline fallback) and 'off' shows nothing.
-  if (resolveUsageDisplay(larkAppId) !== 'footer') {
+  if (resolveUsageDisplay(larkAppId) !== 'footer' && !resolveStatusline(larkAppId)) {
     return { context: null, tokens: null };
   }
 
@@ -4765,6 +4765,74 @@ async function readCardUsageSnapshotForSend(
   } catch {
     return { context: null, tokens: null };
   }
+}
+
+/** Read the Context metric owned by an enabled statusline. It is deliberately
+ * independent from `usageDisplay`, whose native footer/body placement is a
+ * separate feature. */
+async function readStatuslineUsageSnapshotForSend(
+  session: SessionData,
+  larkAppId: string,
+): Promise<CardUsageSnapshot> {
+  if (!resolveStatusline(larkAppId)) return { context: null, tokens: null };
+  try {
+    const daemonPort = findDaemon(larkAppId)?.ipcPort
+      ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (daemonPort) {
+      const path = `/api/sessions/${encodeURIComponent(session.sessionId)}/usage`;
+      const response = await fetchDaemonIpc(daemonPort, path, {
+        method: 'GET',
+        signal: AbortSignal.timeout(1_500),
+      });
+      if (response.ok) {
+        const body = await response.json() as { statuslineUsage?: unknown };
+        const normalized = normalizeCardUsageSnapshot(body.statuslineUsage);
+        if (normalized) return normalized;
+      }
+    }
+  } catch {
+    // Fall back to the local transcript reader below.
+  }
+  try {
+    return getSessionUsageSnapshot({
+      cliId: (session.cliId ?? session.adoptedFrom?.cliId ?? 'unknown') as CliId | 'unknown',
+      sessionId: session.sessionId,
+      cliSessionId: session.cliSessionId ?? session.adoptedFrom?.sessionId,
+      cwd: session.workingDir ?? session.adoptedFrom?.cwd,
+      larkAppId,
+      fresh: true,
+    });
+  } catch {
+    return { context: null, tokens: null };
+  }
+}
+
+function renderCliSessionFooterBrand(
+  session: SessionData,
+  larkAppId: string,
+  usage: CardUsageSnapshot,
+): { brand: string | undefined; forceMarker: boolean } {
+  const statusline = resolveStatusline(larkAppId);
+  if (!statusline) {
+    return {
+      brand: renderBrandTemplate(resolveBrandLabel(larkAppId), session.workingDir, {
+        cli: session.cliId,
+        model: session.model,
+        title: session.title,
+      }),
+      forceMarker: false,
+    };
+  }
+  return {
+    brand: renderBrandTemplate(session.footerTemplate ?? statusline.template, session.workingDir, {
+      agent: resolveStatuslineAgentName(larkAppId),
+      cli: session.cliId,
+      model: session.model ?? 'default',
+      title: session.title,
+      contextPercent: usage.context?.percentUsed,
+    }),
+    forceMarker: true,
+  };
 }
 
 /**
@@ -5386,8 +5454,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
        --proactive                    标记为 AI 主动改名（应用 10 分钟防抖）
-  footer get|set <模板>|clear          配置当前会话回复卡片 statusline
-                                      支持 {cli} {model} {title} {cwdName} {cwd} {cwdUrl}
+  statusline get|set <模板>|clear          配置当前会话回复卡片 statusline
+                                      支持 {agent} {model} {contextPercent} {cli} {title} {cwdName} {cwd} {cwdUrl}
   send [content]                       发消息到当前话题（支持 stdin / --content-file）
        --images <path>                 内联图片（可重复）
        --files <path>                  附件（可重复）
@@ -6411,7 +6479,7 @@ import {
 } from './im/lark/md-card.js';
 import { applyInlineMentions } from './im/lark/inline-mentions.js';
 import { renderBrandTemplate } from './im/lark/brand-template.js';
-import { resolveBrandLabel, resolveUsageDisplay } from './bot-registry.js';
+import { resolveBrandLabel, resolveStatusline, resolveStatuslineAgentName, resolveUsageDisplay } from './bot-registry.js';
 import { config } from './config.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
@@ -7988,16 +8056,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         inlinedIds: usedIds,
       });
       const usageSnapshot = await readCardUsageSnapshotForSend(s, appId);
+      const statusline = resolveStatusline(appId);
+      const statuslineUsage = await readStatuslineUsageSnapshotForSend(s, appId);
+      const footerBrand = renderCliSessionFooterBrand(s, appId, statuslineUsage);
       const footer = buildReplyCardFooter({
-        brand: renderBrandTemplate(s.footerTemplate ?? resolveBrandLabel(appId), s.workingDir, {
-          cli: s.cliId,
-          model: s.model,
-          title: s.title,
-        }),
+        brand: footerBrand.brand,
         recipientOpenIds: footerRecipients,
-        usage: usageSnapshot,
+        usage: statusline ? { context: null, tokens: null } : usageSnapshot,
         locale: localeForBot(appId),
-        forceMarker: s.footerTemplate !== undefined,
+        forceMarker: footerBrand.forceMarker,
       });
       // Footer line (brand 个性签名 + 发送给) and the optional 🔊 语音总结 button
       // share ONE row: footer text on the left (weighted, fills), button pinned
@@ -10860,8 +10927,7 @@ switch (command) {
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
-  case 'footer':
-  case 'statusline': await cmdFooter(process.argv.slice(3)); break;
+  case 'statusline': await cmdStatusline(process.argv.slice(3)); break;
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

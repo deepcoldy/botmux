@@ -1016,6 +1016,17 @@ describe('resolveBrandLabel — sandbox env-first (footer role name fix)', () =>
     expect(mod.resolveBrandLabel('app_sbx')).toBe('[{cwdName}]({cwdUrl})');
   });
 
+  it('keeps statusline opt-in and supplies the agent/model/context default', () => {
+    expect(mod.normalizeStatuslineConfig(undefined)).toBeUndefined();
+    expect(mod.normalizeStatuslineConfig({ enabled: false })).toBeUndefined();
+    expect(mod.normalizeStatuslineConfig({ enabled: true })).toEqual({
+      enabled: true,
+      template: '{agent} · {model} · Context {contextPercent}',
+    });
+    expect(mod.normalizeStatuslineConfig({ enabled: true, template: '{agent} / {contextPercent}' }))
+      .toEqual({ enabled: true, template: '{agent} / {contextPercent}' });
+  });
+
   it('present-but-empty env brandLabel means suppress (returns "")', () => {
     process.env.BOTMUX_LARK_APP_ID = 'app_sbx';
     process.env.BOTMUX_BRAND_LABEL = '';

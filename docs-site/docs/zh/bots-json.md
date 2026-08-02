@@ -139,10 +139,16 @@
 
 ## 卡片与终端
 
+最小启用配置（不写 `template` 即使用 `agent · model · Context 百分比` 默认页脚）：
+
+```json
+"statusline": { "enabled": true }
+```
+
 | 字段 | 说明 |
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
-| 会话 statusline | 用户可直接让 agent 执行 `botmux footer set '<模板>'` 覆盖当前会话页脚，`botmux footer clear` 恢复 bot 级 `brandLabel`。支持 `{cli}`、`{model}`、`{title}`、`{cwdName}`、`{cwd}`、`{cwdUrl}`；发卡热路径只渲染已保存模板，不执行外部命令 |
+| `statusline` | **默认关闭**。显式配置 `{ "enabled": true }` 后启用动态页脚；缺省模板为 `{agent} · {model} · Context {contextPercent}`，也可配置 `template`。支持 `{agent}`、`{model}`、`{contextPercent}`、`{cli}`、`{title}`、`{cwdName}`、`{cwd}`、`{cwdUrl}`。会话内可让 agent 执行 `botmux statusline set '<模板>'` 覆盖，`botmux statusline clear` 恢复 bot 默认；未启用时旧会话模板也不渲染 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |

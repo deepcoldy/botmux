@@ -67,7 +67,7 @@ import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, getDaemonReplyCardUsageSnapshot, getDaemonStatuslineUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring } from './worker-pool.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isSuspendableBackendType } from './persistent-backend.js';
@@ -153,7 +153,8 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, resolveStatusline, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { normalizeStatuslineTemplate } from '../im/lark/brand-template.js';
 import { normalizeKanbanColumn, normalizeKanbanPosition, normalizeSessionTitle } from './session-board.js';
 import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
@@ -650,7 +651,10 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
 ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { error: 'not_found' });
-  jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
+  jsonRes(res, 200, {
+    usage: getDaemonReplyCardUsageSnapshot(ds),
+    statuslineUsage: getDaemonStatuslineUsageSnapshot(ds),
+  });
 });
 
 /** Canonical daemon-side close used by the dashboard and `botmux delete`.
@@ -971,48 +975,42 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
 
 /** Session-local statusline configured by the active agent. This deliberately
  * stores a template rather than executing a shell command in the card hot path. */
-ipcRoute('POST', '/api/sessions/:sessionId/footer', async (req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/statusline', async (req, res, params) => {
   const body = await readJsonBody<{ action?: unknown; template?: unknown } & Record<string, unknown>>(req)
     .catch(() => ({} as { action?: unknown; template?: unknown } & Record<string, unknown>));
   const ds = findActiveBySessionId(params.sessionId);
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const statusline = resolveStatusline(ds.larkAppId);
   const action = typeof body.action === 'string' ? body.action : 'get';
   if (action === 'get') {
-    return jsonRes(res, 200, { ok: true, template: ds.session.footerTemplate ?? null });
+    return jsonRes(res, 200, {
+      ok: true,
+      enabled: !!statusline,
+      source: statusline ? (ds.session.footerTemplate !== undefined ? 'session' : 'bot') : 'disabled',
+      template: statusline ? (ds.session.footerTemplate ?? statusline.template) : null,
+    });
   }
   if (action === 'clear') {
     ds.session.footerTemplate = undefined;
     sessionStore.updateSession(ds.session);
-    return jsonRes(res, 200, { ok: true, template: null });
+    return jsonRes(res, 200, {
+      ok: true,
+      enabled: !!statusline,
+      source: statusline ? 'bot' : 'disabled',
+      template: statusline?.template ?? null,
+    });
   }
+  if (!statusline) return jsonRes(res, 403, { ok: false, error: 'statusline_disabled' });
   if (action !== 'set' || typeof body.template !== 'string') {
     return jsonRes(res, 400, { ok: false, error: 'bad_action_or_template' });
   }
-  const normalizedTemplate = body.template
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!normalizedTemplate) return jsonRes(res, 400, { ok: false, error: 'empty_template' });
-  if (normalizedTemplate.length > 256) return jsonRes(res, 400, { ok: false, error: 'template_too_long' });
-  // Preserve the supported status variables, but store every literal segment
-  // as pure text so an agent cannot inject Lark tags or card markdown.
-  const template = normalizedTemplate.replace(
-    /\{(?:cli|model|title|cwdName|cwd|cwdUrl)\}|[^{}]+|[{}]/g,
-    (segment) => /^\{(?:cli|model|title|cwdName|cwd|cwdUrl)\}$/.test(segment)
-      ? segment
-      : segment
-        .replace(/\\/g, '\\\\')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/([*_~`])/g, '\\$1')
-        .replace(/[\[\]()]/g, ''),
-  );
+  const template = normalizeStatuslineTemplate(body.template);
+  if (!template) return jsonRes(res, 400, { ok: false, error: 'empty_or_invalid_template' });
   ds.session.footerTemplate = template;
   sessionStore.updateSession(ds.session);
-  return jsonRes(res, 200, { ok: true, template });
+  return jsonRes(res, 200, { ok: true, enabled: true, source: 'session', template });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）

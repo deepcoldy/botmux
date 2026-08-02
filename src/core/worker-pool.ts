@@ -56,7 +56,7 @@ import {
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, persistentSessionName, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
-import { getBot, getAllBots, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
+import { effectiveBotDisplayName, getBot, getAllBots, loadBotConfigs, resolveBrandLabel, resolveStatusline, resolveStatuslineAgentName, getLoadedConfigPath, resolveUsageDisplay } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { resolvePromptInjectionMode } from './prompt-bootstrap.js';
@@ -175,6 +175,11 @@ export function getDaemonReplyCardUsageSnapshot(
   effectiveCliId?: CliId,
 ): CardUsageSnapshot {
   try {
+    // An enabled statusline owns the compact reply footer, including Context
+    // percentage; do not append the native Context segment a second time.
+    if (resolveStatusline(ds.larkAppId)) {
+      return { context: null, tokens: null };
+    }
     if (resolveUsageDisplay(ds.larkAppId) !== 'footer') {
       return { context: null, tokens: null };
     }
@@ -182,6 +187,16 @@ export function getDaemonReplyCardUsageSnapshot(
     // Missing runtime config → default 'streaming' → no footer usage.
     return { context: null, tokens: null };
   }
+  return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
+}
+
+/** Native usage snapshot consumed by the dynamic statusline. This is kept
+ * separate from reply-card usage because `usageDisplay` may be `streaming`. */
+export function getDaemonStatuslineUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+): CardUsageSnapshot {
+  if (!resolveStatusline(ds.larkAppId)) return { context: null, tokens: null };
   return getDaemonSessionUsageSnapshot(ds, effectiveCliId);
 }
 
@@ -204,6 +219,37 @@ export function getDaemonStreamingCardUsageSnapshot(
     // Missing runtime config → default 'streaming' → show usage (best-effort).
   }
   return getDaemonSessionUsageSnapshot(ds, effectiveCliId, { fresh: opts?.fresh ?? false });
+}
+
+function renderSessionFooterBrand(
+  ds: DaemonSession,
+  effectiveCliId: CliId,
+  usage: CardUsageSnapshot | undefined,
+): { brand: string | undefined; forceFooterMarker: boolean } {
+  const statusline = resolveStatusline(ds.larkAppId);
+  if (!statusline) {
+    return {
+      brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir, {
+        cli: effectiveCliId,
+        model: ds.session.model,
+        title: ds.session.title,
+      }),
+      forceFooterMarker: false,
+    };
+  }
+  let configuredModel: string | undefined;
+  try { configuredModel = getBot(ds.larkAppId).config.model; } catch { /* best effort */ }
+  const template = ds.session.footerTemplate ?? statusline.template;
+  return {
+    brand: renderBrandTemplate(template, ds.workingDir, {
+      agent: resolveStatuslineAgentName(ds.larkAppId),
+      cli: effectiveCliId,
+      model: ds.session.model ?? configuredModel ?? 'default',
+      title: ds.session.title,
+      contextPercent: usage?.context?.percentUsed,
+    }),
+    forceFooterMarker: true,
+  };
 }
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
@@ -3840,6 +3886,7 @@ export function forkWorker(
     loadedBotsConfigPath: getLoadedConfigPath(),
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
+    statuslineAgentName: effectiveBotDisplayName(bot),
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     turnId: initAttributionTurnId,
@@ -5685,22 +5732,21 @@ function setupWorkerHandlers(
         if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        const replyUsage = getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+        const statuslineUsage = getDaemonStatuslineUsageSnapshot(ds, effectiveCliId);
+        const footerBrand = renderSessionFooterBrand(ds, effectiveCliId, statuslineUsage);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
           assistantText: msg.assistantText,
           assistantLabel: getCliDisplayName(effectiveCliId),
           recipientOpenId,
-          brand: renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
-            cli: effectiveCliId,
-            model: ds.session.model,
-            title: ds.session.title,
-          }),
+          brand: footerBrand.brand,
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
-          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
-          forceFooterMarker: ds.session.footerTemplate !== undefined,
+          usage: replyUsage,
+          forceFooterMarker: footerBrand.forceFooterMarker,
         });
         scopedReply(cardJson, 'interactive', msg.turnId).catch((err: any) => {
           logger.warn(`[${t}] Failed to deliver adopt_preamble to Lark: ${err.message}`);
@@ -6108,6 +6154,8 @@ function deliverFinalOutput(
           ?? daemonCardFooterRecipientOpenId(ds, effectiveCliId);
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      const statuslineUsage = getDaemonStatuslineUsageSnapshot(ds, effectiveCliId);
+      const footerBrand = renderSessionFooterBrand(ds, effectiveCliId, statuslineUsage);
       const cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: msg.kind === 'local-turn-headless'
@@ -6117,30 +6165,22 @@ function deliverFinalOutput(
             assistantText: safeAssistantText,
             assistantLabel: getCliDisplayName(effectiveCliId),
             recipientOpenId,
-            brand: renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
-              cli: effectiveCliId,
-              model: ds.session.model,
-              title: ds.session.title,
-            }),
+            brand: footerBrand.brand,
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
             usage: cardUsage,
-            forceFooterMarker: ds.session.footerTemplate !== undefined,
+            forceFooterMarker: footerBrand.forceFooterMarker,
           })
         : buildMarkdownCard(
             safeAssistantText,
             recipientOpenId,
-            renderBrandTemplate(ds.session.footerTemplate ?? resolveBrandLabel(ds.larkAppId), ds.workingDir, {
-              cli: effectiveCliId,
-              model: ds.session.model,
-              title: ds.session.title,
-            }),
+            footerBrand.brand,
             localeForBot(ds.larkAppId),
             ds.workingDir,
             localHomeLinkMode,
             cardUsage,
-            ds.session.footerTemplate !== undefined,
+            footerBrand.forceFooterMarker,
           );
 
       const proposedOutput = {
@@ -6578,6 +6618,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     apiOnly: botCfg.apiOnly,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
+    statuslineAgentName: effectiveBotDisplayName(bot),
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
     // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
