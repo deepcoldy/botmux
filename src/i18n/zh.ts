@@ -501,6 +501,20 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — 接力失败：{error}',
   'cmd.relay.failed': '⚠️ /relay --create 失败：{error}',
 
+  // ─── /fork（会话分身）─────────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ 无法确定机器人身份，/fork 取消。',
+  'cmd.fork.no_sender': '⚠️ 无法获取发起人 open_id，/fork 取消。',
+  'cmd.fork.no_session': '⚠️ /fork 必须在一个已有会话的话题里发起。',
+  'cmd.fork.not_owner': '⚠️ 只有会话发起人能 fork 它。',
+  'cmd.fork.no_mentions': '⚠️ /fork --create 必须 @ 一个机器人作为分身落地的新群成员。',
+  'cmd.fork.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/fork 取消。请稍后重试。',
+  'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话暂不支持 fork（目前仅 Claude 系 / Codex 终端模式；Codex App、开启 RPC 的 Codex、纯远端后端走 app-server 活会话，无法字节级复制）。',
+  'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
+  'cmd.fork.not_started_yet': '⚠️ 会话还没真正跑起来（没选仓库 / CLI 没起 / 无上下文），无法 fork。',
+  'cmd.fork.adopt_not_forkable': '⚠️ 该会话是 /adopt 接入的外部会话，无法 fork。',
+  'cmd.fork.created': '✅ 已创建群「{name}」并 fork 出分身（源会话原样保留继续）\n👉 {link}\n\n分身带着 fork 时刻的完整上下文，去新群 @ 机器人即可继续。',
+  'cmd.fork.failed': '⚠️ /fork --create 失败：{error}',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',
   'schedule.list_header': '定时任务列表 ({count})：',

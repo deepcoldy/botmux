@@ -498,6 +498,20 @@ export const messages: Record<string, string> = {
   'cmd.relay.report_peer_failed': '• {bot} — relay failed: {error}',
   'cmd.relay.failed': '⚠️ /relay --create failed: {error}',
 
+  // ─── /fork (session clone) ─────────────────────────────────────────────────
+  'cmd.fork.no_bot': '⚠️ Could not determine the bot identity, /fork cancelled.',
+  'cmd.fork.no_sender': '⚠️ Could not resolve sender open_id, /fork cancelled.',
+  'cmd.fork.no_session': '⚠️ /fork must be invoked inside a thread with an existing session.',
+  'cmd.fork.not_owner': '⚠️ Only the session owner can fork it.',
+  'cmd.fork.no_mentions': '⚠️ /fork --create must @ a bot as the member of the new group the clone lands in.',
+  'cmd.fork.resolve_failed': '⚠️ Could not resolve the @-mentioned bot, /fork cancelled. Please retry.',
+  'cmd.fork.unsupported_backend': 'ℹ️ The current {cli} session does not support fork yet (only Claude family / Codex terminal mode; Codex App, RPC-enabled Codex, and pure-remote backends run an app-server live session with no byte-level copy).',
+  'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
+  'cmd.fork.not_started_yet': '⚠️ The session has not really started (no repo / CLI not up / no context) and cannot be forked.',
+  'cmd.fork.adopt_not_forkable': '⚠️ This session was adopted from an external CLI and cannot be forked.',
+  'cmd.fork.created': '✅ Created group "{name}" and forked a clone (the source session is left running untouched)\n👉 {link}\n\nThe clone carries the full context at fork time — go to the new group and @ the bot to continue.',
+  'cmd.fork.failed': '⚠️ /fork --create failed: {error}',
+
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
   'schedule.list_header': 'Scheduled tasks ({count}):',

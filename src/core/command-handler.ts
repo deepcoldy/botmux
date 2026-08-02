@@ -3319,6 +3319,164 @@ export async function handleCommand(
         break;
       }
 
+      case '/fork': {
+        // Session fork (Bot 分身): non-destructive copy of a running session
+        // into a SECOND independent session at a new anchor; source untouched.
+        // PR1 scope: `--create <群名> @bot` (fork to a freshly-created group).
+        // The no-arg picker (fork into the current group) is a follow-up.
+        const argsLine = message.content.replace(/^\/fork\s*/i, '').trim();
+        const forkAppId = larkAppId ?? ds?.larkAppId;
+        if (!forkAppId) {
+          await sessionReply(rootId, t('cmd.fork.no_bot', undefined, loc));
+          break;
+        }
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          break;
+        }
+        const forkSenderOpenId = message.senderId;
+        if (!forkSenderOpenId) {
+          await sessionReply(rootId, t('cmd.fork.no_sender', undefined, loc));
+          break;
+        }
+        // Owner-only.
+        if (ds.session.ownerOpenId && ds.session.ownerOpenId !== forkSenderOpenId) {
+          await sessionReply(rootId, t('cmd.fork.not_owner', undefined, loc));
+          break;
+        }
+        // Capability gate — refuse non-forkable backends up front with a clear,
+        // typed message (mirrors the design doc §4 refusal). Cheap check before
+        // we create any group.
+        const { isForkCapableSession } = await import('./worker-pool.js');
+        if (!isForkCapableSession(ds)) {
+          const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+          await sessionReply(rootId, t('cmd.fork.unsupported_backend', { cli: cliName }, loc));
+          break;
+        }
+
+        if (!/^--create\b/i.test(argsLine)) {
+          // No-arg / picker path — deferred to the follow-up. For now guide the
+          // user to the working entry point so the command never silently
+          // no-ops. (Non-topic-group in-place fork = Branch, PR2.)
+          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          break;
+        }
+
+        // ── /fork --create <群名> @bot ──────────────────────────────────────
+        const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
+
+        // Front guards (fork needs a clean, real, idle source — same as relay).
+        if (ds.session.adoptedFrom) {
+          await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
+          break;
+        }
+        if (ds.pendingRepo) {
+          await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
+          break;
+        }
+
+        // Resolve the single target bot to invite. p2p source: no roster / no
+        // mention gate — the source bot is the sole participant. Group source:
+        // require exactly the @-mentioned bot (fork is single-session, so unlike
+        // relay --create there is no multi-bot leader election / peer coord).
+        const forkSourceIsP2p = ds.chatType === 'p2p';
+        let targetBotAppId = forkAppId;
+        let targetBotName = botDisplayName(forkAppId);
+        if (!forkSourceIsP2p) {
+          const forkMentions = message.mentions ?? [];
+          const knownBotNames = globalKnownBotNames();
+          const forkBotMentions = forkMentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+          if (forkBotMentions.length === 0) {
+            await sessionReply(rootId, t('cmd.fork.no_mentions', undefined, loc));
+            break;
+          }
+          // Resolve the FIRST @-bot to a larkAppId via the source chat roster.
+          const firstBot = forkBotMentions[0];
+          let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
+          try {
+            members = await listChatBotMembers(forkAppId, ds.chatId);
+          } catch (e: any) {
+            logger.warn(`[${logTag}] /fork --create: failed to list source chat members: ${e?.message ?? e}`);
+          }
+          const mem = firstBot.openId ? members.find(m => m.openId === firstBot.openId) : undefined;
+          if (!mem || !mem.larkAppId) {
+            await sessionReply(rootId, t('cmd.fork.resolve_failed', undefined, loc));
+            break;
+          }
+          targetBotAppId = mem.larkAppId;
+          targetBotName = mem.displayName || botDisplayName(mem.larkAppId);
+          // Fork copies THIS session's transcript — the forked child must run
+          // the SAME cli as the source, so the invited bot must be this bot.
+          if (targetBotAppId !== forkAppId) {
+            await sessionReply(rootId, t('cmd.fork.resolve_failed', undefined, loc));
+            break;
+          }
+        }
+
+        // Group name = first non-empty line after --create (mention text stripped).
+        let forkRawArgs = afterFlag;
+        for (const m of (message.mentions ?? [])) {
+          if (m.name) forkRawArgs = forkRawArgs.split(`@${m.name}`).join(' ');
+        }
+        const forkFirstLine = forkRawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const FORK_MAX_NAME = 50;
+        let forkGroupName: string;
+        if (forkFirstLine) {
+          forkGroupName = forkFirstLine.length > FORK_MAX_NAME ? forkFirstLine.slice(0, FORK_MAX_NAME) + '…' : forkFirstLine;
+        } else {
+          const src = ds.session.title || ds.session.sessionId.substring(0, 8);
+          forkGroupName = `🔱 ${src}`.slice(0, FORK_MAX_NAME);
+        }
+
+        // Create the new chat (single bot + the invoking user).
+        let forkChatId: string;
+        let forkInviteLink: string;
+        try {
+          const { createGroupWithBots } = await import('../services/group-creator.js');
+          const result = await createGroupWithBots({
+            creatorLarkAppId: forkAppId,
+            larkAppIds: [targetBotAppId],
+            name: forkGroupName,
+            userOpenIds: [forkSenderOpenId],
+            transferOwnerTo: forkSenderOpenId,
+          });
+          forkChatId = result.chatId;
+          const applink = chatAppLink(result.chatId, normalizeBrand(getBot(forkAppId).config.brand));
+          forkInviteLink = result.shareLink ?? applink;
+        } catch (err: any) {
+          logger.error(`[${logTag}] /fork --create: createGroup failed: ${err?.message ?? err}`);
+          await sessionReply(rootId, t('cmd.fork.failed', { error: err?.message ?? String(err) }, loc));
+          break;
+        }
+
+        // Fork the session into the new chat (chat-scope, group). The new chat
+        // is empty by construction, so no target-anchor conflict. Source is
+        // never touched.
+        const { forkSession } = await import('./worker-pool.js');
+        const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
+        if (!forkResult.ok) {
+          const errKey = forkResult.error === 'worker_busy' ? 'cmd.fork.mid_turn'
+            : forkResult.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
+            : forkResult.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
+            : forkResult.error === 'not_started_yet' ? 'cmd.fork.not_started_yet'
+            : undefined;
+          if (errKey === 'cmd.fork.unsupported_backend') {
+            const cliName = getCliDisplayName((ds.session.cliId ?? getBot(forkAppId).config.cliId ?? 'claude-code') as CliId);
+            await sessionReply(rootId, t(errKey, { cli: cliName }, loc));
+          } else if (errKey) {
+            await sessionReply(rootId, t(errKey, undefined, loc));
+          } else {
+            await sessionReply(rootId, t('cmd.fork.failed', { error: forkResult.error }, loc));
+          }
+          logger.warn(`[${logTag}] /fork --create: forkSession failed (${forkResult.error}); new chat ${forkChatId} left empty`);
+          break;
+        }
+
+        await sessionReply(rootId, t('cmd.fork.created', { name: forkGroupName, link: forkInviteLink }, loc));
+        logger.info(`[${logTag}] /fork --create completed: chat=${forkChatId} child=${forkResult.childSessionId.substring(0, 8)} bot=${targetBotAppId} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
+        break;
+      }
+
       case '/card': {
         // Existing-session path. New topics route /card via handleCardCommand at
         // the router (so no phantom session is created). off/on work without a
