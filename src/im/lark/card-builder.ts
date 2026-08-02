@@ -2136,10 +2136,16 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): stri
 
 /** Fold both adopt sources into one uniform entry list. Live entries come
  *  first (they're the "act now" targets), resume entries after. Order is
- *  stable so pagination is deterministic across re-renders. */
+ *  stable so pagination is deterministic across re-renders.
+ *
+ *  `resumeCliId` labels the resume (history) entries with the bot's own CLI —
+ *  ResumableSession carries no cliId (resume only ever offers the bot's own
+ *  CLI, so the caller knows it), and the user wants to see "Codex" on each
+ *  history row rather than a blank. */
 export function buildAdoptEntries(
   sessions: Array<AdoptableSession | ZellijAdoptableSession>,
   resumable: ResumableSession[],
+  resumeCliId?: CliId,
 ): AdoptPickerEntry[] {
   const live: AdoptPickerEntry[] = sessions.map((s) => {
     const zellij = 'zellijPaneId' in s;
@@ -2162,6 +2168,7 @@ export function buildAdoptEntries(
     return {
       key: `resume:${r.cliSessionId}`,
       kind: 'resume' as const,
+      cliId: resumeCliId,
       title: r.title || r.cliSessionId.slice(0, 8),
       project,
       cwd: r.cwd,
@@ -2213,8 +2220,9 @@ export function buildAdoptSelectCard(
   state?: AdoptPickerState,
   invokerOpenId?: string,
   resumeLimit?: number,
+  resumeCliId?: CliId,
 ): string {
-  const entries = buildAdoptEntries(sessions, resumable ?? []);
+  const entries = buildAdoptEntries(sessions, resumable ?? [], resumeCliId);
   const searchQuery = state?.searchQuery ?? '';
   const requestedPage = state?.page ?? 0;
   const selectedKey = state?.selectedKey;

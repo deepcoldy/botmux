@@ -2497,6 +2497,7 @@ export async function handleCommand(
           undefined,
           message.senderId,
           candidates.resumeLimit,
+          botCliId,
         );
         await sessionReply(rootId, cardJson, 'interactive');
         break;

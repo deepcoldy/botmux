@@ -1802,6 +1802,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       { selectedKey: nextSelected, searchQuery: nextSearch, page: nextPage },
       invokerOpenId ?? operatorOpenId,
       candidates.resumeLimit,
+      botCfg.cliId,
     );
     // event-dispatcher wraps this as { card: { type: 'raw', data } } → in-place patch.
     return JSON.parse(cardJson);
