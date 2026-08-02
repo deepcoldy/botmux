@@ -6139,10 +6139,21 @@ function persistCliSessionId(cliSessionId: string): void {
   });
   try {
     const session = sessionStore.getSession(sessionId);
-    if (!session || session.cliSessionId === cliSessionId) return;
+    if (!session) return;
+    // One-shot native fork completed: the child now has its own CLI-native id
+    // (Claude/Codex minted it during --fork-session / codex fork). Clear the
+    // pending-fork marker so a later refork resumes THIS transcript instead of
+    // re-forking the parent's again. Done HERE (worker process, same write that
+    // sets cliSessionId) rather than only in the daemon's cli_session_id
+    // handler — the worker writes the sessions file directly, and if it reloaded
+    // the row from disk (pendingForkSession still true) its write would race and
+    // clobber the daemon-side clear.
+    const forkMarkerNeedsClear = session.pendingForkSession === true;
+    if (session.cliSessionId === cliSessionId && !forkMarkerNeedsClear) return;
     session.cliSessionId = cliSessionId;
+    if (forkMarkerNeedsClear) session.pendingForkSession = undefined;
     sessionStore.updateSession(session);
-    log(`Persisted CLI session id: ${cliSessionId}`);
+    log(`Persisted CLI session id: ${cliSessionId}${forkMarkerNeedsClear ? ' (cleared pending-fork marker)' : ''}`);
   } catch (err: any) {
     log(`Failed to persist CLI session id: ${err.message}`);
   }
