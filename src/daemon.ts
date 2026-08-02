@@ -171,7 +171,6 @@ import {
   ensureTerminalWorkerPort,
   ensureSessionWhiteboard,
   closeCliMismatchedSessionsForBot,
-  retryQuarantinedActivationTailPromotion,
 } from './core/session-manager.js';
 import { triggerSessionTurn } from './core/trigger-session.js';
 import {
@@ -16932,22 +16931,20 @@ async function handleThreadReplyAdmitted(data: any, ctx: RoutingContext): Promis
     );
     // Quarantined tail-only owner (restore promotion failed transiently): the
     // current turn is now safely appended BEHIND the retained tail via its
-    // reservation, so retry the old head's promotion. On success, promote the
-    // exact old head into the tokened journal and cold-fork THAT (never the
-    // current turn — the invariant is the old head must not be overtaken). On
-    // failure keep the current turn in the tail and stay quarantined for a later
-    // retry. Only worker:null owners reach here (a live worker would have skipped
-    // this gate); the toReattach path handles the eager-fork case.
+    // reservation above, so recover the OLD HEAD — never the current turn. A
+    // blank fork here routes through forkWorker's central quarantine guard: it
+    // retries the old head's promotion and, on success, cold-forks the promoted
+    // head via the exact recovery args (Codex App through its ledger, non-Codex
+    // by resubmitting queuedActivationInput). On failure the guard refuses the
+    // fork (returns false) and the session stays quarantined with the gate held,
+    // the current turn parked in the tail for a later retry.
+    //
+    // This deliberately does NOT call forkReservedInitialSession: that builds a
+    // synthetic opening turn from an empty pendingPrompt (a non-empty new-topic
+    // envelope), which would be accepted as a fresh dispatch and overtake the
+    // promoted old head — the exact defect this recovery must avoid.
     if (ds.quarantinedActivationTailPromotion && (!ds.worker || ds.worker.killed)) {
-      // The current turn is now safely appended BEHIND the retained tail (via its
-      // reservation above), so retry the old head's promotion. On success, the
-      // old head is in the tokened journal and we cold-fork THAT (never the
-      // current turn — the old head must not be overtaken). On failure the current
-      // turn stays parked in the tail and the session stays quarantined.
-      if (retryQuarantinedActivationTailPromotion(ds)) {
-        ds.initialStartPending = true;
-        const availableBots = await getAvailableBots(larkAppId, ctxChatId ?? data?.message?.chat_id);
-        forkReservedInitialSession(ds, availableBots);
+      if (forkWorker(ds, '', true)) {
         logger.info(`[${tag(ds)}] Quarantined activation-tail promotion recovered on inbound; cold-forked promoted head`);
       } else {
         logger.warn(`[${tag(ds)}] Quarantined activation-tail promotion still failing on inbound; current turn parked behind old tail, staying quarantined`);

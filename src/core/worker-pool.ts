@@ -2876,18 +2876,96 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
       && ds.session.queuedActivationInput !== undefined);
 }
 
+export type ForkResumeOrTurnId = boolean | string | {
+  resume?: boolean;
+  turnId?: string;
+  dispatchAttempt?: number;
+  /** The payload is an exact retained activation journal. Do not re-read the
+   * live clean-input feature flag on retry/replay. */
+  codexAppInputGateFrozen?: boolean;
+};
+
+/** Central quarantine decision for one fork boundary — the SINGLE authority that
+ * keeps a restore-time "tail-only quarantine" from being forked incorrectly.
+ *
+ * A quarantined owner (see restoreActiveSessions) has an old activation-tail head
+ * that failed to promote transiently: the head sits un-promoted in the tail with
+ * the admission gate held (worker:null). The invariant across EVERY fork boundary
+ * (restore reattach, IM inbound refork, web-terminal lazy wake, and any future
+ * one) is enforced here so callers cannot each miss it:
+ *
+ *  - Not quarantined → pass the caller's args through unchanged.
+ *  - Quarantined + NON-empty prompt → REFUSE (`fork:false`). forkWorker cannot
+ *    verify the caller durably staged this turn behind the old head, so letting
+ *    it through could overtake the head. The inbound path must durable-admit the
+ *    turn into the tail first, then blank-recover (empty prompt) through here.
+ *  - Quarantined + empty prompt → retry the old head's promotion. On failure keep
+ *    the flag/gate/worker:null and REFUSE (a blank fork would leave a live worker
+ *    beside an unpromoted tail and permanently wedge the FIFO gate). On success,
+ *    clear the flag and rewrite the fork to recover the PROMOTED OLD HEAD (never
+ *    the caller's turn): Codex App recovers through its ledger with an empty
+ *    prompt; a non-Codex CLI resubmits the exact `queuedActivationInput` with the
+ *    persisted resume/turn/attempt — mirroring the daemon activation-recovery fork.
+ *
+ * Extracted (and exported) so the orchestration can be unit-tested without a real
+ * tmux/worker: mock `promoteQueuedActivationTail` and assert refuse vs. recover
+ * args, then that forkWorker applies them.
+ */
+export function resolveQuarantinedForkPlan(
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId,
+): { fork: boolean; promptInput: string | CliTurnPayload; resumeOrTurnId: ForkResumeOrTurnId } {
+  if (!ds.quarantinedActivationTailPromotion) {
+    return { fork: true, promptInput, resumeOrTurnId };
+  }
+  const content = typeof promptInput === 'string' ? promptInput : promptInput.content;
+  if (content.length > 0) {
+    logger.warn(
+      `[${tag(ds)}] Refused non-empty fork of a quarantined tail-only owner; `
+      + `caller must durable-admit the turn behind the old head, then blank-recover`,
+    );
+    return { fork: false, promptInput, resumeOrTurnId };
+  }
+  if (!promoteQueuedActivationTail(ds, { send: false })) {
+    logger.warn(
+      `[${tag(ds)}] Quarantined activation-tail promotion still failing at fork boundary; `
+      + `keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
+    );
+    return { fork: false, promptInput, resumeOrTurnId };
+  }
+  ds.quarantinedActivationTailPromotion = undefined;
+  // Promotion succeeded: the old head is now the tokened queued activation. Fork
+  // THAT, exactly like the daemon's queuedActivation recovery — Codex App through
+  // its dispatch ledger (empty prompt), non-Codex by resubmitting the exact input.
+  const recoverThroughCodexLedger =
+    (ds.session.cliId ?? getBot(ds.larkAppId).config.cliId) === 'codex-app';
+  return {
+    fork: true,
+    promptInput: recoverThroughCodexLedger ? '' : (ds.session.queuedActivationInput ?? ''),
+    resumeOrTurnId: {
+      resume: ds.session.queuedActivationResume ?? ds.hasHistory,
+      turnId: ds.session.queuedActivationTurnId,
+      dispatchAttempt: ds.session.queuedActivationDispatchAttempt,
+    },
+  };
+}
+
+/**
+ * Fork (or re-attach) a worker for `ds`.
+ *
+ * Returns `false` ONLY when a quarantined tail-only owner's promotion could not
+ * be recovered at this fork boundary (see resolveQuarantinedForkPlan): the caller
+ * MUST treat the session as still worker-less (no live worker was started) and
+ * leave the admission gate held. Every other outcome — forked, re-attached,
+ * staged behind an ACK, routed through a live owner, or spawn-deferred during
+ * device isolation — returns `true`.
+ */
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
-  resumeOrTurnId: boolean | string | {
-    resume?: boolean;
-    turnId?: string;
-    dispatchAttempt?: number;
-    /** The payload is an exact retained activation journal. Do not re-read the
-     * live clean-input feature flag on retry/replay. */
-    codexAppInputGateFrozen?: boolean;
-  } = false,
-): void {
+  resumeOrTurnId: ForkResumeOrTurnId = false,
+): boolean {
   // Device enrollment briefly freezes every daemon before the one-way host
   // marker is installed and legacy local CLIs are torn down. Do this before
   // ANY session mutation or child fork. One deferred spawn per logical session
@@ -2899,8 +2977,18 @@ export function forkWorker(
     }
   })) {
     logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
-    return;
+    return true;
   }
+
+  // Central quarantine guard — the single source of truth for the tail-only
+  // restore quarantine invariant (documented on resolveQuarantinedForkPlan). Runs
+  // before ANY prompt derivation or session mutation so a refusal is side-effect
+  // free, and so a recovered plan rewrites the prompt/resume args used below.
+  const quarantinePlan = resolveQuarantinedForkPlan(ds, promptInput, resumeOrTurnId);
+  if (!quarantinePlan.fork) return false;
+  promptInput = quarantinePlan.promptInput;
+  resumeOrTurnId = quarantinePlan.resumeOrTurnId;
+
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const prompt = promptPayload.content;
   let resume = false;
@@ -2929,7 +3017,7 @@ export function forkWorker(
     && hasProtectedSessionMutationOwnership(ds)) {
     if (prompt.length === 0) {
       logger.warn(`[${tag(ds)}] Refused empty worker refork while durable activation ownership is non-empty`);
-      return;
+      return true;
     }
     if (hasQueuedActivationAdmissionGate(ds)) {
       const turnId = initTurnId
@@ -2952,7 +3040,7 @@ export function forkWorker(
         `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
         + `(turn=${turnId})`,
       );
-      return;
+      return true;
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
@@ -2960,7 +3048,7 @@ export function forkWorker(
     logger[routed ? 'info' : 'warn'](
       `[${tag(ds)}] ${routed ? 'Routed' : 'Failed to route'} double-fork prompt through existing durable owner`,
     );
-    return;
+    return true;
   }
 
   const cb = requireCallbacks();
@@ -3570,6 +3658,7 @@ export function forkWorker(
   } catch (err) {
     logger.error(`[${t}] Failed to record attached worker ownership: ${err instanceof Error ? err.message : String(err)}`);
   }
+  return true;
 }
 
 // ─── Shared worker IPC handler ──────────────────────────────────────────────

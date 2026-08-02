@@ -1300,35 +1300,6 @@ export function shouldAutoForkOnRestore(backendType: BackendType): boolean {
   return backendType !== 'pty';
 }
 
-/**
- * Fork-boundary retry for a tail-only quarantine (a restore-time durable
- * activation-tail promotion that failed transiently, leaving the tail
- * un-promoted with the gate held). MUST be called before any blank / opening
- * fork of such a session.
- *
- * Returns true when it is now safe to fork: either the session was not
- * quarantined, or the retry promoted the old head into the tokened journal (so
- * a subsequent fork carries the promoted head, never a later turn). Returns
- * false when the retry still failed — the caller MUST skip the fork and keep the
- * worker:null quarantined owner, so a blank fork never leaves a live worker
- * beside an unpromoted tail (which would permanently wedge the admission gate).
- *
- * Idempotent: `promoteQueuedActivationTail` short-circuits true once the head is
- * already pending, and the quarantine flag is cleared on success.
- */
-export function retryQuarantinedActivationTailPromotion(ds: DaemonSession): boolean {
-  if (!ds.quarantinedActivationTailPromotion) return true;
-  if (!promoteQueuedActivationTail(ds, { send: false })) {
-    logger.warn(
-      `[${ds.session.sessionId.substring(0, 8)}] Quarantined activation-tail promotion still failing at `
-      + `fork boundary; keeping worker:null quarantined owner (no fork) to avoid a live worker beside an unpromoted tail`,
-    );
-    return false;
-  }
-  ds.quarantinedActivationTailPromotion = undefined;
-  return true;
-}
-
 const RECOVERY_FORK_BATCH_SIZE = config.daemon.recoveryForkBatchSize ?? 5;
 const RECOVERY_FORK_DELAY_MS = config.daemon.recoveryForkDelayMs ?? 250;
 
@@ -1701,16 +1672,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // visible quarantined owner: the unpromoted tail keeps protected ownership
       // (occupies the anchor, blocks a duplicate, stays closeable).
       //
-      // CRUCIAL for self-healing: `initialStartPending` is computed true below
-      // from the non-empty tail, but no activation is actually in flight here —
-      // the promotion FAILED. Left true, `tryAcquireInitialStartClaim` refuses
-      // to claim the cold owner and every later inbound only appends to the tail
-      // and returns, so promotion is never retried and the session wedges until
-      // `/close`. Force it false: the next inbound then claims the worker:null
-      // owner, forks, and `forkReservedInitialSession` re-derives the gate + calls
-      // `releaseQueuedActivationReservation` → `promoteQueuedActivationTail`,
-      // draining the retained tail in FIFO order (the new message reserves order
-      // behind it). Persistent-backend restore also re-forks it via `toReattach`.
+      // The gate (`initialStartPending`, computed true below from the non-empty
+      // tail) MUST stay up: no activation is actually in flight (promotion
+      // FAILED), and the invariant is that the old tail head must not be overtaken
+      // by a later turn. Self-healing happens at the next FORK BOUNDARY via the
+      // central quarantine guard inside forkWorker (see resolveQuarantinedForkPlan):
+      // it retries `promoteQueuedActivationTail` and, on success, cold-forks the
+      // promoted head; on failure it refuses the fork and keeps this worker:null
+      // owner. The `quarantinedActivationTailPromotion` flag set below is what the
+      // central guard keys on.
       quarantinedActivationTailPromotion = true;
       logger.warn(
         `[${session.sessionId.substring(0, 8)}] Deferred durable activation-tail promotion `
@@ -1721,13 +1691,13 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     const anchor = sessionAnchorId(ds);
     // A tail-only quarantine (promotion failed above) must NOT clear its gate:
     // the invariant is "retry the old head's promotion at the next fork boundary;
-    // on failure keep owning the gate; never let a later turn overtake". The
-    // eager `toReattach` blank fork and the daemon inbound refork are the two
-    // fork boundaries; both retry `promoteQueuedActivationTail` before forking
-    // (see the toReattach callback below and daemon's activation path). Mark the
-    // runtime so the toReattach fork retries first and skips the blank fork if it
-    // still fails — a blank fork here would leave a live worker beside an
-    // unpromoted tail, permanently wedging the gate.
+    // on failure keep owning the gate; never let a later turn overtake". Every
+    // fork boundary (eager `toReattach` blank fork, daemon inbound refork, and
+    // web-terminal lazy wake) routes through forkWorker, whose central guard
+    // (resolveQuarantinedForkPlan) retries promotion first and refuses the fork
+    // if it still fails — so a blank fork can never leave a live worker beside an
+    // unpromoted tail and permanently wedge the gate. Mark the runtime flag the
+    // guard keys on.
     if (quarantinedActivationTailPromotion) ds.quarantinedActivationTailPromotion = true;
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
@@ -1877,12 +1847,15 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
   await staggeredRecoveryFork(
     toReattach,
     (ds) => {
-      // Quarantined tail-only owner: retry its failed promotion BEFORE the blank
-      // fork. If the retry still fails, skip forking entirely and keep the
-      // worker:null owner — a blank fork here would leave a LIVE worker beside an
-      // unpromoted tail, and the daemon inbound path (seeing a live worker) would
-      // then only append later turns to the tail, never retrying → permanent wedge.
-      if (!retryQuarantinedActivationTailPromotion(ds)) return;
+      // A quarantined tail-only owner (restore promotion failed transiently) is
+      // handled by the CENTRAL guard inside forkWorker: this blank fork retries
+      // the old head's promotion first and, if it still fails, refuses to fork
+      // (returns false) — keeping the worker:null owner so a blank fork never
+      // leaves a live worker beside an unpromoted tail. `recoverExactNonCodex`
+      // below is the DIFFERENT, already-tokened recovery case (queuedActivation
+      // is pending), which a quarantined owner is not (its promotion failed, so
+      // queuedActivationPending stayed false) — the guard rewrites the fork args
+      // in that case instead.
       const recoverExactNonCodex = ds.session.queuedActivationPending
         && ds.session.cliId !== 'codex-app'
         && ds.session.queuedActivationInput;
@@ -1944,7 +1917,15 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 
   if (!ds.worker) {
     logger.info(`[${ds.session.sessionId.substring(0, 8)}] terminal accessed with no live worker — waking to re-attach`);
-    forkWorker(ds, '', true);
+    // Lazy-wake is a fork boundary too. The central guard inside forkWorker
+    // refuses (returns false) for a quarantined tail-only owner whose promotion
+    // still fails — waking a blank worker beside an unpromoted tail would wedge
+    // the FIFO gate. Report unavailable (the terminal retries / 502s) instead of
+    // blocking 10s for a port that will never arrive.
+    if (!forkWorker(ds, '', true)) {
+      logger.warn(`[${ds.session.sessionId.substring(0, 8)}] terminal wake refused (quarantined tail-only owner); serving unavailable`);
+      return undefined;
+    }
   }
 
   // Wait (bounded) for the re-forked worker to report its HTTP port via `ready`.

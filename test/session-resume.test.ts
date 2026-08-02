@@ -144,7 +144,7 @@ vi.mock('../src/core/session-activity.js', () => ({
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, resumeSession, retryQuarantinedActivationTailPromotion } from '../src/core/session-manager.js';
+import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
 import { restoreUsageLimitRuntimeState, closeSession, forkAdoptWorker, promoteQueuedActivationTail } from '../src/core/worker-pool.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -869,43 +869,14 @@ describe('resumeSession', () => {
   });
 });
 
-describe('retryQuarantinedActivationTailPromotion (fork-boundary retry)', () => {
-  beforeEach(() => {
-    vi.mocked(promoteQueuedActivationTail).mockReset();
-    vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
-  });
-
-  function quarantinedDs(): DaemonSession {
-    return {
-      session: {
-        sessionId: 'sid-q', chatId: 'oc', rootMessageId: 'om', status: 'active',
-        queuedActivationTail: [{ id: 't1', order: 1, userPrompt: 'p', cliInput: { content: 'p' }, turnId: 'turn-1' }],
-      },
-      worker: null, larkAppId: 'app_test', quarantinedActivationTailPromotion: true,
-    } as unknown as DaemonSession;
-  }
-
-  it('returns true and clears the flag when the retry promotion SUCCEEDS (safe to fork the promoted head)', () => {
-    const ds = quarantinedDs();
-    vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
-    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(true);
-    expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
-    expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalledWith(ds, { send: false });
-  });
-
-  it('returns FALSE and keeps the flag when the retry promotion still FAILS (caller must skip the fork)', () => {
-    const ds = quarantinedDs();
-    vi.mocked(promoteQueuedActivationTail).mockReturnValue(false);
-    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(false);
-    // Still quarantined so a later boundary retries; NEVER fork now (avoids a
-    // live worker beside an unpromoted tail).
-    expect(ds.quarantinedActivationTailPromotion).toBe(true);
-  });
-
-  it('is a no-op (returns true) for a non-quarantined session — never touches promotion', () => {
-    const ds = quarantinedDs();
-    ds.quarantinedActivationTailPromotion = undefined;
-    expect(retryQuarantinedActivationTailPromotion(ds)).toBe(true);
-    expect(vi.mocked(promoteQueuedActivationTail)).not.toHaveBeenCalled();
-  });
-});
+// NOTE: the fork-boundary quarantine recovery (retry-then-refuse-or-recover) is
+// now enforced by the CENTRAL guard inside forkWorker (resolveQuarantinedForkPlan),
+// not a separate per-site helper. Because this suite fully mocks worker-pool, the
+// real guard cannot run here; its end-to-end behavior (refuse non-empty, retry
+// fail → 0 forks, retry success → fork the promoted old head for Codex App and
+// non-Codex, FIFO preserved) is covered against the REAL forkWorker in
+// test/session-lifecycle-start.test.ts → 'quarantined tail-only owner recovery at
+// the fork boundary'. What this suite owns is the RESTORE side: a transient
+// promotion failure registers a visible quarantined owner and sets the
+// `quarantinedActivationTailPromotion` flag the guard keys on (see the
+// 'registers a visible quarantined owner …' test above).

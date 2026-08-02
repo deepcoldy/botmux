@@ -637,6 +637,131 @@ describe('Codex App clean-input feature gate', () => {
     expect(ds.pendingPrompt).toBeUndefined();
   });
 
+  // ── Central quarantine guard (resolveQuarantinedForkPlan inside forkWorker) ──
+  // These drive the REAL forkWorker + REAL promoteQueuedActivationTail (only the
+  // child fork + session store are faked), so they cover the actual wiring codex
+  // asked for: restore-time quarantine → next real fork boundary. A helper-only
+  // unit test could not catch the P2-A/P2-B defects (wrong fork target / missed
+  // entry point) because those live in how forkWorker applies the plan.
+  describe('quarantined tail-only owner recovery at the fork boundary', () => {
+    function quarantinedDs(cliId: 'codex-app' | 'claude-code'): DaemonSession {
+      const ds = makeDs({
+        hasHistory: true,
+        initialStartPending: true,
+        quarantinedActivationTailPromotion: true,
+      });
+      ds.session.cliId = cliId;
+      // The old head that failed to promote at restore, still parked in the tail.
+      ds.session.queuedActivationTail = [{
+        id: 'tail-head',
+        order: 1,
+        userPrompt: 'OLD_HEAD',
+        cliInput: { content: 'OLD_HEAD' },
+        turnId: 'turn-old-head',
+        dispatchAttempt: 7,
+      }];
+      ds.session.queuedActivationTailNextOrder = 1;
+      return ds;
+    }
+
+    it('REFUSES a non-empty fork while quarantined (returns false, no fork, no promotion, no overtaking)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+
+      const forked = forkWorker(ds, 'BRAND_NEW_TURN', { turnId: 'turn-new' });
+
+      expect(forked).toBe(false);
+      // No worker started — the caller must treat the session as still worker-less.
+      expect(forkMock).not.toHaveBeenCalled();
+      // Promotion NOT attempted (a non-empty prompt could overtake the old head;
+      // the guard bails before touching promotion).
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      // Still quarantined; the old head is untouched at the front of the tail.
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+
+    it('retry FAILS → refuses the blank fork, keeps worker:null + gate + quarantine (never a live worker beside an unpromoted tail)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+      // Promotion's single durable write still fails transiently.
+      vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+        throw new Error('promotion store still unavailable');
+      });
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(false);
+      expect(forkMock).not.toHaveBeenCalled();
+      // Gate stays held and the session stays quarantined for a later boundary.
+      expect(ds.initialStartPending).toBe(true);
+      expect(ds.quarantinedActivationTailPromotion).toBe(true);
+      // Old head not promoted, still parked exactly.
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+
+    it('retry SUCCEEDS (Codex App) → clears quarantine, forks a recovery worker for the PROMOTED OLD HEAD via the ledger', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      // Promotion moved the old head into the tokened activation.
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.queuedActivationInput?.content).toBe('OLD_HEAD');
+      expect(ds.session.queuedActivationTurnId).toBe('turn-old-head');
+      // Quarantine cleared; a real worker was forked to recover it.
+      expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      // Codex App recovers through its dispatch ledger, NOT the init prompt arg:
+      // the promoted old head travels as the tokened queuedActivationInput (+ the
+      // recovered ledger entry), so the worker is spawned with an EMPTY init
+      // prompt — never a synthetic opening turn. (The head content is asserted via
+      // queuedActivationInput above.)
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.prompt).toBe('');
+      expect(init.queuedActivationToken).toBeTruthy();
+    });
+
+    it('retry SUCCEEDS (non-Codex) → forks the exact queuedActivationInput as the recovery prompt (not an opening builder envelope)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'claude-code' }));
+      const ds = quarantinedDs('claude-code');
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      expect(ds.session.queuedActivationPending).toBe(true);
+      expect(ds.session.queuedActivationInput?.content).toBe('OLD_HEAD');
+      expect(ds.quarantinedActivationTailPromotion).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      // Non-Codex resubmits the exact recovered input as the worker prompt — a
+      // plain 'OLD_HEAD', with no new-topic routing/<user_message> envelope wrapped
+      // around it (which forkReservedInitialSession would have produced).
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.prompt).toBe('OLD_HEAD');
+      expect(init.prompt).not.toContain('<user_message>');
+    });
+
+    it('is a pure pass-through for a NON-quarantined session (no promotion side effects)', () => {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+      const ds = quarantinedDs('codex-app');
+      ds.quarantinedActivationTailPromotion = undefined; // not quarantined
+
+      const forked = forkWorker(ds, '', true);
+
+      expect(forked).toBe(true);
+      // The old head is left exactly where it was — the guard did not promote it.
+      expect(ds.session.queuedActivationPending).toBeUndefined();
+      expect(ds.session.queuedActivationTail?.[0]?.turnId).toBe('turn-old-head');
+    });
+  });
+
   it('promotes the admitted clean sidecar exactly even after the live config gate flips off', () => {
     let cleanInputEnabled = true;
     vi.mocked(getBot).mockImplementation(() => defaultBot({
