@@ -364,35 +364,16 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
 }
 
 function loadBotsJson(): any[] {
+  // NOTE: this stays FATAL on a read error, deliberately. Several callers treat
+  // an empty list as "nothing references this" and go on to delete things
+  // (plugin dematerialize / uninstall dependency check) — degrading the read to
+  // [] would turn a denied read into silent destructive action. Anything that
+  // must survive an unreadable bots.json has to opt out explicitly, the way
+  // allBotAppIds() and currentBotIsApiOnly() do.
   if (existsSync(BOTS_JSON_FILE)) {
-    let raw: string;
     try {
-      raw = readFileSync(BOTS_JSON_FILE, 'utf-8');
+      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
     } catch (err: any) {
-      // Separate "cannot READ it" from "read it, it's malformed" — they need
-      // opposite handling and conflating them is what broke every sandboxed bot.
-      //
-      // A sandboxed CLI is denied bots.json on purpose (sibling secrets). Seatbelt
-      // permits the metadata read, so existsSync() above passes and we land here
-      // with EPERM/EACCES. Under isolation that is the DESIGNED state: identity
-      // comes from <BOT_HOME>/send-cred.json via registerSelfFromCredFile(), so
-      // "no bots from disk" is the correct and complete answer.
-      //
-      // NOTE for future edits: exiting here is NOT catchable by callers.
-      // currentBotIsApiOnly() wraps this call in try/catch and documents itself as
-      // "never throws" — literally true and completely useless, because
-      // process.exit() is not an exception. This ran on the ROOT dispatch gate
-      // (managedOriginHasNoTransport), so it killed EVERY botmux subcommand inside
-      // the sandbox, not just send. Introduced by #668, found 2026-08-03.
-      if ((err?.code === 'EPERM' || err?.code === 'EACCES') && underReadIsolation()) return [];
-      // Outside isolation an unreadable bots.json is a real fault: stay fatal.
-      console.error(`❌ ${err?.message ?? String(err)}`);
-      process.exit(1);
-    }
-    try {
-      return parseBotConfigsJson(raw, BOTS_JSON_FILE);
-    } catch (err: any) {
-      // Malformed content is always fatal, isolation or not.
       console.error(`❌ ${err?.message ?? String(err)}`);
       process.exit(1);
     }
@@ -6556,11 +6537,24 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   // appId — a sandboxed bot cannot see (and must not answer for) its siblings.
   // Absent key = not apiOnly: JSON.stringify drops `apiOnly: undefined`, which is
   // exactly what the worker writes for a normal transport-enabled bot.
-  if (underReadIsolation() && process.env.BOTMUX_LARK_APP_ID === larkAppId) {
+  if (underReadIsolation()) {
+    // bots.json is denied in here and loadBotsJson() is FATAL on that — never
+    // reach it from the root dispatch gate. This bot's own apiOnly comes from the
+    // designed private channel instead: <BOT_HOME>/send-cred.json, written
+    // host-side by the worker, carrying apiOnly (worker.ts). Absent key = not
+    // apiOnly (JSON.stringify drops `apiOnly: undefined`, which is exactly what
+    // the worker writes for a normal transport-enabled bot).
+    if (process.env.BOTMUX_LARK_APP_ID !== larkAppId) return false; // can't see siblings
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
       return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
-    } catch { /* no/unreadable cred file → fall through to the bots.json view */ }
+    } catch {
+      // No readable cred file: we cannot tell. Say "not apiOnly" rather than
+      // crash — the transport boundary still fail-closes downstream
+      // (getBotClient throws for apiOnly, and an apiOnly bot has no secret to
+      // talk to Feishu with in the first place).
+      return false;
+    }
   }
   try {
     return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);

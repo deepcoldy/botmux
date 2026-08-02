@@ -20,6 +20,7 @@
  * plaintext). See the design doc for the two-layer rationale.
  */
 
+import { statSync } from 'node:fs';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -379,23 +380,29 @@ function dedupe(xs: string[]): string[] {
 
 /**
  * True when this process is a CLI the worker spawned for a bot under READ
- * ISOLATION (the sandbox). The worker injects BOTH of these and writes that
- * bot's own credential to `<BOT_HOME>/send-cred.json` — see
- * {@link sendCredFilePath}.
+ * ISOLATION (the sandbox), where `~/.botmux/bots.json` is denied ON PURPOSE (it
+ * holds every sibling bot's app secret).
  *
- * Why this predicate exists: inside the sandbox `~/.botmux/bots.json` is denied
- * ON PURPOSE (it holds every sibling bot's secret). Seatbelt allows the METADATA
- * read but denies the CONTENT read, so `existsSync()` says yes and the following
- * `readFileSync()` fails with EPERM/EACCES. Callers must be able to tell that
- * EXPECTED state apart from a genuine unreadable-config fault: under isolation
- * the correct answer is "disk has nothing for you, use send-cred.json"; outside
- * it, an unreadable bots.json must stay fatal (degrading there would silently
- * boot a zero-bot process — no bot answers and nothing says why).
+ * The signal is the EXISTENCE of this bot's own `<BOT_HOME>/send-cred.json`.
+ * The worker writes that file host-side and ONLY for a sandboxed session
+ * (`if (sandboxRequested && SESSION_DATA_DIR)`), so its presence is decided by
+ * the host, not by the sandboxed process's environment.
  *
- * Deliberately requires BOTH markers: a half-configured environment is not
- * isolation, and treating it as such would widen the swallow to cases the
- * sandbox never produces.
+ * ⚠️ Do NOT weaken this back to an env-only check. `BOTMUX_LARK_APP_ID` and
+ * `SESSION_DATA_DIR` are injected into EVERY worker-spawned CLI (worker.ts
+ * `childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId`, ungated), sandboxed or not — an
+ * env-only predicate matches ordinary bots too and would silently downgrade a
+ * genuine "bots.json is unreadable" fault into "there are no bots" on a normal
+ * host. (Caught in review, 2026-08-03.) The env vars stay in the check only to
+ * locate the file.
  */
 export function underReadIsolation(): boolean {
-  return !!process.env.SESSION_DATA_DIR && !!process.env.BOTMUX_LARK_APP_ID;
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  const appId = process.env.BOTMUX_LARK_APP_ID;
+  if (!sessionDataDir || !appId) return false;
+  try {
+    return statSync(sendCredFilePath(sessionDataDir, appId)).isFile();
+  } catch {
+    return false; // absent or unreadable → not a sandboxed session we can vouch for
+  }
 }

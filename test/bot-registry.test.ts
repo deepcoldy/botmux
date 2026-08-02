@@ -1646,7 +1646,23 @@ describe('loadBotConfigs when bots.json exists but is unreadable', () => {
   it('degrades to an empty list under read isolation (identity comes from send-cred.json)', () => {
     process.env.SESSION_DATA_DIR = '/h/.botmux/data';
     process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    // Isolation is proven by the HOST-written send-cred.json, not by env alone —
+    // the worker injects those two vars for ordinary bots too.
+    vi.mocked(fs.statSync).mockImplementation(((p: any) =>
+      String(p).endsWith('/bots/cli_sandboxed/send-cred.json')
+        ? ({ isFile: () => true } as any)
+        : ({ mtimeMs: 0, isFile: () => false } as any)) as never);
     expect(mod.loadBotConfigs()).toEqual([]);
+  });
+
+  it('does NOT degrade for an ordinary worker CLI (same env vars, no cred file)', () => {
+    // The regression this guards: an env-only isolation check matches every
+    // worker-spawned CLI, so a genuinely unreadable bots.json on a normal host
+    // would silently become "there are no bots".
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_plain';
+    vi.mocked(fs.statSync).mockImplementation((() => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); }) as never);
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
   });
 
   it('still throws OUTSIDE read isolation — an unreadable bots.json is a real fault there', () => {
