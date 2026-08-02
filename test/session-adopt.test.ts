@@ -36,9 +36,11 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildAdoptSelectCard: vi.fn(() => JSON.stringify({ type: 'adopt_select' })),
   // Confirm path dynamically imports adoptLiveKey to map a freshly-discovered
   // session back to the clicked entry_key — mirror the real key format.
+  // zellij is pid-AGNOSTIC on purpose (see adoptLiveKey doc / fix 57dcbebbb):
+  // the key must stay stable across a render→confirm pid shift.
   adoptLiveKey: vi.fn((s: any) =>
     'zellijPaneId' in s
-      ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}:${s.cliPid ?? ''}`
+      ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}`
       : `live:tmux:${s.tmuxTarget}:${s.cliPid}`,
   ),
   buildCodexAppThreadSelectCard: vi.fn(() => JSON.stringify({ type: 'codex_app_thread_select' })),

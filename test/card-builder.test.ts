@@ -17,6 +17,7 @@ import {
   buildSessionClosedCard,
   buildRelayPickerCard,
   buildAdoptSelectCard,
+  adoptLiveKey,
   buildAdoptBlockedCard,
   buildPrivateSnapshotCard,
   buildConfigCard,
@@ -169,6 +170,53 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     const text = JSON.stringify(card);
     expect(text).toContain('20');
     expect(text.toLowerCase()).toContain('search'); // en copy points at search
+  });
+
+  it('escapes the echoed search query in the no-match message (defuses ![](url) image injection)', () => {
+    // A malicious query rendered raw into a markdown element would fetch an
+    // external image (tracking beacon / SSRF). The no-match copy must escape it.
+    // Needs ≥1 entry that DOESN'T match, so we reach the empty_filtered branch
+    // (an entirely empty list short-circuits to card.adopt.empty first).
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: '![x](http://evil/beacon)' }));
+    const md = (card.body.elements ?? [])
+      .filter((e: any) => e.tag === 'markdown')
+      .map((e: any) => e.content).join('\n');
+    // The image/link brackets are backslash-escaped, so Lark parses them as
+    // literal text rather than an <img> / <a> — the external fetch never fires.
+    // Escaped form is "!\[x\](…)"; the unescaped "![x](" must NOT survive.
+    expect(md).toContain('\\[x\\]');
+    expect(md).not.toContain('![x](');
+  });
+});
+
+describe('adoptLiveKey (synthetic confirm key)', () => {
+  // Regression guard for the confirm-path match. The card-handler confirm path
+  // re-discovers live sessions and matches `adoptLiveKey(fresh) === entryKey`,
+  // so the key MUST be stable across whatever legitimately shifts between the
+  // render snapshot and the click.
+  const zellijAt = (cliPid: number) => ({
+    zellijSession: 'mywork', zellijPaneId: 'terminal_1', cliPid,
+    cliId: 'codex' as const, sessionId: 'sess', cwd: '/w', paneCols: 80, paneRows: 24,
+  });
+
+  it('zellij key is pid-AGNOSTIC — same (session,paneId), different pid → SAME key', () => {
+    // This is the crux of fix 57dcbebbb: a zellij pane's resolved CLI pid can
+    // shift (wrapper⇄native collapse, re-fork) between render and confirm.
+    // Baking pid into the key would make the confirm match fail and surface a
+    // false "目标已退出". (session, paneId) alone uniquely identifies the pane.
+    expect(adoptLiveKey(zellijAt(111))).toBe(adoptLiveKey(zellijAt(222)));
+    expect(adoptLiveKey(zellijAt(111))).toBe('live:zellij:mywork/terminal_1');
+    expect(adoptLiveKey(zellijAt(111))).not.toContain(':111');
+  });
+
+  it('tmux key stays pid-SENSITIVE (adoptTargetKey includes pid; confirm fast-path parses it)', () => {
+    const tmuxAt = (cliPid: number) => ({
+      source: 'tmux' as const, tmuxTarget: '0:1.0', cliPid,
+      cliId: 'claude-code' as const, sessionId: 's', cwd: '/w', paneCols: 80, paneRows: 24,
+    });
+    expect(adoptLiveKey(tmuxAt(111))).toBe('live:tmux:0:1.0:111');
+    expect(adoptLiveKey(tmuxAt(111))).not.toBe(adoptLiveKey(tmuxAt(222)));
   });
 });
 

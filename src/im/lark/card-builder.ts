@@ -2128,9 +2128,19 @@ export interface AdoptPickerEntry {
 
 /** Deterministic key for a live adoptable session (tmux/herdr/zellij).
  *  Exported so the card-handler's confirm path can match a clicked entry_key
- *  back to a freshly-discovered session without re-deriving the format. */
+ *  back to a freshly-discovered session without re-deriving the format.
+ *
+ *  ⚠️ zellij keys are pid-AGNOSTIC on purpose — do NOT add cliPid back.
+ *  Confirm re-discovers and matches `adoptLiveKey(fresh) === entryKey`; a
+ *  zellij pane's resolved CLI pid legitimately shifts between render and
+ *  confirm (wrapper⇄native collapse, re-fork), so baking pid into the key
+ *  makes that match spuriously fail → user sees a false "目标已退出". This
+ *  is exactly the bug fix 57dcbebbb removed ("点击候选改按 (session,paneId)
+ *  匹配"): (zellijSession, zellijPaneId) already uniquely identifies the pane.
+ *  tmux/herdr keep adoptTargetKey (tmux includes pid, herdr does not) — tmux's
+ *  confirm fast-path parses the trailing pid, and that path is unchanged. */
 export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
-  if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}:${s.cliPid ?? ''}`;
+  if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}`;
   return `live:${adoptTargetKey(s)}`;
 }
 
@@ -2281,7 +2291,12 @@ export function buildAdoptSelectCard(
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
   if (filtered.length === 0) {
-    elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: searchQuery }, locale) });
+    // escapeMd the echoed query: it's raw operator input rendered into a
+    // markdown element, so an unescaped `![](http://x)` would render as an
+    // image (external fetch = tracking beacon / SSRF surface). Neutralising
+    // [ ] ` etc. defuses that. (buildRelayPickerCard echoes its query the
+    // same way and shares the same latent risk — tracked separately.)
+    elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 
