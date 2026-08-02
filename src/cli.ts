@@ -6545,6 +6545,11 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
     // apiOnly (JSON.stringify drops `apiOnly: undefined`, which is exactly what
     // the worker writes for a normal transport-enabled bot).
     if (process.env.BOTMUX_LARK_APP_ID !== larkAppId) return false; // can't see siblings
+    // Host-owned verdict first: a no-transport bot's own send-cred.json is denied
+    // by fs-policy (`!larkTransport` branch denies <BOT_HOME>/send-cred.json), so
+    // for exactly the bots this gate exists to catch the file read below cannot
+    // succeed. The worker therefore also states it in the env.
+    if (process.env.BOTMUX_API_ONLY === '1') return true;
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
       return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;

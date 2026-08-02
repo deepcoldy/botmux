@@ -1,7 +1,5 @@
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { describe, it, expect, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   evaluateReadIsolationGate,
   evaluateCredentialOnlyIsolationGate,
@@ -282,81 +280,44 @@ describe('CLI protected capability wiring', () => {
 // ─── underReadIsolation ───────────────────────────────────────────────────
 
 /**
- * Regression guard (2026-08-03 fleet P0, introduced by #668). Callers use this to
- * decide whether an UNREADABLE ~/.botmux/bots.json is the expected sandbox state
- * (degrade) or a real fault (stay fatal). Wrong in either direction is bad:
- * too narrow → every sandboxed bot's CLI dies on the root dispatch gate;
- * too wide → a genuine unreadable config silently becomes "there are no bots".
- *
- * The predicate must key off the HOST-written send-cred.json, not env alone:
- * BOTMUX_LARK_APP_ID / SESSION_DATA_DIR are injected for every worker-spawned
- * CLI, sandboxed or not.
+ * Regression guard (2026-08-03 fleet P0, introduced by #668). Two earlier
+ * versions of this predicate were wrong and both are pinned here as negative
+ * cases, so a future "simplification" back to either one fails loudly.
  */
 describe('underReadIsolation', () => {
   const saved = { ...process.env };
-  let tmp: string;
+  afterEach(() => { process.env = { ...saved }; });
 
-  beforeEach(() => {
-    tmp = mkdtempSync(join(tmpdir(), 'botmux-iso-'));
-    mkdirSync(join(tmp, 'data'), { recursive: true });
-  });
-  afterEach(() => {
-    process.env = { ...saved };
-    rmSync(tmp, { recursive: true, force: true });
-  });
+  const load = async () => (await import('../src/adapters/cli/read-isolation.js')).underReadIsolation;
 
-  const writeCred = (appId: string) => {
-    const dir = join(tmp, 'bots', appId);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'send-cred.json'), '{"larkAppId":"' + appId + '"}');
-  };
-
-  it('is true when the host-written send-cred.json exists for this bot', async () => {
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    writeCred('cli_sandboxed');
-    process.env.SESSION_DATA_DIR = join(tmp, 'data');
-    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+  it('is true when the worker marked the child as sandboxed', async () => {
+    const underReadIsolation = await load();
+    process.env.BOTMUX_READ_ISOLATION = '1';
     expect(underReadIsolation()).toBe(true);
   });
 
-  it('is FALSE for an ordinary worker-spawned CLI: both env vars set, no cred file', async () => {
-    // This is the case that matters most — the worker injects BOTMUX_LARK_APP_ID
-    // and SESSION_DATA_DIR for NON-sandboxed bots too. An env-only predicate would
-    // wrongly report isolation here and swallow real config faults.
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    process.env.SESSION_DATA_DIR = join(tmp, 'data');
+  it('is false on a plain host', async () => {
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('does NOT infer isolation from SESSION_DATA_DIR + BOTMUX_LARK_APP_ID', async () => {
+    // Rejected v1: the worker injects both of those for EVERY bot it spawns,
+    // sandboxed or not, so this shape is an ordinary CLI. Treating it as isolated
+    // would swallow a real unreadable-bots.json fault on a normal host.
+    const underReadIsolation = await load();
+    delete process.env.BOTMUX_READ_ISOLATION;
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
     process.env.BOTMUX_LARK_APP_ID = 'cli_plain';
     expect(underReadIsolation()).toBe(false);
   });
 
-  it('is false when the cred file belongs to a DIFFERENT bot', async () => {
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    writeCred('cli_someone_else');
-    process.env.SESSION_DATA_DIR = join(tmp, 'data');
-    process.env.BOTMUX_LARK_APP_ID = 'cli_me';
-    expect(underReadIsolation()).toBe(false);
-  });
-
-  it('is false when SESSION_DATA_DIR is missing even though the file exists', async () => {
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    writeCred('cli_sandboxed');
-    delete process.env.SESSION_DATA_DIR;
-    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
-    expect(underReadIsolation()).toBe(false);
-  });
-
-  it('is false on a bare host with neither marker', async () => {
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    delete process.env.SESSION_DATA_DIR;
-    delete process.env.BOTMUX_LARK_APP_ID;
-    expect(underReadIsolation()).toBe(false);
-  });
-
-  it('is false when the cred path is a directory, not a file', async () => {
-    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
-    mkdirSync(join(tmp, 'bots', 'cli_odd', 'send-cred.json'), { recursive: true });
-    process.env.SESSION_DATA_DIR = join(tmp, 'data');
-    process.env.BOTMUX_LARK_APP_ID = 'cli_odd';
-    expect(underReadIsolation()).toBe(false);
+  it('only accepts the exact marker value "1"', async () => {
+    const underReadIsolation = await load();
+    for (const v of ['0', 'true', 'yes', '']) {
+      process.env.BOTMUX_READ_ISOLATION = v;
+      expect(underReadIsolation()).toBe(false);
+    }
   });
 });

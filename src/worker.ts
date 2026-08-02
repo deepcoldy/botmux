@@ -8498,6 +8498,28 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  // Explicit, HOST-DECIDED read-isolation marker. The CLI needs to tell
+  // "bots.json is denied because I'm sandboxed (expected)" from "bots.json is
+  // unreadable (real fault)" — see underReadIsolation() in read-isolation.ts.
+  // It cannot be inferred CLI-side:
+  //   · env like BOTMUX_LARK_APP_ID / SESSION_DATA_DIR is injected for EVERY bot,
+  //     sandboxed or not;
+  //   · the presence of <BOT_HOME>/send-cred.json does not work either — a
+  //     no-transport (apiOnly) bot has its OWN copy denied by fs-policy
+  //     (`push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory')`), and a
+  //     stale file survives flipping a bot from sandbox:true back to false.
+  // Always assign or DELETE, never leave it to chance: a stale value inherited
+  // from an rcfile / tmux environment must not make an unsandboxed CLI believe
+  // it is isolated (same reasoning as chatBotDiscovery below).
+  if (sandboxRequested) childEnv.BOTMUX_READ_ISOLATION = '1';
+  else delete childEnv.BOTMUX_READ_ISOLATION;
+  // Host-owned apiOnly verdict. Needed because a no-transport bot's OWN
+  // send-cred.json is denied by fs-policy (the `!larkTransport` branch), so the
+  // sandboxed CLI cannot read its apiOnly flag from disk and would otherwise have
+  // to assume "not apiOnly". Forging this can only make a turn MORE restricted,
+  // never less. Mirrors what the riff path already does via mergedEnv.
+  if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
+  else delete childEnv.BOTMUX_API_ONLY;
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-
