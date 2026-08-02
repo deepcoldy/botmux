@@ -22,7 +22,7 @@
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
-import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -6544,6 +6544,24 @@ async function relaySend(
  *  with a clear message. Reads bots.json best-effort; an apiOnly bot runs
  *  non-isolated (no Feishu secret to protect), so bots.json is readable here. */
 function currentBotIsApiOnly(larkAppId: string): boolean {
+  // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
+  // can only ever answer "no bots at all". Letting that stand would silently turn
+  // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
+  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // itself as tamper-resistant) delegates its verdict here.
+  //
+  // The worker already hands this bot its OWN config through the designed private
+  // channel: <BOT_HOME>/send-cred.json, written host-side, carrying apiOnly. Take
+  // the verdict from there instead of degrading it away. Only valid for our own
+  // appId — a sandboxed bot cannot see (and must not answer for) its siblings.
+  // Absent key = not apiOnly: JSON.stringify drops `apiOnly: undefined`, which is
+  // exactly what the worker writes for a normal transport-enabled bot.
+  if (underReadIsolation() && process.env.BOTMUX_LARK_APP_ID === larkAppId) {
+    try {
+      const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
+      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+    } catch { /* no/unreadable cred file → fall through to the bots.json view */ }
+  }
   try {
     return loadBotsJson().some((b: any) => b?.larkAppId === larkAppId && b?.apiOnly === true);
   } catch {
