@@ -39,8 +39,8 @@ import { markInitialUserTurnPending } from './initial-user-turn.js';
 import { discoverSlashCommandsForAdapter, listMcpServerNames, supportsFilesystemCommandDiscovery } from './command-discovery.js';
 import { validateWorkingDir } from './working-dir.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
-import { discoverAdoptableSessions, excludeOwnedHerdrAdoptTargets, validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
-import { discoverAdoptableZellijSessions, validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
+import { validateAdoptTarget, adoptTargetKey, adoptTargetLabel, type AdoptableSession } from './session-discovery.js';
+import { validateZellijAdoptTarget, type ZellijAdoptableSession } from './zellij-adopt-discovery.js';
 import { listCodexAppThreads, type CodexAppThreadSummary } from '../services/codex-app-threads.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, DOC_COMMENT_OAUTH_SCOPES } from '../utils/user-token.js';
 import { DocSubscriptionPermissionError, listDocComments, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../im/lark/doc-comment.js';
@@ -2429,28 +2429,19 @@ export async function handleCommand(
         // Discover every supported backend, but only offer live sessions for
         // this bot's configured CLI. A Pi bot must not show Codex/TRAE panes:
         // adopting one would unexpectedly change the agent behind the bot.
-        const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
-          const target = active.session.persistentBackendTarget;
-          return active.session.status === 'active'
-            && !active.adoptedFrom
-            && target?.backendType === 'herdr'
-            && !!target.agentName
-            ? [{ sessionName: target.sessionName, agentName: target.agentName }]
-            : [];
-        });
-        const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
-          ...excludeOwnedHerdrAdoptTargets(
-            discoverAdoptableSessions(botCliId),
-            ownedHerdrTargets,
-          ),
-          ...discoverAdoptableZellijSessions(botCliId),
-        ];
-
-        // Second filter: sessions resumable from disk (paseo-style import).
-        // Only the bot's OWN CLI is offered (resume needs that CLI's binary).
-        const resumable = botCliId
-          ? await discoverResumableSessionsForBot(botCliId, botCfgForAdopt?.cliPathOverride, activeSessions)
-          : [];
+        // collectAdoptCandidates folds live-pane + disk-resume discovery into
+        // one snapshot; we cache it (by root message id) so the V2 picker's
+        // search / page re-renders don't re-shell-out to tmux each click.
+        const { collectAdoptCandidates, cacheAdoptCandidates } = await import('../services/adopt-picker.js');
+        const candidates = await collectAdoptCandidates(
+          botCliId,
+          botCfgForAdopt?.cliPathOverride,
+          activeSessions,
+          discoverResumableSessionsForBot,
+          ADOPT_RESUME_LIMIT,
+        );
+        const sessions = candidates.sessions;
+        const resumable = candidates.resumable;
         if (
           ds
           && adoptSession
@@ -2495,7 +2486,18 @@ export async function handleCommand(
           break;
         }
 
-        const cardJson = buildAdoptSelectCard(sessions, rootId, loc, resumable);
+        // Cache the snapshot so the picker's search / page clicks reuse it
+        // (confirm re-discovers to re-validate the live pane).
+        cacheAdoptCandidates(rootId, candidates, Date.now());
+        const cardJson = buildAdoptSelectCard(
+          sessions,
+          rootId,
+          loc,
+          resumable,
+          undefined,
+          message.senderId,
+          candidates.resumeLimit,
+        );
         await sessionReply(rootId, cardJson, 'interactive');
         break;
       }
@@ -3702,6 +3704,12 @@ export async function startAdoptSession(
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.success', { cliName, project, pane }, loc));
 }
 
+/** Cap on resume candidates surfaced by the /adopt picker. Kept at the legacy
+ *  20 (per product call: the V2 card is a display change, not a scope change).
+ *  When the cap is hit the card shows a hint pointing at search + the
+ *  `/adopt <id>` direct path, so history beyond the cap is still reachable. */
+export const ADOPT_RESUME_LIMIT = 20;
+
 /** Discover the sessions resumable from disk for `cliId`, excluding any whose
  *  CLI-native id is already live in a botmux session (so a session botmux
  *  already runs isn't offered for re-import). Returns [] when the adapter has
@@ -3710,7 +3718,7 @@ export async function discoverResumableSessionsForBot(
   cliId: CliId,
   cliPathOverride: string | undefined,
   activeSessions: Map<string, DaemonSession>,
-  limit = 20,
+  limit = ADOPT_RESUME_LIMIT,
 ): Promise<ResumableSession[]> {
   let adapter: ReturnType<typeof createCliAdapterSync>;
   try { adapter = createCliAdapterSync(cliId, cliPathOverride); } catch { return []; }

@@ -34,6 +34,13 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
       JSON.stringify({ type: 'session', url: _url }),
   ),
   buildAdoptSelectCard: vi.fn(() => JSON.stringify({ type: 'adopt_select' })),
+  // Confirm path dynamically imports adoptLiveKey to map a freshly-discovered
+  // session back to the clicked entry_key — mirror the real key format.
+  adoptLiveKey: vi.fn((s: any) =>
+    'zellijPaneId' in s
+      ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}:${s.cliPid ?? ''}`
+      : `live:tmux:${s.tmuxTarget}:${s.cliPid}`,
+  ),
   buildCodexAppThreadSelectCard: vi.fn(() => JSON.stringify({ type: 'codex_app_thread_select' })),
   buildAdoptBlockedCard: vi.fn((rootId: string, sessionId: string, cliId?: string) => JSON.stringify({
     type: 'adopt_blocked',
@@ -175,11 +182,12 @@ function makeTakeoverEvent(rootId: string, operatorOpenId = 'ou_user') {
   };
 }
 
-function makeAdoptSelectEvent(rootId: string, selectedValue: string, operatorOpenId = 'ou_user') {
+function makeAdoptSelectEvent(rootId: string, entryKey: string, operatorOpenId = 'ou_user') {
+  // V2 picker: confirm carries the synthetic entry_key (live:<adoptTargetKey>
+  // or resume:<cliSessionId>) rather than a JSON-encoded option string.
   return {
     action: {
-      option: selectedValue,
-      value: { key: 'adopt_select', root_id: rootId },
+      value: { action: 'adopt_confirm', entry_key: entryKey, root_id: rootId },
     },
     operator: { open_id: operatorOpenId },
     context: { open_message_id: 'om_card_msg' },
@@ -334,9 +342,9 @@ describe('Adopt card actions', () => {
     });
   });
 
-  // ── adopt_select dropdown ─────────────────────────────────────────────
+  // ── adopt_confirm (V2 picker) ─────────────────────────────────────────
 
-  describe('adopt_select dropdown', () => {
+  describe('adopt_confirm (live)', () => {
     it('should show error when target CLI has exited', async () => {
       // Mock discoverAdoptableSessions to return empty (target gone)
       vi.doMock('../src/core/session-discovery.js', () => ({
@@ -344,11 +352,7 @@ describe('Adopt card actions', () => {
         // 单 pane 快路径同样解析不到（pane 已经没了），card-handler 会回落全量扫描。
         discoverAdoptableSessionByTarget: vi.fn(() => undefined),
         excludeOwnedHerdrAdoptTargets: vi.fn((sessions: unknown[]) => sessions),
-        // card-handler now also pulls adoptTargetKey to disambiguate herdr
-        // vs. tmux targets in the dropdown's selected-value. The empty
-        // session list short-circuits before adoptTargetKey is invoked, so
-        // the noop impl is fine.
-        adoptTargetKey: vi.fn(() => ''),
+        adoptTargetKey: vi.fn((s: any) => `tmux:${s.tmuxTarget}:${s.cliPid}`),
         adoptTargetLabel: vi.fn(() => ''),
       }));
 
@@ -358,8 +362,8 @@ describe('Adopt card actions', () => {
       sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      const selectedValue = JSON.stringify({ tmuxTarget: '0:1.0', cliPid: 99999 });
-      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, selectedValue), deps, APP_ID);
+      // entry_key format = "live:" + adoptTargetKey = "live:tmux:0:1.0:99999".
+      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'live:tmux:0:1.0:99999'), deps, APP_ID);
       await flush();
 
       expect(deps.sessionReply).toHaveBeenCalledWith(
@@ -373,21 +377,26 @@ describe('Adopt card actions', () => {
       vi.doUnmock('../src/core/session-discovery.js');
     });
 
-    it('should ignore invalid JSON in option', async () => {
-      const ds = makeDaemonSession();
+    it('should return early when entry_key or rootId is missing', async () => {
       const sessions = new Map<string, DaemonSession>();
-      const sKey = sessionKey(ROOT_ID, APP_ID);
-      sessions.set(sKey, ds);
       const deps = makeDeps(sessions);
 
-      // Invalid JSON option should be silently ignored
-      await handleCardAction(makeAdoptSelectEvent(ROOT_ID, 'not-json'), deps, APP_ID);
+      const event = {
+        action: {
+          value: { action: 'adopt_confirm', entry_key: 'live:tmux:0:1.0:123' }, // No root_id
+        },
+        operator: { open_id: 'ou_user' },
+      };
+
+      await handleCardAction(event, deps, APP_ID);
       await flush();
 
-      // Should not crash, no session reply for parse error
+      // Should silently return without error
       expect(killWorker).not.toHaveBeenCalled();
     });
+  });
 
+  describe('codex-app thread select', () => {
     it('should resume selected Codex App thread without adopt metadata', async () => {
       vi.mocked(getBot).mockReturnValue({
         config: {
@@ -460,25 +469,6 @@ describe('Adopt card actions', () => {
       expect(ds.adoptedFrom).toBeUndefined();
       expect(ds.pendingRepo).toBe(true);
       expect(ds.session.cliSessionId).not.toBe('thread-1');
-    });
-
-    it('should return early when rootId is missing', async () => {
-      const sessions = new Map<string, DaemonSession>();
-      const deps = makeDeps(sessions);
-
-      const event = {
-        action: {
-          option: JSON.stringify({ tmuxTarget: '0:1.0', cliPid: 123 }),
-          value: { key: 'adopt_select' },  // No root_id
-        },
-        operator: { open_id: 'ou_user' },
-      };
-
-      await handleCardAction(event, deps, APP_ID);
-      await flush();
-
-      // Should silently return without error
-      expect(killWorker).not.toHaveBeenCalled();
     });
   });
 

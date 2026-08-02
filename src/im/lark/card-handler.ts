@@ -1743,6 +1743,177 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   // Handle session card button actions (restart/close)
+  // ─── /adopt V2 picker: state-changing re-renders (pick / page / search) ─
+  // Mirrors the /relay picker. Lark cards are stateless server-side, so every
+  // callback value carries the full state (search / page / selected / root_id /
+  // invoker). We reuse the candidates snapshot cached at first render so a page
+  // flip or search doesn't re-shell-out to tmux; on a cache miss (TTL expiry /
+  // daemon restart) we re-discover and re-cache.
+  if (value?.action && larkAppId && ['adopt_pick', 'adopt_page', 'adopt_search'].includes(value.action as string)) {
+    const rootId = value.root_id as string | undefined;
+    if (!rootId) return { toast: { type: 'error', content: t('card.adopt.toast_missing_value', undefined, localeForBot(larkAppId)) } };
+    const loc = localeForBot(larkAppId);
+    const sKey = sessionKey(rootId, larkAppId);
+    const ds = activeSessions.get(sKey);
+    if (!ds) return { toast: { type: 'error', content: t('card.adopt.toast_no_session', undefined, loc) } };
+
+    // Owner-only, same gate as the command path.
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('card.adopt.toast_no_perm', undefined, loc) } };
+    }
+    // Pin the card to its summoner (legacy cards without the field pass through).
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.adopt.toast_not_invoker', undefined, loc) } };
+    }
+
+    // Reconstruct next state from the action.
+    let nextSearch = (value.search as string) ?? '';
+    let nextPage = Number(value.page ?? 0) || 0;
+    let nextSelected: string | undefined = (value.selected as string) || undefined;
+    if (value.action === 'adopt_search') {
+      nextSearch = String((action as any)?.input_value ?? '').trim();
+      nextPage = 0;
+      nextSelected = undefined; // new filter → drop selection
+    } else if (value.action === 'adopt_page') {
+      nextPage = Number(value.page ?? 0) || 0;
+    } else if (value.action === 'adopt_pick') {
+      nextSelected = value.entry_key as string | undefined;
+    }
+
+    const botCfg = getBot(ds.larkAppId).config;
+    const {
+      collectAdoptCandidates,
+      cacheAdoptCandidates,
+      getCachedAdoptCandidates,
+    } = await import('../../services/adopt-picker.js');
+    let candidates = getCachedAdoptCandidates(rootId, Date.now());
+    if (!candidates) {
+      const { discoverResumableSessionsForBot, ADOPT_RESUME_LIMIT } = await import('../../core/command-handler.js');
+      candidates = await collectAdoptCandidates(
+        botCfg.cliId, botCfg.cliPathOverride, activeSessions,
+        discoverResumableSessionsForBot, ADOPT_RESUME_LIMIT,
+      );
+      cacheAdoptCandidates(rootId, candidates, Date.now());
+    }
+    const { buildAdoptSelectCard } = await import('./card-builder.js');
+    const cardJson = buildAdoptSelectCard(
+      candidates.sessions, rootId, loc, candidates.resumable,
+      { selectedKey: nextSelected, searchQuery: nextSearch, page: nextPage },
+      invokerOpenId ?? operatorOpenId,
+      candidates.resumeLimit,
+    );
+    // event-dispatcher wraps this as { card: { type: 'raw', data } } → in-place patch.
+    return JSON.parse(cardJson);
+  }
+
+  // ─── /adopt V2 picker: confirm (dispatch to adopt or resume-import) ─────
+  // Confirm does NOT trust the cached snapshot for liveness — a live pane may
+  // have exited since render. Live targets re-discover (fast-path by tmux
+  // target to stay inside Lark's 3s callback budget); resume targets re-scan
+  // disk. The cached entry only tells us WHICH target the key refers to.
+  if (value?.action === 'adopt_confirm' && larkAppId) {
+    const rootId = value.root_id as string | undefined;
+    const entryKey = value.entry_key as string | undefined;
+    if (!rootId || !entryKey) return;
+    const loc = localeForBot(larkAppId);
+    const sKey = sessionKey(rootId, larkAppId);
+    const ds = activeSessions.get(sKey);
+    if (!ds) return { toast: { type: 'error', content: t('card.adopt.toast_no_session', undefined, loc) } };
+    const sourceSession = ds.session;
+    if (isSessionTransferring(ds)) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
+    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+      return { toast: { type: 'error', content: t('card.adopt.toast_no_perm', undefined, loc) } };
+    }
+    const invokerOpenId = value.invoker_open_id as string | undefined;
+    if (invokerOpenId && operatorOpenId && invokerOpenId !== operatorOpenId) {
+      return { toast: { type: 'error', content: t('card.adopt.toast_not_invoker', undefined, loc) } };
+    }
+
+    const botCfg = getBot(ds.larkAppId).config;
+    const { clearAdoptCandidates } = await import('../../services/adopt-picker.js');
+
+    // ── Resume-import path (key = "resume:<cliSessionId>") ──────────────
+    if (entryKey.startsWith('resume:')) {
+      const cliSessionId = entryKey.slice('resume:'.length);
+      const { discoverResumableSessionsForBot, startResumeImportSession, ADOPT_RESUME_LIMIT } = await import('../../core/command-handler.js');
+      const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions, ADOPT_RESUME_LIMIT);
+      if (
+        ds.session !== sourceSession || ds.session.status !== 'active'
+        || activeSessions.get(sKey) !== ds || isSessionTransferring(ds)
+      ) {
+        return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+      }
+      const target = resumable.find(r => r.cliSessionId === cliSessionId);
+      if (!target) {
+        await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: cliSessionId }, localeForBot(ds.larkAppId)));
+        clearAdoptCandidates(rootId);
+        if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+        return;
+      }
+      await startResumeImportSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
+      clearAdoptCandidates(rootId);
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      return;
+    }
+
+    // ── Live-adopt path (key = "live:...") ──────────────────────────────
+    // The cached snapshot only tells us WHICH pane the key referred to; we
+    // re-discover fresh so startAdoptSession gets a live pid (a pane may have
+    // exited since render). adoptLiveKey mirrors the builder's key format so
+    // a freshly-discovered session maps back to the clicked entry_key.
+    const { adoptLiveKey } = await import('./card-builder.js');
+    const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets } = await import('../../core/session-discovery.js');
+    const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
+    async function resolveLive() {
+      // Zellij keys carry "live:zellij:" — resolve from the zellij backend.
+      if (entryKey!.startsWith('live:zellij:')) {
+        return discoverAdoptableZellijSessions(botCfg.cliId).find(s => adoptLiveKey(s) === entryKey);
+      }
+      // Fast path: the key IS "live:<adoptTargetKey>" = "live:tmux:<target>:<pid>".
+      // Parse the tmux target for a cheap single-pane resolve, staying under
+      // Lark's 3s callback budget (a full scan can take seconds on many panes).
+      const inner = entryKey!.slice('live:'.length); // e.g. "tmux:0:2.0:12345"
+      const parts = inner.split(':');
+      if (parts[0] === 'tmux' && parts.length >= 3) {
+        const tmuxTarget = parts.slice(1, -1).join(':'); // drop "tmux" + trailing pid
+        const fast = discoverAdoptableSessionByTarget(tmuxTarget, botCfg.cliId);
+        if (fast && adoptLiveKey(fast) === entryKey) return fast;
+      }
+      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
+        const t2 = active.session.persistentBackendTarget;
+        return active.session.status === 'active' && !active.adoptedFrom && t2?.backendType === 'herdr' && !!t2.agentName
+          ? [{ sessionName: t2.sessionName, agentName: t2.agentName }] : [];
+      });
+      return excludeOwnedHerdrAdoptTargets(discoverAdoptableSessions(botCfg.cliId), ownedHerdrTargets)
+        .find(s => adoptLiveKey(s) === entryKey);
+    }
+    let target = await resolveLive();
+    for (let attempt = 0; !target && attempt < 3; attempt++) {
+      await new Promise(r => setTimeout(r, 150));
+      target = await resolveLive();
+    }
+    if (
+      ds.session !== sourceSession || ds.session.status !== 'active'
+      || activeSessions.get(sKey) !== ds || isSessionTransferring(ds)
+    ) {
+      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
+    }
+    if (!target) {
+      await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
+      clearAdoptCandidates(rootId);
+      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+      return;
+    }
+    const { startAdoptSession } = await import('../../core/command-handler.js');
+    await startAdoptSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
+    clearAdoptCandidates(rootId);
+    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
+    return;
+  }
+
   if (value?.action) {
     const { action: actionType, root_id: rootId } = value;
     const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
@@ -2871,152 +3042,6 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     return;
   }
 
-  if (action?.value?.key === 'adopt_select' && option) {
-    const rootId = action?.value?.root_id;
-    if (!rootId) return;
-
-    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
-    const ds = activeSessions.get(sKey);
-    if (!ds) return;
-    const sourceSession = ds.session;
-    if (isSessionTransferring(ds)) {
-      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
-    }
-
-    // /adopt 是管理动作：下拉入口同样要求 canOperate（命令路径已在 daemon 层 gate）。
-    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
-      logger.info(`adopt_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
-      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
-    }
-
-    // Parse selected session info (tmux/herdr: key; zellij: zellijSession+zellijPaneId)
-    let selected: { key?: string; source?: string; tmuxTarget?: string; zellijSession?: string; zellijPaneId?: string; cliPid?: number };
-    try { selected = JSON.parse(option); } catch { return; }
-
-    // Re-discover to get full session info and validate. Keep the same CLI
-    // filter used to build the card so a stale/tampered option cannot switch
-    // this bot to a different agent implementation.
-    const botCfg = getBot(ds.larkAppId).config;
-    let target: Awaited<ReturnType<typeof resolveAdoptTarget>>;
-    async function resolveAdoptTarget() {
-      if (selected.zellijPaneId) {
-        const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
-        // Match by (session, paneId) only — a paneId uniquely identifies the
-        // pane within a session, and the resolved CLI pid can legitimately
-        // differ from the card's snapshot (wrapper⇄native pid shift), so
-        // requiring an exact pid match would spuriously report 已退出. Use the
-        // freshly-discovered entry (with its current pid).
-        return discoverAdoptableZellijSessions(botCfg.cliId)
-          .find(s => s.zellijSession === selected.zellijSession && s.zellijPaneId === selected.zellijPaneId);
-      }
-      const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets, adoptTargetKey } = await import('../../core/session-discovery.js');
-
-      const matchesSelected = (s: import('../../core/session-discovery.js').AdoptableSession) => selected.key
-        ? adoptTargetKey(s) === selected.key
-        : s.tmuxTarget === selected.tmuxTarget && s.cliPid === selected.cliPid;
-
-      // 快路径：卡片 option 里已经带着 tmux 地址，先只解析那一个 pane。
-      // 全量扫描要对每个 pane 走进程树、且树里每个节点都拉一次全量 `ps`，pane 一多
-      // 就是数秒级同步阻塞（31 个 pane 实测 5.4s）。这里是卡片回调，飞书只给 3s
-      // 且**不会重推**，超时用户就看到「目标回调服务超时未响应」；更糟的是同步
-      // execSync 会把事件循环整个冻住，连 2500ms 提前 ACK 的保险丝都发不出去。
-      // 只收窄候选集、判定谓词与全量路径完全一致，没命中就原样回落全量扫描，
-      // 因此不改变任何既有结果，最差只多一次廉价的 tmux display。
-      if (selected.source !== 'herdr' && selected.tmuxTarget) {
-        const fast = discoverAdoptableSessionByTarget(selected.tmuxTarget, botCfg.cliId);
-        if (fast && matchesSelected(fast)) return fast;
-      }
-
-      const ownedHerdrTargets = [...activeSessions.values()].flatMap(active => {
-        const target = active.session.persistentBackendTarget;
-        return active.session.status === 'active'
-          && !active.adoptedFrom
-          && target?.backendType === 'herdr'
-          && !!target.agentName
-          ? [{ sessionName: target.sessionName, agentName: target.agentName }]
-          : [];
-      });
-      return excludeOwnedHerdrAdoptTargets(
-        discoverAdoptableSessions(botCfg.cliId),
-        ownedHerdrTargets,
-      ).find(matchesSelected);
-    }
-    // Discovery scans a live process tree and can transiently miss a pane under
-    // load (a racing `ps` snapshot); retry a few times before giving up so a
-    // momentary miss doesn't surface as "目标 CLI 会话已退出".
-    target = await resolveAdoptTarget();
-    for (let attempt = 0; !target && attempt < 3; attempt++) {
-      await new Promise(r => setTimeout(r, 150));
-      target = await resolveAdoptTarget();
-    }
-    if (
-      ds.session !== sourceSession
-      || ds.session.status !== 'active'
-      || activeSessions.get(sKey) !== ds
-      || isSessionTransferring(ds)
-    ) {
-      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
-    }
-    if (!target) {
-      await sessionReply(rootId, t('cmd.adopt.target_exited', undefined, localeForBot(ds.larkAppId)));
-      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-      return;
-    }
-
-    // Import and call startAdoptSession
-    const { startAdoptSession } = await import('../../core/command-handler.js');
-    await startAdoptSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
-    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-    return;
-  }
-
-  // Second adopt filter: resume a session discovered on disk (paseo-style
-  // import). Re-spawns the bot's CLI via `--resume <id>` in the recorded cwd.
-  if (action?.value?.key === 'adopt_resume_select' && option) {
-    const rootId = action?.value?.root_id;
-    if (!rootId) return;
-
-    const sKey = larkAppId ? sessionKey(rootId, larkAppId) : rootId;
-    const ds = activeSessions.get(sKey);
-    if (!ds) return;
-    const sourceSession = ds.session;
-    if (isSessionTransferring(ds)) {
-      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
-    }
-
-    if (!canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
-      logger.info(`adopt_resume_select blocked for non-operator user: ${operatorOpenId} (chat=${ds.chatId})`);
-      return { toast: { type: 'error', content: t('card.grant.toast_no_repo_perm', undefined, localeForBot(ds.larkAppId)) } };
-    }
-
-    let selected: { cliSessionId?: string; cwd?: string };
-    try { selected = JSON.parse(option); } catch { return; }
-    if (!selected.cliSessionId) return;
-
-    // Re-discover from disk to validate the session still exists (and is not
-    // already live in another botmux session) before committing to the resume.
-    const botCfg = getBot(ds.larkAppId).config;
-    const { discoverResumableSessionsForBot, startResumeImportSession } = await import('../../core/command-handler.js');
-    const resumable = await discoverResumableSessionsForBot(botCfg.cliId, botCfg.cliPathOverride, activeSessions);
-    if (
-      ds.session !== sourceSession
-      || ds.session.status !== 'active'
-      || activeSessions.get(sKey) !== ds
-      || isSessionTransferring(ds)
-    ) {
-      return { toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, localeForBot(ds.larkAppId)) } };
-    }
-    const target = resumable.find(r => r.cliSessionId === selected.cliSessionId);
-    if (!target) {
-      await sessionReply(rootId, t('cmd.adopt.resume_not_found', { id: selected.cliSessionId }, localeForBot(ds.larkAppId)));
-      if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-      return;
-    }
-
-    await startResumeImportSession(target, ds, { activeSessions, sessionReply: deps.sessionReply, getActiveCount: () => 0, lastRepoScan }, larkAppId);
-    if (cardMessageId && larkAppId) deleteMessage(larkAppId, cardMessageId);
-    return;
-  }
 
   // Handle repo select card (option-based dropdowns: plain switch, or
   // `repo_worktree` = create a worktree from the picked repo and open that).

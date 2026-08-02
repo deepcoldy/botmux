@@ -82,8 +82,14 @@ function allActions(card: any): any[] {
     .flatMap((e: any) => e.actions ?? []);
 }
 
-describe('buildAdoptSelectCard', () => {
-  it('shows the backend instead of repeating the cwd basename', () => {
+describe('buildAdoptSelectCard (V2 picker)', () => {
+  // Helper: flatten the V2 card body to the markdown text of each session card.
+  const cardTexts = (card: any): string[] =>
+    (card.body?.elements ?? [])
+      .filter((e: any) => e.tag === 'interactive_container')
+      .map((e: any) => (e.elements ?? []).map((x: any) => x.content ?? '').join('\n'));
+
+  it('renders a live session as a card showing CLI / source / path / target, not a dropdown option', () => {
     const card = parse(buildAdoptSelectCard([{
       source: 'herdr',
       herdrSessionName: 'collie',
@@ -93,9 +99,76 @@ describe('buildAdoptSelectCard', () => {
       paneCols: 200,
       paneRows: 50,
     }], 'om_root', 'en'));
-    const option = card.elements[1].actions[0].options[0].text.content;
-    expect(option).toContain('Pi · herdr · collie:w3:p1');
-    expect(option).not.toContain('· botmux ·');
+    // No legacy dropdown any more.
+    const hasSelectStatic = JSON.stringify(card).includes('select_static');
+    expect(hasSelectStatic).toBe(false);
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('Pi');          // CLI name
+    expect(texts[0]).toContain('collie:w3:p1'); // live target label
+  });
+
+  it('renders a resume (history) session card carrying the session id and a resume: key', () => {
+    const card = parse(buildAdoptSelectCard(
+      [],
+      'om_root',
+      'en',
+      [{ cliSessionId: 'codex-rollout-abc123', cwd: '/Users/test/proj', title: 'fix the thing', lastActivityAt: 1_700_000_000_000 }],
+    ));
+    const texts = cardTexts(card);
+    expect(texts.length).toBe(1);
+    expect(texts[0]).toContain('codex-rollout-abc123'); // session id is visible
+    // The selectable container carries a resume: entry_key.
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key).toBe('resume:codex-rollout-abc123');
+  });
+
+  it('shows the confirm button only after an entry is selected', () => {
+    const entry = { cliSessionId: 'sess-xyz', cwd: '/w', title: 't', lastActivityAt: 1 };
+    const unselected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry]));
+    const hasConfirmBefore = JSON.stringify(unselected).includes('adopt_confirm');
+    expect(hasConfirmBefore).toBe(false);
+    const selected = parse(buildAdoptSelectCard([], 'om_root', 'en', [entry], { selectedKey: 'resume:sess-xyz' }));
+    const hasConfirmAfter = JSON.stringify(selected).includes('adopt_confirm');
+    expect(hasConfirmAfter).toBe(true);
+  });
+
+  it('filters entries by the search query (matches title / cwd / session id)', () => {
+    const resumable = [
+      { cliSessionId: 'aaa', cwd: '/home/alpha', title: 'fix login', lastActivityAt: 3 },
+      { cliSessionId: 'bbb', cwd: '/home/beta', title: 'add cache', lastActivityAt: 2 },
+    ];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'beta' }));
+    const containers = card.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers.length).toBe(1);
+    expect(containers[0].behaviors[0].value.entry_key).toBe('resume:bbb');
+  });
+
+  it('paginates at 5 per page and renders a paginator when there are more', () => {
+    const resumable = Array.from({ length: 7 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const page0 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 0 }));
+    const containers0 = page0.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers0.length).toBe(5);
+    // A paginator (column_set with adopt_page callbacks) is present.
+    const hasPager = JSON.stringify(page0).includes('adopt_page');
+    expect(hasPager).toBe(true);
+    // Page 1 shows the remaining 2.
+    const page1 = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { page: 1 }));
+    const containers1 = page1.body.elements.filter((e: any) => e.tag === 'interactive_container');
+    expect(containers1.length).toBe(2);
+  });
+
+  it('shows a truncation hint when the resume list hit the cap', () => {
+    const resumable = Array.from({ length: 20 }, (_, i) => ({
+      cliSessionId: `s${i}`, cwd: `/w${i}`, title: `t${i}`, lastActivityAt: i,
+    }));
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, undefined, undefined, 20));
+    // The truncation copy mentions the cap number.
+    const text = JSON.stringify(card);
+    expect(text).toContain('20');
+    expect(text.toLowerCase()).toContain('search'); // en copy points at search
   });
 });
 

@@ -2094,90 +2094,315 @@ function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p
   };
 }
 
+// ─── /adopt picker (V2: search + card list + pagination) ────────────────────
+//
+// Replaces the two legacy select_static dropdowns. Unifies the two adopt
+// sources — live processes (tmux/zellij/herdr) and disk-resumable history —
+// into ONE searchable, paginated card list styled like the /relay picker, so
+// each entry can surface CLI type / cwd / session id / time / source instead
+// of a single cramped dropdown line. Selection + confirm dispatch to the
+// right backend based on `kind` (startAdoptSession vs startResumeImportSession).
+
+export type AdoptEntryKind = 'live' | 'resume';
+
+export interface AdoptPickerEntry {
+  /** Synthetic selection key, unique & deterministic across both sources.
+   *  live  → "live:" + adoptTargetKey / zellij target;  resume → "resume:" + cliSessionId.
+   *  Deterministic so a re-render (which re-discovers) reproduces the same key. */
+  key: string;
+  kind: AdoptEntryKind;
+  cliId?: CliId;
+  /** resume: first user prompt; live: project (cwd basename). */
+  title: string;
+  /** cwd basename, shown compactly. */
+  project: string;
+  /** Absolute working dir, shown verbatim. */
+  cwd: string;
+  /** live: probed CLI session id (may be undefined); resume: cliSessionId. */
+  sessionId?: string;
+  /** live: tmux/zellij/herdr target label. */
+  target?: string;
+  /** live: startedAt (uptime); resume: lastActivityAt. */
+  timeMs?: number;
+}
+
+/** Deterministic key for a live adoptable session (tmux/herdr/zellij).
+ *  Exported so the card-handler's confirm path can match a clicked entry_key
+ *  back to a freshly-discovered session without re-deriving the format. */
+export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
+  if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}:${s.cliPid ?? ''}`;
+  return `live:${adoptTargetKey(s)}`;
+}
+
+/** Fold both adopt sources into one uniform entry list. Live entries come
+ *  first (they're the "act now" targets), resume entries after. Order is
+ *  stable so pagination is deterministic across re-renders. */
+export function buildAdoptEntries(
+  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  resumable: ResumableSession[],
+): AdoptPickerEntry[] {
+  const live: AdoptPickerEntry[] = sessions.map((s) => {
+    const zellij = 'zellijPaneId' in s;
+    const project = s.cwd.split('/').pop() || s.cwd;
+    const target = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
+    return {
+      key: adoptLiveKey(s),
+      kind: 'live' as const,
+      cliId: s.cliId,
+      title: project,
+      project,
+      cwd: s.cwd,
+      sessionId: s.sessionId,
+      target,
+      timeMs: s.startedAt,
+    };
+  });
+  const resume: AdoptPickerEntry[] = resumable.map((r) => {
+    const project = r.cwd.split('/').pop() || r.cwd;
+    return {
+      key: `resume:${r.cliSessionId}`,
+      kind: 'resume' as const,
+      title: r.title || r.cliSessionId.slice(0, 8),
+      project,
+      cwd: r.cwd,
+      sessionId: r.cliSessionId,
+      timeMs: r.lastActivityAt || undefined,
+    };
+  });
+  return [...live, ...resume];
+}
+
+export interface AdoptPickerState {
+  selectedKey?: string;
+  searchQuery?: string;
+  page?: number;
+}
+
+const ADOPT_PICKER_PAGE_SIZE = 5;
+const ADOPT_SEARCH_FIELD = 'adopt_search_q';
+
+/** Case-insensitive substring over title / project / cwd / cliId / sessionId.
+ *  Empty query matches everything. Includes sessionId so a user who knows the
+ *  id can type it and jump straight to the entry. */
+function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefined): AdoptPickerEntry[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter((e) => {
+    const haystack = [e.title, e.project, e.cwd, e.cliId, e.sessionId, e.target]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+}
+
+/**
+ * V2 adopt picker card. Layout mirrors buildRelayPickerCard: search box →
+ * ≤5 session cards (clickable, highlight on select) → paginator → confirm.
+ * All state (search / page / selected / root_id / invoker) rides on the
+ * value objects since Lark cards are stateless server-side.
+ *
+ * `truncated` renders a hint when the resume list was capped, so the user
+ * knows to narrow via search instead of assuming they saw everything.
+ */
 export function buildAdoptSelectCard(
   sessions: Array<AdoptableSession | ZellijAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
   resumable?: ResumableSession[],
+  state?: AdoptPickerState,
+  invokerOpenId?: string,
+  resumeLimit?: number,
 ): string {
+  const entries = buildAdoptEntries(sessions, resumable ?? []);
+  const searchQuery = state?.searchQuery ?? '';
+  const requestedPage = state?.page ?? 0;
+  const selectedKey = state?.selectedKey;
+  const elements: any[] = [];
+
   const unknownUptime = t('card.adopt.uptime_unknown', undefined, locale);
-  const options = sessions.map((s) => {
-    const zellij = 'zellijPaneId' in s;
-    const cliName = getCliDisplayName(s.cliId);
-    const backendLabel = zellij ? 'zellij' : s.source;
-    const uptime = s.startedAt ? formatDuration(Date.now() - s.startedAt) : unknownUptime;
-    const targetLabel = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
-    const value = zellij
-      ? { zellijSession: s.zellijSession, zellijPaneId: s.zellijPaneId, cliPid: s.cliPid }
-      : { key: adoptTargetKey(s), source: s.source, tmuxTarget: s.tmuxTarget, cliPid: s.cliPid };
-    return {
-      text: { tag: 'plain_text' as const, content: `${cliName} · ${backendLabel} · ${targetLabel} · ${uptime}` },
-      value: JSON.stringify(value),
-    };
-  });
+  const sessionUnknown = t('card.adopt.session_unknown', undefined, locale);
 
-  // Second filter: sessions resumable from disk (paseo-style import). Picking
-  // one re-spawns the CLI via `--resume <id>` in its recorded cwd — no live
-  // pane required.
-  const resumeOptions = (resumable ?? []).map((r) => {
-    const project = compactPlainText(r.cwd.split('/').pop() || r.cwd, 18);
-    const title = compactPlainText(r.title || r.cliSessionId.slice(0, 8), 40);
-    const when = formatThreadUpdatedAt(r.lastActivityAt || undefined, locale);
-    return {
-      text: { tag: 'plain_text' as const, content: `${title} · ${project} · ${when}` },
-      value: JSON.stringify({ cliSessionId: r.cliSessionId, cwd: r.cwd }),
-    };
-  });
+  // Truncation hint: resume discovery caps at resumeLimit; if it came back
+  // full, the user is probably not seeing everything → tell them to search.
+  const resumeCount = (resumable ?? []).length;
+  const truncated = !!resumeLimit && resumeCount >= resumeLimit;
 
-  const elements: any[] = [
-    {
-      tag: 'div',
-      text: { tag: 'lark_md', content: t('card.adopt.section_live', undefined, locale) },
-    },
-    {
-      tag: 'action',
-      actions: [
-        {
-          tag: 'select_static',
-          placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_select', undefined, locale) },
-          options,
-          value: { key: 'adopt_select', root_id: rootMessageId ?? '' },
-        },
-      ],
-    },
-  ];
+  // ─── Filter & paginate ───────────────────────────────────────────────
+  const filtered = adoptPickerFilter(entries, searchQuery);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / ADOPT_PICKER_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const start = page * ADOPT_PICKER_PAGE_SIZE;
+  const visible = filtered.slice(start, start + ADOPT_PICKER_PAGE_SIZE);
 
-  if (resumeOptions.length > 0) {
-    elements.push(
-      { tag: 'hr' },
+  // Common state carried by every interactive value so re-renders can
+  // reconstruct the view. invoker_open_id pins the card to its summoner.
+  const stateValue: Record<string, unknown> = {
+    root_id: rootMessageId ?? '',
+    invoker_open_id: invokerOpenId ?? '',
+    search: searchQuery,
+    page,
+    selected: selectedKey ?? '',
+  };
+
+  // ─── Search box (auto-submit input, same as relay) ──────────────────
+  elements.push({
+    tag: 'input',
+    name: ADOPT_SEARCH_FIELD,
+    placeholder: { tag: 'plain_text', content: t('card.adopt.search_placeholder', undefined, locale) },
+    default_value: searchQuery,
+    width: 'fill',
+    behaviors: [
       {
-        tag: 'div',
-        text: { tag: 'lark_md', content: t('card.adopt.section_resume', undefined, locale) },
+        type: 'callback',
+        value: { action: 'adopt_search', ...stateValue, selected: '' /* new search → reset selection */ },
       },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'select_static',
-            placeholder: { tag: 'plain_text', content: t('card.adopt.placeholder_resume', undefined, locale) },
-            options: resumeOptions,
-            value: { key: 'adopt_resume_select', root_id: rootMessageId ?? '' },
-          },
-        ],
-      },
-    );
+    ],
+  });
+  if (truncated) {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='orange'>${t('card.adopt.truncated', { limit: resumeLimit }, locale)}</font>`,
+    });
+  }
+  elements.push({ tag: 'hr' });
+
+  // ─── Empty / no-match ───────────────────────────────────────────────
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.adopt.empty', undefined, locale) });
+    return JSON.stringify(wrapAdoptCard(elements, locale));
+  }
+  if (filtered.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: searchQuery }, locale) });
+    return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 
-  const card = {
-    config: { wide_screen_mode: true },
+  const labelKind    = t('card.adopt.field_kind',    undefined, locale);
+  const labelCli     = t('card.adopt.field_cli',     undefined, locale);
+  const labelDir     = t('card.adopt.field_dir',     undefined, locale);
+  const labelSession = t('card.adopt.field_session', undefined, locale);
+  const labelTarget  = t('card.adopt.field_target',  undefined, locale);
+  const selectedTag  = t('card.adopt.selected_tag',  undefined, locale);
+  const selectedEntry = selectedKey ? filtered.find(e => e.key === selectedKey) : undefined;
+  const hasValidSelection = !!selectedEntry;
+
+  // ─── Session cards (current page) ───────────────────────────────────
+  visible.forEach((e) => {
+    const isSelected = e.key === selectedKey;
+    const kindTag = e.kind === 'live'
+      ? t('card.adopt.kind_live', undefined, locale)
+      : t('card.adopt.kind_resume', undefined, locale);
+    const cliName = e.cliId ? getCliDisplayName(e.cliId) : '—';
+    const timeLabel = e.kind === 'live'
+      ? t('card.adopt.field_time_live', undefined, locale)
+      : t('card.adopt.field_time_resume', undefined, locale);
+    const timeVal = e.timeMs
+      ? (e.kind === 'live' ? formatDuration(Date.now() - e.timeMs) : formatThreadUpdatedAt(e.timeMs, locale))
+      : unknownUptime;
+    const titleLine = isSelected
+      ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\``
+      : `**${escapeMd(e.title)}**`;
+    const lines: string[] = [
+      titleLine,
+      `${labelKind}: ${kindTag}`,
+      `${labelCli}: ${escapeMd(cliName)}`,
+      `${labelDir}: \`${escapeMd(e.cwd)}\``,
+      `${labelSession}: \`${escapeMd(e.sessionId || sessionUnknown)}\``,
+    ];
+    if (e.kind === 'live' && e.target) lines.push(`${labelTarget}: \`${escapeMd(e.target)}\``);
+    lines.push(`${timeLabel}: ${timeVal}`);
+    elements.push({
+      tag: 'interactive_container',
+      width: 'fill',
+      padding: '8px 12px',
+      background_style: isSelected ? 'laser' : 'default',
+      has_border: true,
+      border_color: isSelected ? 'blue-500' : 'grey-200',
+      corner_radius: '8px',
+      behaviors: [
+        { type: 'callback', value: { action: 'adopt_pick', entry_key: e.key, ...stateValue } },
+      ],
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  });
+
+  // ─── Paginator ──────────────────────────────────────────────────────
+  if (totalPages > 1) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'default',
+      columns: [
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.relay.btn_prev_page', undefined, locale) },
+            type: 'default',
+            disabled: page === 0,
+            behaviors: [{ type: 'callback', value: { action: 'adopt_page', ...stateValue, page: Math.max(0, page - 1) } }],
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
+          elements: [{
+            tag: 'markdown', text_align: 'center',
+            content: t('card.relay.page_indicator', { current: page + 1, total: totalPages }, locale),
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.relay.btn_next_page', undefined, locale) },
+            type: 'default',
+            disabled: page >= totalPages - 1,
+            behaviors: [{ type: 'callback', value: { action: 'adopt_page', ...stateValue, page: Math.min(totalPages - 1, page + 1) } }],
+          }],
+        },
+      ],
+    });
+  }
+
+  // ─── Confirm button or hint ─────────────────────────────────────────
+  elements.push({ tag: 'hr' });
+  if (hasValidSelection) {
+    const btnKey = selectedEntry!.kind === 'live' ? 'card.adopt.btn_confirm_live' : 'card.adopt.btn_confirm_resume';
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [{
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: t(btnKey, undefined, locale) },
+          type: 'primary',
+          behaviors: [{ type: 'callback', value: { action: 'adopt_confirm', entry_key: selectedEntry!.key, ...stateValue } }],
+        }],
+      }],
+    });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='grey'>${t('card.adopt.hint_pick_first', undefined, locale)}</font>`,
+    });
+  }
+
+  return JSON.stringify(wrapAdoptCard(elements, locale));
+}
+
+function wrapAdoptCard(elements: any[], locale?: Locale): any {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, wide_screen_mode: true },
     header: {
       template: 'blue',
       title: { tag: 'plain_text', content: t('card.adopt.title', undefined, locale) },
     },
-    elements,
+    body: { direction: 'vertical', elements },
   };
-  return JSON.stringify(card);
 }
+
 
 function compactPlainText(s: string, max = 72): string {
   const oneLine = s.replace(/\s+/g, ' ').trim();
