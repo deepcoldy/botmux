@@ -508,6 +508,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.no_source_here': '⚠️ 这里没有可 fork 的活跃会话。/fork 要在**会话所在的那个话题里**发起（就是你平时 @ 机器人聊天的那条话题），不要在群顶层发。',
   'cmd.fork.not_owner': '⚠️ 只有会话发起人能 fork 它。',
   'cmd.fork.no_mentions': '⚠️ /fork --create 必须 @ 一个机器人作为分身落地的新群成员。',
+  'cmd.fork.wrong_bot': '⚠️ fork 只能把当前会话复制给**当前这个机器人**（分身要跑同一个 CLI）。不用 @ 别的机器人；直接 `/fork --create <新群名>` 即可，会默认用当前机器人。',
   'cmd.fork.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/fork 取消。请稍后重试。',
   'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话暂不支持 fork（目前仅 Claude 系 / Codex 终端模式；Codex App、开启 RPC 的 Codex、纯远端后端走 app-server 活会话，无法字节级复制）。',
   'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',

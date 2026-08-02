@@ -3394,41 +3394,34 @@ export async function handleCommand(
           break;
         }
 
-        // Resolve the single target bot to invite. p2p source: no roster / no
-        // mention gate — the source bot is the sole participant. Group source:
-        // require exactly the @-mentioned bot (fork is single-session, so unlike
-        // relay --create there is no multi-bot leader election / peer coord).
+        // Resolve the bot to invite into the new group. Fork copies THIS
+        // session's transcript, so the child MUST run the same bot as the
+        // source — i.e. the invited bot is always this bot. Therefore:
+        //   • no @mention → default to the current bot (the common "fork myself
+        //     to a new group" case — no need to @ the bot you're already talking to);
+        //   • an explicit @mention → must resolve to THIS bot, else refuse.
         const forkSourceIsP2p = ds.chatType === 'p2p';
-        let targetBotAppId = forkAppId;
+        const targetBotAppId = forkAppId;
         let targetBotName = botDisplayName(forkAppId);
         if (!forkSourceIsP2p) {
           const forkMentions = message.mentions ?? [];
           const knownBotNames = globalKnownBotNames();
           const forkBotMentions = forkMentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
-          if (forkBotMentions.length === 0) {
-            await sessionReply(rootId, t('cmd.fork.no_mentions', undefined, loc));
-            break;
-          }
-          // Resolve the FIRST @-bot to a larkAppId via the source chat roster.
-          const firstBot = forkBotMentions[0];
-          let members: Awaited<ReturnType<typeof listChatBotMembers>> = [];
-          try {
-            members = await listChatBotMembers(forkAppId, ds.chatId);
-          } catch (e: any) {
-            logger.warn(`[${logTag}] /fork --create: failed to list source chat members: ${e?.message ?? e}`);
-          }
-          const mem = firstBot.openId ? members.find(m => m.openId === firstBot.openId) : undefined;
-          if (!mem || !mem.larkAppId) {
-            await sessionReply(rootId, t('cmd.fork.resolve_failed', undefined, loc));
-            break;
-          }
-          targetBotAppId = mem.larkAppId;
-          targetBotName = mem.displayName || botDisplayName(mem.larkAppId);
-          // Fork copies THIS session's transcript — the forked child must run
-          // the SAME cli as the source, so the invited bot must be this bot.
-          if (targetBotAppId !== forkAppId) {
-            await sessionReply(rootId, t('cmd.fork.resolve_failed', undefined, loc));
-            break;
+          // Only validate WHEN the user explicitly @'d a bot. An explicit
+          // mention that resolves to a DIFFERENT bot is a real error (fork can't
+          // hand this session's transcript to another CLI). No mention → just
+          // use the current bot.
+          if (forkBotMentions.length > 0) {
+            const firstBot = forkBotMentions[0];
+            const myOpenId = getBotOpenId(forkAppId);
+            const myName = getBot(forkAppId).botName?.toLowerCase();
+            const mentionIsThisBot =
+              (!!myOpenId && firstBot.openId === myOpenId) ||
+              (!myOpenId && !!myName && firstBot.name?.toLowerCase() === myName);
+            if (!mentionIsThisBot) {
+              await sessionReply(rootId, t('cmd.fork.wrong_bot', undefined, loc));
+              break;
+            }
           }
         }
 

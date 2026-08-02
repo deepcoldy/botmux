@@ -505,6 +505,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.no_source_here': '⚠️ No active session to fork here. Invoke /fork **inside the thread the session lives in** (the topic where you normally @ the bot), not at the group top level.',
   'cmd.fork.not_owner': '⚠️ Only the session owner can fork it.',
   'cmd.fork.no_mentions': '⚠️ /fork --create must @ a bot as the member of the new group the clone lands in.',
+  'cmd.fork.wrong_bot': '⚠️ Fork can only clone the current session to **this same bot** (the clone must run the same CLI). No need to @ another bot; just `/fork --create <new group name>` — it defaults to the current bot.',
   'cmd.fork.resolve_failed': '⚠️ Could not resolve the @-mentioned bot, /fork cancelled. Please retry.',
   'cmd.fork.unsupported_backend': 'ℹ️ The current {cli} session does not support fork yet (only Claude family / Codex terminal mode; Codex App, RPC-enabled Codex, and pure-remote backends run an app-server live session with no byte-level copy).',
   'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
