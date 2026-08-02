@@ -251,41 +251,50 @@ export function sandboxEnabled(): boolean {
  */
 let _canUnsharePid: boolean | undefined;
 
+/** Three-state classification of a single bwrap probe run. The distinction is
+ *  load-bearing: only a `clean-nonzero` (bwrap RAN and returned a real verdict)
+ *  is evidence about namespace support; a `timeout`/spawn-error/signal is
+ *  `inconclusive` and must NEVER be treated as such evidence. */
+export type BwrapProbeOutcome = 'success' | 'clean-nonzero' | 'inconclusive';
+
 /**
  * Pure decision for the DUAL pid-ns probe — extracted for unit testing.
  *
  * We must distinguish "this env forbids a fresh /proc mount inside a NEW pid
  * namespace" (the real nested-sandbox condition → safe to drop --unshare-pid)
- * from "bwrap is broken / failing for some other reason" (must NOT degrade).
- * A single --unshare-pid probe cannot tell these apart: a bwrap that fails for
- * ANY reason (e.g. a hostile/fake bwrap that always exits 1, or a --dev-bind
- * that can't work) would look identical to the nested-pid-ns failure.
+ * from "bwrap is broken / the probe couldn't run" (must NOT degrade). Two
+ * probes, each classified into THREE states (success / clean-nonzero /
+ * inconclusive):
+ *   - full = `--unshare-user --unshare-pid --proc /proc …` (real sandbox shape)
+ *   - weak = same MINUS `--unshare-pid`
  *
- * So we run TWO probes and only degrade when the signature is EXACTLY
- * "pid-ns is the problem":
- *   - full = `--unshare-pid --proc /proc …` (what the real sandbox uses)
- *   - weak = same MINUS `--unshare-pid` (drop only the pid namespace)
- * Degrade IFF full FAILED and weak SUCCEEDED — i.e. removing --unshare-pid is
- * precisely what makes bwrap work. If weak ALSO fails, bwrap is broken for a
- * reason dropping pid-ns won't fix → keep full isolation (fail-closed). If full
- * SUCCEEDS, no need to degrade. `canRun===false` (spawn error/timeout/status
- * null) counts as "not a clean success" for that probe.
+ * Degrade IFF `full === 'clean-nonzero' && weak === 'success'` — i.e. bwrap
+ * DEFINITIVELY rejected the run WITH a new pid namespace but ACCEPTED it
+ * WITHOUT one → removing --unshare-pid is precisely the fix (nested signature).
+ * EVERY other combination keeps full isolation (fail-closed):
+ *   - full success → no need to degrade
+ *   - full inconclusive (timeout / spawn error / signal) → NOT evidence of a
+ *     pid-ns restriction, even if weak succeeds → do NOT degrade
+ *   - weak not a clean success (nonzero / inconclusive) → bwrap broken for a
+ *     reason dropping pid-ns won't fix → do NOT degrade
  *
  * Returns whether the host CAN keep --unshare-pid (true = no degrade).
  */
 export function pidNsDualProbeCanUnshare(
-  full: { ranOk: boolean },
-  weak: { ranOk: boolean },
+  full: BwrapProbeOutcome,
+  weak: BwrapProbeOutcome,
 ): boolean {
-  const degrade = !full.ranOk && weak.ranOk;
+  const degrade = full === 'clean-nonzero' && weak === 'success';
   return !degrade;
 }
 
-/** A bwrap probe "ran OK" only when it spawned without error AND exited 0. Any
- *  spawn error (ENOENT), timeout (SIGTERM), or status===null is NOT a clean
- *  success. */
-function probeRanOk(r: ReturnType<typeof spawnSync>): boolean {
-  return !r.error && r.status === 0;
+/** Classify a spawnSync result into the three probe states. A spawn error
+ *  (ENOENT), a timeout/kill (`signal` set, e.g. SIGTERM), or a null exit status
+ *  is `inconclusive` — the probe did not yield a real bwrap verdict. A clean
+ *  numeric exit is `success` (0) or `clean-nonzero` (>0). */
+function classifyProbe(r: ReturnType<typeof spawnSync>): BwrapProbeOutcome {
+  if (r.error || r.signal !== null || r.status === null) return 'inconclusive';
+  return r.status === 0 ? 'success' : 'clean-nonzero';
 }
 
 export function bwrapCanUnsharePid(): boolean {
@@ -295,17 +304,20 @@ export function bwrapCanUnsharePid(): boolean {
   if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
   let executable = located;
   try { executable = realpathSync(located); } catch { /* fall through to probe */ }
-  const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--', '/bin/true'];
-  // FULL: the exact --unshare-pid + fresh --proc combo the real compilation
-  // uses. In a nested pid-ns-restricted sandbox this fails ("Can't mount proc
-  // … Operation not permitted"); on a normal host it succeeds.
-  const full = spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 });
-  if (probeRanOk(full)) { _canUnsharePid = true; return true; } // full works → never degrade
-  // WEAK: same minus --unshare-pid. Only if THIS succeeds is dropping the pid
-  // namespace the actual fix (nested-sandbox signature). A fake/broken bwrap
-  // that fails everything makes weak fail too → we do NOT degrade (fail-closed).
-  const weak = spawnSync(executable, base, { stdio: 'ignore', timeout: 5_000 });
-  _canUnsharePid = pidNsDualProbeCanUnshare({ ranOk: probeRanOk(full) }, { ranOk: probeRanOk(weak) });
+  // Same SHAPE as the real fs-policy compile (compileToBwrap): --unshare-user
+  // is always present there, and its userns interacts with the proc mount, so
+  // the probe must carry it too or it isn't testing the real condition.
+  const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--unshare-user', '--', '/bin/true'];
+  // FULL: real shape WITH --unshare-pid. Nested pid-ns-restricted sandbox →
+  // clean-nonzero ("Can't mount proc … Operation not permitted"); normal host
+  // → success.
+  const full = classifyProbe(spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 }));
+  if (full === 'success') { _canUnsharePid = true; return true; } // full works → never degrade
+  // WEAK: same minus --unshare-pid. Only a clean-nonzero full + success weak is
+  // the nested signature; a full timeout/spawn-error (inconclusive) never
+  // degrades even if weak succeeds.
+  const weak = classifyProbe(spawnSync(executable, base, { stdio: 'ignore', timeout: 5_000 }));
+  _canUnsharePid = pidNsDualProbeCanUnshare(full, weak);
   return _canUnsharePid;
 }
 

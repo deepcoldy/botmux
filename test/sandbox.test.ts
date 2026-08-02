@@ -79,21 +79,32 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
     }
   });
 
-  // codex review concern #2 (P1): a SINGLE --unshare-pid probe treats ANY
-  // bwrap failure as "safe to drop --unshare-pid" — codex reproduced degrade:true
-  // with a fake bwrap that always exits 1. The DUAL probe only degrades when the
-  // signature is exactly "pid-ns is the problem": full (--unshare-pid) fails AND
-  // weak (no --unshare-pid) succeeds. Everything else is fail-closed.
-  describe('pidNsDualProbeCanUnshare (dual full/weak probe, fail-closed)', () => {
-    it('full succeeds → CAN unshare-pid (no degrade), regardless of weak', () => {
-      expect(pidNsDualProbeCanUnshare({ ranOk: true }, { ranOk: true })).toBe(true);
-      expect(pidNsDualProbeCanUnshare({ ranOk: true }, { ranOk: false })).toBe(true);
+  // codex review concern #2 (P1): a naive probe treats ANY bwrap failure as
+  // "safe to drop --unshare-pid". Three-state classification (success /
+  // clean-nonzero / inconclusive) is load-bearing — a timeout/spawn-error must
+  // NOT be lumped with a clean nonzero exit. Degrade ONLY on the exact nested
+  // signature: full=clean-nonzero (bwrap definitively rejected the pid-ns run)
+  // AND weak=success (accepted it without pid-ns). Everything else fail-closed.
+  describe('pidNsDualProbeCanUnshare (three-state, fail-closed)', () => {
+    it('full success → CAN unshare-pid (no degrade), regardless of weak', () => {
+      expect(pidNsDualProbeCanUnshare('success', 'success')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('success', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('success', 'inconclusive')).toBe(true);
     });
-    it('full FAILS but weak SUCCEEDS → nested-sandbox signature → CANNOT unshare-pid (the ONLY degrade case)', () => {
-      expect(pidNsDualProbeCanUnshare({ ranOk: false }, { ranOk: true })).toBe(false);
+    it('full clean-nonzero + weak success → nested signature → CANNOT unshare-pid (the ONLY degrade case)', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'success')).toBe(false);
     });
-    it('BOTH fail (e.g. fake bwrap always exits 1 — codex repro) → bwrap broken, NOT a pid-ns issue → CAN unshare-pid (fail-closed, no degrade)', () => {
-      expect(pidNsDualProbeCanUnshare({ ranOk: false }, { ranOk: false })).toBe(true);
+    it('BOTH clean-nonzero (fake bwrap always exits 1 — codex repro) → bwrap broken, NOT pid-ns → CAN unshare-pid (fail-closed)', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'clean-nonzero')).toBe(true);
+    });
+    it('full INCONCLUSIVE (timeout / spawn-error / signal) + weak success → NOT evidence of pid-ns restriction → CAN unshare-pid (the timeout case codex flagged)', () => {
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'success')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('inconclusive', 'inconclusive')).toBe(true);
+    });
+    it('full clean-nonzero + weak NOT clean-success (nonzero/inconclusive) → do NOT degrade', () => {
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'clean-nonzero')).toBe(true);
+      expect(pidNsDualProbeCanUnshare('clean-nonzero', 'inconclusive')).toBe(true);
     });
   });
 });
