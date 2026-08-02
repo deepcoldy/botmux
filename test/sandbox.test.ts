@@ -11,7 +11,7 @@ import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
-import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -77,6 +77,24 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
       else process.env.BOTMUX_CORE_ONLY = prev;
       __testOnly_resetPidNamespaceProbe();
     }
+  });
+
+  // codex review concern #2 (P1): a SINGLE --unshare-pid probe treats ANY
+  // bwrap failure as "safe to drop --unshare-pid" — codex reproduced degrade:true
+  // with a fake bwrap that always exits 1. The DUAL probe only degrades when the
+  // signature is exactly "pid-ns is the problem": full (--unshare-pid) fails AND
+  // weak (no --unshare-pid) succeeds. Everything else is fail-closed.
+  describe('pidNsDualProbeCanUnshare (dual full/weak probe, fail-closed)', () => {
+    it('full succeeds → CAN unshare-pid (no degrade), regardless of weak', () => {
+      expect(pidNsDualProbeCanUnshare({ ranOk: true }, { ranOk: true })).toBe(true);
+      expect(pidNsDualProbeCanUnshare({ ranOk: true }, { ranOk: false })).toBe(true);
+    });
+    it('full FAILS but weak SUCCEEDS → nested-sandbox signature → CANNOT unshare-pid (the ONLY degrade case)', () => {
+      expect(pidNsDualProbeCanUnshare({ ranOk: false }, { ranOk: true })).toBe(false);
+    });
+    it('BOTH fail (e.g. fake bwrap always exits 1 — codex repro) → bwrap broken, NOT a pid-ns issue → CAN unshare-pid (fail-closed, no degrade)', () => {
+      expect(pidNsDualProbeCanUnshare({ ranOk: false }, { ranOk: false })).toBe(true);
+    });
   });
 });
 

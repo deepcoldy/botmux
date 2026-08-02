@@ -250,6 +250,44 @@ export function sandboxEnabled(): boolean {
  * must not spuriously degrade the normal fleet on an inconclusive probe.
  */
 let _canUnsharePid: boolean | undefined;
+
+/**
+ * Pure decision for the DUAL pid-ns probe — extracted for unit testing.
+ *
+ * We must distinguish "this env forbids a fresh /proc mount inside a NEW pid
+ * namespace" (the real nested-sandbox condition → safe to drop --unshare-pid)
+ * from "bwrap is broken / failing for some other reason" (must NOT degrade).
+ * A single --unshare-pid probe cannot tell these apart: a bwrap that fails for
+ * ANY reason (e.g. a hostile/fake bwrap that always exits 1, or a --dev-bind
+ * that can't work) would look identical to the nested-pid-ns failure.
+ *
+ * So we run TWO probes and only degrade when the signature is EXACTLY
+ * "pid-ns is the problem":
+ *   - full = `--unshare-pid --proc /proc …` (what the real sandbox uses)
+ *   - weak = same MINUS `--unshare-pid` (drop only the pid namespace)
+ * Degrade IFF full FAILED and weak SUCCEEDED — i.e. removing --unshare-pid is
+ * precisely what makes bwrap work. If weak ALSO fails, bwrap is broken for a
+ * reason dropping pid-ns won't fix → keep full isolation (fail-closed). If full
+ * SUCCEEDS, no need to degrade. `canRun===false` (spawn error/timeout/status
+ * null) counts as "not a clean success" for that probe.
+ *
+ * Returns whether the host CAN keep --unshare-pid (true = no degrade).
+ */
+export function pidNsDualProbeCanUnshare(
+  full: { ranOk: boolean },
+  weak: { ranOk: boolean },
+): boolean {
+  const degrade = !full.ranOk && weak.ranOk;
+  return !degrade;
+}
+
+/** A bwrap probe "ran OK" only when it spawned without error AND exited 0. Any
+ *  spawn error (ENOENT), timeout (SIGTERM), or status===null is NOT a clean
+ *  success. */
+function probeRanOk(r: ReturnType<typeof spawnSync>): boolean {
+  return !r.error && r.status === 0;
+}
+
 export function bwrapCanUnsharePid(): boolean {
   if (_canUnsharePid !== undefined) return _canUnsharePid;
   const lookup = spawnSync('sh', ['-c', 'command -v bwrap'], { encoding: 'utf8' });
@@ -257,16 +295,17 @@ export function bwrapCanUnsharePid(): boolean {
   if (!located || !isAbsolute(located)) { _canUnsharePid = true; return true; } // inconclusive → don't degrade
   let executable = located;
   try { executable = realpathSync(located); } catch { /* fall through to probe */ }
-  // Minimal decisive probe: the SAME --unshare-pid + fresh --proc combo the
-  // real compilation uses (fs-policy compileToBwrap). If this fails but a
-  // proc-only mount would succeed, we're in a nested pid-ns-restricted env.
-  const r = spawnSync(executable, [
-    '--dev-bind', '/', '/',
-    '--unshare-pid',
-    '--proc', '/proc',
-    '--', '/bin/true',
-  ], { stdio: 'ignore', timeout: 5_000 });
-  _canUnsharePid = r.status === 0;
+  const base = ['--dev-bind', '/', '/', '--proc', '/proc', '--', '/bin/true'];
+  // FULL: the exact --unshare-pid + fresh --proc combo the real compilation
+  // uses. In a nested pid-ns-restricted sandbox this fails ("Can't mount proc
+  // … Operation not permitted"); on a normal host it succeeds.
+  const full = spawnSync(executable, ['--unshare-pid', ...base], { stdio: 'ignore', timeout: 5_000 });
+  if (probeRanOk(full)) { _canUnsharePid = true; return true; } // full works → never degrade
+  // WEAK: same minus --unshare-pid. Only if THIS succeeds is dropping the pid
+  // namespace the actual fix (nested-sandbox signature). A fake/broken bwrap
+  // that fails everything makes weak fail too → we do NOT degrade (fail-closed).
+  const weak = spawnSync(executable, base, { stdio: 'ignore', timeout: 5_000 });
+  _canUnsharePid = pidNsDualProbeCanUnshare({ ranOk: probeRanOk(full) }, { ranOk: probeRanOk(weak) });
   return _canUnsharePid;
 }
 

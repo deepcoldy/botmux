@@ -3119,10 +3119,12 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
   // Form C: trigger-result carries a read-only web-terminal URL while a live
   // worker terminal exists, so an async caller (riff's task-runner) can open
   // the visible CLI TUI in the sandbox browser.
-  it('trigger-result exposes readOnlyUrl + viewToken when a live worker terminal is up', async () => {
+  it('trigger-result exposes readOnlyUrl + viewToken when a live worker terminal is up (core-only)', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     setLarkAppId('local_smoke');
     setCoreOnlyReady();
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-term', chatId: 'http_async_x', larkAppId: 'local_smoke', status: 'open' },
       chatId: 'http_async_x',
@@ -3133,21 +3135,65 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       asyncTriggerResults: new Map(),
     } as any);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-term/trigger-result`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(typeof body.readOnlyUrl).toBe('string');
-    // Carries the read capability inline, NOT the write token.
-    expect(body.readOnlyUrl).toContain('viewToken=view-cap-abc');
-    expect(body.readOnlyUrl).not.toContain('write-tok');
-    expect(body.viewToken).toBe('view-cap-abc');
-    findSpy.mockRestore();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-term/trigger-result`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(typeof body.readOnlyUrl).toBe('string');
+      // Carries the read capability inline, NOT the write token.
+      expect(body.readOnlyUrl).toContain('viewToken=view-cap-abc');
+      expect(body.readOnlyUrl).not.toContain('write-tok');
+      expect(body.viewToken).toBe('view-cap-abc');
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
+    }
   });
 
-  it('trigger-result omits readOnlyUrl when the live session has no worker terminal yet', async () => {
+  // codex review concern #1: the readOnlyUrl/viewToken attach must be gated to
+  // core-only. On a normal/mixed fleet trigger-result must NEVER mint a terminal
+  // read-capability into the poll response — even with a live worker terminal —
+  // or an HMAC-authed trigger caller would gain a view token the route never
+  // historically handed out (tokens are minted only on explicit /write-link).
+  it('trigger-result does NOT expose readOnlyUrl on a NON-core-only fleet even with a live worker terminal', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    delete process.env.BOTMUX_CORE_ONLY; // normal fleet
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: { sessionId: 's-fleet', chatId: 'oc_real_chat', larkAppId: 'local_smoke', status: 'open' },
+      chatId: 'oc_real_chat',
+      larkAppId: 'local_smoke',
+      workerPort: 4321,               // live worker terminal present …
+      workerToken: 'write-tok',
+      workerViewToken: 'view-cap-abc',
+      asyncTriggerResults: new Map(),
+    } as any);
+    // Normal fleet: default server (no coreOnlyPublicRoutes) — trigger-result
+    // is HMAC-gated; authorize with the same unbound token the write-link tests
+    // use so the request reaches the handler.
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-fleet/trigger-result`, { headers: tokenAuthHeaders() });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // … but NO terminal capability is leaked into the poll response.
+      expect(body.readOnlyUrl).toBeUndefined();
+      expect(body.viewToken).toBeUndefined();
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
+    }
+  });
+
+  it('trigger-result omits readOnlyUrl when the live session has no worker terminal yet (core-only)', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     setLarkAppId('local_smoke');
     setCoreOnlyReady();
+    const prevCoreOnly = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
       session: { sessionId: 's-noterm', chatId: 'http_async_y', larkAppId: 'local_smoke', status: 'open' },
       chatId: 'http_async_y',
@@ -3157,11 +3203,16 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       asyncTriggerResults: new Map(),
     } as any);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
-    const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-noterm/trigger-result`);
-    expect(res.status).toBe(200);
-    const body = await res.json();
-    expect(body.readOnlyUrl).toBeUndefined();
-    expect(body.viewToken).toBeUndefined();
-    findSpy.mockRestore();
+    try {
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-noterm/trigger-result`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.readOnlyUrl).toBeUndefined();
+      expect(body.viewToken).toBeUndefined();
+    } finally {
+      if (prevCoreOnly === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prevCoreOnly;
+      findSpy.mockRestore();
+    }
   });
 });

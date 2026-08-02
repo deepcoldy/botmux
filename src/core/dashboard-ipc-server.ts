@@ -1138,13 +1138,18 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     requestedTriggerId: triggerId,
   });
 
-  // Form C: attach the read-only web-terminal URL when a LIVE worker terminal
-  // exists (workerPort bound + view capability minted). This lets an async
-  // caller open a live view of the visible CLI TUI while the turn runs. Gated
-  // on the live `ds` — a closed/restored session has no reachable terminal, so
-  // we never advertise a stale URL. buildTerminalUrl carries the ?viewToken=
-  // inline; in core-only the host is frozen to 127.0.0.1 (see index-core-only).
-  if (ds && ds.workerPort && ds.workerViewToken) {
+  // Form C: attach the read-only web-terminal URL ONLY in core-only mode, and
+  // only when a LIVE worker terminal exists (workerPort bound + view capability
+  // minted). Core-only is the single-tenant loopback path where trigger-result
+  // is a public (no-HMAC) route and riff's in-sandbox runner polls it to open
+  // the visible CLI TUI. Gating on BOTMUX_CORE_ONLY keeps this OFF the normal/
+  // mixed fleet: there trigger-result is HMAC-gated, but we still must not widen
+  // the token surface by minting a terminal read-capability into a poll response
+  // that historically carried none (the dashboard mints view/write tokens only
+  // on explicit /write-link request). buildTerminalUrl carries ?viewToken=
+  // inline; the write token is never included. Closed/restored sessions have no
+  // live worker terminal, so no stale URL is ever advertised.
+  if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
     resolved.readOnlyUrl = buildTerminalUrl(ds);
     resolved.viewToken = ds.workerViewToken;
   }
