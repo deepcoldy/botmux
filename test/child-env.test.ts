@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
+  BOTMUX_INJECTED_ENV_KEYS,
   CLAUDE_SESSION_MARKER_ENV_KEYS,
   redactChildEnv,
   scrubClaudeSessionMarkerEnv,
@@ -183,5 +184,22 @@ describe('session CLI home scrub call sites', () => {
     expect(fn.slice(0, fn.indexOf('\n}'))).toContain('scrubClaudeSessionMarkerEnv(');
     expect(read('index-daemon.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
     expect(read('worker.ts')).toContain('scrubClaudeSessionMarkerEnv(process.env)');
+  });
+});
+
+// ─── read-isolation markers must reach the child ──────────────────────────
+
+/**
+ * Regression guard (2026-08-03): the sandbox bots.json fix hinges on the worker
+ * telling the CLI it is isolated. buildBotmuxEnvAssignments() forwards ONLY the
+ * keys in BOTMUX_INJECTED_ENV_KEYS, so leaving these out silently strips them on
+ * the tmux backend — the fix would compile, pass every unit test, and do nothing
+ * on a real machine. (Three review rounds did not catch this; the allowlist is
+ * the kind of coupling that is invisible from the call site.)
+ */
+describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
+  it('includes BOTMUX_READ_ISOLATION and BOTMUX_API_ONLY', () => {
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_READ_ISOLATION');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_API_ONLY');
   });
 });

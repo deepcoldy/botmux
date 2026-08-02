@@ -175,6 +175,15 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Resolved display footer for sandboxed `botmux send`; avoids reading the
   // credential-bearing bots.json from inside the child.
   'BOTMUX_BRAND_LABEL',
+  // Read-isolation marker + host-owned apiOnly verdict. Both are decided by the
+  // worker (gated on sandboxRequested / cfg.apiOnly) and MUST reach the child:
+  // inside the sandbox bots.json is denied, so the CLI has no other way to tell
+  // "denied because I'm sandboxed (expected)" from "unreadable (real fault)", nor
+  // to know its own apiOnly (a no-transport bot's send-cred.json is denied too).
+  // Being on this list also means tmuxEnv()/scrubTmuxServerGlobalEnv() strip them
+  // when unset — so a stale value cannot leak into a NON-sandboxed pane.
+  'BOTMUX_READ_ISOLATION',
+  'BOTMUX_API_ONLY',
   // Per-bot display preference for Context / Token usage
   // ('streaming' | 'footer' | 'off'). Injected explicitly so sandboxed offline
   // fallback cannot drift to the default when bots.json is unreadable.
