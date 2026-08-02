@@ -283,3 +283,44 @@ CoCo 目录拷贝；Riff 原生 parentTaskId 分支；`/fork` 同话题快速分
 - Claude 交互式 TUI `/fork` 在带限制 flag 时**拒绝**（提权保护）；但**冷启动**`claude --resume <id> --fork-session <botmux 同款 flag>`**不拒绝**，正常 fork、继承上下文（暗号复制成功）、父文件 8→8 行不变、新文件内部逐行 id 全改写为新 id。→ Claude 路径用原生 `--fork-session` 成立，物理拷贝降为兜底。
 - `codex fork` 用户实测：新 rollout id、`forked_from_id` 血缘、父不动、前缀一致后分岔。→ Codex 路径成立。
 - **唯一待真实环境验证**：父子双活并发写（两个 worker 同时各写各文件不 clobber）——单机 CLI 复现不了，PR1 验收必测。
+
+## 附录 C：真实 botmux 端到端测试记录（2026-08-02）
+
+测试方式：把单个 bot 的 daemon 用 `stop-bot`/`start-bot` 隔离切到本分支 build，不影响其它 bot；发真实飞书消息，核对 daemon 日志 + on-disk transcript + 会话存储。
+
+### Codex 端（seed0630 = `botmux-Seed-2.1-Pro-exp0630`，codex + super-relay-xhigh wrapper）
+
+| 验证点 | 结果 |
+|-|-|
+| `/fork --create` 命令进入 handler | ✅ `[3e355eca] Command: /fork` |
+| 原生 `codex fork <源id>` 真正调用 | ✅ `codex fork … 019fc216-6b41-…`（wrapper 透传 fork 子命令）|
+| 独立新 rollout + `forked_from_id` 血缘 | ✅ `rollout-…-019fc216-f7a4-…` 头含 `forked_from_id=019fc216-6b41-…` |
+| 分身在新群答出暗号 | ✅ 答「暗号是：PINEAPPLE-八六三一」 |
+| 源会话不动 | ✅ 源 rollout 5 处暗号命中未变、id 不变 |
+| child 持久化自己新 id | ✅ `cliSessionId=019fc216-f7a4-…`、`forkedFrom=3e355eca` |
+| Dashboard 父子并存 | ✅ 源「记住暗号…」+ 分身「🔱 记住暗号…·fork测试群」两条独立 |
+| 同源多次 fork | ✅ 连续 fork 多个 child，各自独立、源始终不动 |
+
+### Claude 端（Relay-Claude2 = `cli_aae5948f82789ce4`，claude-code + super-relay-opus wrapper）
+
+| 验证点 | 结果 |
+|-|-|
+| `/fork --create` 命令进入 handler | ✅ `[06d7815b] Command: /fork` |
+| 原生 `--fork-session` 真正调用 | ✅ `claude-super-relay-opus --resume 06d7815b… --fork-session …`（wrapper 透传）|
+| 分身继承上下文 | ✅ child transcript `f473c3a7…` 中暗号 MANGO 出现 6 次 |
+| 源会话不动 | ✅ 源 `06d7815b` 17 行、暗号 5 处未变 |
+| child 拿自己新 id + 血缘 | ✅ `cliSessionId=f473c3a7…`、`forkedFrom=06d7815b`、`🔱` 标题 |
+
+### 测试中发现并修复的问题
+
+| # | 问题 | 修复 |
+|-|-|-|
+| 1 | 建群后才做真实会话检查 → 拒绝时留空群 | 守卫全部提到建群前 |
+| 2 | forkSession 建群后失败仍可能留空群（窄竞态）| 失败时 best-effort disband 空群 |
+| 3 | 裸 `/fork` 复用"没会话"话术、误导 | 改为面向产品的"本群暂不支持原地 fork，用 --create"提示 |
+| 4 | `/fork --create` 要求 @bot、当前 bot 还要 @ 自己一遍（冗余）| 无 @ 默认当前 bot；@ 别的 bot 才校验并拒 |
+| 5 | child fork 后 `pendingForkSession` 未清（worker/daemon 抢写）| 在 worker 侧写 cliSessionId 的同一次写里清标记 |
+
+### 仍未在真实环境验证
+
+- **父子双活并发写**：父会话与分身同时各发消息、各写各的 transcript 不互相 clobber。已顺序验证父子独立；并发压测未做（单机 CLI 复现不了，需两个 live worker 同时活跃）。**建议合并前或紧接着补一次并发验收。**
