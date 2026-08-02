@@ -502,6 +502,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.no_bot': '⚠️ Could not determine the bot identity, /fork cancelled.',
   'cmd.fork.no_sender': '⚠️ Could not resolve sender open_id, /fork cancelled.',
   'cmd.fork.no_session': '⚠️ /fork must be invoked inside a thread with an existing session.',
+  'cmd.fork.no_source_here': '⚠️ No active session to fork here. Invoke /fork **inside the thread the session lives in** (the topic where you normally @ the bot), not at the group top level.',
   'cmd.fork.not_owner': '⚠️ Only the session owner can fork it.',
   'cmd.fork.no_mentions': '⚠️ /fork --create must @ a bot as the member of the new group the clone lands in.',
   'cmd.fork.resolve_failed': '⚠️ Could not resolve the @-mentioned bot, /fork cancelled. Please retry.',

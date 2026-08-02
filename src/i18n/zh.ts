@@ -505,6 +505,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.no_bot': '⚠️ 无法确定机器人身份，/fork 取消。',
   'cmd.fork.no_sender': '⚠️ 无法获取发起人 open_id，/fork 取消。',
   'cmd.fork.no_session': '⚠️ /fork 必须在一个已有会话的话题里发起。',
+  'cmd.fork.no_source_here': '⚠️ 这里没有可 fork 的活跃会话。/fork 要在**会话所在的那个话题里**发起（就是你平时 @ 机器人聊天的那条话题），不要在群顶层发。',
   'cmd.fork.not_owner': '⚠️ 只有会话发起人能 fork 它。',
   'cmd.fork.no_mentions': '⚠️ /fork --create 必须 @ 一个机器人作为分身落地的新群成员。',
   'cmd.fork.resolve_failed': '⚠️ 无法解析被 @ 的机器人，/fork 取消。请稍后重试。',

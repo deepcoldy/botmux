@@ -3366,12 +3366,30 @@ export async function handleCommand(
         const afterFlag = argsLine.replace(/^--create\s*/i, '').trim();
 
         // Front guards (fork needs a clean, real, idle source — same as relay).
+        // These MUST run before createGroupWithBots, otherwise a refusal (e.g.
+        // /fork typed at a chat top-level where ds is an empty scratch, while
+        // the real session lives in a 话题) leaves an orphan empty group.
         if (ds.session.adoptedFrom) {
           await sessionReply(rootId, t('cmd.fork.adopt_not_forkable', undefined, loc));
           break;
         }
         if (ds.pendingRepo) {
           await sessionReply(rootId, t('cmd.fork.not_started_yet', undefined, loc));
+          break;
+        }
+        // Real, resumable source session? A bare /fork scratch (worker:null, no
+        // persisted CLI markers) is not forkable — most commonly this fires when
+        // /fork was invoked at the group top-level while the session lives in a
+        // 话题 (thread-scope). Refuse BEFORE creating any group.
+        const { isRelayableRealSession: forkIsRealSession } = await import('./worker-pool.js');
+        if (!forkIsRealSession(ds)) {
+          await sessionReply(rootId, t('cmd.fork.no_source_here', undefined, loc));
+          break;
+        }
+        // Idle check up front — mid-turn source can't be forked cleanly.
+        const forkSt = ds.lastScreenStatus;
+        if (ds.worker && !ds.worker.killed && forkSt !== 'idle' && forkSt !== 'limited') {
+          await sessionReply(rootId, t('cmd.fork.mid_turn', undefined, loc));
           break;
         }
 
