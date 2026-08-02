@@ -376,3 +376,26 @@ export function isolatedPaneReattachSafe(
 function dedupe(xs: string[]): string[] {
   return Array.from(new Set(xs));
 }
+
+/**
+ * True when this process is a CLI the worker spawned for a bot under READ
+ * ISOLATION (the sandbox). The worker injects BOTH of these and writes that
+ * bot's own credential to `<BOT_HOME>/send-cred.json` — see
+ * {@link sendCredFilePath}.
+ *
+ * Why this predicate exists: inside the sandbox `~/.botmux/bots.json` is denied
+ * ON PURPOSE (it holds every sibling bot's secret). Seatbelt allows the METADATA
+ * read but denies the CONTENT read, so `existsSync()` says yes and the following
+ * `readFileSync()` fails with EPERM/EACCES. Callers must be able to tell that
+ * EXPECTED state apart from a genuine unreadable-config fault: under isolation
+ * the correct answer is "disk has nothing for you, use send-cred.json"; outside
+ * it, an unreadable bots.json must stay fatal (degrading there would silently
+ * boot a zero-bot process — no bot answers and nothing says why).
+ *
+ * Deliberately requires BOTH markers: a half-configured environment is not
+ * isolation, and treating it as such would widen the swallow to cases the
+ * sandbox never produces.
+ */
+export function underReadIsolation(): boolean {
+  return !!process.env.SESSION_DATA_DIR && !!process.env.BOTMUX_LARK_APP_ID;
+}

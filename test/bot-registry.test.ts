@@ -1608,3 +1608,67 @@ describe('vcMeetingAgentConfigActive — apiOnly bots never attend VC meetings',
       .toBeUndefined();
   });
 });
+
+// ─── bots.json unreadable (sandbox read isolation) ────────────────────────
+
+/**
+ * Regression (2026-08-03, fleet P0): every botmux subcommand died inside a
+ * sandboxed bot with `EPERM: operation not permitted, open '~/.botmux/bots.json'`.
+ *
+ * Shape of the bug: Seatbelt allows the METADATA read but denies the CONTENT
+ * read, so resolveBotConfigPath()'s existsSync() passes (the graceful "no config
+ * file" branch is never taken) and parseBotConfigFile()'s readFileSync throws.
+ * The isolated bot's own identity comes from send-cred.json, so disk returning
+ * nothing is the correct answer there — but ONLY there.
+ */
+describe('loadBotConfigs when bots.json exists but is unreadable', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+  let fs: typeof import('node:fs');
+  const savedEnv = { ...process.env };
+
+  const eperm = () => Object.assign(new Error("EPERM: operation not permitted, open '/h/.botmux/bots.json'"), { code: 'EPERM' });
+
+  beforeEach(async () => {
+    delete process.env.BOTS_CONFIG;      // force the ~/.botmux/bots.json branch
+    delete process.env.BOTMUX_CORE_ONLY; // not the synthesized core-only path
+    mod = await freshImport();
+    fs = await import('node:fs');
+    vi.mocked(fs.existsSync).mockReturnValue(true);       // metadata read allowed
+    vi.mocked(fs.readFileSync).mockImplementation(() => { throw eperm(); }); // content denied
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('' as never);
+  });
+
+  it('degrades to an empty list under read isolation (identity comes from send-cred.json)', () => {
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    expect(mod.loadBotConfigs()).toEqual([]);
+  });
+
+  it('still throws OUTSIDE read isolation — an unreadable bots.json is a real fault there', () => {
+    delete process.env.SESSION_DATA_DIR;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    // Swallowing here would silently boot a zero-bot process: no bot answers and
+    // nothing anywhere says why. Crashing loudly is the correct behaviour.
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
+  });
+
+  it('still throws when only ONE isolation marker is present (half-configured is not isolation)', () => {
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    delete process.env.BOTMUX_LARK_APP_ID;
+    expect(() => mod.loadBotConfigs()).toThrow(/EPERM/);
+  });
+
+  it('still throws for a NON-permission read error even under isolation (only EPERM/EACCES are expected)', () => {
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    vi.mocked(fs.readFileSync).mockImplementation(() => {
+      throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+    });
+    expect(() => mod.loadBotConfigs()).toThrow(/EIO/);
+  });
+});

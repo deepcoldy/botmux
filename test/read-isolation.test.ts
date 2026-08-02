@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import {
   evaluateReadIsolationGate,
@@ -274,5 +274,55 @@ describe('CLI protected capability wiring', () => {
     expect(vcSource).toContain(
       'const liveOrigin = resolveSessionContext(config.session.dataDir, receiverSessionId);',
     );
+  });
+});
+
+// ─── underReadIsolation ───────────────────────────────────────────────────
+
+/**
+ * Regression guard (2026-08-03 fleet P0, introduced by #668): callers use this
+ * predicate to decide whether an UNREADABLE ~/.botmux/bots.json is the expected
+ * sandbox state (degrade to "no bots") or a genuine fault (stay fatal). Getting
+ * it wrong in either direction is bad: too narrow → every sandboxed bot's CLI
+ * dies on the root dispatch gate; too wide → a real unreadable config silently
+ * boots a zero-bot process.
+ */
+describe('underReadIsolation', () => {
+  const saved = { ...process.env };
+  afterEach(() => { process.env = { ...saved }; });
+
+  it('is true only when BOTH worker-injected markers are present', async () => {
+    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    expect(underReadIsolation()).toBe(true);
+  });
+
+  it('is false when only SESSION_DATA_DIR is set (half-configured is not isolation)', async () => {
+    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
+    process.env.SESSION_DATA_DIR = '/h/.botmux/data';
+    delete process.env.BOTMUX_LARK_APP_ID;
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('is false when only BOTMUX_LARK_APP_ID is set', async () => {
+    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
+    delete process.env.SESSION_DATA_DIR;
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('is false on a plain host with neither marker', async () => {
+    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
+    delete process.env.SESSION_DATA_DIR;
+    delete process.env.BOTMUX_LARK_APP_ID;
+    expect(underReadIsolation()).toBe(false);
+  });
+
+  it('treats an empty-string marker as absent (not isolation)', async () => {
+    const { underReadIsolation } = await import('../src/adapters/cli/read-isolation.js');
+    process.env.SESSION_DATA_DIR = '';
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    expect(underReadIsolation()).toBe(false);
   });
 });

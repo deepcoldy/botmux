@@ -22,6 +22,7 @@
  */
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync } from 'node:fs';
+import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -364,9 +365,34 @@ function pm2Capture(args: string[], home: string = PM2_HOME, timeoutMs = 10_000)
 
 function loadBotsJson(): any[] {
   if (existsSync(BOTS_JSON_FILE)) {
+    let raw: string;
     try {
-      return parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE);
+      raw = readFileSync(BOTS_JSON_FILE, 'utf-8');
     } catch (err: any) {
+      // Separate "cannot READ it" from "read it, it's malformed" — they need
+      // opposite handling and conflating them is what broke every sandboxed bot.
+      //
+      // A sandboxed CLI is denied bots.json on purpose (sibling secrets). Seatbelt
+      // permits the metadata read, so existsSync() above passes and we land here
+      // with EPERM/EACCES. Under isolation that is the DESIGNED state: identity
+      // comes from <BOT_HOME>/send-cred.json via registerSelfFromCredFile(), so
+      // "no bots from disk" is the correct and complete answer.
+      //
+      // NOTE for future edits: exiting here is NOT catchable by callers.
+      // currentBotIsApiOnly() wraps this call in try/catch and documents itself as
+      // "never throws" — literally true and completely useless, because
+      // process.exit() is not an exception. This ran on the ROOT dispatch gate
+      // (managedOriginHasNoTransport), so it killed EVERY botmux subcommand inside
+      // the sandbox, not just send. Introduced by #668, found 2026-08-03.
+      if ((err?.code === 'EPERM' || err?.code === 'EACCES') && underReadIsolation()) return [];
+      // Outside isolation an unreadable bots.json is a real fault: stay fatal.
+      console.error(`❌ ${err?.message ?? String(err)}`);
+      process.exit(1);
+    }
+    try {
+      return parseBotConfigsJson(raw, BOTS_JSON_FILE);
+    } catch (err: any) {
+      // Malformed content is always fatal, isolation or not.
       console.error(`❌ ${err?.message ?? String(err)}`);
       process.exit(1);
     }

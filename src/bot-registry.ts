@@ -2,6 +2,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { homedir } from 'node:os';
+import { underReadIsolation } from './adapters/cli/read-isolation.js';
 import type { BackendType } from './adapters/backend/types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { CliId } from './adapters/cli/types.js';
@@ -2163,7 +2164,27 @@ export function isManagedActivationStartingAtIndex(
 }
 
 function parseBotConfigFile(filePath: string): BotConfig[] {
-  const raw = readFileSync(filePath, 'utf-8');
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch (err: any) {
+    // A sandboxed CLI is denied bots.json ON PURPOSE (it holds every sibling's
+    // secret). Seatbelt allows the METADATA read but denies the CONTENT read, so
+    // resolveBotConfigPath()'s existsSync() passes and we land here with
+    // EPERM/EACCES — the "no config file" branch that would have degraded
+    // gracefully is never reached. Callers then die with a raw
+    // `EPERM … open '~/.botmux/bots.json'`, which is why EVERY botmux subcommand
+    // (not just send) breaks inside the sandbox.
+    //
+    // Under isolation the bot's identity comes from registerSelfFromCredFile()
+    // instead, so "disk gave us nothing" is the correct, complete answer here.
+    //
+    // Outside isolation an unreadable bots.json is a REAL fault and must still
+    // throw: swallowing it would silently boot a zero-bot process (no bots
+    // respond, no error anywhere) — strictly worse than crashing loudly.
+    if ((err?.code === 'EPERM' || err?.code === 'EACCES') && underReadIsolation()) return [];
+    throw err;
+  }
   try {
     return parseBotConfigsFromText(raw);
   } catch (err: any) {
