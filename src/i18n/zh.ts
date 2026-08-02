@@ -515,6 +515,8 @@ export const messages: Record<string, string> = {
   'cmd.fork.adopt_not_forkable': '⚠️ 该会话是 /adopt 接入的外部会话，无法 fork。',
   'cmd.fork.created': '✅ 已创建群「{name}」并 fork 出分身（源会话原样保留继续）\n👉 {link}\n\n分身带着 fork 时刻的完整上下文，去新群 @ 机器人即可继续。',
   'cmd.fork.failed': '⚠️ /fork --create 失败：{error}',
+  'cmd.fork.picker_pending': 'ℹ️ 不带参数的 /fork（在选择器里挑一个会话 fork 进本群）还没做。当前请用 `/fork --create <新群名> @机器人` —— 会新建一个群、把当前会话 fork 一份分身放进去，源会话保持不动。',
+  'cmd.fork.orphan_group_left': '⚠️ fork 没成功，但新群「{name}」已经建出来了（我尝试自动解散失败，可能因为群主已转给你）。这个空群可以手动删掉。',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': '暂无定时任务。\n\n用法示例：\n/schedule 每日17:50 帮我看看今天AI圈有什么新闻\n/schedule 工作日每天9:00 检查服务状态\n/schedule 每周一10:00 生成周报',

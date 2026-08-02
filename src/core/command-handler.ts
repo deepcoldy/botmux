@@ -3355,10 +3355,11 @@ export async function handleCommand(
         }
 
         if (!/^--create\b/i.test(argsLine)) {
-          // No-arg / picker path — deferred to the follow-up. For now guide the
-          // user to the working entry point so the command never silently
-          // no-ops. (Non-topic-group in-place fork = Branch, PR2.)
-          await sessionReply(rootId, t('cmd.fork.no_session', undefined, loc));
+          // No-arg picker path ("fork into an existing group you pick") is not
+          // built yet. Don't reuse the no-session copy — the user often DOES
+          // have a session here (that's exactly the confusing case). Tell them
+          // the picker is pending and point at the working --create form.
+          await sessionReply(rootId, t('cmd.fork.picker_pending', undefined, loc));
           break;
         }
 
@@ -3473,6 +3474,21 @@ export async function handleCommand(
         const { forkSession } = await import('./worker-pool.js');
         const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat');
         if (!forkResult.ok) {
+          // Residual-orphan cleanup: the front guards already ran before
+          // createGroupWithBots, so this only fires on a narrow TOCTOU race
+          // (source went busy / closed in the sub-second between guard and
+          // fork). Best-effort disband the just-created empty group so a failed
+          // fork never leaves an orphan chat. May fail if ownership already
+          // transferred to the user (transferOwnerTo) — then we just tell them.
+          let orphanCleaned = false;
+          try {
+            const { disbandChat } = await import('../services/groups-store.js');
+            const dis = await disbandChat(forkAppId, forkChatId);
+            orphanCleaned = dis.ok;
+            if (!dis.ok) logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband failed: ${dis.error}`);
+          } catch (e: any) {
+            logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband threw: ${e?.message ?? e}`);
+          }
           const errKey = forkResult.error === 'worker_busy' ? 'cmd.fork.mid_turn'
             : forkResult.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
             : forkResult.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
@@ -3486,7 +3502,10 @@ export async function handleCommand(
           } else {
             await sessionReply(rootId, t('cmd.fork.failed', { error: forkResult.error }, loc));
           }
-          logger.warn(`[${logTag}] /fork --create: forkSession failed (${forkResult.error}); new chat ${forkChatId} left empty`);
+          if (!orphanCleaned) {
+            await sessionReply(rootId, t('cmd.fork.orphan_group_left', { name: forkGroupName }, loc));
+          }
+          logger.warn(`[${logTag}] /fork --create: forkSession failed (${forkResult.error}); new chat ${forkChatId} ${orphanCleaned ? 'disbanded' : 'LEFT (disband failed)'}`);
           break;
         }
 

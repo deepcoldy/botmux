@@ -512,6 +512,8 @@ export const messages: Record<string, string> = {
   'cmd.fork.adopt_not_forkable': '⚠️ This session was adopted from an external CLI and cannot be forked.',
   'cmd.fork.created': '✅ Created group "{name}" and forked a clone (the source session is left running untouched)\n👉 {link}\n\nThe clone carries the full context at fork time — go to the new group and @ the bot to continue.',
   'cmd.fork.failed': '⚠️ /fork --create failed: {error}',
+  'cmd.fork.picker_pending': 'ℹ️ Bare /fork (pick a session from a picker and fork it into this group) is not built yet. For now use `/fork --create <new group name> @bot` — it creates a new group and forks a clone of the current session into it, leaving the source untouched.',
+  'cmd.fork.orphan_group_left': '⚠️ Fork did not succeed, but the new group "{name}" was already created (auto-disband failed, likely because ownership was transferred to you). You can delete this empty group manually.',
 
   // ─── /schedule ───────────────────────────────────────────────────────────
   'schedule.empty_with_examples': 'No scheduled tasks yet.\n\nExamples:\n/schedule daily 17:50 summarize today\'s AI news\n/schedule weekdays 9:00 check service status\n/schedule mondays 10:00 generate weekly report',
