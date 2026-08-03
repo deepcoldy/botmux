@@ -306,7 +306,18 @@ export function buildSeatbeltProfile(
 
 // A marker records which confinement capabilities are attached to the live
 // process. Credential-only panes must cold-spawn when a full sandbox is enabled.
-export const ISOLATION_PANE_MARKER_VERSION = 7;
+//
+// BUMP THIS whenever the START-TIME contract of an isolated CLI changes in a way
+// a still-running process cannot satisfy — a warm reattach preserves the live
+// process untouched, so anything the reattach path relies on but the old process
+// lacks makes reattach unsafe.
+//   · 7 → 8 (2026-08-03): isolated CLIs now MUST carry the host-injected
+//     BOTMUX_READ_ISOLATION / BOTMUX_API_ONLY env (bots.json EPERM fix). Panes
+//     spawned by v3.8.0 have a v7 marker but a process with NEITHER key, so
+//     `botmux` inside them still dies on the denied bots.json read. Reattaching
+//     them would leave the regression unfixed after a plain `daemon:restart`;
+//     the bump forces a cold respawn that injects the markers.
+export const ISOLATION_PANE_MARKER_VERSION = 8;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
