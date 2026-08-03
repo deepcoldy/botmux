@@ -2707,7 +2707,10 @@ function readStringArray(raw: unknown): string[] | undefined {
 function readDirectSkillSelectors(raw: unknown): SkillSelector[] | undefined {
   const values = readStringArray(raw);
   if (!values) return undefined;
-  const selectors = values.filter((value): value is SkillSelector => /^skill:.+$/.test(value));
+  // Accept both `skill:<name>` and `pack:<id>` selectors. Malformed values
+  // (e.g. `skill:` with an empty body, or unknown prefixes) are dropped so a
+  // bot config never carries garbage into the resolver.
+  const selectors = values.filter((value): value is SkillSelector => /^(skill|pack):.+$/.test(value));
   return selectors.length > 0 ? selectors : undefined;
 }
 

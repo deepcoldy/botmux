@@ -1,6 +1,7 @@
 import type { CliId } from '../../adapters/cli/types.js';
 import { readGlobalConfig } from '../../global-config.js';
 import { readSkillRegistry } from '../../services/skill-registry-store.js';
+import { readSkillPackRegistry } from '../../services/skill-pack-store.js';
 import type { BotSkillPolicy, SessionSkillManifest, SkillPackage } from './types.js';
 import { discoverProjectSkills } from './discovery.js';
 import { removeSessionSkillManifest, writeSessionSkillManifest } from './manifest-store.js';
@@ -35,6 +36,7 @@ export function prepareSessionSkillPrompt(opts: {
     globalDelivery: globalSkills?.delivery,
     registrySkills: Object.values(readSkillRegistry().skills),
     projectSkills: discoverProjectSkills(opts.workingDir),
+    packs: readSkillPackRegistry().packs,
   });
   if (!manifest || manifest.prioritySkills.length === 0) {
     removeSessionSkillManifest(opts.sessionId);
