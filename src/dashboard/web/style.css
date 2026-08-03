@@ -7429,7 +7429,13 @@ dialog.onboarding-dialog::backdrop {
 .roles-listener-members {
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  /* Do not let this box shrink: it is a flex child of the listener editor and
+     the whole form (.roles-editor-form) is the scroll container. With the old
+     `min-height:0` it collapsed to ~0 on shorter viewports (≲800px tall) and,
+     combined with `overflow:hidden`, clipped the member rows entirely — the
+     picker looked empty and the wheel had nothing to reveal. Keeping its full
+     content height lets the form overflow and scroll normally. */
+  flex-shrink: 0;
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   overflow: hidden;
