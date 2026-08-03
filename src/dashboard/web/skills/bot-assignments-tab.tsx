@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
 import { useT } from '../react-hooks.js';
 import { SectionHeader } from '../dashboard-components.js';
-import { packIds, priorityNames } from './shared.js';
-import type { BotRow, SkillPolicy, SkillRow, StatusMessage } from './types.js';
+import { buildSkillGraph, packIds, priorityNames, type BotGraphInfo } from './shared.js';
+import type { BotRow, SkillRow, StatusMessage } from './types.js';
 
 interface BotAssignmentsTabProps {
   bots: BotRow[];
@@ -21,6 +21,13 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   const [dragItem, setDragItem] = useState<DragItem | null>(null);
   const [skillQuery, setSkillQuery] = useState('');
   const [activeTag, setActiveTag] = useState<string | null>(null);
+
+  // Single relationship model: per-bot resolution, counts and health all come
+  // from the same graph the other skill tables use.
+  const graph = useMemo(
+    () => buildSkillGraph(props.skills, props.packs, props.bots),
+    [props.skills, props.packs, props.bots],
+  );
 
   const allTags = useMemo(() => {
     const tags = new Set<string>();
@@ -151,8 +158,9 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
                 {props.bots.map(bot => {
                   const skillNames = priorityNames(bot.skills);
                   const packNames = packIds(bot.skills);
-                  const finalCount = computeFinalCount(bot.skills, props.packs, props.skills);
-                  const health = computeBotHealth(bot.skills, props.packs, props.skills);
+                  const botInfo = graph.bots.get(bot.larkAppId);
+                  const finalCount = botInfo?.finalCount ?? 0;
+                  const health = botHealthLabel(botInfo, tr);
                   const isDragOver = dragOverBot === bot.larkAppId;
                   return (
                     <tr
@@ -212,41 +220,14 @@ export function BotAssignmentsTab(props: BotAssignmentsTabProps) {
   );
 }
 
-function computeFinalCount(policy: SkillPolicy | null | undefined, packs: Array<{ id: string; include: string[] }>, skills: SkillRow[]): number {
-  const names = new Set<string>();
-  for (const sel of policy?.include ?? []) {
-    if (sel.startsWith('skill:')) names.add(sel.slice('skill:'.length));
-    else if (sel.startsWith('pack:')) {
-      const pack = packs.find(p => p.id === sel.slice('pack:'.length));
-      if (pack) for (const inc of pack.include) names.add(inc.replace('skill:', ''));
-    }
+/** Map graph health to a display level + translated label. */
+function botHealthLabel(info: BotGraphInfo | undefined, tr: ReturnType<typeof useT>): { level: 'ok' | 'warn' | 'error'; label: string } {
+  switch (info?.health) {
+    case 'pack_missing': return { level: 'error', label: tr('skills.healthPackMissing') };
+    case 'missing': return { level: 'warn', label: tr('skills.healthMissing', { count: info.missingSkills.length }) };
+    case 'default': case undefined: return { level: 'ok', label: tr('skills.healthDefault') };
+    default: return { level: 'ok', label: tr('skills.healthOk') };
   }
-  const installed = new Set(skills.map(s => s.name));
-  let count = 0;
-  for (const n of names) if (installed.has(n)) count++;
-  return count;
-}
-
-function computeBotHealth(policy: SkillPolicy | null | undefined, packs: Array<{ id: string; include: string[] }>, skills: SkillRow[]): { level: 'ok' | 'warn' | 'error'; label: string } {
-  const tr = (k: string) => k;
-  const installed = new Set(skills.map(s => s.name));
-  const missing: string[] = [];
-  for (const sel of policy?.include ?? []) {
-    if (sel.startsWith('skill:')) {
-      const n = sel.slice('skill:'.length);
-      if (!installed.has(n)) missing.push(n);
-    } else if (sel.startsWith('pack:')) {
-      const pack = packs.find(p => p.id === sel.slice('pack:'.length));
-      if (!pack) return { level: 'error', label: 'pack_missing' };
-      for (const inc of pack.include) {
-        const n = inc.replace('skill:', '');
-        if (!installed.has(n)) missing.push(n);
-      }
-    }
-  }
-  if (missing.length > 0) return { level: 'warn', label: `${missing.length} missing` };
-  if ((policy?.include?.length ?? 0) === 0) return { level: 'ok', label: 'default' };
-  return { level: 'ok', label: 'ok' };
 }
 
 function BotAssignmentEditor(props: {

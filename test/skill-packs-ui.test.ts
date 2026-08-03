@@ -39,16 +39,20 @@ describe('skill packs tab', () => {
   afterEach(() => { vi.unstubAllGlobals(); });
 
   it('renders pack health badges for complete / missing / unassigned', async () => {
-    mockFetch(() => jsonRes(200, { packs: [
+    // Packs now arrive via props from the page-level useSkillsData store —
+    // the tab must not issue its own list fetch.
+    const fetchMock = mockFetch(() => jsonRes(500, { error: 'unexpected_fetch' }));
+    const packs = [
       pack({ id: 'complete', name: 'Complete', references: [{ larkAppId: 'b1', botName: 'Bot1' }] }),
       pack({ id: 'missing', name: 'Missing', missingSkills: ['x'], references: [{ larkAppId: 'b1', botName: 'Bot1' }] }),
       pack({ id: 'unassigned', name: 'Unassigned', references: [] }),
-    ] }));
+    ];
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
-      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], onRefresh: () => {}, refreshKey: 0 }));
+      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], packs, onRefresh: () => {} }));
     });
     await flush();
+    expect(fetchMock).not.toHaveBeenCalled();
     const text = JSON.stringify(renderer.toJSON());
     expect(text).toContain('Complete');
     expect(text).toContain('Missing');
@@ -58,11 +62,12 @@ describe('skill packs tab', () => {
   it('delete without in-use: calls DELETE without force', async () => {
     const fetchMock = mockFetch((url, init) => {
       if (init?.method === 'DELETE') return jsonRes(200, { ok: true });
-      return jsonRes(200, { packs: [pack({ references: [{ larkAppId: 'b1', botName: 'Bot1' }] })] });
+      return jsonRes(500, { error: 'unexpected_fetch' });
     });
+    const packs = [pack({ references: [{ larkAppId: 'b1', botName: 'Bot1' }] })];
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
-      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], onRefresh: () => {}, refreshKey: 0 }));
+      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], packs, onRefresh: () => {} }));
     });
     await flush();
     const root = renderer.root;
@@ -83,11 +88,12 @@ describe('skill packs tab', () => {
       if (init?.method === 'DELETE' && url.includes('force=1')) {
         return jsonRes(200, { ok: true });
       }
-      return jsonRes(200, { packs: [pack({ references: [{ larkAppId: 'b1', botName: 'Bot1' }] })] });
+      return jsonRes(500, { error: 'unexpected_fetch' });
     });
+    const packs = [pack({ references: [{ larkAppId: 'b1', botName: 'Bot1' }] })];
     let renderer!: TestRenderer.ReactTestRenderer;
     await act(async () => {
-      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], onRefresh: () => {}, refreshKey: 0 }));
+      renderer = TestRenderer.create(React.createElement(SkillPacksTab, { skills: [], packs, onRefresh: () => {} }));
     });
     await flush();
     const root = renderer.root;
