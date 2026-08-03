@@ -170,17 +170,7 @@ function InstallWizard(props: {
             <input
               autoFocus
               value={props.source}
-              onChange={e => {
-                const val = e.target.value;
-                props.onSourceChange(val);
-                // Auto-extract ref + path from browser-style git URLs
-                const normalized = normalizeGitUrl(val);
-                if (normalized) {
-                  props.onSourceChange(normalized.url);
-                  if (normalized.ref) props.onRefChange(normalized.ref);
-                  if (normalized.path) props.onPathChange(normalized.path);
-                }
-              }}
+              onChange={e => props.onSourceChange(e.target.value)}
               placeholder={tr('skills.sourcePlaceholder')}
             />
             <div className="skills-wizard-source-hint">
@@ -348,22 +338,4 @@ function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbu
   if (s.startsWith('/') || s.startsWith('./') || s.startsWith('~')) return 'local';
   if (s.includes('github')) return 'github';
   return 'unknown';
-}
-
-/** Normalize browser-style git URLs (e.g. host/.../tree/main/path)
- *  into a cloneable repo URL + optional ref + path. Returns null if no
- *  normalization is needed. */
-function normalizeGitUrl(source: string): { url: string; ref: string; path: string } | null {
-  const s = source.trim();
-  // Match /tree/<branch>/<path> or /blob/<branch>/<path> patterns
-  const treeMatch = s.match(/^(.+?)\/(?:tree|blob)\/([^/]+)\/(.+)$/);
-  if (treeMatch) {
-    return { url: treeMatch[1], ref: treeMatch[2], path: treeMatch[3] };
-  }
-  // Match /tree/<branch> at the end
-  const treeMatch2 = s.match(/^(.+?)\/(?:tree|blob)\/([^/]+)\/?$/);
-  if (treeMatch2) {
-    return { url: treeMatch2[1], ref: treeMatch2[2], path: '' };
-  }
-  return null;
 }

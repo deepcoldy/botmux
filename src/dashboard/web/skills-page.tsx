@@ -924,8 +924,15 @@ function SkillsPage() {
   }
 
   function sourceRequestBody(): Record<string, unknown> {
+    let source = installSource.trim();
+    // Backend only auto-detects github.com URLs. For any other http(s) git URL
+    // (e.g. internal git hosts), prepend `git+` so the backend treats it as a
+    // generic git remote instead of falling back to local-file mode.
+    if (/^https?:\/\//i.test(source) && !source.includes('github.com') && !source.startsWith('git+')) {
+      source = `git+${source}`;
+    }
     return {
-      source: installSource.trim(),
+      source,
       path: installPath.trim() || undefined,
       ref: installRef.trim() || undefined,
     };
