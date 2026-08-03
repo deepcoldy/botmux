@@ -67,7 +67,13 @@ export function resolveSkillPolicy(input: SkillPolicyInput): SkillPolicyResult {
     candidates.push(...input.projectSkills);
   }
 
-  const candidateByName = new Map(candidates.map((skill) => [skill.name, skill]));
+  // Keep the same source precedence as direct selectors: registry candidates
+  // are appended before project candidates, so the first package with a name
+  // must win for both `skill:*` and pack-expanded references.
+  const candidateByName = new Map<string, SkillPackage>();
+  for (const skill of candidates) {
+    if (!candidateByName.has(skill.name)) candidateByName.set(skill.name, skill);
+  }
   const raw: ResolvedSkill[] = [];
 
   // Partition the include array so direct `skill:*` references are ALWAYS

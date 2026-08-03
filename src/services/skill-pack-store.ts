@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 import { skillPackRegistryPath } from '../core/skills/registry-paths.js';
 import type { SkillPack, SkillPackRegistryFile } from '../core/skills/types.js';
 
@@ -9,6 +10,7 @@ const MAX_DESCRIPTION_LENGTH = 500;
 const MAX_TAGS = 20;
 const MAX_TAG_LENGTH = 40;
 const MAX_INCLUDE = 100;
+const LOCK_WAIT_MS = 30_000;
 
 export interface SkillPackInput {
   id: string;
@@ -67,6 +69,17 @@ export function readSkillPackRegistry(): SkillPackRegistryFile {
 function writeSkillPackRegistry(registry: SkillPackRegistryFile): void {
   mkdirSync(dirname(skillPackRegistryPath()), { recursive: true });
   atomicWriteFileSync(skillPackRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
+}
+
+function withSkillPackMutation<T>(mutate: (registry: SkillPackRegistryFile) => T): T {
+  const file = skillPackRegistryPath();
+  mkdirSync(dirname(file), { recursive: true });
+  return withFileLockSync(file, () => {
+    const registry = readSkillPackRegistry();
+    const result = mutate(registry);
+    writeSkillPackRegistry(registry);
+    return result;
+  }, { maxWaitMs: LOCK_WAIT_MS });
 }
 
 function isSkillSelector(value: unknown): value is `skill:${string}` {
@@ -146,62 +159,74 @@ export function getSkillPack(id: string): SkillPack | undefined {
 
 export function createSkillPack(input: SkillPackInput): SkillPack {
   const id = validateId(input.id);
-  const registry = readSkillPackRegistry();
-  if (registry.packs[id]) {
-    throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id });
-  }
-  const now = new Date().toISOString();
-  const pack: SkillPack = {
-    id,
-    name: validateName(input.name),
-    description: validateDescription(input.description),
-    tags: normalizeTags(input.tags),
-    include: normalizeInclude(input.include),
-    revision: 1,
-    createdAt: now,
-    updatedAt: now,
-  };
-  registry.packs[id] = pack;
-  writeSkillPackRegistry(registry);
-  return pack;
+  return withSkillPackMutation((registry) => {
+    if (registry.packs[id]) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id });
+    }
+    const now = new Date().toISOString();
+    const pack: SkillPack = {
+      id,
+      name: validateName(input.name),
+      description: validateDescription(input.description),
+      tags: normalizeTags(input.tags),
+      include: normalizeInclude(input.include),
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    registry.packs[id] = pack;
+    return pack;
+  });
 }
 
 export function updateSkillPack(id: string, input: SkillPackUpdateInput): SkillPack {
-  const registry = readSkillPackRegistry();
-  const existing = registry.packs[id];
-  if (!existing) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
-  if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
-    throw new SkillPackStoreError({ code: 'SKILL_PACK_REVISION_CONFLICT', id, current: existing.revision });
-  }
-  const updated: SkillPack = {
-    ...existing,
-    name: input.name !== undefined ? validateName(input.name) : existing.name,
-    description: input.description !== undefined ? validateDescription(input.description) : existing.description,
-    tags: input.tags !== undefined ? normalizeTags(input.tags) : existing.tags,
-    include: input.include !== undefined ? normalizeInclude(input.include) : existing.include,
-    revision: existing.revision + 1,
-    updatedAt: new Date().toISOString(),
-  };
-  registry.packs[id] = updated;
-  writeSkillPackRegistry(registry);
-  return updated;
+  return withSkillPackMutation((registry) => {
+    const existing = registry.packs[id];
+    if (!existing) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    if (input.expectedRevision !== undefined && input.expectedRevision !== existing.revision) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_REVISION_CONFLICT', id, current: existing.revision });
+    }
+    const updated: SkillPack = {
+      ...existing,
+      name: input.name !== undefined ? validateName(input.name) : existing.name,
+      description: input.description !== undefined ? validateDescription(input.description) : existing.description,
+      tags: input.tags !== undefined ? normalizeTags(input.tags) : existing.tags,
+      include: input.include !== undefined ? normalizeInclude(input.include) : existing.include,
+      revision: existing.revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    registry.packs[id] = updated;
+    return updated;
+  });
 }
 
 export function deleteSkillPack(id: string): void {
-  const registry = readSkillPackRegistry();
-  if (!registry.packs[id]) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
-  delete registry.packs[id];
-  writeSkillPackRegistry(registry);
+  withSkillPackMutation((registry) => {
+    if (!registry.packs[id]) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    delete registry.packs[id];
+  });
 }
 
 export function cloneSkillPack(id: string, newId: string): SkillPack {
-  const source = getSkillPack(id);
-  if (!source) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
-  return createSkillPack({
-    id: newId,
-    name: `${source.name} (copy)`,
-    description: source.description,
-    tags: source.tags,
-    include: source.include,
+  const targetId = validateId(newId);
+  return withSkillPackMutation((registry) => {
+    const source = registry.packs[id];
+    if (!source) throw new SkillPackStoreError({ code: 'SKILL_PACK_NOT_FOUND', id });
+    if (registry.packs[targetId]) {
+      throw new SkillPackStoreError({ code: 'SKILL_PACK_ID_CONFLICT', id: targetId });
+    }
+    const now = new Date().toISOString();
+    const clone: SkillPack = {
+      id: targetId,
+      name: validateName(`${source.name} (copy)`),
+      description: source.description,
+      tags: source.tags ? [...source.tags] : undefined,
+      include: [...source.include],
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+    registry.packs[targetId] = clone;
+    return clone;
   });
 }
