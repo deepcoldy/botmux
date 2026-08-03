@@ -4208,6 +4208,30 @@ td code,
   justify-self: center;
 }
 
+.auth-expired-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.auth-login-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0 18px;
+  border-radius: var(--radius-lg);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.auth-login-link:hover {
+  filter: brightness(.96);
+}
+
 .checkbox-row {
   display: flex;
   flex-wrap: wrap;

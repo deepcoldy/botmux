@@ -36,6 +36,7 @@ import {
   dashboardClientShellRedirect,
   readDashboardClientShell,
 } from './client-shell.js';
+import { dashboardLoginHref } from './auth-login.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
 type TopbarAttentionNotice = { count: number; time: string; bot: string; reason: string };
@@ -169,6 +170,7 @@ const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
 const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
+let authLoginBaseUrl: string | undefined;
 
 function icon(children: ReactNode): ReactNode {
   return <svg viewBox="0 0 16 16" aria-hidden="true">{children}</svg>;
@@ -480,8 +482,13 @@ function TopbarStatusMenu(props: { summary: TopbarStatusSummary; autoOpen?: bool
   );
 }
 
-function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): React.JSX.Element | null {
+function AuthExpiredOverlay(props: {
+  open: boolean;
+  loginUrl?: string;
+  onClose(): void;
+}): React.JSX.Element | null {
   if (!props.open) return null;
+  const canLogin = !!props.loginUrl;
   return (
     <div
       id="auth-expired-overlay"
@@ -490,9 +497,31 @@ function AuthExpiredOverlay(props: { open: boolean; onClose(): void }): React.JS
       onClick={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       <div className="auth-expired-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-expired-title">
-        <h2 id="auth-expired-title">访问链接已失效</h2>
-        <p>当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。</p>
-        <button id="auth-expired-dismiss" type="button" className="primary" onClick={props.onClose}>知道了</button>
+        <h2 id="auth-expired-title">{canLogin ? '登录 Dashboard' : '访问链接已失效'}</h2>
+        <p>{canLogin
+          ? '当前浏览器尚未登录。点击后将通过 Botmux 平台校验机器 owner 权限，并返回当前页面；无权限账号仍会被拒绝。'
+          : '当前链接/访问已失效，请使用最新授权链接重新进入（运行 botmux dashboard 获取）。'}</p>
+        <div className="auth-expired-actions">
+          {props.loginUrl ? (
+            <a
+              id="dashboard-one-click-login"
+              className="auth-login-link primary"
+              href={props.loginUrl}
+              target="_top"
+              rel="noopener"
+            >
+              一键登录
+            </a>
+          ) : null}
+          <button
+            id="auth-expired-dismiss"
+            type="button"
+            className={canLogin ? 'secondary' : 'primary'}
+            onClick={props.onClose}
+          >
+            {canLogin ? '暂不登录' : '知道了'}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1128,7 +1157,11 @@ function DashboardShell(): React.JSX.Element {
           </div>
         </div>
       </div>
-      <AuthExpiredOverlay open={authExpiredOpen} onClose={closeAuthExpired} />
+      <AuthExpiredOverlay
+        open={authExpiredOpen}
+        loginUrl={dashboardLoginHref(authLoginBaseUrl, location.hash)}
+        onClose={closeAuthExpired}
+      />
     </>
   );
 }
@@ -1144,7 +1177,11 @@ function setLocale(locale: DashboardLocale): void {
 
 // ── Auth-expiry overlay ──────────────────────────────────────────────────────
 let expiredShown = false;
-export function showAuthExpiredOverlay(): void {
+export function showAuthExpiredOverlay(loginUrl?: string): void {
+  const hasLoginUrl = !!dashboardLoginHref(loginUrl, location.hash);
+  const loginUrlChanged = hasLoginUrl && authLoginBaseUrl !== loginUrl;
+  if (hasLoginUrl) authLoginBaseUrl = loginUrl;
+  if (expiredShown && loginUrlChanged) renderShell();
   if (expiredShown) return;
   expiredShown = true;
   window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
@@ -1174,9 +1211,10 @@ window.fetch = async function patchedFetch(
 ): ReturnType<typeof fetch> {
   const res = await origFetch(...args);
   if (res.status === 401) {
+    const loginUrl = res.headers.get('x-botmux-login-url') ?? undefined;
     const method = (args[1]?.method ?? 'GET').toUpperCase();
     const isRead = method === 'GET' || method === 'HEAD';
-    if (isRead && !publicReadOnly) showAuthExpiredOverlay();
+    if (loginUrl || (isRead && !publicReadOnly)) showAuthExpiredOverlay(loginUrl);
     else showReadOnlyToast();
   }
   return res;

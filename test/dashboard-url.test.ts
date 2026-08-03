@@ -9,21 +9,35 @@ vi.mock('../src/global-config.js', () => ({
 vi.mock('../src/platform/binding.js', () => ({
   platformMachineBaseUrl: vi.fn(() => null),
   publicReverseProxyBaseUrl: vi.fn(() => null),
+  readPlatformBinding: vi.fn(() => null),
 }));
 
-import { buildDashboardUrl, buildDashboardUrls, formatUrlHost } from '../src/core/dashboard-url.js';
+import {
+  buildDashboardUrl,
+  buildDashboardUrls,
+  buildPlatformDashboardLoginUrl,
+  formatUrlHost,
+} from '../src/core/dashboard-url.js';
 import { isRemoteAccessEnabled } from '../src/global-config.js';
-import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../src/platform/binding.js';
+import {
+  platformMachineBaseUrl,
+  publicReverseProxyBaseUrl,
+  readPlatformBinding,
+} from '../src/platform/binding.js';
 
 const setRemote = (on: boolean) => vi.mocked(isRemoteAccessEnabled).mockReturnValue(on);
 const setPlatform = (base: string | null) => vi.mocked(platformMachineBaseUrl).mockReturnValue(base);
 const setPublic = (base: string | null) => vi.mocked(publicReverseProxyBaseUrl).mockReturnValue(base);
+const setBinding = (binding: ReturnType<typeof readPlatformBinding>) => (
+  vi.mocked(readPlatformBinding).mockReturnValue(binding)
+);
 
 describe('buildDashboardUrl', () => {
   beforeEach(() => {
     setRemote(false);
     setPlatform(null);
     setPublic(null);
+    setBinding(null);
   });
 
   it('builds a local host:port URL with token when remote access is off', () => {
@@ -163,5 +177,41 @@ describe('formatUrlHost', () => {
       const h = formatUrlHost(host);
       expect(() => new URL(`http://${h}:7891/#/v3/run-1`)).not.toThrow();
     }
+  });
+});
+
+describe('buildPlatformDashboardLoginUrl', () => {
+  beforeEach(() => {
+    setRemote(false);
+    setBinding(null);
+  });
+
+  it('builds a token-free platform owner-login URL with a safe root fallback', () => {
+    setRemote(true);
+    setBinding({
+      platformUrl: 'https://platform.example',
+      machineId: 'm-1',
+      machineToken: 'machine-secret',
+    });
+    expect(buildPlatformDashboardLoginUrl()).toBe(
+      'https://platform.example/open/m-1?next=%2F%23%2F',
+    );
+    expect(buildPlatformDashboardLoginUrl()).not.toContain('machine-secret');
+  });
+
+  it('is unavailable unless remote access and a platform binding are both present', () => {
+    setBinding({ platformUrl: 'https://platform.example', machineId: 'm-1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+    setRemote(true);
+    setBinding(null);
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+  });
+
+  it('rejects a non-http platform binding and safely encodes the machine id path segment', () => {
+    setRemote(true);
+    setBinding({ platformUrl: 'file:///tmp/platform', machineId: 'm/1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toBeUndefined();
+    setBinding({ platformUrl: 'https://platform.example/base', machineId: 'm/1', machineToken: 'secret' });
+    expect(buildPlatformDashboardLoginUrl()).toContain('/open/m%2F1?');
   });
 });

@@ -1,4 +1,8 @@
-import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
+import {
+  platformMachineBaseUrl,
+  publicReverseProxyBaseUrl,
+  readPlatformBinding,
+} from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 
 export interface DashboardUrls {
@@ -62,4 +66,27 @@ export function buildDashboardUrls(opts: { host: string; port: number | string; 
 /** Convenience: just the primary dashboard URL (see {@link buildDashboardUrls}). */
 export function buildDashboardUrl(opts: { host: string; port: number | string; token?: string }): string {
   return buildDashboardUrls(opts).url;
+}
+
+/**
+ * Build the platform owner-login URL advertised by an unauthenticated
+ * Dashboard response. The SPA replaces only the hash-route `next` value, so
+ * the server never exposes the Dashboard token or machine tunnel credential.
+ */
+export function buildPlatformDashboardLoginUrl(): string | undefined {
+  if (!isRemoteAccessEnabled()) return undefined;
+  const binding = readPlatformBinding();
+  const machineId = binding?.machineId.trim();
+  if (!binding || !machineId) return undefined;
+  try {
+    const platform = new URL(binding.platformUrl);
+    if (!['http:', 'https:'].includes(platform.protocol) || platform.username || platform.password) {
+      return undefined;
+    }
+    const loginUrl = new URL(`/open/${encodeURIComponent(machineId)}`, platform);
+    loginUrl.searchParams.set('next', '/#/');
+    return loginUrl.toString();
+  } catch {
+    return undefined;
+  }
 }

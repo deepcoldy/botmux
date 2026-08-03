@@ -66,7 +66,11 @@ import { checkCliAvailability } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { invalidateGlobalConfigCache, mergeDashboardConfig, mergeGlobalConfig, readGlobalConfig, type MaintenanceConfig, type RepoPickerMode, type WhiteboardConfig } from './global-config.js';
 import { hostLocalTimeZone, scheduleTimeZone } from './utils/timezone.js';
-import { buildDashboardUrls, type DashboardUrls } from './core/dashboard-url.js';
+import {
+  buildDashboardUrls,
+  buildPlatformDashboardLoginUrl,
+  type DashboardUrls,
+} from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
 import { getGitRepoInfo } from './core/session-row-enrichment.js';
@@ -2706,7 +2710,12 @@ const server = createServer(async (req, res) => {
     const authed = !!presentedToken && presentedToken === activeToken && !!activeToken;
 
     if (decision.kind === 'deny401') {
-      res.writeHead(401, { 'content-type': 'text/html; charset=utf-8' });
+      const loginUrl = buildPlatformDashboardLoginUrl();
+      res.writeHead(401, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        ...(loginUrl ? { 'x-botmux-login-url': loginUrl } : {}),
+      });
       res.end('<h1>Token expired</h1><p>Run <code>botmux dashboard</code> to get a fresh URL.</p>');
       return;
     }
