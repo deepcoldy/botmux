@@ -170,11 +170,22 @@ function InstallWizard(props: {
             <input
               autoFocus
               value={props.source}
-              onChange={e => props.onSourceChange(e.target.value)}
+              onChange={e => {
+                const val = e.target.value;
+                props.onSourceChange(val);
+                // Auto-extract ref + path from browser-style git URLs
+                const normalized = normalizeGitUrl(val);
+                if (normalized) {
+                  props.onSourceChange(normalized.url);
+                  if (normalized.ref) props.onRefChange(normalized.ref);
+                  if (normalized.path) props.onPathChange(normalized.path);
+                }
+              }}
               placeholder={tr('skills.sourcePlaceholder')}
             />
             <div className="skills-wizard-source-hint">
               {sourceType === 'github' && <small>{tr('skills.sourceHelpRemote')}</small>}
+              {sourceType === 'git' && <small>{tr('skills.sourceHelpRemote')}</small>}
               {sourceType === 'local' && <small>{tr('skills.sourceHelpLocal')}</small>}
               {sourceType === 'agentbuddy' && <small>{tr('skills.sourceHelpAgentbuddy')}</small>}
             </div>
@@ -201,7 +212,15 @@ function InstallWizard(props: {
 
         {step === 3 && (
           <div className="skills-control-block">
-            <p>{tr('skills.wizConfirm')}</p>
+            <div className="skills-wizard-summary">
+              <p><strong>{tr('skills.source')}:</strong> {props.source || '—'}</p>
+              {props.ref && <p><strong>{tr('skills.ref')}:</strong> {props.ref}</p>}
+              {props.path && <p><strong>{tr('skills.path')}:</strong> {props.path}</p>}
+            </div>
+            {props.discovering && <p className="hint-ok">{tr('skills.scanning')}…</p>}
+            {!props.discovering && !props.selectionOpen && props.status && (
+              <p className={`hint-${props.status.ok ? 'ok' : 'warn'}`}>{props.status.text}</p>
+            )}
             {props.selectionOpen && (
               <div className="skills-install-selection">
                 <div className="skills-install-selection-head">
@@ -220,21 +239,26 @@ function InstallWizard(props: {
                   {props.candidates.map(candidate => (
                     <label key={candidate.name} className="skills-pack-skill-item">
                       <input type="checkbox" checked={props.selected.has(candidate.name)} onChange={() => props.onToggleSkill(candidate.name)} />
-                      <span>{candidate.name}</span>
-                      {candidate.description && <small>{candidate.description}</small>}
+                      <span className="skills-pack-skill-name">{candidate.name}</span>
+                      {candidate.description && <small className="skills-pack-skill-desc">{candidate.description}</small>}
                     </label>
                   ))}
                 </div>
               </div>
             )}
-            {props.status && <p className={`hint-${props.status.ok ? 'ok' : 'warn'}`}>{props.status.text}</p>}
           </div>
         )}
 
         <div className="skills-dialog-actions">
           <button type="button" className="bd-button" onClick={props.onClose}>{tr('skills.cancel')}</button>
           {step > 1 && <button type="button" className="bd-button" onClick={() => { props.onCloseSelection(); setStep(s => s - 1); }}>{tr('skills.wizBack')}</button>}
-          {step < 3 && <button type="button" className="bd-button primary" onClick={() => setStep(s => s + 1)} disabled={step === 1 && !props.source.trim()}>{tr('skills.wizNext')}</button>}
+          {step < 3 && <button type="button" className="bd-button primary" onClick={() => {
+            if (step === 2) {
+              // Run discover when entering step 3 so the user sees a preview
+              void props.onInstall();
+            }
+            setStep(s => s + 1);
+          }} disabled={step === 1 && !props.source.trim()}>{tr('skills.wizNext')}</button>}
           {step === 3 && (
             <button
               type="button"
@@ -324,4 +348,22 @@ function detectSourceType(source: string): 'github' | 'git' | 'local' | 'agentbu
   if (s.startsWith('/') || s.startsWith('./') || s.startsWith('~')) return 'local';
   if (s.includes('github')) return 'github';
   return 'unknown';
+}
+
+/** Normalize browser-style git URLs (e.g. host/.../tree/main/path)
+ *  into a cloneable repo URL + optional ref + path. Returns null if no
+ *  normalization is needed. */
+function normalizeGitUrl(source: string): { url: string; ref: string; path: string } | null {
+  const s = source.trim();
+  // Match /tree/<branch>/<path> or /blob/<branch>/<path> patterns
+  const treeMatch = s.match(/^(.+?)\/(?:tree|blob)\/([^/]+)\/(.+)$/);
+  if (treeMatch) {
+    return { url: treeMatch[1], ref: treeMatch[2], path: treeMatch[3] };
+  }
+  // Match /tree/<branch> at the end
+  const treeMatch2 = s.match(/^(.+?)\/(?:tree|blob)\/([^/]+)\/?$/);
+  if (treeMatch2) {
+    return { url: treeMatch2[1], ref: treeMatch2[2], path: '' };
+  }
+  return null;
 }
